@@ -1,0 +1,45 @@
+{
+  "metadata": {
+    "id": "sqlserver_long_transaction_schema_evolution_v1",
+    "source_type": "sqlserver",
+    "protocol_version": "cdc_change_table_v1",
+    "source_version": "sqlserver>=2019",
+    "fixture_version": 1,
+    "description": "SQL Server long transaction fixture combining control markers, DML, ALTER TABLE, and post-schema-change updates.",
+    "tags": ["sqlserver", "long_transaction", "schema_change", "dml"],
+    "expected_event_count": 5,
+    "captured_at": "2026-05-21T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Control",
+      "payload": "{\"watermark\":\"0x0000000000000003\"}",
+      "tags": ["control"]
+    },
+    {
+      "seq": 1,
+      "message_type": "Capture",
+      "payload": "{\"schema\":\"dbo\",\"table\":\"orders\",\"after\":{\"id\":100,\"status\":\"new\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 2,
+      "message_type": "Ddl",
+      "payload": "{\"statement\":\"ALTER TABLE [dbo].[orders] ADD [priority] INT, DROP COLUMN IF EXISTS [legacy_status];\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 3,
+      "message_type": "Update",
+      "payload": "{\"schema\":\"dbo\",\"table\":\"orders\",\"before\":{\"id\":100,\"status\":\"new\"},\"after\":{\"id\":100,\"status\":\"packed\",\"priority\":1},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 4,
+      "message_type": "Delete",
+      "payload": "{\"schema\":\"dbo\",\"table\":\"orders\",\"before\":{\"id\":100,\"status\":\"packed\",\"priority\":1},\"after\":null,\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    }
+  ]
+}

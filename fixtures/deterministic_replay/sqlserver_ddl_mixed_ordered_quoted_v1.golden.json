@@ -1,0 +1,48 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "dbo",
+      "schema_diff": {
+        "operations": [
+          {
+            "AddColumn": {
+              "column": {
+                "constraints": [],
+                "data_type": "INT",
+                "name": "priority",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "Unsupported": {
+              "clause": "SET (LOCK_ESCALATION = 'auto, manual')"
+            }
+          },
+          {
+            "DropColumn": {
+              "name": "legacy_status"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE [dbo].[orders] ADD [priority] INT, SET (lock_escalation = 'auto, manual'), DROP COLUMN IF EXISTS [legacy_status];",
+      "table": "orders"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "sqlserver",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "dbo",
+    "table": "orders__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

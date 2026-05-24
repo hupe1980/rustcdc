@@ -1,0 +1,21 @@
+{
+  "metadata": {
+    "id": "postgres_ddl_dotted_identifier_v1",
+    "source_type": "postgres",
+    "protocol_version": "pgoutput_v2",
+    "source_version": "postgres>=12,<17",
+    "fixture_version": 1,
+    "description": "PostgreSQL DDL replay fixture with dotted quoted identifiers (dots inside identifier names).",
+    "tags": ["postgres", "ddl", "schema_change", "dotted_identifier"],
+    "expected_event_count": 1,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Ddl",
+      "payload": "{\"statement\":\"ALTER TABLE \\\"tenant.prod\\\".\\\"users.v2\\\" ADD COLUMN \\\"created.at\\\" TIMESTAMP, DROP COLUMN IF EXISTS \\\"updated.ts\\\";\"}",
+      "tags": ["ddl", "schema_change"]
+    }
+  ]
+}

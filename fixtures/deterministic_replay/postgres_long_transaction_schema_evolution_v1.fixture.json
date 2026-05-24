@@ -1,0 +1,51 @@
+{
+  "metadata": {
+    "id": "postgres_long_transaction_schema_evolution_v1",
+    "source_type": "postgres",
+    "protocol_version": "pgoutput_v2",
+    "source_version": "postgres>=12,<17",
+    "fixture_version": 1,
+    "description": "PostgreSQL long transaction fixture combining DML and ALTER TABLE schema evolution.",
+    "tags": ["postgres", "long_transaction", "schema_change", "dml"],
+    "expected_event_count": 6,
+    "captured_at": "2026-05-21T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Begin",
+      "payload": "{}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 1,
+      "message_type": "Insert",
+      "payload": "{\"schema\":\"public\",\"table\":\"users\",\"after\":{\"id\":1,\"name\":\"alice\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 2,
+      "message_type": "Update",
+      "payload": "{\"schema\":\"public\",\"table\":\"users\",\"before\":{\"id\":1,\"name\":\"alice\"},\"after\":{\"id\":1,\"name\":\"alice\",\"status\":\"active\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 3,
+      "message_type": "Ddl",
+      "payload": "{\"statement\":\"ALTER TABLE public.users ADD COLUMN email TEXT, DROP COLUMN IF EXISTS legacy_email\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 4,
+      "message_type": "Insert",
+      "payload": "{\"schema\":\"public\",\"table\":\"users\",\"after\":{\"id\":2,\"name\":\"bob\",\"email\":\"bob@example.com\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 5,
+      "message_type": "Commit",
+      "payload": "{}",
+      "tags": ["transactional"]
+    }
+  ]
+}

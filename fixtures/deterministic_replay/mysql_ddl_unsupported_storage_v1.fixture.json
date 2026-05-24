@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "id": "mysql_ddl_unsupported_storage_v1",
+    "source_type": "mysql",
+    "protocol_version": "binlog_v4",
+    "source_version": "mysql=8.0",
+    "fixture_version": 1,
+    "description": "MySQL DDL replay fixture for unsupported storage/lock ALTER options.",
+    "tags": ["mysql", "ddl", "schema_change", "unsupported_alter"],
+    "expected_event_count": 2,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "QueryEvent",
+      "payload": "{\"query\":\"alter table inventory.products   engine=innodb,   lock = none;\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 1,
+      "message_type": "XidEvent",
+      "payload": "{\"xid\":2101}",
+      "tags": ["transactional"]
+    }
+  ]
+}

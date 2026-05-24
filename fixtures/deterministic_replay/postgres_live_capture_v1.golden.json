@@ -1,0 +1,125 @@
+[
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 0,
+      "marker_type": "transaction_begin",
+      "source_message": "Begin"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_0",
+      "timestamp": 1700000000000
+    },
+    "ts": 1700000000000,
+    "schema": null,
+    "table": "__marker__transaction_begin",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "id": 1,
+      "name": "alice"
+    },
+    "op": "insert",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_1",
+      "timestamp": 1700000000001
+    },
+    "ts": 1700000000001,
+    "schema": "public",
+    "table": "users",
+    "primary_key": [
+      "id"
+    ],
+    "snapshot": null,
+    "transaction": {
+      "tx_id": 0,
+      "total_events": 3,
+      "event_index": 0
+    },
+    "envelope_version": 1
+  },
+  {
+    "before": {
+      "id": 1,
+      "name": "alice"
+    },
+    "after": {
+      "id": 1,
+      "name": "alice_2"
+    },
+    "op": "update",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_2",
+      "timestamp": 1700000000002
+    },
+    "ts": 1700000000002,
+    "schema": "public",
+    "table": "users",
+    "primary_key": [
+      "id"
+    ],
+    "snapshot": null,
+    "transaction": {
+      "tx_id": 0,
+      "total_events": 3,
+      "event_index": 1
+    },
+    "envelope_version": 1
+  },
+  {
+    "before": {
+      "id": 1,
+      "name": "alice_2"
+    },
+    "after": null,
+    "op": "delete",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_3",
+      "timestamp": 1700000000003
+    },
+    "ts": 1700000000003,
+    "schema": "public",
+    "table": "users",
+    "primary_key": [
+      "id"
+    ],
+    "snapshot": null,
+    "transaction": {
+      "tx_id": 0,
+      "total_events": 3,
+      "event_index": 2
+    },
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 4,
+      "marker_type": "transaction_end",
+      "source_message": "Commit"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_4",
+      "timestamp": 1700000000004
+    },
+    "ts": 1700000000004,
+    "schema": null,
+    "table": "__marker__transaction_end",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

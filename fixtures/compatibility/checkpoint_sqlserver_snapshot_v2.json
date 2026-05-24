@@ -1,0 +1,27 @@
+{
+  "checkpoint_format_version": 2,
+  "source_type": "sqlserver_snapshot",
+  "committed_event_count": 28,
+  "offset": {
+    "snapshot_id": "sqlserver-snapshot-compat-1",
+    "lsn_start": [0, 0, 0, 42, 0, 0, 1, 155, 0, 16],
+    "current_table": 0,
+    "next_chunk_index": 3,
+    "tables": [
+      {
+        "table": "dbo.orders",
+        "total_rows": 7,
+        "rows_processed": 7,
+        "cursor_position": "[7]",
+        "is_complete": true
+      },
+      {
+        "table": "dbo.customers",
+        "total_rows": 20,
+        "rows_processed": 11,
+        "cursor_position": "[11]",
+        "is_complete": false
+      }
+    ]
+  }
+}

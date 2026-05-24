@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "id": "sqlserver_ddl_mixed_alter_v1",
+    "source_type": "sqlserver",
+    "protocol_version": "cdc_change_table_v1",
+    "source_version": "sqlserver>=2019",
+    "fixture_version": 1,
+    "description": "SQL Server DDL replay fixture with mixed supported and unsupported ALTER clauses.",
+    "tags": ["sqlserver", "ddl", "schema_change", "unsupported_alter"],
+    "expected_event_count": 2,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Ddl",
+      "payload": "{\"statement\":\"ALTER TABLE [dbo].[orders] ADD [priority] INT, SET (LOCK_ESCALATION = AUTO), DROP COLUMN IF EXISTS [legacy_status];\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 1,
+      "message_type": "Control",
+      "payload": "{\"watermark\":\"0x0000000000000002\"}",
+      "tags": ["control"]
+    }
+  ]
+}

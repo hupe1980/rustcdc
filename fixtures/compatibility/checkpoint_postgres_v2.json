@@ -1,0 +1,9 @@
+{
+  "checkpoint_format_version": 2,
+  "source_type": "postgres",
+  "committed_event_count": 42,
+  "offset": {
+    "lsn": 123456,
+    "slot_name": "compat_slot"
+  }
+}

@@ -1,0 +1,43 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "dbo.legacy",
+      "schema_diff": {
+        "operations": [
+          {
+            "AddColumn": {
+              "column": {
+                "constraints": [],
+                "data_type": "DATETIME",
+                "name": "event.time",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "DropColumn": {
+              "name": "audit.ts"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE [dbo.legacy].[snapshot.v2] ADD [event.time] DATETIME, DROP COLUMN IF EXISTS [audit.ts];",
+      "table": "snapshot.v2"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "sqlserver",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "dbo.legacy",
+    "table": "snapshot.v2__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

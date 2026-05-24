@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "id": "mysql_ddl_mixed_escaped_identifier_v1",
+    "source_type": "mysql",
+    "protocol_version": "binlog_v4",
+    "source_version": "mysql=8.0",
+    "fixture_version": 1,
+    "description": "MySQL DDL replay fixture with escaped backtick identifiers and unsupported option literal.",
+    "tags": ["mysql", "ddl", "schema_change", "mixed_alter", "escaped_identifier"],
+    "expected_event_count": 2,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "QueryEvent",
+      "payload": "{\"query\":\"ALTER TABLE inventory.products ADD COLUMN `na``me` INT, COMMENT='alpha, beta'' gamma', DROP COLUMN IF EXISTS `or``der`;\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 1,
+      "message_type": "XidEvent",
+      "payload": "{\"xid\":2106}",
+      "tags": ["transactional"]
+    }
+  ]
+}

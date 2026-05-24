@@ -1,0 +1,82 @@
+[package]
+name = "cdc-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
+authors      = ["hupe1980"]
+license = "MIT OR Apache-2.0"
+
+[workspace]
+members = [".", "xtask"]
+default-members = ["."]
+resolver = "2"
+
+[features]
+# Default production profile with PostgreSQL source support and TLS transport enabled.
+default = ["postgres", "tls"]
+# Enable PostgreSQL-specific source implementations.
+postgres = ["dep:sqlx", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
+# Enable MySQL-specific source implementations.
+mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "tls"]
+# Enable SQL Server-specific source implementations.
+sqlserver = ["dep:tiberius", "dep:tokio-util", "tls"]
+# Enable TLS-related transport support for source connectors.
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "dep:tokio-rustls"]
+# Enable outbox helpers and transforms.
+outbox = []
+# Enable encryption-oriented transforms and helpers.
+encryption = ["dep:aes-gcm", "dep:base64"]
+# Enable metrics and instrumentation integrations.
+metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+# Enable explicit test-only insecure transport/TLS overrides behind env toggles.
+# Never enable this feature for production builds.
+insecure-test-overrides = []
+
+[dependencies]
+async-trait = "0.1.89"
+ahash = "0.8.11"
+futures-util = "0.3.31"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "rt", "signal", "sync", "time"] }
+tracing = "0.1.41"
+regex = "1.11.1"
+wasmparser = "0.240.0"
+wasmtime = "24.0.2"
+aes-gcm = { version = "0.10.3", optional = true }
+base64 = { version = "0.22.1", optional = true }
+opentelemetry = { version = "0.23.0", features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.23.0", features = ["trace", "metrics", "rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.16.0", features = ["trace", "metrics", "grpc-tonic"], optional = true }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json"], optional = true }
+tokio-postgres = { version = "0.7.15", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+mysql_async = { version = "0.36.2", default-features = false, features = ["minimal", "binlog"], optional = true }
+mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "tokio", "rustls"], optional = true }
+tokio-util = { version = "0.7.16", features = ["compat"], optional = true }
+rustls = { version = "0.23.19", default-features = false, features = ["std", "ring"], optional = true }
+rustls-pemfile = { version = "2.0", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+tokio-rustls = { version = "0.25", optional = true }
+
+[dev-dependencies]
+criterion = "0.7.0"
+tempfile = "3.23.0"
+testcontainers = "0.25.2"
+tokio-test = "0.4.4"
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "std", "json"] }
+reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls"] }
+wasm-bindgen = "0.2.105"
+wat = "1.240.0"
+
+[[bench]]
+name = "quality_perf"
+harness = false
+
+[[bench]]
+name = "cdc_perf"
+harness = false

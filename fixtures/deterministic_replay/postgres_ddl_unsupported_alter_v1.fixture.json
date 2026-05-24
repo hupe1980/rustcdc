@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "id": "postgres_ddl_unsupported_alter_v1",
+    "source_type": "postgres",
+    "protocol_version": "pgoutput_v2",
+    "source_version": "postgres>=12,<17",
+    "fixture_version": 1,
+    "description": "PostgreSQL DDL replay fixture preserving unsupported ALTER metadata.",
+    "tags": ["postgres", "ddl", "schema_change", "unsupported_alter"],
+    "expected_event_count": 3,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Begin",
+      "payload": "{}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 1,
+      "message_type": "Ddl",
+      "payload": "{\"statement\":\"ALTER TABLE public.users REPLICA IDENTITY FULL\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 2,
+      "message_type": "Commit",
+      "payload": "{}",
+      "tags": ["transactional"]
+    }
+  ]
+}

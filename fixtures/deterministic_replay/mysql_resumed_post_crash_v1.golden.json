@@ -1,0 +1,141 @@
+[
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 0,
+      "marker_type": "transaction_begin",
+      "source_message": "QueryEvent"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_0",
+      "timestamp": 1700000000000
+    },
+    "ts": 1700000000000,
+    "schema": null,
+    "table": "__marker__transaction_begin",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "id": 301,
+      "sku": "sku-301"
+    },
+    "op": "insert",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_1",
+      "timestamp": 1700000000001
+    },
+    "ts": 1700000000001,
+    "schema": "inventory",
+    "table": "products",
+    "primary_key": [
+      "id"
+    ],
+    "snapshot": null,
+    "transaction": {
+      "tx_id": 0,
+      "total_events": 1,
+      "event_index": 0
+    },
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 2,
+      "marker_type": "transaction_end",
+      "source_message": "XidEvent"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_2",
+      "timestamp": 1700000000002
+    },
+    "ts": 1700000000002,
+    "schema": null,
+    "table": "__marker__transaction_end",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 3,
+      "marker_type": "transaction_begin",
+      "source_message": "QueryEvent"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_3",
+      "timestamp": 1700000000003
+    },
+    "ts": 1700000000003,
+    "schema": null,
+    "table": "__marker__transaction_begin",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  },
+  {
+    "before": {
+      "id": 301,
+      "sku": "sku-301"
+    },
+    "after": {
+      "id": 301,
+      "sku": "sku-301b"
+    },
+    "op": "update",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_4",
+      "timestamp": 1700000000004
+    },
+    "ts": 1700000000004,
+    "schema": "inventory",
+    "table": "products",
+    "primary_key": [
+      "id"
+    ],
+    "snapshot": null,
+    "transaction": {
+      "tx_id": 3,
+      "total_events": 1,
+      "event_index": 0
+    },
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 5,
+      "marker_type": "transaction_end",
+      "source_message": "XidEvent"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_5",
+      "timestamp": 1700000000005
+    },
+    "ts": 1700000000005,
+    "schema": null,
+    "table": "__marker__transaction_end",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

@@ -1,0 +1,43 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "tenant.prod",
+      "schema_diff": {
+        "operations": [
+          {
+            "AddColumn": {
+              "column": {
+                "constraints": [],
+                "data_type": "TIMESTAMP",
+                "name": "created.at",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "DropColumn": {
+              "name": "updated.ts"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE \"tenant.prod\".\"users.v2\" ADD COLUMN \"created.at\" TIMESTAMP, DROP COLUMN IF EXISTS \"updated.ts\";",
+      "table": "users.v2"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "tenant.prod",
+    "table": "users.v2__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

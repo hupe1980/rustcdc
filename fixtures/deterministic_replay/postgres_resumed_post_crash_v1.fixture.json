@@ -1,0 +1,51 @@
+{
+  "metadata": {
+    "id": "postgres_resumed_post_crash_v1",
+    "source_type": "postgres",
+    "protocol_version": "pgoutput_v2",
+    "source_version": "postgres>=12,<17",
+    "fixture_version": 1,
+    "description": "PostgreSQL resumed-after-crash fixture with post-recovery committed transactions.",
+    "tags": ["postgres", "post_crash_resume", "transaction", "dml"],
+    "expected_event_count": 6,
+    "captured_at": "2026-05-21T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Begin",
+      "payload": "{}",
+      "tags": ["transactional", "post_crash_resume"]
+    },
+    {
+      "seq": 1,
+      "message_type": "Insert",
+      "payload": "{\"schema\":\"public\",\"table\":\"users\",\"after\":{\"id\":201,\"name\":\"alice_resume\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 2,
+      "message_type": "Commit",
+      "payload": "{}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 3,
+      "message_type": "Begin",
+      "payload": "{}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 4,
+      "message_type": "Update",
+      "payload": "{\"schema\":\"public\",\"table\":\"users\",\"before\":{\"id\":201,\"name\":\"alice_resume\"},\"after\":{\"id\":201,\"name\":\"alice_resumed\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 5,
+      "message_type": "Commit",
+      "payload": "{}",
+      "tags": ["transactional"]
+    }
+  ]
+}

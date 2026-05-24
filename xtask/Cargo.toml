@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+
+[features]
+default = []
+tls = ["cdc-rs/tls"]
+postgres = ["cdc-rs/postgres"]
+mysql = ["cdc-rs/mysql"]
+sqlserver = ["cdc-rs/sqlserver", "tls"]
+
+[dependencies]
+cdc-rs = { path = "..", default-features = false }
+tokio = { version = "1.48.0", features = ["macros", "rt", "time"] }

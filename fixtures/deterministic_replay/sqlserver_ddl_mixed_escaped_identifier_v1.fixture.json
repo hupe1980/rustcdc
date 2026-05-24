@@ -1,0 +1,21 @@
+{
+  "metadata": {
+    "id": "sqlserver_ddl_mixed_escaped_identifier_v1",
+    "source_type": "sqlserver",
+    "protocol_version": "cdc_change_table_v1",
+    "source_version": "sqlserver>=2019",
+    "fixture_version": 1,
+    "description": "SQL Server DDL replay fixture with mixed supported and unsupported clauses using escaped bracket identifiers.",
+    "tags": ["sqlserver", "ddl", "schema_change", "mixed_alter", "quoted"],
+    "expected_event_count": 1,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Ddl",
+      "payload": "{\"statement\":\"ALTER TABLE [dbo].[orders] ADD [select] INT, NOCHECK CONSTRAINT [ck_Orders]]State], DROP COLUMN IF EXISTS [from];\"}",
+      "tags": ["ddl", "schema_change"]
+    }
+  ]
+}

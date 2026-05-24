@@ -1,0 +1,48 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "odd]schema",
+      "schema_diff": {
+        "operations": [
+          {
+            "AddColumn": {
+              "column": {
+                "constraints": [],
+                "data_type": "INT",
+                "name": "new]col",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "Unsupported": {
+              "clause": "SET (LOCK_ESCALATION = 'auto'' mode, manual')"
+            }
+          },
+          {
+            "DropColumn": {
+              "name": "old]col"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE [odd]]schema].[na]]me] ADD [new]]col] INT, SET (lock_escalation = 'auto'' mode, manual'), DROP COLUMN IF EXISTS [old]]col];",
+      "table": "na]me"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "sqlserver",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "odd]schema",
+    "table": "na]me__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

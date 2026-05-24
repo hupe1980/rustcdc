@@ -1,0 +1,6 @@
+{
+  "checkpoint_format_version": 2,
+  "source_type": "sqlserver",
+  "committed_event_count": 65,
+  "offset": "0x0000002A0000019B0010"
+}

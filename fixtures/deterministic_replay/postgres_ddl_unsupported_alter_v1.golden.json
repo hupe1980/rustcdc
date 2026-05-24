@@ -1,0 +1,79 @@
+[
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 0,
+      "marker_type": "transaction_begin",
+      "source_message": "Begin"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_0",
+      "timestamp": 1700000000000
+    },
+    "ts": 1700000000000,
+    "schema": null,
+    "table": "__marker__transaction_begin",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "public",
+      "schema_diff": {
+        "operations": [
+          {
+            "Unsupported": {
+              "clause": "REPLICA IDENTITY FULL"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE public.users REPLICA IDENTITY FULL",
+      "table": "users"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_1",
+      "timestamp": 0
+    },
+    "ts": 1700000000001,
+    "schema": "public",
+    "table": "users__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": {
+      "tx_id": 0,
+      "total_events": 1,
+      "event_index": 0
+    },
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 2,
+      "marker_type": "transaction_end",
+      "source_message": "Commit"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_2",
+      "timestamp": 1700000000002
+    },
+    "ts": 1700000000002,
+    "schema": null,
+    "table": "__marker__transaction_end",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

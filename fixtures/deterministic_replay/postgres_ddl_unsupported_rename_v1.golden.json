@@ -1,0 +1,33 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "public",
+      "schema_diff": {
+        "operations": [
+          {
+            "Unsupported": {
+              "clause": "RENAME TO USERS_ARCHIVE"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE public.users   RENAME   TO   users_archive;",
+      "table": "users"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "postgres",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "public",
+    "table": "users__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

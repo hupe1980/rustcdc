@@ -1,0 +1,14 @@
+{
+  "checkpoint_format_version": 2,
+  "source_type": "postgres_snapshot",
+  "committed_event_count": 21,
+  "offset": {
+    "snapshot_id": "snap-compat-1",
+    "snapshot_start_ts": 1716460700000,
+    "snapshot_end_ts": 0,
+    "snapshot_watermark": 123456,
+    "current_table": 0,
+    "next_chunk_index": 3,
+    "tables": []
+  }
+}

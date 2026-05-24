@@ -1,0 +1,51 @@
+{
+  "metadata": {
+    "id": "mysql_resumed_post_crash_v1",
+    "source_type": "mysql",
+    "protocol_version": "binlog_v4",
+    "source_version": "mysql=8.0",
+    "fixture_version": 1,
+    "description": "MySQL resumed-after-crash fixture with post-recovery committed transactions.",
+    "tags": ["mysql", "post_crash_resume", "transaction", "dml"],
+    "expected_event_count": 6,
+    "captured_at": "2026-05-21T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "QueryEvent",
+      "payload": "{\"sql\":\"BEGIN\"}",
+      "tags": ["transactional", "post_crash_resume"]
+    },
+    {
+      "seq": 1,
+      "message_type": "WriteRowsEvent",
+      "payload": "{\"schema\":\"inventory\",\"table\":\"products\",\"after\":{\"id\":301,\"sku\":\"sku-301\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 2,
+      "message_type": "XidEvent",
+      "payload": "{\"xid\":7001}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 3,
+      "message_type": "QueryEvent",
+      "payload": "{\"sql\":\"BEGIN\"}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 4,
+      "message_type": "UpdateRowsEvent",
+      "payload": "{\"schema\":\"inventory\",\"table\":\"products\",\"before\":{\"id\":301,\"sku\":\"sku-301\"},\"after\":{\"id\":301,\"sku\":\"sku-301b\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 5,
+      "message_type": "XidEvent",
+      "payload": "{\"xid\":7002}",
+      "tags": ["transactional"]
+    }
+  ]
+}

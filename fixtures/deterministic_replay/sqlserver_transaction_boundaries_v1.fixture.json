@@ -1,0 +1,39 @@
+{
+  "metadata": {
+    "id": "sqlserver_transaction_boundaries_v1",
+    "source_type": "sqlserver",
+    "protocol_version": "cdc_change_table_v1",
+    "source_version": "sqlserver>=2019",
+    "fixture_version": 1,
+    "description": "SQL Server fixture showing control-event begin/commit transaction boundaries around buffered DML.",
+    "tags": ["sqlserver", "transaction", "control", "marker_sequence"],
+    "expected_event_count": 4,
+    "captured_at": "2026-05-21T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Control",
+      "payload": "{\"kind\":\"begin_transaction\",\"tx_id\":9001}",
+      "tags": ["control", "transactional"]
+    },
+    {
+      "seq": 1,
+      "message_type": "Capture",
+      "payload": "{\"schema\":\"dbo\",\"table\":\"orders\",\"after\":{\"id\":100,\"status\":\"new\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 2,
+      "message_type": "Update",
+      "payload": "{\"schema\":\"dbo\",\"table\":\"orders\",\"before\":{\"id\":100,\"status\":\"new\"},\"after\":{\"id\":100,\"status\":\"packed\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 3,
+      "message_type": "Control",
+      "payload": "{\"kind\":\"commit_transaction\",\"tx_id\":9001}",
+      "tags": ["control", "transactional"]
+    }
+  ]
+}

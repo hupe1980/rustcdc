@@ -1,0 +1,43 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "dbo",
+      "schema_diff": {
+        "operations": [
+          {
+            "AddColumn": {
+              "column": {
+                "constraints": [],
+                "data_type": "INT",
+                "name": "id",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "DropColumn": {
+              "name": "deleted_at"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE [master].[dbo].[users] ADD [id] INT, DROP COLUMN IF EXISTS [deleted_at];",
+      "table": "users"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "sqlserver",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "dbo",
+    "table": "users__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

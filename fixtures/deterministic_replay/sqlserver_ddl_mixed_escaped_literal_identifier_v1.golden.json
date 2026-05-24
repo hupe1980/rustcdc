@@ -1,0 +1,48 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "dbo",
+      "schema_diff": {
+        "operations": [
+          {
+            "AddColumn": {
+              "column": {
+                "constraints": [],
+                "data_type": "INT",
+                "name": "na]me",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "Unsupported": {
+              "clause": "SET (LOCK_ESCALATION = 'auto'' mode, manual')"
+            }
+          },
+          {
+            "DropColumn": {
+              "name": "fr]om"
+            }
+          }
+        ]
+      },
+      "statement": "ALTER TABLE [dbo].[orders] ADD [na]]me] INT, SET (lock_escalation = 'auto'' mode, manual'), DROP COLUMN IF EXISTS [fr]]om];",
+      "table": "orders"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "sqlserver",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "dbo",
+    "table": "orders__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

@@ -1,0 +1,51 @@
+{
+  "metadata": {
+    "id": "sqlserver_resumed_post_crash_v1",
+    "source_type": "sqlserver",
+    "protocol_version": "cdc_change_table_v1",
+    "source_version": "sqlserver>=2019",
+    "fixture_version": 1,
+    "description": "SQL Server resumed-after-crash fixture with control-event transaction boundaries and post-recovery committed DML.",
+    "tags": ["sqlserver", "post_crash_resume", "transaction", "dml"],
+    "expected_event_count": 6,
+    "captured_at": "2026-05-21T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Control",
+      "payload": "{\"kind\":\"begin_transaction\",\"tx_id\":9102}",
+      "tags": ["control", "transactional", "post_crash_resume"]
+    },
+    {
+      "seq": 1,
+      "message_type": "Capture",
+      "payload": "{\"schema\":\"dbo\",\"table\":\"orders\",\"after\":{\"id\":401,\"status\":\"new\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 2,
+      "message_type": "Control",
+      "payload": "{\"kind\":\"commit_transaction\",\"tx_id\":9102}",
+      "tags": ["control", "transactional"]
+    },
+    {
+      "seq": 3,
+      "message_type": "Control",
+      "payload": "{\"kind\":\"begin_transaction\",\"tx_id\":9103}",
+      "tags": ["control", "transactional"]
+    },
+    {
+      "seq": 4,
+      "message_type": "Update",
+      "payload": "{\"schema\":\"dbo\",\"table\":\"orders\",\"before\":{\"id\":401,\"status\":\"new\"},\"after\":{\"id\":401,\"status\":\"resumed\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 5,
+      "message_type": "Control",
+      "payload": "{\"kind\":\"commit_transaction\",\"tx_id\":9103}",
+      "tags": ["control", "transactional"]
+    }
+  ]
+}

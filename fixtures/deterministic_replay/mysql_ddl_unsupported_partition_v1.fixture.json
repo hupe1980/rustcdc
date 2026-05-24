@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "id": "mysql_ddl_unsupported_partition_v1",
+    "source_type": "mysql",
+    "protocol_version": "binlog_v4",
+    "source_version": "mysql=8.0",
+    "fixture_version": 1,
+    "description": "MySQL DDL replay fixture for unsupported REORGANIZE PARTITION ALTER clause.",
+    "tags": ["mysql", "ddl", "schema_change", "unsupported_alter", "partition"],
+    "expected_event_count": 2,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "QueryEvent",
+      "payload": "{\"query\":\"alter table inventory.events reorganize partition p0 into (partition p0a values less than (100), partition p0b values less than (maxvalue));\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 1,
+      "message_type": "XidEvent",
+      "payload": "{\"xid\":2102}",
+      "tags": ["transactional"]
+    }
+  ]
+}

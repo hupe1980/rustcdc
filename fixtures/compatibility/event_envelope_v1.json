@@ -1,0 +1,20 @@
+{
+  "before": null,
+  "after": {
+    "id": 101,
+    "name": "compat-user"
+  },
+  "op": "insert",
+  "source": {
+    "source_name": "postgres",
+    "offset": "0/16B6A70",
+    "timestamp": 1716460800000
+  },
+  "ts": 1716460800000,
+  "schema": "public",
+  "table": "users",
+  "primary_key": ["id"],
+  "snapshot": null,
+  "transaction": null,
+  "envelope_version": 1
+}

@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "id": "mysql_ddl_mixed_ordered_quoted_v1",
+    "source_type": "mysql",
+    "protocol_version": "binlog_v4",
+    "source_version": "mysql=8.0",
+    "fixture_version": 1,
+    "description": "MySQL DDL replay fixture with mixed supported/unsupported ALTER clauses and quoted literals for order stability.",
+    "tags": ["mysql", "ddl", "schema_change", "mixed_alter", "quoted"],
+    "expected_event_count": 2,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "QueryEvent",
+      "payload": "{\"query\":\"alter table inventory.products add column status varchar(32), comment='alpha, beta'' gamma', drop column if exists legacy_status;\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 1,
+      "message_type": "XidEvent",
+      "payload": "{\"xid\":2104}",
+      "tags": ["transactional"]
+    }
+  ]
+}

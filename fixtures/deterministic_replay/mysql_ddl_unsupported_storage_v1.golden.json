@@ -1,0 +1,59 @@
+[
+  {
+    "before": null,
+    "after": {
+      "ddl_type": "ALTER_TABLE",
+      "schema": "inventory",
+      "schema_diff": {
+        "operations": [
+          {
+            "Unsupported": {
+              "clause": "ENGINE=INNODB"
+            }
+          },
+          {
+            "Unsupported": {
+              "clause": "LOCK = NONE"
+            }
+          }
+        ]
+      },
+      "statement": "alter table inventory.products   engine=innodb,   lock = none;",
+      "table": "products"
+    },
+    "op": "schema_change",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_0",
+      "timestamp": 0
+    },
+    "ts": 1700000000000,
+    "schema": "inventory",
+    "table": "products__ddl_events",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  },
+  {
+    "before": null,
+    "after": {
+      "fixture_seq": 1,
+      "marker_type": "transaction_end",
+      "source_message": "XidEvent"
+    },
+    "op": "read",
+    "source": {
+      "source_name": "mysql",
+      "offset": "fixture_seq_1",
+      "timestamp": 1700000000001
+    },
+    "ts": 1700000000001,
+    "schema": null,
+    "table": "__marker__transaction_end",
+    "primary_key": null,
+    "snapshot": null,
+    "transaction": null,
+    "envelope_version": 1
+  }
+]

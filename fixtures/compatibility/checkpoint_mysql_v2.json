@@ -1,0 +1,10 @@
+{
+  "checkpoint_format_version": 2,
+  "source_type": "mysql",
+  "committed_event_count": 84,
+  "offset": {
+    "gtid": "24BC7856-9A30-11EE-8B4B-0242AC120002:1-9",
+    "binlog_file": "mysql-bin.000123",
+    "binlog_pos": 987654
+  }
+}

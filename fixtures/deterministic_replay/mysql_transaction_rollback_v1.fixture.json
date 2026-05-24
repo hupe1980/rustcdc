@@ -1,0 +1,39 @@
+{
+  "metadata": {
+    "id": "mysql_transaction_rollback_v1",
+    "source_type": "mysql",
+    "protocol_version": "binlog_v4",
+    "source_version": "mysql=8.0",
+    "fixture_version": 1,
+    "description": "MySQL fixture showing explicit transaction rollback discarding buffered events before subsequent autocommit DML.",
+    "tags": ["mysql", "transaction", "rollback", "marker_sequence"],
+    "expected_event_count": 4,
+    "captured_at": "2026-05-21T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "QueryEvent",
+      "payload": "{\"sql\":\"BEGIN\"}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 1,
+      "message_type": "WriteRowsEvent",
+      "payload": "{\"schema\":\"inventory\",\"table\":\"products\",\"after\":{\"id\":10,\"sku\":\"sku-10\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    },
+    {
+      "seq": 2,
+      "message_type": "QueryEvent",
+      "payload": "{\"sql\":\"ROLLBACK\"}",
+      "tags": ["transactional"]
+    },
+    {
+      "seq": 3,
+      "message_type": "WriteRowsEvent",
+      "payload": "{\"schema\":\"inventory\",\"table\":\"products\",\"after\":{\"id\":11,\"sku\":\"sku-11\"},\"primary_key\":[\"id\"]}",
+      "tags": ["dml"]
+    }
+  ]
+}

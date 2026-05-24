@@ -1,0 +1,27 @@
+{
+  "metadata": {
+    "id": "mysql_ddl_dotted_identifier_v1",
+    "source_type": "mysql",
+    "protocol_version": "binlog_v4",
+    "source_version": "mysql=8.0",
+    "fixture_version": 1,
+    "description": "MySQL DDL replay fixture with dotted backtick identifiers.",
+    "tags": ["mysql", "ddl", "schema_change", "dotted_identifier"],
+    "expected_event_count": 2,
+    "captured_at": "2026-05-17T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "QueryEvent",
+      "payload": "{\"query\":\"ALTER TABLE `app.events`.`log.history` ADD COLUMN `event.id` BIGINT, DROP COLUMN IF EXISTS `legacy.ts`;\"}",
+      "tags": ["ddl", "schema_change"]
+    },
+    {
+      "seq": 1,
+      "message_type": "XidEvent",
+      "payload": "{\"xid\":2108}",
+      "tags": ["transactional"]
+    }
+  ]
+}

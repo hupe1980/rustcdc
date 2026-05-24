@@ -1,0 +1,30 @@
+{
+  "checkpoint_format_version": 2,
+  "source_type": "mysql_snapshot",
+  "committed_event_count": 33,
+  "offset": {
+    "snapshot_id": "mysql-snapshot-compat-1",
+    "snapshot_start_ts": 1716460701000,
+    "binlog_file": "mysql-bin.000123",
+    "binlog_pos": 987654,
+    "gtid": "24BC7856-9A30-11EE-8B4B-0242AC120002:1-9",
+    "current_table": 1,
+    "next_chunk_index": 4,
+    "tables": [
+      {
+        "table": "orders",
+        "total_rows": 12,
+        "rows_processed": 12,
+        "cursor_position": "[11]",
+        "is_complete": true
+      },
+      {
+        "table": "customers",
+        "total_rows": 20,
+        "rows_processed": 9,
+        "cursor_position": "[8]",
+        "is_complete": false
+      }
+    ]
+  }
+}
