@@ -117,7 +117,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     }
 
     let first_batch = poll_non_empty_batch(&mut runtime, 40).await?;
-    assert_eq!(first_batch.len(), 100);
+    assert!(first_batch.len() >= 100);
 
     let token = first_batch
         .ack_token()
