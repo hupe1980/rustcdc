@@ -2,7 +2,7 @@
 name = "rustcdc"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
 authors      = ["hupe1980"]
 license = "MIT OR Apache-2.0"

@@ -471,7 +471,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         let lsn_text = parser::format_pg_lsn(lsn);
         self.client
             .query_opt(
-                "SELECT 1 FROM pg_replication_slot_advance($1, $2)",
+                "SELECT 1 FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
                 &[&self.slot_name, &lsn_text],
             )
             .await

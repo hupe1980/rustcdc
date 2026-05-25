@@ -112,7 +112,11 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
         ),
     )
     .await?;
-    sqlserver_testkit::sql_exec_with_retry(&mut admin, &format!("USE {database}; DELETE FROM dbo.users")).await?;
+    sqlserver_testkit::sql_exec_with_retry(
+        &mut admin,
+        &format!("USE {database}; DELETE FROM dbo.users"),
+    )
+    .await?;
 
     // Seed enough rows to force multiple chunks.
     for start in (1..=1000).step_by(100) {
@@ -214,7 +218,11 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         ),
     )
     .await?;
-    sqlserver_testkit::sql_exec_with_retry(&mut admin, &format!("USE {database}; DELETE FROM dbo.users")).await?;
+    sqlserver_testkit::sql_exec_with_retry(
+        &mut admin,
+        &format!("USE {database}; DELETE FROM dbo.users"),
+    )
+    .await?;
 
     // Insert 100K rows in deterministic order.
     for chunk_start in (1..=100000).step_by(1000) {

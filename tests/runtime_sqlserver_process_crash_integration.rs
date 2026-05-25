@@ -140,12 +140,8 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
     assert_eq!(saved.source_type(), "sqlserver_snapshot");
     assert_eq!(reader_after_worker.get_committed_count().await?, marker.events as u64);
 
-    let source_cfg = sqlserver_testkit::source_config(
-        host,
-        port,
-        "rustcdc_crash_snapshot".to_string(),
-        30,
-    );
+    let source_cfg =
+        sqlserver_testkit::source_config(host, port, "rustcdc_crash_snapshot".to_string(), 30);
 
     let mut runtime = CdcRuntime::new(
         RuntimeConfig::new(
@@ -422,15 +418,7 @@ fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
 
 fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
     let status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "xtask",
-            "--bin",
-            bin,
-            "--features",
-            feature,
-        ])
+        .args(["build", "-p", "xtask", "--bin", bin, "--features", feature])
         .status()
         .map_err(rustcdc::Error::IoError)?;
 
