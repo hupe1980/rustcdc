@@ -13,8 +13,8 @@ use crate::{
 /// # Example
 ///
 /// ```rust,ignore
-/// use cdc_rs::wasm::{WasmConfig, WasmTransform};
-/// use cdc_rs::transform::{BoxTransform, TransformPipeline};
+/// use rustcdc::wasm::{WasmConfig, WasmTransform};
+/// use rustcdc::transform::{BoxTransform, TransformPipeline};
 ///
 /// let transform = WasmTransform::new(WasmConfig {
 ///     module_path: "my_transform.wasm".into(),

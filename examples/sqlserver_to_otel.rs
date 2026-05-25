@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, EventTracer,
     MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector, RuntimeConfig,
     RuntimeObservability, RuntimeSourceConfig, SqlServerSourceConfig, StructuredLogger,
@@ -21,10 +21,10 @@ use cdc_rs::{
 use serde_json::json;
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> cdc_rs::Result<()> {
+async fn main() -> rustcdc::Result<()> {
     // Parse config from env/CLI so this sample can run both locally and in CI.
     let args = ExampleArgs::from_env_and_args()?;
-    std::fs::create_dir_all(&args.checkpoint_dir).map_err(cdc_rs::Error::IoError)?;
+    std::fs::create_dir_all(&args.checkpoint_dir).map_err(rustcdc::Error::IoError)?;
 
     let otel_config = OTelConfig::new(
         args.otlp_endpoint.clone(),
@@ -131,7 +131,7 @@ async fn main() -> cdc_rs::Result<()> {
                     continue;
                 }
                 let ack = batch.ack_token().ok_or_else(|| {
-                    cdc_rs::Error::StateError("runtime returned non-empty batch without ack token".into())
+                    rustcdc::Error::StateError("runtime returned non-empty batch without ack token".into())
                 })?;
                 let batch_len = batch.len();
 
@@ -272,13 +272,13 @@ struct ExampleArgs {
 }
 
 impl ExampleArgs {
-    fn from_env_and_args() -> cdc_rs::Result<Self> {
+    fn from_env_and_args() -> rustcdc::Result<Self> {
         let mut out = Self {
             host: env_or_default("CDC_RS_SQLSERVER_HOST", "localhost"),
             port: env_or_default("CDC_RS_SQLSERVER_PORT", "1433")
                 .parse::<u16>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_SQLSERVER_PORT: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_SQLSERVER_PORT: {error}"))
                 })?,
             user: env_or_default("CDC_RS_SQLSERVER_USER", "sa"),
             password: env_or_default("CDC_RS_SQLSERVER_PASSWORD", "StrongPass!123"),
@@ -291,35 +291,35 @@ impl ExampleArgs {
                 .collect(),
             checkpoint_dir: PathBuf::from(env_or_default(
                 "CDC_RS_CHECKPOINT_DIR",
-                "./target/cdc-rs-checkpoints",
+                "./target/rustcdc-checkpoints",
             )),
             max_buffer_size: env_or_default("CDC_RS_MAX_BUFFER_SIZE", "1000")
                 .parse::<usize>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_MAX_BUFFER_SIZE: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_MAX_BUFFER_SIZE: {error}"))
                 })?,
             poll_wait_ms: env_or_default("CDC_RS_POLL_WAIT_MS", "500")
                 .parse::<u64>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_POLL_WAIT_MS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_POLL_WAIT_MS: {error}"))
                 })?,
             conn_timeout_secs: env_or_default("CDC_RS_CONN_TIMEOUT_SECS", "30")
                 .parse::<u64>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_CONN_TIMEOUT_SECS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_CONN_TIMEOUT_SECS: {error}"))
                 })?,
             max_events: env_or_default("CDC_RS_MAX_EVENTS", "0")
                 .parse::<usize>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_MAX_EVENTS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_MAX_EVENTS: {error}"))
                 })?,
             max_runtime_secs: env_or_default("CDC_RS_MAX_RUNTIME_SECS", "0")
                 .parse::<u64>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_MAX_RUNTIME_SECS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_MAX_RUNTIME_SECS: {error}"))
                 })?,
             otlp_endpoint: env_or_default("CDC_RS_OTLP_ENDPOINT", "http://localhost:4317"),
-            service_name: env_or_default("CDC_RS_SERVICE_NAME", "cdc-rs-sqlserver-example"),
+            service_name: env_or_default("CDC_RS_SERVICE_NAME", "rustcdc-sqlserver-example"),
             service_version: env_or_default("CDC_RS_SERVICE_VERSION", "current"),
             environment: env_or_default("CDC_RS_ENVIRONMENT", "dev"),
         };
@@ -332,7 +332,7 @@ impl ExampleArgs {
                     out.port = next_value(&mut args, "--port")?
                         .parse::<u16>()
                         .map_err(|error| {
-                            cdc_rs::Error::ConfigError(format!("invalid --port: {error}"))
+                            rustcdc::Error::ConfigError(format!("invalid --port: {error}"))
                         })?
                 }
                 "--user" => out.user = next_value(&mut args, "--user")?,
@@ -353,14 +353,14 @@ impl ExampleArgs {
                     out.max_events = next_value(&mut args, "--max-events")?
                         .parse::<usize>()
                         .map_err(|error| {
-                            cdc_rs::Error::ConfigError(format!("invalid --max-events: {error}"))
+                            rustcdc::Error::ConfigError(format!("invalid --max-events: {error}"))
                         })?
                 }
                 "--max-runtime-secs" => {
                     out.max_runtime_secs = next_value(&mut args, "--max-runtime-secs")?
                         .parse::<u64>()
                         .map_err(|error| {
-                            cdc_rs::Error::ConfigError(format!(
+                            rustcdc::Error::ConfigError(format!(
                                 "invalid --max-runtime-secs: {error}"
                             ))
                         })?
@@ -376,7 +376,7 @@ impl ExampleArgs {
                     std::process::exit(0);
                 }
                 other => {
-                    return Err(cdc_rs::Error::ConfigError(format!(
+                    return Err(rustcdc::Error::ConfigError(format!(
                         "unknown argument: {other}"
                     )));
                 }
@@ -384,7 +384,7 @@ impl ExampleArgs {
         }
 
         if out.snapshot_tables.is_empty() {
-            return Err(cdc_rs::Error::ConfigError(
+            return Err(rustcdc::Error::ConfigError(
                 "snapshot tables must not be empty; provide --snapshot-tables or CDC_RS_SNAPSHOT_TABLES".to_string(),
             ));
         }
@@ -397,9 +397,9 @@ fn env_or_default(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> cdc_rs::Result<String> {
+fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> rustcdc::Result<String> {
     args.next()
-        .ok_or_else(|| cdc_rs::Error::ConfigError(format!("missing value for {flag}")))
+        .ok_or_else(|| rustcdc::Error::ConfigError(format!("missing value for {flag}")))
 }
 
 fn emit_log(event: &str, table: Option<&str>, offset: Option<&str>, message: &str) {

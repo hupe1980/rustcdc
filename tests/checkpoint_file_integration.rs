@@ -1,4 +1,4 @@
-use cdc_rs::checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset};
+use rustcdc::checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset};
 
 #[tokio::test]
 async fn file_checkpoint_survives_checkpoint_store_restart() {

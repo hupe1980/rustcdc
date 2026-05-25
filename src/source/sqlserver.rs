@@ -91,7 +91,7 @@ pub struct SqlServerSourceConfig {
     /// SQL Server CDC uses **polling** against the `cdc.fn_cdc_get_all_changes_*`
     /// table-valued functions rather than a push-based protocol like PostgreSQL
     /// logical replication.  Event-to-consumer latency is therefore bounded by
-    /// this interval: a committed transaction will not be visible to cdc-rs until
+    /// this interval: a committed transaction will not be visible to rustcdc until
     /// the next poll cycle.
     ///
     /// - **p50 latency** is typically a fraction of `stream_poll_interval_ms`

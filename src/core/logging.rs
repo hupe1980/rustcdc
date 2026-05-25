@@ -1,7 +1,7 @@
 //! Structured logging helpers for runtime, source, checkpoint, and transform paths.
 //!
 //! Configure with the standard `RUST_LOG` environment variable, for example:
-//! `RUST_LOG=info` or `RUST_LOG=cdc_rs=debug`.
+//! `RUST_LOG=info` or `RUST_LOG=rustcdc=debug`.
 //!
 //! All logs include structured context fields:
 //! - `source_type`: Source connector type (postgres, mysql, sqlserver)

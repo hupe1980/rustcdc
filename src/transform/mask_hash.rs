@@ -202,7 +202,7 @@ fn decrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
 /// HKDF-SHA-256 key derivation for AES-256-GCM field encryption.
 ///
 /// Derives a 256-bit key from `secret` using HKDF (RFC 5869) with SHA-256 and
-/// the domain-separation label `b"cdc-rs-field-encryption"`. The label ensures
+/// the domain-separation label `b"rustcdc-field-encryption"`. The label ensures
 /// the derived key is independent of any other HKDF usage with the same secret.
 ///
 /// Note: HKDF is an *extraction + expansion* function, not a password KDF. For
@@ -217,7 +217,7 @@ fn derive_encryption_key(secret: &SecretString) -> Result<[u8; 32]> {
     let resolved = secret.resolve()?;
     let hk = Hkdf::<Sha256>::new(None, resolved.as_bytes());
     let mut key = [0_u8; 32];
-    hk.expand(b"cdc-rs-field-encryption", &mut key)
+    hk.expand(b"rustcdc-field-encryption", &mut key)
         .map_err(|_| Error::TransformError("HKDF expand failed (output too long)".into()))?;
     Ok(key)
 }

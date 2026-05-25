@@ -1,10 +1,10 @@
 # Feature Policy Matrix (Library Scope)
 
-This document clarifies cdc-rs feature intent by separating implemented capabilities, intentional non-goals, and roadmap candidates.
+This document clarifies rustcdc feature intent by separating implemented capabilities, intentional non-goals, and roadmap candidates.
 
 ## Scope Statement
 
-cdc-rs is an embedded CDC library for Rust applications.
+rustcdc is an embedded CDC library for Rust applications.
 
 Primary goals:
 - correctness-first event capture and delivery semantics

@@ -43,7 +43,7 @@ require_match "docs/config_reference.md" "ddl_capture=true" "config reference mu
 # Runbook recovery snippets must match strict checkpoint decoder requirements.
 require_match "docs/runbook.md" '"checkpoint_format_version"\s*:\s*2' "runbook replacement checkpoint example must include checkpoint_format_version=2"
 require_match "docs/runbook.md" "jq -e" "runbook recovery flow must validate checkpoint JSON schema before restart"
-require_match "docs/runbook.md" "mv /var/cdc-rs/checkpoint_postgres.json.new /var/cdc-rs/checkpoint_postgres.json" "runbook recovery flow must atomically replace checkpoint file"
+require_match "docs/runbook.md" "mv /var/rustcdc/checkpoint_postgres.json.new /var/rustcdc/checkpoint_postgres.json" "runbook recovery flow must atomically replace checkpoint file"
 
 if [[ "$failures" -gt 0 ]]; then
   echo "docs contract check failed: $failures issue(s)"

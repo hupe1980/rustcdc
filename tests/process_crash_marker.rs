@@ -6,7 +6,7 @@ pub struct WorkerMarker {
     pub ids: HashSet<String>,
 }
 
-pub fn wait_for_marker(path: &Path, timeout: Duration) -> cdc_rs::Result<()> {
+pub fn wait_for_marker(path: &Path, timeout: Duration) -> rustcdc::Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && read_worker_marker(path).is_ok() {
@@ -15,18 +15,18 @@ pub fn wait_for_marker(path: &Path, timeout: Duration) -> cdc_rs::Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    Err(cdc_rs::Error::TimeoutError(format!(
+    Err(rustcdc::Error::TimeoutError(format!(
         "timed out waiting for crash worker marker at {}",
         path.display()
     )))
 }
 
-pub fn read_worker_batch_len(path: &Path) -> cdc_rs::Result<usize> {
+pub fn read_worker_batch_len(path: &Path) -> rustcdc::Result<usize> {
     Ok(read_worker_marker(path)?.events)
 }
 
-pub fn read_worker_marker(path: &Path) -> cdc_rs::Result<WorkerMarker> {
-    let marker = std::fs::read_to_string(path).map_err(cdc_rs::Error::IoError)?;
+pub fn read_worker_marker(path: &Path) -> rustcdc::Result<WorkerMarker> {
+    let marker = std::fs::read_to_string(path).map_err(rustcdc::Error::IoError)?;
     let mut events = None;
     let mut acked = false;
     let mut ids = HashSet::new();
@@ -34,12 +34,12 @@ pub fn read_worker_marker(path: &Path) -> cdc_rs::Result<WorkerMarker> {
     for line in marker.lines() {
         if let Some(value) = line.strip_prefix("events=") {
             if value.is_empty() {
-                return Err(cdc_rs::Error::StateError(
+                return Err(rustcdc::Error::StateError(
                     "worker marker events field is empty".into(),
                 ));
             }
             events = Some(value.parse::<usize>().map_err(|error| {
-                cdc_rs::Error::StateError(format!("invalid worker marker events: {error}"))
+                rustcdc::Error::StateError(format!("invalid worker marker events: {error}"))
             })?);
         } else if let Some(value) = line.strip_prefix("acked=") {
             acked = value == "1";
@@ -51,7 +51,7 @@ pub fn read_worker_marker(path: &Path) -> cdc_rs::Result<WorkerMarker> {
     }
 
     let events = events
-        .ok_or_else(|| cdc_rs::Error::StateError("worker marker missing events field".into()))?;
+        .ok_or_else(|| rustcdc::Error::StateError("worker marker missing events field".into()))?;
 
     Ok(WorkerMarker { events, acked, ids })
 }

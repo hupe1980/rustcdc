@@ -6,14 +6,14 @@ use std::{
     time::Duration,
 };
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
     core::Operation,
     schema_history::InMemorySchemaHistory,
     CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
 };
 #[cfg(feature = "encryption")]
-use cdc_rs::{
+use rustcdc::{
     core::SecretString,
     transform::{MaskHashConfig, MaskHashTransform, MaskRule},
 };
@@ -27,12 +27,12 @@ mod process_crash_marker;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
 
 #[tokio::test]
-async fn runtime_postgres_process_kill_replays_uncommitted_batch() -> cdc_rs::Result<()> {
+async fn runtime_postgres_process_kill_replays_uncommitted_batch() -> rustcdc::Result<()> {
     run_postgres_process_kill_replay_scenario(false).await
 }
 
 #[tokio::test]
-async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() -> cdc_rs::Result<()> {
+async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres snapshot crash-resume integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"
@@ -59,24 +59,24 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let host_text = host.to_string();
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -95,7 +95,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let _lsn_text: String = admin_client
         .query_one(
@@ -103,7 +103,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
             &[&"cdc_runtime_crash_snapshot_slot"],
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .get(0);
 
     let total_rows = 600_i64;
@@ -114,10 +114,10 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let marker_file = checkpoint_dir.path().join("worker-polled.marker");
 
     let mut worker = spawn_crash_worker(
@@ -136,14 +136,14 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
     assert!(marker.acked, "worker should ack first snapshot batch");
     assert!(!marker.ids.is_empty(), "worker should record acked ids");
 
-    worker.kill().map_err(cdc_rs::Error::IoError)?;
-    let _ = worker.wait().map_err(cdc_rs::Error::IoError)?;
+    worker.kill().map_err(rustcdc::Error::IoError)?;
+    let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
     let reader_after_worker = FileCheckpoint::new(checkpoint_dir.path());
     let saved = reader_after_worker
         .load()
         .await?
-        .ok_or_else(|| cdc_rs::Error::StateError("checkpoint should exist after worker ack".into()))?;
+        .ok_or_else(|| rustcdc::Error::StateError("checkpoint should exist after worker ack".into()))?;
     assert_eq!(saved.source_type(), "postgres_snapshot");
     assert_eq!(reader_after_worker.get_committed_count().await?, marker.events as u64);
 
@@ -153,7 +153,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
             &[&"cdc_runtime_crash_snapshot_slot"],
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let source_cfg = PostgresSourceConfig {
         host: host.to_string(),
@@ -198,7 +198,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
                 .as_ref()
                 .and_then(|after| after.get("id"))
                 .and_then(|value| value.as_i64())
-                .ok_or_else(|| cdc_rs::Error::StateError("snapshot event id missing".into()))?;
+                .ok_or_else(|| rustcdc::Error::StateError("snapshot event id missing".into()))?;
             resumed_snapshot_ids.insert(id.to_string());
         }
 
@@ -225,13 +225,13 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
 #[cfg(feature = "encryption")]
 #[tokio::test]
 async fn runtime_postgres_process_kill_replays_uncommitted_batch_with_encryption_transform(
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     run_postgres_process_kill_replay_scenario(true).await
 }
 
 async fn run_postgres_process_kill_replay_scenario(
     _enable_encryption_transform: bool,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres process crash integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"
@@ -258,24 +258,24 @@ async fn run_postgres_process_kill_replay_scenario(
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let host_text = host.to_string();
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -294,7 +294,7 @@ async fn run_postgres_process_kill_replay_scenario(
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Ensure the replication slot exists before inserts so stream events are
     // guaranteed to be visible to the crash worker.
@@ -304,11 +304,11 @@ async fn run_postgres_process_kill_replay_scenario(
             &[&"cdc_runtime_crash_slot"],
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .get(0);
     let baseline_lsn = parse_pg_lsn(&lsn_text)?;
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let marker_file = checkpoint_dir.path().join("worker-polled.marker");
 
     let mut seed_checkpoint = FileCheckpoint::new(checkpoint_dir.path());
@@ -329,7 +329,7 @@ async fn run_postgres_process_kill_replay_scenario(
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let mut worker = spawn_crash_worker(
@@ -347,8 +347,8 @@ async fn run_postgres_process_kill_replay_scenario(
     let worker_batch_len = read_worker_batch_len(&marker_file)?;
 
     // External hard kill simulates real process termination without graceful shutdown.
-    worker.kill().map_err(cdc_rs::Error::IoError)?;
-    let _ = worker.wait().map_err(cdc_rs::Error::IoError)?;
+    worker.kill().map_err(rustcdc::Error::IoError)?;
+    let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
     let reader_before = FileCheckpoint::new(checkpoint_dir.path());
     assert_eq!(reader_before.get_committed_count().await?, 0);
@@ -406,7 +406,7 @@ async fn run_postgres_process_kill_replay_scenario(
                 .and_then(|after| after.get("payload"))
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
-                    cdc_rs::Error::StateError(
+                    rustcdc::Error::StateError(
                         "expected encrypted payload string in replay batch".into(),
                     )
                 })?;
@@ -439,7 +439,7 @@ fn spawn_crash_worker(
     publication: &str,
     snapshot_table: Option<&str>,
     ack_first_batch: bool,
-) -> cdc_rs::Result<Child> {
+) -> rustcdc::Result<Child> {
     let worker_bin = resolve_worker_bin()?;
 
     let mut command = Command::new(worker_bin);
@@ -460,10 +460,10 @@ fn spawn_crash_worker(
     if let Some(table) = snapshot_table {
         command.env("CDC_RS_WORKER_SNAPSHOT_TABLES", table);
     }
-    command.spawn().map_err(cdc_rs::Error::IoError)
+    command.spawn().map_err(rustcdc::Error::IoError)
 }
 
-fn resolve_worker_bin() -> cdc_rs::Result<PathBuf> {
+fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_postgres_crash_worker") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -472,7 +472,7 @@ fn resolve_worker_bin() -> cdc_rs::Result<PathBuf> {
     }
 
     // Fallback for `cargo test` invocations that do not set CARGO_BIN_EXE_*.
-    let test_exe = std::env::current_exe().map_err(cdc_rs::Error::IoError)?;
+    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
     if let Some(debug_dir) = test_exe.parent().and_then(|deps| deps.parent()) {
         let candidate = debug_dir.join("postgres_crash_worker");
         if candidate.exists() {
@@ -485,13 +485,13 @@ fn resolve_worker_bin() -> cdc_rs::Result<PathBuf> {
         }
     }
 
-    Err(cdc_rs::Error::StateError(
+    Err(rustcdc::Error::StateError(
         "postgres crash worker binary not found; build with `cargo build -p xtask --bin postgres_crash_worker --features postgres`"
             .into(),
     ))
 }
 
-fn build_xtask_worker(bin: &str, feature: &str) -> cdc_rs::Result<()> {
+fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
     let status = Command::new("cargo")
         .args([
             "build",
@@ -503,25 +503,25 @@ fn build_xtask_worker(bin: &str, feature: &str) -> cdc_rs::Result<()> {
             feature,
         ])
         .status()
-        .map_err(cdc_rs::Error::IoError)?;
+        .map_err(rustcdc::Error::IoError)?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(cdc_rs::Error::StateError(format!(
+        Err(rustcdc::Error::StateError(format!(
             "failed to build {bin} in xtask crate"
         )))
     }
 }
 
-fn parse_pg_lsn(value: &str) -> cdc_rs::Result<u64> {
+fn parse_pg_lsn(value: &str) -> rustcdc::Result<u64> {
     let (high, low) = value.split_once('/').ok_or_else(|| {
-        cdc_rs::Error::SourceError(format!("invalid postgres lsn format: {value}"))
+        rustcdc::Error::SourceError(format!("invalid postgres lsn format: {value}"))
     })?;
     let high = u64::from_str_radix(high, 16)
-        .map_err(|error| cdc_rs::Error::SourceError(format!("invalid lsn high bits: {error}")))?;
+        .map_err(|error| rustcdc::Error::SourceError(format!("invalid lsn high bits: {error}")))?;
     let low = u64::from_str_radix(low, 16)
-        .map_err(|error| cdc_rs::Error::SourceError(format!("invalid lsn low bits: {error}")))?;
+        .map_err(|error| rustcdc::Error::SourceError(format!("invalid lsn low bits: {error}")))?;
     Ok((high << 32) | low)
 }
 
@@ -529,7 +529,7 @@ async fn poll_until_batch_at_least(
     runtime: &mut CdcRuntime<FileCheckpoint, InMemorySchemaHistory>,
     expected: usize,
     rounds: usize,
-) -> cdc_rs::Result<cdc_rs::EventBatch> {
+) -> rustcdc::Result<rustcdc::EventBatch> {
     for _ in 0..rounds {
         let batch = runtime.poll_event_batch().await?;
         if batch.len() >= expected {
@@ -537,7 +537,7 @@ async fn poll_until_batch_at_least(
         }
     }
 
-    Err(cdc_rs::Error::TimeoutError(format!(
+    Err(rustcdc::Error::TimeoutError(format!(
         "timed out waiting for event batch of at least {expected} events"
     )))
 }

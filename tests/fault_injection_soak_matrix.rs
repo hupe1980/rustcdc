@@ -5,7 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, GenericOffset, InMemoryCheckpoint},
     fault_injection::{
         CheckpointFault, DataLossValidator, FaultInjectingCheckpoint, FaultInjectingSource,
@@ -21,12 +21,12 @@ const SOAK_BATCH_SIZE: usize = 100;
 #[derive(Debug, Clone)]
 struct TestOffset;
 
-impl cdc_rs::Offset for TestOffset {
+impl rustcdc::Offset for TestOffset {
     fn source_type(&self) -> &str {
         "mock"
     }
 
-    fn encode(&self) -> cdc_rs::Result<Vec<u8>> {
+    fn encode(&self) -> rustcdc::Result<Vec<u8>> {
         Ok(Vec::new())
     }
 }
@@ -75,19 +75,19 @@ struct MockSnapshotHandle;
 
 #[async_trait]
 impl SnapshotHandle for MockSnapshotHandle {
-    async fn next_chunk(&mut self, _chunk_size: usize) -> cdc_rs::Result<Vec<Event>> {
+    async fn next_chunk(&mut self, _chunk_size: usize) -> rustcdc::Result<Vec<Event>> {
         Ok(Vec::new())
     }
 
     async fn checkpoint(
         &self,
-        _checkpoint: &mut dyn cdc_rs::checkpoint::Checkpoint,
+        _checkpoint: &mut dyn rustcdc::checkpoint::Checkpoint,
         _committed_event_count: u64,
-    ) -> cdc_rs::Result<()> {
+    ) -> rustcdc::Result<()> {
         Ok(())
     }
 
-    async fn finish(&mut self) -> cdc_rs::Result<SnapshotEnd> {
+    async fn finish(&mut self) -> rustcdc::Result<SnapshotEnd> {
         Ok(SnapshotEnd { snapshot_end_ts: 0 })
     }
 }
@@ -98,18 +98,18 @@ struct MockStreamHandle {
 
 #[async_trait]
 impl StreamHandle for MockStreamHandle {
-    async fn next_events(&mut self, _timeout_ms: u64) -> cdc_rs::Result<Vec<Event>> {
+    async fn next_events(&mut self, _timeout_ms: u64) -> rustcdc::Result<Vec<Event>> {
         Ok(self.batches.pop_front().unwrap_or_default())
     }
 
     async fn save_position(
         &self,
-        _checkpoint: &mut dyn cdc_rs::checkpoint::Checkpoint,
-    ) -> cdc_rs::Result<()> {
+        _checkpoint: &mut dyn rustcdc::checkpoint::Checkpoint,
+    ) -> rustcdc::Result<()> {
         Ok(())
     }
 
-    async fn confirm_lsn(&mut self, _lsn: u64) -> cdc_rs::Result<()> {
+    async fn confirm_lsn(&mut self, _lsn: u64) -> rustcdc::Result<()> {
         Ok(())
     }
 }
@@ -123,14 +123,14 @@ impl Source for MockSource {
     async fn start_snapshot(
         &mut self,
         _tables: &[&str],
-    ) -> cdc_rs::Result<Box<dyn SnapshotHandle>> {
+    ) -> rustcdc::Result<Box<dyn SnapshotHandle>> {
         Ok(Box::new(MockSnapshotHandle))
     }
 
     async fn start_stream(
         &mut self,
-        _resume_from: Option<&dyn cdc_rs::Offset>,
-    ) -> cdc_rs::Result<Box<dyn StreamHandle>> {
+        _resume_from: Option<&dyn rustcdc::Offset>,
+    ) -> rustcdc::Result<Box<dyn StreamHandle>> {
         Ok(Box::new(MockStreamHandle {
             batches: self.stream_batches.clone(),
         }))
@@ -140,7 +140,7 @@ impl Source for MockSource {
         &mut self,
         _snapshot: &mut dyn SnapshotHandle,
         _stream: &mut dyn StreamHandle,
-    ) -> cdc_rs::Result<HandoffResult> {
+    ) -> rustcdc::Result<HandoffResult> {
         Ok(HandoffResult {
             snapshot_end_ts: Some(0),
             stream_start_ts: Some(0),
@@ -270,7 +270,7 @@ async fn sqlserver_soak_transient_auth_failure_recovers_without_loss() {
     };
     let mut wrapped = FaultInjectingSource::new(source);
     wrapped.inject(
-        SourceFault::ConnectionFault(cdc_rs::Error::SourceError("transient auth failure".into())),
+        SourceFault::ConnectionFault(rustcdc::Error::SourceError("transient auth failure".into())),
         0,
     );
 

@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlserver")]
 
-use cdc_rs::checkpoint::{Checkpoint, InMemoryCheckpoint};
-use cdc_rs::{source::Source, SqlServerConnection};
+use rustcdc::checkpoint::{Checkpoint, InMemoryCheckpoint};
+use rustcdc::{source::Source, SqlServerConnection};
 
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;
@@ -9,73 +9,73 @@ mod sqlserver_testkit;
 async fn sql_count(
     client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     sql: &str,
-) -> cdc_rs::Result<u64> {
+) -> rustcdc::Result<u64> {
     let rows = client
         .query(sql, &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .into_first_result()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let count = rows
         .into_iter()
         .next()
         .and_then(|row| row.get::<i64, _>(0))
-        .ok_or_else(|| cdc_rs::Error::SourceError("missing count row".into()))?;
-    u64::try_from(count).map_err(|_| cdc_rs::Error::SourceError("negative row count".into()))
+        .ok_or_else(|| rustcdc::Error::SourceError("missing count row".into()))?;
+    u64::try_from(count).map_err(|_| rustcdc::Error::SourceError("negative row count".into()))
 }
 
 async fn sql_rows(
     client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     sql: &str,
-) -> cdc_rs::Result<Vec<(i32, String)>> {
+) -> rustcdc::Result<Vec<(i32, String)>> {
     let rows = client
         .query(sql, &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .into_first_result()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let id = row
             .get::<i32, _>(0)
-            .ok_or_else(|| cdc_rs::Error::SourceError("missing id column".into()))?;
+            .ok_or_else(|| rustcdc::Error::SourceError("missing id column".into()))?;
         let name = row
             .get::<&str, _>(1)
-            .ok_or_else(|| cdc_rs::Error::SourceError("missing name column".into()))?
+            .ok_or_else(|| rustcdc::Error::SourceError("missing name column".into()))?
             .to_string();
         out.push((id, name));
     }
     Ok(out)
 }
 
-fn json_i32_field(row: &serde_json::Value, field: &str) -> cdc_rs::Result<i32> {
+fn json_i32_field(row: &serde_json::Value, field: &str) -> rustcdc::Result<i32> {
     let value = row
         .get(field)
-        .ok_or_else(|| cdc_rs::Error::SourceError(format!("snapshot row missing {field}")))?;
+        .ok_or_else(|| rustcdc::Error::SourceError(format!("snapshot row missing {field}")))?;
 
     if let Some(number) = value.as_i64() {
         return i32::try_from(number).map_err(|_| {
-            cdc_rs::Error::SourceError(format!("snapshot row {field} out of i32 range"))
+            rustcdc::Error::SourceError(format!("snapshot row {field} out of i32 range"))
         });
     }
 
     if let Some(text) = value.as_str() {
         return text.parse::<i32>().map_err(|error| {
-            cdc_rs::Error::SourceError(format!("invalid {field} in snapshot row: {error}"))
+            rustcdc::Error::SourceError(format!("invalid {field} in snapshot row: {error}"))
         });
     }
 
-    Err(cdc_rs::Error::SourceError(format!(
+    Err(rustcdc::Error::SourceError(format!(
         "snapshot row {field} has unsupported type"
     )))
 }
 
 #[tokio::test]
-async fn sqlserver_snapshot_chunking_matches_table_count() -> cdc_rs::Result<()> {
+async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver snapshot integration test") {
         return Ok(());
     }
@@ -91,7 +91,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> cdc_rs::Result<()>
     )
     .await?;
 
-    let database = "cdc_rs_snapshot_chunking";
+    let database = "rustcdc_snapshot_chunking";
 
     sqlserver_testkit::sql_exec_with_retry(
         &mut admin,
@@ -157,7 +157,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> cdc_rs::Result<()>
 
         chunk_count += 1;
         for event in chunk {
-            assert_eq!(event.op, cdc_rs::Operation::Read);
+            assert_eq!(event.op, rustcdc::Operation::Read);
             assert_eq!(event.table, "users");
             assert_eq!(event.schema.as_deref(), Some("dbo"));
             assert!(event.snapshot.is_some());
@@ -178,7 +178,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> cdc_rs::Result<()>
 
 #[tokio::test]
 async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver snapshot resume integration test") {
         return Ok(());
     }
@@ -193,7 +193,7 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         std::time::Duration::from_secs(2),
     )
     .await?;
-    let database = "cdc_rs_snapshot_resume";
+    let database = "rustcdc_snapshot_resume";
 
     sqlserver_testkit::sql_exec_with_retry(
         &mut admin,
@@ -264,13 +264,13 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         chunks = chunks.saturating_add(1);
         for event in batch {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("snapshot row missing after payload".into())
             })?;
             let id = json_i32_field(&after, "id")?;
             let name = after
                 .get("name")
                 .and_then(|value| value.as_str())
-                .ok_or_else(|| cdc_rs::Error::SourceError("snapshot row missing name".into()))?
+                .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing name".into()))?
                 .to_string();
             captured_rows.push((id, name));
         }
@@ -284,7 +284,7 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
     }
 
     let resume_offset = checkpoint.load().await?.ok_or_else(|| {
-        cdc_rs::Error::CheckpointError("expected snapshot checkpoint after chunk 5".into())
+        rustcdc::Error::CheckpointError("expected snapshot checkpoint after chunk 5".into())
     })?;
     source.close().await;
 
@@ -308,14 +308,14 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
 
         for event in batch {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("resumed snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("resumed snapshot row missing after payload".into())
             })?;
             let id = json_i32_field(&after, "id")?;
             let name = after
                 .get("name")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
-                    cdc_rs::Error::SourceError("resumed snapshot row missing name".into())
+                    rustcdc::Error::SourceError("resumed snapshot row missing name".into())
                 })?
                 .to_string();
             captured_rows.push((id, name));

@@ -1,4 +1,4 @@
-# cdc-rs Documentation Index
+# rustcdc Documentation Index
 
 Last Updated: May 24, 2026
 

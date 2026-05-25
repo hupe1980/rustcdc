@@ -1,7 +1,7 @@
 #![cfg(feature = "mysql")]
 
-use cdc_rs::{source::Source, MysqlConnection, MysqlSourceConfig};
-use cdc_rs::TransportConfig;
+use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
+use rustcdc::TransportConfig;
 use std::collections::HashSet;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -18,7 +18,7 @@ fn json_object_get<'a>(
     keys.iter().find_map(|key| object.get(*key))
 }
 
-async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
+async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -34,7 +34,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
         }
     }
 
-    Err(cdc_rs::Error::SourceError(format!(
+    Err(rustcdc::Error::SourceError(format!(
         "failed to connect mysql admin pool: {}",
         last_error
             .map(|error| error.to_string())
@@ -45,7 +45,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
 /// Test complete snapshot-to-stream handoff cycle
 /// Validates: snapshot completion → stream start → no gaps or duplicates
 #[tokio::test]
-async fn mysql_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
+async fn mysql_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql handoff test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -58,16 +58,16 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -76,7 +76,7 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
     sqlx::query("DROP TABLE IF EXISTS handoff_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE handoff_test (
@@ -86,7 +86,7 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Insert initial snapshot data (1K rows)
     for batch_start in (1..=1000).step_by(100) {
@@ -102,10 +102,10 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
         sqlx::query(&query)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let _checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let _checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let config = MysqlSourceConfig {
         host: host.to_string(),
         port,
@@ -170,7 +170,7 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
         sqlx::query(&query)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Capture stream events (post-handoff)

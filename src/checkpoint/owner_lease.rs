@@ -121,7 +121,7 @@ pub(crate) fn format_lease(hostname: &str, pid: u32) -> String {
 /// Parse a lease token in `HOSTNAME:PID` format.
 ///
 /// Returns `None` when the content is empty or malformed (e.g., an old
-/// single-integer lease written by a previous version of cdc-rs).
+/// single-integer lease written by a previous version of rustcdc).
 pub(crate) fn parse_lease(contents: &str) -> Option<(String, u32)> {
     let contents = contents.trim();
     // New format: `HOSTNAME:PID`
@@ -187,7 +187,7 @@ pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease>
                 }
                 Some((ref host, pid)) if host == hostname && !is_pid_alive(pid) => {
                     tracing::warn!(
-                        target: "cdc_rs::owner_lease",
+                        target: "rustcdc::owner_lease",
                         store_label,
                         store_dir = %parent_dir,
                         stale_owner_pid = pid,
@@ -209,7 +209,7 @@ pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease>
                     // is not shared between hosts.  Refuse to prevent cross-host corruption
                     // on shared NFS paths.
                     tracing::error!(
-                        target: "cdc_rs::owner_lease",
+                        target: "rustcdc::owner_lease",
                         store_label,
                         store_dir = %parent_dir,
                         lease_host = %host,

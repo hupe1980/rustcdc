@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, time::Duration};
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint, MysqlOffset},
     Event, EVENT_ENVELOPE_VERSION,
 };

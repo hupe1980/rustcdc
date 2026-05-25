@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, RuntimeConfig,
     RuntimeSourceConfig,
 };
@@ -14,16 +14,16 @@ mod latency_evidence_common;
 
 use latency_evidence_common::{percentile, write_latency_artifacts, LatencySummary};
 
-async fn sql_exec(client: &mut sqlserver_testkit::SqlClient, sql: &str) -> cdc_rs::Result<()> {
+async fn sql_exec(client: &mut sqlserver_testkit::SqlClient, sql: &str) -> rustcdc::Result<()> {
     client
         .execute(sql, &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     Ok(())
 }
 
 #[tokio::test]
-async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs::Result<()> {
+async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver latency evidence test") {
         return Ok(());
     }
@@ -37,34 +37,34 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> cdc
 
     sql_exec(
         &mut admin,
-        "IF DB_ID('cdc_rs_latency') IS NULL CREATE DATABASE cdc_rs_latency",
+        "IF DB_ID('rustcdc_latency') IS NULL CREATE DATABASE rustcdc_latency",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_latency; IF OBJECT_ID('dbo.latency_users', 'U') IS NULL CREATE TABLE dbo.latency_users (id INT NOT NULL PRIMARY KEY, payload NVARCHAR(255) NOT NULL)",
+        "USE rustcdc_latency; IF OBJECT_ID('dbo.latency_users', 'U') IS NULL CREATE TABLE dbo.latency_users (id INT NOT NULL PRIMARY KEY, payload NVARCHAR(255) NOT NULL)",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_latency; DELETE FROM dbo.latency_users",
+        "USE rustcdc_latency; DELETE FROM dbo.latency_users",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_latency; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
+        "USE rustcdc_latency; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_latency; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.latency_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='latency_users', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_latency; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.latency_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='latency_users', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let source_cfg = sqlserver_testkit::source_config(host, port, "cdc_rs_latency".into(), 30);
+    let source_cfg = sqlserver_testkit::source_config(host, port, "rustcdc_latency".into(), 30);
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut runtime = CdcRuntime::new(
         RuntimeConfig::new(
             RuntimeSourceConfig::SqlServer(source_cfg),
@@ -80,7 +80,7 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> cdc
     let rows_inserted = 4_096_u64;
     for id in 1_u64..=rows_inserted {
         let sql = format!(
-            "USE cdc_rs_latency; INSERT INTO dbo.latency_users (id, payload) VALUES ({}, 'payload-{}')",
+            "USE rustcdc_latency; INSERT INTO dbo.latency_users (id, payload) VALUES ({}, 'payload-{}')",
             id, id
         );
         sql_exec(&mut admin, &sql).await?;
@@ -92,11 +92,11 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> cdc
     let mut events_committed = 0_u64;
     let started = Instant::now();
 
-    let cdc_scan_sql = "USE cdc_rs_latency; EXEC sys.sp_cdc_scan";
+    let cdc_scan_sql = "USE rustcdc_latency; EXEC sys.sp_cdc_scan";
     let deadline = Instant::now() + Duration::from_secs(180);
     while events_committed < rows_inserted {
         if Instant::now() > deadline {
-            return Err(cdc_rs::Error::TimeoutError(format!(
+            return Err(rustcdc::Error::TimeoutError(format!(
                 "timed out while collecting sqlserver latency evidence (committed={events_committed}, expected={rows_inserted})"
             )));
         }

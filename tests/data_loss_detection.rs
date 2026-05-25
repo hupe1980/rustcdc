@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use async_trait::async_trait;
-use cdc_rs::{
+use rustcdc::{
     fault_injection::{CrashSimulationState, DataLossValidator, FaultInjectingSource, SourceFault},
     source::{HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle},
     Event, Offset, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
@@ -16,7 +16,7 @@ impl Offset for TestOffset {
         "mock"
     }
 
-    fn encode(&self) -> cdc_rs::Result<Vec<u8>> {
+    fn encode(&self) -> rustcdc::Result<Vec<u8>> {
         Ok(Vec::new())
     }
 }
@@ -53,19 +53,19 @@ struct NoopSnapshotHandle;
 
 #[async_trait]
 impl SnapshotHandle for NoopSnapshotHandle {
-    async fn next_chunk(&mut self, _chunk_size: usize) -> cdc_rs::Result<Vec<Event>> {
+    async fn next_chunk(&mut self, _chunk_size: usize) -> rustcdc::Result<Vec<Event>> {
         Ok(Vec::new())
     }
 
     async fn checkpoint(
         &self,
-        _checkpoint: &mut dyn cdc_rs::checkpoint::Checkpoint,
+        _checkpoint: &mut dyn rustcdc::checkpoint::Checkpoint,
         _committed_event_count: u64,
-    ) -> cdc_rs::Result<()> {
+    ) -> rustcdc::Result<()> {
         Ok(())
     }
 
-    async fn finish(&mut self) -> cdc_rs::Result<SnapshotEnd> {
+    async fn finish(&mut self) -> rustcdc::Result<SnapshotEnd> {
         Ok(SnapshotEnd { snapshot_end_ts: 0 })
     }
 }
@@ -76,18 +76,18 @@ struct MockStreamHandle {
 
 #[async_trait]
 impl StreamHandle for MockStreamHandle {
-    async fn next_events(&mut self, _timeout_ms: u64) -> cdc_rs::Result<Vec<Event>> {
+    async fn next_events(&mut self, _timeout_ms: u64) -> rustcdc::Result<Vec<Event>> {
         Ok(self.batches.pop_front().unwrap_or_default())
     }
 
     async fn save_position(
         &self,
-        _checkpoint: &mut dyn cdc_rs::checkpoint::Checkpoint,
-    ) -> cdc_rs::Result<()> {
+        _checkpoint: &mut dyn rustcdc::checkpoint::Checkpoint,
+    ) -> rustcdc::Result<()> {
         Ok(())
     }
 
-    async fn confirm_lsn(&mut self, _lsn: u64) -> cdc_rs::Result<()> {
+    async fn confirm_lsn(&mut self, _lsn: u64) -> rustcdc::Result<()> {
         Ok(())
     }
 }
@@ -101,14 +101,14 @@ impl Source for MockSource {
     async fn start_snapshot(
         &mut self,
         _tables: &[&str],
-    ) -> cdc_rs::Result<Box<dyn SnapshotHandle>> {
+    ) -> rustcdc::Result<Box<dyn SnapshotHandle>> {
         Ok(Box::new(NoopSnapshotHandle))
     }
 
     async fn start_stream(
         &mut self,
         _resume_from: Option<&dyn Offset>,
-    ) -> cdc_rs::Result<Box<dyn StreamHandle>> {
+    ) -> rustcdc::Result<Box<dyn StreamHandle>> {
         Ok(Box::new(MockStreamHandle {
             batches: self.stream_batches.clone(),
         }))
@@ -118,7 +118,7 @@ impl Source for MockSource {
         &mut self,
         _snapshot: &mut dyn SnapshotHandle,
         _stream: &mut dyn StreamHandle,
-    ) -> cdc_rs::Result<HandoffResult> {
+    ) -> rustcdc::Result<HandoffResult> {
         Ok(HandoffResult {
             snapshot_end_ts: Some(0),
             stream_start_ts: Some(0),
@@ -153,7 +153,7 @@ fn build_source(total_events: u64, batch_size: usize) -> MockSource {
 }
 
 #[tokio::test]
-async fn data_loss_detection_with_fault_injected_stream_100k() -> cdc_rs::Result<()> {
+async fn data_loss_detection_with_fault_injected_stream_100k() -> rustcdc::Result<()> {
     let total = 100_000_u64;
     let source = build_source(total, 1000);
     let mut faulted = FaultInjectingSource::new(source);
@@ -184,7 +184,7 @@ async fn data_loss_detection_with_fault_injected_stream_100k() -> cdc_rs::Result
 }
 
 #[tokio::test]
-async fn data_loss_detection_catches_corruption_fault() -> cdc_rs::Result<()> {
+async fn data_loss_detection_catches_corruption_fault() -> rustcdc::Result<()> {
     let source = build_source(10_000, 500);
     let mut faulted = FaultInjectingSource::new(source);
     faulted.inject(SourceFault::CorruptionFault(100), 0);
@@ -205,11 +205,11 @@ async fn data_loss_detection_catches_corruption_fault() -> cdc_rs::Result<()> {
 }
 
 #[tokio::test]
-async fn data_loss_matrix_short_10k_connection_fault_is_observable() -> cdc_rs::Result<()> {
+async fn data_loss_matrix_short_10k_connection_fault_is_observable() -> rustcdc::Result<()> {
     let source = build_source(10_000, 500);
     let mut faulted = FaultInjectingSource::new(source);
     faulted.inject(
-        SourceFault::ConnectionFault(cdc_rs::Error::SourceError(
+        SourceFault::ConnectionFault(rustcdc::Error::SourceError(
             "simulated connection drop".into(),
         )),
         2_500,
@@ -227,13 +227,13 @@ async fn data_loss_matrix_short_10k_connection_fault_is_observable() -> cdc_rs::
         }
     }
 
-    Err(cdc_rs::Error::SourceError(
+    Err(rustcdc::Error::SourceError(
         "expected connection fault was not triggered".into(),
     ))
 }
 
 #[tokio::test]
-async fn data_loss_matrix_short_10k_timeout_fault_is_observable() -> cdc_rs::Result<()> {
+async fn data_loss_matrix_short_10k_timeout_fault_is_observable() -> rustcdc::Result<()> {
     let source = build_source(10_000, 500);
     let mut faulted = FaultInjectingSource::new(source);
     faulted.inject(
@@ -253,7 +253,7 @@ async fn data_loss_matrix_short_10k_timeout_fault_is_observable() -> cdc_rs::Res
         }
     }
 
-    Err(cdc_rs::Error::TimeoutError(
+    Err(rustcdc::Error::TimeoutError(
         "expected timeout fault was not triggered".into(),
     ))
 }

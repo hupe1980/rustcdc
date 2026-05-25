@@ -1,6 +1,6 @@
 #![cfg(feature = "postgres")]
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint},
     source::Source,
     PostgresConnection, PostgresSourceConfig,
@@ -15,7 +15,7 @@ use tokio::time::{sleep, Duration};
 /// Test large-table snapshot chunking (100K rows → 10K chunks)
 /// Validates: chunking behavior, checkpoint persistence, and resumable snapshot handling
 #[tokio::test]
-async fn postgres_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
+async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres snapshot integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -40,23 +40,23 @@ async fn postgres_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -76,7 +76,7 @@ async fn postgres_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Insert 100K rows
     for batch_start in (1..=100_000).step_by(1000) {
@@ -92,14 +92,14 @@ async fn postgres_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
         admin_client
             .batch_execute(&sql)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Verify insert count
     let count: i64 = admin_client
         .query_one("SELECT COUNT(*) FROM public.large_snapshot_test", &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .get(0);
     assert_eq!(count, 100_000, "expected 100K rows inserted");
 
@@ -139,7 +139,7 @@ async fn postgres_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
 
         // Validate chunk: all events have expected structure
         for event in &events {
-            assert_eq!(event.op, cdc_rs::Operation::Read);
+            assert_eq!(event.op, rustcdc::Operation::Read);
             assert!(
                 event.after.is_some(),
                 "snapshot events must have after field"
@@ -207,7 +207,7 @@ async fn postgres_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
 /// Test snapshot checkpoint persistence during long-running snapshot
 /// Validates: checkpoint save mid-snapshot and deterministic resume without duplicates
 #[tokio::test]
-async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> cdc_rs::Result<()> {
+async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres snapshot resumption test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -232,23 +232,23 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> c
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -267,7 +267,7 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> c
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Insert 50K rows
     for id in 1..=50_000 {
@@ -279,7 +279,7 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> c
                 &[&id_i64, &value],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let source_cfg = PostgresSourceConfig {
@@ -313,12 +313,12 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> c
         total_first_read += events.len();
         for event in events {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("snapshot row missing after payload".into())
             })?;
             let id = after
                 .get("id")
                 .and_then(|value| value.as_i64())
-                .ok_or_else(|| cdc_rs::Error::SourceError("snapshot row missing id".into()))?;
+                .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
             assert!(seen_ids.insert(id), "duplicate id in first phase: {id}");
         }
     }
@@ -329,14 +329,14 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> c
     );
 
     // Save checkpoint (this should capture the cursor position)
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut checkpoint = FileCheckpoint::new(checkpoint_dir.path());
     snapshot_handle
         .checkpoint(&mut checkpoint, total_first_read as u64)
         .await?;
 
     let saved_offset = checkpoint.load().await?.ok_or_else(|| {
-        cdc_rs::Error::CheckpointError("expected saved snapshot checkpoint".into())
+        rustcdc::Error::CheckpointError("expected saved snapshot checkpoint".into())
     })?;
     assert_eq!(saved_offset.source_type(), "postgres_snapshot");
 
@@ -366,13 +366,13 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> c
         resumed_count += events.len();
         for event in events {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("resumed snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("resumed snapshot row missing after payload".into())
             })?;
             let id = after
                 .get("id")
                 .and_then(|value| value.as_i64())
                 .ok_or_else(|| {
-                    cdc_rs::Error::SourceError("resumed snapshot row missing id".into())
+                    rustcdc::Error::SourceError("resumed snapshot row missing id".into())
                 })?;
             assert!(
                 resumed_ids.insert(id),
@@ -420,7 +420,7 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> c
 /// Validates: no duplicate replay of already checkpointed rows and deterministic
 /// convergence for the resumed window under insert/delete churn.
 #[tokio::test]
-async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::Result<()> {
+async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres snapshot mutation-window resume test (set CDC_RS_RUN_DOCKER_TESTS=1)"
@@ -447,23 +447,23 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -482,7 +482,7 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     for id in 1..=20_000_i64 {
         let value = format!("seed-{id}");
@@ -492,7 +492,7 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
                 &[&id, &value],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let source_cfg = PostgresSourceConfig {
@@ -523,25 +523,25 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
         }
         for event in events {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("snapshot row missing after payload".into())
             })?;
             let id = after
                 .get("id")
                 .and_then(|value| value.as_i64())
-                .ok_or_else(|| cdc_rs::Error::SourceError("snapshot row missing id".into()))?;
+                .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
             assert!(phase1_ids.insert(id), "duplicate id in phase1: {id}");
         }
     }
 
     assert_eq!(phase1_ids.len(), 4_000, "expected 4K rows in phase1");
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut checkpoint = FileCheckpoint::new(checkpoint_dir.path());
     snapshot_handle
         .checkpoint(&mut checkpoint, phase1_ids.len() as u64)
         .await?;
     let saved_offset = checkpoint.load().await?.ok_or_else(|| {
-        cdc_rs::Error::CheckpointError("expected saved snapshot checkpoint".into())
+        rustcdc::Error::CheckpointError("expected saved snapshot checkpoint".into())
     })?;
 
     // Mutate data after checkpoint but before resume: remove a deterministic
@@ -552,7 +552,7 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
             &[],
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     admin_client
         .execute(
@@ -564,7 +564,7 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
             &[],
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     drop(snapshot_handle);
     connection.close().await;
@@ -587,13 +587,13 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
 
         for event in events {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("resumed snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("resumed snapshot row missing after payload".into())
             })?;
             let id = after
                 .get("id")
                 .and_then(|value| value.as_i64())
                 .ok_or_else(|| {
-                    cdc_rs::Error::SourceError("resumed snapshot row missing id".into())
+                    rustcdc::Error::SourceError("resumed snapshot row missing id".into())
                 })?;
             assert!(
                 resumed_ids.insert(id),
@@ -647,7 +647,7 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> cdc_rs::
 /// Validates: table A completion + partial table B checkpoint and duplicate-free
 /// resume semantics across both tables.
 #[tokio::test]
-async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::Result<()> {
+async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres table-boundary snapshot resumption test (set CDC_RS_RUN_DOCKER_TESTS=1)"
@@ -674,23 +674,23 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -715,7 +715,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     for id in 1..=10_000_i64 {
         let value = format!("a-{id}");
@@ -725,7 +725,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
                 &[&id, &value],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     for id in 1..=10_000_i64 {
@@ -736,7 +736,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
                 &[&id, &value],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let source_cfg = PostgresSourceConfig {
@@ -767,19 +767,19 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
     while phase1_a < 10_000 || phase1_b < 3_000 {
         let events = snapshot_handle.next_chunk(500).await?;
         if events.is_empty() {
-            return Err(cdc_rs::Error::SourceError(
+            return Err(rustcdc::Error::SourceError(
                 "unexpected empty chunk before reaching boundary checkpoint target".into(),
             ));
         }
 
         for event in events {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("snapshot row missing after payload".into())
             })?;
             let id = after
                 .get("id")
                 .and_then(|value| value.as_i64())
-                .ok_or_else(|| cdc_rs::Error::SourceError("snapshot row missing id".into()))?;
+                .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
 
             let table_name = event.table.as_str();
             let key = format!("{table_name}:{id}");
@@ -790,7 +790,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
             } else if table_name == "resume_boundary_b" {
                 phase1_b += 1;
             } else {
-                return Err(cdc_rs::Error::SourceError(format!(
+                return Err(rustcdc::Error::SourceError(format!(
                     "unexpected snapshot table '{table_name}'"
                 )));
             }
@@ -806,14 +806,14 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
         "table B should be partially consumed in phase1"
     );
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut checkpoint = FileCheckpoint::new(checkpoint_dir.path());
     snapshot_handle
         .checkpoint(&mut checkpoint, phase1_keys.len() as u64)
         .await?;
 
     let saved_offset = checkpoint.load().await?.ok_or_else(|| {
-        cdc_rs::Error::CheckpointError("expected saved snapshot checkpoint".into())
+        rustcdc::Error::CheckpointError("expected saved snapshot checkpoint".into())
     })?;
     assert_eq!(saved_offset.source_type(), "postgres_snapshot");
 
@@ -841,13 +841,13 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
 
         for event in events {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("resumed snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("resumed snapshot row missing after payload".into())
             })?;
             let id = after
                 .get("id")
                 .and_then(|value| value.as_i64())
                 .ok_or_else(|| {
-                    cdc_rs::Error::SourceError("resumed snapshot row missing id".into())
+                    rustcdc::Error::SourceError("resumed snapshot row missing id".into())
                 })?;
             let table_name = event.table.as_str();
             let key = format!("{table_name}:{id}");
@@ -858,7 +858,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
             } else if table_name == "resume_boundary_b" {
                 resumed_b += 1;
             } else {
-                return Err(cdc_rs::Error::SourceError(format!(
+                return Err(rustcdc::Error::SourceError(format!(
                     "unexpected resumed snapshot table '{table_name}'"
                 )));
             }
@@ -906,7 +906,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> cdc_rs::
 
 /// Test empty table snapshot
 #[tokio::test]
-async fn postgres_snapshot_empty_table() -> cdc_rs::Result<()> {
+async fn postgres_snapshot_empty_table() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres empty snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -931,23 +931,23 @@ async fn postgres_snapshot_empty_table() -> cdc_rs::Result<()> {
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -965,7 +965,7 @@ async fn postgres_snapshot_empty_table() -> cdc_rs::Result<()> {
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let source_cfg = PostgresSourceConfig {
         host: host.to_string(),
@@ -1009,7 +1009,7 @@ async fn postgres_snapshot_empty_table() -> cdc_rs::Result<()> {
 /// Validates: no baseline PK gaps and bounded duplicate window while concurrent
 /// inserts are applied during snapshot reads.
 #[tokio::test]
-async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Result<()> {
+async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres concurrent snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -1034,23 +1034,23 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Re
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -1069,7 +1069,7 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Re
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let baseline_rows: i64 = 20_000;
     for batch_start in (1..=baseline_rows).step_by(1000) {
@@ -1085,7 +1085,7 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Re
         admin_client
             .batch_execute(&sql)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let source_cfg = PostgresSourceConfig {
@@ -1107,7 +1107,7 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Re
         let (writer_client, writer_conn) =
             tokio_postgres::connect(&writer_dsn, tokio_postgres::NoTls)
                 .await
-                .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+                .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
         tokio::spawn(async move {
             let _ = writer_conn.await;
         });
@@ -1125,14 +1125,14 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Re
                     &[&base, &(base + 24_i64)],
                 )
                 .await
-                .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+                .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
             if round % 8_i64 == 0 {
                 sleep(Duration::from_millis(5)).await;
             }
         }
 
-        Ok::<(), cdc_rs::Error>(())
+        Ok::<(), rustcdc::Error>(())
     });
 
     let mut connection = PostgresConnection::new(source_cfg);
@@ -1154,12 +1154,12 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Re
         total_events += events.len();
         for event in events {
             let after = event.after.ok_or_else(|| {
-                cdc_rs::Error::SourceError("snapshot row missing after payload".into())
+                rustcdc::Error::SourceError("snapshot row missing after payload".into())
             })?;
             let id = after
                 .get("id")
                 .and_then(|value| value.as_i64())
-                .ok_or_else(|| cdc_rs::Error::SourceError("snapshot row missing id".into()))?;
+                .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
 
             if id <= baseline_rows && !seen_baseline.insert(id) {
                 baseline_duplicates = baseline_duplicates.saturating_add(1);
@@ -1172,7 +1172,7 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> cdc_rs::Re
 
     let writer_result = writer
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     writer_result?;
 
     let mut missing = Vec::new();

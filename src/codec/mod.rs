@@ -14,8 +14,8 @@
 //! # Usage
 //!
 //! ```rust
-//! use cdc_rs::codec::{EventEncoder, JsonEncoder};
-//! use cdc_rs::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+//! use rustcdc::codec::{EventEncoder, JsonEncoder};
+//! use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 //!
 //! let event = Event {
 //!     before: None,
@@ -87,8 +87,8 @@ impl EncodedOutput {
 /// # Implementing a custom encoder
 ///
 /// ```rust
-/// use cdc_rs::codec::{EncodedOutput, EventEncoder};
-/// use cdc_rs::core::{Event, Result};
+/// use rustcdc::codec::{EncodedOutput, EventEncoder};
+/// use rustcdc::core::{Event, Result};
 ///
 /// struct MyEncoder;
 ///

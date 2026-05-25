@@ -1,7 +1,7 @@
-# cdc-rs Troubleshooting Guide
+# rustcdc Troubleshooting Guide
 
 **Version:** v0.1+  
-**Audience:** Operators and developers debugging cdc-rs issues
+**Audience:** Operators and developers debugging rustcdc issues
 
 ---
 
@@ -99,7 +99,7 @@ ERROR source error: connection to sqlserver closed unexpectedly
 
 | Root Cause | Action |
 |------------|--------|
-| Network blocked | Whitelist cdc-rs server IP on database firewall |
+| Network blocked | Whitelist rustcdc server IP on database firewall |
 | Database not running | Restart database service |
 | Invalid credentials | Verify in config file; check for special characters |
 | Missing REPLICATION role (PG) | Run: `ALTER ROLE cdc_user WITH REPLICATION;` |
@@ -161,19 +161,19 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
 
 1. **Verify checkpoint file exists and is readable:**
    ```bash
-   ls -lh /var/cdc-rs/checkpoint_*.json
+   ls -lh /var/rustcdc/checkpoint_*.json
    ```
    ✅ Should list checkpoint files; ❌ if not, check directory permissions
 
 2. **Verify checkpoint is valid JSON:**
    ```bash
-   cat /var/cdc-rs/checkpoint_postgres.json | jq .
+   cat /var/rustcdc/checkpoint_postgres.json | jq .
    # Should pretty-print JSON; ❌ if error, checkpoint is corrupted
    ```
 
 3. **For PostgreSQL: verify replication slot exists:**
    ```sql
-   SELECT slot_name, active, restart_lsn FROM pg_replication_slots WHERE slot_name = 'cdc_rs_postgres_*';
+   SELECT slot_name, active, restart_lsn FROM pg_replication_slots WHERE slot_name = 'rustcdc_postgres_*';
    -- Should return: slot_name | t | <LSN>
    ```
    ✅ Slot exists and active; ❌ if not, may have been dropped manually
@@ -181,7 +181,7 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
 4. **For PostgreSQL: check LSN divergence:**
    ```sql
    -- Get checkpoint LSN from checkpoint file
-   cat /var/cdc-rs/checkpoint_postgres.json | jq '.offset.lsn'
+   cat /var/rustcdc/checkpoint_postgres.json | jq '.offset.lsn'
    -- Should output: 281474976711680 (example)
    
    -- Get current WAL position
@@ -189,17 +189,17 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
    -- Should return: 0/11000000 (example)
    
    -- Calculate gap
-   -- If checkpoint LSN differs from the slot's confirmed_flush_lsn, cdc-rs now fails closed
+   -- If checkpoint LSN differs from the slot's confirmed_flush_lsn, rustcdc now fails closed
    ```
 
 **Resolution:**
 
 | Root Cause | Action |
 |------------|--------|
-| Checkpoint corrupted | Stop cdc-rs; delete checkpoint file; restart (will scan from current position) |
-| Replication slot dropped | Stop cdc-rs; recreate checkpoint with current LSN; restart |
+| Checkpoint corrupted | Stop rustcdc; delete checkpoint file; restart (will scan from current position) |
+| Replication slot dropped | Stop rustcdc; recreate checkpoint with current LSN; restart |
 | WAL/binlog purged | See [Replication Slot Divergence Recovery](runbook.md#replication-slot-divergence-recovery) |
-| Checkpoint permissions | Verify `/var/cdc-rs/` is writable by cdc-rs process owner |
+| Checkpoint permissions | Verify `/var/rustcdc/` is writable by rustcdc process owner |
 
 ---
 
@@ -216,7 +216,7 @@ WARNING checkpoint latency exceeding 1s
 1. **Check buffer utilization:**
    ```bash
    # From logs
-   grep "buffer_size" /var/log/cdc-rs/structured.log | tail -20
+   grep "buffer_size" /var/log/rustcdc/structured.log | tail -20
    
    # From runtime admin metrics
    curl http://localhost:9090/metrics | grep "cdc_runtime_buffer_depth"
@@ -256,7 +256,7 @@ WARNING checkpoint latency exceeding 1s
 
 **Expected behavior — not a bug:**
 
-SQL Server CDC is **polling-based**.  cdc-rs calls `cdc.fn_cdc_get_all_changes_*`
+SQL Server CDC is **polling-based**.  rustcdc calls `cdc.fn_cdc_get_all_changes_*`
 at a configurable interval (`stream_poll_interval_ms`, default 5 000 ms).  Unlike
 PostgreSQL logical replication (push-based, near-zero propagation), SQL Server
 events are only visible after the next poll cycle **and** after the SQL Server CDC
@@ -323,18 +323,18 @@ WARNING snapshot progress stalled (no new chunks for 30s)
    # Should show avg < 10ms; if > 50ms, network may be congested
    ```
 
-4. **Check cdc-rs resource utilization:**
+4. **Check rustcdc resource utilization:**
    ```bash
    # CPU
-   top -p <cdc_rs_pid> | grep CPU
+   top -p <rustcdc_pid> | grep CPU
    # Should be 25-75% for 1 core; > 90% indicates bottleneck
    
    # Memory
-   ps aux | grep cdc-rs | grep -v grep | awk '{print $6}'
+   ps aux | grep rustcdc | grep -v grep | awk '{print $6}'
    # Should grow to ~300-500 MB, then stabilize
    
    # File descriptors
-   lsof -p <cdc_rs_pid> | wc -l
+   lsof -p <rustcdc_pid> | wc -l
    # Should be < 100 per source
    ```
 
@@ -349,10 +349,10 @@ WARNING snapshot progress stalled (no new chunks for 30s)
 
 | Root Cause | Action |
 |------------|--------|
-| Source DB overloaded | Reduce cdc-rs poll frequency; scale source DB; check for long-running queries |
+| Source DB overloaded | Reduce rustcdc poll frequency; scale source DB; check for long-running queries |
 | Network congested | Verify network MTU (1500 default); check for packet loss (ping -c 100) |
-| cdc-rs CPU maxed | Increase max_poll_wait_ms (batches more events per poll); reduce transform complexity |
-| cdc-rs memory growing | Check for transform memory leaks; verify checkpoint is committing (check committed_count) |
+| rustcdc CPU maxed | Increase max_poll_wait_ms (batches more events per poll); reduce transform complexity |
+| rustcdc memory growing | Check for transform memory leaks; verify checkpoint is committing (check committed_count) |
 | Transform pipeline slow | Profile individual transforms; consider removing non-critical transforms |
 
 ---
@@ -369,7 +369,7 @@ WARNING snapshot progress: 5% complete (10 hours in, estimated 200 hours remaini
 1. **Check snapshot progress:**
    ```bash
    # From logs
-   grep "snapshot_chunk_received\|snapshot_complete" /var/log/cdc-rs/structured.log | tail -20
+   grep "snapshot_chunk_received\|snapshot_complete" /var/log/rustcdc/structured.log | tail -20
    ```
 
 2. **Check source table sizes:**
@@ -402,8 +402,8 @@ WARNING snapshot progress: 5% complete (10 hours in, estimated 200 hours remaini
 |------------|--------|
 | Table too large to snapshot | 1. Reduce `snapshot_tables` list; 2. Increase `snapshot_chunk_size` (e.g., 10K → 50K); 3. Add index on clustering key |
 | Source DB query slow | Add index on clustering/primary key; schedule snapshot during low-activity window |
-| Network bandwidth limited | Verify network bandwidth (iperf); consider moving cdc-rs to same datacenter |
-| cdc-rs CPU bottleneck | Scale to additional cdc-rs instances; profile hot path in transform pipeline |
+| Network bandwidth limited | Verify network bandwidth (iperf); consider moving rustcdc to same datacenter |
+| rustcdc CPU bottleneck | Scale to additional rustcdc instances; profile hot path in transform pipeline |
 
 ---
 
@@ -429,7 +429,7 @@ ERROR detected missing event (event_id=12346 skipped)
 2. **Check for buffered events during shutdown:**
    ```bash
    # From logs
-   grep "drain_pending\|final_checkpoint" /var/log/cdc-rs/structured.log
+   grep "drain_pending\|final_checkpoint" /var/log/rustcdc/structured.log
    # Should show events flushed before shutdown
    ```
 
@@ -483,16 +483,16 @@ ERROR schema error: table schema not found for public.users
 2. **Check event envelope validation:**
    ```bash
    # Enable debug logging
-   export RUST_LOG=cdc_rs::core::event=debug
+   export RUST_LOG=rustcdc::core::event=debug
    
    # Check for validation errors
-   grep "validation error\|ValidationError" /var/log/cdc-rs/structured.log
+   grep "validation error\|ValidationError" /var/log/rustcdc/structured.log
    ```
 
 3. **Verify transform rules are correct:**
    ```bash
    # Review transform configuration
-   grep -A 10 "transform" /etc/cdc-rs/config.toml
+   grep -A 10 "transform" /etc/rustcdc/config.toml
    # Verify mask/filter rules apply to correct tables/columns
    ```
 
@@ -500,7 +500,7 @@ ERROR schema error: table schema not found for public.users
 
 | Root Cause | Action |
 |------------|--------|
-| Source schema changed (DDL) | 1. Update cdc-rs snapshot_tables list; 2. Manually trigger schema refresh in SchemaHistory |
+| Source schema changed (DDL) | 1. Update rustcdc snapshot_tables list; 2. Manually trigger schema refresh in SchemaHistory |
 | Transform filter too broad | Review transform rules; test in development first |
 | Event validation rule violated | Check docs/api.md and src/core/event.rs validation contract; verify source is generating events correctly |
 
@@ -521,14 +521,14 @@ WARNING events filtered by transform (count=50)
 
 1. **Enable debug logging for transforms:**
    ```bash
-   export RUST_LOG=cdc_rs::transform=debug
+   export RUST_LOG=rustcdc::transform=debug
    # See: transform_applied, transform_failed, events_filtered
    ```
 
 2. **Verify transform configuration:**
    ```bash
    # Review config file for each transform
-   grep -A 10 "transform\|route\|filter\|mask" /etc/cdc-rs/config.toml
+   grep -A 10 "transform\|route\|filter\|mask" /etc/rustcdc/config.toml
    
    # Common issues:
    # - Route table name doesn't match source
@@ -562,10 +562,10 @@ WARNING events filtered by transform (count=50)
 curl http://localhost:9090/metrics | grep -E "cdc_runtime_events_polled_total|cdc_runtime_events_committed_total" | head -5
 
 # 2. Recent errors
-journalctl -u cdc-rs -f | grep -i "error\|warn"
+journalctl -u rustcdc -f | grep -i "error\|warn"
 
 # 3. Checkpoint status
-cat /var/cdc-rs/checkpoint_postgres.json | jq .
+cat /var/rustcdc/checkpoint_postgres.json | jq .
 
 # 4. Source connectivity test
 psql "postgresql://user:pass@host/db" -c "SELECT 1;"
@@ -578,8 +578,8 @@ telnet <source_host> <port>
 iperf -c <source_host>  # Bandwidth test
 
 # 6. System resource check
-top -p $(pgrep -f cdc-rs)
-ps aux | grep cdc-rs | awk '{print $2, $3, $4, $6}'
+top -p $(pgrep -f rustcdc)
+ps aux | grep rustcdc | awk '{print $2, $3, $4, $6}'
 
 # 7. Detailed metrics
 curl http://otel-collector:9090/metrics | grep cdc_ | sort
@@ -592,30 +592,30 @@ curl -s http://otel-collector:4317/...  # Check exporter is responding
 
 ```bash
 # Count errors by type
-grep "ERROR\|error" /var/log/cdc-rs/structured.log | cut -d: -f2- | sort | uniq -c | sort -rn
+grep "ERROR\|error" /var/log/rustcdc/structured.log | cut -d: -f2- | sort | uniq -c | sort -rn
 
 # Find slow operations
-grep "duration\|latency" /var/log/cdc-rs/structured.log | sort -k3 -rn | head -20
+grep "duration\|latency" /var/log/rustcdc/structured.log | sort -k3 -rn | head -20
 
 # Timeline of events
-grep "timestamp" /var/log/cdc-rs/structured.log | head -1
-grep "timestamp" /var/log/cdc-rs/structured.log | tail -1
+grep "timestamp" /var/log/rustcdc/structured.log | head -1
+grep "timestamp" /var/log/rustcdc/structured.log | tail -1
 # Calculates duration of log file
 
 # Export metrics trend
-journalctl -u cdc-rs -S "2 hours ago" | grep "cdc_" > metrics_export.log
+journalctl -u rustcdc -S "2 hours ago" | grep "cdc_" > metrics_export.log
 ```
 
 ### Interactive Debugging
 
 ```bash
-# Start cdc-rs with maximum logging
-export RUST_LOG=cdc_rs=trace
+# Start rustcdc with maximum logging
+export RUST_LOG=rustcdc=trace
 export RUST_LOG_FORMAT=json
 cargo run --release
 
 # Attach debugger (if debug build)
-rust-gdb --args ./target/debug/cdc-rs --config config.toml
+rust-gdb --args ./target/debug/rustcdc --config config.toml
 
 # Health endpoint (if embedded in app)
 curl -v http://localhost:8080/health

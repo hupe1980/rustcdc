@@ -4,7 +4,7 @@
 //!
 //! The [`SinkAdapter`] trait and built-in adapters have moved to [`crate::sink`].
 //! They are re-exported here for convenience so existing test code continues to
-//! compile with `use cdc_rs::testkit::SinkAdapter`.
+//! compile with `use rustcdc::testkit::SinkAdapter`.
 //!
 //! # File-based fixtures
 //!

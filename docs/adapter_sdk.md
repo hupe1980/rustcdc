@@ -22,7 +22,7 @@ Behavioral expectations:
 2. Implement `SinkAdapter` on that type.
 3. Ensure idempotent `close` behavior.
 4. Redact credentials from logs and debug output.
-5. Surface recoverable versus unrecoverable errors using `cdc_rs::Error` variants.
+5. Surface recoverable versus unrecoverable errors using `rustcdc::Error` variants.
 
 Recommended pattern:
 - `send`: enqueue and optionally batch.
@@ -47,11 +47,11 @@ Minimum validation loop:
 Quick smoke harness:
 
 ```rust
-use cdc_rs::testkit::{AdapterConformanceSuite, AdapterGoldenFixture, MemorySinkAdapter};
-use cdc_rs::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use rustcdc::testkit::{AdapterConformanceSuite, AdapterGoldenFixture, MemorySinkAdapter};
+use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 use serde_json::json;
 
-async fn validate_adapter() -> cdc_rs::Result<()> {
+async fn validate_adapter() -> rustcdc::Result<()> {
 	let fixture = AdapterGoldenFixture::single_event(Event {
 		before: None,
 		after: Some(json!({"id": 1})),

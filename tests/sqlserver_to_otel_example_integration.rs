@@ -15,18 +15,18 @@ mod sqlserver_testkit;
 async fn sql_exec(
     client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     sql: &str,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     client
         .execute(sql, &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     Ok(())
 }
 
 async fn sql_exec_with_retry(
     client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     sql: &str,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     const MAX_ATTEMPTS: usize = 8;
 
     for attempt in 1..=MAX_ATTEMPTS {
@@ -45,13 +45,13 @@ async fn sql_exec_with_retry(
         }
     }
 
-    Err(cdc_rs::Error::StateError(
+    Err(rustcdc::Error::StateError(
         "sql_exec_with_retry exhausted attempts unexpectedly".to_string(),
     ))
 }
 
 #[tokio::test]
-async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::Result<()> {
+async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver_to_otel example integration test") {
         return Ok(());
     }
@@ -62,21 +62,21 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
         .with_env_var("COLLECTOR_OTLP_ENABLED", "true")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let jaeger_host = jaeger
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .to_string();
     let jaeger_otlp_port = jaeger
         .get_host_port_ipv4(4317.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let jaeger_ui_port = jaeger
         .get_host_port_ipv4(16686.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let sqlserver = sqlserver_testkit::start_sqlserver_container("2019-latest").await?;
     let (sql_host, sql_port) = sqlserver_testkit::host_and_port(&sqlserver).await?;
@@ -91,29 +91,29 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
 
     sql_exec(
         &mut admin,
-        "IF DB_ID('cdc_rs_example') IS NULL CREATE DATABASE cdc_rs_example",
+        "IF DB_ID('rustcdc_example') IS NULL CREATE DATABASE rustcdc_example",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_example; IF OBJECT_ID('dbo.orders', 'U') IS NULL CREATE TABLE dbo.orders (id INT NOT NULL PRIMARY KEY, amount INT NOT NULL)",
+        "USE rustcdc_example; IF OBJECT_ID('dbo.orders', 'U') IS NULL CREATE TABLE dbo.orders (id INT NOT NULL PRIMARY KEY, amount INT NOT NULL)",
     )
     .await?;
-    sql_exec(&mut admin, "USE cdc_rs_example; DELETE FROM dbo.orders").await?;
+    sql_exec(&mut admin, "USE rustcdc_example; DELETE FROM dbo.orders").await?;
     sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_example; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
+        "USE rustcdc_example; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
     sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_example; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.orders')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='orders', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_example; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.orders')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='orders', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
 
     sql_exec(
         &mut admin,
-        "USE cdc_rs_example; INSERT INTO dbo.orders (id, amount) VALUES (1,100), (2,200), (3,300), (4,400), (5,500)",
+        "USE rustcdc_example; INSERT INTO dbo.orders (id, amount) VALUES (1,100), (2,200), (3,300), (4,400), (5,500)",
     )
     .await?;
 
@@ -127,14 +127,14 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
-        .map_err(|error| cdc_rs::Error::SourceError(format!("failed to build example: {error}")))?;
+        .map_err(|error| rustcdc::Error::SourceError(format!("failed to build example: {error}")))?;
     if !status.success() {
-        return Err(cdc_rs::Error::SourceError(
+        return Err(rustcdc::Error::SourceError(
             "example build failed".to_string(),
         ));
     }
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let service_name = format!("sqlserver-to-otel-example-{}", std::process::id());
     let binary = format!(
         "{}/target/debug/examples/sqlserver_to_otel",
@@ -149,7 +149,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
             "CDC_RS_SQLSERVER_PASSWORD",
             sqlserver_testkit::SQLSERVER_SA_PASSWORD,
         )
-        .env("CDC_RS_SQLSERVER_DB", "cdc_rs_example")
+        .env("CDC_RS_SQLSERVER_DB", "rustcdc_example")
         .env("CDC_RS_SNAPSHOT_TABLES", "dbo.orders")
         .env("CDC_RS_CHECKPOINT_DIR", checkpoint_dir.path())
         .env("CDC_RS_MAX_EVENTS", "5")
@@ -165,25 +165,25 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| cdc_rs::Error::SourceError(format!("failed to run example: {error}")))?;
+        .map_err(|error| rustcdc::Error::SourceError(format!("failed to run example: {error}")))?;
 
     let output = tokio::time::timeout(Duration::from_secs(25), async move {
         tokio::task::spawn_blocking(move || child.wait_with_output()).await
     })
     .await
-    .map_err(|_| cdc_rs::Error::TimeoutError("example timed out".to_string()))
+    .map_err(|_| rustcdc::Error::TimeoutError("example timed out".to_string()))
     .and_then(|join_result| {
         join_result
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
             .and_then(|wait_result| {
                 wait_result
-                    .map_err(|error: io::Error| cdc_rs::Error::SourceError(error.to_string()))
+                    .map_err(|error: io::Error| rustcdc::Error::SourceError(error.to_string()))
             })
     })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(cdc_rs::Error::SourceError(format!(
+        return Err(rustcdc::Error::SourceError(format!(
             "example exited with status {:?}: {}",
             output.status.code(),
             stderr
@@ -203,7 +203,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
         }
 
         let parsed: Value = serde_json::from_str(trimmed).map_err(|error| {
-            cdc_rs::Error::SerializationError(format!(
+            rustcdc::Error::SerializationError(format!(
                 "example stdout line is not valid JSON: {error}"
             ))
         })?;
@@ -246,7 +246,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let mut saw_traces = false;
     for _ in 0..12 {
@@ -256,7 +256,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
             ))
             .send()
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
         if !response.status().is_success() {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -266,7 +266,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> cdc_rs::R
         let payload: Value = response
             .json()
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
         let has_data = payload
             .get("data")

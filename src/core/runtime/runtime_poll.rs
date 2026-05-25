@@ -87,7 +87,7 @@ where
                                 break Err(error);
                             }
                             tracing::warn!(
-                                target: "cdc_rs::core::runtime",
+                                target: "rustcdc::core::runtime",
                                 attempt = attempt + 1,
                                 delay_ms,
                                 error = %error,
@@ -158,7 +158,7 @@ where
                     TransformErrorPolicy::Skip => {
                         self.record_runtime_error("runtime.transform.skip", &error);
                         tracing::warn!(
-                            target: "cdc_rs::core::runtime",
+                            target: "rustcdc::core::runtime",
                             table = %table,
                             offset = %offset,
                             error = %error,

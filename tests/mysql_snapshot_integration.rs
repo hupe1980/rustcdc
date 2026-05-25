@@ -1,6 +1,6 @@
 #![cfg(feature = "mysql")]
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint},
     source::Source,
     MysqlConnection, MysqlSourceConfig, TransportConfig,
@@ -21,7 +21,7 @@ fn mysql_snapshot_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
+async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -37,7 +37,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
         }
     }
 
-    Err(cdc_rs::Error::SourceError(format!(
+    Err(rustcdc::Error::SourceError(format!(
         "failed to connect mysql admin pool: {}",
         last_error
             .map(|error| error.to_string())
@@ -45,10 +45,10 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
     )))
 }
 
-fn extract_mysql_row_id(row: &serde_json::Value) -> cdc_rs::Result<u64> {
+fn extract_mysql_row_id(row: &serde_json::Value) -> rustcdc::Result<u64> {
     let id_value = row
         .get("id")
-        .ok_or_else(|| cdc_rs::Error::SourceError("snapshot row missing id".into()))?;
+        .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
 
     if let Some(id) = id_value.as_u64() {
         return Ok(id);
@@ -56,17 +56,17 @@ fn extract_mysql_row_id(row: &serde_json::Value) -> cdc_rs::Result<u64> {
 
     if let Some(id) = id_value.as_i64() {
         return u64::try_from(id).map_err(|_| {
-            cdc_rs::Error::SourceError("snapshot row id must be non-negative".into())
+            rustcdc::Error::SourceError("snapshot row id must be non-negative".into())
         });
     }
 
     if let Some(id_text) = id_value.as_str() {
         return id_text.parse::<u64>().map_err(|_| {
-            cdc_rs::Error::SourceError("snapshot row id string is not numeric".into())
+            rustcdc::Error::SourceError("snapshot row id string is not numeric".into())
         });
     }
 
-    Err(cdc_rs::Error::SourceError(
+    Err(rustcdc::Error::SourceError(
         "snapshot row id has unsupported JSON type".into(),
     ))
 }
@@ -74,7 +74,7 @@ fn extract_mysql_row_id(row: &serde_json::Value) -> cdc_rs::Result<u64> {
 /// Test large-table snapshot chunking (100K rows → 5K chunks)
 /// Validates: keyset pagination, resumable snapshots, no duplicates, checkpoint persistence
 #[tokio::test]
-async fn mysql_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
+async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
     let _guard = mysql_snapshot_test_lock().lock().await;
 
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
@@ -89,16 +89,16 @@ async fn mysql_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Create admin connection to set up test data
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
@@ -108,7 +108,7 @@ async fn mysql_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
     sqlx::query("DROP TABLE IF EXISTS snapshot_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE snapshot_test (
@@ -118,7 +118,7 @@ async fn mysql_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Insert 20K rows in batches.
     for batch_start in (1..=20_000).step_by(2_000) {
@@ -134,10 +134,10 @@ async fn mysql_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
         sqlx::query(&query)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let _checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let _checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let config = MysqlSourceConfig {
         host: host.to_string(),
         port,
@@ -216,7 +216,7 @@ async fn mysql_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
 
 /// Test snapshot resumption from checkpoint
 #[tokio::test]
-async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
+async fn mysql_snapshot_resumption_from_checkpoint() -> rustcdc::Result<()> {
     let _guard = mysql_snapshot_test_lock().lock().await;
 
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
@@ -231,16 +231,16 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -249,7 +249,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
     sqlx::query("DROP TABLE IF EXISTS resumption_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE resumption_test (
@@ -259,7 +259,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     for batch_start in (1..=10_000).step_by(2_000) {
         let mut query = String::from("INSERT INTO resumption_test (value) VALUES ");
@@ -274,10 +274,10 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
         sqlx::query(&query)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let config = MysqlSourceConfig {
         host: host.to_string(),
         port,
@@ -307,7 +307,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
         .checkpoint(&mut checkpoint1, first_chunk.len() as u64)
         .await?;
     let resume_offset = checkpoint1.load().await?.ok_or_else(|| {
-        cdc_rs::Error::CheckpointError("expected saved snapshot checkpoint".into())
+        rustcdc::Error::CheckpointError("expected saved snapshot checkpoint".into())
     })?;
 
     drop(snapshot_handle1);
@@ -335,7 +335,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
     let mut ids = std::collections::HashSet::new();
     for event in first_chunk.iter().chain(resumed_events.iter()) {
         let after = event.after.as_ref().ok_or_else(|| {
-            cdc_rs::Error::SourceError("snapshot row missing after payload".into())
+            rustcdc::Error::SourceError("snapshot row missing after payload".into())
         })?;
         let id = extract_mysql_row_id(after)?;
         assert!(
@@ -370,7 +370,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
 
 /// Test empty table handling
 #[tokio::test]
-async fn mysql_snapshot_empty_table() -> cdc_rs::Result<()> {
+async fn mysql_snapshot_empty_table() -> rustcdc::Result<()> {
     let _guard = mysql_snapshot_test_lock().lock().await;
 
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
@@ -385,16 +385,16 @@ async fn mysql_snapshot_empty_table() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -403,7 +403,7 @@ async fn mysql_snapshot_empty_table() -> cdc_rs::Result<()> {
     sqlx::query("DROP TABLE IF EXISTS empty_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE empty_test (
@@ -413,7 +413,7 @@ async fn mysql_snapshot_empty_table() -> cdc_rs::Result<()> {
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),

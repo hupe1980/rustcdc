@@ -116,7 +116,7 @@ where
             match self.config.options.post_commit_source_confirm_policy {
                 PostCommitSourceConfirmPolicy::Continue => {
                     tracing::warn!(
-                        target: "cdc_rs::core::runtime",
+                        target: "rustcdc::core::runtime",
                         committed_count = count,
                         "runtime ack remained successful after durable checkpoint commit despite post-commit failures: {summary}",
                     );
@@ -127,7 +127,7 @@ where
                     ));
                     self.record_runtime_error("runtime.commit.post_commit_confirm_fail_fast", &error);
                     tracing::error!(
-                        target: "cdc_rs::core::runtime",
+                        target: "rustcdc::core::runtime",
                         committed_count = count,
                         "runtime ack failed by policy after durable checkpoint commit due to post-commit failures: {summary}",
                     );

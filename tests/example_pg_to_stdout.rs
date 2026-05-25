@@ -19,7 +19,7 @@ use testcontainers::{
 };
 
 #[tokio::test]
-async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs::Result<()> {
+async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping pg_to_stdout example integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -45,16 +45,16 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs:
         ])
         .start()
         .await
-        .map_err(|e| cdc_rs::Error::SourceError(e.to_string()))?;
+        .map_err(|e| rustcdc::Error::SourceError(e.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|e| cdc_rs::Error::SourceError(e.to_string()))?;
+        .map_err(|e| rustcdc::Error::SourceError(e.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|e| cdc_rs::Error::SourceError(e.to_string()))?;
+        .map_err(|e| rustcdc::Error::SourceError(e.to_string()))?;
 
     // ── 2. Prepare schema via admin connection ──────────────────────────────
     let dsn = format!(
@@ -62,7 +62,7 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs:
     );
     let (admin, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|e| cdc_rs::Error::SourceError(e.to_string()))?;
+        .map_err(|e| rustcdc::Error::SourceError(e.to_string()))?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -78,7 +78,7 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs:
              CREATE PUBLICATION cdc_example_pub FOR TABLE public.example_items;",
         )
         .await
-        .map_err(|e| cdc_rs::Error::SourceError(e.to_string()))?;
+        .map_err(|e| rustcdc::Error::SourceError(e.to_string()))?;
 
     // ── 3. Build the example binary (should already be built by CI gate) ────
     let status = Command::new("cargo")
@@ -91,15 +91,15 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs:
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
-        .map_err(|e| cdc_rs::Error::SourceError(format!("failed to build example: {e}")))?;
+        .map_err(|e| rustcdc::Error::SourceError(format!("failed to build example: {e}")))?;
     if !status.success() {
-        return Err(cdc_rs::Error::SourceError(
+        return Err(rustcdc::Error::SourceError(
             "example build failed".to_string(),
         ));
     }
 
     // ── 4. Launch the example process ───────────────────────────────────────
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
 
     let example_bin = format!(
         "{}/target/debug/examples/pg_to_stdout",
@@ -123,7 +123,7 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs:
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| cdc_rs::Error::SourceError(format!("failed to spawn example: {e}")))?;
+        .map_err(|e| rustcdc::Error::SourceError(format!("failed to spawn example: {e}")))?;
 
     // ── 5. Insert rows after example has started ────────────────────────────
     // Give the example time to connect and begin streaming.
@@ -136,7 +136,7 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs:
                 &[&id, &format!("item-{id}")],
             )
             .await
-            .map_err(|e| cdc_rs::Error::SourceError(e.to_string()))?;
+            .map_err(|e| rustcdc::Error::SourceError(e.to_string()))?;
     }
 
     // ── 6. Allow streaming to run briefly, then terminate and collect output ─
@@ -144,7 +144,7 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> cdc_rs:
 
     let _ = child.kill();
     let output = child.wait_with_output().map_err(|e| {
-        cdc_rs::Error::SourceError(format!("failed waiting for example output: {e}"))
+        rustcdc::Error::SourceError(format!("failed waiting for example output: {e}"))
     })?;
 
     let stdout_text = String::from_utf8_lossy(&output.stdout);

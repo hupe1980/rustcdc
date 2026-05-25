@@ -6,14 +6,14 @@ use std::{
     time::Duration,
 };
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint, GenericOffset},
     core::Operation,
     schema_history::InMemorySchemaHistory,
     CdcRuntime, RuntimeConfig, RuntimeSourceConfig,
 };
 #[cfg(feature = "encryption")]
-use cdc_rs::{
+use rustcdc::{
     core::SecretString,
     transform::{MaskHashConfig, MaskHashTransform, MaskRule},
 };
@@ -25,25 +25,25 @@ use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_m
 
 type SqlClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
 
-async fn sql_exec(client: &mut SqlClient, sql: &str) -> cdc_rs::Result<()> {
+async fn sql_exec(client: &mut SqlClient, sql: &str) -> rustcdc::Result<()> {
     client
         .execute(sql, &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     Ok(())
 }
 
 async fn query_min_lsn_hex(
     client: &mut SqlClient,
     capture_instance: &str,
-) -> cdc_rs::Result<String> {
+) -> rustcdc::Result<String> {
     let rows = client
         .query("SELECT sys.fn_cdc_get_min_lsn(@P1)", &[&capture_instance])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .into_first_result()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     Ok(rows
         .into_iter()
@@ -53,13 +53,13 @@ async fn query_min_lsn_hex(
 }
 
 #[tokio::test]
-async fn runtime_sqlserver_process_kill_replays_uncommitted_batch() -> cdc_rs::Result<()> {
+async fn runtime_sqlserver_process_kill_replays_uncommitted_batch() -> rustcdc::Result<()> {
     run_sqlserver_process_kill_replay_scenario(false).await
 }
 
 #[tokio::test]
 async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver snapshot crash-resume integration test") {
         return Ok(());
     }
@@ -73,27 +73,27 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
 
     sql_exec(
         &mut admin,
-        "IF DB_ID('cdc_rs_crash_snapshot') IS NULL CREATE DATABASE cdc_rs_crash_snapshot",
+        "IF DB_ID('rustcdc_crash_snapshot') IS NULL CREATE DATABASE rustcdc_crash_snapshot",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash_snapshot; IF OBJECT_ID('dbo.runtime_crash_snapshot_users', 'U') IS NULL CREATE TABLE dbo.runtime_crash_snapshot_users (id INT NOT NULL PRIMARY KEY, payload NVARCHAR(100) NOT NULL)",
+        "USE rustcdc_crash_snapshot; IF OBJECT_ID('dbo.runtime_crash_snapshot_users', 'U') IS NULL CREATE TABLE dbo.runtime_crash_snapshot_users (id INT NOT NULL PRIMARY KEY, payload NVARCHAR(100) NOT NULL)",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash_snapshot; DELETE FROM dbo.runtime_crash_snapshot_users",
+        "USE rustcdc_crash_snapshot; DELETE FROM dbo.runtime_crash_snapshot_users",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash_snapshot; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
+        "USE rustcdc_crash_snapshot; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash_snapshot; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.runtime_crash_snapshot_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='runtime_crash_snapshot_users', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_crash_snapshot; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.runtime_crash_snapshot_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='runtime_crash_snapshot_users', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
 
@@ -102,16 +102,16 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
         let payload = format!("payload-{id}");
         admin
             .execute(
-                "USE cdc_rs_crash_snapshot; INSERT INTO dbo.runtime_crash_snapshot_users (id, payload) VALUES (@P1, @P2)",
+                "USE rustcdc_crash_snapshot; INSERT INTO dbo.runtime_crash_snapshot_users (id, payload) VALUES (@P1, @P2)",
                 &[&id, &payload],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    sql_exec(&mut admin, "USE cdc_rs_crash_snapshot; EXEC sys.sp_cdc_scan").await?;
+    sql_exec(&mut admin, "USE rustcdc_crash_snapshot; EXEC sys.sp_cdc_scan").await?;
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let marker_file = checkpoint_dir.path().join("worker-polled.marker");
 
     let mut worker = spawn_crash_worker(
@@ -119,7 +119,7 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
         port,
         checkpoint_dir.path(),
         &marker_file,
-        "cdc_rs_crash_snapshot",
+        "rustcdc_crash_snapshot",
         Some("dbo.runtime_crash_snapshot_users"),
         true,
     )?;
@@ -129,21 +129,21 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
     assert!(marker.acked, "worker should ack first snapshot batch");
     assert!(!marker.ids.is_empty(), "worker should record acked ids");
 
-    worker.kill().map_err(cdc_rs::Error::IoError)?;
-    let _ = worker.wait().map_err(cdc_rs::Error::IoError)?;
+    worker.kill().map_err(rustcdc::Error::IoError)?;
+    let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
     let reader_after_worker = FileCheckpoint::new(checkpoint_dir.path());
     let saved = reader_after_worker
         .load()
         .await?
-        .ok_or_else(|| cdc_rs::Error::StateError("checkpoint should exist after worker ack".into()))?;
+        .ok_or_else(|| rustcdc::Error::StateError("checkpoint should exist after worker ack".into()))?;
     assert_eq!(saved.source_type(), "sqlserver_snapshot");
     assert_eq!(reader_after_worker.get_committed_count().await?, marker.events as u64);
 
     let source_cfg = sqlserver_testkit::source_config(
         host,
         port,
-        "cdc_rs_crash_snapshot".to_string(),
+        "rustcdc_crash_snapshot".to_string(),
         30,
     );
 
@@ -176,7 +176,7 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
                 .as_ref()
                 .and_then(|after| after.get("id"))
                 .and_then(|value| value.as_i64())
-                .ok_or_else(|| cdc_rs::Error::StateError("snapshot event id missing".into()))?;
+                .ok_or_else(|| rustcdc::Error::StateError("snapshot event id missing".into()))?;
             resumed_snapshot_ids.insert(id.to_string());
         }
 
@@ -203,13 +203,13 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
 #[cfg(feature = "encryption")]
 #[tokio::test]
 async fn runtime_sqlserver_process_kill_replays_uncommitted_batch_with_encryption_transform(
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     run_sqlserver_process_kill_replay_scenario(true).await
 }
 
 async fn run_sqlserver_process_kill_replay_scenario(
     _enable_encryption_transform: bool,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver process crash integration test") {
         return Ok(());
     }
@@ -223,31 +223,31 @@ async fn run_sqlserver_process_kill_replay_scenario(
 
     sql_exec(
         &mut admin,
-        "IF DB_ID('cdc_rs_crash') IS NULL CREATE DATABASE cdc_rs_crash",
+        "IF DB_ID('rustcdc_crash') IS NULL CREATE DATABASE rustcdc_crash",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash; IF OBJECT_ID('dbo.runtime_crash_users', 'U') IS NULL CREATE TABLE dbo.runtime_crash_users (id INT NOT NULL PRIMARY KEY, payload NVARCHAR(100) NOT NULL)",
+        "USE rustcdc_crash; IF OBJECT_ID('dbo.runtime_crash_users', 'U') IS NULL CREATE TABLE dbo.runtime_crash_users (id INT NOT NULL PRIMARY KEY, payload NVARCHAR(100) NOT NULL)",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash; DELETE FROM dbo.runtime_crash_users",
+        "USE rustcdc_crash; DELETE FROM dbo.runtime_crash_users",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
+        "USE rustcdc_crash; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_crash; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.runtime_crash_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='runtime_crash_users', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_crash; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.runtime_crash_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='runtime_crash_users', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let marker_file = checkpoint_dir.path().join("worker-polled.marker");
 
     let mut seed_checkpoint = FileCheckpoint::new(checkpoint_dir.path());
@@ -258,7 +258,7 @@ async fn run_sqlserver_process_kill_replay_scenario(
             &GenericOffset::new(
                 "sqlserver",
                 serde_json::to_vec(&baseline_lsn_hex)
-                    .map_err(|error| cdc_rs::Error::SerializationError(error.to_string()))?,
+                    .map_err(|error| rustcdc::Error::SerializationError(error.to_string()))?,
             ),
             0,
         )
@@ -268,21 +268,21 @@ async fn run_sqlserver_process_kill_replay_scenario(
         let payload = format!("payload-{id}");
         admin
             .execute(
-                "USE cdc_rs_crash; INSERT INTO dbo.runtime_crash_users (id, payload) VALUES (@P1, @P2)",
+                "USE rustcdc_crash; INSERT INTO dbo.runtime_crash_users (id, payload) VALUES (@P1, @P2)",
                 &[&id, &payload],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    sql_exec(&mut admin, "USE cdc_rs_crash; EXEC sys.sp_cdc_scan").await?;
+    sql_exec(&mut admin, "USE rustcdc_crash; EXEC sys.sp_cdc_scan").await?;
 
     let mut worker = spawn_crash_worker(
         &host,
         port,
         checkpoint_dir.path(),
         &marker_file,
-        "cdc_rs_crash",
+        "rustcdc_crash",
         None,
         false,
     )?;
@@ -290,13 +290,13 @@ async fn run_sqlserver_process_kill_replay_scenario(
     wait_for_marker(&marker_file, Duration::from_secs(60))?;
     let worker_batch_len = read_worker_batch_len(&marker_file)?;
 
-    worker.kill().map_err(cdc_rs::Error::IoError)?;
-    let _ = worker.wait().map_err(cdc_rs::Error::IoError)?;
+    worker.kill().map_err(rustcdc::Error::IoError)?;
+    let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
     let reader_before = FileCheckpoint::new(checkpoint_dir.path());
     assert_eq!(reader_before.get_committed_count().await?, 0);
 
-    let source_cfg = sqlserver_testkit::source_config(host, port, "cdc_rs_crash".to_string(), 30);
+    let source_cfg = sqlserver_testkit::source_config(host, port, "rustcdc_crash".to_string(), 30);
 
     let mut runtime = CdcRuntime::new(
         RuntimeConfig::new(
@@ -336,7 +336,7 @@ async fn run_sqlserver_process_kill_replay_scenario(
                 .and_then(|after| after.get("payload"))
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| {
-                    cdc_rs::Error::StateError(
+                    rustcdc::Error::StateError(
                         "expected encrypted payload string in replay batch".into(),
                     )
                 })?;
@@ -368,7 +368,7 @@ fn spawn_crash_worker(
     database: &str,
     snapshot_table: Option<&str>,
     ack_first_batch: bool,
-) -> cdc_rs::Result<Child> {
+) -> rustcdc::Result<Child> {
     let worker_bin = resolve_worker_bin()?;
 
     let mut command = Command::new(worker_bin);
@@ -390,10 +390,10 @@ fn spawn_crash_worker(
     if let Some(table) = snapshot_table {
         command.env("CDC_RS_WORKER_SNAPSHOT_TABLES", table);
     }
-    command.spawn().map_err(cdc_rs::Error::IoError)
+    command.spawn().map_err(rustcdc::Error::IoError)
 }
 
-fn resolve_worker_bin() -> cdc_rs::Result<PathBuf> {
+fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_sqlserver_crash_worker") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -401,7 +401,7 @@ fn resolve_worker_bin() -> cdc_rs::Result<PathBuf> {
         }
     }
 
-    let test_exe = std::env::current_exe().map_err(cdc_rs::Error::IoError)?;
+    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
     if let Some(debug_dir) = test_exe.parent().and_then(|deps| deps.parent()) {
         let candidate = debug_dir.join("sqlserver_crash_worker");
         if candidate.exists() {
@@ -414,13 +414,13 @@ fn resolve_worker_bin() -> cdc_rs::Result<PathBuf> {
         }
     }
 
-    Err(cdc_rs::Error::StateError(
+    Err(rustcdc::Error::StateError(
         "sqlserver crash worker binary not found; build with `cargo build -p xtask --bin sqlserver_crash_worker --features sqlserver`"
             .into(),
     ))
 }
 
-fn build_xtask_worker(bin: &str, feature: &str) -> cdc_rs::Result<()> {
+fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
     let status = Command::new("cargo")
         .args([
             "build",
@@ -432,12 +432,12 @@ fn build_xtask_worker(bin: &str, feature: &str) -> cdc_rs::Result<()> {
             feature,
         ])
         .status()
-        .map_err(cdc_rs::Error::IoError)?;
+        .map_err(rustcdc::Error::IoError)?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(cdc_rs::Error::StateError(format!(
+        Err(rustcdc::Error::StateError(format!(
             "failed to build {bin} in xtask crate"
         )))
     }
@@ -455,7 +455,7 @@ async fn poll_until_batch_at_least(
     runtime: &mut CdcRuntime<FileCheckpoint, InMemorySchemaHistory>,
     expected: usize,
     rounds: usize,
-) -> cdc_rs::Result<cdc_rs::EventBatch> {
+) -> rustcdc::Result<rustcdc::EventBatch> {
     for _ in 0..rounds {
         let batch = runtime.poll_event_batch().await?;
         if batch.len() >= expected {
@@ -463,7 +463,7 @@ async fn poll_until_batch_at_least(
         }
     }
 
-    Err(cdc_rs::Error::TimeoutError(format!(
+    Err(rustcdc::Error::TimeoutError(format!(
         "timed out waiting for event batch of at least {expected} events"
     )))
 }

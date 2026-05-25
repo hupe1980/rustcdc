@@ -181,7 +181,7 @@ static FILE_CHECKPOINT_LEASE_REFS: OnceLock<Mutex<std::collections::HashMap<Path
     OnceLock::new();
 
 impl FileCheckpoint {
-    const OWNER_LEASE_FILENAME: &str = ".cdc_rs_checkpoint.owner";
+    const OWNER_LEASE_FILENAME: &str = ".rustcdc_checkpoint.owner";
 
     fn source_family(source_type: &str) -> &str {
         source_type.strip_suffix("_snapshot").unwrap_or(source_type)
@@ -271,7 +271,7 @@ impl FileCheckpoint {
                     }
                     Some((ref host, pid)) if host != owner_hostname => {
                         tracing::error!(
-                            target: "cdc_rs::checkpoint",
+                            target: "rustcdc::checkpoint",
                             checkpoint_dir = %self.checkpoint_dir.display(),
                             lease_host = %host,
                             lease_pid = pid,
@@ -289,7 +289,7 @@ impl FileCheckpoint {
                     }
                     Some((_, pid)) if !Self::is_pid_alive(pid) => {
                         tracing::warn!(
-                            target: "cdc_rs::checkpoint",
+                            target: "rustcdc::checkpoint",
                             checkpoint_dir = %self.checkpoint_dir.display(),
                             stale_owner_pid = pid,
                             "clearing stale checkpoint owner lease left by dead process"

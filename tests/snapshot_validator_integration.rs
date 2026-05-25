@@ -1,10 +1,10 @@
-use cdc_rs::{
+use rustcdc::{
     Operation, SnapshotMetadata, SnapshotValidator, SourceMetadata, TransactionMetadata,
     EVENT_ENVELOPE_VERSION,
 };
 
-fn snapshot_read_event(table: &str, id: i64) -> cdc_rs::Event {
-    cdc_rs::Event {
+fn snapshot_read_event(table: &str, id: i64) -> rustcdc::Event {
+    rustcdc::Event {
         before: None,
         after: Some(serde_json::json!({"id": id, "name": format!("user-{id}")})),
         op: Operation::Read,

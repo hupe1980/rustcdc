@@ -13,7 +13,7 @@
 //! | CloudEvents attribute | Derived from |
 //! |---|---|
 //! | `specversion` | Always `"1.0"` |
-//! | `type` | `"io.cdc_rs.change.{op}"` (e.g. `io.cdc_rs.change.insert`) |
+//! | `type` | `"io.rustcdc.change.{op}"` (e.g. `io.rustcdc.change.insert`) |
 //! | `source` | `"/{connector}/{schema_or_dash}/{table}"` |
 //! | `id` | `"{source_name}/{offset}"` |
 //! | `time` | RFC 3339 timestamp from `event.ts` (ms since epoch) |
@@ -63,8 +63,8 @@ const CE_SPEC_VERSION: &str = "1.0";
 /// # Example
 ///
 /// ```rust
-/// # use cdc_rs::codec::{EventEncoder, CloudEventsEncoder};
-/// # use cdc_rs::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+/// # use rustcdc::codec::{EventEncoder, CloudEventsEncoder};
+/// # use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// let encoder = CloudEventsEncoder::default();
 /// let event = Event {
 ///     before: None,
@@ -81,13 +81,13 @@ const CE_SPEC_VERSION: &str = "1.0";
 ///     primary_key: Some(vec!["id".into()]),
 ///     snapshot: None,
 ///     transaction: None,
-///     envelope_version: cdc_rs::EVENT_ENVELOPE_VERSION,
+///     envelope_version: rustcdc::EVENT_ENVELOPE_VERSION,
 /// };
 ///
 /// let out = encoder.encode(&event).unwrap();
 /// let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
 /// assert_eq!(ce["specversion"], "1.0");
-/// assert_eq!(ce["type"], "io.cdc_rs.change.insert");
+/// assert_eq!(ce["type"], "io.rustcdc.change.insert");
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct CloudEventsEncoder {
@@ -121,7 +121,7 @@ impl EventEncoder for CloudEventsEncoder {
         };
 
         // CloudEvents `type` — reverse-DNS prefixed event type.
-        let ce_type = format!("io.cdc_rs.change.{}", event.op.to_str());
+        let ce_type = format!("io.rustcdc.change.{}", event.op.to_str());
 
         // CloudEvents `id` — unique per event; use source + offset as a stable key.
         let id = format!("{}/{}", event.source.source_name, event.source.offset);
@@ -315,7 +315,7 @@ mod tests {
         let enc = CloudEventsEncoder::default();
         let out = enc.encode(&insert_event()).unwrap();
         let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
-        assert_eq!(ce["type"], "io.cdc_rs.change.insert");
+        assert_eq!(ce["type"], "io.rustcdc.change.insert");
     }
 
     #[test]
@@ -402,7 +402,7 @@ mod tests {
         ev.after = Some(serde_json::json!({"id": 1, "name": "alice-v2"}));
         let out = enc.encode(&ev).unwrap();
         let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
-        assert_eq!(ce["type"], "io.cdc_rs.change.update");
+        assert_eq!(ce["type"], "io.rustcdc.change.update");
         assert_eq!(ce["cdcop"], "update");
     }
 }

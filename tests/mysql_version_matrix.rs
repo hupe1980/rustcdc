@@ -1,7 +1,7 @@
 #![cfg(feature = "mysql")]
 
-use cdc_rs::{source::Source, MysqlConnection, MysqlSourceConfig};
-use cdc_rs::TransportConfig;
+use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
+use rustcdc::TransportConfig;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -20,7 +20,7 @@ fn skip_mysql_version_matrix_case(case_label: &str) -> bool {
     }
 }
 
-async fn connect_with_retry(connection: &MysqlConnection) -> cdc_rs::Result<()> {
+async fn connect_with_retry(connection: &MysqlConnection) -> rustcdc::Result<()> {
     let mut last_error = None;
     for _ in 0..45 {
         match connection.connect().await {
@@ -33,11 +33,11 @@ async fn connect_with_retry(connection: &MysqlConnection) -> cdc_rs::Result<()> 
     }
 
     Err(last_error.unwrap_or_else(|| {
-        cdc_rs::Error::SourceError("mysql connection did not become ready in time".into())
+        rustcdc::Error::SourceError("mysql connection did not become ready in time".into())
     }))
 }
 
-async fn run_mysql_connection_lifecycle(version: &str, server_id: u32) -> cdc_rs::Result<()> {
+async fn run_mysql_connection_lifecycle(version: &str, server_id: u32) -> rustcdc::Result<()> {
     let container = GenericImage::new("mysql", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -45,16 +45,16 @@ async fn run_mysql_connection_lifecycle(version: &str, server_id: u32) -> cdc_rs
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),
@@ -83,7 +83,7 @@ async fn run_mysql_connection_lifecycle(version: &str, server_id: u32) -> cdc_rs
 macro_rules! mysql_connection_test {
     ($name:ident, $version:literal, $server_id:literal, $label:literal) => {
         #[tokio::test]
-        async fn $name() -> cdc_rs::Result<()> {
+        async fn $name() -> rustcdc::Result<()> {
             if skip_mysql_version_matrix_case($label) {
                 return Ok(());
             }
@@ -107,7 +107,7 @@ mysql_connection_test!(
 );
 
 #[tokio::test]
-async fn mysql_capabilities_are_consistent_in_matrix_profile() -> cdc_rs::Result<()> {
+async fn mysql_capabilities_are_consistent_in_matrix_profile() -> rustcdc::Result<()> {
     if skip_mysql_version_matrix_case("mysql capability matrix test") {
         return Ok(());
     }
@@ -119,16 +119,16 @@ async fn mysql_capabilities_are_consistent_in_matrix_profile() -> cdc_rs::Result
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),

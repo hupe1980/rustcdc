@@ -38,8 +38,8 @@ const CONTENT_TYPE: &str = "avro/binary";
 pub const AVRO_SCHEMA: &str = r#"{
   "type": "record",
   "name": "Event",
-  "namespace": "io.cdc_rs",
-  "doc": "Canonical CDC event envelope — cdc-rs envelope_version=1",
+  "namespace": "io.rustcdc",
+  "doc": "Canonical CDC event envelope — rustcdc envelope_version=1",
   "fields": [
     {
       "name": "before",
@@ -58,7 +58,7 @@ pub const AVRO_SCHEMA: &str = r#"{
       "type": {
         "type": "enum",
         "name": "Operation",
-        "namespace": "io.cdc_rs",
+        "namespace": "io.rustcdc",
         "symbols": ["INSERT", "UPDATE", "DELETE", "READ", "SCHEMA_CHANGE", "TRUNCATE"],
         "doc": "CRUD operation that produced this event."
       }
@@ -68,7 +68,7 @@ pub const AVRO_SCHEMA: &str = r#"{
       "type": {
         "type": "record",
         "name": "SourceMetadata",
-        "namespace": "io.cdc_rs",
+        "namespace": "io.rustcdc",
         "fields": [
           {"name": "source_name", "type": "string", "doc": "Logical connector name"},
           {"name": "offset",      "type": "string", "doc": "Source-specific durable position"},
@@ -103,7 +103,7 @@ pub const AVRO_SCHEMA: &str = r#"{
       "type": ["null", {
         "type": "record",
         "name": "SnapshotMetadata",
-        "namespace": "io.cdc_rs",
+        "namespace": "io.rustcdc",
         "fields": [
           {"name": "snapshot_id",   "type": "string"},
           {"name": "chunk_index",   "type": "int"},
@@ -118,7 +118,7 @@ pub const AVRO_SCHEMA: &str = r#"{
       "type": ["null", {
         "type": "record",
         "name": "TransactionMetadata",
-        "namespace": "io.cdc_rs",
+        "namespace": "io.rustcdc",
         "fields": [
           {"name": "tx_id",        "type": "long"},
           {"name": "total_events", "type": "int"},
@@ -178,8 +178,8 @@ fn op_avro_symbol(op: Operation) -> &'static str {
 /// # Example
 ///
 /// ```rust
-/// # use cdc_rs::codec::{EventEncoder, AvroEncoder};
-/// # use cdc_rs::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+/// # use rustcdc::codec::{EventEncoder, AvroEncoder};
+/// # use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// let encoder = AvroEncoder::new().unwrap();
 /// let event = Event {
 ///     before: None,

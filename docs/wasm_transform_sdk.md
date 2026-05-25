@@ -1,7 +1,7 @@
 # WASM Transform SDK
 
 ## Scope
-This document defines the contract for running user-provided WASM transforms in cdc-rs.
+This document defines the contract for running user-provided WASM transforms in rustcdc.
 The runtime provides a concrete execution engine with static contract validation, lifecycle hooks, memory IO, and timeout/memory guardrails.
 
 ## ABI Contract

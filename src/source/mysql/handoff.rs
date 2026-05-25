@@ -86,7 +86,7 @@ pub(super) async fn mysql_handoff_result(
 
     if overlap_duplicates > 0 {
         tracing::info!(
-            target: "cdc_rs::source::mysql",
+            target: "rustcdc::source::mysql",
             overlap_duplicates,
             snapshot_binlog_file = %handoff.snapshot_binlog_file,
             snapshot_binlog_pos = handoff.snapshot_binlog_pos,

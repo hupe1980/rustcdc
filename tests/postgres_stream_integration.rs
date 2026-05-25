@@ -1,6 +1,6 @@
 #![cfg(feature = "postgres")]
 
-use cdc_rs::{source::Source, PostgresConnection, PostgresSourceConfig};
+use rustcdc::{source::Source, PostgresConnection, PostgresSourceConfig};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -10,7 +10,7 @@ use testcontainers::{
 /// Test PostgreSQL stream capture with INSERT/UPDATE/DELETE events
 /// Validates: event types, transaction boundaries, LSN tracking
 #[tokio::test]
-async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
+async fn postgres_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres stream test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -35,23 +35,23 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -72,7 +72,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let source_cfg = PostgresSourceConfig {
         host: host.to_string(),
@@ -105,7 +105,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
                 &[&id_i64, &name, &balance],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Poll stream
@@ -124,7 +124,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
     // Validate INSERT events
     let inserts: Vec<_> = stream_events
         .iter()
-        .filter(|e| e.op == cdc_rs::Operation::Insert)
+        .filter(|e| e.op == rustcdc::Operation::Insert)
         .collect();
     println!(
         "Captured {} INSERT events from {} total stream events",
@@ -159,7 +159,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
                 &[&id_i64],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Poll more stream events
@@ -177,7 +177,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
 
     let updates: Vec<_> = stream_events
         .iter()
-        .filter(|e| e.op == cdc_rs::Operation::Update)
+        .filter(|e| e.op == rustcdc::Operation::Update)
         .collect();
     println!("Captured {} UPDATE events", updates.len());
     assert!(
@@ -201,7 +201,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
         admin_client
             .execute("DELETE FROM public.stream_test WHERE id = $1", &[&id_i64])
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Poll more stream events
@@ -219,7 +219,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
 
     let deletes: Vec<_> = stream_events
         .iter()
-        .filter(|e| e.op == cdc_rs::Operation::Delete)
+        .filter(|e| e.op == rustcdc::Operation::Delete)
         .collect();
     println!("Captured {} DELETE events", deletes.len());
     assert!(
@@ -246,7 +246,7 @@ async fn postgres_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
 
 /// Test stream resume from checkpoint (LSN continuation)
 #[tokio::test]
-async fn postgres_stream_resume_from_lsn() -> cdc_rs::Result<()> {
+async fn postgres_stream_resume_from_lsn() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres stream resume test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -271,23 +271,23 @@ async fn postgres_stream_resume_from_lsn() -> cdc_rs::Result<()> {
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -306,7 +306,7 @@ async fn postgres_stream_resume_from_lsn() -> cdc_rs::Result<()> {
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Insert initial batch
     for id in 1..=30 {
@@ -318,7 +318,7 @@ async fn postgres_stream_resume_from_lsn() -> cdc_rs::Result<()> {
                 &[&id_i64, &value],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let source_cfg = PostgresSourceConfig {

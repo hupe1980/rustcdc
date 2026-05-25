@@ -1,6 +1,6 @@
-# cdc-rs Documentation
+# rustcdc Documentation
 
-All operational and developer documentation for cdc-rs is located in this directory.
+All operational and developer documentation for rustcdc is located in this directory.
 
 ## Quick Links
 

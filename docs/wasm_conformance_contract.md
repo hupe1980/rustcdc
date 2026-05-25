@@ -1,6 +1,6 @@
 # WASM Transform Conformance Contract
 
-This document is the normative conformance profile for third-party WASM transform modules used with cdc-rs.
+This document is the normative conformance profile for third-party WASM transform modules used with rustcdc.
 
 ## Conformance Requirements
 

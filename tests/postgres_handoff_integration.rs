@@ -1,6 +1,6 @@
 #![cfg(feature = "postgres")]
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
     PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
 };
@@ -13,7 +13,7 @@ use testcontainers::{
 /// Test complete snapshot-to-stream handoff cycle
 /// Validates: snapshot completion → stream start → no gaps or duplicates
 #[tokio::test]
-async fn postgres_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
+async fn postgres_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres handoff test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -38,23 +38,23 @@ async fn postgres_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -74,7 +74,7 @@ async fn postgres_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     // Insert initial snapshot data (1K rows)
     for id in 1..=1000 {
@@ -86,10 +86,10 @@ async fn postgres_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
                 &[&id_i64, &value],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let source_cfg = PostgresSourceConfig {
         host: host.to_string(),
         port,
@@ -155,7 +155,7 @@ async fn postgres_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
                 &[&id_i64, &value],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Capture stream events (post-handoff) and commit per batch.

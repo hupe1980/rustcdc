@@ -39,8 +39,8 @@ const CONTENT_TYPE: &str = "application/x-protobuf";
 /// # Example
 ///
 /// ```rust
-/// # use cdc_rs::codec::{EventEncoder, ProtobufEncoder};
-/// # use cdc_rs::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+/// # use rustcdc::codec::{EventEncoder, ProtobufEncoder};
+/// # use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// let encoder = ProtobufEncoder;
 /// let event = Event {
 ///     before: None,
@@ -201,7 +201,7 @@ pub struct ProtoEvent {
 }
 
 impl ProtoEvent {
-    /// Convert a [`cdc_rs::core::Event`] into its protobuf representation.
+    /// Convert a [`rustcdc::core::Event`] into its protobuf representation.
     pub fn from_event(event: &Event) -> Result<Self> {
         let before = event
             .before

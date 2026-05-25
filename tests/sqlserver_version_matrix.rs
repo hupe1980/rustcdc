@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlserver")]
 
-use cdc_rs::{source::Source, SqlServerConnection, SqlServerSourceConfig};
+use rustcdc::{source::Source, SqlServerConnection, SqlServerSourceConfig};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -14,7 +14,7 @@ fn skip_sqlserver_version_matrix_case(case_label: &str) -> bool {
 async fn sqlserver_base_config(
     image_tag: &str,
     database: &str,
-) -> cdc_rs::Result<(
+) -> rustcdc::Result<(
     SqlServerSourceConfig,
     testcontainers::ContainerAsync<testcontainers::GenericImage>,
 )> {
@@ -27,8 +27,8 @@ async fn sqlserver_base_config(
     Ok((config, container))
 }
 
-async fn run_sqlserver_connection_lifecycle(image_tag: &str) -> cdc_rs::Result<()> {
-    let database = "cdc_rs_connection";
+async fn run_sqlserver_connection_lifecycle(image_tag: &str) -> rustcdc::Result<()> {
+    let database = "rustcdc_connection";
     let (config, _container) = sqlserver_base_config(image_tag, database).await?;
     let connection = SqlServerConnection::new(config);
     connect_with_retry(&connection).await?;
@@ -40,7 +40,7 @@ async fn run_sqlserver_connection_lifecycle(image_tag: &str) -> cdc_rs::Result<(
 macro_rules! sqlserver_connection_test {
     ($name:ident, $image_tag:literal, $label:literal) => {
         #[tokio::test]
-        async fn $name() -> cdc_rs::Result<()> {
+        async fn $name() -> rustcdc::Result<()> {
             if skip_sqlserver_version_matrix_case($label) {
                 return Ok(());
             }
@@ -50,7 +50,7 @@ macro_rules! sqlserver_connection_test {
     };
 }
 
-async fn connect_with_retry(connection: &SqlServerConnection) -> cdc_rs::Result<()> {
+async fn connect_with_retry(connection: &SqlServerConnection) -> rustcdc::Result<()> {
     let mut last_error = None;
     for _ in 0..60 {
         match connection.connect().await {
@@ -63,7 +63,7 @@ async fn connect_with_retry(connection: &SqlServerConnection) -> cdc_rs::Result<
     }
 
     Err(last_error.unwrap_or_else(|| {
-        cdc_rs::Error::SourceError("sqlserver connection did not become ready in time".into())
+        rustcdc::Error::SourceError("sqlserver connection did not become ready in time".into())
     }))
 }
 
@@ -81,12 +81,12 @@ sqlserver_connection_test!(
 
 /// Verify CDC connector capabilities are consistent across SQL Server versions
 #[tokio::test]
-async fn sqlserver_cdc_capabilities_are_consistent() -> cdc_rs::Result<()> {
+async fn sqlserver_cdc_capabilities_are_consistent() -> rustcdc::Result<()> {
     if skip_sqlserver_version_matrix_case("sqlserver cdc capabilities test") {
         return Ok(());
     }
 
-    let database = "cdc_rs_connection";
+    let database = "rustcdc_connection";
     let (config, _container) = sqlserver_base_config("2022-latest", database).await?;
 
     let connection = SqlServerConnection::new(config);

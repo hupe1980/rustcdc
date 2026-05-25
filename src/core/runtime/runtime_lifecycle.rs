@@ -23,7 +23,7 @@ where
 
         if self.config.options.schema_history_retention.is_none() {
             tracing::error!(
-                target: "cdc_rs::core::runtime",
+                target: "rustcdc::core::runtime",
                 "no schema_history_retention policy configured; schema history will grow \
                  unboundedly. Configure RuntimeOptions::with_schema_history_retention() to \
                  avoid resource exhaustion in DDL-heavy deployments."
@@ -51,7 +51,7 @@ where
             if self.is_snapshot_checkpoint(offset.as_ref()) {
                 if !self.source_capabilities().snapshot_checkpoint_resume {
                     tracing::warn!(
-                        target: "cdc_rs::runtime",
+                        target: "rustcdc::runtime",
                         source = self.config.source.source_type().unwrap_or("unknown"),
                         "snapshot checkpoint resume is unsupported by connector; restarting snapshot from scratch"
                     );

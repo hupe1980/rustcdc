@@ -662,7 +662,7 @@ impl Source for PostgresConnection {
         };
 
         tracing::info!(
-            target: "cdc_rs::source::postgres",
+            target: "rustcdc::source::postgres",
             snapshot_watermark = handoff.snapshot_watermark,
             stream_watermark = handoff.stream_watermark,
             stream_watermark_gap = handoff.stream_watermark_gap(),
@@ -735,7 +735,7 @@ impl StreamHandle for PostgresStreamHandle {
                 let events = self.process_messages(xlog_data).await?;
                 if !events.is_empty() {
                     tracing::debug!(
-                        target: "cdc_rs::source::postgres",
+                        target: "rustcdc::source::postgres",
                         count = events.len(),
                         lsn = self.stream.lsn_position,
                         "postgres stream events received",
@@ -871,7 +871,7 @@ where
     S: tokio_postgres::tls::TlsStream + Send + Unpin + 'static,
 {
     if let Err(error) = connection.await {
-        tracing::warn!(target: "cdc_rs::source::postgres", %error, "postgres connection task ended with error");
+        tracing::warn!(target: "rustcdc::source::postgres", %error, "postgres connection task ended with error");
     }
 }
 

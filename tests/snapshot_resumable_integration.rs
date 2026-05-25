@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use cdc_rs::source::SnapshotProgress;
+use rustcdc::source::SnapshotProgress;
 
 const TABLE_COUNT: usize = 5;
 const ROWS_PER_TABLE: usize = 100_000;

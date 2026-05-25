@@ -148,14 +148,14 @@ pub(super) fn build_tls_root_store(ca_cert_path: Option<&str>) -> Result<rustls:
         let native_certs = rustls_native_certs::load_native_certs();
         for err in &native_certs.errors {
             tracing::warn!(
-                target: "cdc_rs::source::postgres",
+                target: "rustcdc::source::postgres",
                 "failed to load a native root certificate: {err}"
             );
         }
         for cert in native_certs.certs {
             if let Err(err) = root_store.add(cert) {
                 tracing::debug!(
-                    target: "cdc_rs::source::postgres",
+                    target: "rustcdc::source::postgres",
                     "skipping invalid native root certificate: {err}"
                 );
             }

@@ -1,7 +1,7 @@
 #![cfg(feature = "postgres")]
 
-use cdc_rs::{source::Source, PostgresConnection, PostgresSourceConfig};
-use cdc_rs::TransportConfig;
+use rustcdc::{source::Source, PostgresConnection, PostgresSourceConfig};
+use rustcdc::TransportConfig;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -21,7 +21,7 @@ fn skip_postgres_version_matrix_case() -> bool {
 macro_rules! postgres_version_test {
     ($name:ident, $image_tag:literal, $slot_name:literal, $publication_name:literal, $table_name:literal, $label:literal) => {
         #[tokio::test]
-        async fn $name() -> cdc_rs::Result<()> {
+        async fn $name() -> rustcdc::Result<()> {
             if skip_postgres_version_matrix_case() {
                 return Ok(());
             }
@@ -45,7 +45,7 @@ async fn run_postgres_version_connection_test(
     slot_name: &str,
     publication_name: &str,
     table_name: &str,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     let container = GenericImage::new("postgres", image_tag)
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
@@ -65,23 +65,23 @@ async fn run_postgres_version_connection_test(
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -100,7 +100,7 @@ async fn run_postgres_version_connection_test(
     admin_client
         .batch_execute(&setup_sql)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = PostgresSourceConfig {
         host: host.to_string(),

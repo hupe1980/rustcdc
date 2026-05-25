@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlserver")]
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::Checkpoint, checkpoint::InMemoryCheckpoint, source::Source, SqlServerConnection,
 };
 
@@ -8,9 +8,9 @@ use cdc_rs::{
 mod sqlserver_testkit;
 
 async fn poll_stream_events(
-    stream: &mut dyn cdc_rs::source::StreamHandle,
+    stream: &mut dyn rustcdc::source::StreamHandle,
     attempts: usize,
-) -> cdc_rs::Result<Vec<cdc_rs::Event>> {
+) -> rustcdc::Result<Vec<rustcdc::Event>> {
     let mut out = Vec::new();
     for _ in 0..attempts {
         let mut batch = stream.next_events(400).await?;
@@ -24,7 +24,7 @@ async fn poll_stream_events(
 }
 
 #[tokio::test]
-async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> cdc_rs::Result<()> {
+async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver handoff integration test") {
         return Ok(());
     }
@@ -41,35 +41,35 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> cdc_rs::Result<()> {
     .await?;
     sqlserver_testkit::sql_exec(
         &mut admin,
-        "IF DB_ID('cdc_rs_handoff') IS NULL CREATE DATABASE cdc_rs_handoff",
+        "IF DB_ID('rustcdc_handoff') IS NULL CREATE DATABASE rustcdc_handoff",
     )
     .await?;
     sqlserver_testkit::sql_exec(
         &mut admin,
-        "USE cdc_rs_handoff; IF OBJECT_ID('dbo.orders', 'U') IS NULL CREATE TABLE dbo.orders (id INT NOT NULL PRIMARY KEY, amount INT NOT NULL)",
+        "USE rustcdc_handoff; IF OBJECT_ID('dbo.orders', 'U') IS NULL CREATE TABLE dbo.orders (id INT NOT NULL PRIMARY KEY, amount INT NOT NULL)",
     )
     .await?;
-    sqlserver_testkit::sql_exec(&mut admin, "USE cdc_rs_handoff; DELETE FROM dbo.orders").await?;
+    sqlserver_testkit::sql_exec(&mut admin, "USE rustcdc_handoff; DELETE FROM dbo.orders").await?;
     sqlserver_testkit::sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_handoff; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
+        "USE rustcdc_handoff; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
     sqlserver_testkit::sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_handoff; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.orders')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='orders', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_handoff; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.orders')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='orders', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
     sqlserver_testkit::sql_exec(
         &mut admin,
-        "USE cdc_rs_handoff; INSERT INTO dbo.orders (id, amount) VALUES (1, 100), (2, 200)",
+        "USE rustcdc_handoff; INSERT INTO dbo.orders (id, amount) VALUES (1, 100), (2, 200)",
     )
     .await?;
 
     let mut source = SqlServerConnection::new(sqlserver_testkit::source_config(
         host.clone(),
         port,
-        "cdc_rs_handoff".into(),
+        "rustcdc_handoff".into(),
         30,
     ));
 
@@ -96,7 +96,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> cdc_rs::Result<()> {
     // Stream polling after handoff should remain operational even if CDC delivery is delayed.
     sqlserver_testkit::sql_exec(
         &mut admin,
-        "USE cdc_rs_handoff; INSERT INTO dbo.orders (id, amount) VALUES (3, 300)",
+        "USE rustcdc_handoff; INSERT INTO dbo.orders (id, amount) VALUES (3, 300)",
     )
     .await?;
     let _events_after_handoff = poll_stream_events(stream.as_mut(), 20).await?;
@@ -107,14 +107,14 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> cdc_rs::Result<()> {
     let resume = checkpoint
         .load()
         .await?
-        .ok_or_else(|| cdc_rs::Error::CheckpointError("missing handoff checkpoint".into()))?;
+        .ok_or_else(|| rustcdc::Error::CheckpointError("missing handoff checkpoint".into()))?;
 
     source.close().await;
 
     let mut resumed = SqlServerConnection::new(sqlserver_testkit::source_config(
         host.clone(),
         port,
-        "cdc_rs_handoff".into(),
+        "rustcdc_handoff".into(),
         30,
     ));
     resumed.connect().await?;
@@ -122,7 +122,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> cdc_rs::Result<()> {
 
     sqlserver_testkit::sql_exec(
         &mut admin,
-        "USE cdc_rs_handoff; INSERT INTO dbo.orders (id, amount) VALUES (4, 400)",
+        "USE rustcdc_handoff; INSERT INTO dbo.orders (id, amount) VALUES (4, 400)",
     )
     .await?;
     let _resumed_events = poll_stream_events(resumed_stream.as_mut(), 20).await?;

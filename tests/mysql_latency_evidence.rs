@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
     MysqlSourceConfig, RuntimeConfig, RuntimeSourceConfig, TransportConfig,
 };
@@ -18,7 +18,7 @@ mod latency_evidence_common;
 
 use latency_evidence_common::{percentile, write_latency_artifacts, LatencySummary};
 
-async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
+async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -34,7 +34,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
         }
     }
 
-    Err(cdc_rs::Error::SourceError(format!(
+    Err(rustcdc::Error::SourceError(format!(
         "failed to connect mysql admin pool: {}",
         last_error
             .map(|error| error.to_string())
@@ -43,7 +43,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
 }
 
 #[tokio::test]
-async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs::Result<()> {
+async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql latency evidence test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -56,16 +56,16 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs:
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -73,7 +73,7 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs:
     sqlx::query("DROP TABLE IF EXISTS latency_evidence_users")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE latency_evidence_users (
@@ -83,7 +83,7 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs:
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let source_cfg = MysqlSourceConfig {
         host: host.to_string(),
@@ -101,7 +101,7 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs:
         ..Default::default()
     };
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut runtime = CdcRuntime::new(
         RuntimeConfig::new(
             RuntimeSourceConfig::Mysql(source_cfg),
@@ -121,7 +121,7 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs:
             .bind(format!("payload-{id}"))
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let mut poll_latencies_ms = Vec::new();
@@ -133,7 +133,7 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs:
     let deadline = Instant::now() + Duration::from_secs(90);
     while events_committed < rows_inserted {
         if Instant::now() > deadline {
-            return Err(cdc_rs::Error::TimeoutError(format!(
+            return Err(rustcdc::Error::TimeoutError(format!(
                 "timed out while collecting mysql latency evidence (committed={events_committed}, expected={rows_inserted})"
             )));
         }

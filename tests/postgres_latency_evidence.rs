@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
     schema_history::InMemorySchemaHistory,
     CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
@@ -19,7 +19,7 @@ mod latency_evidence_common;
 use latency_evidence_common::{percentile, write_latency_artifacts, LatencySummary};
 
 #[tokio::test]
-async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs::Result<()> {
+async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres latency evidence test (set CDC_RS_RUN_DOCKER_TESTS=1 to enable)"
@@ -46,23 +46,23 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> cdc_
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -81,16 +81,16 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> cdc_
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let lsn_text: String = admin_client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .get(0);
     let baseline_lsn = parse_pg_lsn(&lsn_text)?;
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut seed_checkpoint = FileCheckpoint::new(checkpoint_dir.path());
     let seed_offset = PostgresOffset {
         lsn: baseline_lsn,
@@ -131,7 +131,7 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> cdc_
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let mut poll_latencies_ms = Vec::new();
@@ -143,7 +143,7 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> cdc_
     let deadline = Instant::now() + Duration::from_secs(90);
     while events_committed < rows_inserted {
         if Instant::now() > deadline {
-            return Err(cdc_rs::Error::TimeoutError(format!(
+            return Err(rustcdc::Error::TimeoutError(format!(
                 "timed out while collecting latency evidence (committed={events_committed}, expected={rows_inserted})"
             )));
         }
@@ -201,13 +201,13 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> cdc_
     Ok(())
 }
 
-fn parse_pg_lsn(value: &str) -> cdc_rs::Result<u64> {
+fn parse_pg_lsn(value: &str) -> rustcdc::Result<u64> {
     let (high, low) = value.split_once('/').ok_or_else(|| {
-        cdc_rs::Error::SourceError(format!("invalid postgres lsn format: {value}"))
+        rustcdc::Error::SourceError(format!("invalid postgres lsn format: {value}"))
     })?;
     let high = u64::from_str_radix(high, 16)
-        .map_err(|error| cdc_rs::Error::SourceError(format!("invalid lsn high bits: {error}")))?;
+        .map_err(|error| rustcdc::Error::SourceError(format!("invalid lsn high bits: {error}")))?;
     let low = u64::from_str_radix(low, 16)
-        .map_err(|error| cdc_rs::Error::SourceError(format!("invalid lsn low bits: {error}")))?;
+        .map_err(|error| rustcdc::Error::SourceError(format!("invalid lsn low bits: {error}")))?;
     Ok((high << 32) | low)
 }

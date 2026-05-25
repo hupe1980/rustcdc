@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use cdc_rs::StructuredLogger;
+use rustcdc::StructuredLogger;
 use serde_json::Value;
 use tracing::Level;
 use tracing_subscriber::fmt::writer::MakeWriter;
@@ -343,9 +343,9 @@ fn structured_logger_json_100_events_parse_and_redact() {
 /// a lower log level that operators might miss.
 #[tokio::test]
 async fn runtime_startup_without_schema_history_retention_emits_error_log() {
-    use cdc_rs::checkpoint::InMemoryCheckpoint;
-    use cdc_rs::core::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig};
-    use cdc_rs::schema_history::InMemorySchemaHistory;
+    use rustcdc::checkpoint::InMemoryCheckpoint;
+    use rustcdc::core::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig};
+    use rustcdc::schema_history::InMemorySchemaHistory;
 
     let sink = SharedWriter::default();
 
@@ -354,7 +354,7 @@ async fn runtime_startup_without_schema_history_retention_emits_error_log() {
         .with_max_level(Level::ERROR)
         .with_ansi(false)
         .without_time()
-        .with_target(true) // capture target so we can verify cdc_rs::core::runtime
+        .with_target(true) // capture target so we can verify rustcdc::core::runtime
         .finish();
 
     // set_default returns a guard; subscriber is active until the guard is dropped.

@@ -1,7 +1,7 @@
-# cdc-rs Configuration Reference
+# rustcdc Configuration Reference
 
 **Version:** v0.1+  
-**Audience:** Platform engineers and application developers embedding cdc-rs
+**Audience:** Platform engineers and application developers embedding rustcdc
 
 ---
 
@@ -70,7 +70,7 @@ Default runtime safety posture:
 ### RuntimeConfig Builder Example
 
 ```rust
-use cdc_rs::{
+use rustcdc::{
   checkpoint::InMemoryCheckpoint,
   schema_history::InMemorySchemaHistory,
   PostgresSourceConfig,
@@ -87,8 +87,8 @@ let source = PostgresSourceConfig {
   user: "postgres".into(),
   password: SecretString::from_env("CDC_RS_POSTGRES_PASSWORD"),
   database: "mydb".into(),
-  replication_slot_name: "cdc_rs_slot".into(),
-  publication_name: "cdc_rs_publication".into(),
+  replication_slot_name: "rustcdc_slot".into(),
+  publication_name: "rustcdc_publication".into(),
   conn_timeout_secs: 30,
   ..PostgresSourceConfig::default()
 };
@@ -97,7 +97,7 @@ let config = RuntimeConfig::new(RuntimeSourceConfig::Postgres(source), checkpoin
     .with_snapshot_tables(vec!["public.users".to_string(), "public.orders".to_string()])
     .with_max_buffer_size(50_000)
     .with_max_poll_wait_ms(2_000)
-    .with_transform_error_policy(cdc_rs::TransformErrorPolicy::Halt);
+    .with_transform_error_policy(rustcdc::TransformErrorPolicy::Halt);
 ```
 
 ## Runtime Consumption Model
@@ -107,12 +107,12 @@ The preferred embedder surface is now batch-oriented rather than count-oriented.
 `poll_event_batch()` returns an `EventBatch` containing the delivered events plus an opaque `AckToken`. Re-polling before acknowledgement redelivers the same in-flight batch, which keeps retry behavior loss-safe.
 
 ```rust
-use cdc_rs::{CdcRuntime, EventBatch, Result};
+use rustcdc::{CdcRuntime, EventBatch, Result};
 
 async fn consume_once<C, H>(runtime: &mut CdcRuntime<C, H>) -> Result<()>
 where
-  C: cdc_rs::checkpoint::Checkpoint + Send + Sync + 'static,
-  H: cdc_rs::schema_history::SchemaHistory + Send + Sync + 'static,
+  C: rustcdc::checkpoint::Checkpoint + Send + Sync + 'static,
+  H: rustcdc::schema_history::SchemaHistory + Send + Sync + 'static,
 {
   let batch = runtime.poll_event_batch().await?;
   if batch.is_empty() {
@@ -158,7 +158,7 @@ while let Some(batch) = batches.next().await {
 Runtime source selection now exposes explicit connector capabilities through `ConnectorCapabilities`.
 
 ```rust
-use cdc_rs::{ConnectorCapabilities, RuntimeSourceConfig};
+use rustcdc::{ConnectorCapabilities, RuntimeSourceConfig};
 
 let source = RuntimeSourceConfig::Disabled;
 let caps: ConnectorCapabilities = source.capabilities();
@@ -222,11 +222,11 @@ pub struct PostgresSourceConfig {
     pub database: String,
     
     /// Logical replication slot name
-    /// Example: "cdc_rs_slot"
+    /// Example: "rustcdc_slot"
     pub replication_slot_name: String,
 
     /// Publication name used by pgoutput
-    /// Example: "cdc_rs_publication"
+    /// Example: "rustcdc_publication"
     pub publication_name: String,
     
     /// Transport mode (`TransportConfig::tls()` by default when `tls` feature is enabled).
@@ -255,13 +255,13 @@ pub struct PostgresSourceConfig {
 Connector passwords are now modeled as `SecretString`, not raw `String` values.
 
 ```rust
-use cdc_rs::{SecretProvider, SecretString};
+use rustcdc::{SecretProvider, SecretString};
 use std::sync::Arc;
 
 struct VaultProvider;
 
 impl SecretProvider for VaultProvider {
-  fn resolve_secret(&self, reference: &str) -> cdc_rs::Result<String> {
+  fn resolve_secret(&self, reference: &str) -> rustcdc::Result<String> {
     Ok(format!("vault://{reference}"))
   }
 }
@@ -275,7 +275,7 @@ let provider_secret = SecretString::from_provider(
 );
 let callback_secret = SecretString::from_callback("runtime-refresh", || {
   std::env::var("CDC_RS_ROTATED_PASSWORD")
-    .map_err(|error| cdc_rs::Error::ConfigError(error.to_string()))
+    .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
 });
 ```
 
@@ -286,7 +286,7 @@ Deferred secrets are resolved at validation/connect time and remain redacted in 
 Enable the `encryption` feature to use field-level AES-GCM encryption and decryption through the existing `MaskHashTransform` surface.
 
 ```rust
-use cdc_rs::{MaskHashConfig, MaskHashTransform, MaskRule, SecretString};
+use rustcdc::{MaskHashConfig, MaskHashTransform, MaskRule, SecretString};
 use std::collections::HashMap;
 
 let mut encrypt_rules = HashMap::new();
@@ -335,7 +335,7 @@ Set `RuntimeOptions.connection_retry` to automatically retry recoverable source
 connection failures with truncated exponential backoff:
 
 ```rust
-use cdc_rs::core::ConnectionRetryPolicy;
+use rustcdc::core::ConnectionRetryPolicy;
 
 let config = RuntimeConfig::new(source, checkpoint, schema_history)
     .with_connection_retry(ConnectionRetryPolicy {
@@ -496,7 +496,7 @@ sqlserver://user:password@host:port;database=dbname;TrustServerCertificate=no;En
 **Use Case:** Development, testing, single-machine deployments (volatile)
 
 ```rust
-use cdc_rs::checkpoint::InMemoryCheckpoint;
+use rustcdc::checkpoint::InMemoryCheckpoint;
 
 let checkpoint = InMemoryCheckpoint::default();
 // Keeps checkpoint in memory; lost on process restart
@@ -507,10 +507,10 @@ let checkpoint = InMemoryCheckpoint::default();
 **Use Case:** Local machine deployments; single-machine production (persistent but not HA)
 
 ```rust
-use cdc_rs::checkpoint::FileCheckpoint;
+use rustcdc::checkpoint::FileCheckpoint;
 
 // Default: 0o600 (owner read/write only — enforced at load time).
-let checkpoint = FileCheckpoint::new("/var/cdc-rs/checkpoints");
+let checkpoint = FileCheckpoint::new("/var/rustcdc/checkpoints");
 // Stores checkpoint in JSON file; atomically updated via write-rename.
 ```
 
@@ -521,9 +521,9 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 
 **File Location Format:**
 ```
-/var/cdc-rs/checkpoints/checkpoint_postgres.json
-/var/cdc-rs/checkpoints/checkpoint_mysql.json
-/var/cdc-rs/checkpoints/checkpoint_sqlserver.json
+/var/rustcdc/checkpoints/checkpoint_postgres.json
+/var/rustcdc/checkpoints/checkpoint_mysql.json
+/var/rustcdc/checkpoints/checkpoint_sqlserver.json
 ```
 
 **File Content Example:**
@@ -534,7 +534,7 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
   "committed_event_count": 12345,
   "offset": {
     "lsn": 281474976711680,
-    "slot_name": "cdc_rs_postgres_abc123"
+    "slot_name": "rustcdc_postgres_abc123"
   }
 }
 ```
@@ -543,7 +543,7 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 - `checkpoint_format_version = 2` is the current write format.
 - `checkpoint_format_version` is required for all file checkpoints.
 - Unknown or missing versions are rejected at load time.
-- cdc-rs intentionally enforces fail-closed checkpoint decoding for format safety.
+- rustcdc intentionally enforces fail-closed checkpoint decoding for format safety.
 
 ### PostgresCheckpoint (Feature-Gated)
 
@@ -551,7 +551,7 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 
 ```rust
 #[cfg(feature = "postgres")]
-use cdc_rs::checkpoint::PostgresCheckpoint;
+use rustcdc::checkpoint::PostgresCheckpoint;
 
 #[cfg(feature = "postgres")]
 let checkpoint = PostgresCheckpoint::new(
@@ -580,7 +580,7 @@ CREATE TABLE checkpoints (
 ### NoOp Observability (Default)
 
 ```rust
-use cdc_rs::{RuntimeConfig, RuntimeObservability};
+use rustcdc::{RuntimeConfig, RuntimeObservability};
 
 // Metrics and tracing are disabled by default via explicit runtime observability options.
 let config = RuntimeConfig::new(...)
@@ -590,12 +590,12 @@ let config = RuntimeConfig::new(...)
 ### OpenTelemetry Observability
 
 ```rust
-use cdc_rs::{OTelConfig, OTelEventTracer, OTelMetricsCollector, RuntimeConfig, RuntimeObservability};
+use rustcdc::{OTelConfig, OTelEventTracer, OTelMetricsCollector, RuntimeConfig, RuntimeObservability};
 use std::sync::Arc;
 
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
-    "cdc-rs",                        // Service name
+    "rustcdc",                        // Service name
     "0.1.0",                         // Service version
     "production",                    // Environment
 );
@@ -658,7 +658,7 @@ All logs include:
 
 ```bash
 # Set environment variable
-export RUST_LOG=cdc_rs=info,cdc_rs::source=debug
+export RUST_LOG=rustcdc=info,rustcdc::source=debug
 
 # Run with structured JSON output
 export RUST_LOG_FORMAT=json
@@ -728,7 +728,7 @@ For sustained saturation, combine connector tuning with runtime delivery control
 ### TLS Best Practices
 
 ```rust
-use cdc_rs::TransportConfig;
+use rustcdc::TransportConfig;
 
 // Recommended: explicit CA bundle in production.
 let transport = TransportConfig::tls_with_ca_cert_path("/etc/ssl/certs/company-ca.pem");

@@ -34,7 +34,7 @@ use super::mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
 /// ```rust,no_run
 /// # #[cfg(all(feature = "mysql", feature = "mariadb"))]
 /// # {
-/// use cdc_rs::MariaDbSourceConfig;
+/// use rustcdc::MariaDbSourceConfig;
 ///
 /// let config = MariaDbSourceConfig::default()
 ///     .with_host("mariadb.example.com")

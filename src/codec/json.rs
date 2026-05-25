@@ -7,7 +7,7 @@ use crate::core::{Event, Result};
 
 /// Encodes CDC events as compact (single-line) JSON.
 ///
-/// This is the canonical in-process wire format used throughout cdc-rs.
+/// This is the canonical in-process wire format used throughout rustcdc.
 /// It is a zero-copy re-serialization of the [`Event`] struct using
 /// `serde_json::to_vec`.
 ///

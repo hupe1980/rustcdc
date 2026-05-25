@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use cdc_rs::{OTelConfig, OTelEventTracer};
+use rustcdc::{OTelConfig, OTelEventTracer};
 use serde_json::Value;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -11,7 +11,7 @@ use testcontainers::{
 };
 
 #[tokio::test]
-async fn otel_tracing_exports_hierarchy_and_crash_retry_to_jaeger() -> cdc_rs::Result<()> {
+async fn otel_tracing_exports_hierarchy_and_crash_retry_to_jaeger() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping otel tracing integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -26,22 +26,22 @@ async fn otel_tracing_exports_hierarchy_and_crash_retry_to_jaeger() -> cdc_rs::R
         .with_env_var("COLLECTOR_OTLP_ENABLED", "true")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let otlp_port = container
         .get_host_port_ipv4(4317.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let ui_port = container
         .get_host_port_ipv4(16686.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let service_name = format!("cdc-rs-otel-tracing-{}", std::process::id());
+    let service_name = format!("rustcdc-otel-tracing-{}", std::process::id());
     let tracer = OTelEventTracer::with_otlp_exporter(OTelConfig::new(
         format!("http://{host}:{otlp_port}"),
         service_name.clone(),
@@ -86,13 +86,13 @@ async fn otel_tracing_exports_hierarchy_and_crash_retry_to_jaeger() -> cdc_rs::R
         tokio::task::spawn_blocking(move || tracer.shutdown()),
     )
     .await
-    .map_err(|_| cdc_rs::Error::TimeoutError("otel tracer shutdown timed out".to_string()))?
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|_| rustcdc::Error::TimeoutError("otel tracer shutdown timed out".to_string()))?
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let mut validated = false;
     for _ in 0..30 {
@@ -102,7 +102,7 @@ async fn otel_tracing_exports_hierarchy_and_crash_retry_to_jaeger() -> cdc_rs::R
             ))
             .send()
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
         if !response.status().is_success() {
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -112,7 +112,7 @@ async fn otel_tracing_exports_hierarchy_and_crash_retry_to_jaeger() -> cdc_rs::R
         let payload: Value = response
             .json()
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
         if payload_contains_required_hierarchy_and_retry(&payload) {
             validated = true;

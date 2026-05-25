@@ -1,7 +1,7 @@
 #![cfg(feature = "mysql")]
 
-use cdc_rs::{source::Source, MysqlConnection, MysqlSourceConfig};
-use cdc_rs::TransportConfig;
+use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
+use rustcdc::TransportConfig;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -9,7 +9,7 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
-async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
+async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -25,7 +25,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
         }
     }
 
-    Err(cdc_rs::Error::SourceError(format!(
+    Err(rustcdc::Error::SourceError(format!(
         "failed to connect mysql admin pool: {}",
         last_error
             .map(|error| error.to_string())
@@ -35,7 +35,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
 
 /// Test INSERT/UPDATE/DELETE event capture
 #[tokio::test]
-async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
+async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql stream integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -48,16 +48,16 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -66,7 +66,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
     sqlx::query("DROP TABLE IF EXISTS stream_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE stream_test (
@@ -77,7 +77,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),
@@ -107,7 +107,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
             .bind(format!("insert-{}", i))
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Update 20 rows
@@ -117,7 +117,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
             .bind(i)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Delete 10 rows
@@ -126,7 +126,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
             .bind(i)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Capture stream events (with timeout)
@@ -159,11 +159,11 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
 
     for event in &stream_events {
         match event.op {
-            cdc_rs::core::Operation::Insert => {
+            rustcdc::core::Operation::Insert => {
                 insert_count += 1;
                 assert!(event.after.is_some(), "INSERT event must have after field");
             }
-            cdc_rs::core::Operation::Update => {
+            rustcdc::core::Operation::Update => {
                 update_count += 1;
                 assert!(
                     event.before.is_some(),
@@ -171,7 +171,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
                 );
                 assert!(event.after.is_some(), "UPDATE event must have after field");
             }
-            cdc_rs::core::Operation::Delete => {
+            rustcdc::core::Operation::Delete => {
                 delete_count += 1;
                 assert!(
                     event.before.is_some(),
@@ -193,7 +193,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
 
 /// Test stream resume from checkpoint
 #[tokio::test]
-async fn mysql_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
+async fn mysql_stream_resume_from_checkpoint() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql stream resumption test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -206,16 +206,16 @@ async fn mysql_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -224,7 +224,7 @@ async fn mysql_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
     sqlx::query("DROP TABLE IF EXISTS resumption_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE resumption_test (
@@ -234,7 +234,7 @@ async fn mysql_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),
@@ -262,7 +262,7 @@ async fn mysql_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
             .bind(format!("row-{}", i))
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Capture initial events
@@ -306,7 +306,7 @@ async fn mysql_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
 /// rotates to a new binlog file, events after the rotation must still be delivered and
 /// their `source.offset` must reflect the new filename.
 #[tokio::test]
-async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
+async fn mysql_stream_binlog_rotation() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql binlog rotation test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -319,16 +319,16 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -337,7 +337,7 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
     sqlx::query("DROP TABLE IF EXISTS rotation_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE rotation_test (
@@ -348,7 +348,7 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),
@@ -377,11 +377,11 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
             .bind(format!("pre-{i}"))
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Drain pre-rotation events
-    let mut pre_events: Vec<cdc_rs::Event> = Vec::new();
+    let mut pre_events: Vec<rustcdc::Event> = Vec::new();
     for _ in 0..200 {
         let batch = stream_handle.next_events(500).await?;
         pre_events.extend(batch);
@@ -410,7 +410,7 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
     sqlx::query("FLUSH LOGS")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     println!("FLUSH LOGS issued — binlog rotation triggered");
 
     // ── Phase 2: insert rows AFTER rotation ───────────────────────────────────
@@ -420,11 +420,11 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
             .bind(format!("post-{i}"))
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     // Drain post-rotation events
-    let mut post_events: Vec<cdc_rs::Event> = Vec::new();
+    let mut post_events: Vec<rustcdc::Event> = Vec::new();
     for _ in 0..200 {
         let batch = stream_handle.next_events(500).await?;
         post_events.extend(batch);
@@ -454,14 +454,14 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
 
     // All pre-rotation events are valid INSERTs
     for event in &pre_events {
-        assert_eq!(event.op, cdc_rs::core::Operation::Insert);
+        assert_eq!(event.op, rustcdc::core::Operation::Insert);
         assert!(event.after.is_some(), "Insert must have after");
         assert!(event.before.is_none(), "Insert must not have before");
     }
 
     // All post-rotation events are valid INSERTs and arrived (stream survived rotation)
     for event in &post_events {
-        assert_eq!(event.op, cdc_rs::core::Operation::Insert);
+        assert_eq!(event.op, rustcdc::core::Operation::Insert);
         assert!(event.after.is_some(), "Insert must have after");
         assert!(
             !event.source.offset.is_empty(),

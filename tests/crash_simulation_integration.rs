@@ -3,7 +3,7 @@
 //! Tests verify proper recovery and data integrity when the CDC runtime is crashed
 //! at different points in the pipeline (snapshot, stream, handoff, checkpoint, transform).
 
-use cdc_rs::{
+use rustcdc::{
     fault_injection::{CrashSimulationState, CrashSimulationValidator},
     Event, Operation, SourceMetadata, StructuredLogger, EVENT_ENVELOPE_VERSION,
 };

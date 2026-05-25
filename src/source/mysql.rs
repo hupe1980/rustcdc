@@ -1076,7 +1076,7 @@ impl StreamHandle for MysqlStreamHandle {
                 let events = self.process_messages(messages);
                 if !events.is_empty() {
                     tracing::debug!(
-                        target: "cdc_rs::source::mysql",
+                        target: "rustcdc::source::mysql",
                         count = events.len(),
                         file = %self.stream.binlog_file,
                         pos = self.stream.binlog_pos,

@@ -1,19 +1,19 @@
 #![cfg(feature = "sqlserver")]
 
-use cdc_rs::{source::Source, SqlServerConnection, SqlServerSourceConfig};
+use rustcdc::{source::Source, SqlServerConnection, SqlServerSourceConfig};
 
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;
 
 #[tokio::test]
-async fn sqlserver_connection_2019_and_cdc_validation() -> cdc_rs::Result<()> {
+async fn sqlserver_connection_2019_and_cdc_validation() -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver connection integration test") {
         return Ok(());
     }
 
     let container = sqlserver_testkit::start_sqlserver_container("2019-latest").await?;
     let (host_text, port) = sqlserver_testkit::host_and_port(&container).await?;
-    let database = "cdc_rs_connection";
+    let database = "rustcdc_connection";
 
     // Retry to absorb SQL Server startup warm-up.
     let mut last_error = None;
@@ -43,7 +43,7 @@ async fn sqlserver_connection_2019_and_cdc_validation() -> cdc_rs::Result<()> {
     }
 
     Err(last_error.unwrap_or_else(|| {
-        cdc_rs::Error::SourceError(
+        rustcdc::Error::SourceError(
             "sqlserver connection test timed out while waiting for container readiness".into(),
         )
     }))

@@ -105,7 +105,7 @@ impl ValidationError {
 /// # Examples
 ///
 /// ```
-/// use cdc_rs::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+/// use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// use serde_json::json;
 ///
 /// let event = Event {

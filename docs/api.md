@@ -1,10 +1,10 @@
-# cdc-rs API Guide
+# rustcdc API Guide
 
-This document is the primary API reference for embedding cdc-rs in Rust applications.
+This document is the primary API reference for embedding rustcdc in Rust applications.
 
 ## Audience
 
-This guide is for engineers integrating cdc-rs as a library and building custom runtime loops.
+This guide is for engineers integrating rustcdc as a library and building custom runtime loops.
 
 ## API Surface
 
@@ -27,7 +27,7 @@ The core embedder API is centered on:
 Typical shape:
 
 ```rust
-use cdc_rs::{
+use rustcdc::{
   checkpoint::InMemoryCheckpoint,
   IdempotencyOptions,
   schema_history::InMemorySchemaHistory,
@@ -60,16 +60,16 @@ let config_without_dedup = RuntimeConfig::new(
 Durable schema history for restart resilience:
 
 ```rust
-use cdc_rs::{
+use rustcdc::{
   checkpoint::InMemoryCheckpoint,
   schema_history::FileSchemaHistory,
   RuntimeConfig,
   RuntimeSourceConfig,
 };
 
-async fn durable_schema_history_config() -> cdc_rs::Result<()> {
+async fn durable_schema_history_config() -> rustcdc::Result<()> {
   let checkpoint = InMemoryCheckpoint::default();
-  let schema_history = FileSchemaHistory::new("/var/lib/cdc-rs/schema-history.json").await?;
+  let schema_history = FileSchemaHistory::new("/var/lib/rustcdc/schema-history.json").await?;
 
   let _config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
   Ok(())
@@ -89,9 +89,9 @@ The canonical lifecycle is:
 Minimal lifecycle example:
 
 ```rust
-use cdc_rs::{CdcRuntime, Result, RuntimeConfig, RuntimeSourceConfig};
-use cdc_rs::checkpoint::InMemoryCheckpoint;
-use cdc_rs::schema_history::InMemorySchemaHistory;
+use rustcdc::{CdcRuntime, Result, RuntimeConfig, RuntimeSourceConfig};
+use rustcdc::checkpoint::InMemoryCheckpoint;
+use rustcdc::schema_history::InMemorySchemaHistory;
 
 async fn run_once() -> Result<()> {
   let checkpoint = InMemoryCheckpoint::default();
@@ -158,7 +158,7 @@ Important semantics:
 To preserve pre-existing availability-biased behavior, opt into continue mode explicitly:
 
 ```rust
-use cdc_rs::PostCommitSourceConfirmPolicy;
+use rustcdc::PostCommitSourceConfirmPolicy;
 
 let config = config.with_post_commit_source_confirm_policy(
   PostCommitSourceConfirmPolicy::Continue,
@@ -167,13 +167,13 @@ let config = config.with_post_commit_source_confirm_policy(
 
 ### Sink-Side Idempotency Guard
 
-For at-least-once replay tolerance, cdc-rs now provides a built-in
+For at-least-once replay tolerance, rustcdc now provides a built-in
 `EventIdempotencyGuard` helper for consumer loops.
 
 ```rust
-use cdc_rs::{EventIdempotencyGuard, Result};
+use rustcdc::{EventIdempotencyGuard, Result};
 
-async fn process_batch(events: &[cdc_rs::Event]) -> Result<usize> {
+async fn process_batch(events: &[rustcdc::Event]) -> Result<usize> {
   let mut guard = EventIdempotencyGuard::new(100_000)?.with_ttl_ms(60_000)?;
   let mut applied = 0usize;
 
@@ -237,7 +237,7 @@ For transient source connectivity failures, configure `ConnectionRetryPolicy` vi
 (`SourceError`, `TimeoutError`); fatal configuration errors propagate immediately.
 
 ```rust
-use cdc_rs::core::ConnectionRetryPolicy;
+use rustcdc::core::ConnectionRetryPolicy;
 
 let policy = ConnectionRetryPolicy {
     max_retries: Some(5),       // None = retry indefinitely
@@ -258,7 +258,7 @@ errors (unknown field names, unsupported operators, wrong token count) are caugh
 construction time rather than silently at apply time.
 
 ```rust
-use cdc_rs::transform::{FilterProjectionConfig, FilterProjectionTransform};
+use rustcdc::transform::{FilterProjectionConfig, FilterProjectionTransform};
 
 let transform = FilterProjectionTransform::new(FilterProjectionConfig {
     filter_expr: Some("op == 'insert'".into()),
@@ -280,7 +280,7 @@ let transform = FilterProjectionTransform::new(FilterProjectionConfig {
 
 ## MariaDB Support
 
-cdc-rs supports **MariaDB 10.5 and 10.6** via the MySQL connector. The
+rustcdc supports **MariaDB 10.5 and 10.6** via the MySQL connector. The
 `mysql_async` library handles the MariaDB binlog wire protocol transparently;
 no separate connector type is needed.
 
@@ -297,7 +297,7 @@ no separate connector type is needed.
 | Transaction boundaries     | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
 | Schema change events       | ✅          | ✅        | ✅ | ✅          |
 
-**Note on schema change events**: Runtime connectors emit canonical `Operation::SchemaChange` events for supported DDL capture paths. Use `cdc_rs::ddl_capture` and `cdc_rs::schema_history` together when building schema-aware downstream consumers.
+**Note on schema change events**: Runtime connectors emit canonical `Operation::SchemaChange` events for supported DDL capture paths. Use `rustcdc::ddl_capture` and `rustcdc::schema_history` together when building schema-aware downstream consumers.
 
 **MariaDB nuance**: MariaDB schema-change behavior follows the MySQL connector path and is exercised in integration coverage, but depth may vary by engine/version-specific DDL semantics.
 
@@ -306,13 +306,13 @@ no separate connector type is needed.
 Use `MysqlSourceConfig` exactly as you would for MySQL:
 
 ```rust
-use cdc_rs::source::mysql::MysqlSourceConfig;
+use rustcdc::source::mysql::MysqlSourceConfig;
 
 let config = MysqlSourceConfig {
     host: "mariadb-host".into(),
     port: 3306,
     user: "replication_user".into(),
-    password: cdc_rs::SecretString::new("secret"),
+    password: rustcdc::SecretString::new("secret"),
     database: "my_db".into(),
     ..Default::default()
 };

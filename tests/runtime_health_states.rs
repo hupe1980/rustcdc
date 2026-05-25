@@ -3,10 +3,10 @@
 //! These tests verify that the runtime admin surface correctly identifies
 //! the operational state of the CDC system under various conditions.
 
-use cdc_rs::checkpoint::InMemoryCheckpoint;
-use cdc_rs::core::CdcRuntime;
-use cdc_rs::core::{Event, Operation, RuntimeConfig, RuntimeSourceConfig, SourceMetadata};
-use cdc_rs::schema_history::InMemorySchemaHistory;
+use rustcdc::checkpoint::InMemoryCheckpoint;
+use rustcdc::core::CdcRuntime;
+use rustcdc::core::{Event, Operation, RuntimeConfig, RuntimeSourceConfig, SourceMetadata};
+use rustcdc::schema_history::InMemorySchemaHistory;
 use serde_json::json;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,7 +40,7 @@ fn make_event_with_id(id: u64) -> Event {
         primary_key: Some(vec!["id".to_string()]),
         snapshot: None,
         transaction: None,
-        envelope_version: cdc_rs::core::EVENT_ENVELOPE_VERSION,
+        envelope_version: rustcdc::core::EVENT_ENVELOPE_VERSION,
     }
 }
 

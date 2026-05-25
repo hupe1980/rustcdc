@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package cdc_rs;
+package rustcdc;
 
-// Canonical CDC event envelope — cdc-rs envelope_version=1
+// Canonical CDC event envelope — rustcdc envelope_version=1
 //
 // Field numbers are stable. New fields will only be added with new tag numbers.
 // Consumers MUST ignore unknown fields (standard protobuf behaviour).
@@ -13,7 +13,7 @@ package cdc_rs;
 //   - `envelope_version` is currently always 1.
 //
 // Usage example (Go):
-//   import "github.com/acme/cdc_rs/proto/event_pb"
+//   import "github.com/acme/rustcdc/proto/event_pb"
 //   e := &event_pb.Event{}
 //   proto.Unmarshal(data, e)
 //   after := make(map[string]interface{})

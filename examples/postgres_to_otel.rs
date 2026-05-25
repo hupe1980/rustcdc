@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, EventTracer,
     MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector, PostgresSourceConfig,
     RuntimeConfig, RuntimeObservability, RuntimeSourceConfig, StructuredLogger,
@@ -24,10 +24,10 @@ use serde_json::json;
 
 /// Runs a PostgreSQL CDC pipeline with OTLP metrics/tracing and structured lifecycle logs.
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> cdc_rs::Result<()> {
+async fn main() -> rustcdc::Result<()> {
     // Parse config from env/CLI so this sample can run both locally and in CI.
     let args = ExampleArgs::from_env_and_args()?;
-    std::fs::create_dir_all(&args.checkpoint_dir).map_err(cdc_rs::Error::IoError)?;
+    std::fs::create_dir_all(&args.checkpoint_dir).map_err(rustcdc::Error::IoError)?;
 
     let otel_config = OTelConfig::new(
         args.otlp_endpoint.clone(),
@@ -280,19 +280,19 @@ struct ExampleArgs {
 
 impl ExampleArgs {
     /// Parse args with env defaults first, then apply CLI overrides.
-    fn from_env_and_args() -> cdc_rs::Result<Self> {
+    fn from_env_and_args() -> rustcdc::Result<Self> {
         let mut out = Self {
             host: env_or_default("CDC_RS_POSTGRES_HOST", "localhost"),
             port: env_or_default("CDC_RS_POSTGRES_PORT", "5432")
                 .parse::<u16>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_POSTGRES_PORT: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_POSTGRES_PORT: {error}"))
                 })?,
             user: env_or_default("CDC_RS_POSTGRES_USER", "postgres"),
             password: env_or_default("CDC_RS_POSTGRES_PASSWORD", "postgres"),
             database: env_or_default("CDC_RS_POSTGRES_DB", "postgres"),
-            replication_slot_name: env_or_default("CDC_RS_REPLICATION_SLOT_NAME", "cdc_rs_slot"),
-            publication_name: env_or_default("CDC_RS_PUBLICATION_NAME", "cdc_rs_publication"),
+            replication_slot_name: env_or_default("CDC_RS_REPLICATION_SLOT_NAME", "rustcdc_slot"),
+            publication_name: env_or_default("CDC_RS_PUBLICATION_NAME", "rustcdc_publication"),
             snapshot_tables: env_or_default("CDC_RS_SNAPSHOT_TABLES", "public.orders")
                 .split(',')
                 .map(str::trim)
@@ -301,35 +301,35 @@ impl ExampleArgs {
                 .collect(),
             checkpoint_dir: PathBuf::from(env_or_default(
                 "CDC_RS_CHECKPOINT_DIR",
-                "./target/cdc-rs-checkpoints",
+                "./target/rustcdc-checkpoints",
             )),
             max_buffer_size: env_or_default("CDC_RS_MAX_BUFFER_SIZE", "1000")
                 .parse::<usize>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_MAX_BUFFER_SIZE: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_MAX_BUFFER_SIZE: {error}"))
                 })?,
             poll_wait_ms: env_or_default("CDC_RS_POLL_WAIT_MS", "500")
                 .parse::<u64>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_POLL_WAIT_MS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_POLL_WAIT_MS: {error}"))
                 })?,
             conn_timeout_secs: env_or_default("CDC_RS_CONN_TIMEOUT_SECS", "30")
                 .parse::<u64>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_CONN_TIMEOUT_SECS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_CONN_TIMEOUT_SECS: {error}"))
                 })?,
             max_events: env_or_default("CDC_RS_MAX_EVENTS", "0")
                 .parse::<usize>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_MAX_EVENTS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_MAX_EVENTS: {error}"))
                 })?,
             max_runtime_secs: env_or_default("CDC_RS_MAX_RUNTIME_SECS", "0")
                 .parse::<u64>()
                 .map_err(|error| {
-                    cdc_rs::Error::ConfigError(format!("invalid CDC_RS_MAX_RUNTIME_SECS: {error}"))
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_MAX_RUNTIME_SECS: {error}"))
                 })?,
             otlp_endpoint: env_or_default("CDC_RS_OTLP_ENDPOINT", "http://localhost:4317"),
-            service_name: env_or_default("CDC_RS_SERVICE_NAME", "cdc-rs-postgres-example"),
+            service_name: env_or_default("CDC_RS_SERVICE_NAME", "rustcdc-postgres-example"),
             service_version: env_or_default("CDC_RS_SERVICE_VERSION", env!("CARGO_PKG_VERSION")),
             environment: env_or_default("CDC_RS_ENVIRONMENT", "dev"),
         };
@@ -342,7 +342,7 @@ impl ExampleArgs {
                     out.port = next_value(&mut args, "--port")?
                         .parse::<u16>()
                         .map_err(|error| {
-                            cdc_rs::Error::ConfigError(format!("invalid --port: {error}"))
+                            rustcdc::Error::ConfigError(format!("invalid --port: {error}"))
                         })?
                 }
                 "--user" => out.user = next_value(&mut args, "--user")?,
@@ -370,14 +370,14 @@ impl ExampleArgs {
                     out.max_events = next_value(&mut args, "--max-events")?
                         .parse::<usize>()
                         .map_err(|error| {
-                            cdc_rs::Error::ConfigError(format!("invalid --max-events: {error}"))
+                            rustcdc::Error::ConfigError(format!("invalid --max-events: {error}"))
                         })?
                 }
                 "--max-runtime-secs" => {
                     out.max_runtime_secs = next_value(&mut args, "--max-runtime-secs")?
                         .parse::<u64>()
                         .map_err(|error| {
-                            cdc_rs::Error::ConfigError(format!(
+                            rustcdc::Error::ConfigError(format!(
                                 "invalid --max-runtime-secs: {error}"
                             ))
                         })?
@@ -393,7 +393,7 @@ impl ExampleArgs {
                     std::process::exit(0);
                 }
                 other => {
-                    return Err(cdc_rs::Error::ConfigError(format!(
+                    return Err(rustcdc::Error::ConfigError(format!(
                         "unknown argument: {other}"
                     )));
                 }
@@ -401,7 +401,7 @@ impl ExampleArgs {
         }
 
         if out.snapshot_tables.is_empty() {
-            return Err(cdc_rs::Error::ConfigError(
+            return Err(rustcdc::Error::ConfigError(
                 "snapshot tables must not be empty; provide --snapshot-tables or CDC_RS_SNAPSHOT_TABLES".to_string(),
             ));
         }
@@ -413,9 +413,9 @@ fn env_or_default(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> cdc_rs::Result<String> {
+fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> rustcdc::Result<String> {
     args.next()
-        .ok_or_else(|| cdc_rs::Error::ConfigError(format!("missing value for {flag}")))
+        .ok_or_else(|| rustcdc::Error::ConfigError(format!("missing value for {flag}")))
 }
 
 /// Emit structured JSON lifecycle markers for humans and log backends.
@@ -441,8 +441,8 @@ Options:\n\
   --user <user>                 PostgreSQL user (default: postgres)\n\
   --password <password>         PostgreSQL password\n\
   --database <db>               PostgreSQL database\n\
-  --replication-slot-name <name> Replication slot name (default: cdc_rs_slot)\n\
-  --publication-name <name>     Publication name (default: cdc_rs_publication)\n\
+  --replication-slot-name <name> Replication slot name (default: rustcdc_slot)\n\
+  --publication-name <name>     Publication name (default: rustcdc_publication)\n\
   --snapshot-tables <csv>       Snapshot table list (default: public.orders)\n\
   --checkpoint-dir <path>       Checkpoint directory\n\
   --commit-every <n>            Commit cadence in events (default: 50)\n\

@@ -261,7 +261,7 @@ impl IdempotencyOptions {
 ///
 /// # Example
 /// ```
-/// use cdc_rs::core::ConnectionRetryPolicy;
+/// use rustcdc::core::ConnectionRetryPolicy;
 ///
 /// let policy = ConnectionRetryPolicy {
 ///     max_retries: Some(5),

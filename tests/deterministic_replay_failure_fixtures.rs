@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use cdc_rs::deterministic_replay::{Fixture, ReplaySession};
+use rustcdc::deterministic_replay::{Fixture, ReplaySession};
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/deterministic_replay")

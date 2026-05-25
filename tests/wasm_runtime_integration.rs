@@ -4,14 +4,14 @@
 //! (or are filtered by) a WASM module loaded from `fixtures/wasm/`.
 
 use async_trait::async_trait;
-use cdc_rs::checkpoint::InMemoryCheckpoint;
-use cdc_rs::core::{
+use rustcdc::checkpoint::InMemoryCheckpoint;
+use rustcdc::core::{
     CdcRuntime, Event, Operation, RuntimeConfig, RuntimeSourceConfig, SourceMetadata,
     TransformErrorPolicy, EVENT_ENVELOPE_VERSION,
 };
-use cdc_rs::schema_history::InMemorySchemaHistory;
-use cdc_rs::transform::Transform;
-use cdc_rs::wasm::{TransformResult, WasmConfig, WasmRuntime};
+use rustcdc::schema_history::InMemorySchemaHistory;
+use rustcdc::transform::Transform;
+use rustcdc::wasm::{TransformResult, WasmConfig, WasmRuntime};
 use serde_json::json;
 use std::path::Path;
 use tokio::sync::Mutex;
@@ -79,7 +79,7 @@ struct RuntimeWasmTransform {
 }
 
 impl RuntimeWasmTransform {
-    async fn new(config: WasmConfig) -> cdc_rs::Result<Self> {
+    async fn new(config: WasmConfig) -> rustcdc::Result<Self> {
         let mut runtime = WasmRuntime::new_with_config(config)?;
         runtime.init().await?;
         Ok(Self {
@@ -90,7 +90,7 @@ impl RuntimeWasmTransform {
 
 #[async_trait]
 impl Transform for RuntimeWasmTransform {
-    async fn apply(&self, event: &mut Event) -> cdc_rs::Result<bool> {
+    async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         let mut runtime = self.runtime.lock().await;
         match runtime.transform(event).await? {
             TransformResult::Ok(transformed) => {

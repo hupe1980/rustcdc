@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlserver")]
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::Checkpoint, checkpoint::InMemoryCheckpoint, source::Source, Operation,
     SqlServerConnection,
 };
@@ -11,18 +11,18 @@ mod sqlserver_testkit;
 async fn sql_exec(
     client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     sql: &str,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     client
         .execute(sql, &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     Ok(())
 }
 
 async fn sql_exec_with_retry(
     client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     sql: &str,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     const MAX_ATTEMPTS: usize = 8;
 
     for attempt in 1..=MAX_ATTEMPTS {
@@ -41,18 +41,18 @@ async fn sql_exec_with_retry(
         }
     }
 
-    Err(cdc_rs::Error::StateError(
+    Err(rustcdc::Error::StateError(
         "sql_exec_with_retry exhausted attempts unexpectedly".to_string(),
     ))
 }
 
 async fn collect_events_with_deadline(
-    stream: &mut dyn cdc_rs::source::StreamHandle,
+    stream: &mut dyn rustcdc::source::StreamHandle,
     admin: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
     database: &str,
     max_wait: std::time::Duration,
     require_full_crud: bool,
-) -> cdc_rs::Result<Vec<cdc_rs::Event>> {
+) -> rustcdc::Result<Vec<rustcdc::Event>> {
     let deadline = std::time::Instant::now() + max_wait;
     let mut events = Vec::new();
     let cdc_scan_sql = format!("USE {database}; EXEC sys.sp_cdc_scan");
@@ -69,13 +69,13 @@ async fn collect_events_with_deadline(
         if require_full_crud {
             let has_insert = events
                 .iter()
-                .any(|event| event.op == cdc_rs::Operation::Insert);
+                .any(|event| event.op == rustcdc::Operation::Insert);
             let has_update = events
                 .iter()
-                .any(|event| event.op == cdc_rs::Operation::Update);
+                .any(|event| event.op == rustcdc::Operation::Update);
             let has_delete = events
                 .iter()
-                .any(|event| event.op == cdc_rs::Operation::Delete);
+                .any(|event| event.op == rustcdc::Operation::Delete);
             if has_insert && has_update && has_delete {
                 break;
             }
@@ -88,7 +88,7 @@ async fn collect_events_with_deadline(
 }
 
 #[tokio::test]
-async fn sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Result<()> {
+async fn sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Result<()> {
     const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -96,13 +96,13 @@ async fn sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Result<()
     })
     .await
     .map_err(|_| {
-        cdc_rs::Error::TimeoutError(
+        rustcdc::Error::TimeoutError(
             "sqlserver stream integration exceeded 300s timeout".to_string(),
         )
     })?
 }
 
-async fn run_sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Result<()> {
+async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver stream integration test") {
         return Ok(());
     }
@@ -120,28 +120,28 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Resul
 
     sql_exec(
         &mut admin,
-        "IF DB_ID('cdc_rs_test') IS NULL CREATE DATABASE cdc_rs_test",
+        "IF DB_ID('rustcdc_test') IS NULL CREATE DATABASE rustcdc_test",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_test; IF OBJECT_ID('dbo.users', 'U') IS NULL CREATE TABLE dbo.users (id INT NOT NULL PRIMARY KEY, name NVARCHAR(100) NOT NULL)",
+        "USE rustcdc_test; IF OBJECT_ID('dbo.users', 'U') IS NULL CREATE TABLE dbo.users (id INT NOT NULL PRIMARY KEY, name NVARCHAR(100) NOT NULL)",
     )
     .await?;
-    sql_exec(&mut admin, "USE cdc_rs_test; DELETE FROM dbo.users").await?;
+    sql_exec(&mut admin, "USE rustcdc_test; DELETE FROM dbo.users").await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_test; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
+        "USE rustcdc_test; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_test; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='users', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_test; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='users', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let config = sqlserver_testkit::source_config(host.clone(), port, "cdc_rs_test".into(), 30);
+    let config = sqlserver_testkit::source_config(host.clone(), port, "rustcdc_test".into(), 30);
 
     let mut source = SqlServerConnection::new(config.clone());
     source.connect().await?;
@@ -150,24 +150,24 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Resul
     // initial change batch
     sql_exec(
         &mut admin,
-        "USE cdc_rs_test; INSERT INTO dbo.users (id, name) VALUES (1, 'alice'), (2, 'bob')",
+        "USE rustcdc_test; INSERT INTO dbo.users (id, name) VALUES (1, 'alice'), (2, 'bob')",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_test; UPDATE dbo.users SET name='alice_v2' WHERE id=1",
+        "USE rustcdc_test; UPDATE dbo.users SET name='alice_v2' WHERE id=1",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_test; DELETE FROM dbo.users WHERE id=2",
+        "USE rustcdc_test; DELETE FROM dbo.users WHERE id=2",
     )
     .await?;
 
     let events = collect_events_with_deadline(
         &mut *stream,
         &mut admin,
-        "cdc_rs_test",
+        "rustcdc_test",
         std::time::Duration::from_secs(90),
         true,
     )
@@ -175,13 +175,13 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Resul
 
     let has_insert = events
         .iter()
-        .any(|event| event.op == cdc_rs::Operation::Insert);
+        .any(|event| event.op == rustcdc::Operation::Insert);
     let has_update = events
         .iter()
-        .any(|event| event.op == cdc_rs::Operation::Update);
+        .any(|event| event.op == rustcdc::Operation::Update);
     let has_delete = events
         .iter()
-        .any(|event| event.op == cdc_rs::Operation::Delete);
+        .any(|event| event.op == rustcdc::Operation::Delete);
 
     assert!(
         has_insert && has_update && has_delete,
@@ -191,10 +191,10 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Resul
 
     let mut checkpoint = InMemoryCheckpoint::default();
     stream.save_position(&mut checkpoint).await?;
-    let resume: Box<dyn cdc_rs::Offset> = checkpoint
+    let resume: Box<dyn rustcdc::Offset> = checkpoint
         .load()
         .await?
-        .ok_or_else(|| cdc_rs::Error::CheckpointError("missing stream checkpoint".into()))?;
+        .ok_or_else(|| rustcdc::Error::CheckpointError("missing stream checkpoint".into()))?;
 
     source.close().await;
 
@@ -205,14 +205,14 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Resul
 
     sql_exec(
         &mut admin,
-        "USE cdc_rs_test; INSERT INTO dbo.users (id, name) VALUES (3, 'carol')",
+        "USE rustcdc_test; INSERT INTO dbo.users (id, name) VALUES (3, 'carol')",
     )
     .await?;
 
     let resumed_events = collect_events_with_deadline(
         &mut *resumed_stream,
         &mut admin,
-        "cdc_rs_test",
+        "rustcdc_test",
         std::time::Duration::from_secs(90),
         false,
     )
@@ -237,7 +237,7 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> cdc_rs::Resul
 }
 
 #[tokio::test]
-async fn sqlserver_stream_emits_schema_change_for_capture_metadata_refresh() -> cdc_rs::Result<()> {
+async fn sqlserver_stream_emits_schema_change_for_capture_metadata_refresh() -> rustcdc::Result<()> {
     const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -245,14 +245,14 @@ async fn sqlserver_stream_emits_schema_change_for_capture_metadata_refresh() -> 
     })
     .await
     .map_err(|_| {
-        cdc_rs::Error::TimeoutError(
+        rustcdc::Error::TimeoutError(
             "sqlserver schema-change integration exceeded 300s timeout".to_string(),
         )
     })?
 }
 
 async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh(
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver schema-change integration test") {
         return Ok(());
     }
@@ -270,33 +270,33 @@ async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh(
 
     sql_exec(
         &mut admin,
-        "IF DB_ID('cdc_rs_schema_change') IS NULL CREATE DATABASE cdc_rs_schema_change",
+        "IF DB_ID('rustcdc_schema_change') IS NULL CREATE DATABASE rustcdc_schema_change",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_schema_change; IF OBJECT_ID('dbo.users', 'U') IS NULL CREATE TABLE dbo.users (id INT NOT NULL PRIMARY KEY, name NVARCHAR(100) NOT NULL)",
+        "USE rustcdc_schema_change; IF OBJECT_ID('dbo.users', 'U') IS NULL CREATE TABLE dbo.users (id INT NOT NULL PRIMARY KEY, name NVARCHAR(100) NOT NULL)",
     )
     .await?;
     sql_exec(
         &mut admin,
-        "USE cdc_rs_schema_change; DELETE FROM dbo.users",
+        "USE rustcdc_schema_change; DELETE FROM dbo.users",
     )
     .await?;
     sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_schema_change; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
+        "USE rustcdc_schema_change; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
     sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_schema_change; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='users', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_schema_change; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='users', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let config =
-        sqlserver_testkit::source_config(host.clone(), port, "cdc_rs_schema_change".into(), 30);
+        sqlserver_testkit::source_config(host.clone(), port, "rustcdc_schema_change".into(), 30);
 
     let mut source = SqlServerConnection::new(config);
     source.connect().await?;
@@ -305,24 +305,24 @@ async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh(
     // Trigger capture metadata drift by changing source table and recreating capture instance.
     sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_schema_change; ALTER TABLE dbo.users ADD email NVARCHAR(255) NULL",
+        "USE rustcdc_schema_change; ALTER TABLE dbo.users ADD email NVARCHAR(255) NULL",
     )
     .await?;
     sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_schema_change; EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='users', @capture_instance='dbo_users'",
+        "USE rustcdc_schema_change; EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='users', @capture_instance='dbo_users'",
     )
     .await?;
     sql_exec_with_retry(
         &mut admin,
-        "USE cdc_rs_schema_change; EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='users', @role_name=NULL, @supports_net_changes=0",
+        "USE rustcdc_schema_change; EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='users', @role_name=NULL, @supports_net_changes=0",
     )
     .await?;
 
     let events = collect_events_with_deadline(
         stream.as_mut(),
         &mut admin,
-        "cdc_rs_schema_change",
+        "rustcdc_schema_change",
         std::time::Duration::from_secs(90),
         false,
     )

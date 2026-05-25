@@ -121,7 +121,7 @@ impl OTelMetricsCollector {
             .with_reader(reader)
             .build();
 
-        let meter = meter_provider.meter("cdc-rs");
+        let meter = meter_provider.meter("rustcdc");
         let instruments = MetricsInstruments {
             events_processed: meter
                 .u64_counter("cdc.events.processed")
@@ -504,7 +504,7 @@ impl OTelEventTracer {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(TracingState::default())),
-            tracer: Arc::new(global::tracer("cdc-rs")),
+            tracer: Arc::new(global::tracer("rustcdc")),
             source_type: "unknown".to_string(),
         }
     }
@@ -531,7 +531,7 @@ impl OTelEventTracer {
 
         Ok(Self {
             state: Arc::new(Mutex::new(TracingState::default())),
-            tracer: Arc::new(global::tracer("cdc-rs")),
+            tracer: Arc::new(global::tracer("rustcdc")),
             source_type: "unknown".to_string(),
         })
     }

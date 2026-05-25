@@ -1,7 +1,7 @@
 #![cfg(feature = "mysql")]
 
-use cdc_rs::{source::Source, MysqlConnection, MysqlSourceConfig};
-use cdc_rs::TransportConfig;
+use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
+use rustcdc::TransportConfig;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -9,7 +9,7 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
-async fn connect_with_retry(connection: &MysqlConnection) -> cdc_rs::Result<()> {
+async fn connect_with_retry(connection: &MysqlConnection) -> rustcdc::Result<()> {
     let mut last_error = None;
     for _ in 0..30 {
         match connection.connect().await {
@@ -22,13 +22,13 @@ async fn connect_with_retry(connection: &MysqlConnection) -> cdc_rs::Result<()> 
     }
 
     Err(last_error.unwrap_or_else(|| {
-        cdc_rs::Error::SourceError("mysql connection did not become ready in time".into())
+        rustcdc::Error::SourceError("mysql connection did not become ready in time".into())
     }))
 }
 
 /// Test MySQL 8.0 connection lifecycle
 #[tokio::test]
-async fn mysql_connection_8_0() -> cdc_rs::Result<()> {
+async fn mysql_connection_8_0() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql connection integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -41,16 +41,16 @@ async fn mysql_connection_8_0() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),
@@ -85,7 +85,7 @@ async fn mysql_connection_8_0() -> cdc_rs::Result<()> {
 
 /// Test MySQL 8.1 connection lifecycle
 #[tokio::test]
-async fn mysql_connection_8_1() -> cdc_rs::Result<()> {
+async fn mysql_connection_8_1() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql connection integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -98,16 +98,16 @@ async fn mysql_connection_8_1() -> cdc_rs::Result<()> {
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = MysqlSourceConfig {
         host: host.to_string(),

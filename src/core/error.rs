@@ -1,9 +1,9 @@
 //! Error types used across the crate.
 
-/// Shared result type for cdc-rs.
+/// Shared result type for rustcdc.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Top-level error type for cdc-rs operations.
+/// Top-level error type for rustcdc operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Source-specific failure.

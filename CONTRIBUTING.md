@@ -1,6 +1,6 @@
-# Contributing to cdc-rs
+# Contributing to rustcdc
 
-Thank you for your interest in contributing to cdc-rs!
+Thank you for your interest in contributing to rustcdc!
 
 ## Prerequisites
 
@@ -50,8 +50,8 @@ Pass `--all-features` to build and test with all connectors enabled.
 The `Transform` trait uses RPITIT — no `#[async_trait]` needed:
 
 ```rust
-use cdc_rs::transform::{Transform, BoxTransform};
-use cdc_rs::core::Event;
+use rustcdc::transform::{Transform, BoxTransform};
+use rustcdc::core::Event;
 
 struct MyTransform;
 

@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
-use cdc_rs::deterministic_replay::{semantic_diff, DiffLevel, Fixture, ReplaySession};
-use cdc_rs::Event;
+use rustcdc::deterministic_replay::{semantic_diff, DiffLevel, Fixture, ReplaySession};
+use rustcdc::Event;
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/deterministic_replay")

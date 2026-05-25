@@ -1,6 +1,6 @@
 # Reliability Testing Guide
 
-This guide documents the cdc-rs reliability validation toolchain and how to use it in CI and local development.
+This guide documents the rustcdc reliability validation toolchain and how to use it in CI and local development.
 
 ## Audience
 
@@ -12,9 +12,9 @@ This guide documents the cdc-rs reliability validation toolchain and how to use 
 
 The reliability stack is split into three complementary layers:
 
-1. Deterministic replay (`cdc_rs::deterministic_replay`) for protocol-level regression checks.
-2. Fault injection (`cdc_rs::fault_injection`) for crash and error-path validation.
-3. Adapter conformance harness (`cdc_rs::testkit`) for sink lifecycle contract checks.
+1. Deterministic replay (`rustcdc::deterministic_replay`) for protocol-level regression checks.
+2. Fault injection (`rustcdc::fault_injection`) for crash and error-path validation.
+3. Adapter conformance harness (`rustcdc::testkit`) for sink lifecycle contract checks.
 
 Use all three layers together for high confidence before releases.
 
@@ -75,7 +75,7 @@ Fault injection exercises code paths that are difficult to hit with live systems
 
 ## Adapter Conformance Harness
 
-`cdc_rs::testkit` provides a reference `SinkAdapter` contract test suite.
+`rustcdc::testkit` provides a reference `SinkAdapter` contract test suite.
 
 ### Key Types
 

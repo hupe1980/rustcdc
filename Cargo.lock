@@ -529,53 +529,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cdc-rs"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "ahash",
- "apache-avro",
- "async-trait",
- "base64 0.22.1",
- "criterion",
- "futures-util",
- "hkdf",
- "hmac 0.12.1",
- "mysql_async",
- "mysql_common",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "prost 0.13.5",
- "regex",
- "reqwest",
- "rustls 0.23.40",
- "rustls-native-certs 0.8.3",
- "rustls-pemfile 2.2.0",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tempfile",
- "testcontainers",
- "thiserror 2.0.18",
- "tiberius",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tokio-rustls 0.25.0",
- "tokio-test",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "wasmparser 0.240.0",
- "wasmtime",
- "wat",
- "zeroize",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3418,6 +3371,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
+name = "rustcdc"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "ahash",
+ "apache-avro",
+ "async-trait",
+ "base64 0.22.1",
+ "criterion",
+ "futures-util",
+ "hkdf",
+ "hmac 0.12.1",
+ "mysql_async",
+ "mysql_common",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "prost 0.13.5",
+ "regex",
+ "reqwest",
+ "rustls 0.23.40",
+ "rustls-native-certs 0.8.3",
+ "rustls-pemfile 2.2.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "testcontainers",
+ "thiserror 2.0.18",
+ "tiberius",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-rustls 0.25.0",
+ "tokio-test",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "wasmparser 0.240.0",
+ "wasmtime",
+ "wat",
+ "zeroize",
+]
+
+[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6031,7 +6031,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
- "cdc-rs",
+ "rustcdc",
  "tokio",
 ]
 

@@ -2,30 +2,30 @@
 use std::{env, fs, path::PathBuf, time::Duration};
 
 #[cfg(feature = "mysql")]
-use cdc_rs::{
+use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
     MysqlSourceConfig, RuntimeConfig, RuntimeSourceConfig, TransportConfig,
 };
 
 #[cfg(feature = "mysql")]
-fn required_env(name: &str) -> cdc_rs::Result<String> {
-    env::var(name).map_err(|_| cdc_rs::Error::ConfigError(format!("missing env var {name}")))
+fn required_env(name: &str) -> rustcdc::Result<String> {
+    env::var(name).map_err(|_| rustcdc::Error::ConfigError(format!("missing env var {name}")))
 }
 
 #[cfg(feature = "mysql")]
-fn required_u16_env(name: &str) -> cdc_rs::Result<u16> {
+fn required_u16_env(name: &str) -> rustcdc::Result<u16> {
     let value = required_env(name)?;
     value
         .parse::<u16>()
-        .map_err(|error| cdc_rs::Error::ConfigError(format!("invalid {name}: {error}")))
+        .map_err(|error| rustcdc::Error::ConfigError(format!("invalid {name}: {error}")))
 }
 
 #[cfg(feature = "mysql")]
-fn required_u32_env(name: &str) -> cdc_rs::Result<u32> {
+fn required_u32_env(name: &str) -> rustcdc::Result<u32> {
     let value = required_env(name)?;
     value
         .parse::<u32>()
-        .map_err(|error| cdc_rs::Error::ConfigError(format!("invalid {name}: {error}")))
+        .map_err(|error| rustcdc::Error::ConfigError(format!("invalid {name}: {error}")))
 }
 
 #[cfg(feature = "mysql")]
@@ -51,7 +51,7 @@ fn optional_snapshot_tables() -> Vec<String> {
 }
 
 #[cfg(feature = "mysql")]
-fn event_ids(batch: &cdc_rs::EventBatch) -> Vec<String> {
+fn event_ids(batch: &rustcdc::EventBatch) -> Vec<String> {
     batch
         .events()
         .iter()
@@ -66,15 +66,15 @@ fn event_ids(batch: &cdc_rs::EventBatch) -> Vec<String> {
 }
 
 #[cfg(feature = "mysql")]
-fn write_marker_atomic(path: &std::path::Path, payload: &str) -> cdc_rs::Result<()> {
+fn write_marker_atomic(path: &std::path::Path, payload: &str) -> rustcdc::Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, payload).map_err(cdc_rs::Error::IoError)?;
-    fs::rename(&tmp, path).map_err(cdc_rs::Error::IoError)
+    fs::write(&tmp, payload).map_err(rustcdc::Error::IoError)?;
+    fs::rename(&tmp, path).map_err(rustcdc::Error::IoError)
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> cdc_rs::Result<()> {
+async fn main() -> rustcdc::Result<()> {
     let host = required_env("CDC_RS_WORKER_HOST")?;
     let port = required_u16_env("CDC_RS_WORKER_PORT")?;
     let user = required_env("CDC_RS_WORKER_USER")?;
@@ -122,7 +122,7 @@ async fn main() -> cdc_rs::Result<()> {
             if ack_first_batch {
                 let token = batch
                     .ack_token()
-                    .ok_or_else(|| cdc_rs::Error::StateError("missing ack token".into()))?;
+                    .ok_or_else(|| rustcdc::Error::StateError("missing ack token".into()))?;
                 runtime.commit_ack(token).await?;
             }
             let ids = event_ids(&batch).join(",");
@@ -139,7 +139,7 @@ async fn main() -> cdc_rs::Result<()> {
         }
     }
 
-    Err(cdc_rs::Error::TimeoutError(
+    Err(rustcdc::Error::TimeoutError(
         "worker timed out waiting for stream events".into(),
     ))
 }

@@ -1,4 +1,4 @@
-use cdc_rs::{
+use rustcdc::{
     Event, Operation, SourceMetadata, WasmConfig, WasmRuntime, WasmTransformResult,
     EVENT_ENVELOPE_VERSION,
 };

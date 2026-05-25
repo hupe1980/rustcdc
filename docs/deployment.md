@@ -1,10 +1,10 @@
 # Deployment Guide
 
-This guide documents local container deployment, runtime configuration, and production deployment baselines for cdc-rs.
+This guide documents local container deployment, runtime configuration, and production deployment baselines for rustcdc.
 
 ## Deployment Models
 
-cdc-rs can be deployed as:
+rustcdc can be deployed as:
 
 - embedded runtime in an application binary
 - example container runtime for local validation
@@ -17,7 +17,7 @@ The repository includes a Docker-based reference path for the PostgreSQL example
 ### Build Image
 
 ```bash
-docker build -t cdc-rs:postgres-example .
+docker build -t rustcdc:postgres-example .
 ```
 
 ### Start Stack
@@ -29,7 +29,7 @@ docker compose up --build
 The compose topology starts:
 
 - PostgreSQL with logical replication enabled
-- cdc-rs example runtime configured with `CDC_RS_*` variables
+- rustcdc example runtime configured with `CDC_RS_*` variables
 
 ## Runtime Configuration Variables
 
@@ -71,7 +71,7 @@ Recommended baseline controls:
 
 ## Backpressure and Slow-Consumer Behavior
 
-cdc-rs uses **cooperative flow control**: the internal event buffer grows until it reaches `max_buffer_size`, at which point the runtime pauses ingestion and blocks the poll loop until the consumer catches up via `commit_ack()`.
+rustcdc uses **cooperative flow control**: the internal event buffer grows until it reaches `max_buffer_size`, at which point the runtime pauses ingestion and blocks the poll loop until the consumer catches up via `commit_ack()`.
 
 ### How it works
 
@@ -113,7 +113,7 @@ For MySQL and SQL Server deployments, use the same runtime pattern with source-s
 
 ## HTTP Health and Admin Endpoint
 
-cdc-rs is an embeddable library and does not start an HTTP server. `CdcRuntime` exposes
+rustcdc is an embeddable library and does not start an HTTP server. `CdcRuntime` exposes
 `admin_snapshot_json()` which returns a `RuntimeAdminSnapshot` payload as JSON.
 Wire it to any HTTP server of your choice.
 
@@ -122,7 +122,7 @@ Wire it to any HTTP server of your choice.
 ```rust
 use std::sync::Arc;
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
-use cdc_rs::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig, InMemoryCheckpoint, InMemorySchemaHistory};
+use rustcdc::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig, InMemoryCheckpoint, InMemorySchemaHistory};
 
 type SharedRuntime = Arc<tokio::sync::Mutex<CdcRuntime<InMemoryCheckpoint, InMemorySchemaHistory>>>;
 

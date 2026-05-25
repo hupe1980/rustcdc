@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use cdc_rs::{MetricsCollector, OTelConfig, OTelMetricsCollector, Operation};
+use rustcdc::{MetricsCollector, OTelConfig, OTelMetricsCollector, Operation};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -28,7 +28,7 @@ service:
 "#;
 
 #[tokio::test]
-async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> cdc_rs::Result<()> {
+async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping otel metrics integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -45,22 +45,22 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> cdc
         )
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = collector_container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let otlp_port = collector_container
         .get_host_port_ipv4(4317.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let prometheus_port = collector_container
         .get_host_port_ipv4(8889.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let service_name = format!("cdc-rs-otel-metrics-{}", std::process::id());
+    let service_name = format!("rustcdc-otel-metrics-{}", std::process::id());
     let collector = OTelMetricsCollector::with_otlp_exporter(OTelConfig::new(
         format!("http://{host}:{otlp_port}"),
         service_name,
@@ -80,7 +80,7 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> cdc
     collector.record_buffer_size(128);
     collector.record_snapshot_progress(100);
     collector.record_error(
-        &cdc_rs::Error::StateError("boom".to_string()),
+        &rustcdc::Error::StateError("boom".to_string()),
         "integration",
     );
 
@@ -89,13 +89,13 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> cdc
         tokio::task::spawn_blocking(move || collector.shutdown()),
     )
     .await
-    .map_err(|_| cdc_rs::Error::TimeoutError("otel metrics shutdown timed out".to_string()))?
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))??;
+    .map_err(|_| rustcdc::Error::TimeoutError("otel metrics shutdown timed out".to_string()))?
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))??;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let mut metrics_text = String::new();
     for _ in 0..12 {
@@ -103,7 +103,7 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> cdc
             .get(format!("http://{host}:{prometheus_port}/metrics"))
             .send()
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
         if !response.status().is_success() {
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -112,7 +112,7 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> cdc
         let body = response
             .text()
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
         if body.contains("cdc_events_processed_total") && body.contains("cdc_events_filtered_total")
         {

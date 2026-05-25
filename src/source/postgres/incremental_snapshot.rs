@@ -368,7 +368,7 @@ impl IncrementalSnapshotHandle {
             // Table fully exhausted.
             self.tables[table_idx].is_complete = true;
             tracing::debug!(
-                target: "cdc_rs::source::incremental_snapshot",
+                target: "rustcdc::source::incremental_snapshot",
                 table = %self.tables[table_idx].qualified,
                 chunks = self.tables[table_idx].chunks_emitted,
                 rows = self.tables[table_idx].rows_emitted,
@@ -401,7 +401,7 @@ impl IncrementalSnapshotHandle {
             .collect();
 
         tracing::debug!(
-            target: "cdc_rs::source::incremental_snapshot",
+            target: "rustcdc::source::incremental_snapshot",
             table = %self.tables[table_idx].qualified,
             chunk = chunk_index,
             rows = chunk_rows.len(),
@@ -468,7 +468,7 @@ impl IncrementalSnapshotHandle {
         self.tables[table_idx].rows_emitted += emitted;
 
         tracing::debug!(
-            target: "cdc_rs::source::incremental_snapshot",
+            target: "rustcdc::source::incremental_snapshot",
             table = %self.tables[table_idx].qualified,
             chunk = self.tables[table_idx].chunks_emitted,
             emitted,

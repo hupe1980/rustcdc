@@ -1,6 +1,6 @@
 #![cfg(feature = "mariadb")]
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint},
     source::Source,
     MariaDbConnection, MariaDbSourceConfig, TransportConfig,
@@ -13,7 +13,7 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
-async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
+async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -29,7 +29,7 @@ async fn connect_admin_pool(dsn: &str) -> cdc_rs::Result<sqlx::MySqlPool> {
         }
     }
 
-    Err(cdc_rs::Error::SourceError(format!(
+    Err(rustcdc::Error::SourceError(format!(
         "failed to connect mariadb admin pool: {}",
         last_error
             .map(|error| error.to_string())
@@ -68,7 +68,7 @@ fn skip_mariadb_e2e_case(case_label: &str) -> bool {
 macro_rules! mariadb_e2e_test {
     ($name:ident, $version:literal, $server_id:expr, $runner:ident, $label:literal) => {
         #[tokio::test]
-        async fn $name() -> cdc_rs::Result<()> {
+        async fn $name() -> rustcdc::Result<()> {
             if skip_mariadb_e2e_case($label) {
                 return Ok(());
             }
@@ -80,7 +80,7 @@ macro_rules! mariadb_e2e_test {
 async fn run_mariadb_snapshot_resume_from_checkpoint(
     version: &str,
     server_id: u32,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     let container = GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -93,17 +93,17 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .to_string();
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -111,7 +111,7 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
     sqlx::query("DROP TABLE IF EXISTS mariadb_resumption_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE mariadb_resumption_test (
@@ -121,7 +121,7 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     for batch_start in (1..=5000).step_by(500) {
         let mut query = String::from("INSERT INTO mariadb_resumption_test (value) VALUES ");
@@ -136,10 +136,10 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
         sqlx::query(&query)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut checkpoint = FileCheckpoint::new(checkpoint_dir.path());
 
     let config = MariaDbSourceConfig::default();
@@ -172,7 +172,7 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
         .checkpoint(&mut checkpoint, first_batch.len() as u64)
         .await?;
     let resume_offset = checkpoint.load().await?.ok_or_else(|| {
-        cdc_rs::Error::CheckpointError("expected checkpoint offset for mariadb snapshot".into())
+        rustcdc::Error::CheckpointError("expected checkpoint offset for mariadb snapshot".into())
     })?;
 
     drop(snapshot_1);
@@ -198,10 +198,10 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
     let mut ids = HashSet::new();
     for event in first_batch.iter().chain(resumed_events.iter()) {
         let after = event.after.as_ref().ok_or_else(|| {
-            cdc_rs::Error::SourceError("snapshot row missing after payload".into())
+            rustcdc::Error::SourceError("snapshot row missing after payload".into())
         })?;
         let id = json_i64_field(after, &["id", "@0", "@1"])
-            .ok_or_else(|| cdc_rs::Error::SourceError("snapshot row missing id".into()))?;
+            .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
         assert!(ids.insert(id), "duplicate id across resumed snapshot: {id}");
     }
 
@@ -218,7 +218,7 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
 async fn run_mariadb_stream_capture_insert_update_delete(
     version: &str,
     server_id: u32,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     let container = GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -231,17 +231,17 @@ async fn run_mariadb_stream_capture_insert_update_delete(
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .to_string();
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -249,7 +249,7 @@ async fn run_mariadb_stream_capture_insert_update_delete(
     sqlx::query("DROP TABLE IF EXISTS mariadb_stream_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE mariadb_stream_test (
@@ -260,7 +260,7 @@ async fn run_mariadb_stream_capture_insert_update_delete(
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let config = {
         let mut c = MariaDbSourceConfig::default();
@@ -288,7 +288,7 @@ async fn run_mariadb_stream_capture_insert_update_delete(
             .bind(format!("insert-{i}"))
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
     for i in 1..=15 {
         sqlx::query("UPDATE mariadb_stream_test SET value = ? WHERE id = ?")
@@ -296,14 +296,14 @@ async fn run_mariadb_stream_capture_insert_update_delete(
             .bind(i)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
     for i in 31..=40 {
         sqlx::query("DELETE FROM mariadb_stream_test WHERE id = ?")
             .bind(i)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let mut events = Vec::new();
@@ -324,9 +324,9 @@ async fn run_mariadb_stream_capture_insert_update_delete(
     let mut deletes = 0;
     for event in &events {
         match event.op {
-            cdc_rs::core::Operation::Insert => inserts += 1,
-            cdc_rs::core::Operation::Update => updates += 1,
-            cdc_rs::core::Operation::Delete => deletes += 1,
+            rustcdc::core::Operation::Insert => inserts += 1,
+            rustcdc::core::Operation::Update => updates += 1,
+            rustcdc::core::Operation::Delete => deletes += 1,
             _ => {}
         }
     }
@@ -351,7 +351,7 @@ async fn run_mariadb_stream_capture_insert_update_delete(
 async fn run_mariadb_snapshot_stream_handoff_full_cycle(
     version: &str,
     server_id: u32,
-) -> cdc_rs::Result<()> {
+) -> rustcdc::Result<()> {
     let container = GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -364,17 +364,17 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
         .to_string();
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -382,7 +382,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
     sqlx::query("DROP TABLE IF EXISTS mariadb_handoff_test")
         .execute(&admin_pool)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     sqlx::query(
         "CREATE TABLE mariadb_handoff_test (
@@ -392,7 +392,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     for batch_start in (1..=1000).step_by(100) {
         let mut query = String::from("INSERT INTO mariadb_handoff_test (value) VALUES ");
@@ -407,7 +407,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
         sqlx::query(&query)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let config = {
@@ -462,7 +462,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
         sqlx::query(&query)
             .execute(&admin_pool)
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let mut stream_events = Vec::new();

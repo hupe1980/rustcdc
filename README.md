@@ -1,6 +1,6 @@
-# cdc-rs
+# rustcdc
 
-cdc-rs is an embeddable CDC library for Rust with a correctness-first design.
+rustcdc is an embeddable CDC library for Rust with a correctness-first design.
 The repository includes canonical event contracts, checkpoint safety primitives, schema history abstractions, an embedded runtime, and PostgreSQL/MySQL/SQL Server source connectors.
 
 ## Status 🚀
@@ -85,7 +85,7 @@ bash scripts/run_benchmark_report.sh
 ## Quick Start ✅
 
 ```rust
-use cdc_rs::{checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory, RuntimeConfig, RuntimeSourceConfig};
+use rustcdc::{checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory, RuntimeConfig, RuntimeSourceConfig};
 
 let checkpoint = InMemoryCheckpoint::default();
 let schema_history = InMemorySchemaHistory::default();
@@ -102,7 +102,7 @@ let _config = config;
 - Downstream systems should apply idempotency using stable keys (for example: source + table + primary key + source offset/transaction metadata).
 
 Operational expectation:
-- Treat cdc-rs as correctness-first at-least-once transport, not exactly-once.
+- Treat rustcdc as correctness-first at-least-once transport, not exactly-once.
 - Validate sink-side deduplication in staging before production rollout.
 
 ## Runtime Transform Error Policy 🧯
@@ -111,7 +111,7 @@ Operational expectation:
 For best-effort pipelines, switch to `TransformErrorPolicy::Skip`:
 
 ```rust
-use cdc_rs::{
+use rustcdc::{
 	checkpoint::InMemoryCheckpoint,
 	schema_history::InMemorySchemaHistory,
 	PostgresSourceConfig,
@@ -127,8 +127,8 @@ let source = PostgresSourceConfig {
 	user: "postgres".into(),
 	password: "postgres".into(),
 	database: "app".into(),
-	replication_slot_name: "cdc_rs_slot".into(),
-	publication_name: "cdc_rs_publication".into(),
+	replication_slot_name: "rustcdc_slot".into(),
+	publication_name: "rustcdc_publication".into(),
 	conn_timeout_secs: 30,
 	..PostgresSourceConfig::default()
 };
@@ -147,7 +147,7 @@ If source confirmation fails after durable checkpoint commit, runtime returns an
 For availability-biased pipelines, opt into continue behavior explicitly:
 
 ```rust
-use cdc_rs::PostCommitSourceConfirmPolicy;
+use rustcdc::PostCommitSourceConfirmPolicy;
 
 let config = config.with_post_commit_source_confirm_policy(
 	PostCommitSourceConfirmPolicy::Continue,
@@ -163,7 +163,7 @@ PostgreSQL `TRUNCATE` statements are surfaced as `Operation::Truncate` events. `
 Configure `ConnectionRetryPolicy` for automatic reconnection on transient source failures:
 
 ```rust
-use cdc_rs::core::ConnectionRetryPolicy;
+use rustcdc::core::ConnectionRetryPolicy;
 
 let config = config.with_connection_retry(ConnectionRetryPolicy {
     max_retries: Some(5),    // None = retry indefinitely
@@ -179,7 +179,7 @@ Only recoverable errors (`SourceError`, `TimeoutError`) trigger retry. Fatal err
 All connectors default to TLS. For trusted private networks or local testing only, use the explicit plaintext escape hatch:
 
 ```rust
-use cdc_rs::TransportConfig;
+use rustcdc::TransportConfig;
 
 let transport = TransportConfig::plaintext(); // ⚠️ never use in production
 ```
@@ -203,7 +203,7 @@ Bring up the local PostgreSQL + `pg_to_stdout` demo stack:
 docker compose up --build
 ```
 
-The compose setup initializes `public.users` and publication `cdc_rs_example_pub` automatically.
+The compose setup initializes `public.users` and publication `rustcdc_example_pub` automatically.
 
 Stop and clean up:
 

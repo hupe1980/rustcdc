@@ -1,4 +1,4 @@
-//! Core crate surface for cdc-rs.
+//! Core crate surface for rustcdc.
 
 #![forbid(unsafe_code)]
 

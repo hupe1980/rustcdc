@@ -1,6 +1,6 @@
 #![cfg(feature = "postgres")]
 
-use cdc_rs::{
+use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
     schema_history::InMemorySchemaHistory,
     CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
@@ -12,7 +12,7 @@ use testcontainers::{
 };
 
 #[tokio::test]
-async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
+async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres runtime integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -37,23 +37,23 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
         ])
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -71,9 +71,9 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
             ",
         )
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
 
     let source_cfg = PostgresSourceConfig {
         host: host.to_string(),
@@ -104,7 +104,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
     admin_client
         .batch_execute("TRUNCATE TABLE public.runtime_users;")
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     for id in 1_i64..=100_i64 {
         admin_client
@@ -113,7 +113,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let first_batch = poll_non_empty_batch(&mut runtime, 40).await?;
@@ -130,7 +130,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
     let saved = reader
         .load()
         .await?
-        .ok_or_else(|| cdc_rs::Error::StateError("checkpoint should exist after commit".into()))?;
+        .ok_or_else(|| rustcdc::Error::StateError("checkpoint should exist after commit".into()))?;
     let saved_offset = PostgresOffset::from_bytes(&saved.encode()?)?;
     let target_lsn = format_pg_lsn(saved_offset.lsn);
     let advance_sql = format!(
@@ -139,7 +139,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
     admin_client
         .query_one(&advance_sql, &[])
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     drop(runtime);
 
@@ -162,7 +162,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
     let second_batch = poll_non_empty_batch(&mut resumed, 40).await?;
@@ -184,7 +184,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> cdc_rs::Result<()> 
 async fn poll_non_empty_batch(
     runtime: &mut CdcRuntime<FileCheckpoint, InMemorySchemaHistory>,
     rounds: usize,
-) -> cdc_rs::Result<cdc_rs::EventBatch> {
+) -> rustcdc::Result<rustcdc::EventBatch> {
     for _ in 0..rounds {
         let chunk = runtime.poll_event_batch().await?;
         if !chunk.is_empty() {
@@ -192,7 +192,7 @@ async fn poll_non_empty_batch(
         }
     }
 
-    Err(cdc_rs::Error::TimeoutError(
+    Err(rustcdc::Error::TimeoutError(
         "timed out waiting for a non-empty event batch".to_string(),
     ))
 }

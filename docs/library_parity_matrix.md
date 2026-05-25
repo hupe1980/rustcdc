@@ -1,11 +1,11 @@
 # Library Parity Matrix (Embeddable CDC Scope)
 
-This document defines how cdc-rs evaluates feature completeness against other embeddable CDC libraries, while explicitly excluding full platform/daemon expectations.
+This document defines how rustcdc evaluates feature completeness against other embeddable CDC libraries, while explicitly excluding full platform/daemon expectations.
 
 ## Purpose
 
 Use this matrix to answer:
-- Is cdc-rs complete enough for library use in production?
+- Is rustcdc complete enough for library use in production?
 - Which missing features are true gaps versus intentional non-goals?
 
 ## Baseline Comparison Set
@@ -36,7 +36,7 @@ Status values:
 
 ## Must-Have Capabilities (Release Gate)
 
-| Capability | Why this is mandatory for a library | cdc-rs status | Evidence |
+| Capability | Why this is mandatory for a library | rustcdc status | Evidence |
 |---|---|---|---|
 | Multi-source CDC capture (Postgres/MySQL/SQL Server) | Core value proposition of unified library surface | Implemented | src/source/, src/lib.rs |
 | Snapshot + streaming handoff semantics | Prevents data-loss windows during bootstrap | Implemented | src/core/runtime.rs, tests/*snapshot* |
@@ -48,7 +48,7 @@ Status values:
 
 ## Should-Have Capabilities
 
-| Capability | Why it matters | cdc-rs status | Evidence |
+| Capability | Why it matters | rustcdc status | Evidence |
 |---|---|---|---|
 | Durable schema history backend beyond in-memory | Improves restart durability for long-lived deployments | Implemented | src/schema_history/mod.rs |
 | Runtime health/admin introspection depth | Faster incident response and safer operations | Implemented | src/core/runtime.rs |
@@ -66,7 +66,7 @@ Status values:
 
 ## Current Completeness Verdict
 
-For embedded-library scope, cdc-rs is release-viable with conditions:
+For embedded-library scope, rustcdc is release-viable with conditions:
 - Must-have set is fully implemented.
 - Should-have set is now fully implemented; remaining risk is concentrated in deployment-specific policy tuning.
 

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use cdc_rs::transform::{Transform, TransformPipeline};
-use cdc_rs::{Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime, EVENT_ENVELOPE_VERSION};
+use rustcdc::transform::{Transform, TransformPipeline};
+use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime, EVENT_ENVELOPE_VERSION};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 use std::hint::black_box;
@@ -81,7 +81,7 @@ struct AddTagTransform;
 
 #[async_trait]
 impl Transform for AddTagTransform {
-    async fn apply(&self, event: &mut Event) -> cdc_rs::Result<bool> {
+    async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
             after.insert("bench_tag".to_string(), json!("benchmark"));
         }
@@ -97,7 +97,7 @@ struct NormalizeNameTransform;
 
 #[async_trait]
 impl Transform for NormalizeNameTransform {
-    async fn apply(&self, event: &mut Event) -> cdc_rs::Result<bool> {
+    async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         if let Some(name) = event
             .after
             .as_mut()

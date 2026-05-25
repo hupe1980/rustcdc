@@ -35,14 +35,14 @@ pub fn percentile(values: &[f64], pct: f64) -> f64 {
     sorted[rank]
 }
 
-pub fn write_latency_artifacts(prefix: &str, summary: &LatencySummary) -> cdc_rs::Result<()> {
+pub fn write_latency_artifacts(prefix: &str, summary: &LatencySummary) -> rustcdc::Result<()> {
     let target_dir = Path::new("target");
-    fs::create_dir_all(target_dir).map_err(cdc_rs::Error::IoError)?;
+    fs::create_dir_all(target_dir).map_err(rustcdc::Error::IoError)?;
 
     let json_path = target_dir.join(format!("{prefix}-latency-evidence.json"));
     let json = serde_json::to_string_pretty(summary)
-        .map_err(|error| cdc_rs::Error::SerializationError(error.to_string()))?;
-    fs::write(&json_path, json).map_err(cdc_rs::Error::IoError)?;
+        .map_err(|error| rustcdc::Error::SerializationError(error.to_string()))?;
+    fs::write(&json_path, json).map_err(rustcdc::Error::IoError)?;
 
     let markdown_path = target_dir.join(format!("{prefix}-latency-evidence.md"));
     let markdown = format!(
@@ -63,7 +63,7 @@ pub fn write_latency_artifacts(prefix: &str, summary: &LatencySummary) -> cdc_rs
         summary.batch_size_p95,
         summary.batch_size_p99,
     );
-    fs::write(&markdown_path, markdown).map_err(cdc_rs::Error::IoError)?;
+    fs::write(&markdown_path, markdown).map_err(rustcdc::Error::IoError)?;
 
     Ok(())
 }

@@ -1,10 +1,10 @@
-# cdc-rs Architecture
+# rustcdc Architecture
 
-This document describes the runtime architecture, safety properties, and extension boundaries of cdc-rs.
+This document describes the runtime architecture, safety properties, and extension boundaries of rustcdc.
 
 ## Design Goals
 
-cdc-rs is designed for:
+rustcdc is designed for:
 
 - deterministic change-event delivery
 - restart-safe progress tracking
@@ -86,7 +86,7 @@ This protects correctness during long-running snapshots with concurrent writes.
 
 ## Extension Points
 
-cdc-rs is designed to be extended through typed interfaces:
+rustcdc is designed to be extended through typed interfaces:
 
 - `Checkpoint` for offset persistence backends
 - `SchemaHistory` for schema state persistence
@@ -105,7 +105,7 @@ These surfaces are intended to integrate directly with service control planes an
 
 ## Failure Semantics
 
-cdc-rs provides at-least-once delivery semantics at the runtime boundary.
+rustcdc provides at-least-once delivery semantics at the runtime boundary.
 
 Operationally:
 
@@ -132,12 +132,12 @@ Recommended patterns for consumers to absorb duplicate events:
 
 - **Event deduplication table**: maintain a `processed_lsn` / `event_id` set in the destination and skip rows already present.
 - **Upsert by primary key**: for row-level CDC, use INSERT … ON CONFLICT DO UPDATE semantics so replaying the same row is idempotent.
-- **Outbox pattern**: pair cdc-rs with a transactional outbox in the destination; the outbox write and the commit become one transaction.
+- **Outbox pattern**: pair rustcdc with a transactional outbox in the destination; the outbox write and the commit become one transaction.
 - **Sequence-gated apply**: checkpoint the last-applied LSN in the destination table; skip events with `lsn ≤ last_applied`.
 
 ### Exactly-Once Patterns
 
-cdc-rs does not provide a built-in exactly-once transport protocol at the runtime boundary.
+rustcdc does not provide a built-in exactly-once transport protocol at the runtime boundary.
 Exactly-once behavior is achieved by destination-side design, such as transactional outbox,
 deduplication keys, or idempotent upserts.
 
@@ -149,7 +149,7 @@ For heterogeneous destinations (e.g., Kafka + relational DB), use two-phase comm
 2. **Commit phase**: call `runtime.commit_ack(token)` only after both destinations confirm durability.
 3. **Abort / rollback**: if either destination fails, abort and allow the runtime to replay.
 
-This is not built into cdc-rs directly; it requires the consumer to coordinate the two-phase protocol around batch ack and runtime checkpoint commit boundaries.
+This is not built into rustcdc directly; it requires the consumer to coordinate the two-phase protocol around batch ack and runtime checkpoint commit boundaries.
 
 ## Related Documentation
 

@@ -1,7 +1,7 @@
 #![cfg(feature = "mariadb")]
 
-use cdc_rs::{MariaDbConnection, MariaDbSourceConfig};
-use cdc_rs::TransportConfig;
+use rustcdc::{MariaDbConnection, MariaDbSourceConfig};
+use rustcdc::TransportConfig;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -29,7 +29,7 @@ fn skip_mariadb_connection_case(case_label: &str) -> bool {
 
 async fn start_mariadb_container(
     version: &str,
-) -> cdc_rs::Result<testcontainers::ContainerAsync<GenericImage>> {
+) -> rustcdc::Result<testcontainers::ContainerAsync<GenericImage>> {
     GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -42,10 +42,10 @@ async fn start_mariadb_container(
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
 }
 
-async fn wait_for_mariadb_admin_ready(host: &str, port: u16) -> cdc_rs::Result<()> {
+async fn wait_for_mariadb_admin_ready(host: &str, port: u16) -> rustcdc::Result<()> {
     let dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     let mut backoff = Duration::from_millis(250);
@@ -79,22 +79,22 @@ async fn wait_for_mariadb_admin_ready(host: &str, port: u16) -> cdc_rs::Result<(
         backoff = (backoff * 2).min(Duration::from_secs(2));
     }
 
-    Err(cdc_rs::Error::SourceError(format!(
+    Err(rustcdc::Error::SourceError(format!(
         "mariadb admin readiness probe timed out: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
     )))
 }
 
-async fn mariadb_base_config(version: &str, server_id: u32) -> cdc_rs::Result<MariadbTestTarget> {
+async fn mariadb_base_config(version: &str, server_id: u32) -> rustcdc::Result<MariadbTestTarget> {
     let container = start_mariadb_container(version).await?;
     let host = container
         .get_host()
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| cdc_rs::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let host_string = host.to_string();
     wait_for_mariadb_admin_ready(&host_string, port).await?;
@@ -120,7 +120,7 @@ async fn mariadb_base_config(version: &str, server_id: u32) -> cdc_rs::Result<Ma
     })
 }
 
-async fn run_mariadb_connection_lifecycle(version: &str, server_id: u32) -> cdc_rs::Result<()> {
+async fn run_mariadb_connection_lifecycle(version: &str, server_id: u32) -> rustcdc::Result<()> {
     let target = mariadb_base_config(version, server_id).await?;
     let connection = MariaDbConnection::new(target.config.into_inner());
     connect_with_retry(&connection).await?;
@@ -132,7 +132,7 @@ async fn run_mariadb_connection_lifecycle(version: &str, server_id: u32) -> cdc_
 macro_rules! mariadb_connection_test {
     ($name:ident, $version:literal, $server_id:expr, $label:literal) => {
         #[tokio::test]
-        async fn $name() -> cdc_rs::Result<()> {
+        async fn $name() -> rustcdc::Result<()> {
             if skip_mariadb_connection_case($label) {
                 return Ok(());
             }
@@ -141,7 +141,7 @@ macro_rules! mariadb_connection_test {
     };
 }
 
-async fn connect_with_retry(connection: &MariaDbConnection) -> cdc_rs::Result<()> {
+async fn connect_with_retry(connection: &MariaDbConnection) -> rustcdc::Result<()> {
     let deadline = std::time::Instant::now() + CONNECT_RETRY_BUDGET;
     let mut backoff = Duration::from_millis(250);
     let mut last_error = None;
@@ -157,7 +157,7 @@ async fn connect_with_retry(connection: &MariaDbConnection) -> cdc_rs::Result<()
     }
 
     Err(last_error.unwrap_or_else(|| {
-        cdc_rs::Error::SourceError("mariadb connection did not become ready in time".into())
+        rustcdc::Error::SourceError("mariadb connection did not become ready in time".into())
     }))
 }
 
@@ -177,7 +177,7 @@ mariadb_connection_test!(
 
 /// Test MariaDB GTID mode support
 #[tokio::test]
-async fn mariadb_gtid_mode_support() -> cdc_rs::Result<()> {
+async fn mariadb_gtid_mode_support() -> rustcdc::Result<()> {
     if skip_mariadb_connection_case("mariadb gtid mode support test") {
         return Ok(());
     }

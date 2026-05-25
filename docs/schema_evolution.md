@@ -1,6 +1,6 @@
 # Schema Evolution And DDL Capture
 
-This guide documents how cdc-rs captures DDL, tracks schema history, and emits schema-change events.
+This guide documents how rustcdc captures DDL, tracks schema history, and emits schema-change events.
 
 ## Audience
 
@@ -12,8 +12,8 @@ This guide documents how cdc-rs captures DDL, tracks schema history, and emits s
 
 Schema evolution behavior spans two modules:
 
-1. `cdc_rs::ddl_capture` for source-specific DDL extraction and normalized parsing.
-2. `cdc_rs::schema_history` for versioned schema persistence and lookup.
+1. `rustcdc::ddl_capture` for source-specific DDL extraction and normalized parsing.
+2. `rustcdc::schema_history` for versioned schema persistence and lookup.
 
 ## DDL Capture
 
@@ -56,7 +56,7 @@ Schema evolution behavior spans two modules:
 - `apply_retention` to prune old versions using explicit retention policy
 
 Runtime-managed retention is available through `RuntimeConfig::with_schema_history_retention(...)`.
-When configured, cdc-rs applies the retention policy automatically after each persisted DDL mutation.
+When configured, rustcdc applies the retention policy automatically after each persisted DDL mutation.
 
 ### Built-In Backends
 
