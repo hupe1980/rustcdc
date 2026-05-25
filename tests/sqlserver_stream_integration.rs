@@ -237,7 +237,8 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
 }
 
 #[tokio::test]
-async fn sqlserver_stream_emits_schema_change_for_capture_metadata_refresh() -> rustcdc::Result<()> {
+async fn sqlserver_stream_emits_schema_change_for_capture_metadata_refresh() -> rustcdc::Result<()>
+{
     const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
     tokio::time::timeout(TEST_TIMEOUT, async {

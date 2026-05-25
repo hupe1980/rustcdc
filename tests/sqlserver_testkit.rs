@@ -115,7 +115,9 @@ pub async fn connect_admin_with_retry(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        rustcdc::Error::SourceError("sqlserver admin connection did not become ready in time".into())
+        rustcdc::Error::SourceError(
+            "sqlserver admin connection did not become ready in time".into(),
+        )
     }))
 }
 

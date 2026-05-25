@@ -127,7 +127,9 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
-        .map_err(|error| rustcdc::Error::SourceError(format!("failed to build example: {error}")))?;
+        .map_err(|error| {
+            rustcdc::Error::SourceError(format!("failed to build example: {error}"))
+        })?;
     if !status.success() {
         return Err(rustcdc::Error::SourceError(
             "example build failed".to_string(),
