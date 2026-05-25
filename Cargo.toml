@@ -16,9 +16,11 @@ resolver = "2"
 # Default production profile with PostgreSQL source support and TLS transport enabled.
 default = ["postgres", "tls"]
 # Enable PostgreSQL-specific source implementations.
-postgres = ["dep:sqlx", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
 # Enable MySQL-specific source implementations.
 mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "tls"]
+# Enable MariaDB CDC support (thin facade over the MySQL connector).
+mariadb = ["mysql"]
 # Enable SQL Server-specific source implementations.
 sqlserver = ["dep:tiberius", "dep:tokio-util", "tls"]
 # Enable TLS-related transport support for source connectors.
@@ -26,16 +28,25 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "dep:tokio
 # Enable outbox helpers and transforms.
 outbox = []
 # Enable encryption-oriented transforms and helpers.
-encryption = ["dep:aes-gcm", "dep:base64"]
+encryption = ["dep:aes-gcm", "dep:base64", "dep:hkdf", "dep:hmac"]
 # Enable metrics and instrumentation integrations.
 metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 # Enable explicit test-only insecure transport/TLS overrides behind env toggles.
 # Never enable this feature for production builds.
 insecure-test-overrides = []
+# Enable fault-injection and chaos-testing primitives (FaultInjectingSource, FaultInjectingCheckpoint,
+# CrashSimulationValidator, DataLossValidator). Must NOT be enabled in production builds.
+test-harnesses = []
+# Enable CloudEvents 1.0 structured JSON encoding (no additional dependencies).
+cloudevents = []
+# Enable Protocol Buffer binary encoding via prost.
+protobuf = ["dep:prost"]
+# Enable Apache Avro binary encoding via apache-avro.
+avro = ["dep:apache-avro"]
 
 [dependencies]
 async-trait = "0.1.89"
-ahash = "0.8.11"
+ahash = { version = "0.8.11", features = ["serde"] }
 futures-util = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -48,12 +59,14 @@ wasmparser = "0.240.0"
 wasmtime = "24.0.2"
 aes-gcm = { version = "0.10.3", optional = true }
 base64 = { version = "0.22.1", optional = true }
-opentelemetry = { version = "0.23.0", features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.23.0", features = ["trace", "metrics", "rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.16.0", features = ["trace", "metrics", "grpc-tonic"], optional = true }
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json"], optional = true }
+hkdf = { version = "0.12", optional = true }
+hmac = { version = "0.12", optional = true }
+opentelemetry = { version = "0.27", features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["trace", "metrics", "rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["trace", "metrics", "grpc-tonic"], optional = true }
 tokio-postgres = { version = "0.7.15", optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
+zeroize = { version = "1", features = ["alloc"] }
 mysql_async = { version = "0.36.2", default-features = false, features = ["minimal", "binlog"], optional = true }
 mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "tokio", "rustls"], optional = true }
@@ -62,9 +75,12 @@ rustls = { version = "0.23.19", default-features = false, features = ["std", "ri
 rustls-pemfile = { version = "2.0", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 tokio-rustls = { version = "0.25", optional = true }
+prost = { version = "0.13", optional = true }
+apache-avro = { version = "0.17", optional = true }
 
 [dev-dependencies]
 criterion = "0.7.0"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json"] }
 tempfile = "3.23.0"
 testcontainers = "0.25.2"
 tokio-test = "0.4.4"
@@ -80,3 +96,15 @@ harness = false
 [[bench]]
 name = "cdc_perf"
 harness = false
+
+[[test]]
+name = "fault_injection_soak_matrix"
+required-features = ["test-harnesses"]
+
+[[test]]
+name = "crash_simulation_integration"
+required-features = ["test-harnesses"]
+
+[[test]]
+name = "data_loss_detection"
+required-features = ["test-harnesses"]

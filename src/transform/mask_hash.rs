@@ -1,6 +1,6 @@
 //! Sensitive data masking and hashing transform.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -57,31 +57,35 @@ impl MaskHashTransform {
 
     fn apply_payload(&self, payload: &mut Option<Value>) -> Result<()> {
         if let Some(value) = payload {
-            self.walk_value(value, "")?;
+            let mut path_buf = String::new();
+            self.walk_value(value, &mut path_buf)?;
         }
         Ok(())
     }
 
-    fn walk_value(&self, value: &mut Value, path: &str) -> Result<()> {
+    fn walk_value(&self, value: &mut Value, path: &mut String) -> Result<()> {
         match value {
             Value::Object(map) => {
                 for (key, child) in map.iter_mut() {
-                    let child_path = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    self.walk_value(child, &child_path)?;
+                    let prev = path.len();
+                    if prev > 0 {
+                        path.push('.');
+                    }
+                    path.push_str(key);
+                    self.walk_value(child, path)?;
+                    path.truncate(prev);
                 }
             }
             Value::Array(values) => {
+                use std::fmt::Write as _;
                 for (index, child) in values.iter_mut().enumerate() {
-                    let child_path = if path.is_empty() {
-                        index.to_string()
-                    } else {
-                        format!("{path}.{index}")
-                    };
-                    self.walk_value(child, &child_path)?;
+                    let prev = path.len();
+                    if prev > 0 {
+                        path.push('.');
+                    }
+                    let _ = write!(path, "{index}");
+                    self.walk_value(child, path)?;
+                    path.truncate(prev);
                 }
             }
             _ => {
@@ -89,13 +93,14 @@ impl MaskHashTransform {
                     let rule = self
                         .config
                         .mask_rules
-                        .get(path)
+                        .get(path.as_str())
                         .unwrap_or(&self.config.default_rule);
-                    *value = apply_rule(value, rule)?;
+                    if !matches!(rule, MaskRule::Passthrough) {
+                        *value = apply_rule(value, rule)?;
+                    }
                 }
             }
         }
-
         Ok(())
     }
 }
@@ -115,7 +120,7 @@ impl Transform for MaskHashTransform {
 
 fn apply_rule(value: &Value, rule: &MaskRule) -> Result<Value> {
     Ok(match rule {
-        MaskRule::Passthrough => value.clone(),
+        MaskRule::Passthrough => unreachable!("Passthrough is handled before apply_rule"),
         MaskRule::Hash => {
             let digest = Sha256::digest(value.to_string().as_bytes());
             Value::String(format!("{digest:x}"))
@@ -153,7 +158,7 @@ fn encrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
         .map_err(|error| Error::TransformError(format!("encryption failed: {error}")))?;
 
     Ok(Value::String(format!(
-        "enc:v1:{}:{}",
+        "enc:{}:{}",
         STANDARD.encode(nonce),
         STANDARD.encode(ciphertext)
     )))
@@ -167,12 +172,8 @@ fn decrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
     let encoded = value.as_str().ok_or_else(|| {
         Error::TransformError("decrypt rule requires a string ciphertext payload".into())
     })?;
-    let (_, version, nonce_b64, ciphertext_b64) = parse_encrypted_payload(encoded)?;
-    if version != "v1" {
-        return Err(Error::TransformError(format!(
-            "unsupported encrypted payload version: {version}"
-        )));
-    }
+    let (nonce_b64, ciphertext_b64) = parse_encrypted_payload(encoded)?;
+    let key = derive_encryption_key(secret)?;
 
     let nonce = STANDARD.decode(nonce_b64).map_err(|error| {
         Error::TransformError(format!("invalid encrypted payload nonce: {error}"))
@@ -187,7 +188,6 @@ fn decrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
         Error::TransformError(format!("invalid encrypted payload ciphertext: {error}"))
     })?;
 
-    let key = derive_encryption_key(secret)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|error| Error::TransformError(format!("invalid encryption key: {error}")))?;
     let plaintext = cipher
@@ -199,38 +199,58 @@ fn decrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
     })
 }
 
+/// HKDF-SHA-256 key derivation for AES-256-GCM field encryption.
+///
+/// Derives a 256-bit key from `secret` using HKDF (RFC 5869) with SHA-256 and
+/// the domain-separation label `b"cdc-rs-field-encryption"`. The label ensures
+/// the derived key is independent of any other HKDF usage with the same secret.
+///
+/// Note: HKDF is an *extraction + expansion* function, not a password KDF. For
+/// human-chosen passphrases, pre-hash with argon2 or bcrypt before using as the
+/// HKDF input key material. For high-entropy machine secrets (e.g., 256-bit
+/// random tokens), HKDF is sufficient.
 #[cfg(feature = "encryption")]
 fn derive_encryption_key(secret: &SecretString) -> Result<[u8; 32]> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
     let resolved = secret.resolve()?;
-    let digest = Sha256::digest(resolved.as_bytes());
+    let hk = Hkdf::<Sha256>::new(None, resolved.as_bytes());
     let mut key = [0_u8; 32];
-    key.copy_from_slice(&digest);
+    hk.expand(b"cdc-rs-field-encryption", &mut key)
+        .map_err(|_| Error::TransformError("HKDF expand failed (output too long)".into()))?;
     Ok(key)
 }
 
+/// Parses an encrypted field payload in the format `enc:<nonce_b64>:<ciphertext_b64>`.
+/// Returns `(nonce_b64, ciphertext_b64)` on success.
 #[cfg(feature = "encryption")]
-fn parse_encrypted_payload(input: &str) -> Result<(&str, &str, &str, &str)> {
-    let mut parts = input.splitn(4, ':');
-    let prefix = parts.next().unwrap_or_default();
-    let version = parts.next().unwrap_or_default();
-    let nonce = parts.next().unwrap_or_default();
-    let ciphertext = parts.next().unwrap_or_default();
-
-    if prefix != "enc" || version.is_empty() || nonce.is_empty() || ciphertext.is_empty() {
+fn parse_encrypted_payload(input: &str) -> Result<(&str, &str)> {
+    let input = input.strip_prefix("enc:").ok_or_else(|| {
+        Error::TransformError(
+            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
+        )
+    })?;
+    let sep = input.find(':').ok_or_else(|| {
+        Error::TransformError(
+            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
+        )
+    })?;
+    let (nonce, rest) = input.split_at(sep);
+    let ciphertext = &rest[1..];
+    if nonce.is_empty() || ciphertext.is_empty() {
         return Err(Error::TransformError(
-            "encrypted payload must match format enc:v1:<nonce>:<ciphertext>".into(),
+            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
         ));
     }
-
-    Ok((prefix, version, nonce, ciphertext))
+    Ok((nonce, ciphertext))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use ahash::AHashMap as HashMap;
 
     use serde_json::json;
-
     #[cfg(feature = "encryption")]
     use crate::core::SecretString;
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -355,7 +375,8 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(ciphertext.starts_with("enc:v1:"));
+        assert!(ciphertext.starts_with("enc:"));
+        assert_eq!(ciphertext.splitn(3, ':').count(), 3); // enc:<nonce>:<ciphertext>
         assert_ne!(ciphertext, "123456");
 
         let mut decrypt_rules = HashMap::new();

@@ -17,6 +17,14 @@ confirm_runs="${BENCHMARK_CONFIRM_RUNS:-2}"
 preheat_runs="${BENCHMARK_PREHEAT_RUNS:-1}"
 baseline_commit="${BENCHMARK_BASELINE_COMMIT:-}"
 baseline_artifact="${BENCHMARK_BASELINE_ARTIFACT:-}"
+# CRITERION_BASELINE: name of a saved Criterion baseline to compare against
+# (stored under target/criterion/<bench>/<name>/). If unset, Criterion compares
+# against the previous run. Set this in CI to a named baseline pinned to a
+# reference commit to get stable regression detection across machines.
+#
+# BENCHMARK_SAVE_BASELINE: if set, saves the current run as a named Criterion
+# baseline after measuring. Use this to update the CI reference baseline:
+#   BENCHMARK_SAVE_BASELINE=ci-baseline ./scripts/ci-benchmark-gate.sh
 
 current_commit="$(git rev-parse HEAD 2>/dev/null || true)"
 git_tree_state="unknown"
@@ -227,7 +235,21 @@ emit_benchmark_report() {
 run_bench() {
   local bench_name="$1"
   local out_file="$2"
-  cargo bench --bench "$bench_name" -- --sample-size "$bench_sample_size" --measurement-time "$bench_measurement_secs" --warm-up-time "$bench_warm_up_secs" | tee "$out_file"
+  local baseline_args=()
+  # When CRITERION_BASELINE is set, compare against a saved Criterion baseline
+  # instead of the previous run. Use BENCHMARK_SAVE_BASELINE to persist a new
+  # named baseline (e.g. for updating the CI reference point).
+  if [[ -n "${CRITERION_BASELINE:-}" ]]; then
+    baseline_args=(--baseline "$CRITERION_BASELINE")
+  fi
+  if [[ -n "${BENCHMARK_SAVE_BASELINE:-}" ]]; then
+    baseline_args+=(--save-baseline "$BENCHMARK_SAVE_BASELINE")
+  fi
+  cargo bench --bench "$bench_name" -- \
+    --sample-size "$bench_sample_size" \
+    --measurement-time "$bench_measurement_secs" \
+    --warm-up-time "$bench_warm_up_secs" \
+    "${baseline_args[@]}" | tee "$out_file"
 }
 
 run_preheat() {

@@ -5,8 +5,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
+
+use crate::checkpoint::owner_lease::{self, OwnerLease};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -78,6 +80,7 @@ pub trait SchemaHistory: Send + Sync {
 
 /// Retention policy for schema-history pruning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SchemaHistoryRetention {
     /// Maximum number of historical versions retained per table key.
     pub max_versions_per_table: usize,
@@ -117,11 +120,20 @@ pub struct InMemorySchemaHistory {
 ///
 /// `FileSchemaHistory` uses write-rename persistence with file and directory fsync
 /// to provide crash-safe single-process durability semantics.
+///
+/// # Exclusive ownership
+///
+/// On construction, `FileSchemaHistory` acquires a PID lease file at
+/// `<path>.owner` to prevent two processes from writing to the same history file
+/// simultaneously. Stale leases left by dead processes are cleared automatically;
+/// a `StateError` is returned if a live process already holds the lease.
 #[derive(Debug, Clone)]
 pub struct FileSchemaHistory {
     path: Arc<PathBuf>,
     file_mode: u32,
     schemas: Arc<RwLock<SchemaStore>>,
+    /// RAII guard that removes the `.owner` file when the last clone is dropped.
+    _lease: Arc<Mutex<Option<OwnerLease>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -253,10 +265,18 @@ impl FileSchemaHistory {
             HashMap::new()
         };
 
+        let lease_path = path.with_extension(
+            path.extension()
+                .map(|ext| format!("{}.owner", ext.to_string_lossy()))
+                .unwrap_or_else(|| "owner".into()),
+        );
+        let lease = owner_lease::acquire(&lease_path, "schema_history")?;
+
         Ok(Self {
             path: Arc::new(path),
             file_mode: Self::DEFAULT_FILE_MODE,
             schemas: Arc::new(RwLock::new(schemas)),
+            _lease: Arc::new(Mutex::new(Some(lease))),
         })
     }
 

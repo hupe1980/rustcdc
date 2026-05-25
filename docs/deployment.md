@@ -69,6 +69,27 @@ Recommended baseline controls:
 5. configure restart policy with backoff
 6. validate replay behavior before production cutover
 
+## Backpressure and Slow-Consumer Behavior
+
+cdc-rs uses **cooperative flow control**: the internal event buffer grows until it reaches `max_buffer_size`, at which point the runtime pauses ingestion and blocks the poll loop until the consumer catches up via `commit_ack()`.
+
+### How it works
+
+- `poll_event_batch()` returns events from the internal buffer.
+- `commit_ack(offset)` signals that the consumer has durably processed events up to `offset`. The runtime advances the checkpoint and frees buffer capacity.
+- If the consumer calls `poll_event_batch()` repeatedly without calling `commit_ack()`, the buffer fills to `max_buffer_size` and the runtime yields no new events until space is available.
+
+### Tuning guidance
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Low-latency sink (in-memory, fast local writes) | Default `max_buffer_size = 10_000` is appropriate. |
+| Slow remote sink (network I/O, batching) | Increase `max_buffer_size` to absorb burst traffic; ensure `commit_ack()` is called promptly after each durable write. |
+| Very slow consumer or bursty source | Combine a large `max_buffer_size` with an external queue (Kafka, SQS) between the runtime and the final sink. |
+| Memory-constrained deployment | Reduce `max_buffer_size` and call `commit_ack()` as frequently as possible to keep the buffer shallow. |
+
+> ⚠️ **Important**: Never call `poll_event_batch()` in a tight loop without also calling `commit_ack()`. The runtime cannot advance the checkpoint or reclaim buffer memory until acknowledgement is received. Monitor `buffer_depth` via `admin_snapshot()` to detect a stalled consumer early.
+
 ## Rollout Checklist
 
 1. validate source connector permissions in target environment

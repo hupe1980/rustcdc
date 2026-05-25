@@ -1,7 +1,6 @@
 //! Route events to destination labels.
 
-use std::collections::HashMap;
-
+use ahash::AHashMap as HashMap;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
@@ -61,7 +60,7 @@ impl Transform for RouteTransform {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use ahash::AHashMap as HashMap;
 
     use serde_json::json;
 

@@ -27,6 +27,7 @@ use crate::{
     ddl_capture::{extract_captured_ddl, DdlDialect},
     source::{
         ConnectorCapabilities, HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle,
+        IncrementalSnapshotConfig,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,7 @@ mod stream_start;
 mod snapshot_start;
 mod snapshot_chunk;
 mod stream_messages;
+pub mod incremental_snapshot;
 
 use self::{
     parser::{mysql_qualified_table_name_from_reference, quoted_mysql_identifier},
@@ -63,6 +65,38 @@ const DEFAULT_SNAPSHOT_CHUNK_SIZE: usize = 5_000;
 const STREAM_POLL_INTERVAL_MS: u64 = 50;
 const MAX_EVENTS_PER_POLL: usize = 1_000;
 
+/// Identifies the server dialect for a MySQL-protocol connection.
+///
+/// Both MySQL and MariaDB use the same binlog wire protocol and `mysql_async`
+/// driver. The flavor affects `source_type()` (and therefore checkpoint file
+/// names) and structured log labels, but not connection or decoding logic.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerFlavor {
+    #[default]
+    Mysql,
+    MariaDb,
+}
+
+impl ServerFlavor {
+    /// The short name used as `source_type()` and in log labels.
+    pub const fn source_name(self) -> &'static str {
+        match self {
+            Self::Mysql => "mysql",
+            Self::MariaDb => "mariadb",
+        }
+    }
+
+    /// The source type used for snapshot checkpoint offsets.
+    pub const fn snapshot_source_name(self) -> &'static str {
+        match self {
+            Self::Mysql => "mysql_snapshot",
+            Self::MariaDb => "mariadb_snapshot",
+        }
+    }
+}
+
 /// Configuration for a MySQL CDC connection.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MysqlSourceConfig {
@@ -80,6 +114,24 @@ pub struct MysqlSourceConfig {
     pub stream_poll_interval_ms: u64,
     /// Maximum events yielded by a single stream poll cycle.
     pub max_events_per_poll: usize,
+    /// Identifies the server dialect (MySQL or MariaDB).
+    ///
+    /// Defaults to `ServerFlavor::Mysql`. Set to `ServerFlavor::MariaDb` when
+    /// connecting to a MariaDB server so that `source_type()` returns `"mariadb"`
+    /// and checkpoints use a separate `checkpoint_mariadb.json` file.
+    #[serde(default)]
+    pub server_flavor: ServerFlavor,
+    /// Allowlist of tables to stream, in `"schema.table"` format.
+    ///
+    /// When non-empty, only tables in this list are forwarded to the caller.
+    /// Takes precedence over [`table_exclude_list`](MysqlSourceConfig::table_exclude_list).
+    /// An empty list means *all* tables are included.
+    pub table_include_list: Vec<String>,
+    /// Blocklist of tables to suppress, in `"schema.table"` format.
+    ///
+    /// Ignored when [`table_include_list`](MysqlSourceConfig::table_include_list) is non-empty.
+    /// An empty list means no tables are excluded.
+    pub table_exclude_list: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,9 +655,10 @@ impl MysqlConnection {
     pub fn new(config: MysqlSourceConfig) -> Self {
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
         let max_events_per_poll = config.max_events_per_poll.max(1);
+        let flavor_name = config.server_flavor.source_name();
         Self {
             config,
-            logger: StructuredLogger::new("mysql"),
+            logger: StructuredLogger::new(flavor_name),
             state: Arc::new(Mutex::new(ConnectionState::default())),
             snapshot_watermark: None,
             stream_start: None,
@@ -713,9 +766,11 @@ impl MysqlConnection {
         );
 
         if let Some(offset) = resume_from {
-            if offset.source_type() != "mysql_snapshot" {
+            let expected = self.config.server_flavor.snapshot_source_name();
+            if offset.source_type() != expected {
                 return Err(Error::CheckpointError(format!(
-                    "cannot resume mysql snapshot from source type '{}'",
+                    "cannot resume {} snapshot from source type '{}'",
+                    self.config.source_type(),
                     offset.source_type()
                 )));
             }
@@ -806,6 +861,37 @@ impl Drop for MysqlConnection {
     }
 }
 
+impl MysqlConnection {
+    /// Start a non-blocking incremental snapshot using the DBLog watermark pattern.
+    pub async fn start_incremental_snapshot(
+        &mut self,
+        config: IncrementalSnapshotConfig,
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn StreamHandle>> {
+        use crate::source::mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
+        let pool = {
+            let state = self.state.lock().await;
+            state.pool.clone().ok_or_else(|| {
+                Error::StateError(
+                    "mysql connection must be established before incremental snapshot".into(),
+                )
+            })?
+        };
+        let inner = self.start_stream(resume_from).await?;
+        let source_name = self.source_type().to_string();
+        let default_database = self.config.database.clone();
+        let handle = MysqlIncrementalSnapshotHandle::new(
+            inner,
+            pool,
+            config,
+            source_name,
+            default_database,
+        )
+        .await?;
+        Ok(Box::new(handle))
+    }
+}
+
 #[async_trait]
 impl Source for MysqlConnection {
     async fn start_snapshot(&mut self, tables: &[&str]) -> Result<Box<dyn SnapshotHandle>> {
@@ -880,7 +966,7 @@ impl Source for MysqlConnection {
     }
 
     fn source_type(&self) -> &str {
-        MysqlSourceConfig::source_type()
+        self.config.source_type()
     }
 
     fn capabilities(&self) -> ConnectorCapabilities {
@@ -893,6 +979,7 @@ impl Source for MysqlConnection {
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
             truncate: false,
+            incremental_snapshot: true,
         }
     }
 }
@@ -920,7 +1007,8 @@ impl SnapshotHandle for MysqlSnapshotHandle {
         };
 
         let encoded = serde_json::to_vec(&payload)?;
-        let offset = GenericOffset::new("mysql_snapshot", encoded);
+        let snapshot_source = format!("{}_snapshot", self.source_name);
+        let offset = GenericOffset::new(&snapshot_source, encoded);
         checkpoint.save(&offset, committed_event_count).await
     }
 
@@ -1212,6 +1300,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: 1,
             max_events_per_poll: 1,
+            ..Default::default()
         };
 
         config.stream_poll_interval_ms = 0;
@@ -1255,6 +1344,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
 
         let debug = format!("{config:?}");
@@ -1277,6 +1367,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
 
         assert!(config.validate().is_ok());
@@ -1305,6 +1396,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
 
         let _ = config.build_pool_opts().unwrap();
@@ -1328,6 +1420,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         });
 
         assert_eq!(connection.source_type(), "mysql");
@@ -1353,6 +1446,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
         let backend = MockValidationBackend {
             gtid_mode_enabled: true,
@@ -1383,6 +1477,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
         let backend = MockValidationBackend {
             gtid_mode_enabled: false,
@@ -1413,6 +1508,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
 
         let missing_priv = MockValidationBackend {
@@ -1867,6 +1963,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         });
 
         let result = connection.start_snapshot(&[]).await;
@@ -1893,6 +1990,7 @@ mod tests {
                 conn_timeout_secs: 30,
                 stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
                 max_events_per_poll: MAX_EVENTS_PER_POLL,
+                ..Default::default()
             },
             logger: StructuredLogger::new("mysql"),
             state: Arc::new(Mutex::new(ConnectionState::default())),
@@ -2097,6 +2195,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         });
         // Only set stream_start, not snapshot_watermark
         conn.stream_start = Some(MysqlOffset {

@@ -92,6 +92,7 @@ async fn mysql_stream_capture_insert_update_delete() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut connection = MysqlConnection::new(config);
@@ -248,6 +249,7 @@ async fn mysql_stream_resume_from_checkpoint() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut connection = MysqlConnection::new(config);
@@ -361,6 +363,7 @@ async fn mysql_stream_binlog_rotation() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut connection = MysqlConnection::new(config);

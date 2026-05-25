@@ -119,6 +119,7 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     // Phase 1: Snapshot capture

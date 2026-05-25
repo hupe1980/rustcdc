@@ -5,11 +5,10 @@ use crate::{
     source::helpers::now_millis,
 };
 
-use super::
-{
-    decode_pgoutput_message, format_pg_lsn, pg_timestamp_to_millis, PgDelete, PgInsert,
-    PgOutputMessage, PgOutputXLogData, PgRelation, PgTruncate, PgUpdate, PgValue,
-    PostgresStreamHandle,
+use super::{format_pg_lsn, pg_timestamp_to_millis, PostgresStreamHandle};
+use super::decoder::{
+    decode_pgoutput_message, PgDelete, PgInsert, PgOutputMessage, PgOutputXLogData, PgRelation,
+    PgTruncate, PgUpdate, PgValue,
 };
 
 impl PostgresStreamHandle {

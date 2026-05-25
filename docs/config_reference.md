@@ -467,6 +467,10 @@ pub struct SqlServerSourceConfig {
     /// Stream poll interval in milliseconds
     /// Default: 5000
     /// Range: 1 - 60000
+    ///
+    /// ⚠️ LATENCY NOTE: SQL Server CDC is polling-based, not event-driven.
+    /// p99 latency ≈ stream_poll_interval_ms + CDC capture agent delay.
+    /// Reduce this to 500–1000ms for latency-sensitive workloads.
     pub stream_poll_interval_ms: u64,
 
     /// Maximum events yielded per stream poll

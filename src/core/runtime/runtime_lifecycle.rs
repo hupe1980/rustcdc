@@ -22,7 +22,7 @@ where
         }
 
         if self.config.options.schema_history_retention.is_none() {
-            tracing::warn!(
+            tracing::error!(
                 target: "cdc_rs::core::runtime",
                 "no schema_history_retention policy configured; schema history will grow \
                  unboundedly. Configure RuntimeOptions::with_schema_history_retention() to \

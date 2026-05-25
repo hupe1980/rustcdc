@@ -1,46 +1,61 @@
-//! Parallel snapshot chunking for efficient multi-table snapshots.
+//! Per-table snapshot progress tracking for multi-table snapshot coordination.
+//!
+//! [`SnapshotProgressTracker`] is a chunk-progress state machine intended to track
+//! per-table snapshot progress when an embedder coordinates its own multi-table
+//! snapshot workers. It does **not** execute snapshot queries itself; connector
+//! snapshots are sequential by default. Embedders that need true parallel snapshot
+//! execution must manage their own connection pool and call
+//! [`SnapshotProgressTracker::record_chunk_progress`] / [`record_chunk_events`] as
+//! each worker completes a chunk.
+//!
+//! For the state-of-the-art approach to non-blocking snapshot, see the roadmap item
+//! for watermark-based incremental snapshotting (DBLog pattern, G-05 in FINDINGS.md).
 
 use std::sync::{Arc, Mutex};
 
 use crate::core::{Error, Event, Result};
 use crate::source::SnapshotProgress;
 
-/// Configuration for parallel snapshot execution.
+/// Configuration for the [`SnapshotProgressTracker`] coordinator.
 #[derive(Debug, Clone)]
-pub struct ParallelSnapshotConfig {
-    /// Maximum number of tables to snapshot in parallel
-    pub max_parallel_tables: usize,
-    /// Chunk size for each table
+pub struct SnapshotTrackerConfig {
+    /// Default chunk size used when fetching rows for each table.
     pub chunk_size: usize,
 }
 
-impl Default for ParallelSnapshotConfig {
+impl Default for SnapshotTrackerConfig {
     fn default() -> Self {
         Self {
-            max_parallel_tables: 4,
             chunk_size: 5000,
         }
     }
 }
 
-/// State for tracking parallel snapshot execution.
+/// Per-table snapshot progress tracker for multi-table snapshot coordination.
+///
+/// This type tracks chunk-level progress (row counts, PK cursor tokens, completion
+/// state) across multiple tables. It is designed to be the persistence/coordination
+/// layer for embedder-managed parallel snapshot workers. Connector-level snapshot
+/// execution is **not** included; callers drive workers and report progress here.
 #[derive(Debug)]
-pub struct ParallelSnapshotState {
+pub struct SnapshotProgressTracker {
     /// Snapshot progress across all tables
     progress: Arc<Mutex<SnapshotProgress>>,
-    /// Buffered events from parallel chunk fetches
+    /// Buffered events from chunk fetches
     pending_events: Arc<Mutex<Vec<Event>>>,
+    /// Default chunk size from configuration
+    chunk_size: usize,
     /// Table processing order
     table_order: Vec<String>,
 }
 
-impl ParallelSnapshotState {
-    /// Create a new parallel snapshot state.
+impl SnapshotProgressTracker {
+    /// Create a new snapshot progress tracker.
     pub fn new(
         snapshot_id: String,
         created_at: u64,
         tables: Vec<String>,
-        _config: ParallelSnapshotConfig,
+        config: SnapshotTrackerConfig,
     ) -> Self {
         let mut progress = SnapshotProgress::new(snapshot_id, created_at);
         for table in &tables {
@@ -50,11 +65,17 @@ impl ParallelSnapshotState {
         Self {
             progress: Arc::new(Mutex::new(progress)),
             pending_events: Arc::new(Mutex::new(Vec::new())),
+            chunk_size: config.chunk_size,
             table_order: tables,
         }
     }
 
-    /// Get the number of tables to process.
+    /// Default chunk size from the tracker configuration.
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Number of tables registered with this tracker.
     pub fn table_count(&self) -> usize {
         self.table_order.len()
     }
@@ -170,7 +191,7 @@ impl ParallelSnapshotState {
 
 /// Report on parallel snapshot execution.
 #[derive(Debug, Clone)]
-pub struct ParallelSnapshotReport {
+pub struct SnapshotTrackerReport {
     pub snapshot_id: String,
     pub total_tables: usize,
     pub completed_tables: usize,
@@ -186,7 +207,7 @@ mod tests {
     #[test]
     fn test_parallel_snapshot_state_creation() {
         let tables = vec!["users".into(), "orders".into(), "products".into()];
-        let state = ParallelSnapshotState::new("snap1".into(), 1000, tables, Default::default());
+        let state = SnapshotProgressTracker::new("snap1".into(), 1000, tables, Default::default());
 
         assert_eq!(state.table_count(), 3);
         assert!(!state.all_complete().unwrap());
@@ -195,7 +216,7 @@ mod tests {
     #[test]
     fn test_parallel_snapshot_state_progress() {
         let tables = vec!["users".into(), "orders".into()];
-        let state = ParallelSnapshotState::new("snap1".into(), 1000, tables, Default::default());
+        let state = SnapshotProgressTracker::new("snap1".into(), 1000, tables, Default::default());
 
         state.mark_table_complete("users").unwrap();
         assert_eq!(state.completed_tables().unwrap(), 1);
@@ -210,7 +231,7 @@ mod tests {
     #[test]
     fn test_parallel_snapshot_pending_tables() {
         let tables = vec!["users".into(), "orders".into(), "products".into()];
-        let state = ParallelSnapshotState::new("snap1".into(), 1000, tables, Default::default());
+        let state = SnapshotProgressTracker::new("snap1".into(), 1000, tables, Default::default());
 
         let pending = state.get_pending_tables().unwrap();
         assert_eq!(pending.len(), 3);
@@ -225,7 +246,7 @@ mod tests {
     #[test]
     fn test_parallel_snapshot_total_rows() {
         let tables = vec!["users".into(), "orders".into()];
-        let state = ParallelSnapshotState::new("snap1".into(), 1000, tables, Default::default());
+        let state = SnapshotProgressTracker::new("snap1".into(), 1000, tables, Default::default());
 
         assert_eq!(state.total_rows_processed().unwrap(), 0);
 
@@ -257,7 +278,7 @@ mod tests {
     #[test]
     fn test_parallel_snapshot_buffered_events() {
         let tables = vec!["users".into()];
-        let state = ParallelSnapshotState::new("snap1".into(), 1000, tables, Default::default());
+        let state = SnapshotProgressTracker::new("snap1".into(), 1000, tables, Default::default());
 
         let events = vec![Event {
             before: None,
@@ -288,8 +309,79 @@ mod tests {
 
     #[test]
     fn test_parallel_snapshot_default_config() {
-        let config = ParallelSnapshotConfig::default();
-        assert_eq!(config.max_parallel_tables, 4);
+        let config = SnapshotTrackerConfig::default();
         assert_eq!(config.chunk_size, 5000);
+    }
+
+    // ---- C-05: interleaving, partial failure, checkpoint resume ----
+
+    /// Two simulated workers interleave chunk progress on different tables.
+    /// Neither should interfere with the other's row counts.
+    #[test]
+    fn test_interleaved_chunk_progress() {
+        let tables = vec!["users".into(), "orders".into()];
+        let tracker = SnapshotProgressTracker::new("snap-x".into(), 0, tables, Default::default());
+
+        // Alternate chunk reports between the two tables (simulates concurrent workers).
+        tracker.record_chunk_progress("users", 100, Some(b"cursor-users-1".to_vec())).unwrap();
+        tracker.record_chunk_progress("orders", 200, Some(b"cursor-orders-1".to_vec())).unwrap();
+        tracker.record_chunk_progress("users", 50, Some(b"cursor-users-2".to_vec())).unwrap();
+        tracker.record_chunk_progress("orders", 150, None).unwrap();
+
+        assert_eq!(tracker.total_rows_processed().unwrap(), 500);
+        assert!(!tracker.all_complete().unwrap());
+
+        tracker.mark_table_complete("users").unwrap();
+        tracker.mark_table_complete("orders").unwrap();
+
+        assert!(tracker.all_complete().unwrap());
+        assert_eq!(tracker.progress_percent().unwrap(), 100);
+    }
+
+    /// Recording progress for an unknown table returns an error rather than
+    /// silently swallowing the problem.
+    #[test]
+    fn test_unknown_table_returns_error() {
+        let tables = vec!["users".into()];
+        let tracker = SnapshotProgressTracker::new("snap-y".into(), 0, tables, Default::default());
+
+        let err = tracker.record_chunk_progress("nonexistent", 10, None);
+        assert!(err.is_err(), "recording progress for unknown table must fail");
+
+        // The existing table is unaffected.
+        assert_eq!(tracker.total_rows_processed().unwrap(), 0);
+    }
+
+    /// Checkpoint resume: encode current progress, decode it, and verify that
+    /// completed tables are reflected correctly in the restored progress.
+    #[test]
+    fn test_checkpoint_resume_via_encode_decode() {
+        use crate::source::snapshot_progress::SnapshotCheckpointHelper;
+
+        let tables = vec!["a".into(), "b".into(), "c".into()];
+        let tracker = SnapshotProgressTracker::new("snap-z".into(), 42, tables, Default::default());
+
+        // Complete two of three tables, with a cursor token on the partial one.
+        tracker.record_chunk_progress("a", 300, Some(b"pk-300".to_vec())).unwrap();
+        tracker.mark_table_complete("a").unwrap();
+        tracker.record_chunk_progress("b", 150, Some(b"pk-150".to_vec())).unwrap();
+        tracker.mark_table_complete("b").unwrap();
+        tracker.record_chunk_progress("c", 50, Some(b"pk-50".to_vec())).unwrap();
+        // "c" intentionally left incomplete — simulates a mid-run checkpoint.
+
+        let snapshot = tracker.get_progress().unwrap();
+        let encoded = SnapshotCheckpointHelper::serialize_progress(&snapshot).unwrap();
+        let restored = SnapshotCheckpointHelper::deserialize_progress(&encoded).unwrap();
+
+        assert_eq!(restored.completed_tables(), 2);
+        assert_eq!(restored.total_rows_processed(), 500);
+        assert!(!restored.is_all_complete(), "c is still pending");
+
+        let pending = restored.get_pending_tables();
+        assert_eq!(pending, vec!["c".to_string()]);
+
+        // Verify the cursor token for "c" survived round-trip.
+        let c_progress = restored.get_table_progress("c").unwrap();
+        assert_eq!(c_progress.cursor_token, Some(b"pk-50".to_vec()));
     }
 }

@@ -379,7 +379,7 @@ async fn run_postgres_process_kill_replay_scenario(
 
     #[cfg(feature = "encryption")]
     if _enable_encryption_transform {
-        use std::collections::HashMap;
+        use ahash::AHashMap as HashMap;
 
         let mut mask_rules = HashMap::new();
         mask_rules.insert(

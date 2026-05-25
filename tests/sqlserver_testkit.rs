@@ -70,6 +70,7 @@ pub fn source_config(
         prereq_pool_size: 2,
         stream_poll_interval_ms: 250,
         max_events_per_poll: 5_000,
+        ..Default::default()
     }
 }
 

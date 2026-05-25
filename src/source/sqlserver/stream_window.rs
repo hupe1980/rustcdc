@@ -142,52 +142,113 @@ impl SqlServerStreamHandle {
     }
 
     pub(super) fn map_changes_to_events(
-        &self,
+        &mut self,
         meta: &CaptureInstanceMeta,
         changes: Vec<SqlServerRawChange>,
     ) -> Result<Vec<Event>> {
+        // SQL Server CDC with `'all update old'` emits two rows per UPDATE:
+        //   op=3  UPDATE after-image  (new column values)  — ORDER BY emits this first (3 < 4)
+        //   op=4  UPDATE before-image (old column values)  — emitted second
+        //
+        // Both rows share the same (__$start_lsn, __$seqval).  We buffer the op=3 row
+        // in `self.pending_update_afters` and emit a single merged Event when op=4 arrives.
+        // The buffer persists across poll boundaries so pairs split by `max_events_per_poll`
+        // are handled correctly.
         let mut out = Vec::with_capacity(changes.len());
 
         for change in changes {
-            let (op, before, after) = match change.operation {
-                1 => (Operation::Delete, Some(change.row.clone()), None),
-                2 => (Operation::Insert, None, Some(change.row.clone())),
-                3 => (Operation::Update, Some(change.row.clone()), None),
-                4 => (Operation::Update, None, Some(change.row.clone())),
+            match change.operation {
+                // DELETE: full row is the before-image.
+                1 => {
+                    out.push(build_sqlserver_event(
+                        meta,
+                        &change.start_lsn_hex,
+                        &change.seqval_hex,
+                        change.ts_ms,
+                        Operation::Delete,
+                        Some(change.row),
+                        None,
+                    ));
+                }
+                // INSERT: full row is the after-image.
+                2 => {
+                    out.push(build_sqlserver_event(
+                        meta,
+                        &change.start_lsn_hex,
+                        &change.seqval_hex,
+                        change.ts_ms,
+                        Operation::Insert,
+                        None,
+                        Some(change.row),
+                    ));
+                }
+                // UPDATE after-image: buffer until op=4 (before-image) arrives.
+                3 => {
+                    let key = (change.start_lsn_hex, change.seqval_hex);
+                    self.pending_update_afters.insert(key, (change.row, change.ts_ms));
+                }
+                // UPDATE before-image: merge with buffered op=3 after-image.
+                4 => {
+                    let key = (change.start_lsn_hex.clone(), change.seqval_hex.clone());
+                    let (after_row, ts_ms) = self
+                        .pending_update_afters
+                        .remove(&key)
+                        .map(|(row, ts)| (Some(row), ts))
+                        .unwrap_or_else(|| (None, change.ts_ms));
+                    out.push(build_sqlserver_event(
+                        meta,
+                        &change.start_lsn_hex,
+                        &change.seqval_hex,
+                        ts_ms,
+                        Operation::Update,
+                        Some(change.row),
+                        after_row,
+                    ));
+                }
                 other => {
                     return Err(Error::SourceError(format!(
                         "unsupported sqlserver CDC __$operation value: {other}"
-                    )))
+                    )));
                 }
-            };
-
-            out.push(Event {
-                before,
-                after,
-                op,
-                source: SourceMetadata {
-                    source_name: "sqlserver".into(),
-                    offset: change.start_lsn_hex.clone(),
-                    timestamp: change.ts_ms,
-                },
-                ts: change.ts_ms,
-                schema: Some(meta.schema.clone()),
-                table: meta.table.clone(),
-                primary_key: if meta.primary_key.is_empty() {
-                    None
-                } else {
-                    Some(meta.primary_key.clone())
-                },
-                snapshot: None,
-                transaction: Some(TransactionMetadata {
-                    tx_id: tx_id_from_seqval(&change.seqval_hex),
-                    total_events: 1,
-                    event_index: 0,
-                }),
-                envelope_version: EVENT_ENVELOPE_VERSION,
-            });
+            }
         }
 
         Ok(out)
+    }
+}
+
+fn build_sqlserver_event(
+    meta: &CaptureInstanceMeta,
+    start_lsn_hex: &str,
+    seqval_hex: &str,
+    ts_ms: u64,
+    op: Operation,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+) -> Event {
+    Event {
+        before,
+        after,
+        op,
+        source: SourceMetadata {
+            source_name: "sqlserver".into(),
+            offset: start_lsn_hex.to_owned(),
+            timestamp: ts_ms,
+        },
+        ts: ts_ms,
+        schema: Some(meta.schema.clone()),
+        table: meta.table.clone(),
+        primary_key: if meta.primary_key.is_empty() {
+            None
+        } else {
+            Some(meta.primary_key.clone())
+        },
+        snapshot: None,
+        transaction: Some(TransactionMetadata {
+            tx_id: tx_id_from_seqval(seqval_hex),
+            total_events: 1,
+            event_index: 0,
+        }),
+        envelope_version: EVENT_ENVELOPE_VERSION,
     }
 }

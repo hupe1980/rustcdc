@@ -1,6 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroizing;
 
 use crate::core::{Error, Result};
 
@@ -13,7 +14,8 @@ pub trait SecretProvider: Send + Sync {
 
 #[derive(Clone)]
 enum SecretValue {
-    Inline(String),
+    /// Inline secret — zeroed on drop via `Zeroizing<String>`.
+    Inline(Zeroizing<String>),
     Environment {
         variable: String,
     },
@@ -52,7 +54,7 @@ impl SecretString {
     /// Create a new secret wrapper from an owned string.
     pub fn new(value: impl Into<String>) -> Self {
         Self {
-            value: SecretValue::Inline(value.into()),
+            value: SecretValue::Inline(Zeroizing::new(value.into())),
         }
     }
 
@@ -98,7 +100,7 @@ impl SecretString {
     /// Deferred secrets must be resolved with `resolve`.
     pub fn expose_secret(&self) -> Result<&str> {
         match &self.value {
-            SecretValue::Inline(value) => Ok(value),
+            SecretValue::Inline(value) => Ok(value.as_str()),
             SecretValue::Environment { .. }
             | SecretValue::Provider { .. }
             | SecretValue::Callback { .. } => Err(Error::ConfigError(
@@ -110,7 +112,7 @@ impl SecretString {
     /// Resolve the secret value for connector internals.
     pub fn resolve(&self) -> Result<String> {
         match &self.value {
-            SecretValue::Inline(value) => Ok(value.clone()),
+            SecretValue::Inline(value) => Ok(value.as_str().to_owned()),
             SecretValue::Environment { variable } => std::env::var(variable).map_err(|error| {
                 Error::ConfigError(format!(
                     "failed to load secret from environment variable '{variable}': {error}"
@@ -136,7 +138,7 @@ impl SecretString {
     /// Consume the wrapper and return the inline secret.
     pub fn into_inner(self) -> Result<String> {
         match self.value {
-            SecretValue::Inline(value) => Ok(value),
+            SecretValue::Inline(value) => Ok(value.as_str().to_owned()),
             SecretValue::Environment { .. }
             | SecretValue::Provider { .. }
             | SecretValue::Callback { .. } => Err(Error::ConfigError(
@@ -152,7 +154,7 @@ impl SecretString {
 
     fn kind_and_descriptor(&self) -> (&'static str, &str) {
         match &self.value {
-            SecretValue::Inline(value) => ("inline", value),
+            SecretValue::Inline(value) => ("inline", value.as_str()),
             SecretValue::Environment { variable } => ("env", variable),
             SecretValue::Provider {
                 provider_name,

@@ -252,6 +252,41 @@ WARNING checkpoint latency exceeding 1s
 
 ## Performance and Throughput Issues
 
+### Symptom: SQL Server high p99 latency (bursty / non-uniform)
+
+**Expected behavior — not a bug:**
+
+SQL Server CDC is **polling-based**.  cdc-rs calls `cdc.fn_cdc_get_all_changes_*`
+at a configurable interval (`stream_poll_interval_ms`, default 5 000 ms).  Unlike
+PostgreSQL logical replication (push-based, near-zero propagation), SQL Server
+events are only visible after the next poll cycle **and** after the SQL Server CDC
+capture agent has written them to the change tables (typically < 5 s on an idle server).
+
+Expected latency profile:
+
+| Percentile | Typical value |
+|------------|---------------|
+| p50        | ≈ stream_poll_interval_ms / 2 |
+| p99        | ≈ stream_poll_interval_ms + capture agent delay |
+| p99.9      | ≈ 2 × stream_poll_interval_ms (poll jitter under load) |
+
+A p99/p50 ratio of 1 000× is **normal** (e.g. p50 = 0.3 ms measured within a poll
+window, p99 = 318 ms = one poll cycle).
+
+**Tuning for lower latency:**
+
+```rust
+SqlServerSourceConfig {
+    stream_poll_interval_ms: 500,  // default 5000; 500–1000 ms for latency-sensitive
+    ..SqlServerSourceConfig::default()
+}
+```
+
+Lower values increase SQL Server query load.  500 ms is the practical lower bound
+for most production SQL Server deployments.
+
+---
+
 ### Symptom: Low event throughput or high latency
 
 **Error Examples:**

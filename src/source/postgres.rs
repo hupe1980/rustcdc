@@ -15,10 +15,11 @@ use crate::{
     },
     source::{
         helpers::now_millis, ConnectorCapabilities, HandoffResult, SnapshotHandle, Source,
-        StreamHandle,
+        StreamHandle, IncrementalSnapshotConfig,
     },
 };
 
+mod decoder;
 mod parser;
 mod query;
 mod state;
@@ -30,6 +31,10 @@ mod snapshot_finalize;
 mod stream_start;
 mod snapshot_start;
 mod validation;
+pub mod incremental_snapshot;
+
+// Import decoder types used directly in this module.
+use self::decoder::{PgOutputMessageProvider, PgRelation};
 
 use self::handoff::postgres_handoff_result;
 #[cfg(test)]
@@ -45,480 +50,12 @@ use self::state::{
     ConnectionState, PostgresHandoff, PostgresStream, SnapshotCheckpointState, StreamState,
     TableSnapshotState,
 };
+pub use self::incremental_snapshot::IncrementalSnapshotHandle;
 
 const HEARTBEAT_SECS: u64 = 60;
 const DEFAULT_SNAPSHOT_CHUNK_SIZE: usize = 5_000;
 const STREAM_POLL_INTERVAL_MS: u64 = 50;
 const MAX_EVENTS_PER_POLL: usize = 1_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgColumn {
-    name: String,
-    flags: u8,
-    type_oid: u32,
-    type_modifier: i32,
-}
-
-impl PgColumn {
-    fn is_key(&self) -> bool {
-        (self.flags & 0x01) != 0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PgValue {
-    Null,
-    Unchanged,
-    Text(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgRelation {
-    oid: u32,
-    namespace: String,
-    name: String,
-    replica_identity: u8,
-    columns: Vec<PgColumn>,
-}
-
-/// BEGIN message — marks the start of a transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgBegin {
-    /// Final LSN of the transaction (the commit LSN).
-    final_lsn: u64,
-    /// Commit timestamp in microseconds since the PostgreSQL epoch (2000-01-01 UTC).
-    commit_timestamp_us: i64,
-    /// Transaction XID.
-    xid: u32,
-}
-
-/// COMMIT message — marks the end of a successfully committed transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgCommit {
-    /// Unused flags byte (reserved for future use).
-    flags: u8,
-    /// LSN of the commit WAL record.
-    commit_lsn: u64,
-    /// LSN immediately after the commit record (next WAL position).
-    end_lsn: u64,
-    /// Commit timestamp in microseconds since the PostgreSQL epoch.
-    commit_timestamp_us: i64,
-}
-
-/// INSERT message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgInsert {
-    relation_oid: u32,
-    new_tuple: Vec<PgValue>,
-}
-
-/// UPDATE message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgUpdate {
-    relation_oid: u32,
-    /// Key-only old tuple (present when replica identity = DEFAULT and key columns changed).
-    key_tuple: Option<Vec<PgValue>>,
-    /// Full old tuple (present when replica identity = FULL).
-    old_tuple: Option<Vec<PgValue>>,
-    new_tuple: Vec<PgValue>,
-}
-
-/// DELETE message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgDelete {
-    relation_oid: u32,
-    /// Key-only old tuple (replica identity = DEFAULT/INDEX).
-    key_tuple: Option<Vec<PgValue>>,
-    /// Full old tuple (replica identity = FULL).
-    old_tuple: Option<Vec<PgValue>>,
-}
-
-/// TRUNCATE message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PgTruncate {
-    /// Bit 0 = CASCADE, bit 1 = RESTART SEQS.
-    option_bits: u8,
-    relation_oids: Vec<u32>,
-}
-
-/// A decoded pgoutput protocol message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PgOutputMessage {
-    Begin(PgBegin),
-    Commit(PgCommit),
-    Relation(PgRelation),
-    Insert(PgInsert),
-    Update(PgUpdate),
-    Delete(PgDelete),
-    Truncate(PgTruncate),
-    /// Message type not handled by this decoder (Origin, Type, LogicalMessage, etc.).
-    Unknown(u8),
-}
-
-// ─── Pgoutput binary decoder ────────────────────────────────────────────────
-
-/// Cursor over a byte slice for sequential big-endian decoding.
-struct BytesCursor<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> BytesCursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn read_u8(&mut self) -> Result<u8> {
-        self.data
-            .get(self.pos)
-            .ok_or_else(|| {
-                Error::SourceError("unexpected end of pgoutput message reading u8".into())
-            })
-            .map(|&b| {
-                self.pos += 1;
-                b
-            })
-    }
-
-    fn read_u16_be(&mut self) -> Result<u16> {
-        let b = self.read_n_bytes(2)?;
-        Ok(u16::from_be_bytes([b[0], b[1]]))
-    }
-
-    fn read_u32_be(&mut self) -> Result<u32> {
-        let b = self.read_n_bytes(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn read_i32_be(&mut self) -> Result<i32> {
-        let b = self.read_n_bytes(4)?;
-        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn read_u64_be(&mut self) -> Result<u64> {
-        let b = self.read_n_bytes(8)?;
-        Ok(u64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
-    }
-
-    fn read_i64_be(&mut self) -> Result<i64> {
-        let b = self.read_n_bytes(8)?;
-        Ok(i64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
-    }
-
-    fn read_cstring(&mut self) -> Result<String> {
-        let start = self.pos;
-        while self.pos < self.data.len() && self.data[self.pos] != 0 {
-            self.pos += 1;
-        }
-        if self.pos >= self.data.len() {
-            return Err(Error::SourceError(
-                "unterminated cstring in pgoutput message".into(),
-            ));
-        }
-        let s = std::str::from_utf8(&self.data[start..self.pos])
-            .map_err(|error| {
-                Error::SourceError(format!("non-UTF8 cstring in pgoutput message: {error}"))
-            })?
-            .to_string();
-        self.pos += 1;
-        Ok(s)
-    }
-
-    fn read_n_bytes(&mut self, n: usize) -> Result<&[u8]> {
-        let end = self.pos + n;
-        if end > self.data.len() {
-            return Err(Error::SourceError(format!(
-                "unexpected end of pgoutput message: need {n} bytes at offset {} but only {} remain",
-                self.pos,
-                self.data.len() - self.pos
-            )));
-        }
-        let slice = &self.data[self.pos..end];
-        self.pos = end;
-        Ok(slice)
-    }
-}
-
-fn decode_pgoutput_message(data: &[u8]) -> Result<PgOutputMessage> {
-    if data.is_empty() {
-        return Err(Error::SourceError("empty pgoutput message".into()));
-    }
-    let mut cur = BytesCursor::new(data);
-    match cur.read_u8()? {
-        b'B' => Ok(PgOutputMessage::Begin(decode_begin(&mut cur)?)),
-        b'C' => Ok(PgOutputMessage::Commit(decode_commit(&mut cur)?)),
-        b'R' => Ok(PgOutputMessage::Relation(decode_relation(&mut cur)?)),
-        b'I' => Ok(PgOutputMessage::Insert(decode_insert(&mut cur)?)),
-        b'U' => Ok(PgOutputMessage::Update(decode_update(&mut cur)?)),
-        b'D' => Ok(PgOutputMessage::Delete(decode_delete(&mut cur)?)),
-        b'T' => Ok(PgOutputMessage::Truncate(decode_truncate(&mut cur)?)),
-        other => Ok(PgOutputMessage::Unknown(other)),
-    }
-}
-
-fn decode_begin(cur: &mut BytesCursor) -> Result<PgBegin> {
-    let final_lsn = cur.read_u64_be()?;
-    let commit_timestamp_us = cur.read_i64_be()?;
-    let xid = cur.read_u32_be()?;
-    Ok(PgBegin {
-        final_lsn,
-        commit_timestamp_us,
-        xid,
-    })
-}
-
-fn decode_commit(cur: &mut BytesCursor) -> Result<PgCommit> {
-    let flags = cur.read_u8()?;
-    let commit_lsn = cur.read_u64_be()?;
-    let end_lsn = cur.read_u64_be()?;
-    let commit_timestamp_us = cur.read_i64_be()?;
-    Ok(PgCommit {
-        flags,
-        commit_lsn,
-        end_lsn,
-        commit_timestamp_us,
-    })
-}
-
-fn decode_relation(cur: &mut BytesCursor) -> Result<PgRelation> {
-    let oid = cur.read_u32_be()?;
-    let namespace = cur.read_cstring()?;
-    let name = cur.read_cstring()?;
-    let replica_identity = cur.read_u8()?;
-    let ncols = cur.read_u16_be()?;
-    let mut columns = Vec::with_capacity(ncols as usize);
-    for _ in 0..ncols {
-        let flags = cur.read_u8()?;
-        let name = cur.read_cstring()?;
-        let type_oid = cur.read_u32_be()?;
-        let type_modifier = cur.read_i32_be()?;
-        columns.push(PgColumn {
-            name,
-            flags,
-            type_oid,
-            type_modifier,
-        });
-    }
-    Ok(PgRelation {
-        oid,
-        namespace,
-        name,
-        replica_identity,
-        columns,
-    })
-}
-
-fn decode_insert(cur: &mut BytesCursor) -> Result<PgInsert> {
-    let relation_oid = cur.read_u32_be()?;
-    let marker = cur.read_u8()?;
-    if marker != b'N' {
-        return Err(Error::SourceError(format!(
-            "expected 'N' marker in INSERT message, got {marker:#x}"
-        )));
-    }
-    let new_tuple = decode_tuple_data(cur)?;
-    Ok(PgInsert {
-        relation_oid,
-        new_tuple,
-    })
-}
-
-fn decode_update(cur: &mut BytesCursor) -> Result<PgUpdate> {
-    let relation_oid = cur.read_u32_be()?;
-    let marker = cur.read_u8()?;
-    let (key_tuple, old_tuple, new_tuple) = match marker {
-        b'K' => {
-            let key = decode_tuple_data(cur)?;
-            let next = cur.read_u8()?;
-            if next != b'N' {
-                return Err(Error::SourceError(format!(
-                    "expected 'N' after key tuple in UPDATE, got {next:#x}"
-                )));
-            }
-            let new = decode_tuple_data(cur)?;
-            (Some(key), None, new)
-        }
-        b'O' => {
-            let old = decode_tuple_data(cur)?;
-            let next = cur.read_u8()?;
-            if next != b'N' {
-                return Err(Error::SourceError(format!(
-                    "expected 'N' after old tuple in UPDATE, got {next:#x}"
-                )));
-            }
-            let new = decode_tuple_data(cur)?;
-            (None, Some(old), new)
-        }
-        b'N' => {
-            let new = decode_tuple_data(cur)?;
-            (None, None, new)
-        }
-        other => {
-            return Err(Error::SourceError(format!(
-                "unknown UPDATE marker: {other:#x}"
-            )));
-        }
-    };
-    Ok(PgUpdate {
-        relation_oid,
-        key_tuple,
-        old_tuple,
-        new_tuple,
-    })
-}
-
-fn decode_delete(cur: &mut BytesCursor) -> Result<PgDelete> {
-    let relation_oid = cur.read_u32_be()?;
-    let marker = cur.read_u8()?;
-    let (key_tuple, old_tuple) = match marker {
-        b'K' => (Some(decode_tuple_data(cur)?), None),
-        b'O' => (None, Some(decode_tuple_data(cur)?)),
-        other => {
-            return Err(Error::SourceError(format!(
-                "unknown DELETE marker: {other:#x}"
-            )));
-        }
-    };
-    Ok(PgDelete {
-        relation_oid,
-        key_tuple,
-        old_tuple,
-    })
-}
-
-fn decode_truncate(cur: &mut BytesCursor) -> Result<PgTruncate> {
-    let num_rels = usize::try_from(cur.read_u32_be()?).unwrap_or(0);
-    let option_bits = cur.read_u8()?;
-    let mut relation_oids = Vec::with_capacity(num_rels);
-    for _ in 0..num_rels {
-        relation_oids.push(cur.read_u32_be()?);
-    }
-    Ok(PgTruncate {
-        option_bits,
-        relation_oids,
-    })
-}
-
-fn decode_tuple_data(cur: &mut BytesCursor) -> Result<Vec<PgValue>> {
-    let num_cols = usize::from(cur.read_u16_be()?);
-    let mut values = Vec::with_capacity(num_cols);
-    for _ in 0..num_cols {
-        let datum_kind = cur.read_u8()?;
-        let value = match datum_kind {
-            b'n' => PgValue::Null,
-            b'u' => PgValue::Unchanged,
-            b't' => {
-                let len = usize::try_from(cur.read_i32_be()?).map_err(|_| {
-                    Error::SourceError("negative text datum length in pgoutput tuple".into())
-                })?;
-                let bytes = cur.read_n_bytes(len)?;
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|error| {
-                        Error::SourceError(format!(
-                            "non-UTF8 text datum in pgoutput tuple: {error}"
-                        ))
-                    })?
-                    .to_string();
-                PgValue::Text(text)
-            }
-            b'b' => {
-                // Binary datum (pgoutput v2+): hex-encode for safe transport.
-                let len = usize::try_from(cur.read_i32_be()?).map_err(|_| {
-                    Error::SourceError("negative binary datum length in pgoutput tuple".into())
-                })?;
-                let bytes = cur.read_n_bytes(len)?;
-                let hex = bytes
-                    .iter()
-                    .fold(String::with_capacity(len * 2 + 2), |mut acc, b| {
-                        use std::fmt::Write;
-                        let _ = write!(acc, "{b:02x}");
-                        acc
-                    });
-                PgValue::Text(format!("\\x{hex}"))
-            }
-            other => {
-                return Err(Error::SourceError(format!(
-                    "unknown datum kind {other:#x} in pgoutput tuple"
-                )));
-            }
-        };
-        values.push(value);
-    }
-    Ok(values)
-}
-
-#[derive(Debug)]
-struct PgOutputXLogData {
-    lsn: u64,
-    data: Vec<u8>,
-}
-
-#[async_trait]
-trait PgOutputMessageProvider: Send + Sync {
-    async fn poll_xlog_data(&mut self, max_messages: usize) -> Result<Vec<PgOutputXLogData>>;
-    async fn confirm_lsn(&mut self, lsn: u64) -> Result<()>;
-}
-
-struct LivePgOutputMessageProvider {
-    client: Arc<Client>,
-    slot_name: String,
-    publication_name: String,
-    confirmed_lsn: u64,
-}
-
-#[async_trait]
-impl PgOutputMessageProvider for LivePgOutputMessageProvider {
-    async fn poll_xlog_data(&mut self, max_messages: usize) -> Result<Vec<PgOutputXLogData>> {
-        // pg_logical_slot_peek_binary_changes expects upto_nchanges as int4.
-        let capped = i32::try_from(max_messages.max(1)).unwrap_or(i32::MAX);
-        let rows = self
-            .client
-            .query(
-                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication_names', $3)",
-                &[&self.slot_name, &capped, &self.publication_name],
-            )
-            .await
-            .map_err(|error| map_pgoutput_poll_error(&self.slot_name, &error.to_string()))?;
-
-        let mut messages = Vec::with_capacity(rows.len());
-        for row in rows {
-            let lsn_text: String = row.get(0);
-            let data: Vec<u8> = row.get(1);
-            messages.push(PgOutputXLogData {
-                lsn: parse_pg_lsn(&lsn_text)?,
-                data,
-            });
-        }
-
-        Ok(messages)
-    }
-
-    async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
-        if lsn <= self.confirmed_lsn {
-            return Ok(());
-        }
-
-        let lsn_text = format_pg_lsn(lsn);
-        self.client
-            .query_opt(
-                "SELECT 1 FROM pg_replication_slot_advance($1, $2)",
-                &[&self.slot_name, &lsn_text],
-            )
-            .await
-            .map_err(|error| {
-                Error::SourceError(format!(
-                    "failed advancing replication slot '{}' to {}: {error}",
-                    self.slot_name, lsn_text
-                ))
-            })?;
-        self.confirmed_lsn = lsn;
-        Ok(())
-    }
-}
 
 // ─── PostgresStreamHandle ───────────────────────────────────────────────────
 pub struct PostgresStreamHandle {
@@ -867,6 +404,17 @@ pub struct PostgresSourceConfig {
     pub stream_poll_interval_ms: u64,
     /// Maximum events yielded by a single stream poll cycle.
     pub max_events_per_poll: usize,
+    /// Allowlist of tables to stream, in `"schema.table"` format.
+    ///
+    /// When non-empty, only tables in this list are forwarded to the caller.
+    /// Takes precedence over [`table_exclude_list`](PostgresSourceConfig::table_exclude_list).
+    /// An empty list means *all* tables are included (subject to the publication).
+    pub table_include_list: Vec<String>,
+    /// Blocklist of tables to suppress, in `"schema.table"` format.
+    ///
+    /// Ignored when [`table_include_list`](PostgresSourceConfig::table_include_list) is non-empty.
+    /// An empty list means no tables are excluded.
+    pub table_exclude_list: Vec<String>,
 }
 
 /// PostgreSQL connector lifecycle manager.
@@ -931,10 +479,10 @@ impl PostgresConnection {
                 state.heartbeat_task = Some(heartbeat_task);
                 Ok(())
             }
-            TransportConfig::Tls { ca_cert_path } => {
+            TransportConfig::Tls { ca_cert_path, client_cert_path, client_key_path } => {
                 #[cfg(not(feature = "tls"))]
                 {
-                    let _ = ca_cert_path;
+                    let _ = (ca_cert_path, client_cert_path, client_key_path);
                     return Err(Error::ConfigError(
                         "postgres connector requires crate feature 'tls' for TLS transport"
                             .into(),
@@ -945,12 +493,11 @@ impl PostgresConnection {
                 {
                     use tokio_postgres_rustls::MakeRustlsConnect;
 
-                    // Build root cert store: load from file if provided, else use system roots.
-                    let root_store = build_tls_root_store(ca_cert_path.as_deref())?;
-
-                    let tls_config = rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth();
+                    let tls_config = build_tls_client_config(
+                        ca_cert_path.as_deref(),
+                        client_cert_path.as_deref(),
+                        client_key_path.as_deref(),
+                    )?;
 
                     let tls_connector = MakeRustlsConnect::new(tls_config);
                     let connect_config = self.config.build_connect_config()?;
@@ -1002,6 +549,41 @@ impl PostgresConnection {
         resume_from: Option<&dyn Offset>,
     ) -> Result<Box<dyn SnapshotHandle>> {
         start_postgres_snapshot_from_checkpoint(self, tables, resume_from).await
+    }
+
+    /// Start an incremental (non-blocking) snapshot using the DBLog watermark pattern.
+    ///
+    /// Unlike `start_snapshot`, this method:
+    /// - Does **not** pause the replication stream.
+    /// - Does **not** hold a `REPEATABLE READ` transaction.
+    /// - Reads the table in small chunks (keyset-paginated, `READ COMMITTED`).
+    /// - For each chunk, captures a low/high watermark LSN and uses the replication
+    ///   stream to detect concurrent writes, suppressing stale chunk rows.
+    ///
+    /// The returned `StreamHandle` interleaves snapshot `Read` events with live
+    /// replication events.  Once all tables are exhausted it acts as a pure
+    /// stream delegate.
+    ///
+    /// `resume_from` is forwarded to `start_stream` to resume from a saved
+    /// checkpoint offset.
+    pub async fn start_incremental_snapshot(
+        &mut self,
+        config: IncrementalSnapshotConfig,
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn StreamHandle>> {
+        let client = {
+            let state = self.state.lock().await;
+            state.client.clone().ok_or_else(|| {
+                Error::StateError(
+                    "postgres connection must be established before starting an incremental snapshot".into(),
+                )
+            })?
+        };
+        let inner = start_postgres_stream(self, resume_from).await?;
+        let source_name = self.source_type().to_string();
+        let handle =
+            IncrementalSnapshotHandle::new(inner, client, config, source_name).await?;
+        Ok(Box::new(handle))
     }
 
     async fn validate_connected_client(&self, client: &Client) -> Result<()> {
@@ -1108,6 +690,7 @@ impl Source for PostgresConnection {
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
             truncate: true,
+            incremental_snapshot: true,
         }
     }
 }
@@ -1217,10 +800,6 @@ async fn query_primary_key_columns_and_types(
     query::query_primary_key_columns_and_types(client, schema, table).await
 }
 
-fn map_pgoutput_poll_error(slot_name: &str, error_message: &str) -> Error {
-    parser::map_pgoutput_poll_error(slot_name, error_message)
-}
-
 fn parse_pg_lsn(value: &str) -> Result<u64> {
     parser::parse_pg_lsn(value)
 }
@@ -1275,13 +854,16 @@ async fn query_current_wal_lsn(client: &Client) -> Result<u64> {
 
 /// Build a rustls `RootCertStore` from a PEM file path, or use system roots if `None`.
 ///
-/// When a path is provided every PEM certificate in the file is loaded as a
-/// trusted root. If the file cannot be read or contains no valid certificates
-/// an error is returned so mis-configuration is caught at connect time rather
-/// than silently falling back to a weaker trust model.
+/// When mTLS paths are provided (`client_cert_path` + `client_key_path`), mutual TLS
+/// authentication is configured. When only `ca_cert_path` is provided, server-auth-only
+/// TLS is used. Falls back to system trust roots when `ca_cert_path` is `None`.
 #[cfg(feature = "tls")]
-fn build_tls_root_store(ca_cert_path: Option<&str>) -> Result<rustls::RootCertStore> {
-    query::build_tls_root_store(ca_cert_path)
+fn build_tls_client_config(
+    ca_cert_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<rustls::ClientConfig> {
+    query::build_tls_client_config(ca_cert_path, client_cert_path, client_key_path)
 }
 
 async fn run_connection_task<S>(connection: Connection<Socket, S>)
@@ -1310,10 +892,14 @@ mod tests {
     use super::PostgresSourceConfig;
     use super::validation::{validate_with_backend, ValidationBackend};
     use super::{
-        PgOutputMessageProvider, PgOutputXLogData, PgValue, PostgresConnection,
-        PostgresSnapshotHandle, PostgresStream, PostgresStreamHandle, StreamState, TableSnapshot,
-        TableSnapshotState, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS,
+        PgOutputMessageProvider, PostgresConnection, PostgresSnapshotHandle, PostgresStream,
+        PostgresStreamHandle, StreamState, TableSnapshot, TableSnapshotState, MAX_EVENTS_PER_POLL,
+        STREAM_POLL_INTERVAL_MS,
     };
+    use super::decoder::{
+        decode_pgoutput_message, PgOutputMessage, PgOutputXLogData, PgValue,
+    };
+    use super::parser::map_pgoutput_poll_error;
     use crate::{core::TransportConfig, SecretString};
 
     // ─── Validation backend mock ─────────────────────────────────────────────
@@ -1494,8 +1080,8 @@ mod tests {
     #[test]
     fn decode_pgoutput_begin_message() {
         let data = build_begin(1000, 946_684_800_000_000, 42);
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Begin(b) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Begin(b) => {
                 assert_eq!(b.final_lsn, 1000);
                 assert_eq!(b.xid, 42);
                 assert_eq!(b.commit_timestamp_us, 946_684_800_000_000);
@@ -1507,8 +1093,8 @@ mod tests {
     #[test]
     fn decode_pgoutput_commit_message() {
         let data = build_commit(900, 1000, 0);
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Commit(c) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Commit(c) => {
                 assert_eq!(c.commit_lsn, 900);
                 assert_eq!(c.end_lsn, 1000);
                 assert_eq!(c.flags, 0);
@@ -1520,8 +1106,8 @@ mod tests {
     #[test]
     fn decode_pgoutput_relation_message() {
         let data = build_relation(1001, "public", "users", &[("id", true), ("name", false)]);
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Relation(r) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Relation(r) => {
                 assert_eq!(r.oid, 1001);
                 assert_eq!(r.namespace, "public");
                 assert_eq!(r.name, "users");
@@ -1538,8 +1124,8 @@ mod tests {
     #[test]
     fn decode_pgoutput_insert_message() {
         let data = build_insert(1001, &[Some("1"), Some("alice")]);
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Insert(i) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Insert(i) => {
                 assert_eq!(i.relation_oid, 1001);
                 assert_eq!(i.new_tuple.len(), 2);
                 assert_eq!(i.new_tuple[0], PgValue::Text("1".into()));
@@ -1552,8 +1138,8 @@ mod tests {
     #[test]
     fn decode_pgoutput_insert_with_null_column() {
         let data = build_insert(1001, &[Some("1"), None]);
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Insert(i) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Insert(i) => {
                 assert_eq!(i.new_tuple[1], PgValue::Null);
             }
             other => panic!("unexpected: {other:?}"),
@@ -1567,8 +1153,8 @@ mod tests {
             Some(&[Some("1"), Some("alice")]),
             &[Some("1"), Some("bob")],
         );
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Update(u) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Update(u) => {
                 assert_eq!(u.relation_oid, 1001);
                 assert!(u.old_tuple.is_some());
                 let old = u.old_tuple.as_ref().unwrap();
@@ -1582,8 +1168,8 @@ mod tests {
     #[test]
     fn decode_pgoutput_update_message_without_old_tuple() {
         let data = build_update(1001, None, &[Some("1"), Some("bob")]);
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Update(u) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Update(u) => {
                 assert!(u.old_tuple.is_none());
                 assert!(u.key_tuple.is_none());
                 assert_eq!(u.new_tuple[0], PgValue::Text("1".into()));
@@ -1595,8 +1181,8 @@ mod tests {
     #[test]
     fn decode_pgoutput_delete_message_with_key() {
         let data = build_delete(1001, &[Some("1"), None]);
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Delete(d) => {
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Delete(d) => {
                 assert_eq!(d.relation_oid, 1001);
                 assert!(d.key_tuple.is_some());
                 let key = d.key_tuple.as_ref().unwrap();
@@ -1610,22 +1196,22 @@ mod tests {
     #[test]
     fn decode_pgoutput_unknown_message_type() {
         let data = vec![b'X'];
-        match super::decode_pgoutput_message(&data).unwrap() {
-            super::PgOutputMessage::Unknown(t) => assert_eq!(t, b'X'),
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Unknown(t) => assert_eq!(t, b'X'),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
     fn decode_pgoutput_rejects_empty_message() {
-        let result = super::decode_pgoutput_message(&[]);
+        let result = decode_pgoutput_message(&[]);
         assert!(matches!(result, Err(crate::core::Error::SourceError(_))));
     }
 
     #[test]
     fn decode_pgoutput_rejects_truncated_begin() {
         let truncated = &build_begin(1000, 0, 1)[..5]; // cut short
-        let result = super::decode_pgoutput_message(truncated);
+        let result = decode_pgoutput_message(truncated);
         assert!(result.is_err());
     }
 
@@ -1951,7 +1537,7 @@ mod tests {
     #[test]
     fn pgoutput_poll_error_maps_dead_slot_guidance() {
         let err =
-            super::map_pgoutput_poll_error("slot1", "ERROR: required WAL segment has been removed");
+            map_pgoutput_poll_error("slot1", "ERROR: required WAL segment has been removed");
         let msg = err.to_string();
         assert!(msg.contains("stale or dead"));
         assert!(msg.contains("slot1"));
@@ -2039,6 +1625,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: 1,
             max_events_per_poll: 1,
+            ..Default::default()
         };
 
         config.stream_poll_interval_ms = 0;
@@ -2075,6 +1662,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
 
         let debug = format!("{config:?}");
@@ -2096,6 +1684,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
 
         assert!(config.validate().is_ok());
@@ -2116,6 +1705,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         });
 
         assert_eq!(connection.source_type(), "postgres");
@@ -2140,6 +1730,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
         let backend = MockValidationBackend {
             slot_exists: false,
@@ -2169,6 +1760,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
         let backend = MockValidationBackend {
             slot_exists: true,
@@ -2197,6 +1789,7 @@ mod tests {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         };
         let backend = MockValidationBackend {
             slot_exists: true,

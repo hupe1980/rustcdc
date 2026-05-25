@@ -69,6 +69,7 @@ async fn run_mysql_connection_lifecycle(version: &str, server_id: u32) -> cdc_rs
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let connection = MysqlConnection::new(config);
@@ -142,6 +143,7 @@ async fn mysql_capabilities_are_consistent_in_matrix_profile() -> cdc_rs::Result
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let connection = MysqlConnection::new(config);

@@ -98,6 +98,7 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> cdc_rs:
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let checkpoint_dir = tempfile::tempdir().map_err(cdc_rs::Error::IoError)?;

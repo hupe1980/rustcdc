@@ -18,7 +18,7 @@ const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
 fn allow_insecure_test_transport() -> bool {
     #[cfg(feature = "insecure-test-overrides")]
     {
-        return std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1");
+        std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1")
     }
 
     #[cfg(not(feature = "insecure-test-overrides"))]
@@ -64,6 +64,8 @@ impl Default for SqlServerSourceConfig {
             prereq_pool_size: DEFAULT_POOL_SIZE,
             stream_poll_interval_ms: DEFAULT_STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            table_include_list: Vec::new(),
+            table_exclude_list: Vec::new(),
         }
     }
 }
@@ -146,7 +148,7 @@ impl SqlServerSourceConfig {
                 "sqlserver max_events_per_poll must be less than or equal to {MAX_MAX_EVENTS_PER_POLL}"
             )));
         }
-        if let TransportConfig::Tls { ca_cert_path } = &self.transport {
+        if let TransportConfig::Tls { ca_cert_path, .. } = &self.transport {
             #[cfg(not(feature = "tls"))]
             {
                 let _ = ca_cert_path;

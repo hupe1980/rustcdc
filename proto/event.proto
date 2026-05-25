@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package cdc_rs;
+
+// Canonical CDC event envelope — cdc-rs envelope_version=1
+//
+// Field numbers are stable. New fields will only be added with new tag numbers.
+// Consumers MUST ignore unknown fields (standard protobuf behaviour).
+//
+// Encoding notes:
+//   - `before` and `after` carry UTF-8 JSON as raw bytes.
+//   - `ts` is milliseconds since Unix epoch (1970-01-01T00:00:00Z).
+//   - `envelope_version` is currently always 1.
+//
+// Usage example (Go):
+//   import "github.com/acme/cdc_rs/proto/event_pb"
+//   e := &event_pb.Event{}
+//   proto.Unmarshal(data, e)
+//   after := make(map[string]interface{})
+//   json.Unmarshal(e.After, &after)
+
+// ─── Operation ────────────────────────────────────────────────────────────────
+
+// CRUD operation that produced this event.
+enum Operation {
+  // Should never appear in well-formed output.
+  OPERATION_UNSPECIFIED = 0;
+  // INSERT row.
+  INSERT = 1;
+  // UPDATE row (after-image; before-image in `before` field).
+  UPDATE = 2;
+  // DELETE row.
+  DELETE = 3;
+  // READ during initial snapshot.
+  READ = 4;
+  // DDL schema change.
+  SCHEMA_CHANGE = 5;
+  // TRUNCATE table.
+  TRUNCATE = 6;
+}
+
+// ─── SourceMetadata ───────────────────────────────────────────────────────────
+
+// Identity of the source connector and the event's durable position within it.
+message SourceMetadata {
+  // Logical connector name (e.g. "postgres", "mysql", "sqlserver").
+  string source_name = 1;
+  // Source-specific durable position (LSN, GTID, transaction log offset, …).
+  string offset = 2;
+  // Source timestamp in milliseconds since Unix epoch.
+  uint64 timestamp = 3;
+}
+
+// ─── SnapshotMetadata ─────────────────────────────────────────────────────────
+
+// Present only during the initial snapshot phase; absent during streaming CDC.
+message SnapshotMetadata {
+  // Identifier for the snapshot session (uuid or monotonic counter).
+  string snapshot_id = 1;
+  // Zero-based index of this chunk within the snapshot.
+  uint32 chunk_index = 2;
+  // True if this is the last chunk for this snapshot session.
+  bool is_last_chunk = 3;
+}
+
+// ─── TransactionMetadata ──────────────────────────────────────────────────────
+
+// Present when the event participates in a named transaction.
+message TransactionMetadata {
+  // Source transaction identifier (e.g. XID, GTID numeric component).
+  uint64 tx_id = 1;
+  // Total number of events committed in this transaction.
+  uint32 total_events = 2;
+  // Zero-based position of this event within the transaction.
+  uint32 event_index = 3;
+}
+
+// ─── Event ────────────────────────────────────────────────────────────────────
+
+// A single captured CDC event.
+message Event {
+  // JSON-encoded before-image of the row. Absent for INSERT events.
+  optional bytes before = 1;
+  // JSON-encoded after-image of the row. Absent for DELETE events.
+  optional bytes after = 2;
+  // CRUD operation.
+  Operation op = 3;
+  // Source connector identity and durable position.
+  SourceMetadata source = 4;
+  // Event timestamp in milliseconds since Unix epoch.
+  uint64 ts = 5;
+  // Database schema (namespace) name. Absent when unknown.
+  optional string schema = 6;
+  // Table name.
+  string table = 7;
+  // Ordered list of primary key column names.
+  repeated string primary_key = 8;
+  // Snapshot phase metadata. Absent during streaming CDC.
+  SnapshotMetadata snapshot = 9;
+  // Transaction metadata. Absent for single-event transactions.
+  TransactionMetadata transaction = 10;
+  // Canonical envelope schema version. Currently always 1.
+  uint32 envelope_version = 11;
+}

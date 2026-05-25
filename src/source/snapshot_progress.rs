@@ -1,6 +1,6 @@
 //! Resumable snapshot progress tracking and checkpoint persistence.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 
 use serde::{Deserialize, Serialize};
 

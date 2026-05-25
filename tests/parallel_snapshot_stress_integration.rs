@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cdc_rs::source::{ParallelSnapshotConfig, ParallelSnapshotState, SnapshotProgress};
+use cdc_rs::source::{SnapshotTrackerConfig, SnapshotProgressTracker, SnapshotProgress};
 
 const TABLE_COUNT: usize = 10;
 const ROWS_PER_TABLE: usize = 100_000;
@@ -28,13 +28,13 @@ fn parallel_snapshot_stress_resume_after_chunk_5_for_10_tables() {
     let tables = table_names();
     let total_chunks = ROWS_PER_TABLE / CHUNK_SIZE;
 
-    let state = Arc::new(ParallelSnapshotState::new(
+    let state = Arc::new(SnapshotProgressTracker::new(
         "parallel-stress".into(),
         1,
         tables.clone(),
-        ParallelSnapshotConfig {
-            max_parallel_tables: WORKERS,
+        SnapshotTrackerConfig {
             chunk_size: CHUNK_SIZE,
+            ..Default::default()
         },
     ));
 
@@ -79,13 +79,13 @@ fn parallel_snapshot_stress_resume_after_chunk_5_for_10_tables() {
 
     // Phase 2 (restart): hydrate a new state from checkpointed chunk progress,
     // then continue remaining chunks with 8 workers.
-    let resumed = Arc::new(ParallelSnapshotState::new(
+    let resumed = Arc::new(SnapshotProgressTracker::new(
         restored.snapshot_id.clone(),
         restored.created_at,
         tables.clone(),
-        ParallelSnapshotConfig {
-            max_parallel_tables: WORKERS,
+        SnapshotTrackerConfig {
             chunk_size: CHUNK_SIZE,
+            ..Default::default()
         },
     ));
 

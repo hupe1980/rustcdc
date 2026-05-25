@@ -151,6 +151,7 @@ async fn mysql_snapshot_large_table_chunked() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut connection = MysqlConnection::new(config);
@@ -290,6 +291,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     // Phase 1: Capture first 5K rows
@@ -426,6 +428,7 @@ async fn mysql_snapshot_empty_table() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut connection = MysqlConnection::new(config);

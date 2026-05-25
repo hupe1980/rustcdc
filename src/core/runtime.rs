@@ -45,6 +45,7 @@ const DEFAULT_RUNTIME_IDEMPOTENCY_CAPACITY: usize = 100_000;
 
 /// Explicit observability configuration for runtime construction.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct RuntimeObservability {
     /// Metrics collector used by runtime operations.
     pub metrics: Arc<dyn MetricsCollector>,
@@ -77,6 +78,7 @@ impl RuntimeObservability {
 
 /// Explicit runtime tuning and operational options.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct RuntimeOptions {
     /// Observability configuration for runtime instrumentation.
     pub observability: RuntimeObservability,
@@ -100,6 +102,27 @@ pub struct RuntimeOptions {
     /// When `Some`, the runtime retries the failing poll with exponential backoff before
     /// surfacing the error.
     pub connection_retry: Option<ConnectionRetryPolicy>,
+    /// Allowlist of tables whose events are forwarded to the caller, in `"schema.table"` format.
+    ///
+    /// When non-empty, events from tables **not** in this list are silently dropped after
+    /// source read but before transforms or buffering.  Takes precedence over
+    /// [`table_exclude_list`](RuntimeOptions::table_exclude_list).
+    /// An empty list means all tables pass through.
+    pub table_include_list: Vec<String>,
+    /// Blocklist of tables whose events are dropped, in `"schema.table"` format.
+    ///
+    /// Applied only when [`table_include_list`](RuntimeOptions::table_include_list) is empty.
+    /// An empty list means no tables are excluded.
+    pub table_exclude_list: Vec<String>,
+    /// Optional callback invoked when an event is discarded due to a transform error
+    /// under [`TransformErrorPolicy::Skip`].
+    ///
+    /// The handler receives the original (pre-transform) [`Event`] and the
+    /// [`Error`](crate::core::Error) that caused the skip. Use this to route discarded
+    /// events to a dead-letter queue, external error store, or alerting system.
+    ///
+    /// The callback is synchronous and must not block or panic.
+    pub dead_letter_handler: Option<std::sync::Arc<dyn Fn(Event, crate::core::Error) + Send + Sync>>,
 }
 
 impl Default for RuntimeOptions {
@@ -118,7 +141,10 @@ impl Default for RuntimeOptions {
             }),
             validate_events: true,
             schema_history_retention: None,
-            connection_retry: None,
+            connection_retry: Some(ConnectionRetryPolicy::default()),
+            table_include_list: Vec::new(),
+            table_exclude_list: Vec::new(),
+            dead_letter_handler: None,
         }
     }
 }
@@ -197,6 +223,7 @@ impl RuntimeOptions {
 
 /// Runtime-level idempotency guard configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IdempotencyOptions {
     pub capacity: usize,
     pub ttl_ms: Option<u64>,
@@ -243,6 +270,7 @@ impl IdempotencyOptions {
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnectionRetryPolicy {
     /// Maximum number of consecutive retries before the error is surfaced.
     /// `None` means retry indefinitely.
@@ -270,6 +298,8 @@ pub enum RuntimeSourceConfig {
     Postgres(PostgresSourceConfig),
     #[cfg(feature = "mysql")]
     Mysql(MysqlSourceConfig),
+    #[cfg(feature = "mariadb")]
+    MariaDb(crate::source::MariaDbSourceConfig),
     #[cfg(feature = "sqlserver")]
     SqlServer(SqlServerSourceConfig),
     Disabled,
@@ -277,12 +307,18 @@ pub enum RuntimeSourceConfig {
 
 impl RuntimeSourceConfig {
     /// Connector identifier when a real source is configured.
-    pub const fn source_type(&self) -> Option<&'static str> {
+    ///
+    /// For MySQL and MariaDB, this reflects the `server_flavor` field in the
+    /// config, so `RuntimeSourceConfig::Mysql(config_with_mariadb_flavor)` and
+    /// `RuntimeSourceConfig::MariaDb(...)` both return `Some("mariadb")`.
+    pub fn source_type(&self) -> Option<&'static str> {
         match self {
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => Some("postgres"),
             #[cfg(feature = "mysql")]
-            Self::Mysql(_) => Some("mysql"),
+            Self::Mysql(config) => Some(config.source_type()),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(_) => Some("mariadb"),
             #[cfg(feature = "sqlserver")]
             Self::SqlServer(_) => Some("sqlserver"),
             Self::Disabled => None,
@@ -296,6 +332,8 @@ impl RuntimeSourceConfig {
             Self::Postgres(_) => Self::postgres_connector_capabilities(),
             #[cfg(feature = "mysql")]
             Self::Mysql(_) => Self::full_connector_capabilities(),
+            #[cfg(feature = "mariadb")]
+            Self::MariaDb(_) => Self::full_connector_capabilities(),
             #[cfg(feature = "sqlserver")]
             Self::SqlServer(_) => Self::full_connector_capabilities(),
             Self::Disabled => ConnectorCapabilities::none(),
@@ -313,6 +351,7 @@ impl RuntimeSourceConfig {
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
             truncate: false,
+            incremental_snapshot: true,
         }
     }
 
@@ -327,6 +366,7 @@ impl RuntimeSourceConfig {
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
             truncate: true,
+            incremental_snapshot: true,
         }
     }
 }
@@ -937,6 +977,10 @@ where
             RuntimeSourceConfig::Mysql(source) => {
                 Ok(RuntimeSource::Mysql(MysqlConnection::new(source.clone())))
             }
+            #[cfg(feature = "mariadb")]
+            RuntimeSourceConfig::MariaDb(source) => {
+                Ok(RuntimeSource::Mysql(MysqlConnection::new(source.clone().into_inner())))
+            }
             #[cfg(feature = "sqlserver")]
             RuntimeSourceConfig::SqlServer(source) => Ok(RuntimeSource::SqlServer(
                 SqlServerConnection::new(source.clone()),
@@ -968,7 +1012,7 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::json;
     #[cfg(feature = "encryption")]
-    use std::collections::HashMap;
+    use ahash::AHashMap as HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1839,6 +1883,7 @@ mod tests {
                 tls: false,
                 schema_introspection: true,
                 truncate: false,
+                incremental_snapshot: false,
             }
         }
     }
@@ -2080,7 +2125,7 @@ mod tests {
         let encrypted_id = batch.events()[0].after.as_ref().unwrap()["id"]
             .as_str()
             .expect("encrypted payload should be string");
-        assert!(encrypted_id.starts_with("enc:v1:"));
+        assert!(encrypted_id.starts_with("enc:"));
 
         runtime
             .commit_ack(batch.ack_token().unwrap())

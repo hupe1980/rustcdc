@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use ahash::AHashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, sync::Mutex};
@@ -15,7 +16,7 @@ use crate::{
         Error, Offset, Result, SecretString, StructuredLogger, TransportConfig,
     },
     core::Event,
-    source::{ConnectorCapabilities, HandoffResult, SnapshotHandle, Source, StreamHandle},
+    source::{ConnectorCapabilities, HandoffResult, SnapshotHandle, Source, StreamHandle, IncrementalSnapshotConfig},
 };
 #[cfg(test)]
 use crate::core::{Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -34,6 +35,7 @@ mod snapshot_finalize;
 mod stream_start;
 mod snapshot_start;
 mod connection_lifecycle;
+pub mod incremental_snapshot;
 
 use self::snapshot_chunk::next_sqlserver_snapshot_chunk;
 use self::snapshot_finalize::{checkpoint_sqlserver_snapshot, finish_sqlserver_snapshot};
@@ -83,9 +85,38 @@ pub struct SqlServerSourceConfig {
     /// probe/heartbeat fanout pressure under multi-runtime deployments.
     pub prereq_pool_size: usize,
     /// Stream poll interval in milliseconds.
+    ///
+    /// # Latency characteristic
+    ///
+    /// SQL Server CDC uses **polling** against the `cdc.fn_cdc_get_all_changes_*`
+    /// table-valued functions rather than a push-based protocol like PostgreSQL
+    /// logical replication.  Event-to-consumer latency is therefore bounded by
+    /// this interval: a committed transaction will not be visible to cdc-rs until
+    /// the next poll cycle.
+    ///
+    /// - **p50 latency** is typically a fraction of `stream_poll_interval_ms`
+    ///   (events committed just before a poll boundary).
+    /// - **p99 latency** approaches the full `stream_poll_interval_ms` (events
+    ///   committed just after a poll boundary) plus CDC capture agent propagation
+    ///   delay (usually < 5 seconds on an unloaded server).
+    ///
+    /// Lower values reduce tail latency at the cost of higher poll frequency and
+    /// SQL Server query load.  The default (5 000 ms) is a reasonable production
+    /// starting point; latency-sensitive workloads may set this to 500–1 000 ms.
     pub stream_poll_interval_ms: u64,
     /// Maximum events yielded by a single stream poll cycle.
     pub max_events_per_poll: usize,
+    /// Allowlist of tables to stream, in `"schema.table"` format.
+    ///
+    /// When non-empty, only tables in this list are forwarded to the caller.
+    /// Takes precedence over [`table_exclude_list`](SqlServerSourceConfig::table_exclude_list).
+    /// An empty list means *all* tables are included.
+    pub table_include_list: Vec<String>,
+    /// Blocklist of tables to suppress, in `"schema.table"` format.
+    ///
+    /// Ignored when [`table_include_list`](SqlServerSourceConfig::table_include_list) is non-empty.
+    /// An empty list means no tables are excluded.
+    pub table_exclude_list: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +175,14 @@ pub struct SqlServerStreamHandle {
     events_polled: u64,
     requeued_events: Vec<Event>,
     max_events_per_poll: usize,
+    /// Buffered UPDATE after-images (op=3) awaiting their op=4 before-image partner.
+    ///
+    /// SQL Server CDC with `'all update old'` emits op=3 (after) before op=4 (before)
+    /// for the same `(start_lsn, seqval)` key.  We buffer the after-image until the
+    /// matching before-image arrives, then merge them into a single `Event` with both
+    /// `before` and `after` populated.  This buffer persists across poll boundaries so
+    /// a pair split by `max_events_per_poll` is handled correctly.
+    pending_update_afters: AHashMap<(String, String), (serde_json::Value, u64)>,
 }
 
 pub struct SqlServerSnapshotHandle {
@@ -573,7 +612,10 @@ impl StreamHandle for SqlServerStreamHandle {
         let mut out = Vec::new();
 
         while out.is_empty() && std::time::Instant::now() <= deadline {
-            for meta in &self.metas {
+            // Clone the meta list to avoid holding an immutable borrow of `self`
+            // while `map_changes_to_events` takes `&mut self`.
+            let metas_snapshot = self.metas.clone();
+            for meta in &metas_snapshot {
                 let changes = self
                     .fetch_changes_for_capture_instance(
                         &meta.capture_instance,
@@ -897,6 +939,26 @@ impl SqlServerConnection {
         start_sqlserver_snapshot_from_checkpoint(self, tables, resume_from).await
     }
 
+    /// Start a non-blocking incremental snapshot using the DBLog watermark pattern.
+    pub async fn start_incremental_snapshot(
+        &mut self,
+        config: IncrementalSnapshotConfig,
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn StreamHandle>> {
+        use crate::source::sqlserver::incremental_snapshot::SqlServerIncrementalSnapshotHandle;
+        self.ensure_connected().await?;
+        let inner = self.start_stream(resume_from).await?;
+        let source_name = self.source_type().to_string();
+        let handle = SqlServerIncrementalSnapshotHandle::new(
+            inner,
+            self.config.clone(),
+            config,
+            source_name,
+        )
+        .await?;
+        Ok(Box::new(handle))
+    }
+
     async fn load_table_columns(
         &self,
         client: &mut SqlClient,
@@ -1138,6 +1200,7 @@ impl Source for SqlServerConnection {
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
             truncate: false,
+            incremental_snapshot: true,
         }
     }
 }
@@ -1238,6 +1301,7 @@ mod tests {
             prereq_pool_size: DEFAULT_POOL_SIZE,
             stream_poll_interval_ms: DEFAULT_STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
         }
     }
 
@@ -1436,7 +1500,7 @@ mod tests {
 
     #[test]
     fn operation_mapping_produces_expected_events() {
-        let handle = SqlServerStreamHandle {
+        let mut handle = SqlServerStreamHandle {
             config: config(),
             stream: SqlServerStream {
                 lsn_start: [0; 10],
@@ -1448,6 +1512,7 @@ mod tests {
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            pending_update_afters: AHashMap::new(),
         };
 
         let meta = CaptureInstanceMeta {
@@ -1458,21 +1523,33 @@ mod tests {
             captured_columns: vec!["id".into(), "name".into()],
         };
 
+        // A realistic CDC window: INSERT, UPDATE (op=3 after-image then op=4 before-image), DELETE.
         let changes = vec![
+            // INSERT — op=2: full row is the after-image.
             SqlServerRawChange {
-                start_lsn_hex: "0x000000230000015A0004".into(),
-                seqval_hex: "0x000000230000015A0005".into(),
+                start_lsn_hex: "0x000000230000015A0002".into(),
+                seqval_hex: "0x000000230000015A0003".into(),
                 operation: 2,
                 ts_ms: 1,
                 row: serde_json::json!({"id": "1", "name": "alice"}),
             },
+            // UPDATE after-image (op=3) — new values, arrives first in ASC ORDER BY.
             SqlServerRawChange {
-                start_lsn_hex: "0x000000230000015A0006".into(),
-                seqval_hex: "0x000000230000015A0007".into(),
-                operation: 4,
+                start_lsn_hex: "0x000000230000015A0004".into(),
+                seqval_hex: "0x000000230000015A0005".into(),
+                operation: 3,
                 ts_ms: 2,
                 row: serde_json::json!({"id": "1", "name": "alice-v2"}),
             },
+            // UPDATE before-image (op=4) — old values, arrives second; same (lsn, seqval).
+            SqlServerRawChange {
+                start_lsn_hex: "0x000000230000015A0004".into(),
+                seqval_hex: "0x000000230000015A0005".into(),
+                operation: 4,
+                ts_ms: 2,
+                row: serde_json::json!({"id": "1", "name": "alice"}),
+            },
+            // DELETE — op=1: full row is the before-image.
             SqlServerRawChange {
                 start_lsn_hex: "0x000000230000015A0008".into(),
                 seqval_hex: "0x000000230000015A0009".into(),
@@ -1482,14 +1559,88 @@ mod tests {
             },
         ];
 
+        // op=3+op=4 merge into a single Event → total 3 events (not 4).
         let events = handle.map_changes_to_events(&meta, changes).unwrap();
         assert_eq!(events.len(), 3);
+
+        // INSERT
         assert_eq!(events[0].op, Operation::Insert);
+        assert!(events[0].before.is_none(), "INSERT before should be None");
+        assert_eq!(events[0].after, Some(serde_json::json!({"id": "1", "name": "alice"})));
+
+        // UPDATE — before=old values (op=4), after=new values (op=3)
         assert_eq!(events[1].op, Operation::Update);
+        assert_eq!(events[1].before, Some(serde_json::json!({"id": "1", "name": "alice"})),
+            "UPDATE before should hold the OLD row (op=4)");
+        assert_eq!(events[1].after, Some(serde_json::json!({"id": "1", "name": "alice-v2"})),
+            "UPDATE after should hold the NEW row (op=3)");
+
+        // DELETE
         assert_eq!(events[2].op, Operation::Delete);
-        assert!(events[0].after.is_some());
-        assert!(events[2].before.is_some());
+        assert_eq!(events[2].before, Some(serde_json::json!({"id": "1", "name": "alice-v2"})));
+        assert!(events[2].after.is_none(), "DELETE after should be None");
+
+        // tx_id is derived from seqval and must be non-zero for non-trivial seqval.
         assert!(events[0].transaction.as_ref().unwrap().tx_id > 0);
+    }
+
+    #[test]
+    fn update_pair_split_across_polls_merges_correctly() {
+        // Verifies that an op=3 buffered at end of one poll window is correctly merged
+        // when the matching op=4 arrives in the next poll.
+        let mut handle = SqlServerStreamHandle {
+            config: config(),
+            stream: SqlServerStream {
+                lsn_start: [0; 10],
+                lsn_end: [0; 10],
+                change_tables: vec!["dbo_users".into()],
+                poll_interval_ms: 5000,
+            },
+            metas: vec![],
+            events_polled: 0,
+            requeued_events: Vec::new(),
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            pending_update_afters: AHashMap::new(),
+        };
+
+        let meta = CaptureInstanceMeta {
+            capture_instance: "dbo_users".into(),
+            schema: "dbo".into(),
+            table: "users".into(),
+            primary_key: vec!["id".into()],
+            captured_columns: vec!["id".into(), "name".into()],
+        };
+
+        // Poll 1: only the op=3 after-image arrives.
+        let poll1 = vec![
+            SqlServerRawChange {
+                start_lsn_hex: "0x000000230000015A0004".into(),
+                seqval_hex: "0x000000230000015A0005".into(),
+                operation: 3,
+                ts_ms: 10,
+                row: serde_json::json!({"id": "1", "name": "alice-v2"}),
+            },
+        ];
+        let events1 = handle.map_changes_to_events(&meta, poll1).unwrap();
+        assert!(events1.is_empty(), "op=3 alone should be buffered, not emitted");
+        assert_eq!(handle.pending_update_afters.len(), 1);
+
+        // Poll 2: the op=4 before-image arrives; should merge with the buffered op=3.
+        let poll2 = vec![
+            SqlServerRawChange {
+                start_lsn_hex: "0x000000230000015A0004".into(),
+                seqval_hex: "0x000000230000015A0005".into(),
+                operation: 4,
+                ts_ms: 10,
+                row: serde_json::json!({"id": "1", "name": "alice"}),
+            },
+        ];
+        let events2 = handle.map_changes_to_events(&meta, poll2).unwrap();
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0].op, Operation::Update);
+        assert_eq!(events2[0].before, Some(serde_json::json!({"id": "1", "name": "alice"})));
+        assert_eq!(events2[0].after, Some(serde_json::json!({"id": "1", "name": "alice-v2"})));
+        assert!(handle.pending_update_afters.is_empty(), "buffer should be drained after merge");
     }
 
     #[test]
@@ -1512,6 +1663,7 @@ mod tests {
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            pending_update_afters: AHashMap::new(),
         };
 
         let refreshed = vec![
@@ -1578,6 +1730,7 @@ mod tests {
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            pending_update_afters: AHashMap::new(),
         };
 
         let events = handle.compute_schema_events_for_meta_refresh(&[]);

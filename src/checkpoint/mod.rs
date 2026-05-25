@@ -1,8 +1,7 @@
 //! Checkpoint abstractions and in-memory implementations.
 
 mod barrier;
-#[cfg(feature = "postgres")]
-mod postgres;
+pub(crate) mod owner_lease;
 
 use std::{
     collections::VecDeque,
@@ -18,8 +17,6 @@ use serde::{Deserialize, Serialize};
 use crate::core::{Offset, Result};
 
 pub use barrier::{BarrierState, CommitBarrier};
-#[cfg(feature = "postgres")]
-pub use postgres::PostgresCheckpoint;
 
 const FILE_CHECKPOINT_FORMAT_VERSION: u16 = 2;
 const FILE_CHECKPOINT_DEFAULT_FILE_MODE: u32 = 0o600;
@@ -138,7 +135,18 @@ pub trait Checkpoint: Send + Sync {
     async fn get_committed_count(&self) -> Result<u64>;
 }
 
-/// In-memory checkpoint store used by tests and Phase 0 scaffolding.
+/// In-memory checkpoint store for **testing and examples only**.
+///
+/// # Warning
+///
+/// `InMemoryCheckpoint` **must not be used in production**. All checkpoint
+/// state is held in memory and is irrecoverably lost on process restart.
+/// After restart the runtime will perform a full replay from the origin LSN,
+/// producing duplicate events visible to downstream consumers.
+///
+/// For production use, choose [`FileCheckpoint`] (single-process, local
+/// filesystem) or implement the [`Checkpoint`] trait against your own storage
+/// backend (database, object store, Redis, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryCheckpoint {
     entries: Arc<Mutex<VecDeque<StoredCheckpoint>>>,
@@ -221,10 +229,6 @@ impl FileCheckpoint {
         }
     }
 
-    fn parse_lease_pid(contents: &str) -> Option<u32> {
-        contents.trim().parse::<u32>().ok()
-    }
-
     fn ensure_owner_lease(&self) -> Result<()> {
         let mut lease = self.lease.lock().map_err(|_| {
             crate::core::Error::CheckpointError(
@@ -240,6 +244,8 @@ impl FileCheckpoint {
 
         let lock_path = self.lease_path();
         let owner_pid = std::process::id();
+        let owner_hostname = owner_lease::current_hostname();
+        let owner_lease_str = owner_lease::format_lease(owner_hostname, owner_pid);
 
         let create_result = OpenOptions::new()
             .create_new(true)
@@ -250,22 +256,38 @@ impl FileCheckpoint {
             Ok(mut lock_file) => {
                 self.write_permissions(&lock_file)?;
                 lock_file
-                    .write_all(owner_pid.to_string().as_bytes())
+                    .write_all(owner_lease_str.as_bytes())
                     .map_err(crate::core::Error::from)?;
                 lock_file.sync_all().map_err(crate::core::Error::from)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing_pid = fs::read_to_string(&lock_path)
+                let parsed = fs::read_to_string(&lock_path)
                     .ok()
-                    .and_then(|contents| Self::parse_lease_pid(&contents));
+                    .and_then(|contents| owner_lease::parse_lease(&contents));
 
-                match existing_pid {
-                    Some(pid) if pid == owner_pid => {
-                        // Current process already owns the lease (e.g., after a re-open).
+                match parsed {
+                    Some((ref host, pid)) if host == owner_hostname && pid == owner_pid => {
+                        // Current process on this host already owns the lease.
                     }
-                    Some(pid) if !Self::is_pid_alive(pid) => {
-                        // The previous owner process is dead; clear the stale lease and
-                        // take ownership. This eliminates manual recovery after crashes.
+                    Some((ref host, pid)) if host != owner_hostname => {
+                        tracing::error!(
+                            target: "cdc_rs::checkpoint",
+                            checkpoint_dir = %self.checkpoint_dir.display(),
+                            lease_host = %host,
+                            lease_pid = pid,
+                            current_host = %owner_hostname,
+                            "cross-host checkpoint owner lease detected — NFS sharing not supported"
+                        );
+                        return Err(crate::core::Error::CheckpointError(format!(
+                            "checkpoint owner lease conflict for '{}': lease belongs to host '{}' \
+                             pid {}. Cross-host NFS sharing is not supported; use a dedicated \
+                             checkpoint directory per runtime instance.",
+                            self.checkpoint_dir.display(),
+                            host,
+                            pid
+                        )));
+                    }
+                    Some((_, pid)) if !Self::is_pid_alive(pid) => {
                         tracing::warn!(
                             target: "cdc_rs::checkpoint",
                             checkpoint_dir = %self.checkpoint_dir.display(),
@@ -280,16 +302,15 @@ impl FileCheckpoint {
                             .map_err(crate::core::Error::from)?;
                         self.write_permissions(&lock_file)?;
                         lock_file
-                            .write_all(owner_pid.to_string().as_bytes())
+                            .write_all(owner_lease_str.as_bytes())
                             .map_err(crate::core::Error::from)?;
                         lock_file.sync_all().map_err(crate::core::Error::from)?;
                     }
                     _ => {
                         return Err(crate::core::Error::CheckpointError(format!(
-                            "checkpoint owner lease conflict for '{}': lock owned by pid {:?}. \
-                             use a dedicated checkpoint directory per runtime process",
+                            "checkpoint owner lease conflict for '{}': lock owned by another \
+                             process. Use a dedicated checkpoint directory per runtime process.",
                             self.checkpoint_dir.display(),
-                            existing_pid
                         )));
                     }
                 }
@@ -563,7 +584,7 @@ impl Checkpoint for FileCheckpoint {
         let encoded = serde_json::to_vec(&record.offset)?;
         let offset: Box<dyn Offset> = match record.source_type.as_str() {
             "postgres" => Box::new(PostgresOffset::from_bytes(&encoded)?),
-            "mysql" => Box::new(MysqlOffset::from_bytes(&encoded)?),
+            "mysql" | "mariadb" => Box::new(MysqlOffset::from_bytes(&encoded)?),
             other => Box::new(GenericOffset::new(other, encoded)),
         };
         Ok(Some(offset))
@@ -939,8 +960,12 @@ mod tests {
     async fn file_checkpoint_rejects_owner_lease_conflict_from_live_pid() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join(FileCheckpoint::OWNER_LEASE_FILENAME);
-        // PID 1 (init/launchd) is always alive.
-        std::fs::write(&lock_path, b"1").unwrap();
+        // PID 1 (init/launchd) is always alive. Use HOSTNAME:PID format.
+        let lease = crate::checkpoint::owner_lease::format_lease(
+            crate::checkpoint::owner_lease::current_hostname(),
+            1,
+        );
+        std::fs::write(&lock_path, lease.as_bytes()).unwrap();
 
         let checkpoint = FileCheckpoint::new(dir.path());
         let error = checkpoint.get_committed_count().await.unwrap_err();
@@ -954,20 +979,22 @@ mod tests {
     async fn file_checkpoint_recovers_from_stale_owner_lease_of_dead_process() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join(FileCheckpoint::OWNER_LEASE_FILENAME);
-        // PID u32::MAX is extremely unlikely to be alive.
-        std::fs::write(&lock_path, u32::MAX.to_string().as_bytes()).unwrap();
+        // PID u32::MAX is extremely unlikely to be alive. Use HOSTNAME:PID format.
+        let stale_lease = crate::checkpoint::owner_lease::format_lease(
+            crate::checkpoint::owner_lease::current_hostname(),
+            u32::MAX,
+        );
+        std::fs::write(&lock_path, stale_lease.as_bytes()).unwrap();
 
         let checkpoint = FileCheckpoint::new(dir.path());
         // Should succeed: stale lease auto-cleared.
         let count = checkpoint.get_committed_count().await.unwrap();
         assert_eq!(count, 0);
-        // Lock file should now belong to the current process.
-        let new_pid: u32 = std::fs::read_to_string(&lock_path)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_eq!(new_pid, std::process::id());
+        // Lock file should now contain the current process in HOSTNAME:PID format.
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        let (host, pid) = crate::checkpoint::owner_lease::parse_lease(&contents).unwrap();
+        assert_eq!(host, crate::checkpoint::owner_lease::current_hostname());
+        assert_eq!(pid, std::process::id());
     }
 
     #[tokio::test]

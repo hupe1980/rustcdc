@@ -1,6 +1,6 @@
-#![cfg(feature = "mysql")]
+#![cfg(feature = "mariadb")]
 
-use cdc_rs::{MysqlConnection, MysqlSourceConfig};
+use cdc_rs::{MariaDbConnection, MariaDbSourceConfig};
 use cdc_rs::TransportConfig;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -15,7 +15,7 @@ const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(75);
 
 struct MariadbTestTarget {
     _container: testcontainers::ContainerAsync<GenericImage>,
-    config: MysqlSourceConfig,
+    config: MariaDbSourceConfig,
 }
 
 fn skip_mariadb_connection_case(case_label: &str) -> bool {
@@ -101,26 +101,28 @@ async fn mariadb_base_config(version: &str, server_id: u32) -> cdc_rs::Result<Ma
 
     Ok(MariadbTestTarget {
         _container: container,
-        config: MysqlSourceConfig {
-            host: host_string,
-            port,
-            user: "root".to_string(),
-            password: "rootpass".to_string().into(),
-            database: "cdc".to_string(),
-            server_id,
-            gtid_mode_enabled: false,
-            binlog_format_check: true,
-            transport: TransportConfig::tls(),
-            conn_timeout_secs: CONNECT_TIMEOUT_SECS,
-            stream_poll_interval_ms: 50,
-            max_events_per_poll: 1_000,
+        config: {
+            let mut cfg = MariaDbSourceConfig::default();
+            cfg.host = host_string;
+            cfg.port = port;
+            cfg.user = "root".to_string();
+            cfg.password = "rootpass".to_string().into();
+            cfg.database = "cdc".to_string();
+            cfg.server_id = server_id;
+            cfg.gtid_mode_enabled = false;
+            cfg.binlog_format_check = true;
+            cfg.transport = TransportConfig::tls();
+            cfg.conn_timeout_secs = CONNECT_TIMEOUT_SECS;
+            cfg.stream_poll_interval_ms = 50;
+            cfg.max_events_per_poll = 1_000;
+            cfg
         },
     })
 }
 
 async fn run_mariadb_connection_lifecycle(version: &str, server_id: u32) -> cdc_rs::Result<()> {
     let target = mariadb_base_config(version, server_id).await?;
-    let connection = MysqlConnection::new(target.config);
+    let connection = MariaDbConnection::new(target.config.into_inner());
     connect_with_retry(&connection).await?;
     assert!(connection.is_connected().await);
     connection.close().await;
@@ -139,7 +141,7 @@ macro_rules! mariadb_connection_test {
     };
 }
 
-async fn connect_with_retry(connection: &MysqlConnection) -> cdc_rs::Result<()> {
+async fn connect_with_retry(connection: &MariaDbConnection) -> cdc_rs::Result<()> {
     let deadline = std::time::Instant::now() + CONNECT_RETRY_BUDGET;
     let mut backoff = Duration::from_millis(250);
     let mut last_error = None;
@@ -182,7 +184,7 @@ async fn mariadb_gtid_mode_support() -> cdc_rs::Result<()> {
 
     let target = mariadb_base_config("10.6", 102).await?;
 
-    let connection = MysqlConnection::new(target.config);
+    let connection = MariaDbConnection::new(target.config.into_inner());
     connect_with_retry(&connection).await?;
 
     // MariaDB supports both traditional and GTID binlog mode

@@ -8,7 +8,7 @@ use mysql_async::SslOpts;
 
 use crate::core::{Error, Result, SecretString, TransportConfig};
 
-use super::{MysqlSourceConfig, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS};
+use super::{MysqlSourceConfig, ServerFlavor, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS};
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
@@ -17,7 +17,7 @@ const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
 fn allow_insecure_test_transport() -> bool {
     #[cfg(feature = "insecure-test-overrides")]
     {
-        return std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1");
+        std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1")
     }
 
     #[cfg(not(feature = "insecure-test-overrides"))]
@@ -61,14 +61,20 @@ impl Default for MysqlSourceConfig {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            table_include_list: Vec::new(),
+            table_exclude_list: Vec::new(),
+            server_flavor: ServerFlavor::Mysql,
         }
     }
 }
 
 impl MysqlSourceConfig {
-    /// Return the connector name used by the source abstraction.
-    pub const fn source_type() -> &'static str {
-        "mysql"
+    /// Return the connector source type string.
+    ///
+    /// Returns `"mysql"` for standard MySQL connections and `"mariadb"` when
+    /// `server_flavor` is `ServerFlavor::MariaDb`.
+    pub fn source_type(&self) -> &'static str {
+        self.server_flavor.source_name()
     }
 
     /// Validate configuration values before a connection attempt.
@@ -129,7 +135,7 @@ impl MysqlSourceConfig {
                 "mysql max_events_per_poll must be less than or equal to {MAX_MAX_EVENTS_PER_POLL}"
             )));
         }
-        if let TransportConfig::Tls { ca_cert_path } = &self.transport {
+        if let TransportConfig::Tls { ca_cert_path, client_cert_path, client_key_path } = &self.transport {
             #[cfg(not(feature = "tls"))]
             {
                 let _ = ca_cert_path;
@@ -139,15 +145,31 @@ impl MysqlSourceConfig {
             }
 
             #[cfg(feature = "tls")]
-            if let Some(ca_path) = ca_cert_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
             {
-                if !Path::new(ca_path).exists() {
-                    return Err(Error::ConfigError(format!(
-                        "mysql tls_ca_cert_path does not exist: {ca_path}"
-                    )));
+                let _ = (client_cert_path, client_key_path);
+                if let Some(ca_path) = ca_cert_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                {
+                    if !Path::new(ca_path).exists() {
+                        return Err(Error::ConfigError(format!(
+                            "mysql tls_ca_cert_path does not exist: {ca_path}"
+                        )));
+                    }
+                }
+                match (client_cert_path.as_deref(), client_key_path.as_deref()) {
+                    (Some(_), None) => {
+                        return Err(Error::ConfigError(
+                            "mysql mTLS: client_cert_path requires client_key_path".into(),
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        return Err(Error::ConfigError(
+                            "mysql mTLS: client_key_path requires client_cert_path".into(),
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -195,6 +217,17 @@ impl MysqlSourceConfig {
                 ))
             })?;
             ssl_opts = ssl_opts.with_root_certs(vec![ca_bytes.into()]);
+        }
+
+        if let (Some(cert_path), Some(key_path)) = (
+            self.transport.client_cert_path(),
+            self.transport.client_key_path(),
+        ) {
+            let identity = mysql_async::ClientIdentity::new(
+                std::path::Path::new(cert_path).to_path_buf().into(),
+                std::path::Path::new(key_path).to_path_buf().into(),
+            );
+            ssl_opts = ssl_opts.with_client_identity(Some(identity));
         }
 
         Ok(ssl_opts)

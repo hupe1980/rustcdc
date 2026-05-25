@@ -114,6 +114,7 @@ async fn run_postgres_version_connection_test(
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
         transport: TransportConfig::tls(),
+        ..Default::default()
     };
 
     let connection = PostgresConnection::new(config);

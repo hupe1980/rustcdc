@@ -1,8 +1,10 @@
 //! Consumer-side idempotency helpers for at-least-once delivery boundaries.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use ahash::{AHashMap as HashMap, AHasher};
 
 use crate::core::{Error, Event, Result};
 
@@ -105,7 +107,7 @@ pub fn fingerprint_event(event: &Event) -> Result<u64> {
         ]));
     }
 
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = AHasher::default();
     event.source.source_name.hash(&mut hasher);
     event.source.offset.hash(&mut hasher);
     event.table.hash(&mut hasher);
@@ -120,14 +122,63 @@ pub fn fingerprint_event(event: &Event) -> Result<u64> {
         tx.total_events.hash(&mut hasher);
     }
 
+    // Hash JSON payloads without allocating an intermediate String.
+    // serde_json::to_writer writes directly into the hasher's byte sink.
     if let Some(before) = &event.before {
-        before.to_string().hash(&mut hasher);
+        hash_json_value(before, &mut hasher);
     }
     if let Some(after) = &event.after {
-        after.to_string().hash(&mut hasher);
+        hash_json_value(after, &mut hasher);
     }
 
     Ok(hasher.finish())
+}
+
+/// Hash a serde_json Value into the hasher without allocating an intermediate String.
+///
+/// Walks the JSON tree recursively, tagging each variant with a discriminant byte
+/// so `null` ≠ `""` ≠ `false` etc.  For composite values (Array, Object) the
+/// structural traversal is canonical (Object keys are iterated in insertion order
+/// as stored by serde_json's `Map`, which is ordered for reproducible iteration).
+fn hash_json_value(value: &serde_json::Value, hasher: &mut AHasher) {
+    match value {
+        serde_json::Value::Null => 0_u8.hash(hasher),
+        serde_json::Value::Bool(v) => {
+            1_u8.hash(hasher);
+            v.hash(hasher);
+        }
+        serde_json::Value::Number(n) => {
+            2_u8.hash(hasher);
+            if let Some(v) = n.as_i64() {
+                v.hash(hasher);
+            } else if let Some(v) = n.as_u64() {
+                v.hash(hasher);
+            } else if let Some(v) = n.as_f64() {
+                v.to_bits().hash(hasher);
+            } else {
+                n.to_string().hash(hasher);
+            }
+        }
+        serde_json::Value::String(v) => {
+            3_u8.hash(hasher);
+            v.hash(hasher);
+        }
+        serde_json::Value::Array(arr) => {
+            4_u8.hash(hasher);
+            arr.len().hash(hasher);
+            for item in arr {
+                hash_json_value(item, hasher);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            5_u8.hash(hasher);
+            map.len().hash(hasher);
+            for (k, v) in map {
+                k.hash(hasher);
+                hash_json_value(v, hasher);
+            }
+        }
+    }
 }
 
 fn now_millis() -> u64 {

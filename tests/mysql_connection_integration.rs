@@ -65,6 +65,7 @@ async fn mysql_connection_8_0() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     // Test connection
@@ -121,6 +122,7 @@ async fn mysql_connection_8_1() -> cdc_rs::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     // Test connection with GTID validation
@@ -154,6 +156,7 @@ fn mysql_config_debug_no_credentials() {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let debug_str = format!("{:?}", config);

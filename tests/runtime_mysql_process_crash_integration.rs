@@ -151,6 +151,7 @@ async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> 
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut runtime = CdcRuntime::new(
@@ -319,6 +320,7 @@ async fn run_mysql_process_kill_replay_scenario(
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut runtime = CdcRuntime::new(
@@ -333,7 +335,7 @@ async fn run_mysql_process_kill_replay_scenario(
 
     #[cfg(feature = "encryption")]
     if _enable_encryption_transform {
-        use std::collections::HashMap;
+        use ahash::AHashMap as HashMap;
 
         let mut mask_rules = HashMap::new();
         mask_rules.insert(

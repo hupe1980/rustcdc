@@ -79,5 +79,6 @@ pub(super) async fn start_sqlserver_stream(
         events_polled: 0,
         requeued_events: Vec::new(),
         max_events_per_poll: connection.max_events_per_poll,
+        pending_update_afters: ahash::AHashMap::new(),
     }))
 }

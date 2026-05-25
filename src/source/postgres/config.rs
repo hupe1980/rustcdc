@@ -46,6 +46,8 @@ impl Default for PostgresSourceConfig {
             conn_timeout_secs: 30,
             stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
             max_events_per_poll: MAX_EVENTS_PER_POLL,
+            table_include_list: Vec::new(),
+            table_exclude_list: Vec::new(),
         }
     }
 }
@@ -120,25 +122,41 @@ impl PostgresSourceConfig {
             )));
         }
 
-        if let TransportConfig::Tls { ca_cert_path } = &self.transport {
+        if let TransportConfig::Tls { ca_cert_path, client_cert_path, client_key_path } = &self.transport {
             #[cfg(not(feature = "tls"))]
             {
-                let _ = ca_cert_path;
+                let _ = (ca_cert_path, client_cert_path, client_key_path);
                 return Err(Error::ConfigError(
                     "postgres connector requires crate feature 'tls' for TLS transport".into(),
                 ));
             }
 
             #[cfg(feature = "tls")]
-            if let Some(ca_path) = ca_cert_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
             {
-                if !Path::new(ca_path).exists() {
-                    return Err(Error::ConfigError(format!(
-                        "postgres tls_ca_cert_path does not exist: {ca_path}"
-                    )));
+                let _ = (client_cert_path, client_key_path);
+                if let Some(ca_path) = ca_cert_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                {
+                    if !Path::new(ca_path).exists() {
+                        return Err(Error::ConfigError(format!(
+                            "postgres tls_ca_cert_path does not exist: {ca_path}"
+                        )));
+                    }
+                }
+                match (client_cert_path.as_deref(), client_key_path.as_deref()) {
+                    (Some(_), None) => {
+                        return Err(Error::ConfigError(
+                            "postgres mTLS: client_cert_path requires client_key_path".into(),
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        return Err(Error::ConfigError(
+                            "postgres mTLS: client_key_path requires client_cert_path".into(),
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }

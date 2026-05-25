@@ -337,3 +337,47 @@ fn structured_logger_json_100_events_parse_and_redact() {
     assert!(saw_checkpoint_saved);
     assert!(saw_redacted_error);
 }
+
+/// C-04: Verify that starting a runtime with no `schema_history_retention` policy
+/// emits an ERROR-level log at startup. This prevents silent regression back to
+/// a lower log level that operators might miss.
+#[tokio::test]
+async fn runtime_startup_without_schema_history_retention_emits_error_log() {
+    use cdc_rs::checkpoint::InMemoryCheckpoint;
+    use cdc_rs::core::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig};
+    use cdc_rs::schema_history::InMemorySchemaHistory;
+
+    let sink = SharedWriter::default();
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_max_level(Level::ERROR)
+        .with_ansi(false)
+        .without_time()
+        .with_target(true) // capture target so we can verify cdc_rs::core::runtime
+        .finish();
+
+    // set_default returns a guard; subscriber is active until the guard is dropped.
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let checkpoint = InMemoryCheckpoint::default();
+    let schema_history = InMemorySchemaHistory::default();
+    // Intentionally omit .with_schema_history_retention() to trigger the ERROR log.
+    let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+    let mut runtime = CdcRuntime::new(config).expect("runtime construction should succeed");
+    runtime.start().await.expect("start should succeed on Disabled source");
+
+    drop(_guard); // stop capturing before asserting
+
+    let bytes = sink.inner.lock().unwrap().clone();
+    let output = String::from_utf8(bytes).unwrap();
+
+    assert!(
+        output.contains("schema_history_retention"),
+        "startup ERROR log must mention schema_history_retention; got: {output}"
+    );
+    assert!(
+        output.contains("ERROR") || output.contains("error"),
+        "log level must be ERROR; got: {output}"
+    );
+}

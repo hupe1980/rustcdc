@@ -164,3 +164,79 @@ pub(super) fn build_tls_root_store(ca_cert_path: Option<&str>) -> Result<rustls:
 
     Ok(root_store)
 }
+
+/// Build a `rustls::ClientConfig` with optional mTLS client certificate.
+///
+/// When `client_cert_path` and `client_key_path` are both `Some`, mutual TLS
+/// authentication is configured using the supplied PEM-encoded certificate and
+/// private key. Otherwise, server-auth-only TLS is used.
+#[cfg(feature = "tls")]
+pub(super) fn build_tls_client_config(
+    ca_cert_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<rustls::ClientConfig> {
+    use std::io::Cursor;
+
+    let root_store = build_tls_root_store(ca_cert_path)?;
+
+    match (client_cert_path, client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(cert_path).map_err(|error| {
+                Error::ConfigError(format!(
+                    "failed to read mTLS client certificate '{cert_path}': {error}"
+                ))
+            })?;
+            let key_pem = std::fs::read(key_path).map_err(|error| {
+                Error::ConfigError(format!(
+                    "failed to read mTLS client private key '{key_path}': {error}"
+                ))
+            })?;
+
+            let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut Cursor::new(&cert_pem))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        Error::ConfigError(format!(
+                            "failed to parse mTLS client certificate PEM '{cert_path}': {error}"
+                        ))
+                    })?;
+
+            if certs.is_empty() {
+                return Err(Error::ConfigError(format!(
+                    "mTLS client certificate file '{cert_path}' contains no valid certificates"
+                )));
+            }
+
+            let key = rustls_pemfile::private_key(&mut Cursor::new(&key_pem))
+                .map_err(|error| {
+                    Error::ConfigError(format!(
+                        "failed to parse mTLS private key PEM '{key_path}': {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    Error::ConfigError(format!(
+                        "mTLS private key file '{key_path}' contains no private key"
+                    ))
+                })?;
+
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(certs, key)
+                .map_err(|error| {
+                    Error::ConfigError(format!(
+                        "mTLS client certificate configuration failed: {error}"
+                    ))
+                })
+        }
+        (Some(_), None) => Err(Error::ConfigError(
+            "mTLS requires both client_cert_path and client_key_path".into(),
+        )),
+        (None, Some(_)) => Err(Error::ConfigError(
+            "mTLS requires both client_cert_path and client_key_path".into(),
+        )),
+        (None, None) => Ok(rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()),
+    }
+}

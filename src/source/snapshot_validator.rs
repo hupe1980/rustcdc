@@ -1,9 +1,8 @@
 //! Snapshot consistency validation to detect missing rows, duplicates, and corruption.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet, AHasher};
 
 use crate::core::{Error, Event, Operation, Result};
 use serde_json::Value;
@@ -74,9 +73,19 @@ impl SnapshotValidator {
 
                 let pk_hash = hash_primary_key_values(pk, after)?;
 
-                let state = self.tables.entry(event.table.clone()).or_default();
-                state.rows_received = state.rows_received.saturating_add(1);
-                state.received_pks.insert(pk_hash);
+                // Avoid cloning table name on the hot path: look up by &str first,
+                // and only allocate an owned String for the first-seen table.
+                if let Some(state) = self.tables.get_mut(event.table.as_str()) {
+                    state.rows_received = state.rows_received.saturating_add(1);
+                    state.received_pks.insert(pk_hash);
+                } else {
+                    let state = self
+                        .tables
+                        .entry(event.table.clone())
+                        .or_default();
+                    state.rows_received = state.rows_received.saturating_add(1);
+                    state.received_pks.insert(pk_hash);
+                }
 
                 Ok(())
             }
@@ -160,7 +169,8 @@ fn hash_primary_key_values(pk: &[String], after: &Value) -> Result<u64> {
         ])
     })?;
 
-    let mut hasher = DefaultHasher::new();
+    // Use AHasher (non-cryptographic, fast) instead of DefaultHasher (SipHash-1-3).
+    let mut hasher = AHasher::default();
     for key in pk {
         key.hash(&mut hasher);
         let value = object.get(key).ok_or_else(|| {
@@ -173,7 +183,7 @@ fn hash_primary_key_values(pk: &[String], after: &Value) -> Result<u64> {
     Ok(hasher.finish())
 }
 
-fn hash_json_value(value: &Value, hasher: &mut DefaultHasher) {
+fn hash_json_value(value: &Value, hasher: &mut AHasher) {
     match value {
         Value::Null => 0_u8.hash(hasher),
         Value::Bool(v) => {

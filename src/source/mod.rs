@@ -8,16 +8,55 @@ use crate::{
     core::{Event, Offset, Result},
 };
 
-pub mod parallel_snapshot;
+pub mod snapshot_tracker;
 pub mod snapshot_progress;
 pub mod snapshot_validator;
 pub(crate) mod helpers;
 
-pub use parallel_snapshot::{
-    ParallelSnapshotConfig, ParallelSnapshotReport, ParallelSnapshotState,
-};
+pub use snapshot_tracker::
+    {SnapshotTrackerConfig, SnapshotTrackerReport, SnapshotProgressTracker};
 pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TableProgress};
 pub use snapshot_validator::{SnapshotValidationResult, SnapshotValidator};
+
+// ─── Table filtering ─────────────────────────────────────────────────────────
+
+/// Returns `true` if an event for `schema.table` should be forwarded to the caller.
+///
+/// * When `include_list` is non-empty, only listed tables pass through.
+/// * When `include_list` is empty and `exclude_list` is non-empty, listed tables are dropped.
+/// * When both lists are empty, all events pass through.
+///
+/// Table names are matched case-insensitively against `"schema.table"` tokens.
+pub(crate) fn table_is_allowed(
+    schema: Option<&str>,
+    table: &str,
+    include_list: &[String],
+    exclude_list: &[String],
+) -> bool {
+    // Fast path: no filtering configured — avoids all allocations on the hot path.
+    if include_list.is_empty() && exclude_list.is_empty() {
+        return true;
+    }
+
+    let table_lower = table.to_lowercase();
+    let qualified_lower = match schema {
+        Some(s) => format!("{}.{table_lower}", s.to_lowercase()),
+        None => table_lower.clone(),
+    };
+
+    let matches = |list: &[String]| {
+        list.iter().any(|entry| {
+            let e = entry.to_lowercase();
+            e == qualified_lower || e == table_lower
+        })
+    };
+
+    if !include_list.is_empty() {
+        return matches(include_list);
+    }
+    !matches(exclude_list)
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotEnd {
@@ -37,8 +76,45 @@ pub struct HandoffResult {
     pub stream_watermark_gap: Option<u64>,
 }
 
+/// Configuration for incremental (non-blocking) snapshot using the DBLog watermark pattern.
+///
+/// Used by [`PostgresConnection::start_incremental_snapshot`],
+/// [`MysqlConnection::start_incremental_snapshot`], and
+/// [`SqlServerConnection::start_incremental_snapshot`].
+///
+/// Unlike the blocking bulk snapshot, incremental snapshotting interleaves chunk reads
+/// with the live replication stream. The stream never pauses, no long-held
+/// `REPEATABLE READ` transaction accumulates transaction IDs, and each chunk is
+/// independently resumable after a crash.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct IncrementalSnapshotConfig {
+    /// Tables to snapshot in `"schema.table"` format. Tables are processed in order.
+    pub tables: Vec<String>,
+    /// Number of rows to read per chunk. Defaults to `5_000`.
+    pub chunk_size: usize,
+}
+
+impl IncrementalSnapshotConfig {
+    /// Create a new config with the given tables and the default chunk size (5,000).
+    pub fn new(tables: impl Into<Vec<String>>) -> Self {
+        Self {
+            tables: tables.into(),
+            chunk_size: 5_000,
+        }
+    }
+
+    /// Override the per-chunk row limit.
+    #[must_use]
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
+    }
+}
+
 /// Declares connector feature support for runtime and embedder introspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConnectorCapabilities {
     pub snapshot: bool,
     pub snapshot_checkpoint_resume: bool,
@@ -50,6 +126,9 @@ pub struct ConnectorCapabilities {
     /// Whether the connector surfaces `TRUNCATE` operations as
     /// [`crate::core::Operation::Truncate`] events.
     pub truncate: bool,
+    /// Whether the connector supports non-blocking incremental snapshot via the
+    /// DBLog watermark pattern ([`PostgresConnection::start_incremental_snapshot`]).
+    pub incremental_snapshot: bool,
 }
 
 impl ConnectorCapabilities {
@@ -64,6 +143,7 @@ impl ConnectorCapabilities {
             tls: false,
             schema_introspection: false,
             truncate: false,
+            incremental_snapshot: false,
         }
     }
 }
@@ -127,6 +207,8 @@ pub trait Source: Send + Sync {
 
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "mariadb")]
+pub mod mariadb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlserver")]
@@ -139,11 +221,22 @@ pub use sqlserver::SqlServerSourceConfig;
 #[cfg(feature = "mysql")]
 pub use mysql::MysqlConnection;
 #[cfg(feature = "mysql")]
-pub use mysql::MysqlSourceConfig;
+pub use mysql::{MysqlSourceConfig, ServerFlavor};
+#[cfg(feature = "mariadb")]
+pub use mariadb::{
+    MariaDbConnection, MariaDbIncrementalSnapshotHandle, MariaDbSnapshotHandle,
+    MariaDbSourceConfig, MariaDbStreamHandle,
+};
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresConnection;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresSourceConfig;
+#[cfg(feature = "postgres")]
+pub use postgres::incremental_snapshot::IncrementalSnapshotHandle;
+#[cfg(feature = "mysql")]
+pub use mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
+#[cfg(feature = "sqlserver")]
+pub use sqlserver::incremental_snapshot::SqlServerIncrementalSnapshotHandle;
 
 #[cfg(test)]
 mod tests {
@@ -264,6 +357,7 @@ mod tests {
                 tls: false,
                 schema_introspection: true,
                 truncate: false,
+                incremental_snapshot: false,
             }
         }
     }

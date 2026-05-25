@@ -1,0 +1,101 @@
+{
+  "type": "record",
+  "name": "Event",
+  "namespace": "io.cdc_rs",
+  "doc": "Canonical CDC event envelope — cdc-rs envelope_version=1",
+  "fields": [
+    {
+      "name": "before",
+      "type": ["null", "bytes"],
+      "default": null,
+      "doc": "JSON-encoded before-image. null for INSERT events."
+    },
+    {
+      "name": "after",
+      "type": ["null", "bytes"],
+      "default": null,
+      "doc": "JSON-encoded after-image. null for DELETE events."
+    },
+    {
+      "name": "op",
+      "type": {
+        "type": "enum",
+        "name": "Operation",
+        "namespace": "io.cdc_rs",
+        "symbols": ["INSERT", "UPDATE", "DELETE", "READ", "SCHEMA_CHANGE", "TRUNCATE"],
+        "doc": "CRUD operation that produced this event."
+      }
+    },
+    {
+      "name": "source",
+      "type": {
+        "type": "record",
+        "name": "SourceMetadata",
+        "namespace": "io.cdc_rs",
+        "fields": [
+          {"name": "source_name", "type": "string", "doc": "Logical connector name"},
+          {"name": "offset",      "type": "string", "doc": "Source-specific durable position"},
+          {"name": "timestamp",   "type": "long",   "doc": "Source timestamp in ms since epoch"}
+        ]
+      }
+    },
+    {
+      "name": "ts",
+      "type": "long",
+      "doc": "Event timestamp in milliseconds since Unix epoch."
+    },
+    {
+      "name": "schema",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Database schema name. null when unknown."
+    },
+    {
+      "name": "table",
+      "type": "string",
+      "doc": "Table name that produced the event."
+    },
+    {
+      "name": "primary_key",
+      "type": {"type": "array", "items": "string"},
+      "default": [],
+      "doc": "Ordered list of primary key column names."
+    },
+    {
+      "name": "snapshot",
+      "type": ["null", {
+        "type": "record",
+        "name": "SnapshotMetadata",
+        "namespace": "io.cdc_rs",
+        "fields": [
+          {"name": "snapshot_id",   "type": "string"},
+          {"name": "chunk_index",   "type": "int"},
+          {"name": "is_last_chunk", "type": "boolean"}
+        ]
+      }],
+      "default": null,
+      "doc": "Snapshot phase metadata. null outside snapshot."
+    },
+    {
+      "name": "transaction",
+      "type": ["null", {
+        "type": "record",
+        "name": "TransactionMetadata",
+        "namespace": "io.cdc_rs",
+        "fields": [
+          {"name": "tx_id",        "type": "long"},
+          {"name": "total_events", "type": "int"},
+          {"name": "event_index",  "type": "int"}
+        ]
+      }],
+      "default": null,
+      "doc": "Transaction metadata. null for single-event transactions."
+    },
+    {
+      "name": "envelope_version",
+      "type": "int",
+      "default": 1,
+      "doc": "Canonical envelope schema version. Currently always 1."
+    }
+  ]
+}

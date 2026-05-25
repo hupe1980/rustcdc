@@ -56,6 +56,7 @@ async fn main() -> cdc_rs::Result<()> {
         prereq_pool_size: 8,
         stream_poll_interval_ms: 1_000,
         max_events_per_poll: 20_000,
+        ..Default::default()
     };
 
     let mut runtime = CdcRuntime::new(

@@ -7,9 +7,9 @@ use crate::{
 
 use super::{
     decode_stream_resume_lsn, query_current_wal_lsn, reconcile_stream_resume_lsn_with_retry,
-    LivePgOutputMessageProvider, PostgresConnection, PostgresStream, PostgresStreamHandle,
-    StreamState,
+    PostgresConnection, PostgresStream, PostgresStreamHandle, StreamState,
 };
+use super::decoder::LivePgOutputMessageProvider;
 
 pub(super) async fn start_postgres_stream(
     connection: &mut PostgresConnection,

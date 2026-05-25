@@ -13,7 +13,7 @@ use wasmtime::{Caller, Engine, Extern, Instance, Linker, Memory, Module, Store, 
 
 use crate::core::{Error, Event, Result};
 
-pub const DEFAULT_WASM_TIMEOUT_MS: u64 = 10;
+pub const DEFAULT_WASM_TIMEOUT_MS: u64 = 50;
 pub const DEFAULT_WASM_MEMORY_LIMIT_MB: u64 = 16;
 
 #[derive(Debug, Clone)]

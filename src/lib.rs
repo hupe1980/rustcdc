@@ -3,14 +3,17 @@
 #![forbid(unsafe_code)]
 
 pub mod checkpoint;
+pub mod codec;
 pub mod core;
 pub mod ddl_capture;
 pub mod deterministic_replay;
+#[cfg(feature = "test-harnesses")]
 pub mod fault_injection;
 #[cfg(feature = "outbox")]
 pub mod outbox;
 pub mod schema_history;
 pub mod source;
+pub mod sink;
 pub mod testkit;
 pub mod transform;
 pub mod wasm;
@@ -32,17 +35,37 @@ pub use crate::ddl_capture::{
     SchemaDiffOperation,
 };
 pub use crate::source::{
-    ConnectorCapabilities, HandoffResult, ParallelSnapshotConfig, ParallelSnapshotReport,
-    ParallelSnapshotState, SnapshotCheckpointHelper, SnapshotEnd, SnapshotProgress,
+    ConnectorCapabilities, HandoffResult, SnapshotTrackerConfig, SnapshotTrackerReport,
+    SnapshotProgressTracker, SnapshotCheckpointHelper, SnapshotEnd, SnapshotProgress,
     SnapshotValidationResult, SnapshotValidator, TableProgress,
 };
 #[cfg(feature = "mysql")]
-pub use crate::source::{MysqlConnection, MysqlSourceConfig};
+pub use crate::source::{MysqlConnection, MysqlSourceConfig, ServerFlavor};
+#[cfg(feature = "mysql")]
+pub use crate::source::MysqlIncrementalSnapshotHandle;
+#[cfg(feature = "mariadb")]
+pub use crate::source::{
+    MariaDbConnection, MariaDbIncrementalSnapshotHandle, MariaDbSnapshotHandle,
+    MariaDbSourceConfig, MariaDbStreamHandle,
+};
 #[cfg(feature = "postgres")]
 pub use crate::source::{PostgresConnection, PostgresSourceConfig};
+#[cfg(feature = "postgres")]
+pub use crate::source::IncrementalSnapshotHandle;
+pub use crate::source::IncrementalSnapshotConfig;
 #[cfg(feature = "sqlserver")]
 pub use crate::source::{SqlServerConnection, SqlServerSourceConfig};
+#[cfg(feature = "sqlserver")]
+pub use crate::source::SqlServerIncrementalSnapshotHandle;
 pub use crate::wasm::{
     TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,
     DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,
 };
+
+pub use crate::codec::{EncodedOutput, EventEncoder, JsonEncoder, JsonPrettyEncoder};
+#[cfg(feature = "cloudevents")]
+pub use crate::codec::CloudEventsEncoder;
+#[cfg(feature = "protobuf")]
+pub use crate::codec::ProtobufEncoder;
+#[cfg(feature = "avro")]
+pub use crate::codec::AvroEncoder;

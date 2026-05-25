@@ -38,7 +38,8 @@ where
 
             // Deduplicate source events before transform stages mutate payloads.
             let deduplicated = self.filter_idempotent_events(chunk)?;
-            let transformed = self.apply_transforms(deduplicated).await?;
+            let filtered = self.filter_by_table_list(deduplicated);
+            let transformed = self.apply_transforms(filtered).await?;
             self.enqueue_pending_source_events(transformed);
             return self.flush_pending_source_events();
         }
@@ -51,7 +52,8 @@ where
             if !chunk.is_empty() {
                 // Deduplicate source events before transform stages mutate payloads.
                 let deduplicated = self.filter_idempotent_events(chunk)?;
-                let transformed = self.apply_transforms(deduplicated).await?;
+                let filtered = self.filter_by_table_list(deduplicated);
+                let transformed = self.apply_transforms(filtered).await?;
                 self.enqueue_pending_source_events(transformed);
                 return self.flush_pending_source_events();
             }
@@ -112,7 +114,9 @@ where
             }
             // Deduplicate source events before transform stages mutate payloads.
             let deduplicated = self.filter_idempotent_events(events)?;
-            let transformed = self.apply_transforms(deduplicated).await?;
+            // Apply table include/exclude filtering.
+            let filtered = self.filter_by_table_list(deduplicated);
+            let transformed = self.apply_transforms(filtered).await?;
             self.enqueue_pending_source_events(transformed);
             return self.flush_pending_source_events();
         }
@@ -135,10 +139,14 @@ where
     }
 
     pub(super) async fn apply_transforms(&self, events: Vec<Event>) -> Result<Vec<Event>> {
+        let has_dlq = self.config.options.dead_letter_handler.is_some();
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             let table = event.table.clone();
             let offset = event.source.offset.clone();
+            // Only preserve a DLQ copy when a handler is configured — avoids a
+            // full Event clone (including before/after JSON Values) on the common path.
+            let dlq_copy = has_dlq.then(|| event.clone());
             match self.transform_pipeline.apply(event).await {
                 Ok(Some(event)) => out.push(event),
                 Ok(None) => {}
@@ -156,6 +164,15 @@ where
                             error = %error,
                             "runtime transform error; skipping event",
                         );
+                        if let Some((handler, original)) = self
+                            .config
+                            .options
+                            .dead_letter_handler
+                            .as_ref()
+                            .zip(dlq_copy)
+                        {
+                            handler(original, error);
+                        }
                         continue;
                     }
                 },
@@ -179,6 +196,27 @@ where
         }
 
         Ok(out)
+    }
+
+    /// Drop events whose `schema.table` address is not allowed by the runtime's
+    /// include / exclude table lists.  When both lists are empty, all events pass through.
+    fn filter_by_table_list(&self, events: Vec<Event>) -> Vec<Event> {
+        let include = &self.config.options.table_include_list;
+        let exclude = &self.config.options.table_exclude_list;
+        if include.is_empty() && exclude.is_empty() {
+            return events;
+        }
+        events
+            .into_iter()
+            .filter(|event| {
+                crate::source::table_is_allowed(
+                    event.schema.as_deref(),
+                    &event.table,
+                    include,
+                    exclude,
+                )
+            })
+            .collect()
     }
 
     fn enqueue_pending_source_events(&mut self, events: Vec<Event>) {

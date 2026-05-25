@@ -14,6 +14,7 @@ use opentelemetry::{
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{metrics::SdkMeterProvider, runtime, trace as sdktrace, Resource};
+use opentelemetry_sdk::metrics::PeriodicReader;
 
 use crate::core::{Error, Event, EventTracer, MetricsCollector, Operation, Result};
 
@@ -98,71 +99,74 @@ impl OTelMetricsCollector {
     }
 
     pub fn with_otlp_exporter(config: OTelConfig) -> Result<Self> {
-        let meter_provider = opentelemetry_otlp::new_pipeline()
-            .metrics(runtime::Tokio)
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(config.endpoint.clone()),
-            )
+        let exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(config.endpoint.clone())
+            .build()
+            .map_err(|error| {
+                Error::ConfigError(format!("failed to build OTLP metric exporter: {error}"))
+            })?;
+
+        let reader = PeriodicReader::builder(exporter, runtime::Tokio)
+            .with_interval(Duration::from_millis(config.export_interval_ms))
+            .with_timeout(Duration::from_millis(config.export_timeout_ms))
+            .build();
+
+        let meter_provider = SdkMeterProvider::builder()
             .with_resource(Resource::new(vec![
                 KeyValue::new("service.name", config.service_name.clone()),
                 KeyValue::new("service.version", config.service_version.clone()),
                 KeyValue::new("deployment.environment", config.environment.clone()),
             ]))
-            .with_period(Duration::from_millis(config.export_interval_ms))
-            .with_timeout(Duration::from_millis(config.export_timeout_ms))
-            .build()
-            .map_err(|error| {
-                Error::ConfigError(format!("failed to build OTLP metrics pipeline: {error}"))
-            })?;
+            .with_reader(reader)
+            .build();
 
         let meter = meter_provider.meter("cdc-rs");
         let instruments = MetricsInstruments {
             events_processed: meter
                 .u64_counter("cdc.events.processed")
                 .with_description("Processed CDC events")
-                .init(),
+                .build(),
             events_filtered: meter
                 .u64_counter("cdc.events.filtered")
                 .with_description("Filtered CDC events")
-                .init(),
+                .build(),
             errors: meter
                 .u64_counter("cdc.errors")
                 .with_description("CDC processing errors")
-                .init(),
+                .build(),
             checkpoint_committed: meter
                 .u64_counter("cdc.checkpoint.committed_count")
                 .with_description("Committed checkpoint event count")
-                .init(),
+                .build(),
             replication_lag_ms: meter
                 .u64_gauge("cdc.replication_lag_ms")
                 .with_description("Replication lag in milliseconds")
-                .init(),
+                .build(),
             replication_lag_events: meter
                 .u64_gauge("cdc.replication_lag_events")
                 .with_description("Replication lag in events")
-                .init(),
+                .build(),
             checkpoint_offset: meter
                 .u64_gauge("cdc.checkpoint_offset")
                 .with_description("Checkpoint offset surrogate value")
-                .init(),
+                .build(),
             buffer_size: meter
                 .u64_gauge("cdc.buffer_size")
                 .with_description("In-flight event buffer size")
-                .init(),
+                .build(),
             snapshot_progress: meter
                 .u64_gauge("cdc.snapshot_progress_percent")
                 .with_description("Snapshot progress percentage")
-                .init(),
+                .build(),
             event_processing_duration: meter
                 .u64_histogram("cdc.event_processing_duration_ms")
                 .with_description("End-to-end event processing duration")
-                .init(),
+                .build(),
             checkpoint_commit_duration: meter
                 .u64_histogram("cdc.checkpoint_commit_duration_ms")
                 .with_description("Checkpoint commit duration")
-                .init(),
+                .build(),
         };
 
         let collector = Self::new(
@@ -506,22 +510,24 @@ impl OTelEventTracer {
     }
 
     pub fn with_otlp_exporter(config: OTelConfig) -> Result<Self> {
-        opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(config.endpoint),
-            )
-            .with_trace_config(sdktrace::config().with_resource(Resource::new(vec![
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(config.endpoint)
+            .build()
+            .map_err(|error| {
+                Error::ConfigError(format!("failed to build OTLP span exporter: {error}"))
+            })?;
+
+        let tracer_provider = sdktrace::TracerProvider::builder()
+            .with_batch_exporter(exporter, runtime::Tokio)
+            .with_resource(Resource::new(vec![
                 KeyValue::new("service.name", config.service_name),
                 KeyValue::new("service.version", config.service_version),
                 KeyValue::new("deployment.environment", config.environment),
-            ])))
-            .install_batch(runtime::Tokio)
-            .map_err(|error| {
-                Error::ConfigError(format!("failed to build OTLP tracer pipeline: {error}"))
-            })?;
+            ]))
+            .build();
+
+        global::set_tracer_provider(tracer_provider);
 
         Ok(Self {
             state: Arc::new(Mutex::new(TracingState::default())),
