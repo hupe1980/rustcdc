@@ -18,6 +18,12 @@ pub enum MaskRule {
     Redact(String),
     Null,
     Truncate(usize),
+    /// Leave the field value unchanged.
+    ///
+    /// Use `Passthrough` to explicitly opt a field out of the `default_rule`.
+    /// Without `Passthrough`, any field not in `mask_rules` is processed by
+    /// `default_rule` (which defaults to [`MaskRule::Hash`]).
+    Passthrough,
     #[cfg(feature = "encryption")]
     Encrypt(SecretString),
     #[cfg(feature = "encryption")]
@@ -109,6 +115,7 @@ impl Transform for MaskHashTransform {
 
 fn apply_rule(value: &Value, rule: &MaskRule) -> Result<Value> {
     Ok(match rule {
+        MaskRule::Passthrough => value.clone(),
         MaskRule::Hash => {
             let digest = Sha256::digest(value.to_string().as_bytes());
             Value::String(format!("{digest:x}"))

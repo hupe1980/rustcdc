@@ -111,6 +111,7 @@ fn event_fingerprint(event: &Event) -> u64 {
         Operation::Delete => "delete",
         Operation::Read => "read",
         Operation::SchemaChange => "schema_change",
+        Operation::Truncate => "truncate",
     };
     op.hash(&mut hasher);
 

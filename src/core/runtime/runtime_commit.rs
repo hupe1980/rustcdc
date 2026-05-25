@@ -31,11 +31,11 @@ where
             return Ok(());
         }
 
-        let pending_len = self
+        let pending_remaining = self
             .pending_delivery
             .as_ref()
-            .map_or(0, |pending| pending.events.len());
-        if count > self.delivered_not_committed || count > pending_len {
+            .map_or(0, |pending| pending.events.len() - pending.committed_prefix);
+        if count > self.delivered_not_committed || count > pending_remaining {
             return Err(Error::CheckpointError(
                 "cannot commit more events than were delivered".into(),
             ));
@@ -76,12 +76,8 @@ where
             .pending_delivery
             .as_ref()
             .map(|pending| {
-                pending
-                    .events
-                    .iter()
-                    .take(count)
-                    .cloned()
-                    .collect::<Vec<_>>()
+                let start = pending.committed_prefix;
+                pending.events[start..start + count].to_vec()
             })
             .unwrap_or_default();
 
@@ -91,8 +87,8 @@ where
         self.last_commit_at_ms = Some(now_ms);
         self.last_checkpoint_saved_at_ms = Some(now_ms);
         if let Some(pending) = self.pending_delivery.as_mut() {
-            let _ = pending.events.drain(..count);
-            if pending.events.is_empty() {
+            pending.committed_prefix += count;
+            if pending.committed_prefix >= pending.events.len() {
                 self.pending_delivery = None;
             }
         }
@@ -148,10 +144,9 @@ where
             return false;
         };
 
-        pending
-            .events
+        let start = pending.committed_prefix;
+        pending.events[start..start + count]
             .iter()
-            .take(count)
             .any(|event| event.snapshot.is_some())
     }
 
@@ -185,11 +180,12 @@ where
             None => return Ok(None),
         };
 
-        if count == 0 || count > pending.events.len() {
+        let remaining = pending.events.len() - pending.committed_prefix;
+        if count == 0 || count > remaining {
             return Ok(None);
         }
 
-        let last_committed = &pending.events[count - 1];
+        let last_committed = &pending.events[pending.committed_prefix + count - 1];
 
         #[cfg(feature = "postgres")]
         {

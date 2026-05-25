@@ -2,7 +2,7 @@
 
 **Audience:** Platform operators and SREs managing cdc-rs in production  
 **Version:** Current  
-**Last Updated:** May 21, 2026
+**Last Updated:** May 25, 2026
 
 ---
 
@@ -660,6 +660,5 @@ curl -v http://localhost:9090/metrics
 
 ---
 
-**Last Updated:** May 21, 2026  
-**Version:** Current Runbook  
-**Next Review:** Next connector/runtime release cycle
+**Last Updated:** May 25, 2026  
+**Version:** Current Runbook

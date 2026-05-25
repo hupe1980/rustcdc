@@ -45,9 +45,16 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns whether the error is safe to retry without human intervention.
+    /// Returns whether the error represents a transient source condition worth retrying.
+    ///
+    /// Only [`Error::SourceError`] and [`Error::TimeoutError`] are considered
+    /// recoverable — these are the only variants that can arise from a transient
+    /// network or server condition and are meaningful to retry with backoff.
+    ///
+    /// All other variants (config, validation, serialization, state, etc.) indicate
+    /// a permanent problem that retrying will not resolve.
     pub fn is_recoverable(&self) -> bool {
-        !matches!(self, Self::Unrecoverable(_))
+        matches!(self, Self::SourceError(_) | Self::TimeoutError(_))
     }
 }
 
@@ -63,7 +70,14 @@ mod tests {
 
     #[test]
     fn recoverable_flag_matches_contract() {
-        assert!(Error::ConfigError("invalid".into()).is_recoverable());
+        assert!(Error::SourceError("conn reset".into()).is_recoverable());
+        assert!(Error::TimeoutError("deadline exceeded".into()).is_recoverable());
+        assert!(!Error::ConfigError("invalid".into()).is_recoverable());
+        assert!(!Error::ValidationError(vec!["bad field".into()]).is_recoverable());
+        assert!(!Error::CheckpointError("io".into()).is_recoverable());
+        assert!(!Error::SchemaError("missing".into()).is_recoverable());
+        assert!(!Error::StateError("illegal transition".into()).is_recoverable());
+        assert!(!Error::TransformError("crash".into()).is_recoverable());
         assert!(!Error::Unrecoverable("boom".into()).is_recoverable());
     }
 

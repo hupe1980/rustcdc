@@ -1,6 +1,6 @@
 # cdc-rs Configuration Reference
 
-**Version:** Phase 1 (v0.1+)  
+**Version:** v0.1+  
 **Audience:** Platform engineers and application developers embedding cdc-rs
 
 ---
@@ -56,6 +56,9 @@ pub struct RuntimeConfig<C, H> {
     pub idempotency: Option<IdempotencyOptions>,
     pub validate_events: bool,
     pub schema_history_retention: Option<SchemaHistoryRetention>,
+    /// Exponential-backoff retry policy for recoverable source connection errors.
+    /// `None` disables retry (errors propagate immediately).
+    pub connection_retry: Option<ConnectionRetryPolicy>,
   }
   ```
 
@@ -320,8 +323,36 @@ Encrypted fields are emitted as `enc:v1:<nonce>:<ciphertext>` strings and decryp
 **Transport Selection:**
 - `TransportConfig::tls()` (default with `tls` feature): TLS with system trust store
 - `TransportConfig::tls_with_ca_cert_path(path)`: TLS with explicit CA bundle
+- `TransportConfig::plaintext()`: unencrypted transport — credentials and data transmitted in the clear
 
-Use TLS transport for all connector configurations.
+Use TLS transport for all production connector configurations.
+`TransportConfig::plaintext()` is provided as an explicit escape hatch for trusted
+private networks and local integration testing only — never use it in production.
+
+**Connection Retry Policy:**
+
+Set `RuntimeOptions.connection_retry` to automatically retry recoverable source
+connection failures with truncated exponential backoff:
+
+```rust
+use cdc_rs::core::ConnectionRetryPolicy;
+
+let config = RuntimeConfig::new(source, checkpoint, schema_history)
+    .with_connection_retry(ConnectionRetryPolicy {
+        max_retries: Some(5),    // None retries indefinitely
+        initial_delay_ms: 300,   // first retry after 300 ms
+        max_delay_ms: 10_000,    // backoff capped at 10 s
+    });
+```
+
+Only `SourceError` and `TimeoutError` trigger retry. Fatal errors (`ConfigError`,
+`ValidationError`, etc.) propagate immediately regardless of this policy.
+
+**Resumable Snapshot Cursoring:**
+- Snapshot resume uses primary-key keyset cursoring (not `ctid`).
+- Tables configured for resumable snapshots must expose a primary key.
+- Tables without a primary key are rejected for resumable snapshots.
+- This prevents physical tuple cursor instability during long-running snapshots with concurrent writes.
 
 ---
 
@@ -377,12 +408,6 @@ pub struct MysqlSourceConfig {
     
 }
 ```
-
-**Resumable Snapshot Cursoring (PostgreSQL):**
-- Snapshot resume now uses primary-key keyset cursoring (not `ctid`).
-- Tables configured for resumable snapshots must expose a primary key.
-- Tables without a primary key are rejected for resumable Postgres snapshots.
-- This is a deliberate correctness-first behavior to avoid physical tuple cursor instability.
 
 ### MySQL GTID String Format
 
@@ -480,11 +505,15 @@ let checkpoint = InMemoryCheckpoint::default();
 ```rust
 use cdc_rs::checkpoint::FileCheckpoint;
 
-let checkpoint = FileCheckpoint::new("/var/cdc-rs/checkpoints")
-    // Optional: customize file mode
-    .with_file_mode(0o644);
-// Stores checkpoint in JSON file; atomically updated
+// Default: 0o600 (owner read/write only — enforced at load time).
+let checkpoint = FileCheckpoint::new("/var/cdc-rs/checkpoints");
+// Stores checkpoint in JSON file; atomically updated via write-rename.
 ```
+
+File permissions are enforced at load time: if the checkpoint file on disk has
+mode bits accessible to group or other (e.g. 0o644), the load is rejected with
+a `CheckpointError`. This protects connection credentials embedded in the
+checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 
 **File Location Format:**
 ```
@@ -703,8 +732,9 @@ let transport = TransportConfig::tls_with_ca_cert_path("/etc/ssl/certs/company-c
 // Also valid: rely on system trust store.
 let transport = TransportConfig::tls();
 
-// Development/testing: still prefer TLS unless intentionally testing plaintext behavior.
-let transport = TransportConfig::tls();
+// Plaintext: only for trusted private networks or local integration testing.
+// Credentials and event data are transmitted unencrypted.
+let transport = TransportConfig::plaintext();
 ```
 
 ### Monitoring Checklist
@@ -719,5 +749,5 @@ let transport = TransportConfig::tls();
 
 ---
 
-**Last Updated:** May 16, 2026  
-**Version:** Phase 1 Configuration Reference (v0.1+)
+**Last Updated:** May 25, 2026  
+**Version:** Configuration Reference v0.1+

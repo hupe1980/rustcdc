@@ -47,6 +47,9 @@ pub struct ConnectorCapabilities {
     pub heartbeat: bool,
     pub tls: bool,
     pub schema_introspection: bool,
+    /// Whether the connector surfaces `TRUNCATE` operations as
+    /// [`crate::core::Operation::Truncate`] events.
+    pub truncate: bool,
 }
 
 impl ConnectorCapabilities {
@@ -60,6 +63,7 @@ impl ConnectorCapabilities {
             heartbeat: false,
             tls: false,
             schema_introspection: false,
+            truncate: false,
         }
     }
 }
@@ -259,6 +263,7 @@ mod tests {
                 heartbeat: false,
                 tls: false,
                 schema_introspection: true,
+                truncate: false,
             }
         }
     }

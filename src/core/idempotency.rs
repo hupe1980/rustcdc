@@ -109,7 +109,7 @@ pub fn fingerprint_event(event: &Event) -> Result<u64> {
     event.source.source_name.hash(&mut hasher);
     event.source.offset.hash(&mut hasher);
     event.table.hash(&mut hasher);
-    event.op.to_string().hash(&mut hasher);
+    event.op.hash(&mut hasher);
     event.primary_key.hash(&mut hasher);
 
     // Different events can share a source offset inside a transaction; include

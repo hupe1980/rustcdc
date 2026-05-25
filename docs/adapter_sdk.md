@@ -80,5 +80,5 @@ async fn validate_adapter() -> cdc_rs::Result<()> {
 
 ## Notes
 
-- Phase 1 keeps the adapter surface intentionally narrow.
-- Advanced retry policies and delivery semantics are phase-gated for later roadmap stages.
+- The adapter surface is intentionally narrow to keep the contract stable and testable.
+- Retry policies and delivery semantics are the responsibility of the embedding application.

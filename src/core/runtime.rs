@@ -94,6 +94,12 @@ pub struct RuntimeOptions {
     pub validate_events: bool,
     /// Optional schema-history retention policy applied after DDL persistence.
     pub schema_history_retention: Option<SchemaHistoryRetention>,
+    /// Optional retry policy applied when a recoverable source error occurs during streaming.
+    ///
+    /// When `None`, recoverable source errors surface immediately to the caller.
+    /// When `Some`, the runtime retries the failing poll with exponential backoff before
+    /// surfacing the error.
+    pub connection_retry: Option<ConnectionRetryPolicy>,
 }
 
 impl Default for RuntimeOptions {
@@ -112,6 +118,7 @@ impl Default for RuntimeOptions {
             }),
             validate_events: true,
             schema_history_retention: None,
+            connection_retry: None,
         }
     }
 }
@@ -176,6 +183,16 @@ impl RuntimeOptions {
         self.schema_history_retention = Some(retention);
         self
     }
+
+    /// Configure automatic retry with exponential backoff for recoverable source errors.
+    ///
+    /// Without a retry policy every recoverable source error surfaces immediately
+    /// to the caller. With a policy the runtime retries the failing stream poll
+    /// up to `max_retries` times, sleeping between attempts, before propagating.
+    pub fn with_connection_retry(mut self, policy: ConnectionRetryPolicy) -> Self {
+        self.connection_retry = Some(policy);
+        self
+    }
 }
 
 /// Runtime-level idempotency guard configuration.
@@ -206,6 +223,43 @@ impl IdempotencyOptions {
         }
         self.ttl_ms = Some(ttl_ms);
         Ok(self)
+    }
+}
+
+/// Retry policy for recoverable source connection errors.
+///
+/// When a stream poll fails with a recoverable [`Error::SourceError`], the runtime
+/// retries up to `max_retries` times (or indefinitely when `None`) using truncated
+/// exponential backoff clamped to `max_delay_ms`.
+///
+/// # Example
+/// ```
+/// use cdc_rs::core::ConnectionRetryPolicy;
+///
+/// let policy = ConnectionRetryPolicy {
+///     max_retries: Some(5),
+///     initial_delay_ms: 300,
+///     max_delay_ms: 10_000,
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionRetryPolicy {
+    /// Maximum number of consecutive retries before the error is surfaced.
+    /// `None` means retry indefinitely.
+    pub max_retries: Option<u32>,
+    /// Initial retry delay in milliseconds.
+    pub initial_delay_ms: u64,
+    /// Maximum retry delay cap in milliseconds (exponential backoff clamp).
+    pub max_delay_ms: u64,
+}
+
+impl Default for ConnectionRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: Some(5),
+            initial_delay_ms: 300,
+            max_delay_ms: 10_000,
+        }
     }
 }
 
@@ -258,6 +312,7 @@ impl RuntimeSourceConfig {
             heartbeat: true,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
+            truncate: false,
         }
     }
 
@@ -271,6 +326,7 @@ impl RuntimeSourceConfig {
             heartbeat: true,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
+            truncate: true,
         }
     }
 }
@@ -354,16 +410,20 @@ impl AckToken {
 }
 
 /// Delivered runtime events paired with an opaque acknowledgement token.
+///
+/// Internally the events vector is reference-counted so that the runtime can
+/// keep a copy in `pending_delivery` for replay without an O(n) clone per
+/// delivery.  All public accessors expose the same slice/vec API as before.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventBatch {
-    events: Vec<Event>,
+    events: Arc<Vec<Event>>,
     ack_token: Option<AckToken>,
 }
 
 impl EventBatch {
     fn empty() -> Self {
         Self {
-            events: Vec::new(),
+            events: Arc::new(Vec::new()),
             ack_token: None,
         }
     }
@@ -374,8 +434,11 @@ impl EventBatch {
     }
 
     /// Consume the batch and return its events.
+    ///
+    /// If the runtime has already committed and dropped its internal reference
+    /// (via `commit_ack`) this is zero-copy; otherwise the vector is cloned.
     pub fn into_events(self) -> Vec<Event> {
-        self.events
+        Arc::try_unwrap(self.events).unwrap_or_else(|arc| (*arc).clone())
     }
 
     /// Return the acknowledgement token for this delivery, if any events were delivered.
@@ -397,7 +460,9 @@ impl EventBatch {
 #[derive(Clone)]
 struct PendingDelivery {
     delivery_id: u64,
-    events: Vec<Event>,
+    events: Arc<Vec<Event>>,
+    /// Number of events from the front of `events` that have already been committed.
+    committed_prefix: usize,
 }
 
 /// Behavior when a transform stage returns an error for an event.
@@ -891,903 +956,11 @@ where
         self.source = RuntimeSource::Mock(source);
     }
 
-    /// Start the runtime and initialize source handles.
-    pub async fn start(&mut self) -> Result<()> {
-        match self.state {
-            RuntimeState::Idle | RuntimeState::Stopped => {}
-            RuntimeState::Running => {
-                let error = Error::StateError("runtime already started".into());
-                self.record_runtime_error("runtime.start.state", &error);
-                return Err(error);
-            }
-            RuntimeState::Stopping => {
-                let error = Error::StateError("runtime is currently stopping".into());
-                self.record_runtime_error("runtime.start.state", &error);
-                return Err(error);
-            }
-        }
-
-        let committed_event_count = self
-            .config
-            .checkpoint
-            .get_committed_count()
-            .await
-            .inspect_err(|error| self.record_runtime_error("runtime.start.committed_count", error))?;
-        self.commit_barrier
-            .hydrate_committed_event_count(committed_event_count)
-            .inspect_err(|error| self.record_runtime_error("runtime.start.barrier_hydrate", error))?;
-
-        if matches!(self.source, RuntimeSource::Disabled) {
-            self.state = RuntimeState::Running;
-            self.observability().tracer.trace_checkpoint_barrier("open");
-            return Ok(());
-        }
-
-        let mut checkpoint_offset = self.config.checkpoint.load().await?;
-        if let Some(offset) = checkpoint_offset.as_ref() {
-            if self.is_snapshot_checkpoint(offset.as_ref()) {
-                if !self.source_capabilities().snapshot_checkpoint_resume {
-                    tracing::warn!(
-                        target: "cdc_rs::runtime",
-                        source = self.config.source.source_type().unwrap_or("unknown"),
-                        "snapshot checkpoint resume is unsupported by connector; restarting snapshot from scratch"
-                    );
-                    checkpoint_offset = None;
-                }
-
-                if checkpoint_offset.is_some() && self.config.snapshot_tables.is_empty() {
-                    return Err(Error::ConfigError(
-                        "snapshot_tables must not be empty when resuming from a snapshot checkpoint"
-                            .into(),
-                    ));
-                }
-            }
-        }
-
-        self.source
-            .connect()
-            .await
-            .inspect_err(|error| self.record_runtime_error("runtime.start.connect", error))?;
-
-        if let Some(offset) = checkpoint_offset.as_ref() {
-            if self.is_snapshot_checkpoint(offset.as_ref()) {
-                self.snapshot = Some(
-                    self.source
-                        .start_snapshot_from_checkpoint(
-                            &self.config.snapshot_tables,
-                            offset.as_ref(),
-                        )
-                        .await?,
-                );
-                let stream_resume_from =
-                    self.stream_resume_offset_for_snapshot_checkpoint(offset.as_ref())?;
-                self.stream = Some(
-                    self.source
-                        .start_stream(stream_resume_from.as_deref())
-                        .await?,
-                );
-                self.handoff_complete = false;
-            } else {
-                self.stream = Some(self.source.start_stream(Some(offset.as_ref())).await?);
-                self.snapshot = None;
-                self.handoff_complete = true;
-            }
-        } else if self.config.snapshot_tables.is_empty() {
-            self.snapshot = None;
-            self.stream = Some(self.source.start_stream(None).await?);
-            self.handoff_complete = true;
-        } else {
-            self.snapshot = Some(
-                self.source
-                    .start_snapshot(&self.config.snapshot_tables)
-                    .await?,
-            );
-            self.stream = Some(self.source.start_stream(None).await?);
-            self.handoff_complete = false;
-        }
-
-        self.state = RuntimeState::Running;
-        self.observability().tracer.trace_checkpoint_barrier("open");
-        self.started_at_ms = Some(now_millis());
-        self.last_poll_at_ms = None;
-        self.last_source_event_ts_ms = None;
-        self.last_commit_at_ms = None;
-        self.total_events_polled = 0;
-        self.total_events_committed = 0;
-        self.total_events_deduplicated = 0;
-        Ok(())
-    }
-
-    fn is_snapshot_checkpoint(&self, offset: &dyn Offset) -> bool {
-        let Some(source_type) = self.config.source.source_type() else {
-            return false;
-        };
-        let expected_snapshot_source = format!("{source_type}_snapshot");
-        offset.source_type() == expected_snapshot_source
-    }
-
-    #[allow(unused_variables)]
-    fn stream_resume_offset_for_snapshot_checkpoint(
-        &self,
-        snapshot_checkpoint: &dyn Offset,
-    ) -> Result<Option<Box<dyn Offset>>> {
-        #[cfg(feature = "postgres")]
-        if matches!(&self.config.source, RuntimeSourceConfig::Postgres(_)) {
-            return Ok(Some(Box::new(
-                self.postgres_stream_offset_from_snapshot_checkpoint(snapshot_checkpoint)?,
-            )));
-        }
-
-        #[cfg(feature = "mysql")]
-        if matches!(&self.config.source, RuntimeSourceConfig::Mysql(_)) {
-            return Ok(Some(Box::new(
-                Self::mysql_stream_offset_from_snapshot_checkpoint(snapshot_checkpoint)?,
-            )));
-        }
-
-        #[cfg(feature = "sqlserver")]
-        if matches!(&self.config.source, RuntimeSourceConfig::SqlServer(_)) {
-            return Ok(Some(Box::new(
-                Self::sqlserver_stream_offset_from_snapshot_checkpoint(snapshot_checkpoint)?,
-            )));
-        }
-
-        Ok(None)
-    }
-
-    #[cfg(feature = "postgres")]
-    fn postgres_stream_offset_from_snapshot_checkpoint(
-        &self,
-        snapshot_checkpoint: &dyn Offset,
-    ) -> Result<PostgresOffset> {
-        let payload = snapshot_checkpoint.encode()?;
-        let value: serde_json::Value = serde_json::from_slice(&payload)
-            .map_err(|error| Error::CheckpointError(error.to_string()))?;
-
-        let lsn = value
-            .get("snapshot_watermark")
-            .and_then(|entry| entry.as_u64())
-            .ok_or_else(|| {
-                Error::CheckpointError(
-                    "postgres snapshot checkpoint is missing 'snapshot_watermark'".into(),
-                )
-            })?;
-
-        let slot_name = match &self.config.source {
-            RuntimeSourceConfig::Postgres(cfg) => cfg.replication_slot_name.clone(),
-            _ => {
-                return Err(Error::StateError(
-                    "postgres stream resume conversion called for non-postgres runtime source"
-                        .into(),
-                ));
-            }
-        };
-
-        Ok(PostgresOffset { lsn, slot_name })
-    }
-
-    #[cfg(feature = "mysql")]
-    fn mysql_stream_offset_from_snapshot_checkpoint(
-        snapshot_checkpoint: &dyn Offset,
-    ) -> Result<MysqlOffset> {
-        let payload = snapshot_checkpoint.encode()?;
-        let value: serde_json::Value = serde_json::from_slice(&payload)
-            .map_err(|error| Error::CheckpointError(error.to_string()))?;
-
-        let binlog_file = value
-            .get("binlog_file")
-            .and_then(|entry| entry.as_str())
-            .ok_or_else(|| {
-                Error::CheckpointError("mysql snapshot checkpoint is missing 'binlog_file'".into())
-            })?
-            .to_string();
-        let binlog_pos = value
-            .get("binlog_pos")
-            .and_then(|entry| entry.as_u64())
-            .ok_or_else(|| {
-                Error::CheckpointError("mysql snapshot checkpoint is missing 'binlog_pos'".into())
-            })?;
-        let binlog_pos = u32::try_from(binlog_pos).map_err(|_| {
-            Error::CheckpointError("mysql snapshot checkpoint binlog_pos exceeds u32".into())
-        })?;
-        let gtid = value
-            .get("gtid")
-            .and_then(|entry| entry.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        Ok(MysqlOffset {
-            gtid,
-            binlog_file,
-            binlog_pos,
-        })
-    }
-
-    #[cfg(feature = "sqlserver")]
-    fn sqlserver_stream_offset_from_snapshot_checkpoint(
-        snapshot_checkpoint: &dyn Offset,
-    ) -> Result<GenericOffset> {
-        let payload = snapshot_checkpoint.encode()?;
-        let value: serde_json::Value = serde_json::from_slice(&payload)
-            .map_err(|error| Error::CheckpointError(error.to_string()))?;
-
-        let lsn_start = value
-            .get("lsn_start")
-            .and_then(|entry| entry.as_array())
-            .ok_or_else(|| {
-                Error::CheckpointError(
-                    "sqlserver snapshot checkpoint is missing 'lsn_start'".into(),
-                )
-            })?;
-
-        if lsn_start.len() != 10 {
-            return Err(Error::CheckpointError(
-                "sqlserver snapshot checkpoint lsn_start must contain exactly 10 bytes".into(),
-            ));
-        }
-
-        let mut bytes = Vec::with_capacity(10);
-        for value in lsn_start {
-            let byte = value.as_u64().ok_or_else(|| {
-                Error::CheckpointError(
-                    "sqlserver snapshot checkpoint lsn_start contains non-byte value".into(),
-                )
-            })?;
-            let byte = u8::try_from(byte).map_err(|_| {
-                Error::CheckpointError(
-                    "sqlserver snapshot checkpoint lsn_start contains out-of-range byte".into(),
-                )
-            })?;
-            bytes.push(byte);
-        }
-
-        Ok(GenericOffset::new(
-            "sqlserver",
-            serde_json::to_vec(&format!(
-                "0x{}",
-                bytes
-                    .iter()
-                    .map(|byte| format!("{byte:02X}"))
-                    .collect::<String>()
-            ))
-            .map_err(|error| Error::SerializationError(error.to_string()))?,
-        ))
-    }
-
-    /// Stop the runtime.
-    ///
-    /// This is safe-by-default and will fail if there are uncommitted in-memory
-    /// events. Callers must acknowledge deliveries first, or use `force_stop()`
-    /// to explicitly drain pending events.
-    pub async fn stop(&mut self) -> Result<Vec<Event>> {
-        match self.state {
-            RuntimeState::Idle | RuntimeState::Stopped => {
-                self.state = RuntimeState::Stopped;
-                return Ok(Vec::new());
-            }
-            RuntimeState::Stopping => {
-                let error = Error::StateError("runtime already stopping".into());
-                self.record_runtime_error("runtime.stop.state", &error);
-                return Err(error);
-            }
-            RuntimeState::Running => {}
-        }
-
-        let pending_events = self
-            .commit_barrier
-            .pending_count()
-            .saturating_add(self.injected_events.len())
-            .saturating_add(self.pending_source_events.len());
-        if pending_events > 0 {
-            let error = Error::StateError(format!(
-                "runtime has {pending_events} uncommitted events; commit acknowledgements before stop or call force_stop()"
-            ));
-            self.record_runtime_error("runtime.stop.uncommitted", &error);
-            return Err(error);
-        }
-
-        self.state = RuntimeState::Stopping;
-        self.delivered_not_committed = 0;
-        self.pending_delivery = None;
-        self.source.close().await;
-
-        self.snapshot = None;
-        self.stream = None;
-        self.started_at_ms = None;
-        self.last_source_event_ts_ms = None;
-        self.observability()
-            .tracer
-            .trace_checkpoint_barrier("stopped");
-        self.state = RuntimeState::Stopped;
-        Ok(Vec::new())
-    }
-
-    /// Force stop the runtime and drain all pending in-memory events.
-    ///
-    /// This is intended for emergency shutdown paths where replay/duplication
-    /// handling is delegated to the embedder.
-    pub async fn force_stop(&mut self) -> Result<Vec<Event>> {
-        match self.state {
-            RuntimeState::Idle | RuntimeState::Stopped => {
-                self.state = RuntimeState::Stopped;
-                return Ok(Vec::new());
-            }
-            RuntimeState::Stopping => {
-                let error = Error::StateError("runtime already stopping".into());
-                self.record_runtime_error("runtime.force_stop.state", &error);
-                return Err(error);
-            }
-            RuntimeState::Running => {}
-        }
-
-        self.state = RuntimeState::Stopping;
-        let mut drained = std::mem::take(&mut self.injected_events)
-            .into_iter()
-            .collect::<Vec<_>>();
-        if let Some(pending) = self.pending_delivery.take() {
-            drained.extend(pending.events);
-        }
-        drained.extend(self.buffered_events.drain(..));
-        drained.extend(self.pending_source_events.drain(..));
-        self.commit_barrier.clear_pending();
-        for event in &drained {
-            self.observability()
-                .tracer
-                .trace_event_end(&Self::event_trace_id(event), "force_stopped");
-        }
-        self.delivered_not_committed = 0;
-        self.source.close().await;
-
-        self.snapshot = None;
-        self.stream = None;
-        self.started_at_ms = None;
-        self.last_source_event_ts_ms = None;
-        self.observability()
-            .tracer
-            .trace_checkpoint_barrier("stopped");
-        self.state = RuntimeState::Stopped;
-        Ok(drained)
-    }
-
-    /// Return the current lifecycle state.
-    pub fn state(&self) -> RuntimeState {
-        self.state
-    }
-
-    /// Report capabilities for the configured source.
-    pub const fn source_capabilities(&self) -> ConnectorCapabilities {
-        self.config.source.capabilities()
-    }
-
-    /// Return an embeddable admin snapshot for runtime health and capabilities introspection.
-    pub fn admin_snapshot(&self) -> RuntimeAdminSnapshot {
-        let now_ms = now_millis();
-        let checkpoint_age_ms = self
-            .last_checkpoint_saved_at_ms
-            .map(|checkpoint_time| now_ms.saturating_sub(checkpoint_time));
-
-        RuntimeAdminSnapshot {
-            source_type: self.config.source.source_type().map(str::to_string),
-            state: runtime_state_label(self.state).to_string(),
-            readiness: self.state == RuntimeState::Running
-                && (matches!(self.config.source, RuntimeSourceConfig::Disabled)
-                    || self.stream.is_some()
-                    || self.snapshot.is_some()),
-            liveness: self.state != RuntimeState::Stopped,
-            capabilities: self.source_capabilities(),
-            buffer_depth: self.buffered_events.len()
-                + self.injected_events.len()
-                + self.pending_source_events.len(),
-            in_flight_events: self
-                .pending_delivery
-                .as_ref()
-                .map_or(0, |pending| pending.events.len()),
-            snapshot_active: self.snapshot.is_some(),
-            stream_active: self.stream.is_some(),
-            handoff_complete: self.handoff_complete,
-            total_events_polled: self.total_events_polled,
-            total_events_committed: self.total_events_committed,
-            total_events_deduplicated: self.total_events_deduplicated,
-            started_at_ms: self.started_at_ms,
-            last_poll_at_ms: self.last_poll_at_ms,
-            last_commit_at_ms: self.last_commit_at_ms,
-            checkpoint_age_ms,
-            replication_lag_ms: self.estimate_replication_lag_ms(),
-        }
-    }
-
-    /// Estimate replication lag from source event timestamps when available.
-    /// Falls back to poll recency until a source timestamp is observed.
-    fn estimate_replication_lag_ms(&self) -> Option<u64> {
-        let now = now_millis();
-        if let Some(source_ts) = self.last_source_event_ts_ms {
-            return Some(now.saturating_sub(source_ts.min(now)));
-        }
-        self.last_poll_at_ms
-            .map(|poll_time| now.saturating_sub(poll_time))
-    }
-
-    /// Render the current admin snapshot as JSON.
-    pub fn admin_snapshot_json(&self) -> Result<String> {
-        serde_json::to_string(&self.admin_snapshot())
-            .map_err(|error| Error::SerializationError(error.to_string()))
-    }
-
-    /// Render runtime admin metrics in a Prometheus-friendly text exposition format.
-    pub fn admin_metrics_prometheus(&self) -> String {
-        let admin = self.admin_snapshot();
-        let mut out = String::new();
-
-        out.push_str("# HELP cdc_runtime_readiness Runtime readiness (1=ready, 0=not ready).\n");
-        out.push_str("# TYPE cdc_runtime_readiness gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_readiness{{state=\"{}\"}} {}\n",
-            admin.state,
-            if admin.readiness { 1 } else { 0 }
-        ));
-
-        out.push_str("# HELP cdc_runtime_liveness Runtime liveness (1=alive, 0=stopped).\n");
-        out.push_str("# TYPE cdc_runtime_liveness gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_liveness{{state=\"{}\"}} {}\n",
-            admin.state,
-            if admin.liveness { 1 } else { 0 }
-        ));
-
-        out.push_str(
-            "# HELP cdc_runtime_buffer_depth Number of buffered events waiting for delivery.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_buffer_depth gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_buffer_depth {}\n",
-            admin.buffer_depth
-        ));
-
-        out.push_str(
-            "# HELP cdc_runtime_in_flight_events Number of delivered but uncommitted events.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_in_flight_events gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_in_flight_events {}\n",
-            admin.in_flight_events
-        ));
-
-        out.push_str(
-            "# HELP cdc_runtime_events_polled_total Total events delivered by runtime batches.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_events_polled_total counter\n");
-        out.push_str(&format!(
-            "cdc_runtime_events_polled_total {}\n",
-            admin.total_events_polled
-        ));
-
-        out.push_str("# HELP cdc_runtime_events_committed_total Total events acknowledged and checkpointed.\n");
-        out.push_str("# TYPE cdc_runtime_events_committed_total counter\n");
-        out.push_str(&format!(
-            "cdc_runtime_events_committed_total {}\n",
-            admin.total_events_committed
-        ));
-
-        out.push_str(
-            "# HELP cdc_runtime_events_deduplicated_total Total events suppressed by runtime idempotency guard.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_events_deduplicated_total counter\n");
-        out.push_str(&format!(
-            "cdc_runtime_events_deduplicated_total {}\n",
-            admin.total_events_deduplicated
-        ));
-
-        if let Some(checkpoint_age_ms) = admin.checkpoint_age_ms {
-            out.push_str("# HELP cdc_runtime_checkpoint_age_ms Age of last durable checkpoint in milliseconds.\n");
-            out.push_str("# TYPE cdc_runtime_checkpoint_age_ms gauge\n");
-            out.push_str(&format!(
-                "cdc_runtime_checkpoint_age_ms {}\n",
-                checkpoint_age_ms
-            ));
-        }
-
-        if let Some(lag_ms) = admin.replication_lag_ms {
-            out.push_str("# HELP cdc_runtime_replication_lag_ms Estimated replication lag in milliseconds (source event timestamp preferred; poll recency fallback).\n");
-            out.push_str("# TYPE cdc_runtime_replication_lag_ms gauge\n");
-            out.push_str(&format!("cdc_runtime_replication_lag_ms {}\n", lag_ms));
-        }
-
-        out.push_str("# HELP cdc_runtime_source_capability Connector capability flags.\n");
-        out.push_str("# TYPE cdc_runtime_source_capability gauge\n");
-        out.push_str(&format_capability_metric(
-            "snapshot",
-            admin.capabilities.snapshot,
-        ));
-        out.push_str(&format_capability_metric(
-            "handoff",
-            admin.capabilities.handoff,
-        ));
-        out.push_str(&format_capability_metric(
-            "ddl_capture",
-            admin.capabilities.ddl_capture,
-        ));
-        out.push_str(&format_capability_metric(
-            "heartbeat",
-            admin.capabilities.heartbeat,
-        ));
-        out.push_str(&format_capability_metric("tls", admin.capabilities.tls));
-        out.push_str(&format_capability_metric(
-            "schema_introspection",
-            admin.capabilities.schema_introspection,
-        ));
-
-        out
-    }
-
-    /// Poll the next event batch with an opaque acknowledgement token.
-    pub async fn poll_event_batch(&mut self) -> Result<EventBatch> {
-        if self.state != RuntimeState::Running {
-            let error = Error::StateError("runtime must be running before polling".into());
-            self.record_runtime_error("runtime.poll.state", &error);
-            return Err(error);
-        }
-
-        if let Some(batch) = self.current_pending_batch() {
-            return Ok(batch);
-        }
-
-        let metrics = Arc::clone(&self.observability().metrics);
-
-        if !self.buffered_events.is_empty() {
-            return Ok(self.deliver_buffered_batch());
-        }
-
-        if !self.pending_source_events.is_empty() {
-            return self.flush_pending_source_events();
-        }
-
-        if !self.injected_events.is_empty() {
-            let mut chunk = Vec::new();
-            while chunk.len() < self.config.options.max_buffer_size {
-                let Some(event) = self.injected_events.pop_front() else {
-                    break;
-                };
-                chunk.push(event);
-            }
-
-            // Deduplicate source events before transform stages mutate payloads.
-            let deduplicated = self.filter_idempotent_events(chunk)?;
-            let transformed = self.apply_transforms(deduplicated).await?;
-            self.enqueue_pending_source_events(transformed);
-            return self.flush_pending_source_events();
-        }
-
-        if let Some(snapshot) = self.snapshot.as_mut() {
-            let chunk = snapshot
-                .next_chunk(self.config.options.max_buffer_size)
-                .await
-                .inspect_err(|error| metrics.record_error(error, "runtime.poll.snapshot_chunk"))?;
-            if !chunk.is_empty() {
-                // Deduplicate source events before transform stages mutate payloads.
-                let deduplicated = self.filter_idempotent_events(chunk)?;
-                let transformed = self.apply_transforms(deduplicated).await?;
-                self.enqueue_pending_source_events(transformed);
-                return self.flush_pending_source_events();
-            }
-
-            if !self.handoff_complete {
-                let stream = self.stream.as_mut().ok_or_else(|| {
-                    Error::StateError("snapshot-to-stream handoff requires active stream".into())
-                })?;
-                self.source
-                    .perform_handoff(snapshot.as_mut(), stream.as_mut())
-                    .await
-                    .inspect_err(|error| metrics.record_error(error, "runtime.poll.handoff"))?;
-                self.handoff_complete = true;
-            }
-            self.snapshot = None;
-        }
-
-        if let Some(stream) = self.stream.as_mut() {
-            let events = stream
-                .next_events(self.config.options.max_poll_wait_ms)
-                .await
-                .inspect_err(|error| metrics.record_error(error, "runtime.poll.stream_events"))?;
-            if events.is_empty() {
-                return Ok(EventBatch::empty());
-            }
-            // Deduplicate source events before transform stages mutate payloads.
-            let deduplicated = self.filter_idempotent_events(events)?;
-            let transformed = self.apply_transforms(deduplicated).await?;
-            self.enqueue_pending_source_events(transformed);
-            return self.flush_pending_source_events();
-        }
-
-        Ok(EventBatch::empty())
-    }
-
-    /// Expose the runtime as a batch stream that yields non-empty deliveries.
-    pub fn event_batches(&mut self) -> BoxStream<'_, Result<EventBatch>> {
-        stream::unfold(self, |runtime| async move {
-            loop {
-                match runtime.poll_event_batch().await {
-                    Ok(batch) if batch.is_empty() => continue,
-                    Ok(batch) => return Some((Ok(batch), runtime)),
-                    Err(error) => return Some((Err(error), runtime)),
-                }
-            }
-        })
-        .boxed()
-    }
-
-    async fn apply_transforms(&self, events: Vec<Event>) -> Result<Vec<Event>> {
-        let mut out = Vec::with_capacity(events.len());
-        for event in events {
-            let table = event.table.clone();
-            let offset = event.source.offset.clone();
-            match self.transform_pipeline.apply(event).await {
-                Ok(Some(event)) => out.push(event),
-                Ok(None) => {}
-                Err(error) => match self.config.options.transform_error_policy {
-                    TransformErrorPolicy::Halt => {
-                        self.record_runtime_error("runtime.transform.halt", &error);
-                        return Err(error);
-                    }
-                    TransformErrorPolicy::Skip => {
-                        self.record_runtime_error("runtime.transform.skip", &error);
-                        tracing::warn!(
-                            target: "cdc_rs::core::runtime",
-                            table = %table,
-                            offset = %offset,
-                            error = %error,
-                            "runtime transform error; skipping event",
-                        );
-                        continue;
-                    }
-                },
-            }
-        }
-        Ok(out)
-    }
-
-    fn filter_idempotent_events(&mut self, events: Vec<Event>) -> Result<Vec<Event>> {
-        let Some(guard) = self.idempotency_guard.as_mut() else {
-            return Ok(events);
-        };
-
-        let mut out = Vec::with_capacity(events.len());
-        for event in events {
-            if guard.should_process(&event)? {
-                out.push(event);
-            } else {
-                self.total_events_deduplicated = self.total_events_deduplicated.saturating_add(1);
-            }
-        }
-
-        Ok(out)
-    }
-
-    fn enqueue_pending_source_events(&mut self, events: Vec<Event>) {
-        self.pending_source_events.extend(events);
-    }
-
-    fn flush_pending_source_events(&mut self) -> Result<EventBatch> {
-        if self.pending_source_events.is_empty() {
-            return Ok(EventBatch::empty());
-        }
-
-        let available = self
-            .config
-            .options
-            .max_buffer_size
-            .saturating_sub(self.commit_barrier.pending_count());
-
-        if available == 0 {
-            let error = Error::StateError(
-                "runtime commit barrier is full; commit acknowledgements before polling more events"
-                    .into(),
-            );
-            self.record_runtime_error("runtime.poll.buffer_full", &error);
-            return Err(error);
-        }
-
-        let mut chunk = Vec::with_capacity(available.min(self.pending_source_events.len()));
-        while chunk.len() < available {
-            let Some(event) = self.pending_source_events.pop_front() else {
-                break;
-            };
-            chunk.push(event);
-        }
-
-        self.buffer_and_deliver(chunk)
-    }
-
-    fn buffer_and_deliver(&mut self, events: Vec<Event>) -> Result<EventBatch> {
-        for event in events {
-            if self.config.options.validate_events {
-                event.validate_or_error()?;
-            }
-            if event.snapshot.is_some() {
-                // Snapshot checkpoints are persisted via SnapshotHandle::checkpoint
-                // using connector-native structured state; avoid clobbering them
-                // with per-event offsets at commit barrier flush time.
-                self.commit_barrier.add_non_persistent_event()?;
-            } else {
-                let offset = self.build_checkpoint_offset(&event)?;
-                self.commit_barrier.add_event(offset)?;
-            }
-            self.buffered_events.push_back(event);
-        }
-        Ok(self.deliver_buffered_batch())
-    }
-
-    fn build_checkpoint_offset(&self, event: &Event) -> Result<GenericOffset> {
-        let source_type = self
-            .config
-            .source
-            .source_type()
-            .unwrap_or(event.source.source_name.as_str());
-
-        #[cfg(feature = "postgres")]
-        if let RuntimeSourceConfig::Postgres(config) = &self.config.source {
-            let lsn = parse_postgres_lsn(&event.source.offset)?;
-            let slot_name = config.replication_slot_name.clone();
-            let offset = PostgresOffset { lsn, slot_name };
-            return Ok(GenericOffset::new(
-                "postgres",
-                offset
-                    .encode()
-                    .map_err(|error| Error::CheckpointError(error.to_string()))?,
-            ));
-        }
-
-        #[cfg(feature = "mysql")]
-        if matches!(&self.config.source, RuntimeSourceConfig::Mysql(_)) {
-            let (binlog_file, binlog_pos, gtid) = parse_mysql_stream_offset(&event.source.offset)?;
-            let offset = MysqlOffset {
-                gtid,
-                binlog_file,
-                binlog_pos,
-            };
-            return Ok(GenericOffset::new(
-                "mysql",
-                offset
-                    .encode()
-                    .map_err(|error| Error::CheckpointError(error.to_string()))?,
-            ));
-        }
-
-        Ok(GenericOffset::new(
-            source_type.to_string(),
-            serde_json::to_vec(&event.source.offset)
-                .map_err(|error| Error::SerializationError(error.to_string()))?,
-        ))
-    }
-
-    fn current_pending_batch(&self) -> Option<EventBatch> {
-        let pending = self.pending_delivery.as_ref()?;
-        Some(EventBatch {
-            events: pending.events.clone(),
-            ack_token: Some(AckToken {
-                delivery_id: pending.delivery_id,
-                event_count: pending.events.len(),
-            }),
-        })
-    }
-
-    fn deliver_buffered_batch(&mut self) -> EventBatch {
-        let mut events = Vec::new();
-        while events.len() < self.config.options.max_buffer_size {
-            let Some(event) = self.buffered_events.pop_front() else {
-                break;
-            };
-            events.push(event);
-        }
-
-        if events.is_empty() {
-            return EventBatch::empty();
-        }
-
-        self.total_events_polled = self.total_events_polled.saturating_add(events.len() as u64);
-        self.last_poll_at_ms = Some(now_millis());
-        let now_ms = now_millis();
-        for event in &events {
-            self.observability()
-                .tracer
-                .trace_event_start(&Self::event_trace_id(event));
-            let source_ts = normalize_source_timestamp_ms(event.source.timestamp).min(now_ms);
-            let latency_ms = now_ms.saturating_sub(source_ts);
-            self.observability()
-                .metrics
-                .record_event_processed(event.op, latency_ms);
-        }
-        if let Some(latest_source_ts) = events
-            .iter()
-            .map(|event| normalize_source_timestamp_ms(event.source.timestamp))
-            .max()
-        {
-            self.last_source_event_ts_ms = Some(
-                self.last_source_event_ts_ms
-                    .map_or(latest_source_ts, |previous| previous.max(latest_source_ts)),
-            );
-        }
-        self.record_replication_lag_metric();
-
-        let delivery_id = self.next_delivery_id;
-        self.next_delivery_id = self.next_delivery_id.saturating_add(1);
-        self.delivered_not_committed = self.delivered_not_committed.saturating_add(events.len());
-        self.pending_delivery = Some(PendingDelivery {
-            delivery_id,
-            events: events.clone(),
-        });
-
-        EventBatch {
-            events,
-            ack_token: Some(AckToken {
-                delivery_id,
-                event_count: self
-                    .pending_delivery
-                    .as_ref()
-                    .map_or(0, |pending| pending.events.len()),
-            }),
-        }
-    }
-
-    /// Inject a test event directly into the runtime buffer.
-    pub fn enqueue_event(&mut self, event: Event) -> Result<()> {
-        let queued_events = self.buffered_events.len() + self.injected_events.len();
-        if queued_events >= self.config.options.max_buffer_size {
-            return Err(Error::StateError("runtime buffer is full".into()));
-        }
-
-        self.injected_events.push_back(event);
-        Ok(())
-    }
-
-    /// Parse and persist a DDL statement, then emit a canonical `schema_change` event.
-    ///
-    /// Returns `Ok(None)` when the statement is not a supported DDL command.
-    pub async fn capture_ddl_statement(
-        &mut self,
-        dialect: DdlDialect,
-        statement: &str,
-        source_name: &str,
-        offset: String,
-        ts_ms: u64,
-    ) -> Result<Option<Event>> {
-        let Some(parsed) = parse_ddl_statement(dialect, statement) else {
-            return Ok(None);
-        };
-
-        let mut captured = parsed.into_captured();
-        captured.ts = ts_ms;
-
-        let schema_version = match captured.to_schema_event() {
-            Some(schema_event) => {
-                let version = self.config.schema_history.record_ddl(schema_event).await?;
-                if let Some(retention) = self.config.options.schema_history_retention {
-                    self.config.schema_history.apply_retention(retention).await?;
-                }
-                Some(version)
-            }
-            None => None,
-        };
-
-        let mut event = captured.to_event(source_name, offset, ts_ms);
-        if let Some(version) = schema_version {
-            if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
-                after.insert("schema_version".into(), serde_json::json!(version));
-            }
-        }
-
-        self.enqueue_event(event.clone())?;
-        Ok(Some(event))
-    }
 }
 
-fn runtime_state_label(state: RuntimeState) -> &'static str {
-    match state {
-        RuntimeState::Idle => "idle",
-        RuntimeState::Running => "running",
-        RuntimeState::Stopping => "stopping",
-        RuntimeState::Stopped => "stopped",
-    }
-}
+mod runtime_lifecycle;
+mod runtime_admin;
+mod runtime_poll;
 
 #[cfg(test)]
 mod tests {
@@ -2665,6 +1838,7 @@ mod tests {
                 heartbeat: false,
                 tls: false,
                 schema_introspection: true,
+                truncate: false,
             }
         }
     }

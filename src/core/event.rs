@@ -11,7 +11,7 @@ use crate::core::{Error, Result};
 pub const EVENT_ENVELOPE_VERSION: u16 = 1;
 
 /// CRUD-style operations emitted by a source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Insert,
@@ -19,18 +19,33 @@ pub enum Operation {
     Delete,
     Read,
     SchemaChange,
+    /// All rows were removed from the table by a `TRUNCATE` statement.
+    ///
+    /// `before` and `after` are always `None` for truncate events.
+    /// Only connectors that advertise [`crate::source::ConnectorCapabilities::truncate`]
+    /// emit this variant.
+    Truncate,
 }
 
 impl Display for Operation {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let value = match self {
+        f.write_str(self.to_str())
+    }
+}
+
+impl Operation {
+    /// Return a `&'static str` representation without heap allocation.
+    ///
+    /// Prefer this over `to_string()` on hot paths.
+    pub fn to_str(self) -> &'static str {
+        match self {
             Self::Insert => "insert",
             Self::Update => "update",
             Self::Delete => "delete",
             Self::Read => "read",
             Self::SchemaChange => "schema_change",
-        };
-        f.write_str(value)
+            Self::Truncate => "truncate",
+        }
     }
 }
 
@@ -241,6 +256,20 @@ impl Event {
                     errors.push(ValidationError::new(
                         "after",
                         "schema_change events must include after",
+                    ));
+                }
+            }
+            Operation::Truncate => {
+                if self.before.is_some() {
+                    errors.push(ValidationError::new(
+                        "before",
+                        "truncate events must not include before",
+                    ));
+                }
+                if self.after.is_some() {
+                    errors.push(ValidationError::new(
+                        "after",
+                        "truncate events must not include after",
                     ));
                 }
             }

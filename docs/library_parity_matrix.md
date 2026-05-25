@@ -46,7 +46,7 @@ Status values:
 | Capability reporting matches connector behavior | Prevents control-plane and operational misconfiguration | Implemented | src/core/runtime.rs, src/source/postgres.rs, src/source/mysql.rs, src/source/sqlserver.rs |
 | Public docs/API contract aligned with implementation | Prevents integration failures caused by stale guidance | Implemented | docs/api.md, docs/schema_evolution.md, docs/config_reference.md |
 
-## Should-Have Capabilities (Near-Term)
+## Should-Have Capabilities
 
 | Capability | Why it matters | cdc-rs status | Evidence |
 |---|---|---|---|

@@ -127,10 +127,15 @@ The runtime also exposes connector capability metadata via `source_capabilities(
 `Event` is the canonical envelope consumed by downstream code.
 
 Key fields include:
-- `op`: one of `Insert`, `Update`, `Delete`, `Read`, `SchemaChange`
+- `op`: one of `Insert`, `Update`, `Delete`, `Read`, `SchemaChange`, `Truncate`
 - `source`: source metadata and offset context
 - `transaction`: optional transaction metadata
 - `snapshot`: optional snapshot metadata
+
+`Operation::Truncate` is emitted when a `TRUNCATE` statement removes all rows from a table.
+`before` and `after` are always `None` for truncate events. Only connectors that advertise
+`ConnectorCapabilities::truncate` emit this variant (currently: PostgreSQL).
+`Operation::to_str()` returns a `&'static str` for zero-allocation display and comparison.
 
 The event envelope is designed to support stable replay and source-agnostic processing.
 
@@ -224,6 +229,43 @@ The runtime exposes embeddable control-plane state and metrics surfaces:
 - `admin_metrics_prometheus()`
 
 Use these methods for health endpoints, diagnostics views, and lightweight observability bridges.
+
+## Connection Retry Policy
+
+For transient source connectivity failures, configure `ConnectionRetryPolicy` via
+`RuntimeConfig::with_connection_retry`. The runtime retries only recoverable errors
+(`SourceError`, `TimeoutError`); fatal configuration errors propagate immediately.
+
+```rust
+use cdc_rs::core::ConnectionRetryPolicy;
+
+let policy = ConnectionRetryPolicy {
+    max_retries: Some(5),       // None = retry indefinitely
+    initial_delay_ms: 300,
+    max_delay_ms: 10_000,
+};
+
+let config = config.with_connection_retry(policy);
+```
+
+Defaults: 5 retries, 300 ms initial delay, 10 s cap, truncated exponential backoff.
+Set `max_retries: None` for indefinitely-retrying long-running pipelines.
+
+## Transform Configuration
+
+`FilterProjectionTransform::new(config)` returns `Result<Self>` — configuration
+errors (unknown field names, unsupported operators, wrong token count) are caught at
+construction time rather than silently at apply time.
+
+```rust
+use cdc_rs::transform::{FilterProjectionConfig, FilterProjectionTransform};
+
+let transform = FilterProjectionTransform::new(FilterProjectionConfig {
+    filter_expr: Some("op == 'insert'".into()),
+    include_columns: Some(vec!["id".into(), "email".into()]),
+    exclude_columns: None,
+})?;  // returns Err(ConfigError) for invalid expressions
+```
 
 ## Related Documentation
 

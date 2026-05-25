@@ -1,8 +1,8 @@
-# WASM Transform SDK Specification (Phase 2)
+# WASM Transform SDK
 
 ## Scope
-This document defines the Phase 2 contract for running user-provided WASM transforms in cdc-rs.
-The Phase 2 runtime provides a concrete execution engine with static contract validation, lifecycle hooks, memory IO, and timeout/memory guardrails.
+This document defines the contract for running user-provided WASM transforms in cdc-rs.
+The runtime provides a concrete execution engine with static contract validation, lifecycle hooks, memory IO, and timeout/memory guardrails.
 
 ## ABI Contract
 
@@ -24,7 +24,7 @@ Optional:
 - `shutdown() -> i32`
 
 ## Event and Memory Model
-- Event serialization format: JSON in Phase 2.
+- Event serialization format: JSON.
 - Host calls `alloc` to reserve guest memory, then writes serialized bytes into guest linear memory.
 - `transform` input is a pointer/length pair to canonical `Event` JSON.
 - `transform` return semantics:
@@ -45,12 +45,12 @@ Optional:
   - configurable via `WasmConfig.memory_limit_mb`
 - Panics are treated as transform failures and surfaced as runtime errors.
 
-## Performance Targets (Phase 2)
+## Performance Targets
 - Native overhead target: `< 5x`
 - Per-event transform latency target: `< 1ms`
 - Throughput target: `> 1K events/sec per transform instance`
 
-## Rust API Reference (Phase 2)
+## Rust API Reference
 Implemented in [src/wasm/runtime.rs](../src/wasm/runtime.rs):
 - `WasmRuntime`
   - `new(wasm_module_path: &str) -> Result<Self>`
@@ -112,6 +112,6 @@ rustup target add wasm32-unknown-unknown
 cargo build --release --target wasm32-unknown-unknown
 ```
 
-## Phase 2 Non-Goals
+## Non-Goals
 - No full WASI runtime integration.
 - No cross-module orchestration.

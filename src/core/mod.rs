@@ -24,8 +24,9 @@ pub use observability::{EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetr
 #[cfg(feature = "metrics")]
 pub use otel::{MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord};
 pub use runtime::{
-    AckToken, CdcRuntime, EventBatch, IdempotencyOptions, RuntimeAdminSnapshot, RuntimeConfig,
-    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
+    AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, IdempotencyOptions,
+    RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig,
+    RuntimeState, TransformErrorPolicy,
 };
 pub use transport::TransportConfig;
 pub use secret::{SecretProvider, SecretString};

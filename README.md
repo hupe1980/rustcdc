@@ -154,6 +154,36 @@ let config = config.with_post_commit_source_confirm_policy(
 );
 ```
 
+## TRUNCATE Event Support
+
+PostgreSQL `TRUNCATE` statements are surfaced as `Operation::Truncate` events. `before` and `after` are both `None` for truncate events. Connectors that support truncate events advertise `ConnectorCapabilities::truncate`.
+
+## Connection Retry 🔄
+
+Configure `ConnectionRetryPolicy` for automatic reconnection on transient source failures:
+
+```rust
+use cdc_rs::core::ConnectionRetryPolicy;
+
+let config = config.with_connection_retry(ConnectionRetryPolicy {
+    max_retries: Some(5),    // None = retry indefinitely
+    initial_delay_ms: 300,
+    max_delay_ms: 10_000,
+});
+```
+
+Only recoverable errors (`SourceError`, `TimeoutError`) trigger retry. Fatal errors propagate immediately.
+
+## Transport Configuration 🔒
+
+All connectors default to TLS. For trusted private networks or local testing only, use the explicit plaintext escape hatch:
+
+```rust
+use cdc_rs::TransportConfig;
+
+let transport = TransportConfig::plaintext(); // ⚠️ never use in production
+```
+
 ## PostgreSQL Example 🐘
 
 Build and run the PostgreSQL example:

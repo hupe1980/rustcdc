@@ -1,6 +1,6 @@
 # cdc-rs Troubleshooting Guide
 
-**Version:** Phase 1 (v0.1+)  
+**Version:** v0.1+  
 **Audience:** Operators and developers debugging cdc-rs issues
 
 ---
@@ -368,7 +368,7 @@ WARNING snapshot progress: 5% complete (10 hours in, estimated 200 hours remaini
 | Table too large to snapshot | 1. Reduce `snapshot_tables` list; 2. Increase `snapshot_chunk_size` (e.g., 10K → 50K); 3. Add index on clustering key |
 | Source DB query slow | Add index on clustering/primary key; schedule snapshot during low-activity window |
 | Network bandwidth limited | Verify network bandwidth (iperf); consider moving cdc-rs to same datacenter |
-| cdc-rs CPU bottleneck | Increase parallelism (if available in Phase 2+); scale cdc-rs instance |
+| cdc-rs CPU bottleneck | Scale to additional cdc-rs instances; profile hot path in transform pipeline |
 
 ---
 
@@ -588,6 +588,6 @@ curl -v http://localhost:8080/health
 
 ---
 
-**Last Updated:** May 16, 2026  
-**Version:** Phase 1 Troubleshooting Guide (v0.1+)  
+**Last Updated:** May 25, 2026  
+**Version:** Troubleshooting Guide v0.1+  
 **Contributing:** Found a new troubleshooting scenario? File an issue on GitHub!

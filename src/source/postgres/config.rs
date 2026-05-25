@@ -120,25 +120,26 @@ impl PostgresSourceConfig {
             )));
         }
 
-        let TransportConfig::Tls { ca_cert_path } = &self.transport;
-        #[cfg(not(feature = "tls"))]
-        {
-            let _ = ca_cert_path;
-            return Err(Error::ConfigError(
-                "postgres connector requires crate feature 'tls' for TLS transport".into(),
-            ));
-        }
+        if let TransportConfig::Tls { ca_cert_path } = &self.transport {
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = ca_cert_path;
+                return Err(Error::ConfigError(
+                    "postgres connector requires crate feature 'tls' for TLS transport".into(),
+                ));
+            }
 
-        #[cfg(feature = "tls")]
-        if let Some(ca_path) = ca_cert_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        {
-            if !Path::new(ca_path).exists() {
-                return Err(Error::ConfigError(format!(
-                    "postgres tls_ca_cert_path does not exist: {ca_path}"
-                )));
+            #[cfg(feature = "tls")]
+            if let Some(ca_path) = ca_cert_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            {
+                if !Path::new(ca_path).exists() {
+                    return Err(Error::ConfigError(format!(
+                        "postgres tls_ca_cert_path does not exist: {ca_path}"
+                    )));
+                }
             }
         }
         Ok(())

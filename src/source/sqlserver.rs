@@ -1137,6 +1137,7 @@ impl Source for SqlServerConnection {
             heartbeat: true,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
+            truncate: false,
         }
     }
 }

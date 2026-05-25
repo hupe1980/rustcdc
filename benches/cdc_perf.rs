@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use cdc_rs::transform::{Transform, TransformPipeline};
-use cdc_rs::{Event, Operation, SnapshotValidator, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use cdc_rs::{Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime, EVENT_ENVELOPE_VERSION};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 use std::hint::black_box;
@@ -321,5 +321,113 @@ fn bench_utility(c: &mut Criterion) {
     bench_transform_pipeline(c);
 }
 
-criterion_group!(cdc_perf, bench_full_quality_suite, bench_utility);
+/// Compile a WAT text fixture to an in-memory WASM module bytes.
+fn compile_wat(name: &str) -> Vec<u8> {
+    let wat_path = std::path::Path::new("fixtures/wasm").join(name);
+    let wat_src = std::fs::read_to_string(&wat_path)
+        .unwrap_or_else(|_| panic!("read wat fixture: {}", wat_path.display()));
+    wat::parse_str(&wat_src).expect("compile wat fixture")
+}
+
+/// Write WASM bytes to a tempfile and return the path.
+/// The file must outlive the benchmark; callers keep it alive via a named binding.
+fn wasm_tempfile(wasm: &[u8]) -> tempfile::NamedTempFile {
+    let file = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("create temp wasm file");
+    std::fs::write(file.path(), wasm).expect("write wasm fixture");
+    file
+}
+
+/// Benchmark the WASM pass-through transform (event in → same event out).
+/// Documents per-invocation overhead against the <1ms target in docs/wasm_transform_sdk.md.
+fn bench_wasm_transform_pass_through(c: &mut Criterion) {
+    let wasm_bytes = compile_wat("pass_through.wat");
+    let wasm_file = wasm_tempfile(&wasm_bytes);
+
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let mut runtime = rt
+        .block_on(async {
+            let mut r = WasmRuntime::new_with_config(WasmConfig {
+                module_path: wasm_file.path().to_path_buf(),
+                timeout_ms: 50,
+                memory_limit_mb: 16,
+            })
+            .expect("create wasm runtime");
+            r.init().await.expect("init wasm runtime");
+            r
+        });
+
+    let event = build_event(1);
+
+    let mut group = c.benchmark_group("wasm_transform");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("pass_through_single_event", |b| {
+        b.iter(|| {
+            rt.block_on(runtime.transform(black_box(&event)))
+                .expect("wasm transform")
+        })
+    });
+
+    // 100-event batch: measures per-batch overhead and wasmtime epoch reset amortisation.
+    let events: Vec<Event> = (1..=100).map(build_event).collect();
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("pass_through_100_events", |b| {
+        b.iter(|| {
+            for e in black_box(&events) {
+                rt.block_on(runtime.transform(e)).expect("wasm transform");
+            }
+        })
+    });
+
+    group.finish();
+    // Keep the tempfile alive until after the benchmark.
+    let _ = wasm_file;
+}
+
+/// Benchmark the WASM filter-all transform (every event is dropped).
+/// Measures the fast-path overhead of a WASM transform that returns None.
+fn bench_wasm_transform_filter_all(c: &mut Criterion) {
+    let wasm_bytes = compile_wat("filter_out_all.wat");
+    let wasm_file = wasm_tempfile(&wasm_bytes);
+
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let mut runtime = rt.block_on(async {
+        let mut r = WasmRuntime::new_with_config(WasmConfig {
+            module_path: wasm_file.path().to_path_buf(),
+            timeout_ms: 50,
+            memory_limit_mb: 16,
+        })
+        .expect("create wasm runtime");
+        r.init().await.expect("init wasm runtime");
+        r
+    });
+
+    let event = build_event(1);
+
+    c.bench_function("wasm_filter_all_single_event", |b| {
+        b.iter(|| {
+            rt.block_on(runtime.transform(black_box(&event)))
+                .expect("wasm transform filter")
+        })
+    });
+
+    let _ = wasm_file;
+}
+
+fn bench_wasm_suite(c: &mut Criterion) {
+    bench_wasm_transform_pass_through(c);
+    bench_wasm_transform_filter_all(c);
+}
+
+criterion_group!(cdc_perf, bench_full_quality_suite, bench_utility, bench_wasm_suite);
 criterion_main!(cdc_perf);

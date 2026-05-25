@@ -914,46 +914,66 @@ impl PostgresConnection {
             }
         }
 
-        let TransportConfig::Tls { ca_cert_path } = &self.config.transport;
-        #[cfg(not(feature = "tls"))]
-        {
-            let _ = ca_cert_path;
-            return Err(Error::ConfigError(
-                "postgres connector requires crate feature 'tls' for TLS transport"
-                    .into(),
-            ));
-        }
+        let connect_result: Result<()> = match &self.config.transport {
+            TransportConfig::Plaintext => {
+                let connect_config = self.config.build_connect_config()?;
+                let (client, connection) = connect_config
+                    .connect(tokio_postgres::NoTls)
+                    .await
+                    .map_err(|error| Error::SourceError(format!("postgres plaintext connection failed: {error}")))?;
+                let connection_task = tokio::spawn(run_connection_task(connection));
+                self.validate_connected_client(&client).await?;
+                let client = Arc::new(client);
+                let heartbeat_task = self.start_heartbeat(client.clone());
+                let mut state = self.state.lock().await;
+                state.client = Some(client);
+                state.connection_task = Some(connection_task);
+                state.heartbeat_task = Some(heartbeat_task);
+                Ok(())
+            }
+            TransportConfig::Tls { ca_cert_path } => {
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = ca_cert_path;
+                    return Err(Error::ConfigError(
+                        "postgres connector requires crate feature 'tls' for TLS transport"
+                            .into(),
+                    ));
+                }
 
-        #[cfg(feature = "tls")]
-        {
-            use tokio_postgres_rustls::MakeRustlsConnect;
+                #[cfg(feature = "tls")]
+                {
+                    use tokio_postgres_rustls::MakeRustlsConnect;
 
-            // Build root cert store: load from file if provided, else use system roots.
-            let root_store = build_tls_root_store(ca_cert_path.as_deref())?;
+                    // Build root cert store: load from file if provided, else use system roots.
+                    let root_store = build_tls_root_store(ca_cert_path.as_deref())?;
 
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
+                    let tls_config = rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth();
 
-            let tls_connector = MakeRustlsConnect::new(tls_config);
-            let connect_config = self.config.build_connect_config()?;
-            let (client, connection) = connect_config
-                .connect(tls_connector)
-                .await
-                .map_err(|error| Error::SourceError(format!("postgres tls connection failed: {error}")))?;
+                    let tls_connector = MakeRustlsConnect::new(tls_config);
+                    let connect_config = self.config.build_connect_config()?;
+                    let (client, connection) = connect_config
+                        .connect(tls_connector)
+                        .await
+                        .map_err(|error| Error::SourceError(format!("postgres tls connection failed: {error}")))?;
 
-            let connection_task = tokio::spawn(run_connection_task(connection));
-            self.validate_connected_client(&client).await?;
-            let client = Arc::new(client);
-            let heartbeat_task = self.start_heartbeat(client.clone());
+                    let connection_task = tokio::spawn(run_connection_task(connection));
+                    self.validate_connected_client(&client).await?;
+                    let client = Arc::new(client);
+                    let heartbeat_task = self.start_heartbeat(client.clone());
 
-            let mut state = self.state.lock().await;
-            state.client = Some(client);
-            state.connection_task = Some(connection_task);
-            state.heartbeat_task = Some(heartbeat_task);
-            self.logger.source_connected();
-            Ok(())
-        }
+                    let mut state = self.state.lock().await;
+                    state.client = Some(client);
+                    state.connection_task = Some(connection_task);
+                    state.heartbeat_task = Some(heartbeat_task);
+                    Ok(())
+                }
+            }
+        };
+        connect_result.inspect(|_| self.logger.source_connected())?;
+        Ok(())
     }
 
     pub async fn close(&self) {
@@ -1087,6 +1107,7 @@ impl Source for PostgresConnection {
             heartbeat: true,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
+            truncate: true,
         }
     }
 }

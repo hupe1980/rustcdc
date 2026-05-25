@@ -258,12 +258,40 @@ impl FileCheckpoint {
                 let existing_pid = fs::read_to_string(&lock_path)
                     .ok()
                     .and_then(|contents| Self::parse_lease_pid(&contents));
-                if existing_pid != Some(owner_pid) {
-                    return Err(crate::core::Error::CheckpointError(format!(
-                        "checkpoint owner lease conflict for '{}': lock owned by pid {:?}. use a dedicated checkpoint directory per runtime process",
-                        self.checkpoint_dir.display(),
-                        existing_pid
-                    )));
+
+                match existing_pid {
+                    Some(pid) if pid == owner_pid => {
+                        // Current process already owns the lease (e.g., after a re-open).
+                    }
+                    Some(pid) if !Self::is_pid_alive(pid) => {
+                        // The previous owner process is dead; clear the stale lease and
+                        // take ownership. This eliminates manual recovery after crashes.
+                        tracing::warn!(
+                            target: "cdc_rs::checkpoint",
+                            checkpoint_dir = %self.checkpoint_dir.display(),
+                            stale_owner_pid = pid,
+                            "clearing stale checkpoint owner lease left by dead process"
+                        );
+                        let _ = fs::remove_file(&lock_path);
+                        let mut lock_file = OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .open(&lock_path)
+                            .map_err(crate::core::Error::from)?;
+                        self.write_permissions(&lock_file)?;
+                        lock_file
+                            .write_all(owner_pid.to_string().as_bytes())
+                            .map_err(crate::core::Error::from)?;
+                        lock_file.sync_all().map_err(crate::core::Error::from)?;
+                    }
+                    _ => {
+                        return Err(crate::core::Error::CheckpointError(format!(
+                            "checkpoint owner lease conflict for '{}': lock owned by pid {:?}. \
+                             use a dedicated checkpoint directory per runtime process",
+                            self.checkpoint_dir.display(),
+                            existing_pid
+                        )));
+                    }
                 }
             }
             Err(error) => return Err(crate::core::Error::from(error)),
@@ -272,6 +300,34 @@ impl FileCheckpoint {
         Self::increment_lease_ref(&lock_path);
         *lease = Some(FileCheckpointLease { lock_path });
         Ok(())
+    }
+
+    /// Check whether a process with the given PID is currently alive.
+    ///
+    /// Uses `ps -p <pid>` which exits 0 when the PID exists (regardless of
+    /// permissions to signal it) and exits non-zero when the PID is absent.
+    /// This correctly distinguishes ESRCH (dead) from EPERM (alive but
+    /// unowned) — unlike `kill -0` which returns non-zero for both.
+    ///
+    /// On non-Unix platforms, conservatively returns `true` to avoid
+    /// accidentally clearing leases held by live processes.
+    fn is_pid_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("ps")
+                .args(["-p", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(true) // conservatively assume alive on error
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true // cannot check without platform API; conserve existing behavior
+        }
     }
 
     fn checkpoint_path(&self, source_type: &str) -> PathBuf {
@@ -363,11 +419,37 @@ impl FileCheckpoint {
     }
 
     fn read_record(path: &Path) -> Result<FileCheckpointRecord> {
+        Self::check_file_permissions(path)?;
         let record: FileCheckpointRecord =
             serde_json::from_slice(&fs::read(path).map_err(crate::core::Error::from)?)
                 .map_err(crate::core::Error::from)?;
         Self::validate_record_version(path, &record)?;
         Ok(record)
+    }
+
+    /// Reject checkpoint files that are readable or writable by group/other.
+    ///
+    /// If permissions cannot be read (e.g., non-Unix platform) this is a no-op.
+    fn check_file_permissions(path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(path).map_err(crate::core::Error::from)?;
+            let mode = meta.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(crate::core::Error::CheckpointError(format!(
+                    "checkpoint file '{}' has insecure permissions {:04o}; \
+                     expected 0600 (no access for group/other). \
+                     Run: chmod 600 {}",
+                    path.display(),
+                    mode,
+                    path.display(),
+                )));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
     }
 
     fn validate_record_version(path: &Path, record: &FileCheckpointRecord) -> Result<()> {
@@ -625,6 +707,12 @@ mod tests {
         let checkpoint = FileCheckpoint::new(dir.path());
         let path = dir.path().join("checkpoint_postgres.json");
         std::fs::write(&path, b"{not-json").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
 
         let error = checkpoint.load().await.unwrap_err();
         assert!(matches!(error, crate::core::Error::SerializationError(_)));
@@ -698,8 +786,20 @@ mod tests {
             serde_json::to_vec(&snapshot_record).unwrap(),
         )
         .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &snapshot_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         std::fs::write(&stream_path, serde_json::to_vec(&stream_record).unwrap()).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &stream_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
 
         let loaded = checkpoint.load().await.unwrap().unwrap();
         assert_eq!(loaded.source_type(), "postgres");
@@ -741,6 +841,12 @@ mod tests {
             }
         });
         std::fs::write(&path, serde_json::to_vec(&missing_version_payload).unwrap()).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
 
         let error = checkpoint.load().await.unwrap_err();
         assert!(matches!(error, crate::core::Error::SerializationError(_)));
@@ -825,15 +931,43 @@ mod tests {
         assert!(matches!(error, crate::core::Error::CheckpointError(_)));
     }
 
+    /// PID 1 (init/launchd) is always alive on Unix; a lease file claiming
+    /// ownership by PID 1 should trigger a conflict error because the process
+    /// is running and the current process is not PID 1.
     #[tokio::test]
-    async fn file_checkpoint_rejects_owner_lease_conflict_from_other_pid() {
+    #[cfg(unix)]
+    async fn file_checkpoint_rejects_owner_lease_conflict_from_live_pid() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join(FileCheckpoint::OWNER_LEASE_FILENAME);
-        std::fs::write(&lock_path, b"999999").unwrap();
+        // PID 1 (init/launchd) is always alive.
+        std::fs::write(&lock_path, b"1").unwrap();
 
         let checkpoint = FileCheckpoint::new(dir.path());
         let error = checkpoint.get_committed_count().await.unwrap_err();
         assert!(matches!(error, crate::core::Error::CheckpointError(_)));
+    }
+
+    /// A lease file claiming ownership by a PID that no longer exists should
+    /// be auto-cleared so the new process can start without manual intervention.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn file_checkpoint_recovers_from_stale_owner_lease_of_dead_process() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join(FileCheckpoint::OWNER_LEASE_FILENAME);
+        // PID u32::MAX is extremely unlikely to be alive.
+        std::fs::write(&lock_path, u32::MAX.to_string().as_bytes()).unwrap();
+
+        let checkpoint = FileCheckpoint::new(dir.path());
+        // Should succeed: stale lease auto-cleared.
+        let count = checkpoint.get_committed_count().await.unwrap();
+        assert_eq!(count, 0);
+        // Lock file should now belong to the current process.
+        let new_pid: u32 = std::fs::read_to_string(&lock_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(new_pid, std::process::id());
     }
 
     #[tokio::test]

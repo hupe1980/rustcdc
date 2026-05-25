@@ -9,6 +9,15 @@ pub enum TransportConfig {
 		/// Optional PEM-encoded CA certificate file used to verify the server.
 		ca_cert_path: Option<String>,
 	},
+	/// Use plaintext (unencrypted) transport.
+	///
+	/// # Security Warning
+	///
+	/// Plaintext transport transmits credentials and data in the clear.
+	/// Only use this for localhost or fully-trusted private-network deployments
+	/// (e.g., VPC-internal clusters) where all traffic is already isolated.
+	/// Do **not** use plaintext over public or shared networks.
+	Plaintext,
 }
 
 impl Default for TransportConfig {
@@ -30,6 +39,13 @@ impl TransportConfig {
 		Self::Tls { ca_cert_path }
 	}
 
+	/// Construct a plaintext (unencrypted) transport configuration.
+	///
+	/// See the [`TransportConfig::Plaintext`] variant for security guidance.
+	pub const fn plaintext() -> Self {
+		Self::Plaintext
+	}
+
 	/// Return true when TLS transport is configured.
 	pub const fn is_tls(&self) -> bool {
 		matches!(self, Self::Tls { .. })
@@ -41,7 +57,7 @@ impl TransportConfig {
 			Self::Tls {
 				ca_cert_path: Some(path),
 			} => Some(path.as_str()),
-			Self::Tls { .. } => None,
+			_ => None,
 		}
 	}
 }

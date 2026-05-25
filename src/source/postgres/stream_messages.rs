@@ -5,9 +5,11 @@ use crate::{
     source::helpers::now_millis,
 };
 
-use super::{
+use super::
+{
     decode_pgoutput_message, format_pg_lsn, pg_timestamp_to_millis, PgDelete, PgInsert,
-    PgOutputMessage, PgOutputXLogData, PgRelation, PgUpdate, PgValue, PostgresStreamHandle,
+    PgOutputMessage, PgOutputXLogData, PgRelation, PgTruncate, PgUpdate, PgValue,
+    PostgresStreamHandle,
 };
 
 impl PostgresStreamHandle {
@@ -158,6 +160,26 @@ impl PostgresStreamHandle {
         })
     }
 
+    fn build_truncate_events(&self, truncate: &PgTruncate, lsn: u64) -> Vec<Event> {
+        truncate
+            .relation_oids
+            .iter()
+            .map(|&oid| Event {
+                before: None,
+                after: None,
+                op: Operation::Truncate,
+                source: self.source_meta(lsn),
+                ts: self.current_commit_ts,
+                schema: self.relation_schema(oid),
+                table: self.relation_table_name(oid),
+                primary_key: None,
+                snapshot: None,
+                transaction: self.tx_meta(),
+                envelope_version: EVENT_ENVELOPE_VERSION,
+            })
+            .collect()
+    }
+
     fn relation_to_table_schema(relation: &PgRelation) -> TableSchema {
         let primary_keys: Vec<String> = relation
             .columns
@@ -275,7 +297,11 @@ impl PostgresStreamHandle {
                         self.partial_tx_events.push(event);
                     }
                 }
-                PgOutputMessage::Truncate(_) | PgOutputMessage::Unknown(_) => {}
+                PgOutputMessage::Truncate(truncate) => {
+                    let events = self.build_truncate_events(&truncate, item.lsn);
+                    self.partial_tx_events.extend(events);
+                }
+                PgOutputMessage::Unknown(_) => {}
             }
         }
         Ok(committed)
