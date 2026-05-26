@@ -294,6 +294,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
+      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -312,20 +313,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration'
-        run: cargo test --test ${{ matrix.suite }} --features sqlserver
+        run: cargo test --test ${{ matrix.suite }} --features sqlserver,insecure-test-overrides
       - name: cargo test --test runtime_sqlserver_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_sqlserver_process_crash_integration'
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
+        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,insecure-test-overrides --bins
 
   integration-sqlserver-encryption:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
+      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
+      - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption,insecure-test-overrides --bins
+        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption,insecure-test-overrides --bins

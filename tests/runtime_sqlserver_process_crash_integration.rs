@@ -404,7 +404,7 @@ fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
             return Ok(candidate);
         }
 
-        build_xtask_worker("sqlserver_crash_worker", "sqlserver")?;
+        build_xtask_worker("sqlserver_crash_worker", "sqlserver,insecure-test-overrides")?;
         if candidate.exists() {
             return Ok(candidate);
         }
