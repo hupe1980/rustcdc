@@ -122,7 +122,7 @@ enum Phase {
 
 /// Non-blocking incremental snapshot handle for MySQL.
 ///
-/// Returned by [`MysqlConnection::start_incremental_snapshot`].  Wraps the live
+/// Returned by `MysqlConnection::start_incremental_snapshot`. Wraps the live
 /// binlog stream and interleaves DBLog watermark-based chunk reads.
 pub struct MysqlIncrementalSnapshotHandle {
     inner: Box<dyn StreamHandle>,

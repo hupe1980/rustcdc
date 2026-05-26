@@ -88,7 +88,7 @@ enum Phase {
 /// A [`StreamHandle`] that interleaves per-table chunk reads with the live
 /// replication stream using the DBLog watermark pattern.
 ///
-/// Obtain an instance via [`PostgresConnection::start_incremental_snapshot`].
+/// Obtain an instance via `PostgresConnection::start_incremental_snapshot`.
 pub struct IncrementalSnapshotHandle {
     inner: Box<dyn StreamHandle>,
     /// Separate regular (non-replication) connection used for chunk SELECT queries

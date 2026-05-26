@@ -201,7 +201,7 @@ pub struct ProtoEvent {
 }
 
 impl ProtoEvent {
-    /// Convert a [`rustcdc::core::Event`] into its protobuf representation.
+    /// Convert a [`crate::core::Event`] into its protobuf representation.
     pub fn from_event(event: &Event) -> Result<Self> {
         let before = event
             .before

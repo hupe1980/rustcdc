@@ -10,7 +10,7 @@
 //!
 //! [`JsonFixture`] loads newline-delimited JSON event files from disk (e.g. the
 //! fixtures in `fixtures/`).  [`ReplayRunner`] feeds them through a
-//! [`CdcRuntime`](crate::core::CdcRuntime) and collects the output.
+//! [`CdcRuntime`] and collects the output.
 //!
 //! # Conformance suites
 //!

@@ -76,9 +76,9 @@ pub struct HandoffResult {
 
 /// Configuration for incremental (non-blocking) snapshot using the DBLog watermark pattern.
 ///
-/// Used by [`PostgresConnection::start_incremental_snapshot`],
-/// [`MysqlConnection::start_incremental_snapshot`], and
-/// [`SqlServerConnection::start_incremental_snapshot`].
+/// Used by `PostgresConnection::start_incremental_snapshot`,
+/// `MysqlConnection::start_incremental_snapshot`, and
+/// `SqlServerConnection::start_incremental_snapshot`.
 ///
 /// Unlike the blocking bulk snapshot, incremental snapshotting interleaves chunk reads
 /// with the live replication stream. The stream never pauses, no long-held
@@ -125,7 +125,7 @@ pub struct ConnectorCapabilities {
     /// [`crate::core::Operation::Truncate`] events.
     pub truncate: bool,
     /// Whether the connector supports non-blocking incremental snapshot via the
-    /// DBLog watermark pattern ([`PostgresConnection::start_incremental_snapshot`]).
+    /// DBLog watermark pattern (`PostgresConnection::start_incremental_snapshot`).
     pub incremental_snapshot: bool,
 }
 

@@ -7,9 +7,9 @@
 //! |---|---|---|
 //! | [`JsonEncoder`] | *(always available)* | `application/json` |
 //! | [`JsonPrettyEncoder`] | *(always available)* | `application/json` |
-//! | [`CloudEventsEncoder`] | `cloudevents` | `application/cloudevents+json` |
-//! | [`ProtobufEncoder`] | `protobuf` | `application/x-protobuf` |
-//! | [`AvroEncoder`] | `avro` | `avro/binary` |
+//! | `CloudEventsEncoder` | `cloudevents` | `application/cloudevents+json` |
+//! | `ProtobufEncoder` | `protobuf` | `application/x-protobuf` |
+//! | `AvroEncoder` | `avro` | `avro/binary` |
 //!
 //! # Usage
 //!

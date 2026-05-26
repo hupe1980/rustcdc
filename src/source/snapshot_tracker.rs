@@ -5,7 +5,8 @@
 //! snapshot workers. It does **not** execute snapshot queries itself; connector
 //! snapshots are sequential by default. Embedders that need true parallel snapshot
 //! execution must manage their own connection pool and call
-//! [`SnapshotProgressTracker::record_chunk_progress`] / [`record_chunk_events`] as
+//! [`SnapshotProgressTracker::record_chunk_progress`] /
+//! [`SnapshotProgressTracker::record_chunk_events`] as
 //! each worker completes a chunk.
 //!
 //! For the state-of-the-art approach to non-blocking snapshot, see the roadmap item

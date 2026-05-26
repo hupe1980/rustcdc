@@ -149,7 +149,7 @@ enum Phase {
 
 /// Non-blocking incremental snapshot handle for SQL Server.
 ///
-/// Returned by [`SqlServerConnection::start_incremental_snapshot`].
+/// Returned by `SqlServerConnection::start_incremental_snapshot`.
 pub struct SqlServerIncrementalSnapshotHandle {
     inner: Box<dyn StreamHandle>,
     /// Dedicated READ COMMITTED connection used for watermark queries and chunk SELECTs.

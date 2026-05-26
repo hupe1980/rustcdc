@@ -36,7 +36,7 @@ pub trait SinkAdapter: Send {
     async fn flush(&mut self) -> Result<()>;
 
     /// Perform an orderly close of the adapter.  Subsequent calls to [`send`] or
-    /// [`flush`] should return an error once the adapter is closed.
+    /// [`flush`](SinkAdapter::flush) should return an error once the adapter is closed.
     ///
     /// [`send`]: SinkAdapter::send
     async fn close(&mut self) -> Result<()>;

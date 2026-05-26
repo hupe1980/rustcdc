@@ -79,8 +79,10 @@ jobs:
         run: cargo fmt --check
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: cargo doc --no-deps
-        run: cargo doc --no-deps
+      - name: cargo doc --all-features --no-deps
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
   docs-link-check:
     runs-on: ubuntu-latest
