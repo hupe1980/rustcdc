@@ -14,7 +14,7 @@ const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
 const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
 
-fn allow_insecure_test_transport() -> bool {
+fn insecure_test_override_enabled() -> bool {
     #[cfg(feature = "insecure-test-overrides")]
     {
         std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1")
@@ -24,6 +24,10 @@ fn allow_insecure_test_transport() -> bool {
     {
         false
     }
+}
+
+fn allow_insecure_test_transport() -> bool {
+    insecure_test_override_enabled()
 }
 
 impl fmt::Debug for MysqlSourceConfig {
@@ -207,8 +211,7 @@ impl MysqlSourceConfig {
 
         // Local integration containers often use ephemeral self-signed certs.
         // Keep secure defaults. Explicit test overrides require compile-time opt-in.
-        #[cfg(feature = "insecure-test-overrides")]
-        if std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TLS").as_deref() == Ok("1") {
+        if insecure_test_override_enabled() {
             ssl_opts = ssl_opts
                 .with_danger_accept_invalid_certs(true)
                 .with_danger_skip_domain_validation(true);

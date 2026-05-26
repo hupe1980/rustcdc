@@ -30,7 +30,7 @@ Default profile enables `postgres` + `tls`.
 - `--features outbox`: enables outbox helpers and transforms
 - `--features encryption`: enables encryption-oriented transforms and helpers
 - `--features metrics`: enables OpenTelemetry metrics/tracing integrations
-- `--features insecure-test-overrides`: enables opt-in insecure connector test toggles (`CDC_RS_ALLOW_INSECURE_TEST_TLS`, `CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT`) for local integration evidence only; do not enable in production
+- `--features insecure-test-overrides`: enables opt-in insecure connector test toggle (`CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT`) for local integration evidence only; do not enable in production.
 - `--no-default-features`: foundation-only validation without source connectors
 - `--all-features`: validates the full additive feature surface
 

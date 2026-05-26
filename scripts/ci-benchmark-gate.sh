@@ -236,6 +236,12 @@ run_bench() {
   local bench_name="$1"
   local out_file="$2"
   local baseline_args=()
+  local cargo_args=(
+    cargo bench --bench "$bench_name" --
+    --sample-size "$bench_sample_size"
+    --measurement-time "$bench_measurement_secs"
+    --warm-up-time "$bench_warm_up_secs"
+  )
   # When CRITERION_BASELINE is set, compare against a saved Criterion baseline
   # instead of the previous run. Use BENCHMARK_SAVE_BASELINE to persist a new
   # named baseline (e.g. for updating the CI reference point).
@@ -245,11 +251,11 @@ run_bench() {
   if [[ -n "${BENCHMARK_SAVE_BASELINE:-}" ]]; then
     baseline_args+=(--save-baseline "$BENCHMARK_SAVE_BASELINE")
   fi
-  cargo bench --bench "$bench_name" -- \
-    --sample-size "$bench_sample_size" \
-    --measurement-time "$bench_measurement_secs" \
-    --warm-up-time "$bench_warm_up_secs" \
-    "${baseline_args[@]}" | tee "$out_file"
+  if (( ${#baseline_args[@]} > 0 )); then
+    cargo_args+=("${baseline_args[@]}")
+  fi
+
+  "${cargo_args[@]}" | tee "$out_file"
 }
 
 run_preheat() {

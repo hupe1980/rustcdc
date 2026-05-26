@@ -233,7 +233,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TLS: "1"
       CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     strategy:
       fail-fast: false
@@ -263,7 +262,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TLS: "1"
       CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     steps:
       - uses: actions/checkout@v4
@@ -278,7 +276,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TLS: "1"
       CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     strategy:
       fail-fast: false

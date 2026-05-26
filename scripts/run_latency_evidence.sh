@@ -10,7 +10,6 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 export CDC_RS_RUN_DOCKER_TESTS=1
-export CDC_RS_ALLOW_INSECURE_TEST_TLS=1
 export CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT=1
 
 report_path="target/latency-evidence.txt"

@@ -417,7 +417,6 @@ fn spawn_crash_worker(
         .env("CDC_RS_WORKER_SERVER_ID", server_id.to_string())
         .env("CDC_RS_WORKER_CHECKPOINT_DIR", checkpoint_dir)
         .env("CDC_RS_WORKER_MARKER_FILE", marker_file)
-        .env("CDC_RS_ALLOW_INSECURE_TEST_TLS", "1")
         .env("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT", "1")
         .env(
             "CDC_RS_WORKER_ACK_FIRST_BATCH",
