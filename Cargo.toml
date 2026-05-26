@@ -10,7 +10,7 @@ repository   = "https://github.com/hupe1980/rustcdc"
 homepage     = "https://github.com/hupe1980/rustcdc"
 documentation = "https://docs.rs/rustcdc"
 readme       = "README.md"
-keywords     = ["cdc", "change-data-capture", "postgres", "mysql", "mariadb", "mssql"]
+keywords     = ["cdc", "change-data-capture"]
 categories   = ["database", "asynchronous", "data-structures"]
 
 [workspace]
