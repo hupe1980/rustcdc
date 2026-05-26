@@ -149,10 +149,10 @@ fn payload_contains_required_hierarchy_and_retry(payload: &Value) -> bool {
         handoff_stream_ok |= child_relation_exists(spans, "cdc.handoff", "cdc.stream");
 
         for span in spans {
-            if !span
+            if span
                 .get("operationName")
                 .and_then(Value::as_str)
-                .is_some_and(|name| name == "cdc.event.transform")
+                .is_none_or(|name| name != "cdc.event.transform")
             {
                 continue;
             }
@@ -192,10 +192,10 @@ fn child_relation_exists(spans: &[Value], parent_operation: &str, child_operatio
     };
 
     for span in spans {
-        if !span
+        if span
             .get("operationName")
             .and_then(Value::as_str)
-            .is_some_and(|name| name == child_operation)
+            .is_none_or(|name| name != child_operation)
         {
             continue;
         }

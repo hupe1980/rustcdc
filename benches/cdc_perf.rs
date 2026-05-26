@@ -359,7 +359,6 @@ fn bench_wasm_transform_pass_through(c: &mut Criterion) {
             module_path: wasm_file.path().to_path_buf(),
             timeout_ms: 50,
             memory_limit_mb: 16,
-            ..Default::default()
         })
         .expect("create wasm runtime");
         r.init().await.expect("init wasm runtime");
@@ -409,7 +408,6 @@ fn bench_wasm_transform_filter_all(c: &mut Criterion) {
             module_path: wasm_file.path().to_path_buf(),
             timeout_ms: 50,
             memory_limit_mb: 16,
-            ..Default::default()
         })
         .expect("create wasm runtime");
         r.init().await.expect("init wasm runtime");

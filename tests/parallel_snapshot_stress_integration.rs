@@ -34,7 +34,6 @@ fn parallel_snapshot_stress_resume_after_chunk_5_for_10_tables() {
         tables.clone(),
         SnapshotTrackerConfig {
             chunk_size: CHUNK_SIZE,
-            ..Default::default()
         },
     ));
 
@@ -85,7 +84,6 @@ fn parallel_snapshot_stress_resume_after_chunk_5_for_10_tables() {
         tables.clone(),
         SnapshotTrackerConfig {
             chunk_size: CHUNK_SIZE,
-            ..Default::default()
         },
     ));
 

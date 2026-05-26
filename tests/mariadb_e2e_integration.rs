@@ -3,7 +3,7 @@
 use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint},
     source::Source,
-    MariaDbConnection, MariaDbSourceConfig, TransportConfig,
+    MariaDbConnection, MariaDbSourceConfig, MysqlSourceConfig, TransportConfig,
 };
 use std::collections::HashSet;
 use testcontainers::{
@@ -262,22 +262,21 @@ async fn run_mariadb_stream_capture_insert_update_delete(
     .await
     .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let config = {
-        let mut c = MariaDbSourceConfig::default();
-        c.host = host;
-        c.port = port;
-        c.user = "root".to_string();
-        c.password = "rootpass".to_string().into();
-        c.database = "cdc".to_string();
-        c.server_id = server_id;
-        c.gtid_mode_enabled = false;
-        c.binlog_format_check = true;
-        c.transport = TransportConfig::tls();
-        c.conn_timeout_secs = 30;
-        c.stream_poll_interval_ms = 50;
-        c.max_events_per_poll = 1_000;
-        c
-    };
+    let config = MariaDbSourceConfig(MysqlSourceConfig {
+        host,
+        port,
+        user: "root".to_string(),
+        password: "rootpass".to_string().into(),
+        database: "cdc".to_string(),
+        server_id,
+        gtid_mode_enabled: false,
+        binlog_format_check: true,
+        transport: TransportConfig::tls(),
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        ..Default::default()
+    });
 
     let mut connection = MariaDbConnection::new(config.into_inner());
     connection.connect().await?;
@@ -410,22 +409,21 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let config = {
-        let mut c = MariaDbSourceConfig::default();
-        c.host = host;
-        c.port = port;
-        c.user = "root".to_string();
-        c.password = "rootpass".to_string().into();
-        c.database = "cdc".to_string();
-        c.server_id = server_id;
-        c.gtid_mode_enabled = false;
-        c.binlog_format_check = true;
-        c.transport = TransportConfig::tls();
-        c.conn_timeout_secs = 30;
-        c.stream_poll_interval_ms = 50;
-        c.max_events_per_poll = 1_000;
-        c
-    };
+    let config = MariaDbSourceConfig(MysqlSourceConfig {
+        host,
+        port,
+        user: "root".to_string(),
+        password: "rootpass".to_string().into(),
+        database: "cdc".to_string(),
+        server_id,
+        gtid_mode_enabled: false,
+        binlog_format_check: true,
+        transport: TransportConfig::tls(),
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        ..Default::default()
+    });
 
     let mut connection = MariaDbConnection::new(config.clone().into_inner());
     connection.connect().await?;

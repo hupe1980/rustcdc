@@ -1,7 +1,7 @@
 #![cfg(feature = "mariadb")]
 
 use rustcdc::TransportConfig;
-use rustcdc::{MariaDbConnection, MariaDbSourceConfig};
+use rustcdc::{MariaDbConnection, MariaDbSourceConfig, MysqlSourceConfig};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -101,22 +101,21 @@ async fn mariadb_base_config(version: &str, server_id: u32) -> rustcdc::Result<M
 
     Ok(MariadbTestTarget {
         _container: container,
-        config: {
-            let mut cfg = MariaDbSourceConfig::default();
-            cfg.host = host_string;
-            cfg.port = port;
-            cfg.user = "root".to_string();
-            cfg.password = "rootpass".to_string().into();
-            cfg.database = "cdc".to_string();
-            cfg.server_id = server_id;
-            cfg.gtid_mode_enabled = false;
-            cfg.binlog_format_check = true;
-            cfg.transport = TransportConfig::tls();
-            cfg.conn_timeout_secs = CONNECT_TIMEOUT_SECS;
-            cfg.stream_poll_interval_ms = 50;
-            cfg.max_events_per_poll = 1_000;
-            cfg
-        },
+        config: MariaDbSourceConfig(MysqlSourceConfig {
+            host: host_string,
+            port,
+            user: "root".to_string(),
+            password: "rootpass".to_string().into(),
+            database: "cdc".to_string(),
+            server_id,
+            gtid_mode_enabled: false,
+            binlog_format_check: true,
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: CONNECT_TIMEOUT_SECS,
+            stream_poll_interval_ms: 50,
+            max_events_per_poll: 1_000,
+            ..Default::default()
+        }),
     })
 }
 

@@ -56,7 +56,6 @@ async fn build_runtime_with_wasm(
         module_path: wasm_path.as_ref().to_path_buf(),
         timeout_ms: 50,
         memory_limit_mb: 16,
-        ..Default::default()
     })
     .await
     .expect("create wasm transform");

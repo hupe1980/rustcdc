@@ -44,7 +44,6 @@ async fn pass_through_fixture_is_conformant() {
         module_path: wasm_path,
         timeout_ms: 10,
         memory_limit_mb: 16,
-        ..Default::default()
     })
     .expect("create runtime");
 

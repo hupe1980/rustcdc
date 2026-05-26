@@ -99,6 +99,7 @@ async fn main() -> rustcdc::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        ..Default::default()
     };
 
     let mut runtime_config = RuntimeConfig::new(

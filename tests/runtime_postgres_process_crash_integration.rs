@@ -433,6 +433,7 @@ async fn run_postgres_process_kill_replay_scenario(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_crash_worker(
     host: &str,
     port: u16,
