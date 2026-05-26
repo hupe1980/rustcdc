@@ -32,7 +32,8 @@ async fn runtime_postgres_process_kill_replays_uncommitted_batch() -> rustcdc::R
 }
 
 #[tokio::test]
-async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() -> rustcdc::Result<()> {
+async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
+) -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres snapshot crash-resume integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"
@@ -140,12 +141,14 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch() 
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
     let reader_after_worker = FileCheckpoint::new(checkpoint_dir.path());
-    let saved = reader_after_worker
-        .load()
-        .await?
-        .ok_or_else(|| rustcdc::Error::StateError("checkpoint should exist after worker ack".into()))?;
+    let saved = reader_after_worker.load().await?.ok_or_else(|| {
+        rustcdc::Error::StateError("checkpoint should exist after worker ack".into())
+    })?;
     assert_eq!(saved.source_type(), "postgres_snapshot");
-    assert_eq!(reader_after_worker.get_committed_count().await?, marker.events as u64);
+    assert_eq!(
+        reader_after_worker.get_committed_count().await?,
+        marker.events as u64
+    );
 
     admin_client
         .query_one(
@@ -493,15 +496,7 @@ fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
 
 fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
     let status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "xtask",
-            "--bin",
-            bin,
-            "--features",
-            feature,
-        ])
+        .args(["build", "-p", "xtask", "--bin", bin, "--features", feature])
         .status()
         .map_err(rustcdc::Error::IoError)?;
 

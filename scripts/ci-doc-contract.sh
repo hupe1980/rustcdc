@@ -6,11 +6,26 @@ cd "$repo_root"
 
 failures=0
 
+has_rg=0
+if command -v rg >/dev/null 2>&1; then
+  has_rg=1
+fi
+
+match_pattern() {
+  local file="$1"
+  local pattern="$2"
+  if [[ "$has_rg" -eq 1 ]]; then
+    rg -q --pcre2 "$pattern" "$file"
+  else
+    grep -E -q "$pattern" "$file"
+  fi
+}
+
 require_match() {
   local file="$1"
   local pattern="$2"
   local description="$3"
-  if ! rg -q --pcre2 "$pattern" "$file"; then
+  if ! match_pattern "$file" "$pattern"; then
     echo "docs contract check failed: $description ($file)"
     failures=$((failures + 1))
   fi
@@ -20,7 +35,7 @@ forbid_match() {
   local file="$1"
   local pattern="$2"
   local description="$3"
-  if rg -q --pcre2 "$pattern" "$file"; then
+  if match_pattern "$file" "$pattern"; then
     echo "docs contract check failed: $description ($file)"
     failures=$((failures + 1))
   fi
