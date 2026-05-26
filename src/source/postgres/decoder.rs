@@ -469,11 +469,13 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         }
 
         let lsn_text = parser::format_pg_lsn(lsn);
+        let escaped_slot = self.slot_name.replace('\'', "''");
+        let escaped_lsn = lsn_text.replace('\'', "''");
+        let advance_sql = format!(
+            "SELECT 1 FROM pg_replication_slot_advance('{escaped_slot}'::name, '{escaped_lsn}'::pg_lsn)"
+        );
         self.client
-            .query_opt(
-                "SELECT 1 FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
-                &[&self.slot_name, &lsn_text],
-            )
+            .query_opt(&advance_sql, &[])
             .await
             .map_err(|error| {
                 Error::SourceError(format!(
