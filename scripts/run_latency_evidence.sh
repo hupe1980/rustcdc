@@ -10,6 +10,8 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 export CDC_RS_RUN_DOCKER_TESTS=1
+export CDC_RS_ALLOW_INSECURE_TEST_TLS=1
+export CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT=1
 
 report_path="target/latency-evidence.txt"
 mkdir -p target
@@ -27,10 +29,10 @@ run_step "postgres connector latency evidence" \
   cargo test --test postgres_latency_evidence --features postgres -- --nocapture
 
 run_step "mysql connector latency evidence" \
-  cargo test --test mysql_latency_evidence --features mysql -- --nocapture
+  cargo test --test mysql_latency_evidence --features mysql,insecure-test-overrides -- --nocapture
 
 run_step "sqlserver connector latency evidence" \
-  cargo test --test sqlserver_latency_evidence --features sqlserver -- --nocapture
+  cargo test --test sqlserver_latency_evidence --features sqlserver,insecure-test-overrides -- --nocapture
 
 for artifact in target/postgres-latency-evidence.md target/mysql-latency-evidence.md target/sqlserver-latency-evidence.md; do
   if [[ -f "$artifact" ]]; then

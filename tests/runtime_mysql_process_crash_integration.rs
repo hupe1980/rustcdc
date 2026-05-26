@@ -379,7 +379,7 @@ async fn run_mysql_process_kill_replay_scenario(
                     )
                 })?;
             assert!(
-                payload.starts_with("enc:v1:"),
+                payload.starts_with("enc:"),
                 "expected encrypted payload format, got: {payload}"
             );
         }

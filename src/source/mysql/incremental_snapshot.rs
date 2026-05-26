@@ -46,17 +46,27 @@ async fn query_master_status(pool: &MySqlPool) -> Result<BinlogPos> {
             "incremental snapshot: failed to get mysql conn: {e}"
         ))
     })?;
-    let mut row: mysql_async::Row = conn
-        .query_first("SHOW MASTER STATUS")
-        .await
-        .map_err(|e| {
-            Error::SourceError(format!(
-                "incremental snapshot: SHOW MASTER STATUS failed: {e}"
-            ))
-        })?
-        .ok_or_else(|| {
-            Error::SourceError("incremental snapshot: SHOW MASTER STATUS returned no row".into())
-        })?;
+    let mut row: mysql_async::Row = match conn.query_first("SHOW MASTER STATUS").await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Err(Error::SourceError(
+                "incremental snapshot: SHOW MASTER STATUS returned no row".into(),
+            ));
+        }
+        Err(primary_error) => conn
+            .query_first("SHOW BINARY LOG STATUS")
+            .await
+            .map_err(|fallback_error| {
+                Error::SourceError(format!(
+                    "incremental snapshot: failed to read mysql binary log status (SHOW MASTER STATUS error: {primary_error}; SHOW BINARY LOG STATUS error: {fallback_error})"
+                ))
+            })?
+            .ok_or_else(|| {
+                Error::SourceError(
+                    "incremental snapshot: SHOW BINARY LOG STATUS returned no row".into(),
+                )
+            })?,
+    };
     let file: String = row.take(0).unwrap_or_default();
     let pos_u64: u64 = row.take(1).unwrap_or(4);
     let pos = u32::try_from(pos_u64).map_err(|_| {

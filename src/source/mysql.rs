@@ -1189,11 +1189,21 @@ impl ValidationBackend for LiveValidationBackend<'_> {
         let mut conn = self.pool.get_conn().await.map_err(|error| {
             Error::SourceError(format!("failed to query master status: {error}"))
         })?;
-        let mut row: mysql_async::Row = conn
-            .query_first("SHOW MASTER STATUS")
-            .await
-            .map_err(|error| Error::SourceError(format!("failed to query master status: {error}")))?
-            .ok_or_else(|| Error::SourceError("mysql master status unavailable".into()))?;
+        let mut row: mysql_async::Row = match conn.query_first("SHOW MASTER STATUS").await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return Err(Error::SourceError("mysql master status unavailable".into()));
+            }
+            Err(primary_error) => conn
+                .query_first("SHOW BINARY LOG STATUS")
+                .await
+                .map_err(|fallback_error| {
+                    Error::SourceError(format!(
+                        "failed to query mysql binary log status (SHOW MASTER STATUS error: {primary_error}; SHOW BINARY LOG STATUS error: {fallback_error})"
+                    ))
+                })?
+                .ok_or_else(|| Error::SourceError("mysql binary log status unavailable".into()))?,
+        };
         let file: String = row.take(0).unwrap_or_default();
         let pos: u64 = row.take(1).unwrap_or(4);
         Ok((file, pos))

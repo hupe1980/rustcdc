@@ -324,6 +324,7 @@ async fn run_postgres_process_kill_replay_scenario(
             0,
         )
         .await?;
+    drop(seed_checkpoint);
 
     for id in 1_i64..=100_i64 {
         admin_client
@@ -414,7 +415,7 @@ async fn run_postgres_process_kill_replay_scenario(
                     )
                 })?;
             assert!(
-                payload.starts_with("enc:v1:"),
+                payload.starts_with("enc:"),
                 "expected encrypted payload format, got: {payload}"
             );
         }

@@ -26,15 +26,26 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
             ))
         })?;
 
-    let mut master_row: mysql_async::Row = connection
-        .query_first("SHOW MASTER STATUS")
-        .await
-        .map_err(|error| {
-            Error::SourceError(format!(
-                "failed to read mysql master status for snapshot: {error}"
-            ))
-        })?
-        .ok_or_else(|| Error::SourceError("mysql master status unavailable for snapshot".into()))?;
+    let mut master_row: mysql_async::Row = match connection.query_first("SHOW MASTER STATUS").await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Err(Error::SourceError(
+                "mysql master status unavailable for snapshot".into(),
+            ));
+        }
+        Err(primary_error) => connection
+            .query_first("SHOW BINARY LOG STATUS")
+            .await
+            .map_err(|fallback_error| {
+                Error::SourceError(format!(
+                    "failed to read mysql binary log status for snapshot (SHOW MASTER STATUS error: {primary_error}; SHOW BINARY LOG STATUS error: {fallback_error})"
+                ))
+            })?
+            .ok_or_else(|| {
+                Error::SourceError("mysql binary log status unavailable for snapshot".into())
+            })?,
+    };
     let binlog_file: String = master_row.take(0).unwrap_or_default();
     let binlog_pos_u64: u64 = master_row.take(1).unwrap_or(4);
     let binlog_pos = u32::try_from(binlog_pos_u64).map_err(|_| {

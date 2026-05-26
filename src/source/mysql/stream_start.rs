@@ -20,17 +20,27 @@ pub(super) async fn resolve_stream_start_position(
                 "failed to acquire mysql connection for stream: {error}"
             ))
         })?;
-        let mut row: mysql_async::Row = conn
-            .query_first("SHOW MASTER STATUS")
-            .await
-            .map_err(|error| {
-                Error::SourceError(format!(
-                    "failed to read mysql master status for stream start: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Error::SourceError("mysql master status unavailable for stream start".into())
-            })?;
+        let mut row: mysql_async::Row = match conn.query_first("SHOW MASTER STATUS").await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return Err(Error::SourceError(
+                    "mysql master status unavailable for stream start".into(),
+                ));
+            }
+            Err(primary_error) => conn
+                .query_first("SHOW BINARY LOG STATUS")
+                .await
+                .map_err(|fallback_error| {
+                    Error::SourceError(format!(
+                        "failed to read mysql binary log status for stream start (SHOW MASTER STATUS error: {primary_error}; SHOW BINARY LOG STATUS error: {fallback_error})"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    Error::SourceError(
+                        "mysql binary log status unavailable for stream start".into(),
+                    )
+                })?,
+        };
         (row.take(0).unwrap_or_default(), row.take(1).unwrap_or(4))
     };
     let mut gtid: String = {

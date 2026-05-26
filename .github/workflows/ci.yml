@@ -172,7 +172,7 @@ jobs:
           - postgres_snapshot_integration
           - postgres_stream_integration
           - postgres_handoff_integration
-          - postgres_checkpoint_integration
+          - checkpoint_file_integration
           - runtime_postgres_process_crash_integration
           - parallel_snapshot_stress_integration
           - otel_metrics_integration
