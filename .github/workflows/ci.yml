@@ -226,8 +226,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --test ${{ matrix.suite }} --features postgres
-        run: cargo test --test ${{ matrix.suite }} --features postgres
+      - name: cargo test --test ${{ matrix.suite }} --features postgres,test-harnesses
+        run: cargo test --test ${{ matrix.suite }} --features postgres,test-harnesses
 
   integration-mysql:
     runs-on: ubuntu-latest

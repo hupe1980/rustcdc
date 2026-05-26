@@ -18,9 +18,9 @@ use rustcdc::{
     transform::{MaskHashConfig, MaskHashTransform, MaskRule},
 };
 
+mod process_crash_marker;
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;
-mod process_crash_marker;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
 
 type SqlClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
@@ -109,7 +109,11 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    sql_exec(&mut admin, "USE rustcdc_crash_snapshot; EXEC sys.sp_cdc_scan").await?;
+    sql_exec(
+        &mut admin,
+        "USE rustcdc_crash_snapshot; EXEC sys.sp_cdc_scan",
+    )
+    .await?;
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let marker_file = checkpoint_dir.path().join("worker-polled.marker");
@@ -133,12 +137,14 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
     let reader_after_worker = FileCheckpoint::new(checkpoint_dir.path());
-    let saved = reader_after_worker
-        .load()
-        .await?
-        .ok_or_else(|| rustcdc::Error::StateError("checkpoint should exist after worker ack".into()))?;
+    let saved = reader_after_worker.load().await?.ok_or_else(|| {
+        rustcdc::Error::StateError("checkpoint should exist after worker ack".into())
+    })?;
     assert_eq!(saved.source_type(), "sqlserver_snapshot");
-    assert_eq!(reader_after_worker.get_committed_count().await?, marker.events as u64);
+    assert_eq!(
+        reader_after_worker.get_committed_count().await?,
+        marker.events as u64
+    );
 
     let source_cfg =
         sqlserver_testkit::source_config(host, port, "rustcdc_crash_snapshot".to_string(), 30);
@@ -404,7 +410,10 @@ fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
             return Ok(candidate);
         }
 
-        build_xtask_worker("sqlserver_crash_worker", "sqlserver,insecure-test-overrides")?;
+        build_xtask_worker(
+            "sqlserver_crash_worker",
+            "sqlserver,insecure-test-overrides",
+        )?;
         if candidate.exists() {
             return Ok(candidate);
         }

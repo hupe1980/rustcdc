@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::Path, time::{Duration, Instant}};
+use std::{
+    collections::HashSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 pub struct WorkerMarker {
     pub events: usize,
