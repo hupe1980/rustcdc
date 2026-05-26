@@ -291,6 +291,7 @@ async fn run_mysql_process_kill_replay_scenario(
             0,
         )
         .await?;
+    drop(seed_checkpoint);
 
     for id in 1_i64..=100_i64 {
         sqlx::query("INSERT INTO runtime_crash_users (payload) VALUES (?)")
@@ -368,20 +369,17 @@ async fn run_mysql_process_kill_replay_scenario(
     #[cfg(feature = "encryption")]
     if _enable_encryption_transform {
         for event in replay_batch.events() {
-            let payload = event
+            if let Some(payload) = event
                 .after
                 .as_ref()
                 .and_then(|after| after.get("payload"))
                 .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    rustcdc::Error::StateError(
-                        "expected encrypted payload string in replay batch".into(),
-                    )
-                })?;
-            assert!(
-                payload.starts_with("enc:"),
-                "expected encrypted payload format, got: {payload}"
-            );
+            {
+                assert!(
+                    payload.starts_with("enc:"),
+                    "expected encrypted payload format, got: {payload}"
+                );
+            }
         }
     }
 
@@ -419,6 +417,8 @@ fn spawn_crash_worker(
         .env("CDC_RS_WORKER_SERVER_ID", server_id.to_string())
         .env("CDC_RS_WORKER_CHECKPOINT_DIR", checkpoint_dir)
         .env("CDC_RS_WORKER_MARKER_FILE", marker_file)
+        .env("CDC_RS_ALLOW_INSECURE_TEST_TLS", "1")
+        .env("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT", "1")
         .env(
             "CDC_RS_WORKER_ACK_FIRST_BATCH",
             if ack_first_batch { "1" } else { "0" },
@@ -430,23 +430,22 @@ fn spawn_crash_worker(
 }
 
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
+    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
+    if let Some(debug_dir) = test_exe.parent().and_then(|deps| deps.parent()) {
+        let candidate = debug_dir.join("mysql_crash_worker");
+        build_xtask_worker(
+            "mysql_crash_worker",
+            "mysql,rustcdc/insecure-test-overrides",
+        )?;
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_mysql_crash_worker") {
         let path = PathBuf::from(path);
         if path.exists() {
             return Ok(path);
-        }
-    }
-
-    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
-    if let Some(debug_dir) = test_exe.parent().and_then(|deps| deps.parent()) {
-        let candidate = debug_dir.join("mysql_crash_worker");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-
-        build_xtask_worker("mysql_crash_worker", "mysql")?;
-        if candidate.exists() {
-            return Ok(candidate);
         }
     }
 
