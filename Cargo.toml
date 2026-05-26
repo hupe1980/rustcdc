@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -10,7 +10,7 @@ repository   = "https://github.com/hupe1980/rustcdc"
 homepage     = "https://github.com/hupe1980/rustcdc"
 documentation = "https://docs.rs/rustcdc"
 readme       = "README.md"
-keywords     = ["cdc", "change-data-capture", "postgres", "mysql", "debezium"]
+keywords     = ["cdc", "change-data-capture", "postgres", "mysql", "mariadb", "mssql"]
 categories   = ["database", "asynchronous", "data-structures"]
 
 [workspace]
