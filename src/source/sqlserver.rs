@@ -1,53 +1,49 @@
 //! SQL Server source configuration and connection lifecycle.
 
-use std::{
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use ahash::AHashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, sync::Mutex};
 
-use crate::{
-    checkpoint::GenericOffset,
-    core::{
-        Error, Offset, Result, SecretString, StructuredLogger, TransportConfig,
-    },
-    core::Event,
-    source::{ConnectorCapabilities, HandoffResult, SnapshotHandle, Source, StreamHandle, IncrementalSnapshotConfig},
-};
 #[cfg(test)]
 use crate::core::{Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 use crate::source::helpers::now_millis;
+use crate::{
+    checkpoint::GenericOffset,
+    core::Event,
+    core::{Error, Offset, Result, SecretString, StructuredLogger, TransportConfig},
+    source::{
+        ConnectorCapabilities, HandoffResult, IncrementalSnapshotConfig, SnapshotHandle, Source,
+        StreamHandle,
+    },
+};
 
-mod parser;
-mod query;
-mod state;
 mod config;
-mod prereq;
-mod snapshot_fetch;
-mod stream_schema;
-mod stream_window;
-mod snapshot_chunk;
-mod snapshot_finalize;
-mod stream_start;
-mod snapshot_start;
 mod connection_lifecycle;
 pub mod incremental_snapshot;
+mod parser;
+mod prereq;
+mod query;
+mod snapshot_chunk;
+mod snapshot_fetch;
+mod snapshot_finalize;
+mod snapshot_start;
+mod state;
+mod stream_schema;
+mod stream_start;
+mod stream_window;
 
+use self::connection_lifecycle::connect_sqlserver_with_probe;
 use self::snapshot_chunk::next_sqlserver_snapshot_chunk;
 use self::snapshot_finalize::{checkpoint_sqlserver_snapshot, finish_sqlserver_snapshot};
 use self::snapshot_start::{
     start_sqlserver_snapshot_from_checkpoint, start_sqlserver_snapshot_internal,
 };
-use self::connection_lifecycle::connect_sqlserver_with_probe;
 use self::stream_start::start_sqlserver_stream;
 
-use self::prereq::{
-    LiveSqlServerPrereqProbe, SqlServerPrereqProbe, SqlServerPrereqSnapshot,
-};
+use self::prereq::{LiveSqlServerPrereqProbe, SqlServerPrereqProbe, SqlServerPrereqSnapshot};
 use self::snapshot_fetch::{
     DisconnectedSqlServerSnapshotRowFetcher, LiveSqlServerSnapshotRowFetcher,
     SqlServerSnapshotRowFetcher,
@@ -564,8 +560,7 @@ async fn load_primary_key_columns_for_instance(
         .collect())
 }
 
-impl SqlServerStreamHandle {
-}
+impl SqlServerStreamHandle {}
 
 fn decode_sqlserver_cell_to_json(row: &tiberius::Row, index: usize) -> serde_json::Value {
     if let Ok(Some(text)) = row.try_get::<&str, _>(index) {
@@ -1075,7 +1070,6 @@ impl SqlServerConnection {
             ))
         })
     }
-
 }
 
 impl Drop for SqlServerConnection {
@@ -1566,18 +1560,30 @@ mod tests {
         // INSERT
         assert_eq!(events[0].op, Operation::Insert);
         assert!(events[0].before.is_none(), "INSERT before should be None");
-        assert_eq!(events[0].after, Some(serde_json::json!({"id": "1", "name": "alice"})));
+        assert_eq!(
+            events[0].after,
+            Some(serde_json::json!({"id": "1", "name": "alice"}))
+        );
 
         // UPDATE — before=old values (op=4), after=new values (op=3)
         assert_eq!(events[1].op, Operation::Update);
-        assert_eq!(events[1].before, Some(serde_json::json!({"id": "1", "name": "alice"})),
-            "UPDATE before should hold the OLD row (op=4)");
-        assert_eq!(events[1].after, Some(serde_json::json!({"id": "1", "name": "alice-v2"})),
-            "UPDATE after should hold the NEW row (op=3)");
+        assert_eq!(
+            events[1].before,
+            Some(serde_json::json!({"id": "1", "name": "alice"})),
+            "UPDATE before should hold the OLD row (op=4)"
+        );
+        assert_eq!(
+            events[1].after,
+            Some(serde_json::json!({"id": "1", "name": "alice-v2"})),
+            "UPDATE after should hold the NEW row (op=3)"
+        );
 
         // DELETE
         assert_eq!(events[2].op, Operation::Delete);
-        assert_eq!(events[2].before, Some(serde_json::json!({"id": "1", "name": "alice-v2"})));
+        assert_eq!(
+            events[2].before,
+            Some(serde_json::json!({"id": "1", "name": "alice-v2"}))
+        );
         assert!(events[2].after.is_none(), "DELETE after should be None");
 
         // tx_id is derived from seqval and must be non-zero for non-trivial seqval.
@@ -1612,35 +1618,43 @@ mod tests {
         };
 
         // Poll 1: only the op=3 after-image arrives.
-        let poll1 = vec![
-            SqlServerRawChange {
-                start_lsn_hex: "0x000000230000015A0004".into(),
-                seqval_hex: "0x000000230000015A0005".into(),
-                operation: 3,
-                ts_ms: 10,
-                row: serde_json::json!({"id": "1", "name": "alice-v2"}),
-            },
-        ];
+        let poll1 = vec![SqlServerRawChange {
+            start_lsn_hex: "0x000000230000015A0004".into(),
+            seqval_hex: "0x000000230000015A0005".into(),
+            operation: 3,
+            ts_ms: 10,
+            row: serde_json::json!({"id": "1", "name": "alice-v2"}),
+        }];
         let events1 = handle.map_changes_to_events(&meta, poll1).unwrap();
-        assert!(events1.is_empty(), "op=3 alone should be buffered, not emitted");
+        assert!(
+            events1.is_empty(),
+            "op=3 alone should be buffered, not emitted"
+        );
         assert_eq!(handle.pending_update_afters.len(), 1);
 
         // Poll 2: the op=4 before-image arrives; should merge with the buffered op=3.
-        let poll2 = vec![
-            SqlServerRawChange {
-                start_lsn_hex: "0x000000230000015A0004".into(),
-                seqval_hex: "0x000000230000015A0005".into(),
-                operation: 4,
-                ts_ms: 10,
-                row: serde_json::json!({"id": "1", "name": "alice"}),
-            },
-        ];
+        let poll2 = vec![SqlServerRawChange {
+            start_lsn_hex: "0x000000230000015A0004".into(),
+            seqval_hex: "0x000000230000015A0005".into(),
+            operation: 4,
+            ts_ms: 10,
+            row: serde_json::json!({"id": "1", "name": "alice"}),
+        }];
         let events2 = handle.map_changes_to_events(&meta, poll2).unwrap();
         assert_eq!(events2.len(), 1);
         assert_eq!(events2[0].op, Operation::Update);
-        assert_eq!(events2[0].before, Some(serde_json::json!({"id": "1", "name": "alice"})));
-        assert_eq!(events2[0].after, Some(serde_json::json!({"id": "1", "name": "alice-v2"})));
-        assert!(handle.pending_update_afters.is_empty(), "buffer should be drained after merge");
+        assert_eq!(
+            events2[0].before,
+            Some(serde_json::json!({"id": "1", "name": "alice"}))
+        );
+        assert_eq!(
+            events2[0].after,
+            Some(serde_json::json!({"id": "1", "name": "alice-v2"}))
+        );
+        assert!(
+            handle.pending_update_afters.is_empty(),
+            "buffer should be drained after merge"
+        );
     }
 
     #[test]

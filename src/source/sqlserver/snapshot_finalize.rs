@@ -47,7 +47,9 @@ pub(super) async fn finish_sqlserver_snapshot(
 
     if handle.transaction_open {
         let client = handle.client.as_ref().ok_or_else(|| {
-            Error::StateError("sqlserver snapshot handle is missing an active transaction client".into())
+            Error::StateError(
+                "sqlserver snapshot handle is missing an active transaction client".into(),
+            )
         })?;
         let mut client = client.lock().await;
         client

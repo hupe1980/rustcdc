@@ -70,11 +70,7 @@ pub(super) async fn reconcile_stream_resume_lsn_with_retry(
         }
     }
 
-    reconcile_stream_resume_lsn(
-        checkpoint_lsn,
-        last_slot_lsn,
-        slot_name,
-    )
+    reconcile_stream_resume_lsn(checkpoint_lsn, last_slot_lsn, slot_name)
 }
 
 pub(super) async fn query_current_wal_lsn(client: &Client) -> Result<u64> {

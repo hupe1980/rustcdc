@@ -1,7 +1,7 @@
 use async_trait::async_trait;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rustcdc::transform::{Transform, TransformPipeline};
 use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata, EVENT_ENVELOPE_VERSION};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 use std::collections::HashSet;
 use std::hint::black_box;

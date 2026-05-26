@@ -1,9 +1,7 @@
 use ahash::AHashMap as HashMap;
 
 use mysql_common::{
-    binlog::row::BinlogRow,
-    constants::ColumnFlags,
-    row::Row as MysqlRow,
+    binlog::row::BinlogRow, constants::ColumnFlags, row::Row as MysqlRow,
     value::Value as MysqlValue,
 };
 
@@ -34,14 +32,17 @@ pub(super) fn mysql_json_value_to_param(value: &serde_json::Value) -> Result<Mys
     }
 }
 
-
 pub(super) fn mysql_event_pk_fingerprint(event: &Event) -> Option<String> {
     let pk_columns = event.primary_key.as_ref()?;
     if pk_columns.is_empty() {
         return None;
     }
 
-    let row = event.after.as_ref().or(event.before.as_ref())?.as_object()?;
+    let row = event
+        .after
+        .as_ref()
+        .or(event.before.as_ref())?
+        .as_object()?;
 
     let mut fingerprint = String::with_capacity(64);
     fingerprint.push_str(&event.table);

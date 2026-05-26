@@ -76,7 +76,10 @@ where
                 let mut attempt: u32 = 0;
                 let mut delay_ms = policy.initial_delay_ms;
                 loop {
-                    match stream.next_events(self.config.options.max_poll_wait_ms).await {
+                    match stream
+                        .next_events(self.config.options.max_poll_wait_ms)
+                        .await
+                    {
                         Ok(events) => break Ok(events),
                         Err(error) if error.is_recoverable() => {
                             let exhausted = policy
@@ -94,8 +97,7 @@ where
                                 "recoverable source error; retrying stream poll",
                             );
                             metrics.record_error(&error, "runtime.poll.stream_retry");
-                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms))
-                                .await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                             delay_ms = (delay_ms.saturating_mul(2)).min(policy.max_delay_ms);
                             attempt = attempt.saturating_add(1);
                         }
@@ -419,7 +421,10 @@ where
             Some(schema_event) => {
                 let version = self.config.schema_history.record_ddl(schema_event).await?;
                 if let Some(retention) = self.config.options.schema_history_retention {
-                    self.config.schema_history.apply_retention(retention).await?;
+                    self.config
+                        .schema_history
+                        .apply_retention(retention)
+                        .await?;
                 }
                 Some(version)
             }

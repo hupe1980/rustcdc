@@ -135,7 +135,12 @@ impl MysqlSourceConfig {
                 "mysql max_events_per_poll must be less than or equal to {MAX_MAX_EVENTS_PER_POLL}"
             )));
         }
-        if let TransportConfig::Tls { ca_cert_path, client_cert_path, client_key_path } = &self.transport {
+        if let TransportConfig::Tls {
+            ca_cert_path,
+            client_cert_path,
+            client_key_path,
+        } = &self.transport
+        {
             #[cfg(not(feature = "tls"))]
             {
                 let _ = ca_cert_path;

@@ -530,7 +530,9 @@ impl FileCheckpoint {
             )));
         }
 
-        if existing.committed_event_count == next.committed_event_count && existing.offset != next.offset {
+        if existing.committed_event_count == next.committed_event_count
+            && existing.offset != next.offset
+        {
             return Err(crate::core::Error::CheckpointError(format!(
                 "refusing conflicting checkpoint write for source '{}': committed_event_count={} matches existing record but offset payload differs",
                 source_type, next.committed_event_count
@@ -729,11 +731,8 @@ mod tests {
         let path = dir.path().join("checkpoint_postgres.json");
         std::fs::write(&path, b"{not-json").unwrap();
         #[cfg(unix)]
-        std::fs::set_permissions(
-            &path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
 
         let error = checkpoint.load().await.unwrap_err();
         assert!(matches!(error, crate::core::Error::SerializationError(_)));
@@ -863,11 +862,8 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_vec(&missing_version_payload).unwrap()).unwrap();
         #[cfg(unix)]
-        std::fs::set_permissions(
-            &path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
 
         let error = checkpoint.load().await.unwrap_err();
         assert!(matches!(error, crate::core::Error::SerializationError(_)));

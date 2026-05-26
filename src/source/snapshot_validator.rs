@@ -79,10 +79,7 @@ impl SnapshotValidator {
                     state.rows_received = state.rows_received.saturating_add(1);
                     state.received_pks.insert(pk_hash);
                 } else {
-                    let state = self
-                        .tables
-                        .entry(event.table.clone())
-                        .or_default();
+                    let state = self.tables.entry(event.table.clone()).or_default();
                     state.rows_received = state.rows_received.saturating_add(1);
                     state.received_pks.insert(pk_hash);
                 }

@@ -1,10 +1,6 @@
 //! MySQL source configuration, connection lifecycle, and validation helpers.
 
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -21,37 +17,35 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
     checkpoint::{GenericOffset, MysqlOffset},
-    core::{
-        Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig,
-    },
+    core::{Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig},
     ddl_capture::{extract_captured_ddl, DdlDialect},
     source::{
-        ConnectorCapabilities, HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle,
-        IncrementalSnapshotConfig,
+        ConnectorCapabilities, HandoffResult, IncrementalSnapshotConfig, SnapshotEnd,
+        SnapshotHandle, Source, StreamHandle,
     },
 };
 use serde::{Deserialize, Serialize};
 
-mod parser;
-mod query;
-mod state;
 mod config;
 mod handoff;
-mod stream_start;
-mod snapshot_start;
-mod snapshot_chunk;
-mod stream_messages;
 pub mod incremental_snapshot;
+mod parser;
+mod query;
+mod snapshot_chunk;
+mod snapshot_start;
+mod state;
+mod stream_messages;
+mod stream_start;
 
 use self::{
     parser::{mysql_qualified_table_name_from_reference, quoted_mysql_identifier},
     query::{
-        binlog_row_to_mysql_row, format_gtid, mysql_json_value_to_param,
-        mysql_row_to_json, mysql_value_to_json, primary_key_columns_from_row,
+        binlog_row_to_mysql_row, format_gtid, mysql_json_value_to_param, mysql_row_to_json,
+        mysql_value_to_json, primary_key_columns_from_row,
     },
     state::{
-        ConnectionState, MysqlBinlogMessage, MysqlRowChange, MysqlStream,
-        SnapshotCheckpointState, StreamState, TableSnapshotState,
+        ConnectionState, MysqlBinlogMessage, MysqlRowChange, MysqlStream, SnapshotCheckpointState,
+        StreamState, TableSnapshotState,
     },
 };
 use crate::source::helpers::now_millis;
@@ -742,12 +736,9 @@ impl MysqlConnection {
             Error::SourceError(format!("failed to acquire mysql connection: {error}"))
         })?;
 
-        let setup_result = begin_snapshot_and_collect_table_states(
-            &mut connection,
-            tables,
-            &self.config.database,
-        )
-        .await;
+        let setup_result =
+            begin_snapshot_and_collect_table_states(&mut connection, tables, &self.config.database)
+                .await;
 
         let (snapshot, states) = match setup_result {
             Ok(value) => value,
@@ -880,14 +871,9 @@ impl MysqlConnection {
         let inner = self.start_stream(resume_from).await?;
         let source_name = self.source_type().to_string();
         let default_database = self.config.database.clone();
-        let handle = MysqlIncrementalSnapshotHandle::new(
-            inner,
-            pool,
-            config,
-            source_name,
-            default_database,
-        )
-        .await?;
+        let handle =
+            MysqlIncrementalSnapshotHandle::new(inner, pool, config, source_name, default_database)
+                .await?;
         Ok(Box::new(handle))
     }
 }
@@ -909,8 +895,7 @@ impl Source for MysqlConnection {
             })?
         };
 
-        let start =
-            resolve_stream_start_position(&pool, self.source_type(), resume_from).await?;
+        let start = resolve_stream_start_position(&pool, self.source_type(), resume_from).await?;
 
         let mut stream = MysqlStream {
             binlog_file: start.binlog_file.clone(),
@@ -1792,7 +1777,8 @@ mod tests {
         assert_eq!(schema, None);
         assert_eq!(table, "users.with.dot");
 
-        let (schema, table) = super::parser::split_table_reference("`analytics-team`.`users`").unwrap();
+        let (schema, table) =
+            super::parser::split_table_reference("`analytics-team`.`users`").unwrap();
         assert_eq!(schema.as_deref(), Some("analytics-team"));
         assert_eq!(table, "users");
 

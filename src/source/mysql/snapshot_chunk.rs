@@ -1,4 +1,6 @@
-use crate::core::{Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use crate::core::{
+    Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+};
 use crate::source::helpers::now_millis;
 
 use super::{MysqlSnapshotHandle, DEFAULT_SNAPSHOT_CHUNK_SIZE};
@@ -60,9 +62,7 @@ pub(super) async fn next_snapshot_chunk(
                         source_name: handle.source_name.clone(),
                         offset: format!(
                             "{}:{}:{}",
-                            handle.snapshot.binlog_file,
-                            handle.snapshot.binlog_pos,
-                            cursor_text
+                            handle.snapshot.binlog_file, handle.snapshot.binlog_pos, cursor_text
                         ),
                         timestamp: ts,
                     },
@@ -99,9 +99,7 @@ pub(super) async fn next_snapshot_chunk(
                         source_name: handle.source_name.clone(),
                         offset: format!(
                             "{}:{}:{}",
-                            handle.snapshot.binlog_file,
-                            handle.snapshot.binlog_pos,
-                            cursor
+                            handle.snapshot.binlog_file, handle.snapshot.binlog_pos, cursor
                         ),
                         timestamp: ts,
                     },

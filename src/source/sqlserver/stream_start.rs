@@ -27,8 +27,9 @@ pub(super) async fn start_sqlserver_stream(
             min_lsn = Some(min_bytes);
         }
     }
-    let min_lsn = min_lsn
-        .ok_or_else(|| Error::SourceError("sqlserver could not determine CDC minimum LSN".into()))?;
+    let min_lsn = min_lsn.ok_or_else(|| {
+        Error::SourceError("sqlserver could not determine CDC minimum LSN".into())
+    })?;
 
     let max_lsn_hex = connection.query_max_lsn_hex().await?;
     let mut max_lsn = lsn_hex_to_bytes(&max_lsn_hex)?;

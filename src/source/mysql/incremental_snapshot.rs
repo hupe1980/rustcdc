@@ -19,10 +19,11 @@ use mysql_async::{prelude::Queryable, Pool as MySqlPool};
 
 use crate::{
     checkpoint::Checkpoint,
-    core::{Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
-           EVENT_ENVELOPE_VERSION},
-    source::{IncrementalSnapshotConfig, StreamHandle},
+    core::{
+        Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    },
     source::helpers::now_millis,
+    source::{IncrementalSnapshotConfig, StreamHandle},
 };
 
 use super::{
@@ -41,13 +42,17 @@ fn cmp_binlog(a: &BinlogPos, b: &BinlogPos) -> std::cmp::Ordering {
 
 async fn query_master_status(pool: &MySqlPool) -> Result<BinlogPos> {
     let mut conn = pool.get_conn().await.map_err(|e| {
-        Error::SourceError(format!("incremental snapshot: failed to get mysql conn: {e}"))
+        Error::SourceError(format!(
+            "incremental snapshot: failed to get mysql conn: {e}"
+        ))
     })?;
     let mut row: mysql_async::Row = conn
         .query_first("SHOW MASTER STATUS")
         .await
         .map_err(|e| {
-            Error::SourceError(format!("incremental snapshot: SHOW MASTER STATUS failed: {e}"))
+            Error::SourceError(format!(
+                "incremental snapshot: SHOW MASTER STATUS failed: {e}"
+            ))
         })?
         .ok_or_else(|| {
             Error::SourceError("incremental snapshot: SHOW MASTER STATUS returned no row".into())
@@ -86,7 +91,9 @@ struct TableSpec {
 // ─── Phase state machine ──────────────────────────────────────────────────────
 
 enum Phase {
-    ChunkPrepare { table_idx: usize },
+    ChunkPrepare {
+        table_idx: usize,
+    },
     ChunkCollect {
         table_idx: usize,
         low_wm: BinlogPos,
@@ -240,9 +247,7 @@ impl MysqlIncrementalSnapshotHandle {
                 ))
             })?
         } else {
-            let sql = format!(
-                "SELECT * FROM {table_ref} ORDER BY {order_expr} LIMIT {limit}"
-            );
+            let sql = format!("SELECT * FROM {table_ref} ORDER BY {order_expr} LIMIT {limit}");
             conn.exec(sql, ()).await.map_err(|e| {
                 Error::SourceError(format!(
                     "incremental snapshot: chunk SELECT failed for '{}': {e}",
@@ -344,8 +349,7 @@ impl MysqlIncrementalSnapshotHandle {
             _ => return Ok(()),
         };
 
-        let effective_idx = (table_idx..self.tables.len())
-            .find(|&i| !self.tables[i].is_complete);
+        let effective_idx = (table_idx..self.tables.len()).find(|&i| !self.tables[i].is_complete);
         let table_idx = match effective_idx {
             Some(idx) => idx,
             None => {
@@ -372,8 +376,7 @@ impl MysqlIncrementalSnapshotHandle {
                 rows = self.tables[table_idx].rows_emitted,
                 "incremental snapshot: mysql table complete",
             );
-            let next = (table_idx + 1..self.tables.len())
-                .find(|&i| !self.tables[i].is_complete);
+            let next = (table_idx + 1..self.tables.len()).find(|&i| !self.tables[i].is_complete);
             self.phase = match next {
                 Some(idx) => Phase::ChunkPrepare { table_idx: idx },
                 None => Phase::Done,
@@ -635,8 +638,8 @@ fn mysql_value_to_json(value: &mysql_common::value::Value) -> serde_json::Value 
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     use super::MysqlIncrementalSnapshotHandle;
+    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 
     fn stream_event(table: &str, schema: &str, pk: u64, binlog_pos: u32, op: Operation) -> Event {
         let pk_str = pk.to_string();
@@ -682,7 +685,7 @@ mod tests {
 
     #[test]
     fn override_window_detects_in_range_event() {
-        use super::{BinlogPos, cmp_binlog, binlog_pos_from_event};
+        use super::{binlog_pos_from_event, cmp_binlog, BinlogPos};
 
         let low_wm: BinlogPos = ("mysql-bin.000001".into(), 100);
         let high_wm: BinlogPos = ("mysql-bin.000001".into(), 200);

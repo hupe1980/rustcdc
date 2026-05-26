@@ -1,7 +1,7 @@
 #![cfg(feature = "mariadb")]
 
-use rustcdc::{MariaDbConnection, MariaDbSourceConfig};
 use rustcdc::TransportConfig;
+use rustcdc::{MariaDbConnection, MariaDbSourceConfig};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,

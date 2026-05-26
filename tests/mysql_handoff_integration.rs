@@ -1,7 +1,7 @@
 #![cfg(feature = "mysql")]
 
-use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
 use rustcdc::TransportConfig;
+use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
 use std::collections::HashSet;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},

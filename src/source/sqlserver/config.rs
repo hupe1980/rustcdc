@@ -6,8 +6,7 @@ use std::path::Path;
 use crate::core::{Error, Result, SecretString, TransportConfig};
 
 use super::{
-    SqlServerSourceConfig, DEFAULT_POOL_SIZE, DEFAULT_STREAM_POLL_INTERVAL_MS,
-    MAX_EVENTS_PER_POLL,
+    SqlServerSourceConfig, DEFAULT_POOL_SIZE, DEFAULT_STREAM_POLL_INTERVAL_MS, MAX_EVENTS_PER_POLL,
 };
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;

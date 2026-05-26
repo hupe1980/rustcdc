@@ -303,10 +303,7 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
             1,
             Box::new(AvroValue::Record(vec![
                 ("tx_id".into(), AvroValue::Long(t.tx_id as i64)),
-                (
-                    "total_events".into(),
-                    AvroValue::Int(t.total_events as i32),
-                ),
+                ("total_events".into(), AvroValue::Int(t.total_events as i32)),
                 ("event_index".into(), AvroValue::Int(t.event_index as i32)),
             ])),
         ),
@@ -334,11 +331,11 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apache_avro::from_avro_datum;
     use crate::core::{
         Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
         EVENT_ENVELOPE_VERSION,
     };
+    use apache_avro::from_avro_datum;
 
     fn update_event() -> Event {
         Event {
@@ -482,7 +479,8 @@ mod tests {
             if op == Operation::Delete {
                 ev.after = None;
             }
-            enc.encode(&ev).unwrap_or_else(|e| panic!("encode failed for {op:?}: {e}"));
+            enc.encode(&ev)
+                .unwrap_or_else(|e| panic!("encode failed for {op:?}: {e}"));
         }
     }
 

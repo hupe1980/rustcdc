@@ -235,19 +235,21 @@ impl ProtoEvent {
                 chunk_index: s.chunk_index,
                 is_last_chunk: s.is_last_chunk,
             }),
-            transaction: event.transaction.as_ref().map(|t| ProtoTransactionMetadata {
-                tx_id: t.tx_id,
-                total_events: t.total_events,
-                event_index: t.event_index,
-            }),
+            transaction: event
+                .transaction
+                .as_ref()
+                .map(|t| ProtoTransactionMetadata {
+                    tx_id: t.tx_id,
+                    total_events: t.total_events,
+                    event_index: t.event_index,
+                }),
             envelope_version: event.envelope_version as u32,
         })
     }
 
     /// Decode a `ProtoEvent` from raw protobuf bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::decode(bytes)
-            .map_err(|e| Error::SerializationError(format!("protobuf decode: {e}")))
+        Self::decode(bytes).map_err(|e| Error::SerializationError(format!("protobuf decode: {e}")))
     }
 }
 

@@ -25,9 +25,7 @@ pub struct SnapshotTrackerConfig {
 
 impl Default for SnapshotTrackerConfig {
     fn default() -> Self {
-        Self {
-            chunk_size: 5000,
-        }
+        Self { chunk_size: 5000 }
     }
 }
 
@@ -323,9 +321,15 @@ mod tests {
         let tracker = SnapshotProgressTracker::new("snap-x".into(), 0, tables, Default::default());
 
         // Alternate chunk reports between the two tables (simulates concurrent workers).
-        tracker.record_chunk_progress("users", 100, Some(b"cursor-users-1".to_vec())).unwrap();
-        tracker.record_chunk_progress("orders", 200, Some(b"cursor-orders-1".to_vec())).unwrap();
-        tracker.record_chunk_progress("users", 50, Some(b"cursor-users-2".to_vec())).unwrap();
+        tracker
+            .record_chunk_progress("users", 100, Some(b"cursor-users-1".to_vec()))
+            .unwrap();
+        tracker
+            .record_chunk_progress("orders", 200, Some(b"cursor-orders-1".to_vec()))
+            .unwrap();
+        tracker
+            .record_chunk_progress("users", 50, Some(b"cursor-users-2".to_vec()))
+            .unwrap();
         tracker.record_chunk_progress("orders", 150, None).unwrap();
 
         assert_eq!(tracker.total_rows_processed().unwrap(), 500);
@@ -346,7 +350,10 @@ mod tests {
         let tracker = SnapshotProgressTracker::new("snap-y".into(), 0, tables, Default::default());
 
         let err = tracker.record_chunk_progress("nonexistent", 10, None);
-        assert!(err.is_err(), "recording progress for unknown table must fail");
+        assert!(
+            err.is_err(),
+            "recording progress for unknown table must fail"
+        );
 
         // The existing table is unaffected.
         assert_eq!(tracker.total_rows_processed().unwrap(), 0);
@@ -362,11 +369,17 @@ mod tests {
         let tracker = SnapshotProgressTracker::new("snap-z".into(), 42, tables, Default::default());
 
         // Complete two of three tables, with a cursor token on the partial one.
-        tracker.record_chunk_progress("a", 300, Some(b"pk-300".to_vec())).unwrap();
+        tracker
+            .record_chunk_progress("a", 300, Some(b"pk-300".to_vec()))
+            .unwrap();
         tracker.mark_table_complete("a").unwrap();
-        tracker.record_chunk_progress("b", 150, Some(b"pk-150".to_vec())).unwrap();
+        tracker
+            .record_chunk_progress("b", 150, Some(b"pk-150".to_vec()))
+            .unwrap();
         tracker.mark_table_complete("b").unwrap();
-        tracker.record_chunk_progress("c", 50, Some(b"pk-50".to_vec())).unwrap();
+        tracker
+            .record_chunk_progress("c", 50, Some(b"pk-50".to_vec()))
+            .unwrap();
         // "c" intentionally left incomplete — simulates a mid-run checkpoint.
 
         let snapshot = tracker.get_progress().unwrap();

@@ -1,7 +1,7 @@
 #![cfg(feature = "postgres")]
 
-use rustcdc::{source::Source, PostgresConnection, PostgresSourceConfig};
 use rustcdc::TransportConfig;
+use rustcdc::{source::Source, PostgresConnection, PostgresSourceConfig};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,

@@ -1,5 +1,7 @@
 use crate::{
-    core::{Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION},
+    core::{
+        Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    },
     source::helpers::now_millis,
 };
 

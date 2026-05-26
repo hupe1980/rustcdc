@@ -122,7 +122,8 @@ pub struct RuntimeOptions {
     /// events to a dead-letter queue, external error store, or alerting system.
     ///
     /// The callback is synchronous and must not block or panic.
-    pub dead_letter_handler: Option<std::sync::Arc<dyn Fn(Event, crate::core::Error) + Send + Sync>>,
+    pub dead_letter_handler:
+        Option<std::sync::Arc<dyn Fn(Event, crate::core::Error) + Send + Sync>>,
 }
 
 impl Default for RuntimeOptions {
@@ -978,9 +979,9 @@ where
                 Ok(RuntimeSource::Mysql(MysqlConnection::new(source.clone())))
             }
             #[cfg(feature = "mariadb")]
-            RuntimeSourceConfig::MariaDb(source) => {
-                Ok(RuntimeSource::Mysql(MysqlConnection::new(source.clone().into_inner())))
-            }
+            RuntimeSourceConfig::MariaDb(source) => Ok(RuntimeSource::Mysql(MysqlConnection::new(
+                source.clone().into_inner(),
+            ))),
             #[cfg(feature = "sqlserver")]
             RuntimeSourceConfig::SqlServer(source) => Ok(RuntimeSource::SqlServer(
                 SqlServerConnection::new(source.clone()),
@@ -999,20 +1000,19 @@ where
     pub(crate) fn inject_mock_source(&mut self, source: Box<dyn crate::source::Source>) {
         self.source = RuntimeSource::Mock(source);
     }
-
 }
 
-mod runtime_lifecycle;
 mod runtime_admin;
+mod runtime_lifecycle;
 mod runtime_poll;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "encryption")]
+    use ahash::AHashMap as HashMap;
     use async_trait::async_trait;
     use futures_util::StreamExt;
     use serde_json::json;
-    #[cfg(feature = "encryption")]
-    use ahash::AHashMap as HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1033,8 +1033,8 @@ mod tests {
     use crate::checkpoint::FileCheckpoint;
 
     use super::{
-        CdcRuntime, IdempotencyOptions, RuntimeConfig, RuntimeObservability,
-        RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
+        CdcRuntime, IdempotencyOptions, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
+        RuntimeState, TransformErrorPolicy,
     };
 
     #[cfg(feature = "postgres")]
@@ -1992,7 +1992,15 @@ mod tests {
         let loaded = runtime.config.checkpoint.load().await.unwrap().unwrap();
         assert_eq!(loaded.source_type(), "mock_snapshot");
         assert_eq!(loaded.encode().unwrap(), expected_payload);
-        assert_eq!(runtime.config.checkpoint.get_committed_count().await.unwrap(), 1);
+        assert_eq!(
+            runtime
+                .config
+                .checkpoint
+                .get_committed_count()
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2020,15 +2028,24 @@ mod tests {
 
         let batch1 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch1.len(), 2);
-        runtime.commit_ack(batch1.ack_token().unwrap()).await.unwrap();
+        runtime
+            .commit_ack(batch1.ack_token().unwrap())
+            .await
+            .unwrap();
 
         let batch2 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch2.len(), 2);
-        runtime.commit_ack(batch2.ack_token().unwrap()).await.unwrap();
+        runtime
+            .commit_ack(batch2.ack_token().unwrap())
+            .await
+            .unwrap();
 
         let batch3 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch3.len(), 1);
-        runtime.commit_ack(batch3.ack_token().unwrap()).await.unwrap();
+        runtime
+            .commit_ack(batch3.ack_token().unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(
             runtime
@@ -2310,7 +2327,10 @@ mod tests {
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 1);
-        runtime.commit_ack(batch.ack_token().unwrap()).await.unwrap();
+        runtime
+            .commit_ack(batch.ack_token().unwrap())
+            .await
+            .unwrap();
         drop(runtime);
 
         let checkpoint = FileCheckpoint::new(checkpoint_dir.path());
@@ -2345,14 +2365,17 @@ mod tests {
             .lock()
             .expect("snapshot resume source mutex should not be poisoned")
             .clone();
-        assert_eq!(resumed_snapshot_source.as_deref(), Some(snapshot_source_type));
+        assert_eq!(
+            resumed_snapshot_source.as_deref(),
+            Some(snapshot_source_type)
+        );
 
         let resumed_snapshot_payload = snapshot_resume_payload
             .lock()
             .expect("snapshot resume payload mutex should not be poisoned")
             .clone();
-        let resumed_snapshot_payload = resumed_snapshot_payload
-            .expect("snapshot resume payload should be present");
+        let resumed_snapshot_payload =
+            resumed_snapshot_payload.expect("snapshot resume payload should be present");
         let resumed_snapshot_payload: serde_json::Value =
             serde_json::from_slice(&resumed_snapshot_payload).unwrap();
         let expected_payload_json: serde_json::Value =
@@ -2498,7 +2521,9 @@ mod tests {
         let error = runtime
             .commit_ack(batch.ack_token().unwrap())
             .await
-            .expect_err("default fail-fast policy should return an error after durable checkpoint commit");
+            .expect_err(
+                "default fail-fast policy should return an error after durable checkpoint commit",
+            );
 
         assert!(matches!(error, crate::core::Error::SourceError(_)));
 

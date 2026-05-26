@@ -36,11 +36,7 @@ pub(super) async fn query_bool(
     Ok(query_i32(client, operation, query).await? != 0)
 }
 
-pub(super) async fn query_u32(
-    client: &mut SqlClient,
-    operation: &str,
-    query: &str,
-) -> Result<u32> {
+pub(super) async fn query_u32(client: &mut SqlClient, operation: &str, query: &str) -> Result<u32> {
     let value = query_i32(client, operation, query).await?;
     u32::try_from(value).map_err(|_| {
         Error::SourceError(format!(
@@ -64,9 +60,7 @@ pub(super) async fn query_i32(client: &mut SqlClient, operation: &str, query: &s
         ))
     })?;
     row.get::<i32, _>(0).ok_or_else(|| {
-        Error::SourceError(format!(
-            "sqlserver operation '{operation}' returned NULL"
-        ))
+        Error::SourceError(format!("sqlserver operation '{operation}' returned NULL"))
     })
 }
 

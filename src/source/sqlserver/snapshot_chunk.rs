@@ -1,4 +1,6 @@
-use crate::core::{Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use crate::core::{
+    Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+};
 use crate::source::helpers::now_millis;
 
 use super::{lsn_bytes_to_hex, SqlServerSnapshotHandle};
@@ -60,7 +62,11 @@ pub(super) async fn next_sqlserver_snapshot_chunk(
                 op: Operation::Read,
                 source: SourceMetadata {
                     source_name: "sqlserver".into(),
-                    offset: format!("{}:{}", lsn_bytes_to_hex(&handle.snapshot.lsn_start), cursor_json),
+                    offset: format!(
+                        "{}:{}",
+                        lsn_bytes_to_hex(&handle.snapshot.lsn_start),
+                        cursor_json
+                    ),
                     timestamp: ts,
                 },
                 ts,

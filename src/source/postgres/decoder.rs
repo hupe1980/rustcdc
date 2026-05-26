@@ -494,7 +494,7 @@ mod tests {
         let mut msg = vec![b'B'];
         msg.extend_from_slice(&100u64.to_be_bytes()); // final_lsn
         msg.extend_from_slice(&999i64.to_be_bytes()); // commit_timestamp_us
-        msg.extend_from_slice(&42u32.to_be_bytes());  // xid
+        msg.extend_from_slice(&42u32.to_be_bytes()); // xid
         msg
     }
 

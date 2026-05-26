@@ -37,8 +37,11 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
         .ok_or_else(|| Error::SourceError("mysql master status unavailable for snapshot".into()))?;
     let binlog_file: String = master_row.take(0).unwrap_or_default();
     let binlog_pos_u64: u64 = master_row.take(1).unwrap_or(4);
-    let binlog_pos = u32::try_from(binlog_pos_u64)
-        .map_err(|_| Error::SourceError(format!("mysql binlog position exceeds u32: {binlog_pos_u64}")))?;
+    let binlog_pos = u32::try_from(binlog_pos_u64).map_err(|_| {
+        Error::SourceError(format!(
+            "mysql binlog position exceeds u32: {binlog_pos_u64}"
+        ))
+    })?;
     let gtid: String = connection
         .query_first("SELECT @@GLOBAL.GTID_EXECUTED")
         .await

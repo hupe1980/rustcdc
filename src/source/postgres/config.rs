@@ -122,7 +122,12 @@ impl PostgresSourceConfig {
             )));
         }
 
-        if let TransportConfig::Tls { ca_cert_path, client_cert_path, client_key_path } = &self.transport {
+        if let TransportConfig::Tls {
+            ca_cert_path,
+            client_cert_path,
+            client_key_path,
+        } = &self.transport
+        {
             #[cfg(not(feature = "tls"))]
             {
                 let _ = (ca_cert_path, client_cert_path, client_key_path);

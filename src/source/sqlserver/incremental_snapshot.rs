@@ -19,19 +19,20 @@ use tokio::sync::Mutex;
 
 use crate::{
     checkpoint::Checkpoint,
-    core::{Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
-           EVENT_ENVELOPE_VERSION},
-    source::{IncrementalSnapshotConfig, StreamHandle},
+    core::{
+        Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    },
     source::helpers::now_millis,
+    source::{IncrementalSnapshotConfig, StreamHandle},
 };
 
 use super::{
-    SqlServerSourceConfig, SqlClient,
     parser::{
         build_snapshot_fetch_sql, compare_lsn, lsn_bytes_to_hex, lsn_from_source_offset,
         parse_schema_table, qualified_table_name,
     },
     query::connect_client,
+    SqlClient, SqlServerSourceConfig,
 };
 
 // ─── Watermark helpers ────────────────────────────────────────────────────────
@@ -45,24 +46,17 @@ async fn query_max_lsn(client: &mut SqlClient) -> Result<[u8; 10]> {
         )
         .await
         .map_err(|e| {
-            Error::SourceError(format!(
-                "incremental snapshot: max LSN query failed: {e}"
-            ))
+            Error::SourceError(format!("incremental snapshot: max LSN query failed: {e}"))
         })?
         .into_first_result()
         .await
         .map_err(|e| {
-            Error::SourceError(format!(
-                "incremental snapshot: max LSN decode failed: {e}"
-            ))
+            Error::SourceError(format!("incremental snapshot: max LSN decode failed: {e}"))
         })?;
 
-    let hex: &str = rows
-        .first()
-        .and_then(|row| row.get(0))
-        .ok_or_else(|| {
-            Error::SourceError("incremental snapshot: max LSN returned no row".into())
-        })?;
+    let hex: &str = rows.first().and_then(|row| row.get(0)).ok_or_else(|| {
+        Error::SourceError("incremental snapshot: max LSN returned no row".into())
+    })?;
 
     super::parser::lsn_hex_to_bytes(hex)
 }
@@ -134,7 +128,9 @@ struct TableSpec {
 // ─── Phase state machine ──────────────────────────────────────────────────────
 
 enum Phase {
-    ChunkPrepare { table_idx: usize },
+    ChunkPrepare {
+        table_idx: usize,
+    },
     ChunkCollect {
         table_idx: usize,
         low_wm: [u8; 10],
@@ -233,7 +229,11 @@ impl SqlServerIncrementalSnapshotHandle {
         let has_cursor = table.pk_cursor.is_some();
 
         // limit param comes after cursor params (if any)
-        let cursor_param_count = if has_cursor { table.pk_columns.len() } else { 0 };
+        let cursor_param_count = if has_cursor {
+            table.pk_columns.len()
+        } else {
+            0
+        };
         let limit_param_idx = cursor_param_count + 1;
 
         let sql = build_snapshot_fetch_sql(
@@ -264,15 +264,12 @@ impl SqlServerIncrementalSnapshotHandle {
             ))
         })?;
 
-        let rows = result_stream
-            .into_first_result()
-            .await
-            .map_err(|e| {
-                Error::SourceError(format!(
-                    "incremental snapshot: chunk SELECT decode failed for '{}': {e}",
-                    table.qualified
-                ))
-            })?;
+        let rows = result_stream.into_first_result().await.map_err(|e| {
+            Error::SourceError(format!(
+                "incremental snapshot: chunk SELECT decode failed for '{}': {e}",
+                table.qualified
+            ))
+        })?;
 
         let table = &self.tables[table_idx];
         let mut decoded = Vec::with_capacity(rows.len());
@@ -300,13 +297,12 @@ impl SqlServerIncrementalSnapshotHandle {
                         table.qualified
                     ))
                 })?;
-            let row_obj: serde_json::Value =
-                serde_json::from_str(row_json_str).map_err(|e| {
-                    Error::SerializationError(format!(
-                        "incremental snapshot: row_json parse failed for '{}': {e}",
-                        table.qualified
-                    ))
-                })?;
+            let row_obj: serde_json::Value = serde_json::from_str(row_json_str).map_err(|e| {
+                Error::SerializationError(format!(
+                    "incremental snapshot: row_json parse failed for '{}': {e}",
+                    table.qualified
+                ))
+            })?;
 
             // Extract PK values in column order from the cursor object
             let pk_json: Vec<serde_json::Value> = table
@@ -405,8 +401,7 @@ impl SqlServerIncrementalSnapshotHandle {
             _ => return Ok(()),
         };
 
-        let effective_idx = (table_idx..self.tables.len())
-            .find(|&i| !self.tables[i].is_complete);
+        let effective_idx = (table_idx..self.tables.len()).find(|&i| !self.tables[i].is_complete);
         let table_idx = match effective_idx {
             Some(idx) => idx,
             None => {
@@ -439,8 +434,7 @@ impl SqlServerIncrementalSnapshotHandle {
                 rows = self.tables[table_idx].rows_emitted,
                 "incremental snapshot: sqlserver table complete",
             );
-            let next = (table_idx + 1..self.tables.len())
-                .find(|&i| !self.tables[i].is_complete);
+            let next = (table_idx + 1..self.tables.len()).find(|&i| !self.tables[i].is_complete);
             self.phase = match next {
                 Some(idx) => Phase::ChunkPrepare { table_idx: idx },
                 None => Phase::Done,
@@ -543,11 +537,7 @@ impl SqlServerIncrementalSnapshotHandle {
 
 // ─── Table metadata queries ───────────────────────────────────────────────────
 
-async fn load_pk_columns(
-    client: &mut SqlClient,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<String>> {
+async fn load_pk_columns(client: &mut SqlClient, schema: &str, table: &str) -> Result<Vec<String>> {
     let rows = client
         .query(
             "SELECT k.COLUMN_NAME \
@@ -689,11 +679,7 @@ impl StreamHandle for SqlServerIncrementalSnapshotHandle {
                     }
 
                     let wm_passed = self
-                        .stream_passed_high_wm(
-                            &stream_events,
-                            max_batch_lsn.as_ref(),
-                            &high_wm,
-                        )
+                        .stream_passed_high_wm(&stream_events, max_batch_lsn.as_ref(), &high_wm)
                         .await?;
 
                     if wm_passed {
@@ -731,8 +717,8 @@ impl StreamHandle for SqlServerIncrementalSnapshotHandle {
 
 #[cfg(test)]
 mod tests {
+    use super::{compare_lsn, lsn_from_event, SqlServerIncrementalSnapshotHandle};
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
-    use super::{SqlServerIncrementalSnapshotHandle, compare_lsn, lsn_from_event};
 
     fn lsn_bytes(pos: u64) -> [u8; 10] {
         let mut lsn = [0u8; 10];
@@ -811,10 +797,8 @@ mod tests {
 
         let row1_pk = vec![serde_json::json!(1_u64)];
         let row2_pk = vec![serde_json::json!(2_u64)];
-        let fp1 =
-            SqlServerIncrementalSnapshotHandle::pk_fingerprint("users", &row1_pk);
-        let fp2 =
-            SqlServerIncrementalSnapshotHandle::pk_fingerprint("users", &row2_pk);
+        let fp1 = SqlServerIncrementalSnapshotHandle::pk_fingerprint("users", &row1_pk);
+        let fp2 = SqlServerIncrementalSnapshotHandle::pk_fingerprint("users", &row2_pk);
 
         let event1 = stream_event_with_lsn("users", "dbo", 1, 50);
         let event2 = stream_event_with_lsn("users", "dbo", 2, 50);

@@ -365,7 +365,10 @@ async fn runtime_startup_without_schema_history_retention_emits_error_log() {
     // Intentionally omit .with_schema_history_retention() to trigger the ERROR log.
     let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
     let mut runtime = CdcRuntime::new(config).expect("runtime construction should succeed");
-    runtime.start().await.expect("start should succeed on Disabled source");
+    runtime
+        .start()
+        .await
+        .expect("start should succeed on Disabled source");
 
     drop(_guard); // stop capturing before asserting
 

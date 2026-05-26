@@ -126,8 +126,9 @@ async fn checkpoint_v2_fixtures_cover_mysql_and_sqlserver_source_families() {
         );
 
         if loaded.source_type() == "mysql" {
-            let decoded = MysqlOffset::from_bytes(&loaded.encode().expect("mysql offset should encode"))
-                .expect("mysql stream checkpoint fixture should decode as typed mysql offset");
+            let decoded =
+                MysqlOffset::from_bytes(&loaded.encode().expect("mysql offset should encode"))
+                    .expect("mysql stream checkpoint fixture should decode as typed mysql offset");
             assert_eq!(decoded.binlog_file, "mysql-bin.000123");
             assert_eq!(decoded.binlog_pos, 987654);
             assert_eq!(decoded.gtid, "24BC7856-9A30-11EE-8B4B-0242AC120002:1-9");

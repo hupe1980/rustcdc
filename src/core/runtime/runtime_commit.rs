@@ -41,7 +41,8 @@ where
             ));
         }
 
-        self.persist_snapshot_checkpoint_before_commit(count).await?;
+        self.persist_snapshot_checkpoint_before_commit(count)
+            .await?;
 
         let started = tokio::time::Instant::now();
         let confirmation_lsn = self.committed_confirmation_lsn(count)?;
@@ -125,7 +126,10 @@ where
                     let error = Error::SourceError(format!(
                         "post-commit source confirmation failed after durable checkpoint commit: {summary}"
                     ));
-                    self.record_runtime_error("runtime.commit.post_commit_confirm_fail_fast", &error);
+                    self.record_runtime_error(
+                        "runtime.commit.post_commit_confirm_fail_fast",
+                        &error,
+                    );
                     tracing::error!(
                         target: "rustcdc::core::runtime",
                         committed_count = count,
@@ -171,7 +175,9 @@ where
         snapshot
             .checkpoint(&mut self.config.checkpoint, target_committed_count)
             .await
-            .inspect_err(|error| self.record_runtime_error("runtime.commit.snapshot_checkpoint", error))
+            .inspect_err(|error| {
+                self.record_runtime_error("runtime.commit.snapshot_checkpoint", error)
+            })
     }
 
     fn committed_confirmation_lsn(&self, count: usize) -> Result<Option<u64>> {

@@ -13,8 +13,8 @@ use opentelemetry::{
     Context, KeyValue,
 };
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{metrics::SdkMeterProvider, runtime, trace as sdktrace, Resource};
 use opentelemetry_sdk::metrics::PeriodicReader;
+use opentelemetry_sdk::{metrics::SdkMeterProvider, runtime, trace as sdktrace, Resource};
 
 use crate::core::{Error, Event, EventTracer, MetricsCollector, Operation, Result};
 

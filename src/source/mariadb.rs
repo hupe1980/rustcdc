@@ -18,10 +18,10 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
+use super::mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
 use super::mysql::{
     MysqlConnection, MysqlSnapshotHandle, MysqlSourceConfig, MysqlStreamHandle, ServerFlavor,
 };
-use super::mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
 
 /// Configuration for a MariaDB CDC connection.
 ///

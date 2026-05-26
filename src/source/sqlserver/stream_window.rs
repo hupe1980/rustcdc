@@ -185,7 +185,8 @@ impl SqlServerStreamHandle {
                 // UPDATE after-image: buffer until op=4 (before-image) arrives.
                 3 => {
                     let key = (change.start_lsn_hex, change.seqval_hex);
-                    self.pending_update_afters.insert(key, (change.row, change.ts_ms));
+                    self.pending_update_afters
+                        .insert(key, (change.row, change.ts_ms));
                 }
                 // UPDATE before-image: merge with buffered op=3 after-image.
                 4 => {

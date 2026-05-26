@@ -5,11 +5,11 @@ use crate::{
     source::helpers::now_millis,
 };
 
-use super::{format_pg_lsn, pg_timestamp_to_millis, PostgresStreamHandle};
 use super::decoder::{
     decode_pgoutput_message, PgDelete, PgInsert, PgOutputMessage, PgOutputXLogData, PgRelation,
     PgTruncate, PgUpdate, PgValue,
 };
+use super::{format_pg_lsn, pg_timestamp_to_millis, PostgresStreamHandle};
 
 impl PostgresStreamHandle {
     fn tuple_to_json(&self, relation_oid: u32, values: &[PgValue]) -> Option<serde_json::Value> {

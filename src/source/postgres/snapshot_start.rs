@@ -8,9 +8,9 @@ use crate::{
 };
 
 use super::{
-    now_millis, parse_table_reference, query_current_wal_lsn, query_primary_key_columns_and_types,
-    qualified_table_name, PostgresConnection, PostgresSnapshot, PostgresSnapshotHandle,
-    TableSnapshot, TableSnapshotState,
+    now_millis, parse_table_reference, qualified_table_name, query_current_wal_lsn,
+    query_primary_key_columns_and_types, PostgresConnection, PostgresSnapshot,
+    PostgresSnapshotHandle, TableSnapshot, TableSnapshotState,
 };
 
 pub(super) async fn start_postgres_snapshot_internal(

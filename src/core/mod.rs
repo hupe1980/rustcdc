@@ -10,8 +10,8 @@ mod otel;
 mod runtime;
 mod runtime_offsets;
 mod runtime_utils;
-mod transport;
 mod secret;
+mod transport;
 
 pub use error::{Error, Result};
 pub use event::{
@@ -28,8 +28,8 @@ pub use runtime::{
     RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig,
     RuntimeState, TransformErrorPolicy,
 };
-pub use transport::TransportConfig;
 pub use secret::{SecretProvider, SecretString};
+pub use transport::TransportConfig;
 
 use std::fmt::Debug;
 

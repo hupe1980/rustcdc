@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rustcdc::source::{SnapshotTrackerConfig, SnapshotProgressTracker, SnapshotProgress};
+use rustcdc::source::{SnapshotProgress, SnapshotProgressTracker, SnapshotTrackerConfig};
 
 const TABLE_COUNT: usize = 10;
 const ROWS_PER_TABLE: usize = 100_000;

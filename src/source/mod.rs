@@ -8,14 +8,13 @@ use crate::{
     core::{Event, Offset, Result},
 };
 
-pub mod snapshot_tracker;
-pub mod snapshot_progress;
-pub mod snapshot_validator;
 pub(crate) mod helpers;
+pub mod snapshot_progress;
+pub mod snapshot_tracker;
+pub mod snapshot_validator;
 
-pub use snapshot_tracker::
-    {SnapshotTrackerConfig, SnapshotTrackerReport, SnapshotProgressTracker};
 pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TableProgress};
+pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
 pub use snapshot_validator::{SnapshotValidationResult, SnapshotValidator};
 
 // ─── Table filtering ─────────────────────────────────────────────────────────
@@ -56,7 +55,6 @@ pub(crate) fn table_is_allowed(
     }
     !matches(exclude_list)
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotEnd {
@@ -205,10 +203,10 @@ pub trait Source: Send + Sync {
     }
 }
 
-#[cfg(feature = "mysql")]
-pub mod mysql;
 #[cfg(feature = "mariadb")]
 pub mod mariadb;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlserver")]
@@ -218,23 +216,23 @@ pub use sqlserver::SqlServerConnection;
 #[cfg(feature = "sqlserver")]
 pub use sqlserver::SqlServerSourceConfig;
 
-#[cfg(feature = "mysql")]
-pub use mysql::MysqlConnection;
-#[cfg(feature = "mysql")]
-pub use mysql::{MysqlSourceConfig, ServerFlavor};
 #[cfg(feature = "mariadb")]
 pub use mariadb::{
     MariaDbConnection, MariaDbIncrementalSnapshotHandle, MariaDbSnapshotHandle,
     MariaDbSourceConfig, MariaDbStreamHandle,
 };
+#[cfg(feature = "mysql")]
+pub use mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
+#[cfg(feature = "mysql")]
+pub use mysql::MysqlConnection;
+#[cfg(feature = "mysql")]
+pub use mysql::{MysqlSourceConfig, ServerFlavor};
+#[cfg(feature = "postgres")]
+pub use postgres::incremental_snapshot::IncrementalSnapshotHandle;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresConnection;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresSourceConfig;
-#[cfg(feature = "postgres")]
-pub use postgres::incremental_snapshot::IncrementalSnapshotHandle;
-#[cfg(feature = "mysql")]
-pub use mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
 #[cfg(feature = "sqlserver")]
 pub use sqlserver::incremental_snapshot::SqlServerIncrementalSnapshotHandle;
 

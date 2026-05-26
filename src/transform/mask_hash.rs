@@ -227,14 +227,10 @@ fn derive_encryption_key(secret: &SecretString) -> Result<[u8; 32]> {
 #[cfg(feature = "encryption")]
 fn parse_encrypted_payload(input: &str) -> Result<(&str, &str)> {
     let input = input.strip_prefix("enc:").ok_or_else(|| {
-        Error::TransformError(
-            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
-        )
+        Error::TransformError("encrypted payload must match format enc:<nonce>:<ciphertext>".into())
     })?;
     let sep = input.find(':').ok_or_else(|| {
-        Error::TransformError(
-            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
-        )
+        Error::TransformError("encrypted payload must match format enc:<nonce>:<ciphertext>".into())
     })?;
     let (nonce, rest) = input.split_at(sep);
     let ciphertext = &rest[1..];
@@ -250,11 +246,11 @@ fn parse_encrypted_payload(input: &str) -> Result<(&str, &str)> {
 mod tests {
     use ahash::AHashMap as HashMap;
 
-    use serde_json::json;
     #[cfg(feature = "encryption")]
     use crate::core::SecretString;
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     use crate::transform::Transform;
+    use serde_json::json;
 
     use super::{MaskHashConfig, MaskHashTransform, MaskRule};
 

@@ -35,10 +35,14 @@ where
             .checkpoint
             .get_committed_count()
             .await
-            .inspect_err(|error| self.record_runtime_error("runtime.start.committed_count", error))?;
+            .inspect_err(|error| {
+                self.record_runtime_error("runtime.start.committed_count", error)
+            })?;
         self.commit_barrier
             .hydrate_committed_event_count(committed_event_count)
-            .inspect_err(|error| self.record_runtime_error("runtime.start.barrier_hydrate", error))?;
+            .inspect_err(|error| {
+                self.record_runtime_error("runtime.start.barrier_hydrate", error)
+            })?;
 
         if matches!(self.source, RuntimeSource::Disabled) {
             self.state = RuntimeState::Running;

@@ -27,15 +27,15 @@ use tokio_postgres::Client;
 
 use crate::{
     checkpoint::Checkpoint,
-    core::{Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
-           EVENT_ENVELOPE_VERSION},
+    core::{
+        Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    },
     source::{IncrementalSnapshotConfig, StreamHandle},
 };
 
 use super::{
-    format_pg_lsn, now_millis, parse_pg_lsn, parse_table_reference,
-    qualified_table_name, query_current_wal_lsn, query_primary_key_columns_and_types,
-    quote_pg_identifier,
+    format_pg_lsn, now_millis, parse_pg_lsn, parse_table_reference, qualified_table_name,
+    query_current_wal_lsn, query_primary_key_columns_and_types, quote_pg_identifier,
 };
 
 // ─── Per-table metadata ───────────────────────────────────────────────────────
@@ -161,10 +161,7 @@ impl IncrementalSnapshotHandle {
 
     /// Execute a keyset-paginated chunk SELECT on the regular (READ COMMITTED)
     /// query client.  Returns decoded `(pk_values, row_json)` pairs.
-    async fn fetch_chunk(
-        &self,
-        table_idx: usize,
-    ) -> Result<Vec<(Vec<String>, serde_json::Value)>> {
+    async fn fetch_chunk(&self, table_idx: usize) -> Result<Vec<(Vec<String>, serde_json::Value)>> {
         let table = &self.tables[table_idx];
         let limit = i64::try_from(self.chunk_size).unwrap_or(i64::MAX);
         let pk_cols = &table.pk_columns;
@@ -345,8 +342,7 @@ impl IncrementalSnapshotHandle {
         };
 
         // Find the first incomplete table starting from table_idx.
-        let effective_idx = (table_idx..self.tables.len())
-            .find(|&i| !self.tables[i].is_complete);
+        let effective_idx = (table_idx..self.tables.len()).find(|&i| !self.tables[i].is_complete);
         let table_idx = match effective_idx {
             Some(idx) => idx,
             None => {
@@ -375,8 +371,7 @@ impl IncrementalSnapshotHandle {
                 "incremental snapshot: table complete",
             );
             // Advance to the next pending table.
-            let next = (table_idx + 1..self.tables.len())
-                .find(|&i| !self.tables[i].is_complete);
+            let next = (table_idx + 1..self.tables.len()).find(|&i| !self.tables[i].is_complete);
             self.phase = match next {
                 Some(idx) => Phase::ChunkPrepare { table_idx: idx },
                 None => Phase::Done,
@@ -394,8 +389,7 @@ impl IncrementalSnapshotHandle {
             .into_iter()
             .map(|(pk_values, json)| {
                 let fp = Self::pk_fingerprint(&pk_values);
-                let event =
-                    self.build_snapshot_event(table_idx, &pk_values, json, chunk_index);
+                let event = self.build_snapshot_event(table_idx, &pk_values, json, chunk_index);
                 (fp, event)
             })
             .collect();
@@ -503,8 +497,7 @@ impl StreamHandle for IncrementalSnapshotHandle {
                         Phase::ChunkEmit { table_idx, events } => {
                             let batch_size = events.len().min(1_000);
                             if batch_size > 0 {
-                                let batch: Vec<Event> =
-                                    events.drain(..batch_size).collect();
+                                let batch: Vec<Event> = events.drain(..batch_size).collect();
                                 return Ok(batch);
                             }
                             (*table_idx, true)
@@ -529,8 +522,7 @@ impl StreamHandle for IncrementalSnapshotHandle {
                 // ── Collect stream overrides ─────────────────────────────────
                 Phase::ChunkCollect { .. } => {
                     // Use a short timeout so we don't block too long per iteration.
-                    let stream_events =
-                        self.inner.next_events(timeout_ms.min(100)).await?;
+                    let stream_events = self.inner.next_events(timeout_ms.min(100)).await?;
 
                     // Extract the target table before the mutable borrow below.
                     let (table_idx, low_wm, high_wm) = match &self.phase {
@@ -556,16 +548,13 @@ impl StreamHandle for IncrementalSnapshotHandle {
                                 // Record override: event is for the snapshotted
                                 // table and its LSN falls in (low_wm, high_wm].
                                 let event_table = event.table.as_str();
-                                let event_schema =
-                                    event.schema.as_deref().unwrap_or("public");
+                                let event_schema = event.schema.as_deref().unwrap_or("public");
                                 if event_table == target_table
                                     && event_schema == target_schema
                                     && lsn > low_wm
                                     && lsn <= high_wm
                                 {
-                                    if let Some(fp) =
-                                        Self::extract_event_pk_fingerprint(event)
-                                    {
+                                    if let Some(fp) = Self::extract_event_pk_fingerprint(event) {
                                         override_pks.insert(fp);
                                     }
                                 }
@@ -622,9 +611,7 @@ impl StreamHandle for IncrementalSnapshotHandle {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION},
-    };
+    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 
     fn stream_event(table: &str, pk: u64, lsn: u64, op: Operation) -> Event {
         let pk_str = pk.to_string();
@@ -767,8 +754,14 @@ mod tests {
         // Only `inside` (pk=5) and `at_high` (pk=8) qualify.
         let fp5 = IncrementalSnapshotHandle::pk_fingerprint(&["5".into()]);
         let fp8 = IncrementalSnapshotHandle::pk_fingerprint(&["8".into()]);
-        assert!(overrides.contains(&fp5), "pk=5 inside window should be an override");
-        assert!(overrides.contains(&fp8), "pk=8 at high_wm should be an override");
+        assert!(
+            overrides.contains(&fp5),
+            "pk=5 inside window should be an override"
+        );
+        assert!(
+            overrides.contains(&fp8),
+            "pk=8 at high_wm should be an override"
+        );
         assert_eq!(overrides.len(), 2, "only 2 qualifying events");
     }
 
@@ -803,9 +796,18 @@ mod tests {
         };
 
         let chunk_rows: Vec<(String, Event)> = vec![
-            (IncrementalSnapshotHandle::pk_fingerprint(&["1".into()]), make_event(1)),
-            (IncrementalSnapshotHandle::pk_fingerprint(&["2".into()]), make_event(2)),
-            (IncrementalSnapshotHandle::pk_fingerprint(&["3".into()]), make_event(3)),
+            (
+                IncrementalSnapshotHandle::pk_fingerprint(&["1".into()]),
+                make_event(1),
+            ),
+            (
+                IncrementalSnapshotHandle::pk_fingerprint(&["2".into()]),
+                make_event(2),
+            ),
+            (
+                IncrementalSnapshotHandle::pk_fingerprint(&["3".into()]),
+                make_event(3),
+            ),
         ];
         let mut override_pks = HashSet::new();
         override_pks.insert(IncrementalSnapshotHandle::pk_fingerprint(&["2".into()]));
@@ -818,10 +820,15 @@ mod tests {
             .collect();
 
         assert_eq!(merged.len(), 2, "only pk=1 and pk=3 should be emitted");
-        assert!(merged
-            .iter()
-            .all(|e| e.after.as_ref().and_then(|j| j.get("id")).map(|v| v.as_str().unwrap_or("")) != Some("2")),
-            "pk=2 must be suppressed");
+        assert!(
+            merged.iter().all(|e| e
+                .after
+                .as_ref()
+                .and_then(|j| j.get("id"))
+                .map(|v| v.as_str().unwrap_or(""))
+                != Some("2")),
+            "pk=2 must be suppressed"
+        );
     }
 
     use super::*;

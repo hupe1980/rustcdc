@@ -119,11 +119,12 @@ impl FilterProjectionTransform {
                 "==" => FilterOperator::Eq,
                 _ => FilterOperator::Ne, // "!="; validate() already checked
             };
-            let value = parts[2]
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_owned();
-            ParsedFilter { field, operator, value }
+            let value = parts[2].trim_matches('"').trim_matches('\'').to_owned();
+            ParsedFilter {
+                field,
+                operator,
+                value,
+            }
         });
 
         // Pre-build column sets so project_payload has no per-event allocations.

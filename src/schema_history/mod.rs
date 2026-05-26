@@ -91,8 +91,7 @@ impl SchemaHistoryRetention {
     pub fn keep_last(max_versions_per_table: usize) -> Result<Self> {
         if max_versions_per_table == 0 {
             return Err(Error::ConfigError(
-                "schema history retention max_versions_per_table must be greater than zero"
-                    .into(),
+                "schema history retention max_versions_per_table must be greater than zero".into(),
             ));
         }
         Ok(Self {

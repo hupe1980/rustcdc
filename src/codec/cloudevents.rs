@@ -137,14 +137,8 @@ impl EventEncoder for CloudEventsEncoder {
 
         // Build the `data` payload (CDC-specific fields).
         let mut data = Map::new();
-        data.insert(
-            "before".into(),
-            event.before.clone().unwrap_or(Value::Null),
-        );
-        data.insert(
-            "after".into(),
-            event.after.clone().unwrap_or(Value::Null),
-        );
+        data.insert("before".into(), event.before.clone().unwrap_or(Value::Null));
+        data.insert("after".into(), event.after.clone().unwrap_or(Value::Null));
         if let Some(pk) = &event.primary_key {
             data.insert("primary_key".into(), json!(pk));
         }
@@ -248,7 +242,9 @@ fn is_leap_year(year: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{
+        Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+    };
 
     fn insert_event() -> Event {
         Event {
@@ -284,7 +280,10 @@ mod tests {
     #[test]
     fn rfc3339_known_date() {
         // 2024-05-25T00:00:00.000Z = 1716595200000 ms
-        assert_eq!(unix_ms_to_rfc3339(1716595200000), "2024-05-25T00:00:00.000Z");
+        assert_eq!(
+            unix_ms_to_rfc3339(1716595200000),
+            "2024-05-25T00:00:00.000Z"
+        );
     }
 
     #[test]
@@ -297,7 +296,10 @@ mod tests {
     #[test]
     fn rfc3339_leap_day() {
         // 2024-02-29T00:00:00.000Z = 1709164800000 ms
-        assert_eq!(unix_ms_to_rfc3339(1709164800000), "2024-02-29T00:00:00.000Z");
+        assert_eq!(
+            unix_ms_to_rfc3339(1709164800000),
+            "2024-02-29T00:00:00.000Z"
+        );
     }
 
     // ── CloudEvents encoder ──────────────────────────────────────────────────
@@ -371,7 +373,10 @@ mod tests {
         ev.schema = None;
         let out = enc.encode(&ev).unwrap();
         let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
-        assert!(ce.get("cdcschema").is_none(), "cdcschema must be absent when schema is None");
+        assert!(
+            ce.get("cdcschema").is_none(),
+            "cdcschema must be absent when schema is None"
+        );
     }
 
     #[test]

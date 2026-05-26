@@ -10,28 +10,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     checkpoint::PostgresOffset,
-    core::{
-        Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig,
-    },
+    core::{Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig},
     source::{
-        helpers::now_millis, ConnectorCapabilities, HandoffResult, SnapshotHandle, Source,
-        StreamHandle, IncrementalSnapshotConfig,
+        helpers::now_millis, ConnectorCapabilities, HandoffResult, IncrementalSnapshotConfig,
+        SnapshotHandle, Source, StreamHandle,
     },
 };
 
+mod config;
 mod decoder;
+mod handoff;
+pub mod incremental_snapshot;
 mod parser;
 mod query;
-mod state;
-mod config;
-mod handoff;
-mod stream_messages;
 mod snapshot_chunk;
 mod snapshot_finalize;
-mod stream_start;
 mod snapshot_start;
+mod state;
+mod stream_messages;
+mod stream_start;
 mod validation;
-pub mod incremental_snapshot;
 
 // Import decoder types used directly in this module.
 use self::decoder::{PgOutputMessageProvider, PgRelation};
@@ -39,18 +37,18 @@ use self::decoder::{PgOutputMessageProvider, PgRelation};
 use self::handoff::postgres_handoff_result;
 #[cfg(test)]
 use self::handoff::postgres_handoff_stream_watermark_gap;
+pub use self::incremental_snapshot::IncrementalSnapshotHandle;
 use self::snapshot_chunk::next_postgres_snapshot_chunk;
 use self::snapshot_finalize::{checkpoint_postgres_snapshot, finish_postgres_snapshot};
 use self::snapshot_start::{
     start_postgres_snapshot_from_checkpoint, start_postgres_snapshot_internal,
 };
-use self::stream_start::start_postgres_stream;
-use self::validation::validate_connected_postgres_client;
 use self::state::{
     ConnectionState, PostgresHandoff, PostgresStream, SnapshotCheckpointState, StreamState,
     TableSnapshotState,
 };
-pub use self::incremental_snapshot::IncrementalSnapshotHandle;
+use self::stream_start::start_postgres_stream;
+use self::validation::validate_connected_postgres_client;
 
 const HEARTBEAT_SECS: u64 = 60;
 const DEFAULT_SNAPSHOT_CHUNK_SIZE: usize = 5_000;
@@ -468,7 +466,9 @@ impl PostgresConnection {
                 let (client, connection) = connect_config
                     .connect(tokio_postgres::NoTls)
                     .await
-                    .map_err(|error| Error::SourceError(format!("postgres plaintext connection failed: {error}")))?;
+                    .map_err(|error| {
+                        Error::SourceError(format!("postgres plaintext connection failed: {error}"))
+                    })?;
                 let connection_task = tokio::spawn(run_connection_task(connection));
                 self.validate_connected_client(&client).await?;
                 let client = Arc::new(client);
@@ -479,13 +479,16 @@ impl PostgresConnection {
                 state.heartbeat_task = Some(heartbeat_task);
                 Ok(())
             }
-            TransportConfig::Tls { ca_cert_path, client_cert_path, client_key_path } => {
+            TransportConfig::Tls {
+                ca_cert_path,
+                client_cert_path,
+                client_key_path,
+            } => {
                 #[cfg(not(feature = "tls"))]
                 {
                     let _ = (ca_cert_path, client_cert_path, client_key_path);
                     return Err(Error::ConfigError(
-                        "postgres connector requires crate feature 'tls' for TLS transport"
-                            .into(),
+                        "postgres connector requires crate feature 'tls' for TLS transport".into(),
                     ));
                 }
 
@@ -504,7 +507,9 @@ impl PostgresConnection {
                     let (client, connection) = connect_config
                         .connect(tls_connector)
                         .await
-                        .map_err(|error| Error::SourceError(format!("postgres tls connection failed: {error}")))?;
+                        .map_err(|error| {
+                            Error::SourceError(format!("postgres tls connection failed: {error}"))
+                        })?;
 
                     let connection_task = tokio::spawn(run_connection_task(connection));
                     self.validate_connected_client(&client).await?;
@@ -581,8 +586,7 @@ impl PostgresConnection {
         };
         let inner = start_postgres_stream(self, resume_from).await?;
         let source_name = self.source_type().to_string();
-        let handle =
-            IncrementalSnapshotHandle::new(inner, client, config, source_name).await?;
+        let handle = IncrementalSnapshotHandle::new(inner, client, config, source_name).await?;
         Ok(Box::new(handle))
     }
 
@@ -889,17 +893,15 @@ mod tests {
     use crate::checkpoint::{Checkpoint, InMemoryCheckpoint, PostgresOffset};
     use crate::source::{SnapshotHandle, Source, StreamHandle};
 
-    use super::PostgresSourceConfig;
+    use super::decoder::{decode_pgoutput_message, PgOutputMessage, PgOutputXLogData, PgValue};
+    use super::parser::map_pgoutput_poll_error;
     use super::validation::{validate_with_backend, ValidationBackend};
+    use super::PostgresSourceConfig;
     use super::{
         PgOutputMessageProvider, PostgresConnection, PostgresSnapshotHandle, PostgresStream,
         PostgresStreamHandle, StreamState, TableSnapshot, TableSnapshotState, MAX_EVENTS_PER_POLL,
         STREAM_POLL_INTERVAL_MS,
     };
-    use super::decoder::{
-        decode_pgoutput_message, PgOutputMessage, PgOutputXLogData, PgValue,
-    };
-    use super::parser::map_pgoutput_poll_error;
     use crate::{core::TransportConfig, SecretString};
 
     // ─── Validation backend mock ─────────────────────────────────────────────
@@ -1536,8 +1538,7 @@ mod tests {
 
     #[test]
     fn pgoutput_poll_error_maps_dead_slot_guidance() {
-        let err =
-            map_pgoutput_poll_error("slot1", "ERROR: required WAL segment has been removed");
+        let err = map_pgoutput_poll_error("slot1", "ERROR: required WAL segment has been removed");
         let msg = err.to_string();
         assert!(msg.contains("stale or dead"));
         assert!(msg.contains("slot1"));
@@ -1740,9 +1741,7 @@ mod tests {
             ..Default::default()
         };
 
-        validate_with_backend(&config, &backend)
-            .await
-            .unwrap();
+        validate_with_backend(&config, &backend).await.unwrap();
         assert!(backend.create_called.load(Ordering::Relaxed));
     }
 
@@ -1769,9 +1768,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = validate_with_backend(&config, &backend)
-            .await
-            .unwrap_err();
+        let error = validate_with_backend(&config, &backend).await.unwrap_err();
         assert!(matches!(error, crate::core::Error::SourceError(_)));
     }
 
@@ -1798,9 +1795,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = validate_with_backend(&config, &backend)
-            .await
-            .unwrap_err();
+        let error = validate_with_backend(&config, &backend).await.unwrap_err();
         assert!(matches!(error, crate::core::Error::SourceError(_)));
     }
 

@@ -306,7 +306,9 @@ impl ExampleArgs {
             conn_timeout_secs: env_or_default("CDC_RS_CONN_TIMEOUT_SECS", "30")
                 .parse::<u64>()
                 .map_err(|error| {
-                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_CONN_TIMEOUT_SECS: {error}"))
+                    rustcdc::Error::ConfigError(format!(
+                        "invalid CDC_RS_CONN_TIMEOUT_SECS: {error}"
+                    ))
                 })?,
             max_events: env_or_default("CDC_RS_MAX_EVENTS", "0")
                 .parse::<usize>()

@@ -1,9 +1,7 @@
 use mysql_async::{prelude::Queryable, Pool as MySqlPool};
 
-use crate::{
-    core::{Error, Offset, Result},
-};
 use super::parser::decode_stream_resume_position;
+use crate::core::{Error, Offset, Result};
 
 pub(super) struct MysqlStreamStartPosition {
     pub(super) binlog_file: String,

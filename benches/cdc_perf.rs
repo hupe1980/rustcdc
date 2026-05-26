@@ -1,7 +1,10 @@
 use async_trait::async_trait;
-use rustcdc::transform::{Transform, TransformPipeline};
-use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime, EVENT_ENVELOPE_VERSION};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use rustcdc::transform::{Transform, TransformPipeline};
+use rustcdc::{
+    Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime,
+    EVENT_ENVELOPE_VERSION,
+};
 use serde_json::json;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -351,18 +354,17 @@ fn bench_wasm_transform_pass_through(c: &mut Criterion) {
         .build()
         .expect("build tokio runtime");
 
-    let mut runtime = rt
-        .block_on(async {
-            let mut r = WasmRuntime::new_with_config(WasmConfig {
-                module_path: wasm_file.path().to_path_buf(),
-                timeout_ms: 50,
-                memory_limit_mb: 16,
-                ..Default::default()
-            })
-            .expect("create wasm runtime");
-            r.init().await.expect("init wasm runtime");
-            r
-        });
+    let mut runtime = rt.block_on(async {
+        let mut r = WasmRuntime::new_with_config(WasmConfig {
+            module_path: wasm_file.path().to_path_buf(),
+            timeout_ms: 50,
+            memory_limit_mb: 16,
+            ..Default::default()
+        })
+        .expect("create wasm runtime");
+        r.init().await.expect("init wasm runtime");
+        r
+    });
 
     let event = build_event(1);
 
@@ -431,5 +433,10 @@ fn bench_wasm_suite(c: &mut Criterion) {
     bench_wasm_transform_filter_all(c);
 }
 
-criterion_group!(cdc_perf, bench_full_quality_suite, bench_utility, bench_wasm_suite);
+criterion_group!(
+    cdc_perf,
+    bench_full_quality_suite,
+    bench_utility,
+    bench_wasm_suite
+);
 criterion_main!(cdc_perf);

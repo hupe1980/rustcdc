@@ -57,9 +57,12 @@ async fn runtime_mysql_process_kill_replays_uncommitted_batch() -> rustcdc::Resu
 }
 
 #[tokio::test]
-async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> rustcdc::Result<()> {
+async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> rustcdc::Result<()>
+{
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping mysql snapshot crash-resume integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        eprintln!(
+            "skipping mysql snapshot crash-resume integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"
+        );
         return Ok(());
     }
 
@@ -131,12 +134,14 @@ async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> 
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
     let reader_after_worker = FileCheckpoint::new(checkpoint_dir.path());
-    let saved = reader_after_worker
-        .load()
-        .await?
-        .ok_or_else(|| rustcdc::Error::StateError("checkpoint should exist after worker ack".into()))?;
+    let saved = reader_after_worker.load().await?.ok_or_else(|| {
+        rustcdc::Error::StateError("checkpoint should exist after worker ack".into())
+    })?;
     assert_eq!(saved.source_type(), "mysql_snapshot");
-    assert_eq!(reader_after_worker.get_committed_count().await?, marker.events as u64);
+    assert_eq!(
+        reader_after_worker.get_committed_count().await?,
+        marker.events as u64
+    );
 
     let source_cfg = MysqlSourceConfig {
         host: host_text,
@@ -295,8 +300,15 @@ async fn run_mysql_process_kill_replay_scenario(
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let mut worker =
-        spawn_crash_worker(&host_text, port, checkpoint_dir.path(), &marker_file, 402, None, false)?;
+    let mut worker = spawn_crash_worker(
+        &host_text,
+        port,
+        checkpoint_dir.path(),
+        &marker_file,
+        402,
+        None,
+        false,
+    )?;
 
     wait_for_marker(&marker_file, Duration::from_secs(90))?;
     let worker_batch_len = read_worker_batch_len(&marker_file)?;
@@ -446,15 +458,7 @@ fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
 
 fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
     let status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "xtask",
-            "--bin",
-            bin,
-            "--features",
-            feature,
-        ])
+        .args(["build", "-p", "xtask", "--bin", bin, "--features", feature])
         .status()
         .map_err(rustcdc::Error::IoError)?;
 

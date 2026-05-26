@@ -72,7 +72,11 @@ pub(super) fn sqlserver_event_pk_fingerprint(event: &Event) -> Option<String> {
         return None;
     }
 
-    let row = event.after.as_ref().or(event.before.as_ref())?.as_object()?;
+    let row = event
+        .after
+        .as_ref()
+        .or(event.before.as_ref())?
+        .as_object()?;
 
     let mut fingerprint = String::with_capacity(64);
     fingerprint.push_str(&event.table);
@@ -225,7 +229,11 @@ fn parse_sqlserver_identifier_path(input: &str) -> Result<Vec<String>> {
     Ok(parts)
 }
 
-fn finalize_sqlserver_identifier_segment(raw: &str, quoted: bool, full_input: &str) -> Result<String> {
+fn finalize_sqlserver_identifier_segment(
+    raw: &str,
+    quoted: bool,
+    full_input: &str,
+) -> Result<String> {
     let segment = if quoted {
         raw.to_string()
     } else {
@@ -345,7 +353,10 @@ pub(super) fn build_cdc_poll_sql(
 }
 
 pub(super) fn build_snapshot_row_count_sql(schema: &str, table: &str) -> String {
-    format!("SELECT COUNT_BIG(1) FROM {}", qualified_table_name(schema, table))
+    format!(
+        "SELECT COUNT_BIG(1) FROM {}",
+        qualified_table_name(schema, table)
+    )
 }
 
 pub(super) fn is_sqlserver_cdc_window_error(message: &str) -> bool {

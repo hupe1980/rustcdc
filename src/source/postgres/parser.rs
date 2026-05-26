@@ -85,7 +85,11 @@ fn parse_postgres_identifier_path(input: &str) -> Result<Vec<String>> {
     Ok(parts)
 }
 
-fn finalize_postgres_identifier_segment(raw: &str, quoted: bool, full_input: &str) -> Result<String> {
+fn finalize_postgres_identifier_segment(
+    raw: &str,
+    quoted: bool,
+    full_input: &str,
+) -> Result<String> {
     let segment = if quoted {
         raw.to_string()
     } else {

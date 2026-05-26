@@ -20,8 +20,8 @@
 
 // Re-export the public sink API so callers importing via `testkit` continue to work.
 pub use crate::sink::{
-    AdapterConformanceSuite, AdapterConformanceTest, AdapterGoldenFixture,
-    BasicAdapterConformance, MemorySinkAdapter, SinkAdapter, TestResult,
+    AdapterConformanceSuite, AdapterConformanceTest, AdapterGoldenFixture, BasicAdapterConformance,
+    MemorySinkAdapter, SinkAdapter, TestResult,
 };
 
 use std::{

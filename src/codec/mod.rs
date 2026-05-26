@@ -41,21 +41,21 @@
 //! assert!(!output.bytes.is_empty());
 //! ```
 
-pub mod json;
-#[cfg(feature = "cloudevents")]
-pub mod cloudevents;
-#[cfg(feature = "protobuf")]
-pub mod protobuf;
 #[cfg(feature = "avro")]
 pub mod avro;
-
-pub use json::{JsonEncoder, JsonPrettyEncoder};
 #[cfg(feature = "cloudevents")]
-pub use cloudevents::CloudEventsEncoder;
+pub mod cloudevents;
+pub mod json;
 #[cfg(feature = "protobuf")]
-pub use protobuf::ProtobufEncoder;
+pub mod protobuf;
+
 #[cfg(feature = "avro")]
 pub use avro::AvroEncoder;
+#[cfg(feature = "cloudevents")]
+pub use cloudevents::CloudEventsEncoder;
+pub use json::{JsonEncoder, JsonPrettyEncoder};
+#[cfg(feature = "protobuf")]
+pub use protobuf::ProtobufEncoder;
 
 use crate::core::{Event, Result};
 
@@ -73,7 +73,10 @@ pub struct EncodedOutput {
 impl EncodedOutput {
     /// Create a new `EncodedOutput`.
     pub fn new(bytes: Vec<u8>, content_type: &'static str) -> Self {
-        Self { bytes, content_type }
+        Self {
+            bytes,
+            content_type,
+        }
     }
 }
 
@@ -116,8 +119,8 @@ pub trait EventEncoder: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     use crate::codec::json::JsonEncoder;
+    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 
     fn sample_event() -> Event {
         Event {
