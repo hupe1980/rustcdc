@@ -430,12 +430,8 @@ mod tests {
         continuous.mark_table_complete("orders").unwrap();
 
         // Path B: checkpoint mid-run, restore, then continue.
-        let before_restore = SnapshotProgressTracker::new(
-            "snap-identical".into(),
-            100,
-            tables,
-            Default::default(),
-        );
+        let before_restore =
+            SnapshotProgressTracker::new("snap-identical".into(), 100, tables, Default::default());
         before_restore
             .record_chunk_progress("users", 100, Some(b"u-1".to_vec()))
             .unwrap();
@@ -447,10 +443,9 @@ mod tests {
             .unwrap();
         before_restore.mark_table_complete("users").unwrap();
 
-        let encoded = SnapshotCheckpointHelper::serialize_progress(
-            &before_restore.get_progress().unwrap(),
-        )
-        .unwrap();
+        let encoded =
+            SnapshotCheckpointHelper::serialize_progress(&before_restore.get_progress().unwrap())
+                .unwrap();
         let restored = SnapshotCheckpointHelper::deserialize_progress(&encoded).unwrap();
 
         let resumed = SnapshotProgressTracker::new(
@@ -471,7 +466,10 @@ mod tests {
 
         assert_eq!(final_a.snapshot_id, final_b.snapshot_id);
         assert_eq!(final_a.created_at, final_b.created_at);
-        assert_eq!(final_a.total_rows_processed(), final_b.total_rows_processed());
+        assert_eq!(
+            final_a.total_rows_processed(),
+            final_b.total_rows_processed()
+        );
         assert_eq!(final_a.completed_tables(), final_b.completed_tables());
         assert_eq!(final_a.get_pending_tables(), final_b.get_pending_tables());
 

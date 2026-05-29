@@ -338,7 +338,11 @@ async fn postgres_incremental_snapshot_reads_all_seed_rows_once() -> rustcdc::Re
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
+                .and_then(|value| {
+                    value
+                        .as_i64()
+                        .or_else(|| value.as_str()?.parse::<i64>().ok())
+                })
                 .ok_or_else(|| {
                     rustcdc::Error::SourceError("incremental snapshot row missing id".into())
                 })?;
