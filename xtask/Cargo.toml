@@ -11,6 +11,7 @@ tls = ["rustcdc/tls"]
 postgres = ["rustcdc/postgres"]
 mysql = ["rustcdc/mysql"]
 sqlserver = ["rustcdc/sqlserver", "tls"]
+insecure-test-overrides = ["rustcdc/insecure-test-overrides"]
 
 [dependencies]
 rustcdc = { path = "..", default-features = false }
