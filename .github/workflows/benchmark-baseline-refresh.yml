@@ -1,0 +1,38 @@
+name: benchmark-baseline-refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_name:
+        description: Criterion baseline name to save
+        required: true
+        default: ci-baseline
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      BENCHMARK_STRICT: "1"
+      BENCHMARK_BASELINE_COMMIT: ${{ github.sha }}
+      BENCHMARK_BASELINE_ARTIFACT: BENCHMARK_REPORT.md
+      BENCHMARK_SAVE_BASELINE: ${{ github.event.inputs.baseline_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: save criterion baseline
+        run: bash scripts/ci-benchmark-gate.sh
+      - name: upload benchmark baseline artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline-${{ github.event.inputs.baseline_name }}
+          path: |
+            target/benchmark-ci-gate*.txt
+            target/benchmark-ci-env.txt
+            target/criterion
+            BENCHMARK_REPORT.md

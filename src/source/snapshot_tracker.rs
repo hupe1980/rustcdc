@@ -398,4 +398,99 @@ mod tests {
         let c_progress = restored.get_table_progress("c").unwrap();
         assert_eq!(c_progress.cursor_token, Some(b"pk-50".to_vec()));
     }
+
+    /// Behavioral identity: continuing from a restored checkpoint should produce
+    /// the same final progress state as running uninterrupted.
+    #[test]
+    fn test_checkpoint_restore_matches_continuous_progression() {
+        use crate::source::snapshot_progress::SnapshotCheckpointHelper;
+
+        let tables = vec!["users".into(), "orders".into()];
+
+        // Path A: uninterrupted progression.
+        let continuous = SnapshotProgressTracker::new(
+            "snap-identical".into(),
+            100,
+            tables.clone(),
+            Default::default(),
+        );
+        continuous
+            .record_chunk_progress("users", 100, Some(b"u-1".to_vec()))
+            .unwrap();
+        continuous
+            .record_chunk_progress("users", 80, Some(b"u-2".to_vec()))
+            .unwrap();
+        continuous
+            .record_chunk_progress("orders", 200, Some(b"o-1".to_vec()))
+            .unwrap();
+        continuous.mark_table_complete("users").unwrap();
+        continuous
+            .record_chunk_progress("orders", 50, Some(b"o-2".to_vec()))
+            .unwrap();
+        continuous.mark_table_complete("orders").unwrap();
+
+        // Path B: checkpoint mid-run, restore, then continue.
+        let before_restore = SnapshotProgressTracker::new(
+            "snap-identical".into(),
+            100,
+            tables,
+            Default::default(),
+        );
+        before_restore
+            .record_chunk_progress("users", 100, Some(b"u-1".to_vec()))
+            .unwrap();
+        before_restore
+            .record_chunk_progress("users", 80, Some(b"u-2".to_vec()))
+            .unwrap();
+        before_restore
+            .record_chunk_progress("orders", 200, Some(b"o-1".to_vec()))
+            .unwrap();
+        before_restore.mark_table_complete("users").unwrap();
+
+        let encoded = SnapshotCheckpointHelper::serialize_progress(
+            &before_restore.get_progress().unwrap(),
+        )
+        .unwrap();
+        let restored = SnapshotCheckpointHelper::deserialize_progress(&encoded).unwrap();
+
+        let resumed = SnapshotProgressTracker::new(
+            "snap-identical".into(),
+            100,
+            vec!["users".into(), "orders".into()],
+            Default::default(),
+        );
+        *resumed.progress.lock().unwrap() = restored;
+
+        resumed
+            .record_chunk_progress("orders", 50, Some(b"o-2".to_vec()))
+            .unwrap();
+        resumed.mark_table_complete("orders").unwrap();
+
+        let final_a = continuous.get_progress().unwrap();
+        let final_b = resumed.get_progress().unwrap();
+
+        assert_eq!(final_a.snapshot_id, final_b.snapshot_id);
+        assert_eq!(final_a.created_at, final_b.created_at);
+        assert_eq!(final_a.total_rows_processed(), final_b.total_rows_processed());
+        assert_eq!(final_a.completed_tables(), final_b.completed_tables());
+        assert_eq!(final_a.get_pending_tables(), final_b.get_pending_tables());
+
+        for table in ["users", "orders"] {
+            let a = final_a.get_table_progress(table).unwrap();
+            let b = final_b.get_table_progress(table).unwrap();
+            assert_eq!(a.row_count, b.row_count, "row_count mismatch for {table}");
+            assert_eq!(
+                a.chunk_index, b.chunk_index,
+                "chunk_index mismatch for {table}"
+            );
+            assert_eq!(
+                a.cursor_token, b.cursor_token,
+                "cursor mismatch for {table}"
+            );
+            assert_eq!(
+                a.is_complete, b.is_complete,
+                "completion mismatch for {table}"
+            );
+        }
+    }
 }

@@ -84,6 +84,21 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  transport-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --lib --features postgres,tls
+        run: cargo test --lib --features postgres,tls
+      - name: cargo test --lib --features mysql,tls
+        run: cargo test --lib --features mysql,tls
+      - name: cargo test --lib --features sqlserver,tls
+        run: cargo test --lib --features sqlserver,tls
+
   docs-link-check:
     runs-on: ubuntu-latest
     steps:
@@ -108,6 +123,7 @@ jobs:
   benchmark-regression-gate:
     runs-on: ubuntu-latest
     env:
+      CRITERION_BASELINE: ci-baseline
       BENCHMARK_BASELINE_COMMIT: ${{ github.sha }}
       BENCHMARK_BASELINE_ARTIFACT: BENCHMARK_REPORT.md
     steps:

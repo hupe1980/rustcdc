@@ -2,7 +2,7 @@
 
 use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint},
-    source::Source,
+    source::{IncrementalSnapshotConfig, Source},
     PostgresConnection, PostgresSourceConfig,
 };
 use testcontainers::{
@@ -201,6 +201,160 @@ async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         chunk_count
     );
 
+    Ok(())
+}
+
+/// Test connector-level incremental snapshot end-to-end on PostgreSQL.
+///
+/// Validates: non-blocking incremental snapshot emits each existing row exactly
+/// once for the configured table under steady-state (no concurrent writes).
+#[tokio::test]
+async fn postgres_incremental_snapshot_reads_all_seed_rows_once() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres incremental snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+
+    let container = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=8",
+            "-c",
+            "max_wal_senders=8",
+        ])
+        .start()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let host = container
+        .get_host()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let admin_dsn = format!(
+        "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
+    );
+    let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+
+    admin_client
+        .batch_execute(
+            "
+            CREATE TABLE IF NOT EXISTS public.incremental_snapshot_test (
+              id BIGINT PRIMARY KEY,
+              payload TEXT NOT NULL
+            );
+            ALTER TABLE public.incremental_snapshot_test REPLICA IDENTITY FULL;
+            DROP PUBLICATION IF EXISTS incremental_snapshot_pub;
+            CREATE PUBLICATION incremental_snapshot_pub FOR TABLE public.incremental_snapshot_test;
+            TRUNCATE TABLE public.incremental_snapshot_test;
+            ",
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let row_count = 5_000_i64;
+    for id in 1_i64..=row_count {
+        let payload = format!("seed-{id}");
+        admin_client
+            .execute(
+                "INSERT INTO public.incremental_snapshot_test (id, payload) VALUES ($1, $2)",
+                &[&id, &payload],
+            )
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    }
+
+    let source_cfg = PostgresSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "postgres".to_string(),
+        password: "postgres".to_string().into(),
+        database: "cdc".to_string(),
+        replication_slot_name: "incremental_snapshot_slot".to_string(),
+        publication_name: "incremental_snapshot_pub".to_string(),
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        ..PostgresSourceConfig::default()
+    };
+
+    let mut connection = PostgresConnection::new(source_cfg);
+    connection.connect().await?;
+
+    let mut handle = connection
+        .start_incremental_snapshot(
+            IncrementalSnapshotConfig::new(vec!["public.incremental_snapshot_test".to_string()])
+                .with_chunk_size(500),
+            None,
+        )
+        .await?;
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut empty_polls = 0usize;
+
+    for _ in 0..300 {
+        if seen_ids.len() == row_count as usize {
+            break;
+        }
+
+        let events = handle.next_events(250).await?;
+        if events.is_empty() {
+            empty_polls += 1;
+            if empty_polls >= 20 {
+                break;
+            }
+            continue;
+        }
+        empty_polls = 0;
+
+        for event in events {
+            if event.table != "incremental_snapshot_test" {
+                continue;
+            }
+            if event.op != rustcdc::Operation::Read {
+                continue;
+            }
+            let after = event.after.ok_or_else(|| {
+                rustcdc::Error::SourceError("incremental snapshot row missing after payload".into())
+            })?;
+            let id = after
+                .get("id")
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
+                .ok_or_else(|| {
+                    rustcdc::Error::SourceError("incremental snapshot row missing id".into())
+                })?;
+
+            let is_new = seen_ids.insert(id);
+            assert!(is_new, "duplicate id from incremental snapshot: {id}");
+        }
+    }
+
+    assert_eq!(
+        seen_ids.len(),
+        row_count as usize,
+        "incremental snapshot should emit every seeded row exactly once"
+    );
+
+    connection.close().await;
     Ok(())
 }
 

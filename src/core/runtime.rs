@@ -9,7 +9,10 @@ use crate::{
     checkpoint::{CommitBarrier, GenericOffset},
     ddl_capture::{parse_ddl_statement, DdlDialect},
     schema_history::{SchemaHistory, SchemaHistoryRetention},
-    source::{ConnectorCapabilities, HandoffResult, SnapshotHandle, StreamHandle},
+    source::{
+        ConnectorCapabilities, HandoffResult, IncrementalSnapshotConfig, SnapshotHandle,
+        StreamHandle,
+    },
     transform::TransformPipeline,
 };
 
@@ -580,6 +583,12 @@ pub struct RuntimeConfig<C, H> {
     pub source: RuntimeSourceConfig,
     /// Snapshot table list used on first run when no checkpoint exists.
     pub snapshot_tables: Vec<String>,
+    /// Optional incremental (non-blocking) snapshot configuration.
+    ///
+    /// When set, runtime startup initializes stream ingestion through the connector's
+    /// watermark-based incremental snapshot handle instead of the classic
+    /// snapshot + handoff path.
+    pub incremental_snapshot: Option<IncrementalSnapshotConfig>,
     /// Checkpoint backend owned by the runtime.
     pub checkpoint: C,
     /// Schema history backend owned by the runtime.
@@ -594,6 +603,7 @@ impl<C, H> RuntimeConfig<C, H> {
         Self {
             source,
             snapshot_tables: Vec::new(),
+            incremental_snapshot: None,
             checkpoint,
             schema_history,
             options: RuntimeOptions::default(),
@@ -692,6 +702,15 @@ impl<C, H> RuntimeConfig<C, H> {
     /// Configure snapshot tables for initial snapshot mode.
     pub fn with_snapshot_tables(mut self, snapshot_tables: Vec<String>) -> Self {
         self.snapshot_tables = snapshot_tables;
+        self
+    }
+
+    /// Configure runtime startup to use incremental (non-blocking) snapshot mode.
+    ///
+    /// This supersedes the classic `with_snapshot_tables` bootstrapping path.
+    /// Do not set both at once.
+    pub fn with_incremental_snapshot(mut self, config: IncrementalSnapshotConfig) -> Self {
+        self.incremental_snapshot = Some(config);
         self
     }
 }
@@ -812,6 +831,29 @@ impl RuntimeSource {
             )),
             #[cfg(test)]
             Self::Mock(source) => source.start_stream(resume_from).await,
+        }
+    }
+
+    #[allow(unused_variables)]
+    async fn start_incremental_snapshot(
+        &mut self,
+        config: IncrementalSnapshotConfig,
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn StreamHandle>> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(source) => source.start_incremental_snapshot(config, resume_from).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(source) => source.start_incremental_snapshot(config, resume_from).await,
+            #[cfg(feature = "sqlserver")]
+            Self::SqlServer(source) => source.start_incremental_snapshot(config, resume_from).await,
+            Self::Disabled => Err(Error::ConfigError(
+                "runtime source is disabled in this build".into(),
+            )),
+            #[cfg(test)]
+            Self::Mock(_) => Err(Error::ConfigError(
+                "incremental snapshot startup is unsupported for mock runtime source".into(),
+            )),
         }
     }
 

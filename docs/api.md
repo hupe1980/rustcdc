@@ -47,6 +47,9 @@ let config = RuntimeConfig::new(
 .with_idempotency(IdempotencyOptions::new(100_000)?)
 .with_max_poll_wait_ms(500);
 
+// InMemoryCheckpoint is for tests and local development only.
+// Use FileCheckpoint (or a custom durable backend) in production.
+
 // Runtime duplicate suppression is enabled by default.
 // Use this only when you need to opt out explicitly.
 let config_without_dedup = RuntimeConfig::new(
@@ -153,6 +156,7 @@ Important semantics:
 - not acknowledging after sink durability may replay already-delivered events
 - `stop()` fails fast if uncommitted events remain in-flight
 - `force_stop()` is intended for emergency drain where replay is acceptable
+- process termination without `stop()` can replay the in-flight batch on restart (at-least-once)
 - source confirmation failures after durable checkpoint commit now fail fast by default (`PostCommitSourceConfirmPolicy::FailFast`)
 
 To preserve pre-existing availability-biased behavior, opt into continue mode explicitly:
@@ -208,6 +212,37 @@ while let Some(batch) = batches.next().await {
 }
 ```
 
+## Incremental Snapshot API (DBLog Pattern)
+
+`CdcRuntime::start()` currently initializes the classic snapshot + stream handoff.
+If you want non-blocking incremental snapshot behavior, start it from a connector
+connection directly via `start_incremental_snapshot(...)`.
+
+```rust
+use rustcdc::{
+  IncrementalSnapshotConfig, PostgresConnection, PostgresSourceConfig, Result,
+};
+
+async fn start_incremental_stream(config: PostgresSourceConfig) -> Result<()> {
+  let mut connection = PostgresConnection::new(config);
+  connection.connect().await?;
+
+  let incremental = IncrementalSnapshotConfig::new(vec!["public.users".to_string()])
+    .with_chunk_size(1_000);
+
+  let mut stream = connection
+    .start_incremental_snapshot(incremental, None)
+    .await?;
+
+  let _events = stream.next_events(5_000).await?;
+  Ok(())
+}
+```
+
+This connector-level API is also available for MySQL and SQL Server via
+`MysqlConnection::start_incremental_snapshot(...)` and
+`SqlServerConnection::start_incremental_snapshot(...)`.
+
 ## Checkpoint Backends
 
 Checkpoint implementations persist source offsets and determine restart position.
@@ -216,7 +251,6 @@ Built-in options include:
 
 - in-memory checkpoint storage (tests)
 - file-backed checkpoint storage
-- PostgreSQL-backed checkpoint storage
 
 Custom checkpoint backends can be implemented through the `Checkpoint` trait.
 

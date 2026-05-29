@@ -13,6 +13,9 @@ jobs:
   # ── Sanity checks ──────────────────────────────────────────────────────────
   preflight:
     runs-on: ubuntu-latest
+    env:
+      CDC_RS_RUN_DOCKER_TESTS: "1"
+      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,6 +47,24 @@ jobs:
 
       - name: cargo package (dry-run)
         run: cargo package --no-verify --all-features
+
+      - name: full integration and reliability matrix evidence
+        run: bash scripts/run_full_integration_matrix_evidence.sh
+
+      - name: upload release-gate evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-evidence
+          path: |
+            target/integration-full-matrix-evidence.txt
+            target/latency-evidence.txt
+            target/latency-gate.txt
+            target/postgres-latency-evidence.json
+            target/postgres-latency-evidence.md
+            target/mysql-latency-evidence.json
+            target/mysql-latency-evidence.md
+            target/sqlserver-latency-evidence.json
+            target/sqlserver-latency-evidence.md
 
   # ── Publish ────────────────────────────────────────────────────────────────
   publish:

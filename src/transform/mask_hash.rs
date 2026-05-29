@@ -222,15 +222,20 @@ fn derive_encryption_key(secret: &SecretString) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// Parses an encrypted field payload in the format `enc:<nonce_b64>:<ciphertext_b64>`.
+/// Parses an encrypted field payload in the format
+/// `enc:<nonce_b64>:<ciphertext_b64>`.
 /// Returns `(nonce_b64, ciphertext_b64)` on success.
 #[cfg(feature = "encryption")]
 fn parse_encrypted_payload(input: &str) -> Result<(&str, &str)> {
     let input = input.strip_prefix("enc:").ok_or_else(|| {
-        Error::TransformError("encrypted payload must match format enc:<nonce>:<ciphertext>".into())
+        Error::TransformError(
+            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
+        )
     })?;
     let sep = input.find(':').ok_or_else(|| {
-        Error::TransformError("encrypted payload must match format enc:<nonce>:<ciphertext>".into())
+        Error::TransformError(
+            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
+        )
     })?;
     let (nonce, rest) = input.split_at(sep);
     let ciphertext = &rest[1..];
@@ -438,5 +443,30 @@ mod tests {
 
         let mut decrypt_event = encrypted_event;
         assert!(decrypt.apply(&mut decrypt_event).await.is_err());
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn decrypt_rejects_invalid_unversioned_payload_format() {
+        let mut decrypt_rules = HashMap::new();
+        decrypt_rules.insert(
+            "email".into(),
+            MaskRule::Decrypt(SecretString::new("field-key")),
+        );
+        let decrypt = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: decrypt_rules,
+            default_rule: MaskRule::Null,
+        });
+
+        let mut malformed_event = event();
+        malformed_event.after = Some(json!({
+            "id": 1,
+            "email": "enc:missing-separator",
+            "profile": {"phone": "123456"}
+        }));
+
+        let error = decrypt.apply(&mut malformed_event).await.unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("enc:<nonce>:<ciphertext>"));
     }
 }

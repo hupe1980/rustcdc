@@ -114,7 +114,7 @@ run_case "postgres version matrix" cargo test --test postgres_version_matrix --f
 run_case "postgres snapshot" cargo test --test postgres_snapshot_integration --features postgres
 run_case "postgres stream" cargo test --test postgres_stream_integration --features postgres
 run_case "postgres handoff" cargo test --test postgres_handoff_integration --features postgres
-run_case "postgres checkpoint" cargo test --test postgres_checkpoint_integration --features postgres
+run_case "postgres checkpoint" cargo test --test checkpoint_file_integration --features postgres
 run_case "postgres crash worker build" cargo build -p xtask --bin postgres_crash_worker --features postgres
 run_case "postgres process crash" cargo test --test runtime_postgres_process_crash_integration --features postgres
 run_case "postgres parallel snapshot stress" cargo test --test parallel_snapshot_stress_integration --features postgres
@@ -135,6 +135,16 @@ run_case "sqlserver stream" cargo test --test sqlserver_stream_integration --fea
 run_case "sqlserver handoff" cargo test --test sqlserver_handoff_integration --features sqlserver,tls,insecure-test-overrides
 run_case "sqlserver crash worker build" cargo build -p xtask --bin sqlserver_crash_worker --features sqlserver,tls,insecure-test-overrides
 run_case "sqlserver process crash" cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,tls,insecure-test-overrides
+
+run_case "reliability data loss detection" cargo test --test data_loss_detection --features postgres,test-harnesses
+run_case "reliability deterministic replay failure fixtures" cargo test --test deterministic_replay_failure_fixtures --features postgres,test-harnesses
+run_case "reliability deterministic replay golden fixtures" cargo test --test deterministic_replay_golden_fixtures --features postgres,test-harnesses
+run_case "reliability runtime health states" cargo test --test runtime_health_states --features postgres,test-harnesses
+run_case "reliability fault injection soak matrix" cargo test --test fault_injection_soak_matrix --features postgres,test-harnesses
+run_case "reliability wasm runtime integration" cargo test --test wasm_runtime_integration --features postgres,test-harnesses
+run_case "reliability wasm conformance contract" cargo test --test wasm_conformance_contract --features postgres,test-harnesses
+
+run_case "latency evidence gate" bash scripts/ci-latency-gate.sh
 
 if ((${#failed_labels[@]} > 0)); then
   echo "Full integration matrix completed with failures." | tee -a "$report_path"

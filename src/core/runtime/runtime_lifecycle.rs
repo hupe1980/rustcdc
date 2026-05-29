@@ -50,9 +50,22 @@ where
             return Ok(());
         }
 
+        if self.config.incremental_snapshot.is_some() && !self.config.snapshot_tables.is_empty() {
+            return Err(Error::ConfigError(
+                "cannot configure both snapshot_tables and incremental_snapshot; choose one startup mode"
+                    .into(),
+            ));
+        }
+
         let mut checkpoint_offset = self.config.checkpoint.load().await?;
         if let Some(offset) = checkpoint_offset.as_ref() {
             if self.is_snapshot_checkpoint(offset.as_ref()) {
+                if self.config.incremental_snapshot.is_some() {
+                    return Err(Error::ConfigError(
+                        "cannot resume incremental snapshot startup from a snapshot checkpoint"
+                            .into(),
+                    ));
+                }
                 if !self.source_capabilities().snapshot_checkpoint_resume {
                     tracing::warn!(
                         target: "rustcdc::runtime",
@@ -75,6 +88,27 @@ where
             .connect()
             .await
             .inspect_err(|error| self.record_runtime_error("runtime.start.connect", error))?;
+
+        if let Some(incremental) = self.config.incremental_snapshot.clone() {
+            self.snapshot = None;
+            self.stream = Some(
+                self.source
+                    .start_incremental_snapshot(incremental, checkpoint_offset.as_deref())
+                    .await?,
+            );
+            self.handoff_complete = true;
+
+            self.state = RuntimeState::Running;
+            self.observability().tracer.trace_checkpoint_barrier("open");
+            self.started_at_ms = Some(now_millis());
+            self.last_poll_at_ms = None;
+            self.last_source_event_ts_ms = None;
+            self.last_commit_at_ms = None;
+            self.total_events_polled = 0;
+            self.total_events_committed = 0;
+            self.total_events_deduplicated = 0;
+            return Ok(());
+        }
 
         if let Some(offset) = checkpoint_offset.as_ref() {
             if self.is_snapshot_checkpoint(offset.as_ref()) {

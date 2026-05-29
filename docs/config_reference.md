@@ -312,7 +312,18 @@ let decrypt_transform = MaskHashTransform::new(MaskHashConfig {
 });
 ```
 
-Encrypted fields are emitted as `enc:v1:<nonce>:<ciphertext>` strings and decrypted back into their original JSON values with the matching key.
+Encrypted fields are emitted as `enc:<nonce_b64>:<ciphertext_b64>` strings and decrypted back into their original JSON values with the matching key.
+
+Format/KDF contract for current unversioned payloads:
+- AEAD: AES-256-GCM
+- Nonce: 12 random bytes (base64 encoded)
+- KDF: HKDF-SHA-256, 32-byte output, no salt
+- HKDF info label: `b"rustcdc-field-encryption"`
+
+Future backward-compatibility rollout plan (when versioning becomes necessary):
+- phase 1: decrypt supports both legacy unversioned and new versioned payloads
+- phase 2: encrypt emits only the new versioned payload format
+- phase 3: after migration window, remove legacy decrypt support with release-note callout
 
 **Replay determinism caveat (important):**
 - `MaskRule::Encrypt` is intentionally nonce-based and therefore non-deterministic.
@@ -347,6 +358,22 @@ let config = RuntimeConfig::new(source, checkpoint, schema_history)
 
 Only `SourceError` and `TimeoutError` trigger retry. Fatal errors (`ConfigError`,
 `ValidationError`, etc.) propagate immediately regardless of this policy.
+
+### Connector-Specific Post-Commit Confirmation Semantics
+
+`commit_ack()` has a uniform API but connector confirmation semantics are intentionally connector-specific:
+
+- PostgreSQL:
+  - Runtime confirms durable progress via replication-slot LSN confirmation.
+  - Post-commit confirmation failures are governed by `PostCommitSourceConfirmPolicy`.
+- MySQL:
+  - Runtime durability is checkpoint-first.
+  - `confirm_lsn` is a connector compatibility hook and does not provide PostgreSQL-style slot advancement semantics.
+- SQL Server:
+  - Runtime durability is checkpoint-first.
+  - `confirm_lsn` is a connector compatibility hook and does not provide PostgreSQL-style slot advancement semantics.
+
+Operationally, all connectors remain at-least-once at the runtime boundary; downstream idempotency remains mandatory.
 
 **Resumable Snapshot Cursoring:**
 - Snapshot resume uses primary-key keyset cursoring (not `ctid`).
