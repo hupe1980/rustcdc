@@ -76,7 +76,7 @@ rustcdc uses **cooperative flow control**: the internal event buffer grows until
 ### How it works
 
 - `poll_event_batch()` returns events from the internal buffer.
-- `commit_ack(offset)` signals that the consumer has durably processed events up to `offset`. The runtime advances the checkpoint and frees buffer capacity.
+- `commit_ack(token)` signals that the consumer has durably processed the acknowledged batch prefix represented by `AckToken`. The runtime advances the checkpoint and frees buffer capacity.
 - If the consumer calls `poll_event_batch()` repeatedly without calling `commit_ack()`, the buffer fills to `max_buffer_size` and the runtime yields no new events until space is available.
 
 ### Tuning guidance

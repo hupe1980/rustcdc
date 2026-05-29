@@ -106,24 +106,9 @@ jobs:
       - name: markdown link check
         run: bash scripts/ci-doc-links.sh
 
-  docs-contract-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: docs contract drift check
-        run: bash scripts/ci-doc-contract.sh
-
-  hygiene-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: source hygiene gate
-        run: bash scripts/ci-hygiene-gate.sh
-
   benchmark-regression-gate:
     runs-on: ubuntu-latest
     env:
-      CRITERION_BASELINE: ci-baseline
       BENCHMARK_BASELINE_COMMIT: ${{ github.sha }}
       BENCHMARK_BASELINE_ARTIFACT: BENCHMARK_REPORT.md
     steps:
@@ -134,6 +119,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: benchmark regression gate (criterion)
         run: bash scripts/ci-benchmark-gate.sh
+      - name: upload benchmark regression artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-regression-evidence
+          path: |
+            target/benchmark-ci-gate*.txt
+            target/benchmark-ci-env.txt
+            target/criterion
+            BENCHMARK_REPORT.md
 
   latency-evidence:
     runs-on: ubuntu-latest

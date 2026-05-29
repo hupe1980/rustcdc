@@ -427,13 +427,13 @@ impl IncrementalSnapshotHandle {
         max_lsn_in_batch: u64,
         high_watermark: u64,
     ) -> Result<bool> {
-        if max_lsn_in_batch > high_watermark {
+        if max_lsn_in_batch >= high_watermark {
             return Ok(true);
         }
         if stream_events.is_empty() {
             // No events from the inner stream; check WAL directly.
             let current = query_current_wal_lsn(&self.query_client).await?;
-            return Ok(current > high_watermark);
+            return Ok(current >= high_watermark);
         }
         Ok(false)
     }

@@ -233,10 +233,9 @@ WARNING checkpoint latency exceeding 1s
    ```bash
    # If using FileCheckpoint
    iostat -x 1 5 | grep sda  # Watch %util and await
-   
-   # If using PostgresCheckpoint
-   psql -c "EXPLAIN ANALYZE UPDATE checkpoints SET offset = ... WHERE source_type = 'postgres';"
-   # Should complete in < 100ms
+
+   # If using a custom external checkpoint backend (for example PostgreSQL),
+   # measure write latency of the backend-specific checkpoint upsert/update path.
    ```
 
 **Resolution:**
@@ -244,7 +243,7 @@ WARNING checkpoint latency exceeding 1s
 | Root Cause | Action |
 |------------|--------|
 | Checkpoint store slow (disk I/O) | 1. Switch to FileCheckpoint on faster disk; 2. Increase max_buffer_size to batch more events |
-| Checkpoint store slow (DB query) | 1. Add index on `checkpoints(source_type)`; 2. Monitor DB query latency |
+| Checkpoint store slow (external backend) | Optimize backend-specific checkpoint writes and indexes; monitor write latency and contention |
 | Buffer size too small | Increase `max_buffer_size` in RuntimeConfig (e.g., 50_000 → 100_000) |
 | Transform errors causing queue buildup | Check transform error logs; fix failing transforms or set `transform_error_policy = Skip` |
 

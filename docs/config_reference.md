@@ -572,33 +572,14 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 - Unknown or missing versions are rejected at load time.
 - rustcdc intentionally enforces fail-closed checkpoint decoding for format safety.
 
-### PostgresCheckpoint (Feature-Gated)
+### Custom Durable Checkpoint Backend
 
-**Use Case:** High-availability deployments; centralized checkpoint management
+**Use Case:** High-availability or centralized checkpoint management
 
-```rust
-#[cfg(feature = "postgres")]
-use rustcdc::checkpoint::PostgresCheckpoint;
-
-#[cfg(feature = "postgres")]
-let checkpoint = PostgresCheckpoint::new(
-    "postgresql://user:pass@checkpoint-db:5432/cdc_state",
-    "checkpoints",  // Table name
-)
-.await?;
-// Stores checkpoint in PostgreSQL; survives node failures
-```
-
-**Schema:**
-```sql
-CREATE TABLE checkpoints (
-    source_type TEXT NOT NULL,
-    committed_event_count BIGINT NOT NULL,
-    offset JSONB NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (source_type)
-);
-```
+rustcdc currently ships with `FileCheckpoint` and `InMemoryCheckpoint`.
+For HA or centralized state, implement the `Checkpoint` trait against your
+own storage backend (for example PostgreSQL, Redis, object storage, or a
+platform metadata service).
 
 ---
 
@@ -700,7 +681,7 @@ export RUST_LOG_FORMAT=json
 | Scenario | Recommendation | Rationale |
 |----------|---|----------|
 | Single machine, restarts acceptable | FileCheckpoint | Simple, no external dependencies |
-| HA cluster, centralized state | PostgresCheckpoint | Survives node failures; HA checkpoint table |
+| HA cluster, centralized state | Custom `Checkpoint` backend | Integrates with your existing HA metadata store |
 | Development/testing | InMemoryCheckpoint | Fast iteration; ephemeral OK |
 
 ### Buffer Size Tuning

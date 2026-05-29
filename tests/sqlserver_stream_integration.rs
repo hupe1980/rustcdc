@@ -129,12 +129,12 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
     )
     .await?;
     sql_exec(&mut admin, "USE rustcdc_test; DELETE FROM dbo.users").await?;
-    sql_exec(
+    sql_exec_with_retry(
         &mut admin,
         "USE rustcdc_test; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
     )
     .await?;
-    sql_exec(
+    sql_exec_with_retry(
         &mut admin,
         "USE rustcdc_test; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='users', @role_name=NULL, @supports_net_changes=0",
     )
