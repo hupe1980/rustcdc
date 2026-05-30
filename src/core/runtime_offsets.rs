@@ -29,7 +29,7 @@ pub(super) fn parse_mysql_stream_offset(value: &str) -> Result<(String, u32, Str
         ))
     })?;
 
-    let (position_part, gtid) = rest.split_once("#gtid=").map_or((rest, ""), |parts| parts);
+    let (position_part, gtid) = rest.split_once("#gtid=").unwrap_or((rest, ""));
 
     let binlog_pos = position_part.parse::<u32>().map_err(|error| {
         Error::CheckpointError(format!(
