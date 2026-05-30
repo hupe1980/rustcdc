@@ -180,10 +180,25 @@ where
         }
 
         #[cfg(feature = "mysql")]
-        if matches!(&self.config.source, RuntimeSourceConfig::Mysql(_)) {
-            return Ok(Some(Box::new(
-                Self::mysql_stream_offset_from_snapshot_checkpoint(snapshot_checkpoint)?,
-            )));
+        let mysql_family = {
+            let mysql_family = matches!(&self.config.source, RuntimeSourceConfig::Mysql(_));
+            #[cfg(feature = "mariadb")]
+            let mysql_family =
+                mysql_family || matches!(&self.config.source, RuntimeSourceConfig::MariaDb(_));
+            mysql_family
+        };
+
+        #[cfg(feature = "mysql")]
+        if mysql_family {
+            let offset = Self::mysql_stream_offset_from_snapshot_checkpoint(snapshot_checkpoint)?;
+            #[cfg(feature = "mariadb")]
+            if matches!(&self.config.source, RuntimeSourceConfig::MariaDb(_)) {
+                return Ok(Some(Box::new(GenericOffset::new(
+                    "mariadb",
+                    offset.encode()?,
+                ))));
+            }
+            return Ok(Some(Box::new(offset)));
         }
 
         #[cfg(feature = "sqlserver")]

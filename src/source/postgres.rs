@@ -12,8 +12,8 @@ use crate::{
     checkpoint::PostgresOffset,
     core::{Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig},
     source::{
-        helpers::now_millis, ConnectorCapabilities, HandoffResult, IncrementalSnapshotConfig,
-        SnapshotHandle, Source, StreamHandle,
+        helpers::now_millis, ConnectorCapabilities, DatabaseAuthMode, HandoffResult,
+        IncrementalSnapshotConfig, SnapshotHandle, Source, StreamHandle,
     },
 };
 
@@ -393,6 +393,12 @@ pub struct PostgresSourceConfig {
     pub port: u16,
     pub user: String,
     pub password: SecretString,
+    /// Connector authentication mode.
+    ///
+    /// `AwsIamToken` indicates the password field should provide short-lived
+    /// IAM auth tokens (typically via `SecretString::from_callback`).
+    #[serde(default)]
+    pub auth_mode: DatabaseAuthMode,
     pub database: String,
     pub replication_slot_name: String,
     pub publication_name: String,
@@ -1690,6 +1696,65 @@ mod tests {
 
         assert!(config.validate().is_ok());
         assert!(config.build_connect_config().is_ok());
+    }
+
+    #[test]
+    fn aws_iam_auth_mode_requires_tls() {
+        let mut config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: SecretString::from_callback("postgres-iam-token", || {
+                Ok("iam-token".to_string())
+            }),
+            auth_mode: super::DatabaseAuthMode::AwsIamToken,
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::plaintext(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(error, crate::core::Error::ConfigError(message) if message.contains("requires TLS"))
+        );
+
+        config.transport = TransportConfig::tls();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn plaintext_transport_is_explicitly_supported() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            auth_mode: super::DatabaseAuthMode::Password,
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::plaintext(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn transport_helper_methods_set_expected_mode() {
+        let plaintext = PostgresSourceConfig::default().with_plaintext_transport();
+        assert!(!plaintext.transport.is_tls());
+
+        let tls = plaintext.with_tls_transport();
+        assert!(tls.transport.is_tls());
     }
 
     #[tokio::test]

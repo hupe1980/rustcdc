@@ -25,7 +25,9 @@ use testcontainers::{
 };
 
 mod process_crash_marker;
+mod process_crash_worker;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
+use process_crash_worker::resolve_xtask_worker_bin;
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
     let mut last_error = None;
@@ -429,44 +431,12 @@ fn spawn_crash_worker(
 }
 
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
-    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
-    if let Some(debug_dir) = test_exe.parent().and_then(|deps| deps.parent()) {
-        let candidate = debug_dir.join("mysql_crash_worker");
-        build_xtask_worker(
-            "mysql_crash_worker",
-            "mysql,rustcdc/insecure-test-overrides",
-        )?;
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mysql_crash_worker") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    Err(rustcdc::Error::StateError(
-        "mysql crash worker binary not found; build with `cargo build -p xtask --bin mysql_crash_worker --features mysql`"
-            .into(),
-    ))
-}
-
-fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
-    let status = Command::new("cargo")
-        .args(["build", "-p", "xtask", "--bin", bin, "--features", feature])
-        .status()
-        .map_err(rustcdc::Error::IoError)?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(rustcdc::Error::StateError(format!(
-            "failed to build {bin} in xtask crate"
-        )))
-    }
+    resolve_xtask_worker_bin(
+        "mysql_crash_worker",
+        "mysql,rustcdc/insecure-test-overrides",
+        "CARGO_BIN_EXE_mysql_crash_worker",
+        "mysql crash worker binary not found; build with `cargo build -p xtask --bin mysql_crash_worker --features mysql`",
+    )
 }
 
 async fn poll_until_batch_at_least(

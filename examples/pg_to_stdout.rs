@@ -1,4 +1,4 @@
-#![cfg(feature = "postgres")]
+#![cfg_attr(not(feature = "postgres"), allow(dead_code, unused_imports))]
 
 // Phase 1 embedding example:
 // - Config can be supplied via CLI flags or CDC_RS_* environment variables.
@@ -6,14 +6,17 @@
 // - Every delivered batch is acknowledged with an opaque runtime token.
 // - Ctrl+C triggers graceful shutdown and final commit.
 
+#[cfg(feature = "postgres")]
 use std::{env, io::Write, path::PathBuf, sync::Arc};
 
+#[cfg(feature = "postgres")]
 use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
     PostgresSourceConfig, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
     StructuredLogger,
 };
 
+#[cfg(feature = "postgres")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> rustcdc::Result<()> {
     let args = ExampleArgs::from_env_and_args()?;
@@ -82,6 +85,14 @@ async fn main() -> rustcdc::Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "postgres"))]
+fn main() {
+    eprintln!(
+        "pg_to_stdout requires the postgres feature. Run with: cargo run --example pg_to_stdout --features postgres"
+    );
+}
+
+#[cfg(feature = "postgres")]
 #[derive(Debug, Clone)]
 struct ExampleArgs {
     host: String,
@@ -98,6 +109,7 @@ struct ExampleArgs {
     conn_timeout_secs: u64,
 }
 
+#[cfg(feature = "postgres")]
 impl ExampleArgs {
     fn from_env_and_args() -> rustcdc::Result<Self> {
         let mut out = Self {
@@ -209,15 +221,18 @@ impl ExampleArgs {
     }
 }
 
+#[cfg(feature = "postgres")]
 fn env_or_default(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+#[cfg(feature = "postgres")]
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> rustcdc::Result<String> {
     args.next()
         .ok_or_else(|| rustcdc::Error::ConfigError(format!("missing value for {flag}")))
 }
 
+#[cfg(feature = "postgres")]
 fn print_help() {
     println!(
         "pg_to_stdout (Phase 1 example)\n\n\

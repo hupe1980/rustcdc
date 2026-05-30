@@ -586,7 +586,13 @@ impl Checkpoint for FileCheckpoint {
         let encoded = serde_json::to_vec(&record.offset)?;
         let offset: Box<dyn Offset> = match record.source_type.as_str() {
             "postgres" => Box::new(PostgresOffset::from_bytes(&encoded)?),
-            "mysql" | "mariadb" => Box::new(MysqlOffset::from_bytes(&encoded)?),
+            "mysql" => Box::new(MysqlOffset::from_bytes(&encoded)?),
+            "mariadb" => {
+                // Validate MariaDB checkpoints with the MySQL offset schema but
+                // preserve the source namespace for strict resume checks.
+                let _validated = MysqlOffset::from_bytes(&encoded)?;
+                Box::new(GenericOffset::new("mariadb", encoded))
+            }
             other => Box::new(GenericOffset::new(other, encoded)),
         };
         Ok(Some(offset))

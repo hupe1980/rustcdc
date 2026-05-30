@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use crate::core::{Error, Event, Result};
 
+pub mod field_mapping;
 pub mod filter_projection;
 pub mod mask_hash;
 #[cfg(feature = "outbox")]
@@ -11,7 +12,10 @@ pub mod outbox;
 pub mod route;
 pub mod unwrap;
 
-pub use filter_projection::{FilterProjectionConfig, FilterProjectionTransform};
+pub use field_mapping::{FieldMappingConfig, FieldMappingTransform};
+pub use filter_projection::{
+    FilterField, FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule,
+};
 pub use mask_hash::{MaskHashConfig, MaskHashTransform, MaskRule};
 #[cfg(feature = "outbox")]
 pub use outbox::{OutboxResult, OutboxTransform};

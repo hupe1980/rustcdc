@@ -9,6 +9,7 @@ retry_out="target/benchmark-ci-gate-retry.txt"
 regression_threshold="${BENCHMARK_MAX_REGRESSION_PERCENT:-5}"
 strict_mode="${BENCHMARK_STRICT:-1}"
 gated_benches_raw="${BENCHMARK_GATED_BENCHES:-quality_perf cdc_perf}"
+critical_group_prefixes_raw="${BENCHMARK_CRITICAL_GROUP_PREFIXES:-quality_gates wasm_transform}"
 allow_non_strict="${ALLOW_BENCHMARK_NON_STRICT:-0}"
 bench_sample_size="${BENCHMARK_SAMPLE_SIZE:-30}"
 bench_measurement_secs="${BENCHMARK_MEASUREMENT_SECS:-8}"
@@ -93,9 +94,15 @@ if [[ "$strict_mode" != "1" && "$allow_non_strict" != "1" ]]; then
 fi
 
 IFS=' ' read -r -a gated_benches <<< "$gated_benches_raw"
+IFS=' ' read -r -a critical_group_prefixes <<< "$critical_group_prefixes_raw"
 
 if [[ "${#gated_benches[@]}" -eq 0 ]]; then
   echo "No benchmark targets configured for gate."
+  exit 1
+fi
+
+if [[ "${#critical_group_prefixes[@]}" -eq 0 ]]; then
+  echo "No critical benchmark group prefixes configured for gate."
   exit 1
 fi
 
@@ -116,6 +123,7 @@ policy_reason="${policy_info#*|}"
   echo "threshold_percent=${regression_threshold}"
   echo "strict_mode=${strict_mode}"
   echo "gated_benches=${gated_benches_raw}"
+  echo "critical_group_prefixes=${critical_group_prefixes_raw}"
   echo "sample_size=${bench_sample_size}"
   echo "measurement_secs=${bench_measurement_secs}"
   echo "warmup_secs=${bench_warm_up_secs}"
@@ -148,6 +156,7 @@ emit_benchmark_report() {
     echo "baseline_artifact=${baseline_artifact}"
     rustc -Vv
     echo "gated_benches=${gated_benches_raw}"
+    echo "critical_group_prefixes=${critical_group_prefixes_raw}"
     echo "regression_threshold_percent=${regression_threshold}"
     echo "strict_mode=${strict_mode}"
     echo "sample_size=${bench_sample_size}"
@@ -308,39 +317,33 @@ has_significant_regression() {
   return "$found"
 }
 
-is_quality_gate_bench() {
+is_critical_group_bench() {
   local bench_name="$1"
-  [[ "$bench_name" == quality_gates/* ]]
-}
-
-has_quality_gate_regression_marker() {
-  local in_file="$1"
-  while IFS='|' read -r gate_bench _upper; do
-    [[ -z "$gate_bench" ]] && continue
-    if is_quality_gate_bench "$gate_bench"; then
-      echo "Quality-gate regression marker: $gate_bench"
+  local prefix
+  for prefix in "${critical_group_prefixes[@]}"; do
+    [[ -z "$prefix" ]] && continue
+    if [[ "$bench_name" == "$prefix"/* ]]; then
       return 0
     fi
-  done < <(collect_regressions "$in_file")
-
+  done
   return 1
 }
 
-has_significant_quality_gate_regression() {
+has_significant_critical_group_regression() {
   local in_file="$1"
   local threshold="$2"
   local found=1
 
-  while IFS='|' read -r gate_bench upper; do
-    [[ -z "$gate_bench" ]] && continue
-    if ! is_quality_gate_bench "$gate_bench"; then
+  while IFS='|' read -r bench_name upper; do
+    [[ -z "$bench_name" ]] && continue
+    if ! is_critical_group_bench "$bench_name"; then
       continue
     fi
     if awk -v val="$upper" -v limit="$threshold" 'BEGIN { exit (val + 0 >= limit + 0 ? 0 : 1) }'; then
-      echo "Significant quality-gate regression: $gate_bench (+$upper% >= +$threshold%)" >&2
+      echo "Significant critical-group regression: $bench_name (+$upper% >= +$threshold%)" >&2
       found=0
     else
-      echo "Ignoring minor quality-gate regression marker: $gate_bench (+$upper% < +$threshold%)" >&2
+      echo "Ignoring minor critical-group regression marker: $bench_name (+$upper% < +$threshold%)" >&2
     fi
   done < <(collect_regressions "$in_file")
 
@@ -354,14 +357,14 @@ run_confirmation_bench() {
   run_bench "$bench_name" "$out_file"
 }
 
-count_significant_quality_gate_regressions() {
+count_significant_critical_group_regressions() {
   local threshold="$1"
   shift
   local significant_count=0
   local file
   for file in "$@"; do
     [[ -f "$file" ]] || continue
-    if has_significant_quality_gate_regression "$file" "$threshold"; then
+    if has_significant_critical_group_regression "$file" "$threshold"; then
       significant_count=$((significant_count + 1))
     fi
   done
@@ -397,11 +400,11 @@ for bench in "${gated_benches[@]}"; do
       done
     fi
 
-    significant_runs="$(count_significant_quality_gate_regressions "$regression_threshold" "${confirmation_outputs[@]}")"
+    significant_runs="$(count_significant_critical_group_regressions "$regression_threshold" "${confirmation_outputs[@]}")"
 
     if [[ "$strict_mode" == "1" ]]; then
       if (( significant_runs >= 2 )); then
-        echo "Benchmark regression gate failed: strict mode observed reproducible significant quality-gate regressions (${bench}) in ${significant_runs} runs."
+        echo "Benchmark regression gate failed: strict mode observed reproducible significant critical-group regressions (${bench}) in ${significant_runs} runs."
         rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_raw_out" || true
         rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_retry_out" || true
         for out_file in "${confirmation_outputs[@]}"; do
@@ -411,11 +414,11 @@ for bench in "${gated_benches[@]}"; do
         exit 1
       fi
 
-      echo "Strict benchmark confirmation set for ${bench} did not show reproducible significant quality-gate regressions; treating initial marker as noise."
+      echo "Strict benchmark confirmation set for ${bench} did not show reproducible significant critical-group regressions; treating initial marker as noise."
       continue
     fi
 
-    if ! has_significant_quality_gate_regression "$bench_raw_out" "$regression_threshold"; then
+    if ! has_significant_critical_group_regression "$bench_raw_out" "$regression_threshold"; then
       echo "Only minor regression markers detected for ${bench} in initial run (threshold: +$regression_threshold%)."
       continue
     fi
@@ -437,4 +440,4 @@ done
 
 emit_benchmark_report
 
-echo "Benchmark regression gate passed: no reproducible quality-gate regressions detected."
+echo "Benchmark regression gate passed: no reproducible critical-group regressions detected."

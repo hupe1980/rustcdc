@@ -53,6 +53,7 @@ Status values:
 | Durable schema history backend beyond in-memory | Improves restart durability for long-lived deployments | Implemented | src/schema_history/mod.rs |
 | Runtime health/admin introspection depth | Faster incident response and safer operations | Implemented | src/core/runtime.rs |
 | Structured observability (metrics/tracing/logging) | Production diagnosis and SLO ownership | Implemented | tests/otel_metrics_integration.rs, tests/otel_tracing_integration.rs, tests/logging_structured.rs |
+| Built-in field mapping transform primitives (copy/rename/set/remove) | Covers common schema-alignment workloads without mandatory custom/WASM code | Implemented | src/transform/field_mapping.rs, src/transform/mod.rs, docs/config_reference.md |
 | Example/build matrix across sources | Prevents connector-specific integration drift | Implemented | .github/workflows/ci.yml, scripts/ci-preflight.sh, examples/ |
 | Connector version-compatibility test depth | Reduces production surprises on engine upgrades | Implemented (connector-specific depth varies) | tests/postgres_version_matrix.rs |
 
@@ -67,8 +68,9 @@ Status values:
 ## Current Completeness Verdict
 
 For embedded-library scope, rustcdc is release-viable with conditions:
-- Must-have set is fully implemented.
-- Should-have set is now fully implemented; remaining risk is concentrated in deployment-specific policy tuning.
+- Must-have set is implemented for the primary connector paths, and each release
+	must confirm connector-specific restart evidence remains current.
+- Should-have set is broadly implemented; remaining risk is concentrated in deployment-specific policy tuning and continuous evidence rigor.
 
 ## Release Decision Rules
 

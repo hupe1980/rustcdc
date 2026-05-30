@@ -7,28 +7,15 @@ use std::path::Path;
 use mysql_async::SslOpts;
 
 use crate::core::{Error, Result, SecretString, TransportConfig};
+use crate::source::allow_insecure_test_transport;
 
-use super::{MysqlSourceConfig, ServerFlavor, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS};
+use super::{
+    DatabaseAuthMode, MysqlSourceConfig, ServerFlavor, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS,
+};
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
 const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
-
-fn insecure_test_override_enabled() -> bool {
-    #[cfg(feature = "insecure-test-overrides")]
-    {
-        std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1")
-    }
-
-    #[cfg(not(feature = "insecure-test-overrides"))]
-    {
-        false
-    }
-}
-
-fn allow_insecure_test_transport() -> bool {
-    insecure_test_override_enabled()
-}
 
 impl fmt::Debug for MysqlSourceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,6 +25,7 @@ impl fmt::Debug for MysqlSourceConfig {
             .field("port", &self.port)
             .field("user", &self.user)
             .field("password", &"***redacted***")
+            .field("auth_mode", &self.auth_mode)
             .field("database", &self.database)
             .field("server_id", &self.server_id)
             .field("gtid_mode_enabled", &self.gtid_mode_enabled)
@@ -57,6 +45,7 @@ impl Default for MysqlSourceConfig {
             port: 3306,
             user: String::new(),
             password: SecretString::default(),
+            auth_mode: DatabaseAuthMode::Password,
             database: String::new(),
             server_id: 1,
             gtid_mode_enabled: false,
@@ -81,6 +70,34 @@ impl MysqlSourceConfig {
         self.server_flavor.source_name()
     }
 
+    /// Enable AWS IAM token-based database authentication mode.
+    #[must_use]
+    pub fn with_aws_iam_auth(mut self) -> Self {
+        self.auth_mode = DatabaseAuthMode::AwsIamToken;
+        self
+    }
+
+    /// Enable static password database authentication mode.
+    #[must_use]
+    pub fn with_password_auth(mut self) -> Self {
+        self.auth_mode = DatabaseAuthMode::Password;
+        self
+    }
+
+    /// Set plaintext transport explicitly.
+    #[must_use]
+    pub fn with_plaintext_transport(mut self) -> Self {
+        self.transport = TransportConfig::plaintext();
+        self
+    }
+
+    /// Set TLS transport explicitly.
+    #[must_use]
+    pub fn with_tls_transport(mut self) -> Self {
+        self.transport = TransportConfig::tls();
+        self
+    }
+
     /// Validate configuration values before a connection attempt.
     pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
@@ -97,6 +114,11 @@ impl MysqlSourceConfig {
         if self.password.resolve()?.trim().is_empty() {
             return Err(Error::ConfigError(
                 "mysql password must not be empty".into(),
+            ));
+        }
+        if matches!(self.auth_mode, DatabaseAuthMode::AwsIamToken) && !self.transport.is_tls() {
+            return Err(Error::ConfigError(
+                "mysql auth_mode=aws_iam_token requires TLS transport".into(),
             ));
         }
         if self.database.trim().is_empty() {
@@ -211,7 +233,7 @@ impl MysqlSourceConfig {
 
         // Local integration containers often use ephemeral self-signed certs.
         // Keep secure defaults. Explicit test overrides require compile-time opt-in.
-        if insecure_test_override_enabled() {
+        if allow_insecure_test_transport() {
             ssl_opts = ssl_opts
                 .with_danger_accept_invalid_certs(true)
                 .with_danger_skip_domain_validation(true);

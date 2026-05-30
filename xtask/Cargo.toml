@@ -10,6 +10,7 @@ default = []
 tls = ["rustcdc/tls"]
 postgres = ["rustcdc/postgres"]
 mysql = ["rustcdc/mysql"]
+mariadb = ["rustcdc/mariadb"]
 sqlserver = ["rustcdc/sqlserver", "tls"]
 insecure-test-overrides = ["rustcdc/insecure-test-overrides"]
 

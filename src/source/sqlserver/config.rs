@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::core::{Error, Result, SecretString, TransportConfig};
+use crate::source::allow_insecure_test_transport;
 
 use super::{
     SqlServerSourceConfig, DEFAULT_POOL_SIZE, DEFAULT_STREAM_POLL_INTERVAL_MS, MAX_EVENTS_PER_POLL,
@@ -13,18 +14,6 @@ const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_PREREQ_POOL_SIZE: usize = 64;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
 const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
-
-fn allow_insecure_test_transport() -> bool {
-    #[cfg(feature = "insecure-test-overrides")]
-    {
-        std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1")
-    }
-
-    #[cfg(not(feature = "insecure-test-overrides"))]
-    {
-        false
-    }
-}
 
 impl fmt::Debug for SqlServerSourceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -73,6 +62,20 @@ impl SqlServerSourceConfig {
     /// Return the connector name used by the source abstraction.
     pub const fn source_type() -> &'static str {
         "sqlserver"
+    }
+
+    /// Set plaintext transport explicitly.
+    #[must_use]
+    pub fn with_plaintext_transport(mut self) -> Self {
+        self.transport = TransportConfig::plaintext();
+        self
+    }
+
+    /// Set TLS transport explicitly.
+    #[must_use]
+    pub fn with_tls_transport(mut self) -> Self {
+        self.transport = TransportConfig::tls();
+        self
     }
 
     /// Validate configuration values before a connection attempt.

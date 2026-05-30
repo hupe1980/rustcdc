@@ -17,6 +17,36 @@ pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TablePro
 pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
 pub use snapshot_validator::{SnapshotValidationResult, SnapshotValidator};
 
+/// Returns true when source connector insecure transport overrides are explicitly enabled.
+///
+/// This guard is intended for local integration tests only.
+#[cfg(any(feature = "mysql", feature = "sqlserver"))]
+pub(crate) fn allow_insecure_test_transport() -> bool {
+    #[cfg(feature = "insecure-test-overrides")]
+    {
+        std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1")
+    }
+
+    #[cfg(not(feature = "insecure-test-overrides"))]
+    {
+        false
+    }
+}
+
+/// Authentication mode for database source connectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabaseAuthMode {
+    /// Traditional static password authentication.
+    #[default]
+    Password,
+    /// AWS IAM database authentication using short-lived auth tokens.
+    ///
+    /// Token generation/rotation is provided by the embedder via `SecretString`
+    /// deferred resolution patterns.
+    AwsIamToken,
+}
+
 // ─── Table filtering ─────────────────────────────────────────────────────────
 
 /// Returns `true` if an event for `schema.table` should be forwarded to the caller.
@@ -26,6 +56,7 @@ pub use snapshot_validator::{SnapshotValidationResult, SnapshotValidator};
 /// * When both lists are empty, all events pass through.
 ///
 /// Table names are matched case-insensitively against `"schema.table"` tokens.
+#[cfg(test)]
 pub(crate) fn table_is_allowed(
     schema: Option<&str>,
     table: &str,
@@ -37,23 +68,33 @@ pub(crate) fn table_is_allowed(
         return true;
     }
 
-    let table_lower = table.to_lowercase();
-    let qualified_lower = match schema {
-        Some(s) => format!("{}.{table_lower}", s.to_lowercase()),
-        None => table_lower.clone(),
-    };
-
     let matches = |list: &[String]| {
-        list.iter().any(|entry| {
-            let e = entry.to_lowercase();
-            e == qualified_lower || e == table_lower
-        })
+        list.iter()
+            .any(|entry| table_entry_matches(entry, schema, table))
     };
 
     if !include_list.is_empty() {
         return matches(include_list);
     }
     !matches(exclude_list)
+}
+
+#[cfg(test)]
+fn table_entry_matches(entry: &str, schema: Option<&str>, table: &str) -> bool {
+    let token = entry.trim();
+    if token.is_empty() {
+        return false;
+    }
+
+    if let Some((entry_schema, entry_table)) = token.split_once('.') {
+        return schema
+            .map(|s| {
+                s.eq_ignore_ascii_case(entry_schema) && table.eq_ignore_ascii_case(entry_table)
+            })
+            .unwrap_or(false);
+    }
+
+    table.eq_ignore_ascii_case(token)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,7 +288,8 @@ mod tests {
     };
 
     use super::{
-        ConnectorCapabilities, HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle,
+        table_is_allowed, ConnectorCapabilities, HandoffResult, SnapshotEnd, SnapshotHandle,
+        Source, StreamHandle,
     };
 
     fn sample_event() -> Event {
@@ -397,5 +439,62 @@ mod tests {
         snapshot.checkpoint(&mut checkpoint, 1).await.unwrap();
         let end = snapshot.finish().await.unwrap();
         assert_eq!(end.snapshot_end_ts, 42);
+    }
+
+    #[test]
+    fn table_filter_include_takes_precedence() {
+        let include = vec!["public.users".to_string()];
+        let exclude = vec!["users".to_string()];
+
+        assert!(table_is_allowed(
+            Some("public"),
+            "users",
+            &include,
+            &exclude
+        ));
+        assert!(!table_is_allowed(
+            Some("public"),
+            "orders",
+            &include,
+            &exclude
+        ));
+    }
+
+    #[test]
+    fn table_filter_exclude_applies_when_include_empty() {
+        let include = Vec::new();
+        let exclude = vec!["users".to_string()];
+
+        assert!(!table_is_allowed(
+            Some("public"),
+            "users",
+            &include,
+            &exclude
+        ));
+        assert!(table_is_allowed(
+            Some("public"),
+            "orders",
+            &include,
+            &exclude
+        ));
+    }
+
+    #[test]
+    fn table_filter_matches_schema_table_case_insensitively() {
+        let include = vec!["Public.Users".to_string()];
+        let exclude = Vec::new();
+
+        assert!(table_is_allowed(
+            Some("public"),
+            "users",
+            &include,
+            &exclude
+        ));
+        assert!(table_is_allowed(
+            Some("PUBLIC"),
+            "USERS",
+            &include,
+            &exclude
+        ));
     }
 }

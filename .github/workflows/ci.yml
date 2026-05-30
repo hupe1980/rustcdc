@@ -111,6 +111,7 @@ jobs:
     env:
       BENCHMARK_BASELINE_COMMIT: ${{ github.sha }}
       BENCHMARK_BASELINE_ARTIFACT: BENCHMARK_REPORT.md
+      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -296,6 +297,7 @@ jobs:
         suite:
           - mariadb_connection_integration
           - mariadb_e2e_integration
+          - runtime_mariadb_process_crash_integration
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -303,7 +305,25 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --test ${{ matrix.suite }}
-        run: cargo test --test ${{ matrix.suite }} --features mysql,insecure-test-overrides
+        if: matrix.suite != 'runtime_mariadb_process_crash_integration'
+        run: cargo test --test ${{ matrix.suite }} --features mariadb,insecure-test-overrides
+      - name: cargo test --test runtime_mariadb_process_crash_integration (with bins)
+        if: matrix.suite == 'runtime_mariadb_process_crash_integration'
+        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,insecure-test-overrides --bins
+
+  integration-mariadb-encryption:
+    runs-on: ubuntu-latest
+    env:
+      CDC_RS_RUN_DOCKER_TESTS: "1"
+      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption,insecure-test-overrides --bins
+        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption,insecure-test-overrides --bins
 
   integration-sqlserver:
     runs-on: ubuntu-latest

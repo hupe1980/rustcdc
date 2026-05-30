@@ -1,4 +1,7 @@
-#![cfg(all(feature = "postgres", feature = "metrics"))]
+#![cfg_attr(
+    not(all(feature = "postgres", feature = "metrics")),
+    allow(dead_code, unused_imports)
+)]
 //! # PostgreSQL to OpenTelemetry example
 //!
 //! Advanced streaming example with comprehensive observability:
@@ -7,6 +10,7 @@
 //! - Structured JSON logs to stdout
 //! - Deterministic graceful shutdown (max events or runtime budget)
 
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 use std::{
     env,
     path::PathBuf,
@@ -14,14 +18,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, EventTracer,
     MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector, PostgresSourceConfig,
     RuntimeConfig, RuntimeObservability, RuntimeSourceConfig, StructuredLogger, TransportConfig,
 };
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 use serde_json::json;
 
 /// Runs a PostgreSQL CDC pipeline with OTLP metrics/tracing and structured lifecycle logs.
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> rustcdc::Result<()> {
     // Parse config from env/CLI so this sample can run both locally and in CI.
@@ -255,6 +262,14 @@ async fn main() -> rustcdc::Result<()> {
     Ok(())
 }
 
+#[cfg(not(all(feature = "postgres", feature = "metrics")))]
+fn main() {
+    eprintln!(
+        "postgres_to_otel requires features postgres,metrics. Run with: cargo run --example postgres_to_otel --features postgres,metrics"
+    );
+}
+
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 #[derive(Debug, Clone)]
 struct ExampleArgs {
     host: String,
@@ -277,6 +292,7 @@ struct ExampleArgs {
     environment: String,
 }
 
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 impl ExampleArgs {
     /// Parse args with env defaults first, then apply CLI overrides.
     fn from_env_and_args() -> rustcdc::Result<Self> {
@@ -410,16 +426,19 @@ impl ExampleArgs {
     }
 }
 
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 fn env_or_default(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> rustcdc::Result<String> {
     args.next()
         .ok_or_else(|| rustcdc::Error::ConfigError(format!("missing value for {flag}")))
 }
 
 /// Emit structured JSON lifecycle markers for humans and log backends.
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 fn emit_log(event: &str, table: Option<&str>, offset: Option<&str>, message: &str) {
     let value = json!({
         "kind": "log",
@@ -432,6 +451,7 @@ fn emit_log(event: &str, table: Option<&str>, offset: Option<&str>, message: &st
     println!("{value}");
 }
 
+#[cfg(all(feature = "postgres", feature = "metrics"))]
 fn print_help() {
     println!(
         "postgres_to_otel\n\n\

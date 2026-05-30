@@ -63,7 +63,7 @@ Fault injection exercises code paths that are difficult to hit with live systems
 ### Suite Classification
 
 - Synthetic coverage: `tests/crash_simulation_integration.rs`, `tests/data_loss_detection.rs`
-- Live connector/process-kill coverage: `tests/runtime_postgres_process_crash_integration.rs`, `tests/runtime_mysql_process_crash_integration.rs`, `tests/runtime_sqlserver_process_crash_integration.rs`
+- Live connector/process-kill coverage: `tests/runtime_postgres_process_crash_integration.rs`, `tests/runtime_mysql_process_crash_integration.rs`, `tests/runtime_mariadb_process_crash_integration.rs`, `tests/runtime_sqlserver_process_crash_integration.rs`
 - Live process-kill suites require Docker and the `CDC_RS_RUN_DOCKER_TESTS=1` gate.
 
 ### Guarantee Boundaries
@@ -111,6 +111,7 @@ cargo test deterministic_replay_golden_fixtures
 cargo test fault_injection_soak_matrix
 cargo test runtime_postgres_process_crash_integration
 cargo test runtime_mysql_process_crash_integration --features mysql --bins
+cargo test runtime_mariadb_process_crash_integration --features mariadb --bins
 cargo test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 cargo test data_loss_detection
 ```

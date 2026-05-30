@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Local CI preflight runner.
 # - Mirrors the workflow command matrix for check/quality jobs.
-# - Integration suites are optional for fast local iteration.
+# - Integration suites are optional, but when enabled they use matrix-equivalent
+#   connector feature wiring by default.
 
 WITH_INTEGRATION=0
 WITH_FULL_MATRIX=0
@@ -20,7 +21,7 @@ Skipped release-gate surfaces include:
   - docker-gated process-crash suites
   - latency evidence gate
 
-To run partial Docker integration validation locally:
+To run matrix-equivalent Docker integration validation locally:
   ./scripts/ci-preflight.sh --with-integration
 
 To run full release-gate validation locally:
@@ -42,7 +43,7 @@ for arg in "$@"; do
 Usage: ./scripts/ci-preflight.sh [--with-integration] [--with-full-matrix]
 
 Options:
-  --with-integration   Run partial Docker-backed integration suites.
+  --with-integration   Run matrix-equivalent Docker-backed integration suites.
   --with-full-matrix   Run full release-gate integration evidence matrix.
   -h, --help           Show this help text.
 USAGE
@@ -128,6 +129,7 @@ run_step "cargo build --example pg_to_stdout --features postgres" cargo build --
 
 if [[ "$WITH_INTEGRATION" -eq 1 ]]; then
   export CDC_RS_RUN_DOCKER_TESTS=1
+  export CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT=1
 
   for tc in "${TOOLCHAINS[@]}"; do
     if [[ -n "$tc" ]]; then
@@ -143,7 +145,15 @@ if [[ "$WITH_INTEGRATION" -eq 1 ]]; then
     done
 
     for suite in mysql_connection_integration mysql_snapshot_integration mysql_stream_integration mysql_handoff_integration; do
-      run_step "integration mysql ($TOOLCHAIN_LABEL / $suite)" "${CARGO[@]}" test --test "$suite" --features mysql
+      run_step "integration mysql ($TOOLCHAIN_LABEL / $suite)" "${CARGO[@]}" test --test "$suite" --features mysql,insecure-test-overrides
+    done
+
+    for suite in mariadb_connection_integration mariadb_e2e_integration; do
+      run_step "integration mariadb ($TOOLCHAIN_LABEL / $suite)" "${CARGO[@]}" test --test "$suite" --features mariadb,insecure-test-overrides
+    done
+
+    for suite in sqlserver_version_matrix sqlserver_snapshot_integration sqlserver_stream_integration sqlserver_handoff_integration; do
+      run_step "integration sqlserver ($TOOLCHAIN_LABEL / $suite)" "${CARGO[@]}" test --test "$suite" --features sqlserver,insecure-test-overrides
     done
   done
 
@@ -153,7 +163,7 @@ if [[ "$WITH_INTEGRATION" -eq 1 ]]; then
     run_step "full integration matrix evidence" bash scripts/run_full_integration_matrix_evidence.sh
   else
     echo
-    echo "note: --with-integration runs a partial matrix; use --with-full-matrix for release-gate coverage"
+    echo "note: --with-integration now uses matrix-equivalent connector feature wiring; use --with-full-matrix for crash-worker + extended evidence lanes"
   fi
 else
   print_integration_skip_warning

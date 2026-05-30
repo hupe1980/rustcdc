@@ -16,6 +16,10 @@ jobs:
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
       CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
+      BENCHMARK_STRICT: "1"
+      BENCHMARK_BASELINE_COMMIT: ${{ github.sha }}
+      BENCHMARK_BASELINE_ARTIFACT: BENCHMARK_REPORT.md
+      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,6 +52,9 @@ jobs:
       - name: cargo package (dry-run)
         run: cargo package --no-verify --all-features
 
+      - name: strict benchmark evidence gate
+        run: bash scripts/ci-benchmark-gate.sh
+
       - name: full integration and reliability matrix evidence
         run: bash scripts/run_full_integration_matrix_evidence.sh
 
@@ -65,6 +72,10 @@ jobs:
             target/mysql-latency-evidence.md
             target/sqlserver-latency-evidence.json
             target/sqlserver-latency-evidence.md
+            target/benchmark-ci-gate*.txt
+            target/benchmark-ci-env.txt
+            target/criterion
+            BENCHMARK_REPORT.md
 
   # ── Publish ────────────────────────────────────────────────────────────────
   publish:

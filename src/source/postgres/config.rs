@@ -7,7 +7,7 @@ use tokio_postgres::Config as PgConnectConfig;
 
 use crate::core::{Error, Result, SecretString, TransportConfig};
 
-use super::{PostgresSourceConfig, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS};
+use super::{DatabaseAuthMode, PostgresSourceConfig, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS};
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
@@ -21,6 +21,7 @@ impl fmt::Debug for PostgresSourceConfig {
             .field("port", &self.port)
             .field("user", &self.user)
             .field("password", &"***redacted***")
+            .field("auth_mode", &self.auth_mode)
             .field("database", &self.database)
             .field("replication_slot_name", &self.replication_slot_name)
             .field("publication_name", &self.publication_name)
@@ -39,6 +40,7 @@ impl Default for PostgresSourceConfig {
             port: 5432,
             user: String::new(),
             password: SecretString::default(),
+            auth_mode: DatabaseAuthMode::Password,
             database: String::new(),
             replication_slot_name: String::new(),
             publication_name: String::new(),
@@ -58,6 +60,34 @@ impl PostgresSourceConfig {
         "postgres"
     }
 
+    /// Enable AWS IAM token-based database authentication mode.
+    #[must_use]
+    pub fn with_aws_iam_auth(mut self) -> Self {
+        self.auth_mode = DatabaseAuthMode::AwsIamToken;
+        self
+    }
+
+    /// Enable static password database authentication mode.
+    #[must_use]
+    pub fn with_password_auth(mut self) -> Self {
+        self.auth_mode = DatabaseAuthMode::Password;
+        self
+    }
+
+    /// Set plaintext transport explicitly.
+    #[must_use]
+    pub fn with_plaintext_transport(mut self) -> Self {
+        self.transport = TransportConfig::plaintext();
+        self
+    }
+
+    /// Set TLS transport explicitly.
+    #[must_use]
+    pub fn with_tls_transport(mut self) -> Self {
+        self.transport = TransportConfig::tls();
+        self
+    }
+
     /// Validate configuration values before a connection attempt.
     pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
@@ -74,6 +104,11 @@ impl PostgresSourceConfig {
         if self.password.resolve()?.trim().is_empty() {
             return Err(Error::ConfigError(
                 "postgres password must not be empty".into(),
+            ));
+        }
+        if matches!(self.auth_mode, DatabaseAuthMode::AwsIamToken) && !self.transport.is_tls() {
+            return Err(Error::ConfigError(
+                "postgres auth_mode=aws_iam_token requires TLS transport".into(),
             ));
         }
         if self.database.trim().is_empty() {

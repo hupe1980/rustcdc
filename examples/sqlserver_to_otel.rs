@@ -1,10 +1,14 @@
-#![cfg(all(feature = "sqlserver", feature = "metrics"))]
+#![cfg_attr(
+    not(all(feature = "sqlserver", feature = "metrics")),
+    allow(dead_code, unused_imports)
+)]
 //! Advanced Phase 2 example:
 //! - SQL Server snapshot + stream processing
 //! - OTLP metrics + tracing export
 //! - Structured JSON logs to stdout
 //! - Deterministic graceful shutdown (max events or runtime budget)
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 use std::{
     env,
     path::PathBuf,
@@ -12,14 +16,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, EventTracer,
     MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector, RuntimeConfig,
     RuntimeObservability, RuntimeSourceConfig, SqlServerSourceConfig, StructuredLogger,
     TransportConfig,
 };
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 use serde_json::json;
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> rustcdc::Result<()> {
     // Parse config from env/CLI so this sample can run both locally and in CI.
@@ -251,6 +258,14 @@ async fn main() -> rustcdc::Result<()> {
     Ok(())
 }
 
+#[cfg(not(all(feature = "sqlserver", feature = "metrics")))]
+fn main() {
+    eprintln!(
+        "sqlserver_to_otel requires features sqlserver,metrics. Run with: cargo run --example sqlserver_to_otel --features sqlserver,metrics"
+    );
+}
+
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 #[derive(Debug, Clone)]
 struct ExampleArgs {
     host: String,
@@ -271,6 +286,7 @@ struct ExampleArgs {
     environment: String,
 }
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 impl ExampleArgs {
     fn from_env_and_args() -> rustcdc::Result<Self> {
         let mut out = Self {
@@ -395,15 +411,18 @@ impl ExampleArgs {
     }
 }
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 fn env_or_default(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> rustcdc::Result<String> {
     args.next()
         .ok_or_else(|| rustcdc::Error::ConfigError(format!("missing value for {flag}")))
 }
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 fn emit_log(event: &str, table: Option<&str>, offset: Option<&str>, message: &str) {
     let value = json!({
         "kind": "log",
@@ -416,6 +435,7 @@ fn emit_log(event: &str, table: Option<&str>, offset: Option<&str>, message: &st
     println!("{value}");
 }
 
+#[cfg(all(feature = "sqlserver", feature = "metrics"))]
 fn print_help() {
     println!(
         "sqlserver_to_otel (Phase 2 example)\n\n\

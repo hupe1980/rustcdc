@@ -45,6 +45,7 @@ use super::{
 mod runtime_commit;
 
 const DEFAULT_RUNTIME_IDEMPOTENCY_CAPACITY: usize = 100_000;
+const DEFAULT_SCHEMA_HISTORY_MAX_VERSIONS_PER_TABLE: usize = 256;
 
 /// Explicit observability configuration for runtime construction.
 #[derive(Clone)]
@@ -105,18 +106,6 @@ pub struct RuntimeOptions {
     /// When `Some`, the runtime retries the failing poll with exponential backoff before
     /// surfacing the error.
     pub connection_retry: Option<ConnectionRetryPolicy>,
-    /// Allowlist of tables whose events are forwarded to the caller, in `"schema.table"` format.
-    ///
-    /// When non-empty, events from tables **not** in this list are silently dropped after
-    /// source read but before transforms or buffering.  Takes precedence over
-    /// [`table_exclude_list`](RuntimeOptions::table_exclude_list).
-    /// An empty list means all tables pass through.
-    pub table_include_list: Vec<String>,
-    /// Blocklist of tables whose events are dropped, in `"schema.table"` format.
-    ///
-    /// Applied only when [`table_include_list`](RuntimeOptions::table_include_list) is empty.
-    /// An empty list means no tables are excluded.
-    pub table_exclude_list: Vec<String>,
     /// Optional callback invoked when an event is discarded due to a transform error
     /// under [`TransformErrorPolicy::Skip`].
     ///
@@ -144,10 +133,13 @@ impl Default for RuntimeOptions {
                 ttl_ms: None,
             }),
             validate_events: true,
-            schema_history_retention: None,
+            // Correctness-first + operability default: keep bounded schema history
+            // to prevent unbounded growth in long-lived DDL-heavy deployments.
+            schema_history_retention: Some(
+                SchemaHistoryRetention::keep_last(DEFAULT_SCHEMA_HISTORY_MAX_VERSIONS_PER_TABLE)
+                    .expect("default schema history retention policy must be valid"),
+            ),
             connection_retry: Some(ConnectionRetryPolicy::default()),
-            table_include_list: Vec::new(),
-            table_exclude_list: Vec::new(),
             dead_letter_handler: None,
         }
     }
@@ -2325,17 +2317,75 @@ mod tests {
         assert_eq!(resume_source.as_deref(), Some("mysql"));
     }
 
-    #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
+    #[cfg(feature = "mariadb")]
+    #[tokio::test]
+    async fn mariadb_snapshot_checkpoint_resumes_stream_from_mariadb_offset() {
+        let mut snapshot_event = event();
+        snapshot_event.snapshot = Some(crate::core::SnapshotMetadata {
+            snapshot_id: "snap-1".into(),
+            chunk_index: 0,
+            is_last_chunk: false,
+        });
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::MariaDb(crate::source::MariaDbSourceConfig::default()),
+            checkpoint,
+            schema_history,
+        )
+        .with_snapshot_tables(vec!["users".to_string()]);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        let source = MockSource::with_snapshot(vec![vec![snapshot_event]], vec![vec![event()]]);
+        let resume_source = source.last_stream_resume_source();
+        runtime.inject_mock_source(Box::new(source));
+
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new(
+                    "mariadb_snapshot",
+                    br#"{"snapshot_id":"s","snapshot_start_ts":1,"binlog_file":"mariadb-bin.000123","binlog_pos":789,"gtid":"uuid:8-9","current_table":0,"next_chunk_index":0,"tables":[]}"#.to_vec(),
+                ),
+                0,
+            )
+            .await
+            .unwrap();
+
+        runtime.start().await.unwrap();
+        let first = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        let resume_source = resume_source
+            .lock()
+            .expect("resume source mutex should not be poisoned")
+            .clone();
+        assert_eq!(resume_source.as_deref(), Some("mariadb"));
+    }
+
+    #[cfg(any(
+        feature = "postgres",
+        feature = "mysql",
+        feature = "mariadb",
+        feature = "sqlserver"
+    ))]
     fn snapshot_checkpoint_payload_for_source(snapshot_source_type: &str) -> Vec<u8> {
         match snapshot_source_type {
             "postgres_snapshot" => br#"{"snapshot_id":"snap","snapshot_start_ts":1,"snapshot_end_ts":0,"snapshot_watermark":4242,"current_table":0,"next_chunk_index":1,"tables":[]}"#.to_vec(),
             "mysql_snapshot" => br#"{"snapshot_id":"snap","snapshot_start_ts":1,"binlog_file":"mysql-bin.000123","binlog_pos":789,"gtid":"uuid:8-9","current_table":0,"next_chunk_index":1,"tables":[]}"#.to_vec(),
+            "mariadb_snapshot" => br#"{"snapshot_id":"snap","snapshot_start_ts":1,"binlog_file":"mariadb-bin.000123","binlog_pos":789,"gtid":"uuid:8-9","current_table":0,"next_chunk_index":1,"tables":[]}"#.to_vec(),
             "sqlserver_snapshot" => br#"{"snapshot_id":"snap","lsn_start":[0,0,0,42,0,0,1,155,0,16],"current_table":0,"next_chunk_index":1,"tables":[]}"#.to_vec(),
             other => panic!("unsupported snapshot source type in test fixture: {other}"),
         }
     }
 
-    #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
+    #[cfg(any(
+        feature = "postgres",
+        feature = "mysql",
+        feature = "mariadb",
+        feature = "sqlserver"
+    ))]
     async fn assert_runtime_snapshot_resume_through_commit_ack(
         source_config: RuntimeSourceConfig,
         snapshot_source_type: &str,
@@ -2450,6 +2500,16 @@ mod tests {
         assert_runtime_snapshot_resume_through_commit_ack(
             RuntimeSourceConfig::Mysql(crate::source::MysqlSourceConfig::default()),
             "mysql_snapshot",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "mariadb")]
+    #[tokio::test]
+    async fn mariadb_snapshot_checkpoint_commit_ack_survives_restart_and_resumes_runtime() {
+        assert_runtime_snapshot_resume_through_commit_ack(
+            RuntimeSourceConfig::MariaDb(crate::source::MariaDbSourceConfig::default()),
+            "mariadb_snapshot",
         )
         .await;
     }
@@ -2878,6 +2938,56 @@ mod tests {
         let decoded = crate::checkpoint::MysqlOffset::from_bytes(&saved.encode().unwrap()).unwrap();
         assert_eq!(decoded.gtid, "uuid:3-9");
         assert_eq!(decoded.binlog_file, "binlog.000002");
+        assert_eq!(decoded.binlog_pos, 432);
+    }
+
+    #[cfg(feature = "mariadb")]
+    #[tokio::test]
+    async fn mariadb_checkpoint_offset_preserves_gtid_from_event_offset() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::MariaDb(crate::source::MariaDbSourceConfig::default()),
+            checkpoint,
+            schema_history,
+        );
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        let mut ev = event();
+        ev.source.source_name = "mariadb".into();
+        ev.source.offset = "mariadb-bin.000002:432#gtid=uuid:3-9".into();
+        runtime.inject_mock_source(Box::new(MockSource::stream_only(vec![vec![ev]])));
+
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new(
+                    "mariadb",
+                    br#"{"gtid":"","binlog_file":"mariadb-bin.000001","binlog_pos":4}"#.to_vec(),
+                ),
+                0,
+            )
+            .await
+            .unwrap();
+
+        runtime.start().await.unwrap();
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime
+            .commit_ack(batch.ack_token().unwrap())
+            .await
+            .unwrap();
+
+        let saved = runtime
+            .config
+            .checkpoint
+            .load()
+            .await
+            .unwrap()
+            .expect("mariadb checkpoint should be present");
+        assert_eq!(saved.source_type(), "mariadb");
+        let decoded = crate::checkpoint::MysqlOffset::from_bytes(&saved.encode().unwrap()).unwrap();
+        assert_eq!(decoded.gtid, "uuid:3-9");
+        assert_eq!(decoded.binlog_file, "mariadb-bin.000002");
         assert_eq!(decoded.binlog_pos, 432);
     }
 

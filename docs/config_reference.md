@@ -66,6 +66,7 @@ Default runtime safety posture:
 - `transform_error_policy = Halt`
 - `post_commit_source_confirm_policy = FailFast`
 - `validate_events = true`
+- `schema_history_retention = Some(SchemaHistoryRetention::keep_last(256))`
 
 ### RuntimeConfig Builder Example
 
@@ -217,6 +218,11 @@ pub struct PostgresSourceConfig {
     /// Use `SecretString::new`, `SecretString::from_env`,
     /// `SecretString::from_provider`, or `SecretString::from_callback`.
     pub password: SecretString,
+
+    /// Database authentication mode.
+    /// - `Password` (default): static password semantics
+    /// - `AwsIamToken`: short-lived IAM token semantics (requires TLS transport)
+    pub auth_mode: DatabaseAuthMode,
     
     /// Database name to replicate from
     pub database: String,
@@ -325,6 +331,34 @@ Future backward-compatibility rollout plan (when versioning becomes necessary):
 - phase 2: encrypt emits only the new versioned payload format
 - phase 3: after migration window, remove legacy decrypt support with release-note callout
 
+### Field Mapping Transform
+
+Use `FieldMappingTransform` for high-value schema-alignment operations without
+custom code:
+
+- copy fields (`copy`)
+- rename/move fields (`rename`)
+- inject static literals (`set_literals`)
+- remove fields (`remove`)
+
+Paths use dot notation (`profile.email`, `meta.source`).
+
+```rust
+use rustcdc::{FieldMappingConfig, FieldMappingTransform};
+use serde_json::json;
+
+let transform = FieldMappingTransform::new(FieldMappingConfig {
+  copy: vec![("user.email".into(), "email".into())],
+  rename: vec![("user.name".into(), "user.full_name".into())],
+  set_literals: vec![("meta.pipeline".into(), json!("orders-v2"))],
+  remove: vec!["legacy_flag".into()],
+  strict: true,
+})?;
+```
+
+`strict = true` fails fast when copy/rename/remove source paths are missing,
+which helps catch drift during schema evolution and replay.
+
 **Replay determinism caveat (important):**
 - `MaskRule::Encrypt` is intentionally nonce-based and therefore non-deterministic.
 - Replaying the same logical event will produce different ciphertext bytes.
@@ -399,6 +433,11 @@ pub struct MysqlSourceConfig {
     
     /// MySQL password material as `SecretString`
     pub password: SecretString,
+
+    /// Database authentication mode.
+    /// - `Password` (default): static password semantics
+    /// - `AwsIamToken`: short-lived IAM token semantics (requires TLS transport)
+    pub auth_mode: DatabaseAuthMode,
     
     /// Database name to replicate from
     pub database: String,
@@ -507,6 +546,14 @@ pub struct SqlServerSourceConfig {
     
 }
 ```
+
+### AWS IAM Auth Mode (MySQL/PostgreSQL)
+
+For RDS-style IAM database auth, use connector `auth_mode = AwsIamToken` and
+resolve the token through `SecretString::from_callback` (or provider) so each
+new connection can fetch a fresh short-lived token.
+
+TLS is mandatory when `auth_mode = AwsIamToken`.
 
 ### SQL Server Connection String Format
 
@@ -747,6 +794,16 @@ let transport = TransportConfig::tls();
 // Plaintext: only for trusted private networks or local integration testing.
 // Credentials and event data are transmitted unencrypted.
 let transport = TransportConfig::plaintext();
+```
+
+Connector config helpers now provide explicit transport selection APIs:
+
+```rust
+let mysql_cfg = MysqlSourceConfig::default().with_plaintext_transport();
+let pg_cfg = PostgresSourceConfig::default().with_plaintext_transport();
+let mssql_cfg = SqlServerSourceConfig::default().with_plaintext_transport();
+
+let mysql_tls = mysql_cfg.with_tls_transport();
 ```
 
 ### Monitoring Checklist

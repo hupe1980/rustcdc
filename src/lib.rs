@@ -21,10 +21,10 @@ pub mod wasm;
 pub use crate::core::{
     fingerprint_event, AckToken, CdcRuntime, Error, Event, EventBatch, EventIdempotencyGuard,
     EventTracer, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
-    Offset, Operation, Result, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability,
-    RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString,
-    SnapshotMetadata, SourceMetadata, StructuredLogger, TransactionMetadata, TransformErrorPolicy,
-    TransportConfig, ValidationError, EVENT_ENVELOPE_VERSION,
+    Offset, Operation, PostCommitSourceConfirmPolicy, Result, RuntimeAdminSnapshot, RuntimeConfig,
+    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider,
+    SecretString, SnapshotMetadata, SourceMetadata, StructuredLogger, TransactionMetadata,
+    TransformErrorPolicy, TransportConfig, ValidationError, EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "metrics")]
 pub use crate::core::{
@@ -42,8 +42,8 @@ pub use crate::source::MysqlIncrementalSnapshotHandle;
 #[cfg(feature = "sqlserver")]
 pub use crate::source::SqlServerIncrementalSnapshotHandle;
 pub use crate::source::{
-    ConnectorCapabilities, HandoffResult, SnapshotCheckpointHelper, SnapshotEnd, SnapshotProgress,
-    SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport,
+    ConnectorCapabilities, DatabaseAuthMode, HandoffResult, SnapshotCheckpointHelper, SnapshotEnd,
+    SnapshotProgress, SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport,
     SnapshotValidationResult, SnapshotValidator, TableProgress,
 };
 #[cfg(feature = "mariadb")]
@@ -57,6 +57,11 @@ pub use crate::source::{MysqlConnection, MysqlSourceConfig, ServerFlavor};
 pub use crate::source::{PostgresConnection, PostgresSourceConfig};
 #[cfg(feature = "sqlserver")]
 pub use crate::source::{SqlServerConnection, SqlServerSourceConfig};
+pub use crate::transform::{
+    FieldMappingConfig, FieldMappingTransform, FilterField, FilterOperator, FilterProjectionConfig,
+    FilterProjectionTransform, FilterRule, MaskHashConfig, MaskHashTransform, MaskRule,
+    RouteConfig, RouteTransform, Transform, TransformPipeline, UnwrapConfig, UnwrapTransform,
+};
 pub use crate::wasm::{
     TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,
     DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,

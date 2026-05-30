@@ -288,17 +288,19 @@ Set `max_retries: None` for indefinitely-retrying long-running pipelines.
 ## Transform Configuration
 
 `FilterProjectionTransform::new(config)` returns `Result<Self>` — configuration
-errors (unknown field names, unsupported operators, wrong token count) are caught at
-construction time rather than silently at apply time.
+errors (for example empty filter values) are caught at construction time rather
+than silently at apply time.
 
 ```rust
-use rustcdc::transform::{FilterProjectionConfig, FilterProjectionTransform};
+use rustcdc::transform::{
+  FilterField, FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule,
+};
 
 let transform = FilterProjectionTransform::new(FilterProjectionConfig {
-    filter_expr: Some("op == 'insert'".into()),
+  filter: Some(FilterRule::new(FilterField::Op, FilterOperator::Eq, "insert")),
     include_columns: Some(vec!["id".into(), "email".into()]),
     exclude_columns: None,
-})?;  // returns Err(ConfigError) for invalid expressions
+})?;  // returns Err(ConfigError) for invalid filter values
 ```
 
 ## Related Documentation
@@ -314,9 +316,10 @@ let transform = FilterProjectionTransform::new(FilterProjectionConfig {
 
 ## MariaDB Support
 
-rustcdc supports **MariaDB 10.5 and 10.6** via the MySQL connector. The
-`mysql_async` library handles the MariaDB binlog wire protocol transparently;
-no separate connector type is needed.
+rustcdc supports **MariaDB 10.5 and 10.6** via the MySQL protocol stack. The
+`mysql_async` library handles the MariaDB binlog wire protocol transparently.
+rustcdc also provides a first-class `MariaDbSourceConfig` wrapper for explicit
+runtime source typing (`mariadb`) and separate checkpoint namespace handling.
 
 ### Capability Matrix
 

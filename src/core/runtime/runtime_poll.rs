@@ -5,10 +5,9 @@ where
     C: crate::checkpoint::Checkpoint + Send + Sync + 'static,
     H: SchemaHistory + Send + Sync + 'static,
 {
-    /// Poll the next event batch with an opaque acknowledgement token.
     pub async fn poll_event_batch(&mut self) -> Result<EventBatch> {
         if self.state != RuntimeState::Running {
-            let error = Error::StateError("runtime must be running before polling".into());
+            let error = Error::StateError("runtime is not running".into());
             self.record_runtime_error("runtime.poll.state", &error);
             return Err(error);
         }
@@ -38,8 +37,7 @@ where
 
             // Deduplicate source events before transform stages mutate payloads.
             let deduplicated = self.filter_idempotent_events(chunk)?;
-            let filtered = self.filter_by_table_list(deduplicated);
-            let transformed = self.apply_transforms(filtered).await?;
+            let transformed = self.apply_transforms(deduplicated).await?;
             self.enqueue_pending_source_events(transformed);
             return self.flush_pending_source_events();
         }
@@ -52,8 +50,7 @@ where
             if !chunk.is_empty() {
                 // Deduplicate source events before transform stages mutate payloads.
                 let deduplicated = self.filter_idempotent_events(chunk)?;
-                let filtered = self.filter_by_table_list(deduplicated);
-                let transformed = self.apply_transforms(filtered).await?;
+                let transformed = self.apply_transforms(deduplicated).await?;
                 self.enqueue_pending_source_events(transformed);
                 return self.flush_pending_source_events();
             }
@@ -116,9 +113,7 @@ where
             }
             // Deduplicate source events before transform stages mutate payloads.
             let deduplicated = self.filter_idempotent_events(events)?;
-            // Apply table include/exclude filtering.
-            let filtered = self.filter_by_table_list(deduplicated);
-            let transformed = self.apply_transforms(filtered).await?;
+            let transformed = self.apply_transforms(deduplicated).await?;
             self.enqueue_pending_source_events(transformed);
             return self.flush_pending_source_events();
         }
@@ -200,27 +195,6 @@ where
         Ok(out)
     }
 
-    /// Drop events whose `schema.table` address is not allowed by the runtime's
-    /// include / exclude table lists.  When both lists are empty, all events pass through.
-    fn filter_by_table_list(&self, events: Vec<Event>) -> Vec<Event> {
-        let include = &self.config.options.table_include_list;
-        let exclude = &self.config.options.table_exclude_list;
-        if include.is_empty() && exclude.is_empty() {
-            return events;
-        }
-        events
-            .into_iter()
-            .filter(|event| {
-                crate::source::table_is_allowed(
-                    event.schema.as_deref(),
-                    &event.table,
-                    include,
-                    exclude,
-                )
-            })
-            .collect()
-    }
-
     fn enqueue_pending_source_events(&mut self, events: Vec<Event>) {
         self.pending_source_events.extend(events);
     }
@@ -296,7 +270,16 @@ where
         }
 
         #[cfg(feature = "mysql")]
-        if matches!(&self.config.source, RuntimeSourceConfig::Mysql(_)) {
+        let mysql_family = {
+            let mysql_family = matches!(&self.config.source, RuntimeSourceConfig::Mysql(_));
+            #[cfg(feature = "mariadb")]
+            let mysql_family =
+                mysql_family || matches!(&self.config.source, RuntimeSourceConfig::MariaDb(_));
+            mysql_family
+        };
+
+        #[cfg(feature = "mysql")]
+        if mysql_family {
             let (binlog_file, binlog_pos, gtid) = parse_mysql_stream_offset(&event.source.offset)?;
             let offset = MysqlOffset {
                 gtid,
@@ -304,7 +287,7 @@ where
                 binlog_pos,
             };
             return Ok(GenericOffset::new(
-                "mysql",
+                source_type.to_string(),
                 offset
                     .encode()
                     .map_err(|error| Error::CheckpointError(error.to_string()))?,

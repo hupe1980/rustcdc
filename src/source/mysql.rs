@@ -20,8 +20,8 @@ use crate::{
     core::{Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig},
     ddl_capture::{extract_captured_ddl, DdlDialect},
     source::{
-        ConnectorCapabilities, HandoffResult, IncrementalSnapshotConfig, SnapshotEnd,
-        SnapshotHandle, Source, StreamHandle,
+        ConnectorCapabilities, DatabaseAuthMode, HandoffResult, IncrementalSnapshotConfig,
+        SnapshotEnd, SnapshotHandle, Source, StreamHandle,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,12 @@ pub struct MysqlSourceConfig {
     pub port: u16,
     pub user: String,
     pub password: SecretString,
+    /// Connector authentication mode.
+    ///
+    /// `AwsIamToken` indicates the password field should provide short-lived
+    /// IAM auth tokens (typically via `SecretString::from_callback`).
+    #[serde(default)]
+    pub auth_mode: DatabaseAuthMode,
     pub database: String,
     pub server_id: u32,
     pub gtid_mode_enabled: bool,
@@ -1398,6 +1404,68 @@ mod tests {
         let _ = config.build_pool_opts().unwrap();
 
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn aws_iam_auth_mode_requires_tls() {
+        let mut config = MysqlSourceConfig {
+            host: "localhost".into(),
+            port: 3306,
+            user: "cdc".into(),
+            password: SecretString::from_callback(
+                "mysql-iam-token",
+                || Ok("iam-token".to_string()),
+            ),
+            auth_mode: super::DatabaseAuthMode::AwsIamToken,
+            database: "app".into(),
+            server_id: 7,
+            gtid_mode_enabled: false,
+            binlog_format_check: true,
+            transport: TransportConfig::plaintext(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(error, crate::core::Error::ConfigError(message) if message.contains("requires TLS"))
+        );
+
+        config.transport = TransportConfig::tls();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn plaintext_transport_is_explicitly_supported() {
+        let config = MysqlSourceConfig {
+            host: "localhost".into(),
+            port: 3306,
+            user: "cdc".into(),
+            password: "secret".into(),
+            auth_mode: super::DatabaseAuthMode::Password,
+            database: "app".into(),
+            server_id: 7,
+            gtid_mode_enabled: false,
+            binlog_format_check: true,
+            transport: TransportConfig::plaintext(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn transport_helper_methods_set_expected_mode() {
+        let plaintext = MysqlSourceConfig::default().with_plaintext_transport();
+        assert!(!plaintext.transport.is_tls());
+
+        let tls = plaintext.with_tls_transport();
+        assert!(tls.transport.is_tls());
     }
 
     #[tokio::test]

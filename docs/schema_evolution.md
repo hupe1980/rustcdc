@@ -57,6 +57,7 @@ Schema evolution behavior spans two modules:
 
 Runtime-managed retention is available through `RuntimeConfig::with_schema_history_retention(...)`.
 When configured, rustcdc applies the retention policy automatically after each persisted DDL mutation.
+Runtime defaults now enable bounded retention (`keep_last(256)` per table) to prevent unbounded growth.
 
 ### Built-In Backends
 

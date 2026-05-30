@@ -1384,6 +1384,23 @@ mod tests {
         assert!(cfg.to_tiberius_config().is_ok());
     }
 
+    #[test]
+    fn plaintext_transport_is_explicitly_supported() {
+        let mut cfg = config();
+        cfg.transport = TransportConfig::plaintext();
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn transport_helper_methods_set_expected_mode() {
+        let plaintext = SqlServerSourceConfig::default().with_plaintext_transport();
+        assert!(!plaintext.transport.is_tls());
+
+        let tls = plaintext.with_tls_transport();
+        assert!(tls.transport.is_tls());
+    }
+
     #[tokio::test]
     async fn source_capabilities_are_reported() {
         let connection = SqlServerConnection::with_probe(
