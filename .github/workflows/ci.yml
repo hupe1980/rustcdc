@@ -168,6 +168,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull postgres images (public ecr mirror)
+        run: |
+          for tag in 16-alpine; do
+            docker pull public.ecr.aws/docker/library/postgres:${tag}
+            docker tag public.ecr.aws/docker/library/postgres:${tag} postgres:${tag}
+          done
       - name: cargo test --test runtime_postgres --features postgres
         run: cargo test --test runtime_postgres --features postgres
 
@@ -197,6 +203,12 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull postgres images (public ecr mirror)
+        run: |
+          for tag in 12-alpine 14-alpine 15-alpine 16-alpine; do
+            docker pull public.ecr.aws/docker/library/postgres:${tag}
+            docker tag public.ecr.aws/docker/library/postgres:${tag} postgres:${tag}
+          done
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration'
         run: cargo test --test ${{ matrix.suite }} --features postgres
@@ -217,6 +229,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull postgres images (public ecr mirror)
+        run: |
+          for tag in 16-alpine; do
+            docker pull public.ecr.aws/docker/library/postgres:${tag}
+            docker tag public.ecr.aws/docker/library/postgres:${tag} postgres:${tag}
+          done
       - name: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
         run: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
 
