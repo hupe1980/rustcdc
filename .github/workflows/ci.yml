@@ -142,6 +142,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull postgres image (public ecr mirror)
+        run: bash scripts/ci-pull-postgres-images.sh 16-alpine
       - name: connector-backed latency evidence gate (p95/p99)
         run: bash scripts/ci-latency-gate.sh
       - name: upload latency evidence artifacts
@@ -170,10 +172,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
         run: |
-          for tag in 16-alpine; do
-            docker pull public.ecr.aws/docker/library/postgres:${tag}
-            docker tag public.ecr.aws/docker/library/postgres:${tag} postgres:${tag}
-          done
+          bash scripts/ci-pull-postgres-images.sh 16-alpine
       - name: cargo test --test runtime_postgres --features postgres
         run: cargo test --test runtime_postgres --features postgres
 
@@ -205,10 +204,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
         run: |
-          for tag in 12-alpine 14-alpine 15-alpine 16-alpine; do
-            docker pull public.ecr.aws/docker/library/postgres:${tag}
-            docker tag public.ecr.aws/docker/library/postgres:${tag} postgres:${tag}
-          done
+          tags="16-alpine"
+          if [[ "${{ matrix.suite }}" == "postgres_version_matrix" ]]; then
+            tags="12-alpine 14-alpine 15-alpine 16-alpine"
+          fi
+          bash scripts/ci-pull-postgres-images.sh ${tags}
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration'
         run: cargo test --test ${{ matrix.suite }} --features postgres
@@ -230,11 +230,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
-        run: |
-          for tag in 16-alpine; do
-            docker pull public.ecr.aws/docker/library/postgres:${tag}
-            docker tag public.ecr.aws/docker/library/postgres:${tag} postgres:${tag}
-          done
+        run: bash scripts/ci-pull-postgres-images.sh 16-alpine
       - name: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
         run: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
 
