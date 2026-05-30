@@ -7,7 +7,7 @@ The repository includes canonical event contracts, checkpoint safety primitives,
 
 Active development. Core connector/runtime library paths are implemented and validated by unit and integration suites.
 
-Current crate release: 0.1.2.
+Current crate release: 0.1.3.
 
 ## MSRV 🛠️
 
