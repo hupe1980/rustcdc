@@ -105,6 +105,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: install policy gate dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep jq
       - name: policy gates (schema + deprecated + workflow drift)
         run: bash scripts/ci-policy-gate.sh
 
@@ -410,6 +414,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: install release evidence dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep jq
 
       - name: verify tag matches Cargo.toml version
         run: |
