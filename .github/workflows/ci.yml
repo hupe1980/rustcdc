@@ -112,6 +112,64 @@ jobs:
       - name: policy gates (schema + deprecated + workflow drift)
         run: bash scripts/ci-policy-gate.sh
 
+  release-evidence-benchmark-preflight:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    needs:
+      - msrv
+      - check
+      - quality
+      - transport-security
+      - policy-gate
+      - correctness-smoke
+      - reliability-core
+      - latency-core
+      - integration-postgres
+      - integration-postgres-encryption
+      - integration-reliability
+      - integration-mysql
+      - integration-mysql-encryption
+      - integration-mariadb
+      - integration-mariadb-encryption
+      - integration-sqlserver
+      - integration-sqlserver-encryption
+    runs-on: ubuntu-latest
+    env:
+      BENCHMARK_STRICT: "1"
+      BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
+      BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
+      BENCHMARK_VALIDATE_POLICY_ONLY: "1"
+      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: derive benchmark baseline inputs
+        env:
+          CONFIGURED_BASELINE_COMMIT: ${{ vars.BENCHMARK_BASELINE_COMMIT }}
+          CONFIGURED_BASELINE_ARTIFACT: ${{ vars.BENCHMARK_BASELINE_ARTIFACT }}
+        run: |
+          set -euo pipefail
+
+          baseline_commit="${CONFIGURED_BASELINE_COMMIT}"
+          baseline_artifact="${CONFIGURED_BASELINE_ARTIFACT}"
+
+          if [ -z "$baseline_commit" ]; then
+            baseline_commit="$(git rev-parse HEAD^)"
+          fi
+
+          if [ -z "$baseline_artifact" ]; then
+            baseline_artifact="commit:${baseline_commit}"
+          fi
+
+          echo "BENCHMARK_BASELINE_COMMIT=$baseline_commit" >> "$GITHUB_ENV"
+          echo "BENCHMARK_BASELINE_ARTIFACT=$baseline_artifact" >> "$GITHUB_ENV"
+
+      - name: release-evidence benchmark policy preflight
+        run: bash scripts/ci-benchmark-gate.sh
+
   correctness-smoke:
     runs-on: ubuntu-latest
     env:
@@ -402,8 +460,6 @@ jobs:
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
       BENCHMARK_STRICT: "1"
-      BENCHMARK_BASELINE_COMMIT: ${{ vars.BENCHMARK_BASELINE_COMMIT }}
-      BENCHMARK_BASELINE_ARTIFACT: ${{ vars.BENCHMARK_BASELINE_ARTIFACT }}
       BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
       BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
       CRITERION_BASELINE: ci-baseline
@@ -412,12 +468,46 @@ jobs:
       LATENCY_GATE_DEFAULT_P99_MS: "1000"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install release evidence dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep jq
+
+      - name: derive benchmark baseline inputs
+        env:
+          CONFIGURED_BASELINE_COMMIT: ${{ vars.BENCHMARK_BASELINE_COMMIT }}
+          CONFIGURED_BASELINE_ARTIFACT: ${{ vars.BENCHMARK_BASELINE_ARTIFACT }}
+        run: |
+          set -euo pipefail
+
+          current_tag="${GITHUB_REF_NAME}"
+          baseline_commit="${CONFIGURED_BASELINE_COMMIT}"
+          baseline_artifact="${CONFIGURED_BASELINE_ARTIFACT}"
+
+          if [ -z "$baseline_commit" ]; then
+            previous_tag="$(git tag --sort=-v:refname | grep '^v' | grep -Fxv "$current_tag" | head -n 1 || true)"
+            if [ -n "$previous_tag" ]; then
+              baseline_commit="$(git rev-list -n 1 "$previous_tag")"
+              if [ -z "$baseline_artifact" ]; then
+                baseline_artifact="release-tag:${previous_tag}"
+              fi
+            fi
+          fi
+
+          if [ -z "$baseline_commit" ]; then
+            baseline_commit="$(git rev-parse HEAD^)"
+          fi
+
+          if [ -z "$baseline_artifact" ]; then
+            baseline_artifact="commit:${baseline_commit}"
+          fi
+
+          echo "BENCHMARK_BASELINE_COMMIT=$baseline_commit" >> "$GITHUB_ENV"
+          echo "BENCHMARK_BASELINE_ARTIFACT=$baseline_artifact" >> "$GITHUB_ENV"
 
       - name: verify tag matches Cargo.toml version
         run: |

@@ -20,6 +20,7 @@ baseline_commit="${BENCHMARK_BASELINE_COMMIT:-}"
 baseline_artifact="${BENCHMARK_BASELINE_ARTIFACT:-}"
 benchmark_require_historical_baseline="${BENCHMARK_REQUIRE_HISTORICAL_BASELINE:-1}"
 benchmark_enforce_release_policy="${BENCHMARK_ENFORCE_RELEASE_POLICY:-0}"
+benchmark_validate_policy_only="${BENCHMARK_VALIDATE_POLICY_ONLY:-0}"
 # CRITERION_BASELINE: name of a saved Criterion baseline to compare against
 # (stored under target/criterion/<bench>/<name>/). If unset, Criterion compares
 # against the previous run. Set this in CI to a named baseline pinned to a
@@ -150,6 +151,11 @@ if [[ "$benchmark_enforce_release_policy" == "1" && "$policy_status" != "release
   echo "Benchmark policy gate failed: ${policy_reason}" >&2
   echo "Set BENCHMARK_ENFORCE_RELEASE_POLICY=0 only for non-release/local exploratory runs." >&2
   exit 1
+fi
+
+if [[ "$benchmark_validate_policy_only" == "1" ]]; then
+  echo "Benchmark policy preflight passed: ${policy_status} (${policy_reason})"
+  exit 0
 fi
 
 emit_benchmark_report() {
