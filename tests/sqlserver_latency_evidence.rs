@@ -50,11 +50,7 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
         "USE rustcdc_latency; DELETE FROM dbo.latency_users",
     )
     .await?;
-    sql_exec(
-        &mut admin,
-        "USE rustcdc_latency; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
-    )
-    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, "rustcdc_latency").await?;
     sql_exec(
         &mut admin,
         "USE rustcdc_latency; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.latency_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='latency_users', @role_name=NULL, @supports_net_changes=0",

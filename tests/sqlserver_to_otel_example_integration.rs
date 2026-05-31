@@ -100,11 +100,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
     )
     .await?;
     sql_exec(&mut admin, "USE rustcdc_example; DELETE FROM dbo.orders").await?;
-    sql_exec_with_retry(
-        &mut admin,
-        "USE rustcdc_example; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
-    )
-    .await?;
+    sqlserver_testkit::enable_cdc(&sql_host, sql_port, "rustcdc_example").await?;
     sql_exec_with_retry(
         &mut admin,
         "USE rustcdc_example; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.orders')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='orders', @role_name=NULL, @supports_net_changes=0",

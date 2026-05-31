@@ -50,11 +50,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
     )
     .await?;
     sqlserver_testkit::sql_exec(&mut admin, "USE rustcdc_handoff; DELETE FROM dbo.orders").await?;
-    sqlserver_testkit::sql_exec_with_retry(
-        &mut admin,
-        "USE rustcdc_handoff; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
-    )
-    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, "rustcdc_handoff").await?;
     sqlserver_testkit::sql_exec_with_retry(
         &mut admin,
         "USE rustcdc_handoff; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.orders')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='orders', @role_name=NULL, @supports_net_changes=0",

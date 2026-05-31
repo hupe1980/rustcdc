@@ -88,11 +88,7 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
         "USE rustcdc_crash_snapshot; DELETE FROM dbo.runtime_crash_snapshot_users",
     )
     .await?;
-    sql_exec(
-        &mut admin,
-        "USE rustcdc_crash_snapshot; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
-    )
-    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, "rustcdc_crash_snapshot").await?;
     sql_exec(
         &mut admin,
         "USE rustcdc_crash_snapshot; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.runtime_crash_snapshot_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='runtime_crash_snapshot_users', @role_name=NULL, @supports_net_changes=0",
@@ -240,11 +236,7 @@ async fn run_sqlserver_process_kill_replay_scenario(
         "USE rustcdc_crash; DELETE FROM dbo.runtime_crash_users",
     )
     .await?;
-    sql_exec(
-        &mut admin,
-        "USE rustcdc_crash; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db",
-    )
-    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, "rustcdc_crash").await?;
     sql_exec(
         &mut admin,
         "USE rustcdc_crash; IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.runtime_crash_users')) EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='runtime_crash_users', @role_name=NULL, @supports_net_changes=0",

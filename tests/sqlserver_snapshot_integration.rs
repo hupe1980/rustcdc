@@ -98,13 +98,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
         &format!("IF DB_ID('{database}') IS NULL CREATE DATABASE {database}"),
     )
     .await?;
-    sqlserver_testkit::sql_exec_with_retry(
-        &mut admin,
-        &format!(
-            "USE {database}; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db"
-        ),
-    )
-    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, database).await?;
     sqlserver_testkit::sql_exec_with_retry(
         &mut admin,
         &format!(
@@ -204,13 +198,7 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         &format!("IF DB_ID('{database}') IS NULL CREATE DATABASE {database}"),
     )
     .await?;
-    sqlserver_testkit::sql_exec_with_retry(
-        &mut admin,
-        &format!(
-            "USE {database}; IF (SELECT is_cdc_enabled FROM sys.databases WHERE name = DB_NAME()) = 0 EXEC sys.sp_cdc_enable_db"
-        ),
-    )
-    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, database).await?;
     sqlserver_testkit::sql_exec_with_retry(
         &mut admin,
         &format!(
