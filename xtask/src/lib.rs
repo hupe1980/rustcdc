@@ -2,8 +2,7 @@ pub mod worker_common {
     use std::{env, fs, path::Path};
 
     pub fn required_env(name: &str) -> rustcdc::Result<String> {
-        env::var(name)
-            .map_err(|_| rustcdc::Error::ConfigError(format!("missing env var {name}")))
+        env::var(name).map_err(|_| rustcdc::Error::ConfigError(format!("missing env var {name}")))
     }
 
     pub fn required_u16_env(name: &str) -> rustcdc::Result<u16> {

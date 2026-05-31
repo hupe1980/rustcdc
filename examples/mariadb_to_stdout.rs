@@ -108,12 +108,16 @@ impl ExampleArgs {
             host: env_or_default("CDC_RS_HOST", "localhost"),
             port: env_or_default("CDC_RS_PORT", "3306")
                 .parse::<u16>()
-                .map_err(|error| rustcdc::Error::ConfigError(format!("invalid CDC_RS_PORT: {error}")))?,
+                .map_err(|error| {
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_PORT: {error}"))
+                })?,
             user: env_or_default("CDC_RS_USER", "cdc_user"),
             database: env_or_default("CDC_RS_DB", "events"),
             server_id: env_or_default("CDC_RS_SERVER_ID", "5401")
                 .parse::<u32>()
-                .map_err(|error| rustcdc::Error::ConfigError(format!("invalid CDC_RS_SERVER_ID: {error}")))?,
+                .map_err(|error| {
+                    rustcdc::Error::ConfigError(format!("invalid CDC_RS_SERVER_ID: {error}"))
+                })?,
             snapshot_tables: env_or_default("CDC_RS_SNAPSHOT_TABLES", "public.users")
                 .split(',')
                 .map(str::trim)
@@ -206,14 +210,15 @@ fn env_or_default(name: &str, default: &str) -> String {
 
 #[cfg(feature = "mariadb")]
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> rustcdc::Result<String> {
-    args.next().ok_or_else(|| {
-        rustcdc::Error::ConfigError(format!("missing value for {flag}"))
-    })
+    args.next()
+        .ok_or_else(|| rustcdc::Error::ConfigError(format!("missing value for {flag}")))
 }
 
 #[cfg(feature = "mariadb")]
 fn print_help() {
     eprintln!("Usage: mariadb_to_stdout [--host HOST] [--port PORT] [--user USER] [--db DATABASE]");
     eprintln!("                        [--server-id ID] [--snapshot-tables S1,S2]");
-    eprintln!("                        [--checkpoint-dir DIR] [--max-buffer-size N] [--poll-wait-ms MS]");
+    eprintln!(
+        "                        [--checkpoint-dir DIR] [--max-buffer-size N] [--poll-wait-ms MS]"
+    );
 }

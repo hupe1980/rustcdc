@@ -193,7 +193,8 @@ impl SqlServerSourceConfig {
         if self.transport.is_tls() {
             config.encryption(tiberius::EncryptionLevel::Required);
 
-            if self.transport.allow_invalid_certificates() || self.transport.allow_invalid_hostnames()
+            if self.transport.allow_invalid_certificates()
+                || self.transport.allow_invalid_hostnames()
             {
                 config.trust_cert();
             } else if let Some(ca_path) = self

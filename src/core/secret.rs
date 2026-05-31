@@ -89,11 +89,9 @@ impl SecretString {
     pub fn expose_secret(&self) -> Result<&str> {
         match &self.value {
             SecretValue::Inline(value) => Ok(value.as_str()),
-            SecretValue::Provider { .. } | SecretValue::Callback { .. } => Err(
-                Error::ConfigError(
+            SecretValue::Provider { .. } | SecretValue::Callback { .. } => Err(Error::ConfigError(
                 "attempted to expose a deferred secret directly; use resolve()".into(),
-            ),
-            ),
+            )),
         }
     }
 
@@ -122,11 +120,9 @@ impl SecretString {
     pub fn into_inner(self) -> Result<String> {
         match self.value {
             SecretValue::Inline(value) => Ok(value.as_str().to_owned()),
-            SecretValue::Provider { .. } | SecretValue::Callback { .. } => Err(
-                Error::ConfigError(
+            SecretValue::Provider { .. } | SecretValue::Callback { .. } => Err(Error::ConfigError(
                 "attempted to consume a deferred secret directly; use resolve()".into(),
-            ),
-            ),
+            )),
         }
     }
 
