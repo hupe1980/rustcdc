@@ -370,7 +370,7 @@ use serde_json::json;
 let transform = FieldMappingTransform::new(FieldMappingConfig {
   copy: vec![("user.email".into(), "email".into())],
   rename: vec![("user.name".into(), "user.full_name".into())],
-  set_literals: vec![("meta.pipeline".into(), json!("orders-v2"))],
+  set_literals: vec![("meta.pipeline".into(), json!("orders"))],
   remove: vec!["legacy_flag".into()],
   strict: true,
 })?;
@@ -649,7 +649,7 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 **File Content Example:**
 ```json
 {
-  "checkpoint_format_version": 2,
+  "checkpoint_format_version": 1,
   "source_type": "postgres",
   "committed_event_count": 12345,
   "offset": {
@@ -660,7 +660,7 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 ```
 
 **Checkpoint Format Version Policy:**
-- `checkpoint_format_version = 2` is the current write format.
+- `checkpoint_format_version = 1` is the current write format.
 - `checkpoint_format_version` is required for all file checkpoints.
 - Unknown or missing versions are rejected at load time.
 - rustcdc intentionally enforces fail-closed checkpoint decoding for format safety.

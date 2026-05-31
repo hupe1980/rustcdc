@@ -10,9 +10,29 @@ fn fixture(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
 }
 
+#[cfg(unix)]
+fn secure_file_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = fs::metadata(path)
+        .expect("copied checkpoint fixture metadata should load")
+        .permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)
+        .expect("copied checkpoint fixture permissions should be set to 0600");
+}
+
+#[cfg(not(unix))]
+fn secure_file_permissions(_path: &std::path::Path) {}
+
+fn copy_checkpoint_fixture(src: PathBuf, dst: PathBuf) {
+    fs::copy(src, &dst).expect("compat checkpoint fixture copy should succeed");
+    secure_file_permissions(&dst);
+}
+
 #[test]
-fn event_envelope_v1_fixture_decodes_and_validates() {
-    let raw = fs::read_to_string(fixture("fixtures/compatibility/event_envelope_v1.json"))
+fn event_envelope_fixture_decodes_and_validates() {
+    let raw = fs::read_to_string(fixture("fixtures/compatibility/event_envelope.json"))
         .expect("compat event fixture should exist");
     let event = Event::from_json(&raw).expect("compat event fixture should decode");
 
@@ -24,24 +44,22 @@ fn event_envelope_v1_fixture_decodes_and_validates() {
 }
 
 #[tokio::test]
-async fn checkpoint_v2_fixture_round_trips_via_file_checkpoint_backend() {
+async fn checkpoint_fixture_round_trips_via_file_checkpoint_backend() {
     let dir = tempdir().expect("tempdir should be created");
     let checkpoint_dir = dir.path();
 
-    fs::copy(
-        fixture("fixtures/compatibility/checkpoint_postgres_v2.json"),
+    copy_checkpoint_fixture(
+        fixture("fixtures/compatibility/checkpoint_postgres.json"),
         checkpoint_dir.join("checkpoint_postgres.json"),
-    )
-    .expect("stream checkpoint fixture copy should succeed");
+    );
 
     // Ensure deterministic mtime ordering for latest-record selection.
     std::thread::sleep(Duration::from_millis(2));
 
-    fs::copy(
-        fixture("fixtures/compatibility/checkpoint_postgres_snapshot_v2.json"),
+    copy_checkpoint_fixture(
+        fixture("fixtures/compatibility/checkpoint_postgres_snapshot.json"),
         checkpoint_dir.join("checkpoint_postgres_snapshot.json"),
-    )
-    .expect("snapshot checkpoint fixture copy should succeed");
+    );
 
     let checkpoint = FileCheckpoint::new(checkpoint_dir);
     let loaded = checkpoint
@@ -61,12 +79,12 @@ async fn checkpoint_v2_fixture_round_trips_via_file_checkpoint_backend() {
         .expect("compat checkpoint committed count should load");
     assert!(
         matches!(committed, 21 | 42),
-        "compat checkpoint committed count should match v2 fixtures"
+        "compat checkpoint committed count should match compatibility fixtures"
     );
 }
 
 #[tokio::test]
-async fn checkpoint_v2_fixtures_cover_mysql_and_sqlserver_source_families() {
+async fn checkpoint_fixtures_cover_mysql_and_sqlserver_source_families() {
     struct CheckpointFixtureCase {
         fixture_name: &'static str,
         checkpoint_file: &'static str,
@@ -76,25 +94,25 @@ async fn checkpoint_v2_fixtures_cover_mysql_and_sqlserver_source_families() {
 
     let cases = [
         CheckpointFixtureCase {
-            fixture_name: "checkpoint_mysql_v2.json",
+            fixture_name: "checkpoint_mysql.json",
             checkpoint_file: "checkpoint_mysql.json",
             expected_source_type: "mysql",
             expected_committed_count: 84,
         },
         CheckpointFixtureCase {
-            fixture_name: "checkpoint_mysql_snapshot_v2.json",
+            fixture_name: "checkpoint_mysql_snapshot.json",
             checkpoint_file: "checkpoint_mysql_snapshot.json",
             expected_source_type: "mysql_snapshot",
             expected_committed_count: 33,
         },
         CheckpointFixtureCase {
-            fixture_name: "checkpoint_sqlserver_v2.json",
+            fixture_name: "checkpoint_sqlserver.json",
             checkpoint_file: "checkpoint_sqlserver.json",
             expected_source_type: "sqlserver",
             expected_committed_count: 65,
         },
         CheckpointFixtureCase {
-            fixture_name: "checkpoint_sqlserver_snapshot_v2.json",
+            fixture_name: "checkpoint_sqlserver_snapshot.json",
             checkpoint_file: "checkpoint_sqlserver_snapshot.json",
             expected_source_type: "sqlserver_snapshot",
             expected_committed_count: 28,
@@ -105,11 +123,10 @@ async fn checkpoint_v2_fixtures_cover_mysql_and_sqlserver_source_families() {
         let dir = tempdir().expect("tempdir should be created");
         let checkpoint_dir = dir.path();
 
-        fs::copy(
+        copy_checkpoint_fixture(
             fixture(&format!("fixtures/compatibility/{}", case.fixture_name)),
             checkpoint_dir.join(case.checkpoint_file),
-        )
-        .expect("compat checkpoint fixture copy should succeed");
+        );
 
         let checkpoint = FileCheckpoint::new(checkpoint_dir);
         let loaded = checkpoint

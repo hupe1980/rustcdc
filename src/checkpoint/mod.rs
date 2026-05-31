@@ -18,7 +18,7 @@ use crate::core::{Offset, Result};
 
 pub use barrier::{BarrierState, CommitBarrier};
 
-const FILE_CHECKPOINT_FORMAT_VERSION: u16 = 2;
+const FILE_CHECKPOINT_FORMAT_VERSION: u16 = 1;
 const FILE_CHECKPOINT_DEFAULT_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

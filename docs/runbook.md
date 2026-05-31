@@ -124,7 +124,7 @@ SELECT
 
 cat > /var/rustcdc/checkpoint_postgres.json.new <<EOF
 {
-  "checkpoint_format_version": 2,
+  "checkpoint_format_version": 1,
   "source_type": "postgres",
   "committed_event_count": 0,
   "offset": {
@@ -136,7 +136,7 @@ EOF
 
 # Validate checkpoint schema before swapping it in.
 cat /var/rustcdc/checkpoint_postgres.json.new | jq -e '
-  .checkpoint_format_version == 2 and
+  .checkpoint_format_version == 1 and
   .source_type == "postgres" and
   (.committed_event_count | type == "number") and
   (.offset.lsn | type == "number") and
@@ -536,7 +536,7 @@ psql -U postgres -d your_database -c "ALTER ROLE cdc_user WITH PASSWORD NULL;" #
 
 ```bash
 # 1. Create new user with password supplied via secret manager
-mysql --defaults-extra-file=/etc/rustcdc/mysql-admin.cnf -e "CREATE USER 'cdc_user_v2'@'%' IDENTIFIED BY '${NEW_CDC_PASSWORD}'; GRANT SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'cdc_user_v2'@'%';"
+mysql --defaults-extra-file=/etc/rustcdc/mysql-admin.cnf -e "CREATE USER 'cdc_user_new'@'%' IDENTIFIED BY '${NEW_CDC_PASSWORD}'; GRANT SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'cdc_user_new'@'%';"
 
 # 2. Update rustcdc config
 # Update configured secret source for `MysqlSourceConfig.password`

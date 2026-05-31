@@ -1,5 +1,5 @@
 {
-  "checkpoint_format_version": 2,
+  "checkpoint_format_version": 1,
   "source_type": "postgres_snapshot",
   "committed_event_count": 21,
   "offset": {
