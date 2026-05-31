@@ -137,7 +137,7 @@ jobs:
       BENCHMARK_STRICT: "1"
       BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
       BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
-      BENCHMARK_VALIDATE_POLICY_ONLY: "1"
+      CRITERION_BASELINE: ci-baseline
       BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
     steps:
       - uses: actions/checkout@v4
@@ -145,6 +145,10 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: install benchmark gate dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep jq
 
       - name: derive benchmark baseline inputs
         env:
@@ -167,7 +171,7 @@ jobs:
           echo "BENCHMARK_BASELINE_COMMIT=$baseline_commit" >> "$GITHUB_ENV"
           echo "BENCHMARK_BASELINE_ARTIFACT=$baseline_artifact" >> "$GITHUB_ENV"
 
-      - name: release-evidence benchmark policy preflight
+      - name: release-evidence benchmark preflight
         run: bash scripts/ci-benchmark-gate.sh
 
   correctness-smoke:

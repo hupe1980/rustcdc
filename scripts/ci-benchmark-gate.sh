@@ -21,6 +21,7 @@ baseline_artifact="${BENCHMARK_BASELINE_ARTIFACT:-}"
 benchmark_require_historical_baseline="${BENCHMARK_REQUIRE_HISTORICAL_BASELINE:-1}"
 benchmark_enforce_release_policy="${BENCHMARK_ENFORCE_RELEASE_POLICY:-0}"
 benchmark_validate_policy_only="${BENCHMARK_VALIDATE_POLICY_ONLY:-0}"
+benchmark_fallback_benches=""
 # CRITERION_BASELINE: name of a saved Criterion baseline to compare against
 # (stored under target/criterion/<bench>/<name>/). If unset, Criterion compares
 # against the previous run. Set this in CI to a named baseline pinned to a
@@ -170,6 +171,10 @@ emit_benchmark_report() {
       echo "> Reason: ${policy_reason}."
       echo
     fi
+    if [[ -n "$benchmark_fallback_benches" ]]; then
+      echo "> NOTICE: Criterion baseline auto-bootstrap fallback was used for: ${benchmark_fallback_benches}."
+      echo
+    fi
     echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo
     echo "## Environment"
@@ -269,10 +274,27 @@ emit_benchmark_report() {
   echo "Benchmark report written to $report_path"
 }
 
+record_baseline_fallback_bench() {
+  local bench_name="$1"
+  if [[ -z "$benchmark_fallback_benches" ]]; then
+    benchmark_fallback_benches="$bench_name"
+    return
+  fi
+
+  case ",$benchmark_fallback_benches," in
+    *",$bench_name,"*)
+      ;;
+    *)
+      benchmark_fallback_benches+=" $bench_name"
+      ;;
+  esac
+}
+
 run_bench() {
   local bench_name="$1"
   local out_file="$2"
   local mode="${3:-compare}"
+  local allow_missing_baseline_retry="${4:-1}"
   local baseline_args=()
   local cargo_args=(
     cargo bench --bench "$bench_name" --
@@ -295,7 +317,26 @@ run_bench() {
     cargo_args+=("${baseline_args[@]}")
   fi
 
-  "${cargo_args[@]}" | tee "$out_file"
+  set +e
+  "${cargo_args[@]}" 2>&1 | tee "$out_file"
+  local bench_exit_code=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$bench_exit_code" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$mode" == "compare" && "$allow_missing_baseline_retry" == "1" && -n "${CRITERION_BASELINE:-}" ]] \
+    && rg -q "Baseline '.*' must exist before comparison is allowed" "$out_file"; then
+    local bootstrap_out="target/benchmark-ci-gate-bootstrap-${bench_name}.txt"
+    record_baseline_fallback_bench "$bench_name"
+    echo "Criterion baseline entries missing for '${bench_name}' under '${CRITERION_BASELINE}'. Bootstrapping and retrying compare..."
+    run_bench "$bench_name" "$bootstrap_out" save 0
+    run_bench "$bench_name" "$out_file" compare 0
+    return 0
+  fi
+
+  return "$bench_exit_code"
 }
 
 criterion_named_baseline_exists() {
@@ -497,6 +538,8 @@ for bench in "${gated_benches[@]}"; do
     echo "Benchmark confirmation set for ${bench} did not reproduce significant regressions; treating first-run result as noise."
   fi
 done
+
+echo "criterion_baseline_bootstrap_fallback_benches=${benchmark_fallback_benches:-none}" >> target/benchmark-ci-env.txt
 
 emit_benchmark_report
 
