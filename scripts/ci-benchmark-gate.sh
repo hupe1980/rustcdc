@@ -32,6 +32,7 @@ benchmark_validate_policy_only="${BENCHMARK_VALIDATE_POLICY_ONLY:-0}"
 
 current_commit="$(git rev-parse HEAD 2>/dev/null || true)"
 git_tree_state="unknown"
+sanitized_kernel="$(uname -srm)"
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   if git diff --quiet --ignore-submodules HEAD --; then
     git_tree_state="clean"
@@ -126,7 +127,7 @@ policy_reason="${policy_info#*|}"
 
 {
   echo "timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  echo "kernel=$(uname -a)"
+  echo "kernel=${sanitized_kernel}"
   echo "git_commit=${current_commit:-unknown}"
   echo "git_tree_state=${git_tree_state}"
   echo "baseline_commit=${baseline_commit}"
@@ -174,7 +175,7 @@ emit_benchmark_report() {
     echo "## Environment"
     echo
     echo '```text'
-    uname -a
+    echo "${sanitized_kernel}"
     echo "git_commit=${current_commit:-unknown}"
     echo "git_tree_state=${git_tree_state}"
     echo "baseline_commit=${baseline_commit}"
@@ -271,6 +272,7 @@ emit_benchmark_report() {
 run_bench() {
   local bench_name="$1"
   local out_file="$2"
+  local mode="${3:-compare}"
   local baseline_args=()
   local cargo_args=(
     cargo bench --bench "$bench_name" --
@@ -281,10 +283,12 @@ run_bench() {
   # When CRITERION_BASELINE is set, compare against a saved Criterion baseline
   # instead of the previous run. Use BENCHMARK_SAVE_BASELINE to persist a new
   # named baseline (e.g. for updating the CI reference point).
-  if [[ -n "${CRITERION_BASELINE:-}" ]]; then
+  if [[ "$mode" == "compare" && -n "${CRITERION_BASELINE:-}" ]]; then
     baseline_args=(--baseline "$CRITERION_BASELINE")
   fi
-  if [[ -n "${BENCHMARK_SAVE_BASELINE:-}" ]]; then
+  if [[ "$mode" == "save" && -n "${CRITERION_BASELINE:-}" ]]; then
+    baseline_args+=(--save-baseline "$CRITERION_BASELINE")
+  elif [[ -n "${BENCHMARK_SAVE_BASELINE:-}" ]]; then
     baseline_args+=(--save-baseline "$BENCHMARK_SAVE_BASELINE")
   fi
   if (( ${#baseline_args[@]} > 0 )); then
@@ -292,6 +296,34 @@ run_bench() {
   fi
 
   "${cargo_args[@]}" | tee "$out_file"
+}
+
+criterion_named_baseline_exists() {
+  local baseline_name="$1"
+  [[ -n "$baseline_name" ]] || return 1
+  [[ -d target/criterion ]] || return 1
+
+  find target/criterion -path "*/${baseline_name}/estimates.json" -print -quit | grep -q .
+}
+
+ensure_named_baseline() {
+  local bench_name="$1"
+  local baseline_name="${CRITERION_BASELINE:-}"
+
+  [[ -n "$baseline_name" ]] || return 0
+
+  if criterion_named_baseline_exists "$baseline_name"; then
+    return 0
+  fi
+
+  local bootstrap_out="target/benchmark-ci-gate-bootstrap-${bench_name}.txt"
+  echo "Bootstrapping missing Criterion baseline '${baseline_name}' for ${bench_name}..."
+  run_bench "$bench_name" "$bootstrap_out" save
+
+  if ! criterion_named_baseline_exists "$baseline_name"; then
+    echo "Benchmark baseline bootstrap failed: Criterion baseline '${baseline_name}' was not created for ${bench_name}." >&2
+    exit 1
+  fi
 }
 
 run_preheat() {
@@ -413,6 +445,7 @@ for bench in "${gated_benches[@]}"; do
     done
   fi
 
+  ensure_named_baseline "$bench"
   run_bench "$bench" "$bench_raw_out"
 
   if rg -q "Performance has regressed\." "$bench_raw_out"; then

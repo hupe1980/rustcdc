@@ -24,3 +24,6 @@ target
 FINDINGS.md
 REVIEW.md
 .DS_Store
+
+# Generated local benchmark summary.
+/BENCHMARK_REPORT.md
