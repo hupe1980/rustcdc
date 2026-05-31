@@ -54,7 +54,7 @@ Status values:
 | Runtime health/admin introspection depth | Faster incident response and safer operations | Implemented | src/core/runtime.rs |
 | Structured observability (metrics/tracing/logging) | Production diagnosis and SLO ownership | Implemented | tests/otel_metrics_integration.rs, tests/otel_tracing_integration.rs, tests/logging_structured.rs |
 | Built-in field mapping transform primitives (copy/rename/set/remove) | Covers common schema-alignment workloads without mandatory custom/WASM code | Implemented | src/transform/field_mapping.rs, src/transform/mod.rs, docs/config_reference.md |
-| Example/build matrix across sources | Prevents connector-specific integration drift | Implemented | .github/workflows/ci.yml, scripts/ci-preflight.sh, examples/ |
+| Example/build matrix across sources | Prevents connector-specific integration drift | Implemented | .github/workflows/ci.yml, scripts/ci-policy-gate.sh, examples/ |
 | Connector version-compatibility test depth | Reduces production surprises on engine upgrades | Implemented (connector-specific depth varies) | tests/postgres_version_matrix.rs |
 
 ## Intentional Non-Goals (Do Not Gate Library Releases)

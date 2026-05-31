@@ -302,6 +302,35 @@ pub enum RuntimeSourceConfig {
 }
 
 impl RuntimeSourceConfig {
+    /// Construct a disabled source configuration.
+    pub const fn disabled() -> Self {
+        Self::Disabled
+    }
+
+    /// Construct a PostgreSQL source configuration.
+    #[cfg(feature = "postgres")]
+    pub fn postgres(source: PostgresSourceConfig) -> Self {
+        Self::Postgres(source)
+    }
+
+    /// Construct a MySQL source configuration.
+    #[cfg(feature = "mysql")]
+    pub fn mysql(source: MysqlSourceConfig) -> Self {
+        Self::Mysql(source)
+    }
+
+    /// Construct a MariaDB source configuration.
+    #[cfg(feature = "mariadb")]
+    pub fn mariadb(source: crate::source::MariaDbSourceConfig) -> Self {
+        Self::MariaDb(source)
+    }
+
+    /// Construct a SQL Server source configuration.
+    #[cfg(feature = "sqlserver")]
+    pub fn sqlserver(source: SqlServerSourceConfig) -> Self {
+        Self::SqlServer(source)
+    }
+
     /// Connector identifier when a real source is configured.
     ///
     /// For MySQL and MariaDB, this reflects the `server_flavor` field in the
@@ -2989,6 +3018,21 @@ mod tests {
         assert_eq!(decoded.gtid, "uuid:3-9");
         assert_eq!(decoded.binlog_file, "mariadb-bin.000002");
         assert_eq!(decoded.binlog_pos, 432);
+    }
+
+    #[tokio::test]
+    async fn disabled_runtime_source_constructor_is_empty() {
+        let source = RuntimeSourceConfig::disabled();
+        assert_eq!(source.source_type(), None);
+        assert!(!source.capabilities().snapshot);
+    }
+
+    #[cfg(feature = "mariadb")]
+    #[tokio::test]
+    async fn mariadb_runtime_source_constructor_keeps_mariadb_identity() {
+        let source = RuntimeSourceConfig::mariadb(crate::source::MariaDbSourceConfig::default());
+        assert_eq!(source.source_type(), Some("mariadb"));
+        assert!(source.capabilities().snapshot);
     }
 
     #[tokio::test]

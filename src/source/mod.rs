@@ -17,22 +17,6 @@ pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TablePro
 pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
 pub use snapshot_validator::{SnapshotValidationResult, SnapshotValidator};
 
-/// Returns true when source connector insecure transport overrides are explicitly enabled.
-///
-/// This guard is intended for local integration tests only.
-#[cfg(any(feature = "mysql", feature = "sqlserver"))]
-pub(crate) fn allow_insecure_test_transport() -> bool {
-    #[cfg(feature = "insecure-test-overrides")]
-    {
-        std::env::var("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT").as_deref() == Ok("1")
-    }
-
-    #[cfg(not(feature = "insecure-test-overrides"))]
-    {
-        false
-    }
-}
-
 /// Authentication mode for database source connectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

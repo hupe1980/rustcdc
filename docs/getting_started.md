@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.80 or newer
+- Rust 1.88 or newer
 - Cargo
 - Docker if you want to run connector-backed integration tests with testcontainers
 
@@ -17,12 +17,16 @@ cargo test --lib
 
 - `--no-default-features`: foundation-only validation without source connectors
 - default profile: secure-by-default build with `postgres` + `tls`
-- relational connector features (`postgres`, `mysql`, `sqlserver`) require and enable `tls` transitively
+- relational connector features (`postgres`, `mysql`, `mariadb`, `sqlserver`) require and enable `tls` transitively
+- `mariadb`: MariaDB profile with first-class MariaDB source identity on the MySQL transport stack
 - `outbox`: enables outbox helpers and transforms
 - `encryption`: enables encryption-oriented transforms and helpers
 - `metrics`: enables OpenTelemetry metrics/tracing integrations
-- `insecure-test-overrides`: test-only insecure connector toggle support; do not enable in production
 - `--all-features`: validates the full additive feature surface
+
+For self-signed or private-CA deployments, use `TransportConfig::tls_with_ca_cert_path(...)` or `TransportConfig::mtls(...)`. Those production-safe TLS paths do not require a special Cargo feature.
+
+For local testing or tightly controlled air-gapped environments where CA distribution is not practical, an explicit insecure opt-in is available: `TransportConfig::tls_insecure_skip_verify()`. This disables certificate and hostname verification and should not be used in production.
 
 ## Useful Commands
 
@@ -42,7 +46,7 @@ cargo doc --no-deps
 - Checkpoint trait and commit barrier
 - In-memory schema history and validator
 - Embedded runtime with batch/ack delivery model
-- PostgreSQL, MySQL, and SQL Server source connectors
+- PostgreSQL, MySQL, MariaDB, and SQL Server source connectors
 - Fixture replay and conformance harness foundations
 
 ## Known Limits

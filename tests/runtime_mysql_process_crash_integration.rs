@@ -154,7 +154,7 @@ async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> 
         server_id: 411,
         gtid_mode_enabled: false,
         binlog_format_check: true,
-        transport: TransportConfig::tls(),
+        transport: TransportConfig::plaintext(),
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -331,7 +331,7 @@ async fn run_mysql_process_kill_replay_scenario(
         server_id: 403,
         gtid_mode_enabled: false,
         binlog_format_check: true,
-        transport: TransportConfig::tls(),
+        transport: TransportConfig::plaintext(),
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -419,7 +419,6 @@ fn spawn_crash_worker(
         .env("CDC_RS_WORKER_SERVER_ID", server_id.to_string())
         .env("CDC_RS_WORKER_CHECKPOINT_DIR", checkpoint_dir)
         .env("CDC_RS_WORKER_MARKER_FILE", marker_file)
-        .env("CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT", "1")
         .env(
             "CDC_RS_WORKER_ACK_FIRST_BATCH",
             if ack_first_batch { "1" } else { "0" },
@@ -433,7 +432,7 @@ fn spawn_crash_worker(
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
     resolve_xtask_worker_bin(
         "mysql_crash_worker",
-        "mysql,rustcdc/insecure-test-overrides",
+        "mysql",
         "CARGO_BIN_EXE_mysql_crash_worker",
         "mysql crash worker binary not found; build with `cargo build -p xtask --bin mysql_crash_worker --features mysql`",
     )

@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
 
 permissions:
@@ -99,38 +101,68 @@ jobs:
       - name: cargo test --lib --features sqlserver,tls
         run: cargo test --lib --features sqlserver,tls
 
-  docs-link-check:
+  policy-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: markdown link check
-        run: bash scripts/ci-doc-links.sh
+      - name: policy gates (schema + deprecated + workflow drift)
+        run: bash scripts/ci-policy-gate.sh
 
-  benchmark-regression-gate:
+  correctness-smoke:
     runs-on: ubuntu-latest
     env:
-      BENCHMARK_BASELINE_COMMIT: ${{ github.sha }}
-      BENCHMARK_BASELINE_ARTIFACT: BENCHMARK_REPORT.md
-      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
+      CDC_RS_RUN_DOCKER_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: benchmark regression gate (criterion)
-        run: bash scripts/ci-benchmark-gate.sh
-      - name: upload benchmark regression artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-regression-evidence
-          path: |
-            target/benchmark-ci-gate*.txt
-            target/benchmark-ci-env.txt
-            target/criterion
-            BENCHMARK_REPORT.md
+      - name: pre-pull postgres image (public ecr mirror)
+        run: bash scripts/ci-pull-relational-images.sh 16-alpine
+      - name: pre-pull mysql/mariadb/sqlserver images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
+      - name: contract compatibility smoke
+        run: cargo test --test compatibility_contract --all-features
+      - name: postgres checkpoint durability smoke
+        run: cargo test --test checkpoint_file_integration --features postgres
+      - name: postgres process-crash replay smoke
+        run: cargo test --test runtime_postgres_process_crash_integration --features postgres --bins
+      - name: reliability data-loss smoke
+        run: cargo test --test data_loss_detection --features postgres,test-harnesses
+      - name: mysql connection integration smoke
+        run: cargo test --test mysql_connection_integration --features mysql
+      - name: mariadb connection integration smoke
+        run: cargo test --test mariadb_connection_integration --features mariadb
+      - name: sqlserver connection integration smoke
+        run: cargo test --test sqlserver_connection_integration --features sqlserver
+      - name: mysql process-crash replay smoke
+        run: cargo test --test runtime_mysql_process_crash_integration --features mysql --bins
+      - name: mariadb process-crash replay smoke
+        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb --bins
+      - name: sqlserver process-crash replay smoke
+        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
-  latency-evidence:
+  reliability-core:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - deterministic_replay_failure_fixtures
+          - deterministic_replay_golden_fixtures
+          - runtime_health_states
+          - wasm_conformance_contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: reliability core suite (${{ matrix.suite }})
+        run: cargo test --test ${{ matrix.suite }} --features postgres,test-harnesses
+
+  latency-core:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -143,38 +175,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres image (public ecr mirror)
-        run: bash scripts/ci-pull-postgres-images.sh 16-alpine
+        run: bash scripts/ci-pull-relational-images.sh 16-alpine
       - name: connector-backed latency evidence gate (p95/p99)
         run: bash scripts/ci-latency-gate.sh
-      - name: upload latency evidence artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: latency-evidence
-          path: |
-            target/latency-evidence.txt
-            target/latency-gate.txt
-            target/postgres-latency-evidence.json
-            target/postgres-latency-evidence.md
-            target/mysql-latency-evidence.json
-            target/mysql-latency-evidence.md
-            target/sqlserver-latency-evidence.json
-            target/sqlserver-latency-evidence.md
-
-  integration-postgres-runtime:
-    runs-on: ubuntu-latest
-    env:
-      CDC_RS_RUN_DOCKER_TESTS: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@v2
-      - name: pre-pull postgres images (public ecr mirror)
-        run: |
-          bash scripts/ci-pull-postgres-images.sh 16-alpine
-      - name: cargo test --test runtime_postgres --features postgres
-        run: cargo test --test runtime_postgres --features postgres
 
   integration-postgres:
     runs-on: ubuntu-latest
@@ -183,7 +186,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, nightly]
         suite:
           - runtime_postgres
           - postgres_version_matrix
@@ -200,7 +202,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
         run: |
@@ -208,7 +210,7 @@ jobs:
           if [[ "${{ matrix.suite }}" == "postgres_version_matrix" ]]; then
             tags="12-alpine 14-alpine 15-alpine 16-alpine"
           fi
-          bash scripts/ci-pull-postgres-images.sh ${tags}
+          bash scripts/ci-pull-relational-images.sh ${tags}
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration'
         run: cargo test --test ${{ matrix.suite }} --features postgres
@@ -230,7 +232,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
-        run: bash scripts/ci-pull-postgres-images.sh 16-alpine
+        run: bash scripts/ci-pull-relational-images.sh 16-alpine
       - name: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
         run: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
 
@@ -260,11 +262,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, nightly]
         suite:
           - mysql_version_matrix
           - mysql_connection_integration
@@ -276,20 +276,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mysql_process_crash_integration'
-        run: cargo test --test ${{ matrix.suite }} --features mysql,insecure-test-overrides
+        run: cargo test --test ${{ matrix.suite }} --features mysql
       - name: cargo test --test runtime_mysql_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_mysql_process_crash_integration'
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql,insecure-test-overrides --bins
+        run: cargo test --test runtime_mysql_process_crash_integration --features mysql --bins
 
   integration-mysql-encryption:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -297,17 +296,15 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption,insecure-test-overrides --bins
+        run: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
 
   integration-mariadb:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, nightly]
         suite:
           - mariadb_connection_integration
           - mariadb_e2e_integration
@@ -316,38 +313,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mariadb_process_crash_integration'
-        run: cargo test --test ${{ matrix.suite }} --features mariadb,insecure-test-overrides
+        run: cargo test --test ${{ matrix.suite }} --features mariadb
       - name: cargo test --test runtime_mariadb_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_mariadb_process_crash_integration'
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,insecure-test-overrides --bins
+        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb --bins
 
   integration-mariadb-encryption:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption,insecure-test-overrides --bins
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption,insecure-test-overrides --bins
+      - name: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
+        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
 
   integration-sqlserver:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, nightly]
         suite:
           - sqlserver_version_matrix
           - sqlserver_snapshot_integration
@@ -358,25 +352,116 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration'
-        run: cargo test --test ${{ matrix.suite }} --features sqlserver,insecure-test-overrides
+        run: cargo test --test ${{ matrix.suite }} --features sqlserver
       - name: cargo test --test runtime_sqlserver_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_sqlserver_process_crash_integration'
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,insecure-test-overrides --bins
+        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
   integration-sqlserver-encryption:
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
-      CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption,insecure-test-overrides --bins
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption,insecure-test-overrides --bins
+      - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
+        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
+
+  release-evidence:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - msrv
+      - check
+      - quality
+      - transport-security
+      - policy-gate
+      - correctness-smoke
+      - reliability-core
+      - latency-core
+      - integration-postgres
+      - integration-postgres-encryption
+      - integration-reliability
+      - integration-mysql
+      - integration-mysql-encryption
+      - integration-mariadb
+      - integration-mariadb-encryption
+      - integration-sqlserver
+      - integration-sqlserver-encryption
+    runs-on: ubuntu-latest
+    env:
+      CDC_RS_RUN_DOCKER_TESTS: "1"
+      BENCHMARK_STRICT: "1"
+      BENCHMARK_BASELINE_COMMIT: ${{ vars.BENCHMARK_BASELINE_COMMIT }}
+      BENCHMARK_BASELINE_ARTIFACT: ${{ vars.BENCHMARK_BASELINE_ARTIFACT }}
+      BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
+      BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
+      CRITERION_BASELINE: ci-baseline
+      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
+      LATENCY_GATE_DEFAULT_P95_MS: "500"
+      LATENCY_GATE_DEFAULT_P99_MS: "1000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: verify tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rustcdc") | .version')
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: cargo package (dry-run)
+        run: cargo package --no-verify --all-features
+
+      - name: policy gate
+        run: bash scripts/ci-policy-gate.sh
+
+      - name: benchmark policy gate
+        run: bash scripts/ci-benchmark-gate.sh
+
+      - name: full integration matrix evidence
+        run: bash scripts/run_full_integration_matrix_evidence.sh
+
+      - name: upload release-gate evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-evidence
+          path: |
+            target/integration-full-matrix-evidence.txt
+            target/latency-evidence.txt
+            target/latency-gate.txt
+            target/postgres-latency-evidence.json
+            target/postgres-latency-evidence.md
+            target/mysql-latency-evidence.json
+            target/mysql-latency-evidence.md
+            target/sqlserver-latency-evidence.json
+            target/sqlserver-latency-evidence.md
+            target/benchmark-ci-gate*.txt
+            target/benchmark-ci-env.txt
+            target/criterion
+            BENCHMARK_REPORT.md
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-evidence
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo publish
+        run: cargo publish --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

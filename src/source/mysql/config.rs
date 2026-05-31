@@ -7,7 +7,6 @@ use std::path::Path;
 use mysql_async::SslOpts;
 
 use crate::core::{Error, Result, SecretString, TransportConfig};
-use crate::source::allow_insecure_test_transport;
 
 use super::{
     DatabaseAuthMode, MysqlSourceConfig, ServerFlavor, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS,
@@ -165,6 +164,7 @@ impl MysqlSourceConfig {
             ca_cert_path,
             client_cert_path,
             client_key_path,
+            ..
         } = &self.transport
         {
             #[cfg(not(feature = "tls"))]
@@ -217,7 +217,7 @@ impl MysqlSourceConfig {
             .db_name(Some(self.database.clone()));
 
         #[cfg(feature = "tls")]
-        let builder = if self.transport.is_tls() && !allow_insecure_test_transport() {
+        let builder = if self.transport.is_tls() {
             let ssl_opts = self.build_ssl_opts()?;
             builder.ssl_opts(Some(ssl_opts))
         } else {
@@ -231,12 +231,11 @@ impl MysqlSourceConfig {
     fn build_ssl_opts(&self) -> Result<SslOpts> {
         let mut ssl_opts = SslOpts::default();
 
-        // Local integration containers often use ephemeral self-signed certs.
-        // Keep secure defaults. Explicit test overrides require compile-time opt-in.
-        if allow_insecure_test_transport() {
-            ssl_opts = ssl_opts
-                .with_danger_accept_invalid_certs(true)
-                .with_danger_skip_domain_validation(true);
+        if self.transport.allow_invalid_certificates() {
+            ssl_opts = ssl_opts.with_danger_accept_invalid_certs(true);
+        }
+        if self.transport.allow_invalid_hostnames() {
+            ssl_opts = ssl_opts.with_danger_skip_domain_validation(true);
         }
 
         if let Some(ca_path) = self.transport.ca_cert_path() {

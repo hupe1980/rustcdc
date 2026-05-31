@@ -120,8 +120,20 @@ async fn run_once() -> Result<()> {
 
 - `Postgres(PostgresSourceConfig)`
 - `Mysql(MysqlSourceConfig)`
+- `MariaDb(MariaDbSourceConfig)`
 - `SqlServer(SqlServerSourceConfig)`
-- `Disabled`
+
+Prefer the associated constructors when building embedder code for readability:
+
+`RuntimeSourceConfig::postgres(...)`
+`RuntimeSourceConfig::mysql(...)`
+`RuntimeSourceConfig::mariadb(...)`
+`RuntimeSourceConfig::sqlserver(...)`
+`RuntimeSourceConfig::disabled()`
+
+Source configuration in library code is explicit and typed; environment parsing
+belongs in host applications or examples that map `CDC_RS_*` variables into
+connector config values.
 
 The runtime also exposes connector capability metadata via `source_capabilities()` and validates incompatible settings (for example, snapshot tables for a source that does not support snapshots). Capability metadata includes `snapshot_checkpoint_resume`, which is `true` for PostgreSQL, MySQL, and SQL Server. Snapshot checkpoints now resume through connector-native cursor state and keep stream bootstrap aligned with the saved snapshot watermark.
 
@@ -214,9 +226,13 @@ while let Some(batch) = batches.next().await {
 
 ## Incremental Snapshot API (DBLog Pattern)
 
-`CdcRuntime::start()` currently initializes the classic snapshot + stream handoff.
-If you want non-blocking incremental snapshot behavior, start it from a connector
-connection directly via `start_incremental_snapshot(...)`.
+`CdcRuntime::start()` supports both classic snapshot + stream handoff and
+runtime-driven incremental snapshot startup (when configured via
+`with_incremental_snapshot(...)`).
+
+If you want connector-managed non-blocking incremental snapshot behavior,
+you can also start it directly from a connector connection via
+`start_incremental_snapshot(...)`.
 
 ```rust
 use rustcdc::{
@@ -316,14 +332,14 @@ let transform = FilterProjectionTransform::new(FilterProjectionConfig {
 
 ## MariaDB Support
 
-rustcdc supports **MariaDB 10.5 and 10.6** via the MySQL protocol stack. The
+rustcdc supports **MariaDB 10.5, 10.6, and 10.11** via the MySQL protocol stack. The
 `mysql_async` library handles the MariaDB binlog wire protocol transparently.
 rustcdc also provides a first-class `MariaDbSourceConfig` wrapper for explicit
 runtime source typing (`mariadb`) and separate checkpoint namespace handling.
 
 ### Capability Matrix
 
-| Capability                 | PostgreSQL | MySQL 8+ | MariaDB 10.5/10.6 | SQL Server |
+| Capability                 | PostgreSQL | MySQL 8+ | MariaDB 10.5/10.6/10.11 | SQL Server |
 |----------------------------|:----------:|:--------:|:-----------------:|:----------:|
 | Full-table snapshot        | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
 | Resumable snapshot (keyset)| ✅        | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
@@ -333,6 +349,9 @@ runtime source typing (`mariadb`) and separate checkpoint namespace handling.
 | TLS connections            | ✅          | ✅        | ✅ (connector support) | ✅          |
 | Transaction boundaries     | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
 | Schema change events       | ✅          | ✅        | ✅ | ✅          |
+
+MariaDB 10.11 currently has explicit process-crash and replay evidence coverage,
+while 10.5/10.6 are validated across the core connection and end-to-end lanes.
 
 **Note on schema change events**: Runtime connectors emit canonical `Operation::SchemaChange` events for supported DDL capture paths. Use `rustcdc::ddl_capture` and `rustcdc::schema_history` together when building schema-aware downstream consumers.
 
@@ -367,5 +386,6 @@ let config = MysqlSourceConfig {
 MariaDB integration evidence includes dedicated end-to-end suites for snapshot
 resume, stream CDC, and snapshot-to-stream handoff on MariaDB 10.5 and 10.6 in
 `tests/mariadb_e2e_integration.rs`, plus connection lifecycle coverage in
-`tests/mariadb_connection_integration.rs`.
+`tests/mariadb_connection_integration.rs`, and process-crash replay coverage on
+MariaDB 10.11 in `tests/runtime_mariadb_process_crash_integration.rs`.
 

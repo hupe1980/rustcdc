@@ -141,6 +141,7 @@ mysql -h <host> --ssl-mode=REQUIRED --ssl-ca=/path/to/ca.pem -u <user> -p<pass>
 |-------|--------|
 | Certificate not trusted | Use `TransportConfig::tls_with_ca_cert_path(...)` with the CA bundle path |
 | TLS handshake fails behind proxy | Verify proxy certificates are rooted in the CA bundle configured via `TransportConfig::tls_with_ca_cert_path(...)` |
+| Self-signed cert in test/air-gapped env | Use explicit opt-in `TransportConfig::tls_insecure_skip_verify()` only for non-production environments |
 | Expired certificate | Request new certificate from database admin |
 | Wrong CA certificate | Verify CA cert matches database server certificate issuer |
 

@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::Zeroizing;
 
 use crate::core::{Error, Result};
@@ -16,9 +16,6 @@ pub trait SecretProvider: Send + Sync {
 enum SecretValue {
     /// Inline secret — zeroed on drop via `Zeroizing<String>`.
     Inline(Zeroizing<String>),
-    Environment {
-        variable: String,
-    },
     Provider {
         provider_name: String,
         reference: String,
@@ -58,15 +55,6 @@ impl SecretString {
         }
     }
 
-    /// Resolve a secret from an environment variable at connect time.
-    pub fn from_env(variable: impl Into<String>) -> Self {
-        Self {
-            value: SecretValue::Environment {
-                variable: variable.into(),
-            },
-        }
-    }
-
     /// Resolve a secret from an external provider at connect time.
     pub fn from_provider(
         provider_name: impl Into<String>,
@@ -101,11 +89,11 @@ impl SecretString {
     pub fn expose_secret(&self) -> Result<&str> {
         match &self.value {
             SecretValue::Inline(value) => Ok(value.as_str()),
-            SecretValue::Environment { .. }
-            | SecretValue::Provider { .. }
-            | SecretValue::Callback { .. } => Err(Error::ConfigError(
+            SecretValue::Provider { .. } | SecretValue::Callback { .. } => Err(
+                Error::ConfigError(
                 "attempted to expose a deferred secret directly; use resolve()".into(),
-            )),
+            ),
+            ),
         }
     }
 
@@ -113,11 +101,6 @@ impl SecretString {
     pub fn resolve(&self) -> Result<String> {
         match &self.value {
             SecretValue::Inline(value) => Ok(value.as_str().to_owned()),
-            SecretValue::Environment { variable } => std::env::var(variable).map_err(|error| {
-                Error::ConfigError(format!(
-                    "failed to load secret from environment variable '{variable}': {error}"
-                ))
-            }),
             SecretValue::Provider {
                 provider_name,
                 reference,
@@ -139,11 +122,11 @@ impl SecretString {
     pub fn into_inner(self) -> Result<String> {
         match self.value {
             SecretValue::Inline(value) => Ok(value.as_str().to_owned()),
-            SecretValue::Environment { .. }
-            | SecretValue::Provider { .. }
-            | SecretValue::Callback { .. } => Err(Error::ConfigError(
+            SecretValue::Provider { .. } | SecretValue::Callback { .. } => Err(
+                Error::ConfigError(
                 "attempted to consume a deferred secret directly; use resolve()".into(),
-            )),
+            ),
+            ),
         }
     }
 
@@ -155,7 +138,6 @@ impl SecretString {
     fn kind_and_descriptor(&self) -> (&'static str, &str) {
         match &self.value {
             SecretValue::Inline(value) => ("inline", value.as_str()),
-            SecretValue::Environment { variable } => ("env", variable),
             SecretValue::Provider {
                 provider_name,
                 reference,
@@ -189,7 +171,6 @@ impl fmt::Debug for SecretString {
         let (kind, descriptor) = self.kind_and_descriptor();
         match kind {
             "inline" => f.write_str("SecretString(***redacted***)"),
-            "env" => write!(f, "SecretString(env:{descriptor}, ***redacted***)"),
             "provider" => write!(f, "SecretString(provider:{descriptor}, ***redacted***)"),
             "callback" => write!(f, "SecretString(callback:{descriptor}, ***redacted***)"),
             _ => f.write_str("SecretString(***redacted***)"),
@@ -204,19 +185,14 @@ impl fmt::Display for SecretString {
 }
 
 impl Serialize for SecretString {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         match &self.value {
             SecretValue::Inline(_) => Err(serde::ser::Error::custom(
-                "inline secrets cannot be serialized; use env/provider/callback references",
+                "inline secrets cannot be serialized; use provider/callback references",
             )),
-            SecretValue::Environment { variable } => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("env", variable)?;
-                map.end()
-            }
             SecretValue::Provider { .. } => Err(serde::ser::Error::custom(
                 "provider-backed secrets cannot be serialized; store a provider reference in code",
             )),
@@ -232,17 +208,8 @@ impl<'de> Deserialize<'de> for SecretString {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Inline(String),
-            Environment { env: String },
-        }
-
-        match Repr::deserialize(deserializer)? {
-            Repr::Inline(value) => Ok(SecretString::new(value)),
-            Repr::Environment { env } => Ok(SecretString::from_env(env)),
-        }
+        let inline = String::deserialize(deserializer)?;
+        Ok(SecretString::new(inline))
     }
 }
 
@@ -289,7 +256,7 @@ mod tests {
 
     #[test]
     fn expose_secret_rejects_deferred_values() {
-        let secret = SecretString::from_env("HOME");
+        let secret = SecretString::from_callback("runtime", || Ok("from-callback".to_string()));
         assert!(matches!(
             secret.expose_secret(),
             Err(Error::ConfigError(message)) if message.contains("use resolve")
@@ -298,18 +265,11 @@ mod tests {
 
     #[test]
     fn into_inner_rejects_deferred_values() {
-        let secret = SecretString::from_env("HOME");
+        let secret = SecretString::from_callback("runtime", || Ok("from-callback".to_string()));
         assert!(matches!(
             secret.into_inner(),
             Err(Error::ConfigError(message)) if message.contains("use resolve")
         ));
-    }
-
-    #[test]
-    fn env_secret_resolves_from_environment() {
-        let expected = std::env::var("HOME").expect("HOME should be present for test execution");
-        let secret = SecretString::from_env("HOME");
-        assert_eq!(secret.resolve().unwrap(), expected);
     }
 
     #[test]
@@ -363,9 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn secret_deserializes_env_form() {
-        let secret: SecretString = serde_json::from_str(r#"{"env":"CDC_RS_PASSWORD"}"#).unwrap();
-        assert!(format!("{secret:?}").contains("env:CDC_RS_PASSWORD"));
+    fn secret_deserializes_inline_string() {
+        let secret: SecretString = serde_json::from_str(r#""plain-secret""#).unwrap();
+        assert_eq!(secret.expose_secret().unwrap(), "plain-secret");
     }
 
     #[test]
@@ -376,9 +336,9 @@ mod tests {
     }
 
     #[test]
-    fn env_secret_serializes_as_env_reference() {
-        let secret = SecretString::from_env("CDC_RS_PASSWORD");
-        let json = serde_json::to_string(&secret).unwrap();
-        assert_eq!(json, r#"{"env":"CDC_RS_PASSWORD"}"#);
+    fn provider_secret_serialization_is_rejected() {
+        let secret = SecretString::from_provider("static", "db/password", Arc::new(StaticProvider));
+        let error = serde_json::to_string(&secret).unwrap_err().to_string();
+        assert!(error.contains("provider-backed secrets cannot be serialized"));
     }
 }

@@ -115,7 +115,7 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
         server_id: 300,
         gtid_mode_enabled: false,
         binlog_format_check: true,
-        transport: TransportConfig::tls(),
+        transport: TransportConfig::tls_insecure_skip_verify(),
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,

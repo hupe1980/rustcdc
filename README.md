@@ -1,13 +1,13 @@
 # rustcdc
 
 rustcdc is an embeddable CDC library for Rust with a correctness-first design.
-The repository includes canonical event contracts, checkpoint safety primitives, schema history abstractions, an embedded runtime, and PostgreSQL/MySQL/SQL Server source connectors.
+The repository includes canonical event contracts, checkpoint safety primitives, schema history abstractions, an embedded runtime, and PostgreSQL/MySQL/MariaDB/SQL Server source connectors.
 
 ## Status 🚀
 
 Active development. Core connector/runtime library paths are implemented and validated by unit and integration suites.
 
-Current crate release: 0.1.3.
+Current crate release: 0.1.4.
 
 ## MSRV 🛠️
 
@@ -27,14 +27,16 @@ Default profile enables `postgres` + `tls`.
 - default profile: secure-by-default build with `postgres` + `tls`
 - `--features postgres`: PostgreSQL connector profile (TLS transport is required and enabled transitively)
 - `--features mysql`: MySQL connector profile (TLS transport is required and enabled transitively)
+- `--features mariadb`: MariaDB connector profile (reuses the MySQL transport stack with MariaDB source identity)
 - `--features sqlserver`: SQL Server connector profile (TLS transport is required and enabled transitively)
 - `--features tls`: explicit TLS transport surface (already included by relational connector features)
 - `--features outbox`: enables outbox helpers and transforms
 - `--features encryption`: enables encryption-oriented transforms and helpers
 - `--features metrics`: enables OpenTelemetry metrics/tracing integrations
-- `--features insecure-test-overrides`: enables opt-in insecure connector test toggle (`CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT`) for local integration evidence only; do not enable in production.
 - `--no-default-features`: foundation-only validation without source connectors
 - `--all-features`: validates the full additive feature surface
+
+For self-signed or private-CA deployments, configure TLS directly with `TransportConfig::tls_with_ca_cert_path(...)` or `TransportConfig::mtls(...)`. No Cargo feature is required for those production-safe paths.
 
 ## License
 
@@ -42,19 +44,20 @@ Licensed under either of:
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
-Run a local preflight that mirrors the CI command matrix:
+Run local quality checks:
 
 ```bash
-./scripts/ci-preflight.sh
+cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+bash scripts/ci-policy-gate.sh
 ```
 
-Include Docker-backed integration suites (requires Docker daemon):
+Run full connector-backed evidence locally (requires Docker daemon):
 
 ```bash
-./scripts/ci-preflight.sh --with-integration
+bash scripts/ci-benchmark-gate.sh
+bash scripts/run_full_integration_matrix_evidence.sh
 ```
-
-Without `--with-integration`, preflight prints a warning summary listing skipped Docker-backed release-gate suites.
 
 To validate the foundation profile without source-specific features:
 
@@ -64,25 +67,27 @@ cargo test --lib --no-default-features
 
 ## Benchmark Evidence Policy
 
-Local benchmark report runs now default to `target/benchmark-local-report.md`.
-This avoids accidentally treating ad-hoc benchmark output as release evidence.
+Benchmark evidence is produced via `scripts/ci-benchmark-gate.sh`.
+Local runs are allowed, but are classified as non-release evidence unless strict release-policy inputs are satisfied.
 
-Writing non-release benchmark output to `BENCHMARK_REPORT.md` is blocked unless explicitly overridden:
+Example local run (non-release classification expected):
 
 ```bash
-BENCHMARK_ALLOW_NON_RELEASE_REPORT=1 BENCHMARK_REPORT_PATH=BENCHMARK_REPORT.md \
-	bash scripts/run_benchmark_report.sh
+bash scripts/ci-benchmark-gate.sh
 ```
 
-Release-grade benchmark classification now requires commit-pinned metadata:
+Release-grade benchmark classification now requires commit-pinned metadata plus a named Criterion baseline:
 
 ```bash
 BENCHMARK_STRICT=1 \
 BENCHMARK_MAX_REGRESSION_PERCENT=5 \
 BENCHMARK_BASELINE_COMMIT="$(git rev-parse HEAD)" \
 BENCHMARK_BASELINE_ARTIFACT="BENCHMARK_REPORT.md" \
-bash scripts/run_benchmark_report.sh
+CRITERION_BASELINE="ci-baseline" \
+bash scripts/ci-benchmark-gate.sh
 ```
+
+Use the same `CRITERION_BASELINE=ci-baseline` value in CI so release evidence and local reports compare against the same named baseline.
 
 ## Quick Start ✅
 
@@ -196,6 +201,17 @@ cargo build --example pg_to_stdout --features postgres
 ```
 
 The example also accepts environment variables (`CDC_RS_HOST`, `CDC_RS_PORT`, `CDC_RS_DB`, `CDC_RS_SNAPSHOT_TABLES`, and related settings) and commits every 100 events by default.
+
+## MariaDB Example 🐬
+
+Build and run the MariaDB example:
+
+```bash
+cargo build --example mariadb_to_stdout --features mariadb
+./target/debug/examples/mariadb_to_stdout --host localhost --port 3306 --database testdb --snapshot-tables public.users
+```
+
+The MariaDB example uses the same runtime loop as the PostgreSQL example, but it starts from `MariaDbSourceConfig` and a MariaDB-specific source identity.
 
 ## Docker Compose Example 🐳
 

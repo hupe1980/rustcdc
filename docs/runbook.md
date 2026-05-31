@@ -159,16 +159,13 @@ psql -U cdc_user -d your_database -c "SELECT slot_name, active, confirmed_flush_
 
 ⚠️ **WARNING:** This discards uncommitted events and may cause data loss if not coordinated with downstream systems.
 
-Before executing force reset, run the checklist guardrail script:
+Before executing force reset, record and confirm this checklist in the incident/change ticket:
 
-```bash
-./scripts/runbook-force-reset-checklist.sh \
-  --change-ticket INC-12345 \
-  --snapshot-backed-up \
-  --downstream-paused \
-  --slot-impact-reviewed \
-  --rollback-plan-ready
-```
+- Change ticket created (for example `INC-12345`) with operator + reviewer names.
+- Current checkpoint/offset snapshot archived.
+- Downstream consumers paused or explicitly verified dedup-safe.
+- Replication-slot/binlog retention and catch-up impact reviewed.
+- Rollback plan prepared and on-call ownership confirmed.
 
 ```bash
 # 1. Stop rustcdc

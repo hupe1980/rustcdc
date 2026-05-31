@@ -4,7 +4,6 @@ use std::fmt;
 use std::path::Path;
 
 use crate::core::{Error, Result, SecretString, TransportConfig};
-use crate::source::allow_insecure_test_transport;
 
 use super::{
     SqlServerSourceConfig, DEFAULT_POOL_SIZE, DEFAULT_STREAM_POLL_INTERVAL_MS, MAX_EVENTS_PER_POLL,
@@ -192,20 +191,19 @@ impl SqlServerSourceConfig {
 
         #[cfg(feature = "tls")]
         if self.transport.is_tls() {
-            if allow_insecure_test_transport() {
-                config.encryption(tiberius::EncryptionLevel::NotSupported);
-            } else {
-                config.encryption(tiberius::EncryptionLevel::Required);
+            config.encryption(tiberius::EncryptionLevel::Required);
 
-                if let Some(ca_path) = self
-                    .transport
-                    .ca_cert_path()
-                    .as_ref()
-                    .map(|path| path.trim())
-                    .filter(|path| !path.is_empty())
-                {
-                    config.trust_cert_ca(ca_path);
-                }
+            if self.transport.allow_invalid_certificates() || self.transport.allow_invalid_hostnames()
+            {
+                config.trust_cert();
+            } else if let Some(ca_path) = self
+                .transport
+                .ca_cert_path()
+                .as_ref()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+            {
+                config.trust_cert_ca(ca_path);
             }
         } else {
             config.encryption(tiberius::EncryptionLevel::NotSupported);

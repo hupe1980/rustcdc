@@ -18,6 +18,18 @@ pub enum TransportConfig {
         /// Optional PEM-encoded client private key file for mTLS authentication.
         /// Must be paired with `client_cert_path`.
         client_key_path: Option<String>,
+        /// When true, accept invalid or unknown CA certificates.
+        ///
+        /// This is intended only for local testing or tightly controlled
+        /// private environments where certificate distribution is not practical.
+        #[serde(default)]
+        allow_invalid_certificates: bool,
+        /// When true, skip TLS hostname verification.
+        ///
+        /// This is intended only for local testing or tightly controlled
+        /// private environments where DNS/SAN validation is not practical.
+        #[serde(default)]
+        allow_invalid_hostnames: bool,
     },
     /// Use plaintext (unencrypted) transport.
     ///
@@ -44,6 +56,8 @@ impl TransportConfig {
             ca_cert_path: None,
             client_cert_path: None,
             client_key_path: None,
+            allow_invalid_certificates: false,
+            allow_invalid_hostnames: false,
         }
     }
 
@@ -53,6 +67,8 @@ impl TransportConfig {
             ca_cert_path,
             client_cert_path: None,
             client_key_path: None,
+            allow_invalid_certificates: false,
+            allow_invalid_hostnames: false,
         }
     }
 
@@ -69,6 +85,21 @@ impl TransportConfig {
             ca_cert_path,
             client_cert_path: Some(client_cert_path),
             client_key_path: Some(client_key_path),
+            allow_invalid_certificates: false,
+            allow_invalid_hostnames: false,
+        }
+    }
+
+    /// Construct TLS transport that skips certificate and hostname validation.
+    ///
+    /// Use only for local testing or tightly controlled private environments.
+    pub fn tls_insecure_skip_verify() -> Self {
+        Self::Tls {
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            allow_invalid_certificates: true,
+            allow_invalid_hostnames: true,
         }
     }
 
@@ -107,6 +138,28 @@ impl TransportConfig {
         }
     }
 
+    /// Return true when TLS certificate verification is disabled.
+    pub const fn allow_invalid_certificates(&self) -> bool {
+        match self {
+            Self::Tls {
+                allow_invalid_certificates,
+                ..
+            } => *allow_invalid_certificates,
+            Self::Plaintext => false,
+        }
+    }
+
+    /// Return true when TLS hostname verification is disabled.
+    pub const fn allow_invalid_hostnames(&self) -> bool {
+        match self {
+            Self::Tls {
+                allow_invalid_hostnames,
+                ..
+            } => *allow_invalid_hostnames,
+            Self::Plaintext => false,
+        }
+    }
+
     /// Return the configured client certificate path, if any.
     pub fn client_cert_path(&self) -> Option<&str> {
         match self {
@@ -127,5 +180,26 @@ impl TransportConfig {
             } => Some(path.as_str()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportConfig;
+
+    #[test]
+    fn tls_defaults_to_strict_verification() {
+        let transport = TransportConfig::tls();
+        assert!(transport.is_tls());
+        assert!(!transport.allow_invalid_certificates());
+        assert!(!transport.allow_invalid_hostnames());
+    }
+
+    #[test]
+    fn tls_insecure_skip_verify_sets_insecure_flags() {
+        let transport = TransportConfig::tls_insecure_skip_verify();
+        assert!(transport.is_tls());
+        assert!(transport.allow_invalid_certificates());
+        assert!(transport.allow_invalid_hostnames());
     }
 }

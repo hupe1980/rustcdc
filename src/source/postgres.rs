@@ -489,6 +489,7 @@ impl PostgresConnection {
                 ca_cert_path,
                 client_cert_path,
                 client_key_path,
+                ..
             } => {
                 #[cfg(not(feature = "tls"))]
                 {
@@ -1678,12 +1679,14 @@ mod tests {
     }
 
     #[test]
-    fn validation_accepts_env_backed_passwords() {
+    fn validation_accepts_callback_backed_passwords() {
         let config = PostgresSourceConfig {
             host: "localhost".into(),
             port: 5432,
             user: "cdc".into(),
-            password: SecretString::from_env("HOME"),
+            password: SecretString::from_callback("postgres-password", || {
+                Ok("callback-secret".to_string())
+            }),
             database: "app".into(),
             replication_slot_name: "slot".into(),
             publication_name: "pub".into(),

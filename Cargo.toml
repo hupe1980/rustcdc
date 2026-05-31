@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.88"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -37,9 +37,6 @@ outbox = []
 encryption = ["dep:aes-gcm", "dep:base64", "dep:hkdf", "dep:hmac"]
 # Enable metrics and instrumentation integrations.
 metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
-# Enable explicit test-only insecure transport/TLS overrides behind env toggles.
-# Never enable this feature for production builds.
-insecure-test-overrides = []
 # Enable fault-injection and chaos-testing primitives (FaultInjectingSource, FaultInjectingCheckpoint,
 # CrashSimulationValidator, DataLossValidator). Must NOT be enabled in production builds.
 test-harnesses = []

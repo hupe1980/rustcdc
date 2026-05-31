@@ -12,10 +12,11 @@
 3. [Connector Capabilities](#connector-capabilities)
 4. [PostgreSQL Source Configuration](#postgresql-source-configuration)
 5. [MySQL Source Configuration](#mysql-source-configuration)
-6. [SQL Server Source Configuration](#sql-server-source-configuration)
-7. [Checkpoint Configuration](#checkpoint-configuration)
-8. [Observability Configuration](#observability-configuration)
-9. [Production Recommendations](#production-recommendations)
+6. [MariaDB Source Configuration](#mariadb-source-configuration)
+7. [SQL Server Source Configuration](#sql-server-source-configuration)
+8. [Checkpoint Configuration](#checkpoint-configuration)
+9. [Observability Configuration](#observability-configuration)
+10. [Production Recommendations](#production-recommendations)
 
 ---
 
@@ -86,7 +87,10 @@ let source = PostgresSourceConfig {
   host: "localhost".into(),
   port: 5432,
   user: "postgres".into(),
-  password: SecretString::from_env("CDC_RS_POSTGRES_PASSWORD"),
+  password: SecretString::from_callback("postgres-password", || {
+    std::env::var("CDC_RS_POSTGRES_PASSWORD")
+      .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
+  }),
   database: "mydb".into(),
   replication_slot_name: "rustcdc_slot".into(),
   publication_name: "rustcdc_publication".into(),
@@ -94,12 +98,23 @@ let source = PostgresSourceConfig {
   ..PostgresSourceConfig::default()
 };
 
-let config = RuntimeConfig::new(RuntimeSourceConfig::Postgres(source), checkpoint, schema_history)
+let config = RuntimeConfig::new(RuntimeSourceConfig::postgres(source), checkpoint, schema_history)
     .with_snapshot_tables(vec!["public.users".to_string(), "public.orders".to_string()])
     .with_max_buffer_size(50_000)
     .with_max_poll_wait_ms(2_000)
     .with_transform_error_policy(rustcdc::TransformErrorPolicy::Halt);
 ```
+
+For env-driven bootstrapping, use explicit argument parsing in your host
+application and map values into typed source configs.
+
+Prefer the associated constructors when selecting a source in embedder code:
+
+- `RuntimeSourceConfig::postgres(...)`
+- `RuntimeSourceConfig::mysql(...)`
+- `RuntimeSourceConfig::mariadb(...)`
+- `RuntimeSourceConfig::sqlserver(...)`
+- `RuntimeSourceConfig::disabled()`
 
 ## Runtime Consumption Model
 
@@ -177,7 +192,7 @@ if !caps.snapshot {
 }
 ```
 
-For configured PostgreSQL/MySQL/SQL Server sources, the runtime advertises
+For configured PostgreSQL/MySQL/MariaDB/SQL Server sources, the runtime advertises
 `snapshot=true`, `handoff=true`, `ddl_capture=true`, `heartbeat=true`, and
 `schema_introspection=true`.
 
@@ -215,7 +230,7 @@ pub struct PostgresSourceConfig {
     pub user: String,
     
     /// PostgreSQL password material.
-    /// Use `SecretString::new`, `SecretString::from_env`,
+    /// Use `SecretString::new`,
     /// `SecretString::from_provider`, or `SecretString::from_callback`.
     pub password: SecretString,
 
@@ -273,7 +288,6 @@ impl SecretProvider for VaultProvider {
 }
 
 let inline_secret = SecretString::new("postgres");
-let env_secret = SecretString::from_env("CDC_RS_POSTGRES_PASSWORD");
 let provider_secret = SecretString::from_provider(
   "vault",
   "database/postgres/password",
@@ -298,7 +312,10 @@ use std::collections::HashMap;
 let mut encrypt_rules = HashMap::new();
 encrypt_rules.insert(
   "profile.phone".to_string(),
-  MaskRule::Encrypt(SecretString::from_env("CDC_RS_FIELD_KEY")),
+  MaskRule::Encrypt(SecretString::from_callback("field-key", || {
+    std::env::var("CDC_RS_FIELD_KEY")
+      .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
+  })),
 );
 
 let encrypt_transform = MaskHashTransform::new(MaskHashConfig {
@@ -309,7 +326,10 @@ let encrypt_transform = MaskHashTransform::new(MaskHashConfig {
 let mut decrypt_rules = HashMap::new();
 decrypt_rules.insert(
   "profile.phone".to_string(),
-  MaskRule::Decrypt(SecretString::from_env("CDC_RS_FIELD_KEY")),
+  MaskRule::Decrypt(SecretString::from_callback("field-key", || {
+    std::env::var("CDC_RS_FIELD_KEY")
+      .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
+  })),
 );
 
 let decrypt_transform = MaskHashTransform::new(MaskHashConfig {
@@ -368,6 +388,7 @@ which helps catch drift during schema evolution and replay.
 **Transport Selection:**
 - `TransportConfig::tls()` (default with `tls` feature): TLS with system trust store
 - `TransportConfig::tls_with_ca_cert_path(path)`: TLS with explicit CA bundle
+- `TransportConfig::tls_insecure_skip_verify()`: TLS with certificate/hostname verification disabled (testing or tightly controlled air-gapped environments only)
 - `TransportConfig::plaintext()`: unencrypted transport — credentials and data transmitted in the clear
 
 Use TLS transport for all production connector configurations.
@@ -481,6 +502,31 @@ pub struct MysqlSourceConfig {
 GTID Set Format: "source_id:interval[, ...]"
 Example: "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
 ```
+
+---
+
+## MariaDB Source Configuration
+
+MariaDB uses the same MySQL-protocol transport stack, but rustcdc exposes it as a first-class source identity through [`MariaDbSourceConfig`] and `RuntimeSourceConfig::mariadb(...)`.
+
+Use MariaDB when you need distinct checkpoint naming, source labeling, or runtime routing while keeping the same underlying binlog transport semantics as MySQL.
+
+```rust
+use rustcdc::{MariaDbSourceConfig, RuntimeSourceConfig};
+
+let source = MariaDbSourceConfig {
+  host: "localhost".to_string(),
+  port: 3306,
+  user: "cdc_user".to_string(),
+  password: "cdc_password".to_string().into(),
+  database: "events".to_string(),
+  ..MariaDbSourceConfig::default()
+};
+
+let runtime_source = RuntimeSourceConfig::mariadb(source);
+```
+
+MariaDB supports the same startup, snapshot, and streaming modes as MySQL, but emits `source_type() == "mariadb"` and uses MariaDB-specific checkpoint identifiers.
 
 ---
 
@@ -651,7 +697,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.1.3",                         // Service version
+    "0.1.4",                         // Service version
     "production",                    // Environment
 );
 
@@ -790,6 +836,9 @@ let transport = TransportConfig::tls_with_ca_cert_path("/etc/ssl/certs/company-c
 
 // Also valid: rely on system trust store.
 let transport = TransportConfig::tls();
+
+// Testing/air-gapped fallback only: disable certificate + hostname verification.
+let transport = TransportConfig::tls_insecure_skip_verify();
 
 // Plaintext: only for trusted private networks or local integration testing.
 // Credentials and event data are transmitted unencrypted.

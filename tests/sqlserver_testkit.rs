@@ -63,7 +63,7 @@ pub fn source_config(
         password: SQLSERVER_SA_PASSWORD.to_string().into(),
         database,
         instance_name: None,
-        transport: TransportConfig::tls(),
+        transport: TransportConfig::plaintext(),
         conn_timeout_secs,
         cdc_enabled: true,
         cdc_schema: "cdc".into(),

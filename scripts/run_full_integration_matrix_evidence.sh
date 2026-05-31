@@ -9,9 +9,12 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-export CDC_RS_RUN_DOCKER_TESTS=1
-export CDC_RS_ALLOW_INSECURE_TEST_TRANSPORT=1
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required for release evidence artifact validation" >&2
+  exit 1
+fi
 
+export CDC_RS_RUN_DOCKER_TESTS=1
 report_path="target/integration-full-matrix-evidence.txt"
 mkdir -p target
 : > "$report_path"
@@ -39,6 +42,48 @@ is_transient_postgres_process_crash_failure() {
   rg -qi "container is not ready|database system is starting up|could not connect to server|connection refused|timed out waiting for crash worker marker" "$log_file"
 }
 
+require_file() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo "FAIL: required artifact missing: $file" | tee -a "$report_path"
+    exit 1
+  fi
+  if [[ ! -s "$file" ]]; then
+    echo "FAIL: required artifact is empty: $file" | tee -a "$report_path"
+    exit 1
+  fi
+}
+
+check_latency_json() {
+  local file="$1"
+  require_file "$file"
+  if ! jq -e '
+    has("poll_latency_ms_p95") and
+    has("poll_latency_ms_p99") and
+    has("commit_latency_ms_p95") and
+    has("commit_latency_ms_p99") and
+    (.poll_latency_ms_p95 | type == "number") and
+    (.poll_latency_ms_p99 | type == "number") and
+    (.commit_latency_ms_p95 | type == "number") and
+    (.commit_latency_ms_p99 | type == "number")
+  ' "$file" >/dev/null; then
+    echo "FAIL: malformed latency JSON artifact: $file" | tee -a "$report_path"
+    exit 1
+  fi
+}
+
+validate_release_artifacts() {
+  require_file "target/integration-full-matrix-evidence.txt"
+  require_file "target/latency-evidence.txt"
+  require_file "target/latency-gate.txt"
+  require_file "target/benchmark-ci-env.txt"
+  require_file "BENCHMARK_REPORT.md"
+
+  check_latency_json "target/postgres-latency-evidence.json"
+  check_latency_json "target/mysql-latency-evidence.json"
+  check_latency_json "target/sqlserver-latency-evidence.json"
+}
+
 run_case() {
   local label="$1"
   shift
@@ -62,6 +107,10 @@ run_case() {
     : > "$temp_log"
     if "$@" >"$temp_log" 2>&1; then
       cat "$temp_log" | tee -a "$report_path"
+      if [[ "${1:-}" == "cargo" && "${2:-}" == "test" ]] && rg -q '^running 0 tests$' "$temp_log"; then
+        echo "STATUS: FAIL - $label (zero-test pass detected)" | tee -a "$report_path"
+        break
+      fi
       echo "STATUS: PASS - $label (attempt ${attempts}/${max_attempts})" | tee -a "$report_path"
       passed=1
       break
@@ -109,40 +158,98 @@ run_case() {
   echo | tee -a "$report_path"
 }
 
-run_case "postgres runtime" cargo test --test runtime_postgres --features postgres
-run_case "postgres version matrix" cargo test --test postgres_version_matrix --features postgres
-run_case "postgres snapshot" cargo test --test postgres_snapshot_integration --features postgres
-run_case "postgres stream" cargo test --test postgres_stream_integration --features postgres
-run_case "postgres handoff" cargo test --test postgres_handoff_integration --features postgres
-run_case "postgres checkpoint" cargo test --test checkpoint_file_integration --features postgres
-run_case "postgres crash worker build" cargo build -p xtask --bin postgres_crash_worker --features postgres
-run_case "postgres process crash" cargo test --test runtime_postgres_process_crash_integration --features postgres
-run_case "postgres parallel snapshot stress" cargo test --test parallel_snapshot_stress_integration --features postgres
-run_case "postgres otel metrics" cargo test --test otel_metrics_integration --features postgres,metrics
-run_case "postgres otel tracing" cargo test --test otel_tracing_integration --features postgres,metrics
-run_case "postgres snapshot resumable" cargo test --test snapshot_resumable_integration --features postgres
-run_case "mysql connection" cargo test --test mysql_connection_integration --features mysql,tls,insecure-test-overrides
-run_case "mysql snapshot" cargo test --test mysql_snapshot_integration --features mysql,tls,insecure-test-overrides
-run_case "mysql stream" cargo test --test mysql_stream_integration --features mysql,tls,insecure-test-overrides
-run_case "mysql handoff" cargo test --test mysql_handoff_integration --features mysql,tls,insecure-test-overrides
-run_case "mysql crash worker build" cargo build -p xtask --bin mysql_crash_worker --features mysql,tls,insecure-test-overrides
-run_case "mysql process crash" cargo test --test runtime_mysql_process_crash_integration --features mysql,tls,insecure-test-overrides
-run_case "mariadb connection" cargo test --test mariadb_connection_integration --features mysql,tls,insecure-test-overrides
-run_case "mariadb e2e" cargo test --test mariadb_e2e_integration --features mysql,tls,insecure-test-overrides
-run_case "sqlserver version matrix" cargo test --test sqlserver_version_matrix --features sqlserver,tls,insecure-test-overrides
-run_case "sqlserver snapshot" cargo test --test sqlserver_snapshot_integration --features sqlserver,tls,insecure-test-overrides
-run_case "sqlserver stream" cargo test --test sqlserver_stream_integration --features sqlserver,tls,insecure-test-overrides
-run_case "sqlserver handoff" cargo test --test sqlserver_handoff_integration --features sqlserver,tls,insecure-test-overrides
-run_case "sqlserver crash worker build" cargo build -p xtask --bin sqlserver_crash_worker --features sqlserver,tls,insecure-test-overrides
-run_case "sqlserver process crash" cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,tls,insecure-test-overrides
+run_test_case() {
+  local label="$1"
+  local test_target="$2"
+  local features="$3"
+  run_case "$label" cargo test --test "$test_target" --features "$features"
+}
 
-run_case "reliability data loss detection" cargo test --test data_loss_detection --features postgres,test-harnesses
-run_case "reliability deterministic replay failure fixtures" cargo test --test deterministic_replay_failure_fixtures --features postgres,test-harnesses
-run_case "reliability deterministic replay golden fixtures" cargo test --test deterministic_replay_golden_fixtures --features postgres,test-harnesses
-run_case "reliability runtime health states" cargo test --test runtime_health_states --features postgres,test-harnesses
-run_case "reliability fault injection soak matrix" cargo test --test fault_injection_soak_matrix --features postgres,test-harnesses
-run_case "reliability wasm runtime integration" cargo test --test wasm_runtime_integration --features postgres,test-harnesses
-run_case "reliability wasm conformance contract" cargo test --test wasm_conformance_contract --features postgres,test-harnesses
+run_xtask_worker_build_case() {
+  local label="$1"
+  local worker_bin="$2"
+  local features="$3"
+  run_case "$label" cargo build -p xtask --bin "$worker_bin" --features "$features"
+}
+
+postgres_suites=(
+  "postgres runtime|runtime_postgres|postgres"
+  "postgres version matrix|postgres_version_matrix|postgres"
+  "postgres snapshot|postgres_snapshot_integration|postgres"
+  "postgres stream|postgres_stream_integration|postgres"
+  "postgres handoff|postgres_handoff_integration|postgres"
+  "postgres checkpoint|checkpoint_file_integration|postgres"
+  "postgres process crash|runtime_postgres_process_crash_integration|postgres"
+  "postgres parallel snapshot stress|parallel_snapshot_stress_integration|postgres"
+  "postgres otel metrics|otel_metrics_integration|postgres,metrics"
+  "postgres otel tracing|otel_tracing_integration|postgres,metrics"
+  "postgres snapshot resumable|snapshot_resumable_integration|postgres"
+)
+
+mysql_suites=(
+  "mysql connection|mysql_connection_integration|mysql"
+  "mysql snapshot|mysql_snapshot_integration|mysql"
+  "mysql stream|mysql_stream_integration|mysql"
+  "mysql handoff|mysql_handoff_integration|mysql"
+  "mysql process crash|runtime_mysql_process_crash_integration|mysql"
+)
+
+mariadb_suites=(
+  "mariadb connection|mariadb_connection_integration|mariadb"
+  "mariadb e2e|mariadb_e2e_integration|mariadb"
+)
+
+sqlserver_suites=(
+  "sqlserver version matrix|sqlserver_version_matrix|sqlserver"
+  "sqlserver snapshot|sqlserver_snapshot_integration|sqlserver"
+  "sqlserver stream|sqlserver_stream_integration|sqlserver"
+  "sqlserver handoff|sqlserver_handoff_integration|sqlserver"
+  "sqlserver process crash|runtime_sqlserver_process_crash_integration|sqlserver"
+)
+
+reliability_suites=(
+  "reliability data loss detection|data_loss_detection|postgres,test-harnesses"
+  "reliability deterministic replay failure fixtures|deterministic_replay_failure_fixtures|postgres,test-harnesses"
+  "reliability deterministic replay golden fixtures|deterministic_replay_golden_fixtures|postgres,test-harnesses"
+  "reliability runtime health states|runtime_health_states|postgres,test-harnesses"
+  "reliability fault injection soak matrix|fault_injection_soak_matrix|postgres,test-harnesses"
+  "reliability wasm runtime integration|wasm_runtime_integration|postgres,test-harnesses"
+  "reliability wasm conformance contract|wasm_conformance_contract|postgres,test-harnesses"
+)
+
+for entry in "${postgres_suites[@]}"; do
+  IFS='|' read -r label test_target features <<< "$entry"
+  if [[ "$test_target" == "runtime_postgres_process_crash_integration" ]]; then
+    run_xtask_worker_build_case "postgres crash worker build" "postgres_crash_worker" "postgres"
+  fi
+  run_test_case "$label" "$test_target" "$features"
+done
+
+for entry in "${mysql_suites[@]}"; do
+  IFS='|' read -r label test_target features <<< "$entry"
+  if [[ "$test_target" == "runtime_mysql_process_crash_integration" ]]; then
+    run_xtask_worker_build_case "mysql crash worker build" "mysql_crash_worker" "mysql"
+  fi
+  run_test_case "$label" "$test_target" "$features"
+done
+
+for entry in "${mariadb_suites[@]}"; do
+  IFS='|' read -r label test_target features <<< "$entry"
+  run_test_case "$label" "$test_target" "$features"
+done
+
+for entry in "${sqlserver_suites[@]}"; do
+  IFS='|' read -r label test_target features <<< "$entry"
+  if [[ "$test_target" == "runtime_sqlserver_process_crash_integration" ]]; then
+    run_xtask_worker_build_case "sqlserver crash worker build" "sqlserver_crash_worker" "sqlserver"
+  fi
+  run_test_case "$label" "$test_target" "$features"
+done
+
+for entry in "${reliability_suites[@]}"; do
+  IFS='|' read -r label test_target features <<< "$entry"
+  run_test_case "$label" "$test_target" "$features"
+done
 
 run_case "latency evidence gate" bash scripts/ci-latency-gate.sh
 
@@ -155,6 +262,8 @@ if ((${#failed_labels[@]} > 0)); then
   echo "Report written to $report_path"
   exit 1
 fi
+
+validate_release_artifacts
 
 echo "Full integration matrix completed successfully." | tee -a "$report_path"
 echo "Report written to $report_path"

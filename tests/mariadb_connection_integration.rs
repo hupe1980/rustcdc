@@ -110,7 +110,7 @@ async fn mariadb_base_config(version: &str, server_id: u32) -> rustcdc::Result<M
             server_id,
             gtid_mode_enabled: false,
             binlog_format_check: true,
-            transport: TransportConfig::tls(),
+            transport: TransportConfig::plaintext(),
             conn_timeout_secs: CONNECT_TIMEOUT_SECS,
             stream_poll_interval_ms: 50,
             max_events_per_poll: 1_000,

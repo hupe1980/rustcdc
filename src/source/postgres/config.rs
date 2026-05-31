@@ -161,6 +161,7 @@ impl PostgresSourceConfig {
             ca_cert_path,
             client_cert_path,
             client_key_path,
+            ..
         } = &self.transport
         {
             #[cfg(not(feature = "tls"))]

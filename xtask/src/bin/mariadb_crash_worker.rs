@@ -1,76 +1,16 @@
 #[cfg(feature = "mariadb")]
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 #[cfg(feature = "mariadb")]
 use rustcdc::{
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
     MariaDbSourceConfig, RuntimeConfig, RuntimeSourceConfig, TransportConfig,
 };
-
 #[cfg(feature = "mariadb")]
-fn required_env(name: &str) -> rustcdc::Result<String> {
-    env::var(name).map_err(|_| rustcdc::Error::ConfigError(format!("missing env var {name}")))
-}
-
-#[cfg(feature = "mariadb")]
-fn required_u16_env(name: &str) -> rustcdc::Result<u16> {
-    let value = required_env(name)?;
-    value
-        .parse::<u16>()
-        .map_err(|error| rustcdc::Error::ConfigError(format!("invalid {name}: {error}")))
-}
-
-#[cfg(feature = "mariadb")]
-fn required_u32_env(name: &str) -> rustcdc::Result<u32> {
-    let value = required_env(name)?;
-    value
-        .parse::<u32>()
-        .map_err(|error| rustcdc::Error::ConfigError(format!("invalid {name}: {error}")))
-}
-
-#[cfg(feature = "mariadb")]
-fn optional_bool_env(name: &str) -> bool {
-    matches!(
-        env::var(name).ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
-}
-
-#[cfg(feature = "mariadb")]
-fn optional_snapshot_tables() -> Vec<String> {
-    env::var("CDC_RS_WORKER_SNAPSHOT_TABLES")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|table| !table.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(feature = "mariadb")]
-fn event_ids(batch: &rustcdc::EventBatch) -> Vec<String> {
-    batch
-        .events()
-        .iter()
-        .filter_map(|event| {
-            event
-                .after
-                .as_ref()
-                .and_then(|after| after.get("id"))
-                .map(|id| id.to_string())
-        })
-        .collect()
-}
-
-#[cfg(feature = "mariadb")]
-fn write_marker_atomic(path: &std::path::Path, payload: &str) -> rustcdc::Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, payload).map_err(rustcdc::Error::IoError)?;
-    fs::rename(&tmp, path).map_err(rustcdc::Error::IoError)
-}
+use xtask::worker_common::{
+    event_ids, optional_bool_env, optional_snapshot_tables, required_env, required_u16_env,
+    required_u32_env, write_marker_atomic,
+};
 
 #[cfg(feature = "mariadb")]
 #[tokio::main(flavor = "current_thread")]
@@ -96,7 +36,7 @@ async fn main() -> rustcdc::Result<()> {
         cfg.server_id = server_id;
         cfg.gtid_mode_enabled = false;
         cfg.binlog_format_check = true;
-        cfg.transport = TransportConfig::tls();
+        cfg.transport = TransportConfig::plaintext();
         cfg.conn_timeout_secs = 30;
         cfg.stream_poll_interval_ms = 50;
         cfg.max_events_per_poll = 1_000;

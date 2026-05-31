@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pull PostgreSQL images from public ECR and tag them as postgres:<tag>.
+# Pull Docker images used by connector CI lanes with retry.
 # Usage:
-#   bash scripts/ci-pull-postgres-images.sh 16-alpine
-#   bash scripts/ci-pull-postgres-images.sh 12-alpine 14-alpine 15-alpine 16-alpine
+#   bash scripts/ci-pull-relational-images.sh 16-alpine
+#   bash scripts/ci-pull-relational-images.sh 12-alpine 14-alpine 15-alpine 16-alpine
+#   bash scripts/ci-pull-relational-images.sh --relational-smoke
 
-if [[ "$#" -eq 0 ]]; then
-  echo "usage: $0 <tag> [<tag> ...]" >&2
-  exit 2
-fi
+# Non-postgres smoke images. Postgres tags are passed explicitly as positional args.
+NON_POSTGRES_RELATIONAL_SMOKE_IMAGES=(
+  "mysql:8.0"
+  "mysql:8.1"
+  "mariadb:10.6"
+  "mariadb:10.11"
+  "mcr.microsoft.com/mssql/server:2019-latest"
+)
 
 pull_with_retry() {
   local image="$1"
@@ -33,6 +38,19 @@ pull_with_retry() {
     attempt=$((attempt + 1))
   done
 }
+
+if [[ "$#" -eq 0 ]]; then
+  echo "usage: $0 <tag> [<tag> ...] | --relational-smoke" >&2
+  exit 2
+fi
+
+if [[ "${1:-}" == "--relational-smoke" ]]; then
+  for image in "${NON_POSTGRES_RELATIONAL_SMOKE_IMAGES[@]}"; do
+    pull_with_retry "$image"
+    echo "prepared ${image}"
+  done
+  exit 0
+fi
 
 for tag in "$@"; do
   image="public.ecr.aws/docker/library/postgres:${tag}"

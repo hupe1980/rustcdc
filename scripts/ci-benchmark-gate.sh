@@ -18,6 +18,8 @@ confirm_runs="${BENCHMARK_CONFIRM_RUNS:-2}"
 preheat_runs="${BENCHMARK_PREHEAT_RUNS:-1}"
 baseline_commit="${BENCHMARK_BASELINE_COMMIT:-}"
 baseline_artifact="${BENCHMARK_BASELINE_ARTIFACT:-}"
+benchmark_require_historical_baseline="${BENCHMARK_REQUIRE_HISTORICAL_BASELINE:-1}"
+benchmark_enforce_release_policy="${BENCHMARK_ENFORCE_RELEASE_POLICY:-0}"
 # CRITERION_BASELINE: name of a saved Criterion baseline to compare against
 # (stored under target/criterion/<bench>/<name>/). If unset, Criterion compares
 # against the previous run. Set this in CI to a named baseline pinned to a
@@ -70,15 +72,24 @@ benchmark_policy_status() {
     elif ! contains_bench_target "cdc_perf" "${gated_benches[@]}"; then
       status="non-release-local"
       reason="gated_benches must include cdc_perf"
+    elif [[ -z "$current_commit" ]]; then
+      status="non-release-local"
+      reason="current git commit must be available"
     elif [[ -z "$baseline_commit" ]]; then
       status="non-release-local"
       reason="baseline_commit must be set"
-    elif [[ "$baseline_commit" != "$current_commit" ]]; then
+    elif [[ "$benchmark_require_historical_baseline" == "1" && "$baseline_commit" == "$current_commit" ]]; then
       status="non-release-local"
-      reason="baseline_commit must match current git commit"
+      reason="baseline_commit must reference a prior commit"
+    elif [[ "$benchmark_require_historical_baseline" == "1" ]] && ! git merge-base --is-ancestor "$baseline_commit" "$current_commit" >/dev/null 2>&1; then
+      status="non-release-local"
+      reason="baseline_commit must be an ancestor of current commit"
     elif [[ -z "$baseline_artifact" ]]; then
       status="non-release-local"
       reason="baseline_artifact must be set"
+    elif [[ "$benchmark_require_historical_baseline" == "1" && "$baseline_artifact" == "BENCHMARK_REPORT.md" ]]; then
+      status="non-release-local"
+      reason="baseline_artifact must reference immutable baseline evidence"
     elif [[ "$git_tree_state" != "clean" ]]; then
       status="non-release-local"
       reason="git tree must be clean for release baseline evidence"
@@ -119,6 +130,8 @@ policy_reason="${policy_info#*|}"
   echo "git_tree_state=${git_tree_state}"
   echo "baseline_commit=${baseline_commit}"
   echo "baseline_artifact=${baseline_artifact}"
+  echo "require_historical_baseline=${benchmark_require_historical_baseline}"
+  echo "enforce_release_policy=${benchmark_enforce_release_policy}"
   echo "rustc=$(rustc -Vv | tr '\n' ';')"
   echo "threshold_percent=${regression_threshold}"
   echo "strict_mode=${strict_mode}"
@@ -132,6 +145,12 @@ policy_reason="${policy_info#*|}"
   echo "report_classification=${policy_status}"
   echo "report_classification_reason=${policy_reason}"
 } > target/benchmark-ci-env.txt
+
+if [[ "$benchmark_enforce_release_policy" == "1" && "$policy_status" != "release-gate-eligible" ]]; then
+  echo "Benchmark policy gate failed: ${policy_reason}" >&2
+  echo "Set BENCHMARK_ENFORCE_RELEASE_POLICY=0 only for non-release/local exploratory runs." >&2
+  exit 1
+fi
 
 emit_benchmark_report() {
   local report_path="BENCHMARK_REPORT.md"
@@ -154,6 +173,8 @@ emit_benchmark_report() {
     echo "git_tree_state=${git_tree_state}"
     echo "baseline_commit=${baseline_commit}"
     echo "baseline_artifact=${baseline_artifact}"
+    echo "require_historical_baseline=${benchmark_require_historical_baseline}"
+    echo "enforce_release_policy=${benchmark_enforce_release_policy}"
     rustc -Vv
     echo "gated_benches=${gated_benches_raw}"
     echo "critical_group_prefixes=${critical_group_prefixes_raw}"

@@ -401,7 +401,7 @@ fn spawn_crash_worker(
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
     resolve_xtask_worker_bin(
         "sqlserver_crash_worker",
-        "sqlserver,rustcdc/insecure-test-overrides",
+        "sqlserver",
         "CARGO_BIN_EXE_sqlserver_crash_worker",
         "sqlserver crash worker binary not found; build with `cargo build -p xtask --bin sqlserver_crash_worker --features sqlserver`",
     )

@@ -10,7 +10,45 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # Execute connector-backed latency evidence first.
-bash scripts/run_latency_evidence.sh
+if ! command -v docker >/dev/null 2>&1; then
+  echo "docker is required for latency evidence runs" >&2
+  exit 1
+fi
+
+export CDC_RS_RUN_DOCKER_TESTS=1
+latency_evidence_report_path="target/latency-evidence.txt"
+mkdir -p target
+: > "$latency_evidence_report_path"
+
+run_latency_step() {
+  local label="$1"
+  shift
+  echo "==> $label" | tee -a "$latency_evidence_report_path"
+  "$@" 2>&1 | tee -a "$latency_evidence_report_path"
+  echo | tee -a "$latency_evidence_report_path"
+}
+
+run_latency_step "postgres connector latency evidence" \
+  cargo test --test postgres_latency_evidence --features postgres -- --nocapture
+
+run_latency_step "mysql connector latency evidence" \
+  cargo test --test mysql_latency_evidence --features mysql -- --nocapture
+
+run_latency_step "sqlserver connector latency evidence" \
+  cargo test --test sqlserver_latency_evidence --features sqlserver -- --nocapture
+
+for artifact in target/postgres-latency-evidence.md target/mysql-latency-evidence.md target/sqlserver-latency-evidence.md; do
+  if [[ -f "$artifact" ]]; then
+    {
+      echo "==> $(basename "$artifact")"
+      cat "$artifact"
+      echo
+    } | tee -a "$latency_evidence_report_path"
+  fi
+done
+
+echo "Latency evidence run completed successfully." | tee -a "$latency_evidence_report_path"
+echo "Report written to $latency_evidence_report_path" | tee -a "$latency_evidence_report_path"
 
 # Global defaults are intentionally conservative to avoid flake-driven noise.
 DEFAULT_P95_MS="${LATENCY_GATE_DEFAULT_P95_MS:-500}"
