@@ -149,7 +149,7 @@ impl FilterProjectionConfig {
             if rule.value.trim().is_empty() {
                 return Err(Error::ConfigError(format!(
                     "filter value must not be empty for field {:?}",
-                    &rule.field
+                    rule.field
                 )));
             }
 
