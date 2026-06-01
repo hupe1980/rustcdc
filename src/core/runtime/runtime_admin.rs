@@ -184,9 +184,15 @@ where
             ("ddl_capture", admin.capabilities.ddl_capture),
             ("heartbeat", admin.capabilities.heartbeat),
             ("tls", admin.capabilities.tls),
-            ("schema_introspection", admin.capabilities.schema_introspection),
+            (
+                "schema_introspection",
+                admin.capabilities.schema_introspection,
+            ),
             ("truncate", admin.capabilities.truncate),
-            ("incremental_snapshot", admin.capabilities.incremental_snapshot),
+            (
+                "incremental_snapshot",
+                admin.capabilities.incremental_snapshot,
+            ),
         ] {
             writeln!(
                 w,

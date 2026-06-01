@@ -283,7 +283,10 @@ mod tests {
             transform.apply(&mut e).await.unwrap(),
             "Truncate on outbox table must not error"
         );
-        assert_eq!(e.table, "outbox", "table must remain unchanged for Truncate");
+        assert_eq!(
+            e.table, "outbox",
+            "table must remain unchanged for Truncate"
+        );
     }
 
     #[tokio::test]
@@ -291,8 +294,12 @@ mod tests {
         let transform = OutboxTransform::new("outbox");
         // Update represents marking a row as processed — should not be re-emitted.
         let mut e = Event {
-            before: Some(json!({"aggregate_id": "u1", "event_type": "user.created", "payload": {}})),
-            after: Some(json!({"aggregate_id": "u1", "event_type": "user.created", "payload": {}, "processed": true})),
+            before: Some(
+                json!({"aggregate_id": "u1", "event_type": "user.created", "payload": {}}),
+            ),
+            after: Some(
+                json!({"aggregate_id": "u1", "event_type": "user.created", "payload": {}, "processed": true}),
+            ),
             op: Operation::Update,
             source: SourceMetadata {
                 source_name: "test".into(),

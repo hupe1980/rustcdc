@@ -170,9 +170,9 @@ pub(crate) fn parse_lease(contents: &str) -> Option<(String, u32)> {
 ///   the method falls back to a compare-and-swap attempt which is
 ///   best-effort but still better than remove-then-create.
 pub(crate) fn atomic_write_lease(lock_path: &Path, content: &str) -> std::io::Result<()> {
-    let parent = lock_path
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "lock_path has no parent"))?;
+    let parent = lock_path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "lock_path has no parent")
+    })?;
 
     // Generate a unique temp path in the same directory (same device → rename works).
     let stamp = std::time::SystemTime::now()
@@ -316,10 +316,7 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
                 dwProcessId: u32,
             ) -> *mut std::ffi::c_void;
             fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-            fn GetExitCodeProcess(
-                hProcess: *mut std::ffi::c_void,
-                lpExitCode: *mut u32,
-            ) -> i32;
+            fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const STILL_ACTIVE: u32 = 259;

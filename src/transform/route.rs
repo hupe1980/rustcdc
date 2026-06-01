@@ -231,7 +231,10 @@ mod tests {
 
         let mut e = event("users");
         assert!(transform.apply(&mut e).await.unwrap());
-        assert_eq!(e.table, "topic-users", "event.table must be updated to destination");
+        assert_eq!(
+            e.table, "topic-users",
+            "event.table must be updated to destination"
+        );
     }
 
     #[tokio::test]

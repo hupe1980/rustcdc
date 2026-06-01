@@ -38,7 +38,9 @@ mod stream_messages;
 mod stream_start;
 
 use self::{
-    parser::{mysql_qualified_table_name_from_reference, parse_truncate_target, quoted_mysql_identifier},
+    parser::{
+        mysql_qualified_table_name_from_reference, parse_truncate_target, quoted_mysql_identifier,
+    },
     query::{
         binlog_row_to_mysql_row, format_gtid, mysql_json_value_to_param, mysql_row_to_json,
         mysql_value_to_json, primary_key_columns_from_row,

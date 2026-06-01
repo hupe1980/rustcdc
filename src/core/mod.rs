@@ -18,7 +18,9 @@ pub use event::{
     Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata, ValidationError,
     EVENT_ENVELOPE_VERSION,
 };
-pub use idempotency::{fingerprint_event_stable, fingerprint_event_transient, EventIdempotencyGuard};
+pub use idempotency::{
+    fingerprint_event_stable, fingerprint_event_transient, EventIdempotencyGuard,
+};
 pub use logging::StructuredLogger;
 pub use observability::{EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector};
 #[cfg(feature = "metrics")]

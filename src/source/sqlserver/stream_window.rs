@@ -1,6 +1,7 @@
 use crate::{
     core::{
-        Error, Event, Operation, Result, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+        Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
+        EVENT_ENVELOPE_VERSION,
     },
     source::table_is_allowed,
 };
@@ -285,9 +286,7 @@ impl SqlServerStreamHandle {
     /// return them as `Operation::Truncate` events.  Consumed IDs are marked
     /// after the batch is assembled (at-least-once: on crash-before-mark,
     /// the same truncate events will be re-emitted on replay).
-    pub(super) async fn fetch_and_emit_truncate_events(
-        &mut self,
-    ) -> Result<Vec<Event>> {
+    pub(super) async fn fetch_and_emit_truncate_events(&mut self) -> Result<Vec<Event>> {
         if !self.config.capture_truncate_events {
             return Ok(Vec::new());
         }
@@ -295,9 +294,12 @@ impl SqlServerStreamHandle {
         let lsn_end_hex = lsn_bytes_to_hex(&self.stream.lsn_end);
         let mut client = query::connect_client(&self.config).await?;
 
-        let rows =
-            query::fetch_pending_truncate_events(&mut client, &self.config.cdc_schema, &lsn_end_hex)
-                .await?;
+        let rows = query::fetch_pending_truncate_events(
+            &mut client,
+            &self.config.cdc_schema,
+            &lsn_end_hex,
+        )
+        .await?;
 
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -348,8 +350,7 @@ impl SqlServerStreamHandle {
             // Best-effort periodic cleanup; ignore errors to avoid interrupting
             // the stream on non-critical housekeeping failures.
             let _ =
-                query::cleanup_consumed_truncate_events(&mut client, &self.config.cdc_schema)
-                    .await;
+                query::cleanup_consumed_truncate_events(&mut client, &self.config.cdc_schema).await;
         }
 
         Ok(events)

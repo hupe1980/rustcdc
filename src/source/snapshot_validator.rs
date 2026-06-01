@@ -171,7 +171,10 @@ impl SnapshotValidator {
                 } else {
                     format!(" (PKs: [{}])", state.pk_samples.join(", "))
                 };
-                extra_tables.push(format!("{table}: unexpected table with {} rows{sample}", state.rows_received));
+                extra_tables.push(format!(
+                    "{table}: unexpected table with {} rows{sample}",
+                    state.rows_received
+                ));
             }
         }
 
@@ -331,9 +334,15 @@ mod tests {
         assert_eq!(result.missing_rows.len(), 1);
         let diag = &result.missing_rows[0];
         assert!(diag.contains("users"), "diagnostic must mention the table");
-        assert!(diag.contains("missing ~2"), "diagnostic must state gap count");
+        assert!(
+            diag.contains("missing ~2"),
+            "diagnostic must state gap count"
+        );
         // Received PK sample must list the rows we actually got.
-        assert!(diag.contains("{id=1}") || diag.contains("id=1"), "diagnostic must include a received PK sample");
+        assert!(
+            diag.contains("{id=1}") || diag.contains("id=1"),
+            "diagnostic must include a received PK sample"
+        );
     }
 
     #[test]

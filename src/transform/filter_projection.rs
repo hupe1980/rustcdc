@@ -192,13 +192,9 @@ impl FilterProjectionTransform {
             .iter()
             .map(|rule| {
                 if rule.operator == FilterOperator::Regex {
-                    Regex::new(&rule.value)
-                        .map(Some)
-                        .map_err(|error| {
-                            Error::ConfigError(format!(
-                                "filter regex pattern is invalid: {error}"
-                            ))
-                        })
+                    Regex::new(&rule.value).map(Some).map_err(|error| {
+                        Error::ConfigError(format!("filter regex pattern is invalid: {error}"))
+                    })
                 } else {
                     Ok(None)
                 }
@@ -228,8 +224,7 @@ impl FilterProjectionTransform {
         // Truncate events have both before and after as None.  Content-field
         // rules cannot match, so they would always return false under FilterMode::All.
         // Honour pass_through_truncate to avoid silently dropping every TRUNCATE.
-        if self.config.pass_through_truncate
-            && matches!(event.op, crate::core::Operation::Truncate)
+        if self.config.pass_through_truncate && matches!(event.op, crate::core::Operation::Truncate)
         {
             return true;
         }
@@ -254,7 +249,9 @@ impl FilterProjectionTransform {
     #[inline]
     fn evaluate_rule(&self, event: &Event, rule: &FilterRule, regex: Option<&Regex>) -> bool {
         match &rule.field {
-            FilterField::Op => apply_operator(event.op.to_str(), &rule.operator, &rule.value, regex),
+            FilterField::Op => {
+                apply_operator(event.op.to_str(), &rule.operator, &rule.value, regex)
+            }
             FilterField::Table => apply_operator(&event.table, &rule.operator, &rule.value, regex),
             FilterField::AfterField(path) => {
                 let Some(payload) = event.after.as_ref() else {
@@ -313,22 +310,33 @@ impl FilterProjectionTransform {
 /// For numeric comparisons (`Lt`, `LtEq`, `Gt`, `GtEq`) both `left` and `rule_value`
 /// are parsed as `f64`; if either fails to parse the comparison returns `false`.
 #[inline]
-fn apply_operator(left: &str, op: &FilterOperator, rule_value: &str, regex: Option<&Regex>) -> bool {
+fn apply_operator(
+    left: &str,
+    op: &FilterOperator,
+    rule_value: &str,
+    regex: Option<&Regex>,
+) -> bool {
     match op {
         FilterOperator::Eq => left == rule_value,
         FilterOperator::Ne => left != rule_value,
         FilterOperator::Contains => left.contains(rule_value),
         FilterOperator::Regex => regex.is_some_and(|re| re.is_match(left)),
         FilterOperator::Lt | FilterOperator::LtEq | FilterOperator::Gt | FilterOperator::GtEq => {
-            let Ok(lv) = left.parse::<f64>() else { return false; };
-            let Ok(rv) = rule_value.parse::<f64>() else { return false; };
+            let Ok(lv) = left.parse::<f64>() else {
+                return false;
+            };
+            let Ok(rv) = rule_value.parse::<f64>() else {
+                return false;
+            };
             match op {
-                FilterOperator::Lt   => lv < rv,
+                FilterOperator::Lt => lv < rv,
                 FilterOperator::LtEq => lv <= rv,
-                FilterOperator::Gt   => lv > rv,
+                FilterOperator::Gt => lv > rv,
                 FilterOperator::GtEq => lv >= rv,
                 // SAFETY: outer match arm already restricts to the four numeric variants above.
-                _ => unreachable!("numeric comparison arm is exhausted by the outer Lt|LtEq|Gt|GtEq restriction"),
+                _ => unreachable!(
+                    "numeric comparison arm is exhausted by the outer Lt|LtEq|Gt|GtEq restriction"
+                ),
             }
         }
     }
@@ -399,7 +407,11 @@ mod tests {
     #[tokio::test]
     async fn event_can_be_filtered_out() {
         let transform = FilterProjectionTransform::new(FilterProjectionConfig {
-            filters: vec![FilterRule::new(FilterField::Op, FilterOperator::Ne, "delete")],
+            filters: vec![FilterRule::new(
+                FilterField::Op,
+                FilterOperator::Ne,
+                "delete",
+            )],
             ..Default::default()
         })
         .unwrap();
@@ -456,7 +468,11 @@ mod tests {
     #[test]
     fn invalid_filter_rule_rejected_at_construction() {
         let err = FilterProjectionTransform::new(FilterProjectionConfig {
-            filters: vec![FilterRule::new(FilterField::Table, FilterOperator::Eq, "   ")],
+            filters: vec![FilterRule::new(
+                FilterField::Table,
+                FilterOperator::Eq,
+                "   ",
+            )],
             ..Default::default()
         });
         assert!(err.is_err(), "expected ConfigError for empty filter value");
@@ -478,7 +494,11 @@ mod tests {
     #[tokio::test]
     async fn filter_projection_is_deterministic() {
         let transform = FilterProjectionTransform::new(FilterProjectionConfig {
-            filters: vec![FilterRule::new(FilterField::Table, FilterOperator::Eq, "users")],
+            filters: vec![FilterRule::new(
+                FilterField::Table,
+                FilterOperator::Eq,
+                "users",
+            )],
             include_columns: Some(vec!["id".into()]),
             ..Default::default()
         })
@@ -507,7 +527,10 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(transform.apply(&mut e).await.unwrap(), "event with name=alice must pass");
+        assert!(
+            transform.apply(&mut e).await.unwrap(),
+            "event with name=alice must pass"
+        );
     }
 
     #[tokio::test]
@@ -523,7 +546,10 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(!transform.apply(&mut e).await.unwrap(), "event with name=alice must be dropped");
+        assert!(
+            !transform.apply(&mut e).await.unwrap(),
+            "event with name=alice must be dropped"
+        );
     }
 
     #[tokio::test]
@@ -539,7 +565,10 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(transform.apply(&mut e).await.unwrap(), "\"alice\" contains \"lic\"");
+        assert!(
+            transform.apply(&mut e).await.unwrap(),
+            "\"alice\" contains \"lic\""
+        );
     }
 
     #[tokio::test]
@@ -555,7 +584,10 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(transform.apply(&mut e).await.unwrap(), "\"alice\" matches ^ali");
+        assert!(
+            transform.apply(&mut e).await.unwrap(),
+            "\"alice\" matches ^ali"
+        );
     }
 
     #[test]
@@ -568,7 +600,10 @@ mod tests {
             )],
             ..Default::default()
         });
-        assert!(err.is_err(), "invalid regex must be rejected at construction");
+        assert!(
+            err.is_err(),
+            "invalid regex must be rejected at construction"
+        );
     }
 
     #[tokio::test]
@@ -600,7 +635,10 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Update);
-        assert!(transform.apply(&mut e).await.unwrap(), "before.secret=x must match");
+        assert!(
+            transform.apply(&mut e).await.unwrap(),
+            "before.secret=x must match"
+        );
     }
 
     // ── Multi-rule AND / OR ───────────────────────────────────────────────────
@@ -761,4 +799,3 @@ mod tests {
         );
     }
 }
-

@@ -756,9 +756,8 @@ impl StreamHandle for SqlServerStreamHandle {
                     // Re-sort the combined buffer by offset (LSN hex string sort
                     // is byte-lexicographic, which matches numeric order for the
                     // 0x-prefixed fixed-width strings SQL Server produces).
-                    self.window_buffer.sort_by(|a, b| {
-                        a.source.offset.cmp(&b.source.offset)
-                    });
+                    self.window_buffer
+                        .sort_by(|a, b| a.source.offset.cmp(&b.source.offset));
                 }
 
                 self.events_polled = self
@@ -2370,10 +2369,8 @@ mod tests {
         };
 
         // Collect all changes (as next_events does) and flatten with meta.
-        let all_changes: Vec<(CaptureInstanceMeta, Vec<SqlServerRawChange>)> = vec![
-            (meta_a, changes_a),
-            (meta_b, changes_b),
-        ];
+        let all_changes: Vec<(CaptureInstanceMeta, Vec<SqlServerRawChange>)> =
+            vec![(meta_a, changes_a), (meta_b, changes_b)];
         let mut flat: Vec<(CaptureInstanceMeta, SqlServerRawChange)> = all_changes
             .into_iter()
             .flat_map(|(meta, changes)| changes.into_iter().map(move |c| (meta.clone(), c)))
@@ -2408,7 +2405,13 @@ mod tests {
             "events must be in ascending LSN order; got {offsets:?}"
         );
         // Confirm which table came first.
-        assert_eq!(events[0].table, "table_b", "table_b (earlier LSN) must be first");
-        assert_eq!(events[1].table, "table_a", "table_a (later LSN) must be second");
+        assert_eq!(
+            events[0].table, "table_b",
+            "table_b (earlier LSN) must be first"
+        );
+        assert_eq!(
+            events[1].table, "table_a",
+            "table_a (later LSN) must be second"
+        );
     }
 }

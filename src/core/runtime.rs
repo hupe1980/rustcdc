@@ -392,7 +392,9 @@ impl RuntimeSourceConfig {
             #[cfg(feature = "mariadb")]
             Self::MariaDb(_) => Self::mysql_connector_capabilities(),
             #[cfg(feature = "sqlserver")]
-            Self::SqlServer(config) => Self::sqlserver_connector_capabilities(config.capture_truncate_events),
+            Self::SqlServer(config) => {
+                Self::sqlserver_connector_capabilities(config.capture_truncate_events)
+            }
             Self::Disabled => ConnectorCapabilities::none(),
         }
     }
@@ -423,7 +425,9 @@ impl RuntimeSourceConfig {
     /// truncate capture requires an opt-in DDL trigger
     /// (`capture_truncate_events: true`).
     #[cfg(feature = "sqlserver")]
-    const fn sqlserver_connector_capabilities(capture_truncate_events: bool) -> ConnectorCapabilities {
+    const fn sqlserver_connector_capabilities(
+        capture_truncate_events: bool,
+    ) -> ConnectorCapabilities {
         ConnectorCapabilities {
             snapshot: true,
             snapshot_checkpoint_resume: true,
@@ -1428,7 +1432,10 @@ mod tests {
         assert!(caps.ddl_capture);
         assert!(caps.heartbeat);
         assert!(caps.schema_introspection);
-        assert!(caps.truncate, "MySQL connector must report truncate support (binlog QueryEvent)");
+        assert!(
+            caps.truncate,
+            "MySQL connector must report truncate support (binlog QueryEvent)"
+        );
     }
 
     #[cfg(feature = "sqlserver")]
@@ -3583,12 +3590,9 @@ mod tests {
         let checkpoint = InMemoryCheckpoint::default();
         let schema_history = crate::schema_history::InMemorySchemaHistory::default();
 
-        let mut config = RuntimeConfig::new(
-            RuntimeSourceConfig::Disabled,
-            checkpoint,
-            schema_history,
-        )
-        .with_idempotency_disabled();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
+                .with_idempotency_disabled();
         // Use aggressive retry timing so the test completes quickly.
         config.options.connection_retry = Some(ConnectionRetryPolicy {
             max_retries: Some(3),

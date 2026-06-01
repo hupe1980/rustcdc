@@ -223,19 +223,28 @@ mod tests {
     #[test]
     fn parse_truncate_qualified_backticks() {
         let result = parse_truncate_target("TRUNCATE TABLE `mydb`.`orders`");
-        assert_eq!(result, Some((Some("mydb".to_string()), "orders".to_string())));
+        assert_eq!(
+            result,
+            Some((Some("mydb".to_string()), "orders".to_string()))
+        );
     }
 
     #[test]
     fn parse_truncate_qualified_no_backticks() {
         let result = parse_truncate_target("TRUNCATE TABLE mydb.orders");
-        assert_eq!(result, Some((Some("mydb".to_string()), "orders".to_string())));
+        assert_eq!(
+            result,
+            Some((Some("mydb".to_string()), "orders".to_string()))
+        );
     }
 
     #[test]
     fn parse_truncate_mixed_case() {
         let result = parse_truncate_target("truncate table `shop`.`line_items`");
-        assert_eq!(result, Some((Some("shop".to_string()), "line_items".to_string())));
+        assert_eq!(
+            result,
+            Some((Some("shop".to_string()), "line_items".to_string()))
+        );
     }
 
     #[test]

@@ -163,14 +163,11 @@ pub(super) async fn ensure_truncate_capture_setup(
         END"
     );
 
-    client
-        .execute(&create_table, &[])
-        .await
-        .map_err(|error| {
-            Error::SourceError(format!(
-                "sqlserver truncate capture setup (create table) failed: {error}"
-            ))
-        })?;
+    client.execute(&create_table, &[]).await.map_err(|error| {
+        Error::SourceError(format!(
+            "sqlserver truncate capture setup (create table) failed: {error}"
+        ))
+    })?;
 
     client
         .execute(&create_trigger, &[])
@@ -220,9 +217,7 @@ pub(super) async fn fetch_pending_truncate_events(
         .query(&sql, &[])
         .await
         .map_err(|error| {
-            Error::SourceError(format!(
-                "sqlserver truncate-event poll failed: {error}"
-            ))
+            Error::SourceError(format!("sqlserver truncate-event poll failed: {error}"))
         })?
         .into_first_result()
         .await
@@ -234,24 +229,23 @@ pub(super) async fn fetch_pending_truncate_events(
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i64 = row.get::<i64, _>(0).ok_or_else(|| {
-            Error::SourceError("sqlserver truncate event row missing id".into())
-        })?;
-        let schema_name: String = row
-            .get::<&str, _>(1)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                Error::SourceError("sqlserver truncate event row missing schema_name".into())
-            })?;
+        let id: i64 = row
+            .get::<i64, _>(0)
+            .ok_or_else(|| Error::SourceError("sqlserver truncate event row missing id".into()))?;
+        let schema_name: String =
+            row.get::<&str, _>(1)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    Error::SourceError("sqlserver truncate event row missing schema_name".into())
+                })?;
         let table_name: String = row
             .get::<&str, _>(2)
             .map(ToOwned::to_owned)
             .ok_or_else(|| {
                 Error::SourceError("sqlserver truncate event row missing table_name".into())
             })?;
-        let max_lsn_bytes: Option<[u8; 10]> = row
-            .get::<&[u8], _>(3)
-            .and_then(|b| b.try_into().ok());
+        let max_lsn_bytes: Option<[u8; 10]> =
+            row.get::<&[u8], _>(3).and_then(|b| b.try_into().ok());
         let ts_ms: u64 = row
             .get::<i64, _>(4)
             .and_then(|v| u64::try_from(v).ok())
@@ -324,9 +318,7 @@ pub(super) async fn cleanup_consumed_truncate_events(
            AND event_time < DATEADD(HOUR, -24, SYSUTCDATETIME())"
     );
     client.execute(&sql, &[]).await.map_err(|error| {
-        Error::SourceError(format!(
-            "sqlserver truncate-event cleanup failed: {error}"
-        ))
+        Error::SourceError(format!("sqlserver truncate-event cleanup failed: {error}"))
     })?;
     Ok(())
 }

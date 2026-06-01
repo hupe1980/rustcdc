@@ -177,9 +177,11 @@ where
                                     error = %connect_error,
                                     "source reconnect failed; will retry on next attempt",
                                 );
-                                metrics.record_error(&connect_error, "runtime.poll.stream_reconnect");
+                                metrics
+                                    .record_error(&connect_error, "runtime.poll.stream_reconnect");
                             } else {
-                                let resume_offset = self.config.checkpoint.load().await.ok().flatten();
+                                let resume_offset =
+                                    self.config.checkpoint.load().await.ok().flatten();
                                 match self.source.start_stream(resume_offset.as_deref()).await {
                                     Ok(new_stream) => {
                                         self.stream = Some(new_stream);
@@ -196,7 +198,10 @@ where
                                             error = %start_error,
                                             "stream restart after reconnect failed; will retry",
                                         );
-                                        metrics.record_error(&start_error, "runtime.poll.stream_reconnect");
+                                        metrics.record_error(
+                                            &start_error,
+                                            "runtime.poll.stream_reconnect",
+                                        );
                                     }
                                 }
                             }

@@ -564,10 +564,7 @@ mod tests {
     async fn hmac_sha256_different_keys_produce_different_tags() {
         let make_transform = |key: &str| {
             let mut rules = HashMap::new();
-            rules.insert(
-                "email".into(),
-                MaskRule::HmacSha256(SecretString::new(key)),
-            );
+            rules.insert("email".into(), MaskRule::HmacSha256(SecretString::new(key)));
             MaskHashTransform::new(MaskHashConfig {
                 mask_rules: rules,
                 default_rule: MaskRule::Null,
@@ -581,7 +578,10 @@ mod tests {
         let mut e2 = event();
         assert!(t1.apply(&mut e1).await.unwrap());
         assert!(t2.apply(&mut e2).await.unwrap());
-        assert_ne!(e1.after, e2.after, "different keys must produce different tags");
+        assert_ne!(
+            e1.after, e2.after,
+            "different keys must produce different tags"
+        );
     }
 
     #[cfg(feature = "encryption")]

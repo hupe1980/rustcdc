@@ -79,10 +79,10 @@ struct RuntimeWasmTransform {
 
 impl std::fmt::Debug for RuntimeWasmTransform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeWasmTransform").finish_non_exhaustive()
+        f.debug_struct("RuntimeWasmTransform")
+            .finish_non_exhaustive()
     }
 }
-
 
 impl RuntimeWasmTransform {
     async fn new(config: WasmConfig) -> rustcdc::Result<Self> {

@@ -1,4 +1,7 @@
-use crate::{core::{Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION}, source::table_is_allowed};
+use crate::{
+    core::{Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
+    source::table_is_allowed,
+};
 
 use super::{
     parser::format_mysql_source_offset, MysqlBinlogMessage, MysqlRowChange, MysqlStreamHandle,
@@ -21,7 +24,12 @@ impl MysqlStreamHandle {
         }
     }
 
-    fn source_meta_at(&self, binlog_file: &str, binlog_pos: u32, timestamp_ms: u64) -> SourceMetadata {
+    fn source_meta_at(
+        &self,
+        binlog_file: &str,
+        binlog_pos: u32,
+        timestamp_ms: u64,
+    ) -> SourceMetadata {
         SourceMetadata {
             source_name: self.source_name.clone(),
             offset: format_mysql_source_offset(binlog_file, binlog_pos, &self.stream.gtid),

@@ -21,12 +21,12 @@ pub mod wasm;
 
 pub use crate::core::{
     fingerprint_event_stable, fingerprint_event_transient, AckToken, CdcRuntime, Error, Event,
-    EventBatch, EventIdempotencyGuard,
-    EventTracer, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
-    Offset, Operation, PostCommitSourceConfirmPolicy, Result, RuntimeAdminSnapshot, RuntimeConfig,
-    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider,
-    SecretString, SnapshotMetadata, SourceMetadata, StructuredLogger, TransactionMetadata,
-    TransformErrorPolicy, TransportConfig, ValidationError, EVENT_ENVELOPE_VERSION,
+    EventBatch, EventIdempotencyGuard, EventTracer, IdempotencyOptions, MetricsCollector,
+    NoOpEventTracer, NoOpMetricsCollector, Offset, Operation, PostCommitSourceConfirmPolicy,
+    Result, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability, RuntimeOptions,
+    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
+    SourceMetadata, StructuredLogger, TransactionMetadata, TransformErrorPolicy, TransportConfig,
+    ValidationError, EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "metrics")]
 pub use crate::core::{
