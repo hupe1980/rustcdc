@@ -209,6 +209,7 @@ impl MysqlSourceConfig {
 
     /// Build typed options for connection pooling.
     pub(super) fn build_pool_opts(&self) -> Result<mysql_async::Opts> {
+        self.transport.warn_if_insecure(self.server_flavor.source_name());
         let builder = mysql_async::OptsBuilder::default()
             .ip_or_hostname(self.host.clone())
             .tcp_port(self.port)

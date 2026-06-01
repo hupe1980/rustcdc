@@ -1,4 +1,12 @@
 //! Sensitive data masking and hashing transform.
+//!
+//! # Security Note
+//!
+//! [`MaskRule::UnsaltedSha256`] provides **obfuscation**, not pseudonymization.
+//! SHA-256 is a deterministic, fast hash: for low-cardinality fields (e.g. gender, country code)
+//! or enumerable values, the original value can be recovered via brute-force lookup.
+//! For GDPR-grade pseudonymization use [`MaskRule::HmacSha256`] (requires the `encryption`
+//! feature) or [`MaskRule::Encrypt`] instead.
 
 use ahash::AHashMap as HashMap;
 
@@ -13,17 +21,29 @@ use crate::core::{Event, Result};
 use super::Transform;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MaskRule {
-    Hash,
+    /// Deterministic SHA-256 hash (no salt).
+    ///
+    /// Provides obfuscation only — **not** GDPR-safe pseudonymization for low-cardinality fields.
+    /// Use [`MaskRule::HmacSha256`] or [`MaskRule::Encrypt`] for keyed pseudonymization.
+    UnsaltedSha256,
     Redact(String),
     Null,
     Truncate(usize),
     /// Leave the field value unchanged.
     ///
-    /// Use `Passthrough` to explicitly opt a field out of the `default_rule`.
-    /// Without `Passthrough`, any field not in `mask_rules` is processed by
-    /// `default_rule` (which defaults to [`MaskRule::Hash`]).
+    /// This is the `default_rule` for [`MaskHashConfig`], meaning fields not
+    /// explicitly listed in `mask_rules` pass through unmodified unless you
+    /// call [`MaskHashConfig::hash_all`].
     Passthrough,
+    /// HMAC-SHA256 keyed pseudonymization (requires `encryption` feature).
+    ///
+    /// Produces a deterministic, non-reversible 256-bit MAC tag using the supplied secret as the
+    /// HMAC key. Safe to use for GDPR pseudonymization when the key is kept secret — unlike
+    /// [`MaskRule::UnsaltedSha256`], a rainbow-table attack requires knowledge of the key.
+    #[cfg(feature = "encryption")]
+    HmacSha256(SecretString),
     #[cfg(feature = "encryption")]
     Encrypt(SecretString),
     #[cfg(feature = "encryption")]
@@ -33,14 +53,41 @@ pub enum MaskRule {
 #[derive(Debug, Clone)]
 pub struct MaskHashConfig {
     pub mask_rules: HashMap<String, MaskRule>,
+    /// Rule applied to any field not present in `mask_rules`.
+    ///
+    /// **Default: [`MaskRule::Passthrough`]** — unlisted fields are left unchanged.
+    /// To hash all unlisted fields use [`MaskHashConfig::hash_all`].
     pub default_rule: MaskRule,
 }
 
 impl Default for MaskHashConfig {
+    /// Creates a configuration that **leaves all fields unchanged** unless
+    /// they are explicitly listed in `mask_rules`.
+    ///
+    /// # Behaviour change
+    /// Earlier versions defaulted `default_rule` to `MaskRule::UnsaltedSha256`, which
+    /// silently hashed every field not mentioned in `mask_rules`.  This has
+    /// been changed to `MaskRule::Passthrough` to eliminate unexpected data
+    /// loss.  Use [`MaskHashConfig::hash_all`] to restore the old behaviour.
     fn default() -> Self {
         Self {
             mask_rules: HashMap::new(),
-            default_rule: MaskRule::Hash,
+            default_rule: MaskRule::Passthrough,
+        }
+    }
+}
+
+impl MaskHashConfig {
+    /// Create a configuration that **SHA-256 hashes every field** not
+    /// explicitly listed in `mask_rules`.
+    ///
+    /// This is the opt-in "hash everything" mode.  Use [`Default::default`]
+    /// when you only want to mask a specific set of fields and leave the rest
+    /// untouched.
+    pub fn hash_all() -> Self {
+        Self {
+            mask_rules: HashMap::new(),
+            default_rule: MaskRule::UnsaltedSha256,
         }
     }
 }
@@ -121,9 +168,20 @@ impl Transform for MaskHashTransform {
 fn apply_rule(value: &Value, rule: &MaskRule) -> Result<Value> {
     Ok(match rule {
         MaskRule::Passthrough => unreachable!("Passthrough is handled before apply_rule"),
-        MaskRule::Hash => {
-            let digest = Sha256::digest(value.to_string().as_bytes());
+        MaskRule::UnsaltedSha256 => {
+            let digest = Sha256::digest(value_as_hash_input(value).as_bytes());
             Value::String(format!("{digest:x}"))
+        }
+        #[cfg(feature = "encryption")]
+        MaskRule::HmacSha256(secret) => {
+            use hmac::{Hmac, Mac};
+            type HmacSha256Instance = Hmac<Sha256>;
+            let resolved = secret.resolve()?;
+            let mut mac = HmacSha256Instance::new_from_slice(resolved.as_bytes())
+                .map_err(|error| Error::TransformError(format!("HMAC key error: {error}")))?;
+            mac.update(value_as_hash_input(value).as_bytes());
+            let tag = mac.finalize().into_bytes();
+            Value::String(tag.iter().map(|b| format!("{b:02x}")).collect())
         }
         MaskRule::Redact(mask) => Value::String(mask.clone()),
         MaskRule::Null => Value::Null,
@@ -136,6 +194,17 @@ fn apply_rule(value: &Value, rule: &MaskRule) -> Result<Value> {
         #[cfg(feature = "encryption")]
         MaskRule::Decrypt(secret) => decrypt_value(value, secret)?,
     })
+}
+
+/// Encrypt/decrypt use the full JSON encoding intentionally so round-trips are
+/// lossless across all value types.  Hash/HMAC callers use this helper instead
+/// so that `UnsaltedSha256("alice")` hashes the bare string `alice`, not the
+/// JSON-quoted form `"alice"`.
+fn value_as_hash_input(value: &Value) -> std::borrow::Cow<'_, str> {
+    match value {
+        Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        other => std::borrow::Cow::Owned(other.to_string()),
+    }
 }
 
 #[cfg(feature = "encryption")]
@@ -282,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn hash_rule_is_applied() {
         let mut rules = HashMap::new();
-        rules.insert("email".into(), MaskRule::Hash);
+        rules.insert("email".into(), MaskRule::UnsaltedSha256);
         let transform = MaskHashTransform::new(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Null,
@@ -315,7 +384,7 @@ mod tests {
         rules.insert("email".into(), MaskRule::Truncate(5));
         let transform = MaskHashTransform::new(MaskHashConfig {
             mask_rules: rules,
-            default_rule: MaskRule::Hash,
+            default_rule: MaskRule::UnsaltedSha256,
         });
 
         let mut event = event();
@@ -329,7 +398,7 @@ mod tests {
         rules.insert("profile.phone".into(), MaskRule::Redact("hidden".into()));
         let transform = MaskHashTransform::new(MaskHashConfig {
             mask_rules: rules,
-            default_rule: MaskRule::Hash,
+            default_rule: MaskRule::UnsaltedSha256,
         });
 
         let mut event = event();
@@ -340,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn mask_hash_is_deterministic() {
         let mut rules = HashMap::new();
-        rules.insert("email".into(), MaskRule::Hash);
+        rules.insert("email".into(), MaskRule::UnsaltedSha256);
         let transform = MaskHashTransform::new(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Null,
@@ -464,5 +533,87 @@ mod tests {
         let error = decrypt.apply(&mut malformed_event).await.unwrap_err();
         let message = format!("{error}");
         assert!(message.contains("enc:<nonce>:<ciphertext>"));
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn hmac_sha256_is_deterministic_and_keyed() {
+        let secret = SecretString::new("my-secret-key");
+        let mut rules = HashMap::new();
+        rules.insert("email".into(), MaskRule::HmacSha256(secret.clone()));
+        let transform = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: rules,
+            default_rule: MaskRule::Null,
+        });
+
+        let mut first = event();
+        let mut second = event();
+        assert!(transform.apply(&mut first).await.unwrap());
+        assert!(transform.apply(&mut second).await.unwrap());
+        // Deterministic with same key.
+        assert_eq!(first.after, second.after);
+
+        // Tag is 64 hex chars (256-bit HMAC-SHA256).
+        let tag = first.after.unwrap()["email"].as_str().unwrap().to_string();
+        assert_eq!(tag.len(), 64);
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn hmac_sha256_different_keys_produce_different_tags() {
+        let make_transform = |key: &str| {
+            let mut rules = HashMap::new();
+            rules.insert(
+                "email".into(),
+                MaskRule::HmacSha256(SecretString::new(key)),
+            );
+            MaskHashTransform::new(MaskHashConfig {
+                mask_rules: rules,
+                default_rule: MaskRule::Null,
+            })
+        };
+
+        let t1 = make_transform("key-a");
+        let t2 = make_transform("key-b");
+
+        let mut e1 = event();
+        let mut e2 = event();
+        assert!(t1.apply(&mut e1).await.unwrap());
+        assert!(t2.apply(&mut e2).await.unwrap());
+        assert_ne!(e1.after, e2.after, "different keys must produce different tags");
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn hmac_sha256_differs_from_unsalted_sha256() {
+        let unsalted = {
+            let mut rules = HashMap::new();
+            rules.insert("email".into(), MaskRule::UnsaltedSha256);
+            MaskHashTransform::new(MaskHashConfig {
+                mask_rules: rules,
+                default_rule: MaskRule::Null,
+            })
+        };
+        let keyed = {
+            let mut rules = HashMap::new();
+            rules.insert(
+                "email".into(),
+                MaskRule::HmacSha256(SecretString::new("key")),
+            );
+            MaskHashTransform::new(MaskHashConfig {
+                mask_rules: rules,
+                default_rule: MaskRule::Null,
+            })
+        };
+
+        let mut e1 = event();
+        let mut e2 = event();
+        assert!(unsalted.apply(&mut e1).await.unwrap());
+        assert!(keyed.apply(&mut e2).await.unwrap());
+        assert_ne!(
+            e1.after, e2.after,
+            "unsalted SHA-256 and HMAC-SHA256 must produce different output for same input"
+        );
     }
 }

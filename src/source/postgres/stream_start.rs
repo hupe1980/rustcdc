@@ -61,5 +61,7 @@ pub(super) async fn start_postgres_stream(
         provider,
         connection.max_events_per_poll,
         connection.stream_poll_interval_ms,
+        connection.config.table_include_list.clone(),
+        connection.config.table_exclude_list.clone(),
     )))
 }

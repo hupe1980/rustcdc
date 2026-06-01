@@ -205,6 +205,12 @@ impl<'de> Deserialize<'de> for SecretString {
         D: Deserializer<'de>,
     {
         let inline = String::deserialize(deserializer)?;
+        tracing::warn!(
+            target: "rustcdc::security",
+            "SecretString deserialized from inline plaintext value. \
+             Prefer SecretString::from_provider or SecretString::from_callback for production \
+             deployments to avoid embedding plaintext credentials in configuration files."
+        );
         Ok(SecretString::new(inline))
     }
 }

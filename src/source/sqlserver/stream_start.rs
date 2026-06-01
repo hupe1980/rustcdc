@@ -4,7 +4,7 @@ use crate::{
 };
 
 use super::{
-    compare_lsn, lsn_bytes_to_hex, lsn_hex_to_bytes, sqlserver_resume_lsn_from_offset_bytes,
+    compare_lsn, lsn_bytes_to_hex, lsn_hex_to_bytes, query, sqlserver_resume_lsn_from_offset_bytes,
     SqlServerConnection, SqlServerStream, SqlServerStreamHandle,
 };
 
@@ -58,6 +58,13 @@ pub(super) async fn start_sqlserver_stream(
     if compare_lsn(&max_lsn, &start_lsn).is_lt() {
         max_lsn = start_lsn;
     }
+
+    // Set up the truncate-event shadow table and DDL trigger if requested.
+    if connection.config.capture_truncate_events {
+        let mut client = query::connect_client(&connection.config).await?;
+        query::ensure_truncate_capture_setup(&mut client, &connection.config.cdc_schema).await?;
+    }
+
     {
         let mut state = connection.state.lock().await;
         state.stream_lsn_start = Some(start_lsn);
@@ -81,5 +88,6 @@ pub(super) async fn start_sqlserver_stream(
         requeued_events: Vec::new(),
         max_events_per_poll: connection.max_events_per_poll,
         pending_update_afters: ahash::AHashMap::new(),
+        window_buffer: Vec::new(),
     }))
 }

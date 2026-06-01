@@ -7,6 +7,9 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet, AHasher};
 use crate::core::{Error, Event, Operation, Result};
 use serde_json::Value;
 
+/// Maximum number of received-PK strings stored for diagnostic output per table.
+const MAX_PK_SAMPLE: usize = 100;
+
 /// Result of snapshot validation.
 #[derive(Debug, Clone)]
 pub struct SnapshotValidationResult {
@@ -30,6 +33,8 @@ struct TableValidationState {
     received_pks: HashSet<u64>,
     rows_received: u64,
     expected_rows: Option<u64>,
+    /// Up to [`MAX_PK_SAMPLE`] serialised PK values seen for diagnostic reporting.
+    pk_samples: Vec<String>,
 }
 
 impl TableValidationState {
@@ -73,15 +78,22 @@ impl SnapshotValidator {
 
                 let pk_hash = hash_primary_key_values(pk, after)?;
 
+                // Build a compact JSON representation for the PK sample (kept for diagnostics).
+                let pk_label = format_pk_label(pk, after);
+
                 // Avoid cloning table name on the hot path: look up by &str first,
                 // and only allocate an owned String for the first-seen table.
                 if let Some(state) = self.tables.get_mut(event.table.as_str()) {
                     state.rows_received = state.rows_received.saturating_add(1);
-                    state.received_pks.insert(pk_hash);
+                    let is_new = state.received_pks.insert(pk_hash);
+                    if is_new && state.pk_samples.len() < MAX_PK_SAMPLE {
+                        state.pk_samples.push(pk_label);
+                    }
                 } else {
                     let state = self.tables.entry(event.table.clone()).or_default();
                     state.rows_received = state.rows_received.saturating_add(1);
                     state.received_pks.insert(pk_hash);
+                    state.pk_samples.push(pk_label);
                 }
 
                 Ok(())
@@ -123,20 +135,43 @@ impl SnapshotValidator {
 
             if received_count < expected_count {
                 let missing = expected_count - received_count;
-                for i in 0..missing {
-                    missing_tables.push(format!("{}[row_{}]", table, i));
-                }
+                // Report a single, actionable diagnostic entry per table that
+                // includes which rows WERE received so operators can identify gaps.
+                let sample_str = if state.pk_samples.is_empty() {
+                    String::from("no pk samples captured")
+                } else {
+                    let truncated = state.pk_samples.len() < received_count as usize;
+                    let joined = state.pk_samples.join(", ");
+                    if truncated {
+                        format!("{joined} … ({} total)", received_count)
+                    } else {
+                        joined
+                    }
+                };
+                missing_tables.push(format!(
+                    "{table}: expected {expected_count} rows, received {received_count} \
+                     (missing ~{missing}; received PKs: [{sample_str}])"
+                ));
             } else if received_count > expected_count {
-                for i in 0..(received_count - expected_count) {
-                    extra_tables.push(format!("{}[duplicate_{}]", table, i));
-                }
+                let extra_count = received_count - expected_count;
+                let unique_count = state.received_pks.len() as u64;
+                let dup_count = received_count.saturating_sub(unique_count);
+                extra_tables.push(format!(
+                    "{table}: received {received_count} rows but expected {expected_count} \
+                     ({extra_count} extra; {dup_count} duplicates)"
+                ));
             }
         }
 
         // Check for unexpected tables
         for (table, state) in &self.tables {
             if state.expected_rows.is_none() && state.rows_received > 0 {
-                extra_tables.push(format!("{}[unexpected_table]", table));
+                let sample = if state.pk_samples.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (PKs: [{}])", state.pk_samples.join(", "))
+                };
+                extra_tables.push(format!("{table}: unexpected table with {} rows{sample}", state.rows_received));
             }
         }
 
@@ -157,6 +192,24 @@ impl Default for SnapshotValidator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Format PK field values from the `after` payload as a compact diagnostic label
+/// (e.g., `{id=42}` or `{tenant_id=1,id=99}`).
+///
+/// Falls back to `"<unknown>"` on any error to keep the hot path infallible.
+fn format_pk_label(pk: &[String], after: &Value) -> String {
+    let Some(obj) = after.as_object() else {
+        return "<unknown>".into();
+    };
+    let parts: Vec<String> = pk
+        .iter()
+        .map(|k| {
+            let v = obj.get(k).map_or(Value::Null, |v| v.clone());
+            format!("{k}={v}")
+        })
+        .collect();
+    format!("{{{}}}", parts.join(","))
 }
 
 fn hash_primary_key_values(pk: &[String], after: &Value) -> Result<u64> {
@@ -274,7 +327,13 @@ mod tests {
         assert!(!result.is_valid);
         assert_eq!(result.rows_expected, 5);
         assert_eq!(result.rows_received, 3);
-        assert_eq!(result.missing_rows.len(), 2);
+        // New behaviour: one diagnostic entry per table (not one per missing row).
+        assert_eq!(result.missing_rows.len(), 1);
+        let diag = &result.missing_rows[0];
+        assert!(diag.contains("users"), "diagnostic must mention the table");
+        assert!(diag.contains("missing ~2"), "diagnostic must state gap count");
+        // Received PK sample must list the rows we actually got.
+        assert!(diag.contains("{id=1}") || diag.contains("id=1"), "diagnostic must include a received PK sample");
     }
 
     #[test]

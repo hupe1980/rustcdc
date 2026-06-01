@@ -68,11 +68,80 @@ where
             self.snapshot = None;
         }
 
-        if let Some(stream) = self.stream.as_mut() {
+        if self.stream.is_some() {
             let result = if let Some(policy) = self.config.options.connection_retry {
                 let mut attempt: u32 = 0;
                 let mut delay_ms = policy.initial_delay_ms;
                 loop {
+                    // If stream is None (reconnect failed on a previous attempt), try to
+                    // reconnect before polling again.
+                    if self.stream.is_none() {
+                        self.source.close().await;
+                        if let Err(connect_error) = self.source.connect().await {
+                            tracing::warn!(
+                                target: "rustcdc::core::runtime",
+                                attempt = attempt + 1,
+                                error = %connect_error,
+                                "source reconnect failed; will retry on next attempt",
+                            );
+                            metrics.record_error(&connect_error, "runtime.poll.stream_reconnect");
+                            let exhausted = policy
+                                .max_retries
+                                .map(|max| attempt >= max)
+                                .unwrap_or(false);
+                            if exhausted {
+                                return Err(crate::core::Error::SourceError(format!(
+                                    "connection retries exhausted after {} attempt(s) during reconnect; \
+                                     check source connectivity and connection retry policy configuration",
+                                    attempt + 1
+                                )));
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                            delay_ms = (delay_ms.saturating_mul(2)).min(policy.max_delay_ms);
+                            attempt = attempt.saturating_add(1);
+                            continue;
+                        }
+                        let resume_offset = self.config.checkpoint.load().await.ok().flatten();
+                        match self.source.start_stream(resume_offset.as_deref()).await {
+                            Ok(new_stream) => {
+                                self.stream = Some(new_stream);
+                                tracing::info!(
+                                    target: "rustcdc::core::runtime",
+                                    "source reconnected; stream resumed from checkpoint",
+                                );
+                            }
+                            Err(start_error) => {
+                                tracing::warn!(
+                                    target: "rustcdc::core::runtime",
+                                    attempt = attempt + 1,
+                                    error = %start_error,
+                                    "stream restart after reconnect failed; will retry",
+                                );
+                                metrics.record_error(&start_error, "runtime.poll.stream_reconnect");
+                                let exhausted = policy
+                                    .max_retries
+                                    .map(|max| attempt >= max)
+                                    .unwrap_or(false);
+                                if exhausted {
+                                    return Err(crate::core::Error::SourceError(format!(
+                                        "stream restart retries exhausted after {} attempt(s); \
+                                         check source connectivity and connection retry policy configuration",
+                                        attempt + 1
+                                    )));
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms))
+                                    .await;
+                                delay_ms = (delay_ms.saturating_mul(2)).min(policy.max_delay_ms);
+                                attempt = attempt.saturating_add(1);
+                                continue;
+                            }
+                        }
+                    }
+                    let stream = self.stream.as_mut().ok_or_else(|| {
+                        crate::core::Error::SourceError(
+                            "poll loop entered with no active stream".into(),
+                        )
+                    })?;
                     match stream
                         .next_events(self.config.options.max_poll_wait_ms)
                         .await
@@ -91,10 +160,47 @@ where
                                 attempt = attempt + 1,
                                 delay_ms,
                                 error = %error,
-                                "recoverable source error; retrying stream poll",
+                                "recoverable source error; reconnecting and retrying stream poll",
                             );
                             metrics.record_error(&error, "runtime.poll.stream_retry");
                             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+
+                            // Drop the dead stream handle and reconnect the source, resuming
+                            // from the last durable checkpoint offset to preserve at-least-once
+                            // delivery without data loss.
+                            self.stream = None;
+                            self.source.close().await;
+                            if let Err(connect_error) = self.source.connect().await {
+                                tracing::warn!(
+                                    target: "rustcdc::core::runtime",
+                                    attempt = attempt + 1,
+                                    error = %connect_error,
+                                    "source reconnect failed; will retry on next attempt",
+                                );
+                                metrics.record_error(&connect_error, "runtime.poll.stream_reconnect");
+                            } else {
+                                let resume_offset = self.config.checkpoint.load().await.ok().flatten();
+                                match self.source.start_stream(resume_offset.as_deref()).await {
+                                    Ok(new_stream) => {
+                                        self.stream = Some(new_stream);
+                                        tracing::info!(
+                                            target: "rustcdc::core::runtime",
+                                            attempt = attempt + 1,
+                                            "source reconnected; stream resumed from checkpoint",
+                                        );
+                                    }
+                                    Err(start_error) => {
+                                        tracing::warn!(
+                                            target: "rustcdc::core::runtime",
+                                            attempt = attempt + 1,
+                                            error = %start_error,
+                                            "stream restart after reconnect failed; will retry",
+                                        );
+                                        metrics.record_error(&start_error, "runtime.poll.stream_reconnect");
+                                    }
+                                }
+                            }
+
                             delay_ms = (delay_ms.saturating_mul(2)).min(policy.max_delay_ms);
                             attempt = attempt.saturating_add(1);
                         }
@@ -102,7 +208,13 @@ where
                     }
                 }
             } else {
-                stream
+                self.stream
+                    .as_mut()
+                    .ok_or_else(|| {
+                        crate::core::Error::SourceError(
+                            "poll loop entered with no active stream".into(),
+                        )
+                    })?
                     .next_events(self.config.options.max_poll_wait_ms)
                     .await
             };

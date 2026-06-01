@@ -35,7 +35,13 @@ impl Default for WasmConfig {
 
 #[derive(Debug, Clone)]
 pub enum TransformResult {
+    /// The WASM module transformed the event successfully.
     Ok(Box<Event>),
+    /// The WASM module explicitly filtered the event (returned `null`/`None`).
+    ///
+    /// This is a normal, expected outcome — not an error. The event should be silently dropped.
+    Filtered,
+    /// The WASM module returned an error message.
     Err(String),
 }
 
@@ -111,9 +117,7 @@ impl WasmRuntime {
 
     pub async fn transform(&mut self, event: &Event) -> Result<TransformResult> {
         if !self.initialized {
-            return Err(Error::StateError(
-                "WASM runtime must be initialized before transform()".to_string(),
-            ));
+            self.init().await?;
         }
 
         validate_event_within_memory_limit(event, self.config.memory_limit_mb)?;
@@ -133,9 +137,7 @@ impl WasmRuntime {
 
         match operation {
             Some(transformed) => Ok(TransformResult::Ok(Box::new(transformed))),
-            None => Ok(TransformResult::Err(
-                "WASM transform filtered event".to_string(),
-            )),
+            None => Ok(TransformResult::Filtered),
         }
     }
 

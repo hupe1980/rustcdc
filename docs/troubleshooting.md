@@ -297,7 +297,15 @@ WARNING snapshot progress stalled (no new chunks for 30s)
 
 **Diagnosis Checklist:**
 
-1. **Check replication lag:**
+1. **Check replication lag (startup note):**
+
+   > **Startup behavior:** When rustcdc first connects to a source that has been idle or
+   > when the replication slot/offset has not been read recently, the connector must replay
+   > all WAL/binlog entries since the last confirmed LSN. This causes an **expected initial
+   > replication lag spike** at startup that is *not* an error. The lag metric will trend
+   > downward as the connector catches up. Allow at least `max_poll_wait_ms × 2` seconds
+   > before treating non-zero replication lag as a problem.
+
    ```bash
    # From runtime admin metrics
    curl http://localhost:9090/metrics | grep "cdc_runtime_replication_lag_ms"

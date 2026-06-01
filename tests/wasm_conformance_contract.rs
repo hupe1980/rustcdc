@@ -53,7 +53,8 @@ async fn pass_through_fixture_is_conformant() {
     let result = runtime.transform(&input).await.expect("transform event");
     let transformed = match result {
         WasmTransformResult::Ok(event) => event,
-        WasmTransformResult::Err(message) => panic!("unexpected filter result: {message}"),
+        WasmTransformResult::Filtered => panic!("unexpected filter-out on passthrough fixture"),
+        WasmTransformResult::Err(message) => panic!("unexpected error result: {message}"),
     };
 
     assert_eq!(transformed.table, "users");
@@ -73,7 +74,7 @@ async fn filter_fixture_is_conformant() {
 
     let input = build_event("orders");
     let result = runtime.transform(&input).await.expect("transform event");
-    assert!(matches!(result, WasmTransformResult::Err(_)));
+    assert!(matches!(result, WasmTransformResult::Filtered));
 
     runtime.shutdown().await.expect("shutdown runtime");
 }

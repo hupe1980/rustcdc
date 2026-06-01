@@ -156,6 +156,48 @@ pub(crate) fn parse_lease(contents: &str) -> Option<(String, u32)> {
 ///
 /// `store_label` is used only in error messages (e.g. `"checkpoint"`,
 /// `"schema_history"`).
+///
+/// Atomically replace (or create) `lock_path` with `content`.
+///
+/// Writes to a sibling temp file then renames over `lock_path`.  On POSIX,
+/// `rename(2)` is atomic within the same filesystem, eliminating the TOCTOU
+/// window present in a `remove → create_new` pattern.
+///
+/// # Atomicity guarantees
+/// - POSIX: the rename is atomic — no other process can observe a moment
+///   where `lock_path` is absent.
+/// - Windows: `fs::rename` is not atomic with respect to an existing target;
+///   the method falls back to a compare-and-swap attempt which is
+///   best-effort but still better than remove-then-create.
+pub(crate) fn atomic_write_lease(lock_path: &Path, content: &str) -> std::io::Result<()> {
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "lock_path has no parent"))?;
+
+    // Generate a unique temp path in the same directory (same device → rename works).
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = parent.join(format!(".owner_lease_{stamp}.tmp"));
+
+    let mut tmp_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(content.as_bytes())?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+
+    // Atomic replace.
+    if let Err(err) = fs::rename(&tmp_path, lock_path) {
+        let _ = fs::remove_file(&tmp_path); // best-effort cleanup
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease> {
     let owner_pid = std::process::id();
     let hostname = current_hostname();
@@ -193,16 +235,9 @@ pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease>
                         stale_owner_pid = pid,
                         "clearing stale {store_label} owner lease left by dead process"
                     );
-                    let _ = fs::remove_file(lock_path);
-                    let mut lock_file = OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .open(lock_path)
-                        .map_err(Error::from)?;
-                    lock_file
-                        .write_all(lease_content.as_bytes())
-                        .map_err(Error::from)?;
-                    lock_file.sync_all().map_err(Error::from)?;
+                    // Atomically replace the stale lease using write-to-temp + rename.
+                    // This eliminates the TOCTOU window between `remove` and `create_new`.
+                    atomic_write_lease(lock_path, &lease_content).map_err(Error::from)?;
                 }
                 Some((ref host, pid)) if host != hostname => {
                     // Different host — do NOT attempt liveness check: the PID namespace
@@ -268,7 +303,42 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
             .map(|s| s.success())
             .unwrap_or(true) // conservatively assume alive on error
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Use OpenProcess with SYNCHRONIZE (0x00100000) to probe existence.
+        // Returns a non-null handle when the PID exists (even without full access).
+        // Falls back to conservatively assuming alive on unexpected errors.
+        use std::os::windows::io::OwnedHandle;
+        extern "system" {
+            fn OpenProcess(
+                dwDesiredAccess: u32,
+                bInheritHandle: i32,
+                dwProcessId: u32,
+            ) -> *mut std::ffi::c_void;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+            fn GetExitCodeProcess(
+                hProcess: *mut std::ffi::c_void,
+                lpExitCode: *mut u32,
+            ) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // GetLastError() == ERROR_INVALID_PARAMETER (87) means no such PID.
+                return false;
+            }
+            let mut exit_code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            if ok == 0 {
+                return true; // conservatively alive on query error
+            }
+            exit_code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true

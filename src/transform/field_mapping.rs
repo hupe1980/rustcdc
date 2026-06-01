@@ -112,10 +112,11 @@ impl FieldMappingTransform {
     }
 
     fn apply_payload(&self, payload: &mut Option<Value>) -> Result<()> {
-        if payload.is_none() && !self.set_rules.is_empty() {
-            *payload = Some(Value::Object(Map::new()));
-        }
-
+        // Do NOT create a synthetic payload for None values.
+        // Insert.before, Delete.after, and all Truncate payloads are intentionally
+        // None per the canonical event envelope contract.  Creating an object here
+        // would produce phantom payloads that fail event.validate() downstream.
+        // set_literal rules are only applied to payloads that already exist.
         let Some(value) = payload else {
             return Ok(());
         };
@@ -418,5 +419,71 @@ mod tests {
         });
 
         assert!(error.is_err());
+    }
+
+    // ── Truncate / no-payload events ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn truncate_event_passes_through_without_phantom_payloads() {
+        // set_literals are configured but the event has no before/after.
+        // The transform must NOT create phantom `Some({...})` payloads.
+        let transform = FieldMappingTransform::new(FieldMappingConfig {
+            set_literals: vec![("meta.source".into(), json!("mysql"))],
+            ..FieldMappingConfig::default()
+        })
+        .unwrap();
+
+        let mut e = Event {
+            before: None,
+            after: None,
+            op: Operation::Truncate,
+            source: SourceMetadata {
+                source_name: "test".into(),
+                offset: "1".into(),
+                timestamp: 1,
+            },
+            ts: 1,
+            schema: Some("public".into()),
+            table: "users".into(),
+            primary_key: None,
+            snapshot: None,
+            transaction: None,
+            envelope_version: EVENT_ENVELOPE_VERSION,
+        };
+        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(e.before.is_none(), "before must remain None for Truncate");
+        assert!(e.after.is_none(), "after must remain None for Truncate");
+    }
+
+    #[tokio::test]
+    async fn delete_event_after_remains_none_with_set_literals() {
+        // Delete events have after = None; set_literal must not create a phantom after.
+        let transform = FieldMappingTransform::new(FieldMappingConfig {
+            set_literals: vec![("_source".into(), json!("cdc"))],
+            ..FieldMappingConfig::default()
+        })
+        .unwrap();
+
+        let mut e = Event {
+            before: Some(json!({"id": 5})),
+            after: None,
+            op: Operation::Delete,
+            source: SourceMetadata {
+                source_name: "test".into(),
+                offset: "2".into(),
+                timestamp: 2,
+            },
+            ts: 2,
+            schema: None,
+            table: "orders".into(),
+            primary_key: Some(vec!["id".into()]),
+            snapshot: None,
+            transaction: None,
+            envelope_version: EVENT_ENVELOPE_VERSION,
+        };
+        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(e.after.is_none(), "after must remain None for Delete");
+        // set_literal IS applied to the before payload (it's present).
+        assert_eq!(e.before.as_ref().unwrap()["_source"], "cdc");
     }
 }

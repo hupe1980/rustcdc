@@ -57,7 +57,10 @@ impl Transform for WasmTransform {
                 *event = *transformed;
                 Ok(true)
             }
-            TransformResult::Err(_reason) => Ok(false),
+            TransformResult::Filtered => Ok(false),
+            TransformResult::Err(reason) => Err(crate::core::Error::SourceError(format!(
+                "WASM transform returned error: {reason}"
+            ))),
         }
     }
 

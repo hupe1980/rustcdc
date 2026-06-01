@@ -123,6 +123,27 @@ cargo test data_loss_detection
 3. Use fault injection to validate observability signals, not only functional outcomes.
 4. Treat data-loss and commit-barrier regressions as release-blocking defects.
 
+## Feature Gate: `test-harnesses`
+
+The `test-harnesses` feature exposes `rustcdc::testkit`, `CrashSimulationValidator`,
+`DataLossValidator`, and related types that are only safe to use in test and
+validation environments.
+
+A compile-time guard prevents `test-harnesses` from being active in standard
+release builds:
+
+```rust
+#[cfg(all(feature = "test-harnesses", not(debug_assertions)))]
+compile_error!("...");
+```
+
+> **Edge case:** This guard relies on the `debug_assertions` cfg flag, which is
+> `false` in standard `--release` builds.  A custom Cargo profile that sets
+> `debug-assertions = true` in release mode (for example, a `[profile.release-dbg]`
+> profile) will bypass the guard and allow `test-harnesses` to be compiled into a
+> release artifact.  If your project uses custom profiles, audit them to ensure
+> `debug-assertions` is `false` before shipping.
+
 ## Related Documentation
 
 - [API Guide](api.md)

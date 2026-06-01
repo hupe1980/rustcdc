@@ -316,7 +316,7 @@ async fn run_sqlserver_process_kill_replay_scenario(
         );
         runtime.add_transform(Box::new(MaskHashTransform::new(MaskHashConfig {
             mask_rules,
-            default_rule: MaskRule::Hash,
+            default_rule: MaskRule::UnsaltedSha256,
         })));
     }
 

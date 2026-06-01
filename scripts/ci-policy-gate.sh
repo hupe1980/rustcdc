@@ -173,6 +173,39 @@ run_async_trait_policy_check() {
   echo "Async-trait policy check passed."
 }
 
+run_cargo_profile_safety_check() {
+  # Reject any Cargo profile section that enables debug-assertions on a release-variant profile.
+  # Release-variant profiles are any profile whose name starts with "release" or contains the
+  # word "release", as well as any profile that explicitly inherits from the built-in "release".
+  local matches
+  matches="$(rg -n 'debug-assertions\s*=\s*true' Cargo.toml 2>/dev/null || true)"
+
+  if [[ -z "$matches" ]]; then
+    echo "Cargo profile safety check passed (no debug-assertions = true found)."
+    return 0
+  fi
+
+  # If matches exist, check whether they appear under a release-variant profile table.
+  # Extract the section context by scanning Cargo.toml for [profile.*release*] or
+  # inherits = "release" sections that also contain debug-assertions = true.
+  local profile_contexts
+  profile_contexts="$(awk '
+    /^\[profile\./ { current_section = $0 }
+    /debug-assertions\s*=\s*true/ {
+      if (current_section ~ /release/) print current_section ": " $0
+    }
+  ' Cargo.toml || true)"
+
+  if [[ -n "$profile_contexts" ]]; then
+    echo "FAIL: debug-assertions = true found in a release-variant Cargo profile:" >&2
+    echo "$profile_contexts" >&2
+    echo "Release builds must not enable debug-assertions. Remove or gate this setting." >&2
+    exit 1
+  fi
+
+  echo "Cargo profile safety check passed."
+}
+
 require_match() {
   local pattern="$1"
   local file="$2"
@@ -244,8 +277,9 @@ run_workflow_drift_check() {
   require_match "bash scripts/run_full_integration_matrix_evidence.sh" "$CI_WORKFLOW" "full matrix evidence run"
   require_match "BENCHMARK_ENFORCE_RELEASE_POLICY: \"1\"" "$CI_WORKFLOW" "benchmark policy enforcement"
   require_match "  release-evidence:" "$CI_WORKFLOW" "release evidence job"
+  require_match "  release-evidence-verify:" "$CI_WORKFLOW" "release evidence verification job"
   require_match "  publish:" "$CI_WORKFLOW" "publish job"
-  require_match "needs: release-evidence" "$CI_WORKFLOW" "publish dependency on release evidence"
+  require_match "needs: release-evidence-verify" "$CI_WORKFLOW" "publish dependency on release evidence verification"
 
   require_match "mysql_snapshot_integration" "$CI_WORKFLOW" "mysql depth suite"
   require_match "mariadb_e2e_integration" "$CI_WORKFLOW" "mariadb depth suite"
@@ -279,6 +313,7 @@ run_markdown_link_check
 run_schema_contract_check
 run_deprecated_usage_check
 run_async_trait_policy_check
+run_cargo_profile_safety_check
 run_workflow_drift_check
 
 echo "Policy gate passed."

@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.88"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -25,7 +25,9 @@ default = ["postgres", "tls"]
 postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
 # Enable MySQL-specific source implementations.
 mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "tls"]
-# Enable MariaDB CDC support (thin facade over the MySQL connector).
+# Enable MariaDB CDC support. Uses the MySQL binlog connector under the hood;
+# MariaDB-specific protocol differences (GTID format, system variable names,
+# capability flags) are handled transparently by the shared connector code.
 mariadb = ["mysql"]
 # Enable SQL Server-specific source implementations.
 sqlserver = ["dep:tiberius", "dep:tokio-util", "tls"]

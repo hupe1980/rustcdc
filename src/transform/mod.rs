@@ -14,7 +14,8 @@ pub mod unwrap;
 
 pub use field_mapping::{FieldMappingConfig, FieldMappingTransform};
 pub use filter_projection::{
-    FilterField, FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule,
+    FilterField, FilterMode, FilterOperator, FilterProjectionConfig, FilterProjectionTransform,
+    FilterRule,
 };
 pub use mask_hash::{MaskHashConfig, MaskHashTransform, MaskRule};
 #[cfg(feature = "outbox")]
@@ -23,7 +24,7 @@ pub use route::{RouteConfig, RouteTransform};
 pub use unwrap::{UnwrapConfig, UnwrapTransform};
 
 #[async_trait]
-pub trait Transform: Send + Sync {
+pub trait Transform: Send + Sync + std::fmt::Debug {
     /// Apply transform in-place; return true to keep event, false to drop it.
     async fn apply(&self, event: &mut Event) -> Result<bool>;
     fn name(&self) -> &str;
@@ -34,9 +35,42 @@ pub struct TransformPipeline {
     transforms: Vec<Box<dyn Transform>>,
 }
 
+impl std::fmt::Debug for TransformPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.transforms.iter().map(|t| t.name()).collect();
+        f.debug_struct("TransformPipeline")
+            .field("transforms", &names)
+            .finish()
+    }
+}
+
 impl TransformPipeline {
+    /// Add a transform to the end of the pipeline (mutating form).
     pub fn add_transform(&mut self, transform: Box<dyn Transform>) {
         self.transforms.push(transform);
+    }
+
+    /// Add a transform to the end of the pipeline (fluent builder form).
+    ///
+    /// ```ignore
+    /// let pipeline = TransformPipeline::default()
+    ///     .with(MaskHashTransform::new(config))
+    ///     .with(RouteTransform::new(route_config).unwrap());
+    /// ```
+    #[must_use]
+    pub fn with<T: Transform + 'static>(mut self, transform: T) -> Self {
+        self.transforms.push(Box::new(transform));
+        self
+    }
+
+    /// Number of transforms in the pipeline.
+    pub fn len(&self) -> usize {
+        self.transforms.len()
+    }
+
+    /// Returns `true` when the pipeline contains no transforms.
+    pub fn is_empty(&self) -> bool {
+        self.transforms.is_empty()
     }
 
     pub async fn apply(&self, mut event: Event) -> Result<Option<Event>> {
@@ -62,10 +96,13 @@ mod tests {
 
     use super::{Transform, TransformPipeline};
 
+    #[derive(Debug)]
     struct AppendSuffix;
 
+    #[derive(Debug)]
     struct DropEvent;
 
+    #[derive(Debug)]
     struct FailTransform;
 
     #[async_trait]

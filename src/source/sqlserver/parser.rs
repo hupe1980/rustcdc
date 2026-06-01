@@ -29,6 +29,12 @@ pub(super) fn lsn_hex_to_bytes(lsn_hex: &str) -> Result<[u8; 10]> {
     Ok(bytes)
 }
 
+/// Returns `None` on parse failure; use in sort comparators where `Result`
+/// propagation is not possible.
+pub(super) fn lsn_hex_to_bytes_opt(lsn_hex: &str) -> Option<[u8; 10]> {
+    lsn_hex_to_bytes(lsn_hex).ok()
+}
+
 pub(super) fn lsn_bytes_to_hex(lsn: &[u8; 10]) -> String {
     let mut out = String::from("0x");
     for byte in lsn {

@@ -36,7 +36,7 @@ use crate::{
 use super::runtime_offsets::parse_mysql_stream_offset;
 #[cfg(any(feature = "postgres", test))]
 use super::runtime_offsets::parse_postgres_lsn;
-use super::runtime_utils::{format_capability_metric, normalize_source_timestamp_ms, now_millis};
+use super::runtime_utils::{normalize_source_timestamp_ms, now_millis};
 use super::{
     Error, Event, EventIdempotencyGuard, EventTracer, MetricsCollector, NoOpEventTracer,
     NoOpMetricsCollector, Offset, Result,
@@ -113,7 +113,16 @@ pub struct RuntimeOptions {
     /// [`Error`](crate::core::Error) that caused the skip. Use this to route discarded
     /// events to a dead-letter queue, external error store, or alerting system.
     ///
-    /// The callback is synchronous and must not block or panic.
+    /// # Hard constraints
+    ///
+    /// **The callback is invoked synchronously inside the runtime poll loop.**
+    /// It **must not block** (no `std::thread::sleep`, no synchronous I/O, no
+    /// blocking locks) and **must not panic**. A blocking handler will stall
+    /// the entire CDC pipeline for as long as the call takes.
+    ///
+    /// If you need to write to a slow external system, enqueue the event into
+    /// an internal channel or `VecDeque` inside the callback and drain it from
+    /// a separate thread or async task.
     pub dead_letter_handler:
         Option<std::sync::Arc<dyn Fn(Event, crate::core::Error) + Send + Sync>>,
 }
@@ -287,6 +296,29 @@ impl Default for ConnectionRetryPolicy {
     }
 }
 
+impl ConnectionRetryPolicy {
+    /// Validate the policy fields, returning an error for obviously wrong configurations.
+    ///
+    /// Constraints:
+    /// - `initial_delay_ms` must be greater than zero.
+    /// - `max_delay_ms` must be ≥ `initial_delay_ms` (the backoff cap cannot be
+    ///   lower than the starting delay or the cap is meaningless).
+    pub fn validate(self) -> Result<Self> {
+        if self.initial_delay_ms == 0 {
+            return Err(Error::ConfigError(
+                "connection_retry.initial_delay_ms must be greater than zero".into(),
+            ));
+        }
+        if self.max_delay_ms < self.initial_delay_ms {
+            return Err(Error::ConfigError(format!(
+                "connection_retry.max_delay_ms ({}) must be ≥ initial_delay_ms ({})",
+                self.max_delay_ms, self.initial_delay_ms
+            )));
+        }
+        Ok(self)
+    }
+}
+
 /// Source configuration for runtime construction.
 #[derive(Clone)]
 pub enum RuntimeSourceConfig {
@@ -351,22 +383,26 @@ impl RuntimeSourceConfig {
     }
 
     /// Capabilities advertised by the selected source connector.
-    pub const fn capabilities(&self) -> ConnectorCapabilities {
+    pub fn capabilities(&self) -> ConnectorCapabilities {
         match self {
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => Self::postgres_connector_capabilities(),
             #[cfg(feature = "mysql")]
-            Self::Mysql(_) => Self::full_connector_capabilities(),
+            Self::Mysql(_) => Self::mysql_connector_capabilities(),
             #[cfg(feature = "mariadb")]
-            Self::MariaDb(_) => Self::full_connector_capabilities(),
+            Self::MariaDb(_) => Self::mysql_connector_capabilities(),
             #[cfg(feature = "sqlserver")]
-            Self::SqlServer(_) => Self::full_connector_capabilities(),
+            Self::SqlServer(config) => Self::sqlserver_connector_capabilities(config.capture_truncate_events),
             Self::Disabled => ConnectorCapabilities::none(),
         }
     }
 
-    #[cfg(any(feature = "mysql", feature = "sqlserver"))]
-    const fn full_connector_capabilities() -> ConnectorCapabilities {
+    /// Capabilities for the MySQL and MariaDB connectors.
+    ///
+    /// Both connectors capture `TRUNCATE TABLE` from the binlog `QueryEvent`
+    /// and emit `Operation::Truncate` events, so `truncate` is always `true`.
+    #[cfg(any(feature = "mysql", feature = "mariadb"))]
+    const fn mysql_connector_capabilities() -> ConnectorCapabilities {
         ConnectorCapabilities {
             snapshot: true,
             snapshot_checkpoint_resume: true,
@@ -375,7 +411,28 @@ impl RuntimeSourceConfig {
             heartbeat: true,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
-            truncate: false,
+            truncate: true,
+            incremental_snapshot: true,
+        }
+    }
+
+    /// Capabilities for the SQL Server connector.
+    ///
+    /// `truncate` reflects `SqlServerSourceConfig::capture_truncate_events`:
+    /// SQL Server CDC change tables do not record `TRUNCATE TABLE` natively;
+    /// truncate capture requires an opt-in DDL trigger
+    /// (`capture_truncate_events: true`).
+    #[cfg(feature = "sqlserver")]
+    const fn sqlserver_connector_capabilities(capture_truncate_events: bool) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            snapshot: true,
+            snapshot_checkpoint_resume: true,
+            handoff: true,
+            ddl_capture: true,
+            heartbeat: true,
+            tls: cfg!(feature = "tls"),
+            schema_introspection: true,
+            truncate: capture_truncate_events,
             incremental_snapshot: true,
         }
     }
@@ -398,11 +455,23 @@ impl RuntimeSourceConfig {
 
 /// Runtime lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeState {
     Idle,
     Running,
     Stopping,
     Stopped,
+}
+
+impl std::fmt::Display for RuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+        })
+    }
 }
 
 /// Embeddable admin snapshot for runtime introspection.
@@ -563,6 +632,7 @@ struct PendingDelivery {
 /// config.with_transform_error_policy(TransformErrorPolicy::Skip)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransformErrorPolicy {
     Halt,
     Skip,
@@ -578,8 +648,15 @@ impl TransformErrorPolicy {
     }
 }
 
+impl std::fmt::Display for TransformErrorPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.description())
+    }
+}
+
 /// Behavior when source confirmation fails after checkpoint durability is already guaranteed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PostCommitSourceConfirmPolicy {
     /// Keep ack successful once checkpoint commit is durable and emit warning telemetry.
     Continue,
@@ -594,6 +671,12 @@ impl PostCommitSourceConfirmPolicy {
             Self::Continue => "keep ack successful and emit warning",
             Self::FailFast => "return error after durable commit on confirmation failure",
         }
+    }
+}
+
+impl std::fmt::Display for PostCommitSourceConfirmPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.description())
     }
 }
 
@@ -972,6 +1055,12 @@ where
             ));
         }
 
+        if !config.snapshot_tables.is_empty() && config.incremental_snapshot.is_some() {
+            return Err(Error::ConfigError(
+                "snapshot_tables and incremental_snapshot are mutually exclusive — use one or the other, not both".into(),
+            ));
+        }
+
         let capabilities = config.source.capabilities();
         // Skip capability checks for Disabled sources (used in tests with mock sources).
         if !matches!(config.source, RuntimeSourceConfig::Disabled) {
@@ -985,6 +1074,12 @@ where
                     "configured source does not support snapshot-to-stream handoff".into(),
                 ));
             }
+        }
+
+        // Validate the retry policy early so callers get a clear error at construction
+        // time rather than a subtle misconfiguration silently surviving into the poll loop.
+        if let Some(retry) = config.options.connection_retry {
+            retry.validate()?;
         }
 
         let source = Self::build_source(&config)?;
@@ -1096,8 +1191,8 @@ mod tests {
     use crate::checkpoint::FileCheckpoint;
 
     use super::{
-        CdcRuntime, IdempotencyOptions, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
-        RuntimeState, TransformErrorPolicy,
+        CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, RuntimeConfig, RuntimeObservability,
+        RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
     };
 
     #[cfg(feature = "postgres")]
@@ -1333,6 +1428,7 @@ mod tests {
         assert!(caps.ddl_capture);
         assert!(caps.heartbeat);
         assert!(caps.schema_introspection);
+        assert!(caps.truncate, "MySQL connector must report truncate support (binlog QueryEvent)");
     }
 
     #[cfg(feature = "sqlserver")]
@@ -1347,6 +1443,24 @@ mod tests {
         assert!(caps.ddl_capture);
         assert!(caps.heartbeat);
         assert!(caps.schema_introspection);
+        assert!(
+            !caps.truncate,
+            "SQL Server connector reports truncate false by default (requires capture_truncate_events: true)"
+        );
+    }
+
+    #[cfg(feature = "sqlserver")]
+    #[test]
+    fn sqlserver_runtime_source_capabilities_truncate_enabled_when_opt_in() {
+        let config = crate::source::SqlServerSourceConfig {
+            capture_truncate_events: true,
+            ..Default::default()
+        };
+        let caps = RuntimeSourceConfig::SqlServer(config).capabilities();
+        assert!(
+            caps.truncate,
+            "SQL Server connector must report truncate when capture_truncate_events is enabled"
+        );
     }
 
     #[test]
@@ -1594,7 +1708,9 @@ mod tests {
         assert!(matches!(error, crate::core::Error::CheckpointError(_)));
     }
 
+    #[derive(Debug)]
     struct FailTransform;
+    #[derive(Debug)]
     struct NonDeterministicTransform;
 
     #[async_trait]
@@ -2192,7 +2308,7 @@ mod tests {
         );
         runtime.add_transform(Box::new(MaskHashTransform::new(MaskHashConfig {
             mask_rules: rules,
-            default_rule: MaskRule::Hash,
+            default_rule: MaskRule::UnsaltedSha256,
         })));
 
         runtime.start().await.unwrap();
@@ -3362,5 +3478,241 @@ mod tests {
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.events()[0].op, Operation::SchemaChange);
+    }
+
+    // ─── Reconnect recovery test ─────────────────────────────────────────────
+
+    /// Verifies that a recoverable `SourceError` from a live stream triggers
+    /// the reconnect-and-resume path: the runtime must close the old stream,
+    /// call `start_stream` again, and continue delivering events — without
+    /// surfacing the transient error to the caller.
+    #[tokio::test]
+    async fn recoverable_stream_error_triggers_reconnect_and_resumes_delivery() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicU32, Ordering as AOrdering};
+
+        // ── Mini StreamHandle ─────────────────────────────────────────────
+        // Returns queued event batches, then optionally emits one recoverable
+        // error, then returns empty batches indefinitely.
+        struct FailOnceStream {
+            events: VecDeque<Vec<Event>>,
+            error_pending: bool,
+        }
+
+        #[async_trait]
+        impl crate::source::StreamHandle for FailOnceStream {
+            async fn next_events(&mut self, _timeout_ms: u64) -> crate::core::Result<Vec<Event>> {
+                if let Some(batch) = self.events.pop_front() {
+                    return Ok(batch);
+                }
+                if self.error_pending {
+                    self.error_pending = false;
+                    return Err(crate::core::Error::SourceError(
+                        "simulated TCP reset by peer".into(),
+                    ));
+                }
+                Ok(vec![])
+            }
+
+            async fn save_position(
+                &self,
+                _checkpoint: &mut dyn crate::checkpoint::Checkpoint,
+            ) -> crate::core::Result<()> {
+                Ok(())
+            }
+
+            async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+                Ok(())
+            }
+        }
+
+        // ── Mini Source ───────────────────────────────────────────────────
+        // Counts `start_stream` invocations so the test can verify reconnect
+        // happened. First stream: 1 event then a recoverable error.
+        // Second stream (after reconnect): 2 events.
+        struct ReconnectableSource {
+            call_count: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl crate::source::Source for ReconnectableSource {
+            async fn start_snapshot(
+                &mut self,
+                _tables: &[&str],
+            ) -> crate::core::Result<Box<dyn crate::source::SnapshotHandle>> {
+                unreachable!("reconnect test does not use snapshot")
+            }
+
+            async fn start_stream(
+                &mut self,
+                _resume_from: Option<&dyn crate::core::Offset>,
+            ) -> crate::core::Result<Box<dyn crate::source::StreamHandle>> {
+                let call = self.call_count.fetch_add(1, AOrdering::SeqCst);
+                let (events, error_pending) = if call == 0 {
+                    // First stream: yield one event, then fail with recoverable error.
+                    (vec![vec![event()]], true)
+                } else {
+                    // Reconnected stream: yield two events normally.
+                    (vec![vec![event(), event()]], false)
+                };
+                Ok(Box::new(FailOnceStream {
+                    events: events.into_iter().collect(),
+                    error_pending,
+                }))
+            }
+
+            async fn perform_handoff(
+                &mut self,
+                _snapshot: &mut dyn crate::source::SnapshotHandle,
+                _stream: &mut dyn crate::source::StreamHandle,
+            ) -> crate::core::Result<crate::source::HandoffResult> {
+                unreachable!("no handoff in reconnect test")
+            }
+
+            fn source_type(&self) -> &str {
+                "mock"
+            }
+        }
+
+        // ── Setup ─────────────────────────────────────────────────────────
+        let call_count = Arc::new(AtomicU32::new(0));
+        let source = ReconnectableSource {
+            call_count: Arc::clone(&call_count),
+        };
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = crate::schema_history::InMemorySchemaHistory::default();
+
+        let mut config = RuntimeConfig::new(
+            RuntimeSourceConfig::Disabled,
+            checkpoint,
+            schema_history,
+        )
+        .with_idempotency_disabled();
+        // Use aggressive retry timing so the test completes quickly.
+        config.options.connection_retry = Some(ConnectionRetryPolicy {
+            max_retries: Some(3),
+            initial_delay_ms: 1,
+            max_delay_ms: 10,
+        });
+
+        let mut runtime: CdcRuntime<InMemoryCheckpoint, InMemorySchemaHistory> =
+            CdcRuntime::new(config).unwrap();
+        runtime.inject_mock_source(Box::new(source));
+
+        // Pre-populate a checkpoint offset so the runtime enters stream mode
+        // directly rather than starting a full snapshot phase.
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new("mock", b"stream-offset-0".to_vec()),
+                0,
+            )
+            .await
+            .unwrap();
+
+        runtime.start().await.unwrap();
+
+        // ── First poll: delivers 1 event from the first stream ────────────
+        let batch1 = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(batch1.len(), 1, "first batch should have 1 event");
+        runtime
+            .commit_ack(batch1.ack_token().unwrap())
+            .await
+            .unwrap();
+
+        // ── Second poll: first stream raises a recoverable error,  ────────
+        //    the runtime reconnects, and the second stream delivers 2 events.
+        let batch2 = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(
+            batch2.len(),
+            2,
+            "reconnected stream should deliver the remaining 2 events"
+        );
+
+        // ── Invariant: start_stream must have been called exactly twice ───
+        assert_eq!(
+            call_count.load(AOrdering::SeqCst),
+            2,
+            "source.start_stream must be invoked once on initial connect \
+             and once more after the recoverable error triggers reconnect"
+        );
+
+        runtime.force_stop().await.unwrap();
+    }
+
+    // ─── ConnectionRetryPolicy validation ────────────────────────────────
+
+    #[test]
+    fn connection_retry_policy_default_is_valid() {
+        assert!(ConnectionRetryPolicy::default().validate().is_ok());
+    }
+
+    #[test]
+    fn connection_retry_policy_rejects_zero_initial_delay() {
+        let policy = ConnectionRetryPolicy {
+            initial_delay_ms: 0,
+            max_delay_ms: 10_000,
+            max_retries: Some(5),
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(
+            matches!(err, crate::core::Error::ConfigError(_)),
+            "expected ConfigError, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("initial_delay_ms"),
+            "error message should mention initial_delay_ms"
+        );
+    }
+
+    #[test]
+    fn connection_retry_policy_rejects_max_delay_below_initial() {
+        let policy = ConnectionRetryPolicy {
+            initial_delay_ms: 500,
+            max_delay_ms: 100, // less than initial
+            max_retries: Some(3),
+        };
+        let err = policy.validate().unwrap_err();
+        assert!(
+            matches!(err, crate::core::Error::ConfigError(_)),
+            "expected ConfigError, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("max_delay_ms"),
+            "error message should mention max_delay_ms"
+        );
+    }
+
+    #[test]
+    fn connection_retry_policy_allows_equal_initial_and_max_delay() {
+        // initial == max is valid (no exponential growth, fixed delay)
+        let policy = ConnectionRetryPolicy {
+            initial_delay_ms: 300,
+            max_delay_ms: 300,
+            max_retries: None,
+        };
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_new_rejects_invalid_connection_retry_policy() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        config.options.connection_retry = Some(ConnectionRetryPolicy {
+            initial_delay_ms: 0,
+            max_delay_ms: 10_000,
+            max_retries: Some(3),
+        });
+        let err = CdcRuntime::new(config)
+            .err()
+            .expect("CdcRuntime::new should reject an invalid retry policy");
+        assert!(
+            matches!(err, crate::core::Error::ConfigError(_)),
+            "expected ConfigError, got {err:?}"
+        );
     }
 }

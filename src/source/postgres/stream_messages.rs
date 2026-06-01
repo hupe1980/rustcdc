@@ -2,7 +2,7 @@ use crate::{
     core::{Event, Operation, Result, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
     ddl_capture::CapturedDdl,
     schema_history::{ColumnDef, TableSchema},
-    source::helpers::now_millis,
+    source::{helpers::now_millis, table_is_allowed},
 };
 
 use super::decoder::{
@@ -282,23 +282,59 @@ impl PostgresStreamHandle {
                     }
                 }
                 PgOutputMessage::Insert(insert) => {
-                    if let Some(event) = self.build_insert_event(&insert, item.lsn) {
-                        self.partial_tx_events.push(event);
+                    let schema = self.relation_schema(insert.relation_oid);
+                    let table = self.relation_table_name(insert.relation_oid);
+                    if table_is_allowed(
+                        schema.as_deref(),
+                        &table,
+                        &self.table_include_list,
+                        &self.table_exclude_list,
+                    ) {
+                        if let Some(event) = self.build_insert_event(&insert, item.lsn) {
+                            self.partial_tx_events.push(event);
+                        }
                     }
                 }
                 PgOutputMessage::Update(update) => {
-                    if let Some(event) = self.build_update_event(&update, item.lsn) {
-                        self.partial_tx_events.push(event);
+                    let schema = self.relation_schema(update.relation_oid);
+                    let table = self.relation_table_name(update.relation_oid);
+                    if table_is_allowed(
+                        schema.as_deref(),
+                        &table,
+                        &self.table_include_list,
+                        &self.table_exclude_list,
+                    ) {
+                        if let Some(event) = self.build_update_event(&update, item.lsn) {
+                            self.partial_tx_events.push(event);
+                        }
                     }
                 }
                 PgOutputMessage::Delete(delete) => {
-                    if let Some(event) = self.build_delete_event(&delete, item.lsn) {
-                        self.partial_tx_events.push(event);
+                    let schema = self.relation_schema(delete.relation_oid);
+                    let table = self.relation_table_name(delete.relation_oid);
+                    if table_is_allowed(
+                        schema.as_deref(),
+                        &table,
+                        &self.table_include_list,
+                        &self.table_exclude_list,
+                    ) {
+                        if let Some(event) = self.build_delete_event(&delete, item.lsn) {
+                            self.partial_tx_events.push(event);
+                        }
                     }
                 }
                 PgOutputMessage::Truncate(truncate) => {
                     let events = self.build_truncate_events(&truncate, item.lsn);
-                    self.partial_tx_events.extend(events);
+                    for event in events {
+                        if table_is_allowed(
+                            event.schema.as_deref(),
+                            &event.table,
+                            &self.table_include_list,
+                            &self.table_exclude_list,
+                        ) {
+                            self.partial_tx_events.push(event);
+                        }
+                    }
                 }
                 PgOutputMessage::Unknown(_) => {}
             }

@@ -40,7 +40,6 @@ pub enum DatabaseAuthMode {
 /// * When both lists are empty, all events pass through.
 ///
 /// Table names are matched case-insensitively against `"schema.table"` tokens.
-#[cfg(test)]
 pub(crate) fn table_is_allowed(
     schema: Option<&str>,
     table: &str,
@@ -63,7 +62,6 @@ pub(crate) fn table_is_allowed(
     !matches(exclude_list)
 }
 
-#[cfg(test)]
 fn table_entry_matches(entry: &str, schema: Option<&str>, table: &str) -> bool {
     let token = entry.trim();
     if token.is_empty() {
@@ -148,6 +146,22 @@ pub struct ConnectorCapabilities {
     pub schema_introspection: bool,
     /// Whether the connector surfaces `TRUNCATE` operations as
     /// [`crate::core::Operation::Truncate`] events.
+    ///
+    /// **PostgreSQL, MySQL, and MariaDB** emit `Truncate` events.
+    ///
+    /// - PostgreSQL: captured via the `pgoutput` logical replication protocol.
+    /// - MySQL/MariaDB: captured from the `TRUNCATE TABLE` `QueryEvent` in the
+    ///   binlog (logged as a DDL statement, not a rows event). Respects
+    ///   `table_include_list` / `table_exclude_list` filters.
+    ///
+    /// **SQL Server CDC** (`cdc.fn_cdc_get_all_changes_*`) does **not** record
+    /// `TRUNCATE TABLE` in the change tables because TRUNCATE bypasses row-level
+    /// logging.  When [`SqlServerSourceConfig::capture_truncate_events`] is
+    /// `true`, rustcdc installs a database-level DDL trigger that records each
+    /// `TRUNCATE TABLE` in a shadow table and emits an `Operation::Truncate`
+    /// event positioned after all DML changes at the LSN captured by the trigger.
+    /// The SQL Server connector reports `truncate: true` only when this option is
+    /// enabled.
     pub truncate: bool,
     /// Whether the connector supports non-blocking incremental snapshot via the
     /// DBLog watermark pattern (`PostgresConnection::start_incremental_snapshot`).

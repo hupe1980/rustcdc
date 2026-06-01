@@ -31,6 +31,7 @@ impl fmt::Debug for SqlServerSourceConfig {
             .field("stream_poll_interval_ms", &self.stream_poll_interval_ms)
             .field("max_events_per_poll", &self.max_events_per_poll);
         debug.field("transport", &self.transport);
+        debug.field("capture_truncate_events", &self.capture_truncate_events);
         debug.finish()
     }
 }
@@ -53,6 +54,7 @@ impl Default for SqlServerSourceConfig {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             table_include_list: Vec::new(),
             table_exclude_list: Vec::new(),
+            capture_truncate_events: false,
         }
     }
 }
@@ -182,6 +184,7 @@ impl SqlServerSourceConfig {
     }
 
     pub(super) fn to_tiberius_config(&self) -> Result<tiberius::Config> {
+        self.transport.warn_if_insecure("sqlserver");
         let mut config = tiberius::Config::new();
         config.host(self.tds_host());
         config.port(self.port);

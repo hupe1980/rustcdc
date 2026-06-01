@@ -20,7 +20,7 @@ where
     }
 
     /// Report capabilities for the configured source.
-    pub const fn source_capabilities(&self) -> ConnectorCapabilities {
+    pub fn source_capabilities(&self) -> ConnectorCapabilities {
         self.config.source.capabilities()
     }
 
@@ -62,14 +62,13 @@ where
     }
 
     /// Estimate replication lag from source event timestamps when available.
-    /// Falls back to poll recency until a source timestamp is observed.
+    ///
+    /// Returns `None` until the first source-stamped event is observed so that
+    /// callers receive a reliable signal rather than a misleading poll-age proxy.
     pub(super) fn estimate_replication_lag_ms(&self) -> Option<u64> {
         let now = now_millis();
-        if let Some(source_ts) = self.last_source_event_ts_ms {
-            return Some(now.saturating_sub(source_ts.min(now)));
-        }
-        self.last_poll_at_ms
-            .map(|poll_time| now.saturating_sub(poll_time))
+        let source_ts = self.last_source_event_ts_ms?;
+        Some(now.saturating_sub(source_ts.min(now)))
     }
 
     /// Render the current admin snapshot as JSON.
@@ -78,109 +77,137 @@ where
             .map_err(|error| Error::SerializationError(error.to_string()))
     }
 
-    /// Render runtime admin metrics in a Prometheus-friendly text exposition format.
-    pub fn admin_metrics_prometheus(&self) -> String {
+    /// Write runtime admin metrics in Prometheus text exposition format to any
+    /// [`std::io::Write`] sink.
+    ///
+    /// Prefer this over [`Self::admin_metrics_prometheus`] when writing directly
+    /// to an HTTP response body or file: it avoids the intermediate `String`
+    /// allocation and lets the caller drive the output buffer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any `std::io::Error` from the underlying writer. Writes to an
+    /// in-memory `Vec<u8>` are infallible in practice.
+    pub fn write_admin_metrics_prometheus<W: std::io::Write>(
+        &self,
+        w: &mut W,
+    ) -> std::io::Result<()> {
         let admin = self.admin_snapshot();
-        let mut out = String::new();
 
-        out.push_str("# HELP cdc_runtime_readiness Runtime readiness (1=ready, 0=not ready).\n");
-        out.push_str("# TYPE cdc_runtime_readiness gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_readiness{{state=\"{}\"}} {}\n",
+        writeln!(
+            w,
+            "# HELP cdc_runtime_readiness Runtime readiness (1=ready, 0=not ready).\n\
+             # TYPE cdc_runtime_readiness gauge\n\
+             cdc_runtime_readiness{{state=\"{}\"}} {}",
             admin.state,
-            if admin.readiness { 1 } else { 0 }
-        ));
+            u8::from(admin.readiness)
+        )?;
 
-        out.push_str("# HELP cdc_runtime_liveness Runtime liveness (1=alive, 0=stopped).\n");
-        out.push_str("# TYPE cdc_runtime_liveness gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_liveness{{state=\"{}\"}} {}\n",
+        writeln!(
+            w,
+            "# HELP cdc_runtime_liveness Runtime liveness (1=alive, 0=stopped).\n\
+             # TYPE cdc_runtime_liveness gauge\n\
+             cdc_runtime_liveness{{state=\"{}\"}} {}",
             admin.state,
-            if admin.liveness { 1 } else { 0 }
-        ));
+            u8::from(admin.liveness)
+        )?;
 
-        out.push_str(
-            "# HELP cdc_runtime_buffer_depth Number of buffered events waiting for delivery.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_buffer_depth gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_buffer_depth {}\n",
+        writeln!(
+            w,
+            "# HELP cdc_runtime_buffer_depth Number of buffered events waiting for delivery.\n\
+             # TYPE cdc_runtime_buffer_depth gauge\n\
+             cdc_runtime_buffer_depth {}",
             admin.buffer_depth
-        ));
+        )?;
 
-        out.push_str(
-            "# HELP cdc_runtime_in_flight_events Number of delivered but uncommitted events.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_in_flight_events gauge\n");
-        out.push_str(&format!(
-            "cdc_runtime_in_flight_events {}\n",
+        writeln!(
+            w,
+            "# HELP cdc_runtime_in_flight_events Number of delivered but uncommitted events.\n\
+             # TYPE cdc_runtime_in_flight_events gauge\n\
+             cdc_runtime_in_flight_events {}",
             admin.in_flight_events
-        ));
+        )?;
 
-        out.push_str(
-            "# HELP cdc_runtime_events_polled_total Total events delivered by runtime batches.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_events_polled_total counter\n");
-        out.push_str(&format!(
-            "cdc_runtime_events_polled_total {}\n",
+        writeln!(
+            w,
+            "# HELP cdc_runtime_events_polled_total Total events delivered by runtime batches.\n\
+             # TYPE cdc_runtime_events_polled_total counter\n\
+             cdc_runtime_events_polled_total {}",
             admin.total_events_polled
-        ));
+        )?;
 
-        out.push_str("# HELP cdc_runtime_events_committed_total Total events acknowledged and checkpointed.\n");
-        out.push_str("# TYPE cdc_runtime_events_committed_total counter\n");
-        out.push_str(&format!(
-            "cdc_runtime_events_committed_total {}\n",
+        writeln!(
+            w,
+            "# HELP cdc_runtime_events_committed_total Total events acknowledged and checkpointed.\n\
+             # TYPE cdc_runtime_events_committed_total counter\n\
+             cdc_runtime_events_committed_total {}",
             admin.total_events_committed
-        ));
+        )?;
 
-        out.push_str(
-            "# HELP cdc_runtime_events_deduplicated_total Total events suppressed by runtime idempotency guard.\n",
-        );
-        out.push_str("# TYPE cdc_runtime_events_deduplicated_total counter\n");
-        out.push_str(&format!(
-            "cdc_runtime_events_deduplicated_total {}\n",
+        writeln!(
+            w,
+            "# HELP cdc_runtime_events_deduplicated_total Total events suppressed by runtime idempotency guard.\n\
+             # TYPE cdc_runtime_events_deduplicated_total counter\n\
+             cdc_runtime_events_deduplicated_total {}",
             admin.total_events_deduplicated
-        ));
+        )?;
 
         if let Some(checkpoint_age_ms) = admin.checkpoint_age_ms {
-            out.push_str("# HELP cdc_runtime_checkpoint_age_ms Age of last durable checkpoint in milliseconds.\n");
-            out.push_str("# TYPE cdc_runtime_checkpoint_age_ms gauge\n");
-            out.push_str(&format!(
-                "cdc_runtime_checkpoint_age_ms {}\n",
+            writeln!(
+                w,
+                "# HELP cdc_runtime_checkpoint_age_ms Age of last durable checkpoint in milliseconds.\n\
+                 # TYPE cdc_runtime_checkpoint_age_ms gauge\n\
+                 cdc_runtime_checkpoint_age_ms {}",
                 checkpoint_age_ms
-            ));
+            )?;
         }
 
         if let Some(lag_ms) = admin.replication_lag_ms {
-            out.push_str("# HELP cdc_runtime_replication_lag_ms Estimated replication lag in milliseconds (source event timestamp preferred; poll recency fallback).\n");
-            out.push_str("# TYPE cdc_runtime_replication_lag_ms gauge\n");
-            out.push_str(&format!("cdc_runtime_replication_lag_ms {}\n", lag_ms));
+            writeln!(
+                w,
+                "# HELP cdc_runtime_replication_lag_ms Estimated replication lag in milliseconds (source event timestamp preferred; poll recency fallback).\n\
+                 # TYPE cdc_runtime_replication_lag_ms gauge\n\
+                 cdc_runtime_replication_lag_ms {}",
+                lag_ms
+            )?;
         }
 
-        out.push_str("# HELP cdc_runtime_source_capability Connector capability flags.\n");
-        out.push_str("# TYPE cdc_runtime_source_capability gauge\n");
-        out.push_str(&format_capability_metric(
-            "snapshot",
-            admin.capabilities.snapshot,
-        ));
-        out.push_str(&format_capability_metric(
-            "handoff",
-            admin.capabilities.handoff,
-        ));
-        out.push_str(&format_capability_metric(
-            "ddl_capture",
-            admin.capabilities.ddl_capture,
-        ));
-        out.push_str(&format_capability_metric(
-            "heartbeat",
-            admin.capabilities.heartbeat,
-        ));
-        out.push_str(&format_capability_metric("tls", admin.capabilities.tls));
-        out.push_str(&format_capability_metric(
-            "schema_introspection",
-            admin.capabilities.schema_introspection,
-        ));
+        writeln!(
+            w,
+            "# HELP cdc_runtime_source_capability Connector capability flags.\n\
+             # TYPE cdc_runtime_source_capability gauge"
+        )?;
 
-        out
+        for (name, enabled) in [
+            ("snapshot", admin.capabilities.snapshot),
+            ("handoff", admin.capabilities.handoff),
+            ("ddl_capture", admin.capabilities.ddl_capture),
+            ("heartbeat", admin.capabilities.heartbeat),
+            ("tls", admin.capabilities.tls),
+            ("schema_introspection", admin.capabilities.schema_introspection),
+            ("truncate", admin.capabilities.truncate),
+            ("incremental_snapshot", admin.capabilities.incremental_snapshot),
+        ] {
+            writeln!(
+                w,
+                "cdc_runtime_source_capability{{capability=\"{name}\"}} {}",
+                u8::from(enabled)
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Render runtime admin metrics in a Prometheus-friendly text exposition format.
+    ///
+    /// For zero-copy output (e.g., HTTP response streaming), prefer
+    /// [`Self::write_admin_metrics_prometheus`] which writes directly to any
+    /// [`std::io::Write`] sink without the intermediate `String` allocation.
+    pub fn admin_metrics_prometheus(&self) -> String {
+        let mut buf = Vec::with_capacity(2048);
+        self.write_admin_metrics_prometheus(&mut buf)
+            .expect("writing to Vec<u8> is infallible");
+        // SAFETY: all format strings above produce valid UTF-8.
+        String::from_utf8(buf).expect("prometheus metrics output is always valid UTF-8")
     }
 }

@@ -38,7 +38,7 @@ mod stream_messages;
 mod stream_start;
 
 use self::{
-    parser::{mysql_qualified_table_name_from_reference, quoted_mysql_identifier},
+    parser::{mysql_qualified_table_name_from_reference, parse_truncate_target, quoted_mysql_identifier},
     query::{
         binlog_row_to_mysql_row, format_gtid, mysql_json_value_to_param, mysql_row_to_json,
         mysql_value_to_json, primary_key_columns_from_row,
@@ -281,6 +281,27 @@ impl LiveMysqlBinlogProvider {
                         binlog_file: self.binlog_file.clone(),
                         binlog_pos: self.next_pos,
                     });
+                } else if let Some((schema, table)) = parse_truncate_target(&statement) {
+                    // TRUNCATE TABLE is a DDL statement logged as a QueryEvent in MySQL/MariaDB.
+                    // It is NOT wrapped in BEGIN/XID, so it commits immediately on arrival.
+                    // Flush any open implicit transaction before emitting the truncate event.
+                    if let Some(tx_id) = self.active_tx_id.take() {
+                        out.push(MysqlBinlogMessage::Xid {
+                            tx_id,
+                            timestamp_ms,
+                            binlog_file: self.binlog_file.clone(),
+                            binlog_pos: self.next_pos,
+                            gtid: self.active_gtid.clone(),
+                        });
+                        self.active_gtid = None;
+                    }
+                    out.push(MysqlBinlogMessage::Truncate {
+                        schema,
+                        table,
+                        timestamp_ms,
+                        binlog_file: self.binlog_file.clone(),
+                        binlog_pos: self.next_pos,
+                    });
                 }
             }
             EventData::RowsEvent(rows) => {
@@ -423,6 +444,8 @@ pub struct MysqlStreamHandle {
     events_polled: u64,
     max_events_per_poll: usize,
     stream_poll_interval_ms: u64,
+    table_include_list: Vec<String>,
+    table_exclude_list: Vec<String>,
 }
 
 impl MysqlStreamHandle {
@@ -432,6 +455,8 @@ impl MysqlStreamHandle {
         provider: Box<dyn MysqlBinlogProvider>,
         max_events_per_poll: usize,
         stream_poll_interval_ms: u64,
+        table_include_list: Vec<String>,
+        table_exclude_list: Vec<String>,
     ) -> Self {
         Self {
             source_name,
@@ -444,6 +469,8 @@ impl MysqlStreamHandle {
             events_polled: 0,
             max_events_per_poll: max_events_per_poll.max(1),
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
+            table_include_list,
+            table_exclude_list,
         }
     }
 }
@@ -933,6 +960,8 @@ impl Source for MysqlConnection {
             ),
             self.max_events_per_poll,
             self.stream_poll_interval_ms,
+            self.config.table_include_list.clone(),
+            self.config.table_exclude_list.clone(),
         )))
     }
 
@@ -969,7 +998,7 @@ impl Source for MysqlConnection {
             heartbeat: true,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
-            truncate: false,
+            truncate: true,
             incremental_snapshot: true,
         }
     }
@@ -1652,6 +1681,8 @@ mod tests {
             Box::new(provider),
             super::MAX_EVENTS_PER_POLL,
             super::STREAM_POLL_INTERVAL_MS,
+            Vec::new(),
+            Vec::new(),
         )
     }
 

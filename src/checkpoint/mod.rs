@@ -259,6 +259,29 @@ impl FileCheckpoint {
                     .write_all(owner_lease_str.as_bytes())
                     .map_err(crate::core::Error::from)?;
                 lock_file.sync_all().map_err(crate::core::Error::from)?;
+                // Warn if checkpoint files already exist in this directory — a
+                // new lease on a non-empty directory may indicate a multi-process
+                // scenario or an unclean handoff from a previous instance.
+                let has_existing_checkpoints = fs::read_dir(&self.checkpoint_dir)
+                    .ok()
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            let name = e.file_name();
+                            let n = name.to_string_lossy();
+                            n.ends_with(".json") && n != "owner.lock"
+                        })
+                    })
+                    .unwrap_or(false);
+                if has_existing_checkpoints {
+                    tracing::warn!(
+                        target: "rustcdc::checkpoint",
+                        checkpoint_dir = %self.checkpoint_dir.display(),
+                        owner_pid = owner_pid,
+                        "checkpoint directory already contains checkpoint files — new process is \
+                         taking over. Ensure no other runtime instance is running against this \
+                         directory to avoid concurrent write corruption."
+                    );
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let parsed = fs::read_to_string(&lock_path)
@@ -294,17 +317,10 @@ impl FileCheckpoint {
                             stale_owner_pid = pid,
                             "clearing stale checkpoint owner lease left by dead process"
                         );
-                        let _ = fs::remove_file(&lock_path);
-                        let mut lock_file = OpenOptions::new()
-                            .create_new(true)
-                            .write(true)
-                            .open(&lock_path)
+                        // Atomic replace: write-to-tmp then rename, eliminating the
+                        // TOCTOU window in a naive remove→create_new sequence.
+                        owner_lease::atomic_write_lease(&lock_path, &owner_lease_str)
                             .map_err(crate::core::Error::from)?;
-                        self.write_permissions(&lock_file)?;
-                        lock_file
-                            .write_all(owner_lease_str.as_bytes())
-                            .map_err(crate::core::Error::from)?;
-                        lock_file.sync_all().map_err(crate::core::Error::from)?;
                     }
                     _ => {
                         return Err(crate::core::Error::CheckpointError(format!(
@@ -626,6 +642,12 @@ impl Drop for FileCheckpoint {
 #[async_trait]
 impl Checkpoint for InMemoryCheckpoint {
     async fn save(&mut self, offset: &dyn Offset, committed_event_count: u64) -> Result<()> {
+        tracing::warn!(
+            target: "rustcdc::checkpoint",
+            "InMemoryCheckpoint::save called — all checkpoint state is held in memory and will \
+             be lost on process restart, causing full replay and potential duplicate event delivery. \
+             Use FileCheckpoint or a durable backend for production deployments."
+        );
         self.entries
             .lock()
             .map_err(|_| {

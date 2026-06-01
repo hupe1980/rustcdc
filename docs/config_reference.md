@@ -414,6 +414,25 @@ let config = RuntimeConfig::new(source, checkpoint, schema_history)
 Only `SourceError` and `TimeoutError` trigger retry. Fatal errors (`ConfigError`,
 `ValidationError`, etc.) propagate immediately regardless of this policy.
 
+> **Operational warning — `max_retries: None` (indefinite retry):**
+> Setting `max_retries: None` causes the runtime to retry failed source
+> connections forever. This is appropriate for highly-available deployments
+> where the source database is expected to recover (e.g., failover, transient
+> network blips), but it **masks dead source connections indefinitely**.
+> If your monitoring relies on `poll_event_batch` returning an error to
+> trigger alerts or circuit-breaking logic, indefinite retry will prevent
+> that signal from surfacing.
+>
+> **Recommendations for `max_retries: None`:**
+> - Set a `replication_lag_ms` alert threshold in your observability stack;
+>   rising lag indicates the source is unreachable even when the runtime
+>   does not surface an error.
+> - Emit a dead-man's-switch metric: if `total_events_polled` stops growing
+>   for an unexpectedly long window, treat the pipeline as stalled.
+> - Consider bounded retry (`max_retries: Some(N)`) with external restart
+>   orchestration (e.g., Kubernetes pod restart policy) so stalled pipelines
+>   surface cleanly rather than silently burning CPU in a backoff loop.
+
 ### Connector-Specific Post-Commit Confirmation Semantics
 
 `commit_ack()` has a uniform API but connector confirmation semantics are intentionally connector-specific:
@@ -527,6 +546,15 @@ let runtime_source = RuntimeSourceConfig::mariadb(source);
 ```
 
 MariaDB supports the same startup, snapshot, and streaming modes as MySQL, but emits `source_type() == "mariadb"` and uses MariaDB-specific checkpoint identifiers.
+
+> **GTID Format Warning:** MariaDB uses a distinct GTID format — `domain_id-server_id-sequence_no`
+> (e.g. `0-1-12345`) — that is **incompatible** with MySQL's `uuid:interval` format
+> (e.g. `3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5`). Never mix checkpoint files between
+> MySQL and MariaDB instances, even if the schemas are identical. Doing so will produce
+> invalid GTID resume positions and cause the connector to silently restart replication
+> from the beginning or raise a fatal position error. Always use
+> `RuntimeSourceConfig::mariadb(...)` (not `RuntimeSourceConfig::mysql(...)`) when
+> connecting to a MariaDB server to ensure correct checkpoint namespace isolation.
 
 ---
 
@@ -697,7 +725,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.1.4",                         // Service version
+    "0.1.5",                         // Service version
     "production",                    // Environment
 );
 

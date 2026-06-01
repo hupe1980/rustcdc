@@ -113,6 +113,33 @@ pub struct SqlServerSourceConfig {
     /// Ignored when [`table_include_list`](SqlServerSourceConfig::table_include_list) is non-empty.
     /// An empty list means no tables are excluded.
     pub table_exclude_list: Vec<String>,
+    /// Capture `TRUNCATE TABLE` operations via a database-level DDL trigger.
+    ///
+    /// ## How it works
+    ///
+    /// SQL Server CDC (`cdc.fn_cdc_get_all_changes_*`) cannot capture `TRUNCATE
+    /// TABLE` because TRUNCATE bypasses row-level logging.  When this option is
+    /// `true`, rustcdc creates a shadow table (`[<cdc_schema>].[rustcdc_truncate_events]`)
+    /// and a database-level DDL trigger (`rustcdc_truncate_capture`) on first connect.
+    /// The trigger fires synchronously during each `TRUNCATE TABLE` statement and
+    /// records the affected schema and table, together with the current CDC maximum
+    /// LSN captured via `sys.fn_cdc_get_max_lsn()`.  rustcdc polls the shadow table
+    /// alongside the normal CDC change tables and emits [`Operation::Truncate`] events
+    /// positioned after all DML changes at or before the captured LSN.
+    ///
+    /// ## Setup requirements
+    ///
+    /// The connected user must hold `db_owner`, `db_ddladmin`, or `sysadmin` to
+    /// create the shadow table and DDL trigger (already required for CDC admin
+    /// operations).  The objects are created idempotently and survive restarts.
+    ///
+    /// ## Ordering guarantee
+    ///
+    /// The ordering is *best-effort*: the truncate event is placed after all DML
+    /// changes whose commit LSN ≤ the LSN captured at DDL trigger execution time.
+    /// This is as precise as SQL Server allows for DDL operations that bypass the
+    /// transaction log at the row level.
+    pub capture_truncate_events: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +185,19 @@ struct SqlServerRawChange {
     row: serde_json::Value,
 }
 
+/// A TRUNCATE TABLE event captured by the `rustcdc_truncate_capture` DDL trigger.
+#[derive(Debug, Clone)]
+struct SqlServerRawTruncate {
+    /// Row ID in the shadow table (used for marking consumed).
+    id: i64,
+    schema_name: String,
+    table_name: String,
+    /// LSN hex captured inside the DDL trigger via `sys.fn_cdc_get_max_lsn()`.
+    /// TRUNCATE events sort after all DML changes at the same LSN.
+    lsn_hex: String,
+    ts_ms: u64,
+}
+
 impl SqlServerHandoff {
     fn has_no_gap(&self) -> bool {
         compare_lsn(&self.stream_lsn_start, &self.snapshot_lsn_start).is_le()
@@ -179,6 +219,20 @@ pub struct SqlServerStreamHandle {
     /// `before` and `after` populated.  This buffer persists across poll boundaries so
     /// a pair split by `max_events_per_poll` is handled correctly.
     pending_update_afters: AHashMap<(String, String), (serde_json::Value, u64)>,
+    /// Events collected from all capture instances in the current LSN window, sorted by
+    /// LSN and waiting to be delivered in pages.
+    ///
+    /// SQL Server CDC requires polling each capture instance (table) independently.
+    /// Without a merge-sort step the relative order of events across tables is
+    /// determined by the poll loop iteration order — not by the commit LSN.
+    ///
+    /// This buffer fills once per LSN window (all capture instances are queried before
+    /// any events are returned), then is drained in `max_events_per_poll`-sized pages.
+    /// The LSN window is **not** advanced until the buffer is fully drained, preserving
+    /// at-least-once restart safety: `save_position` always records the window-start LSN
+    /// of the events that have been delivered, so a crash mid-buffer causes at most one
+    /// window of duplicate delivery (handled by the idempotency guard).
+    window_buffer: Vec<Event>,
 }
 
 pub struct SqlServerSnapshotHandle {
@@ -292,6 +346,15 @@ fn lsn_bytes_to_hex(lsn: &[u8; 10]) -> String {
 
 fn compare_lsn(left: &[u8; 10], right: &[u8; 10]) -> std::cmp::Ordering {
     parser::compare_lsn(left, right)
+}
+
+/// Returns a monotonic u64 proxy for LSN ordering / distance calculations.
+///
+/// SQL Server LSN layout: `[vlfSeqNo:4][blockOffset:4][recordNo:2]`.
+/// Taking the first 8 bytes as a big-endian u64 gives a value that increases
+/// monotonically as the log advances and can be used for gap estimation.
+fn lsn_bytes_to_u64_distance(lsn: &[u8; 10]) -> u64 {
+    u64::from_be_bytes(lsn[..8].try_into().expect("slice is exactly 8 bytes"))
 }
 
 fn tx_id_from_seqval(seqval_hex: &str) -> u64 {
@@ -587,11 +650,13 @@ fn decode_sqlserver_cell_to_json(row: &tiberius::Row, index: usize) -> serde_jso
 #[async_trait]
 impl StreamHandle for SqlServerStreamHandle {
     async fn next_events(&mut self, timeout_ms: u64) -> Result<Vec<Event>> {
+        // ── Priority 1: flush snapshot-handoff requeued events ─────────────────
         if !self.requeued_events.is_empty() {
             let drained = self.requeued_events.drain(..).collect::<Vec<_>>();
             return Ok(drained);
         }
 
+        // ── Priority 2: flush schema-change events ──────────────────────────────
         let mut schema_events = self.refresh_metas_and_collect_schema_events().await?;
         if !schema_events.is_empty() {
             self.events_polled = self
@@ -603,13 +668,37 @@ impl StreamHandle for SqlServerStreamHandle {
             return Ok(schema_events);
         }
 
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-        let mut out = Vec::new();
+        // ── Priority 3: drain the window buffer if it already has events ────────
+        //
+        // We advance the LSN window only after the buffer is fully drained so
+        // that `save_position` always records a window-start LSN that is ≤ all
+        // events delivered since the last checkpoint.  A crash mid-buffer causes
+        // at most one window of duplicate delivery (at-least-once guarantee).
+        if !self.window_buffer.is_empty() {
+            let count = self.max_events_per_poll.min(self.window_buffer.len());
+            let batch: Vec<Event> = self.window_buffer.drain(..count).collect();
+            // Advance the window once the buffer is empty so the next fill
+            // queries a fresh LSN range.
+            if self.window_buffer.is_empty() {
+                self.advance_window().await?;
+            }
+            return Ok(batch);
+        }
 
-        while out.is_empty() && std::time::Instant::now() <= deadline {
-            // Clone the meta list to avoid holding an immutable borrow of `self`
-            // while `map_changes_to_events` takes `&mut self`.
+        // ── Priority 4: fill the window buffer ─────────────────────────────────
+        //
+        // Collect changes from *all* capture instances for the current LSN
+        // window, sort them by commit LSN for global cross-table ordering, then
+        // store in `window_buffer`.  The window is NOT advanced here — it is
+        // advanced in priority 3 once the buffer drains completely.
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+
+        loop {
+            // Clone meta list to avoid holding an immutable borrow while the
+            // mutable `map_changes_to_events` methods run.
             let metas_snapshot = self.metas.clone();
+            let mut all_changes: Vec<(CaptureInstanceMeta, Vec<SqlServerRawChange>)> = Vec::new();
+
             for meta in &metas_snapshot {
                 let changes = self
                     .fetch_changes_for_capture_instance(
@@ -618,32 +707,96 @@ impl StreamHandle for SqlServerStreamHandle {
                         self.max_events_per_poll,
                     )
                     .await?;
-                if changes.is_empty() {
-                    continue;
-                }
-
-                let mut events = self.map_changes_to_events(meta, changes)?;
-                self.events_polled += events.len() as u64;
-                out.append(&mut events);
-                if out.len() >= self.max_events_per_poll {
-                    out.truncate(self.max_events_per_poll);
-                    break;
+                if !changes.is_empty() {
+                    all_changes.push((meta.clone(), changes));
                 }
             }
 
-            if out.is_empty() {
-                let sleep_for = self
-                    .stream
-                    .poll_interval_ms
-                    .min(timeout_ms.max(1))
-                    .min(DEFAULT_STREAM_POLL_INTERVAL_MS);
-                tokio::time::sleep(Duration::from_millis(sleep_for)).await;
+            if !all_changes.is_empty() {
+                // Flatten all (meta, changes) pairs with their LSN for sorting.
+                // Each SqlServerRawChange already carries `start_lsn_hex` and
+                // `seqval_hex`; we use those to establish a total global order.
+                let mut flat: Vec<(CaptureInstanceMeta, SqlServerRawChange)> = all_changes
+                    .into_iter()
+                    .flat_map(|(meta, changes)| changes.into_iter().map(move |c| (meta.clone(), c)))
+                    .collect();
+
+                flat.sort_by(|(_, a), (_, b)| {
+                    // Parse hex LSN bytes for comparison.  Fall back to equal on
+                    // parse error (keeps stable relative order within each table).
+                    let ord = match (
+                        parser::lsn_hex_to_bytes_opt(&a.start_lsn_hex),
+                        parser::lsn_hex_to_bytes_opt(&b.start_lsn_hex),
+                    ) {
+                        (Some(la), Some(lb)) => compare_lsn(&la, &lb),
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    ord.then_with(|| a.seqval_hex.cmp(&b.seqval_hex))
+                        .then_with(|| a.operation.cmp(&b.operation))
+                });
+
+                // Map sorted raw changes to Events.  UPDATE op=3/op=4 pairs share
+                // the same (start_lsn, seqval) key, so the after-image (op=3)
+                // will always precede the before-image (op=4) in our sort order
+                // (since 3 < 4), preserving the expected merge behaviour.
+                for (meta, change) in flat {
+                    let mut events = self.map_changes_to_events(&meta, vec![change])?;
+                    self.window_buffer.append(&mut events);
+                }
+
+                // Merge in any truncate events that fall within the current LSN
+                // window.  Truncate events are positioned after all DML changes
+                // at the same LSN (TRUNCATE bypasses row-level logging, so the
+                // captured LSN is a ceiling bound, not an exact match).
+                let mut truncate_events = self.fetch_and_emit_truncate_events().await?;
+                if !truncate_events.is_empty() {
+                    // Insert each truncate event after all DML events at or
+                    // before its captured LSN.
+                    self.window_buffer.append(&mut truncate_events);
+                    // Re-sort the combined buffer by offset (LSN hex string sort
+                    // is byte-lexicographic, which matches numeric order for the
+                    // 0x-prefixed fixed-width strings SQL Server produces).
+                    self.window_buffer.sort_by(|a, b| {
+                        a.source.offset.cmp(&b.source.offset)
+                    });
+                }
+
+                self.events_polled = self
+                    .events_polled
+                    .saturating_add(self.window_buffer.len() as u64);
+
+                // Drain the first page and return.  Window advancement is
+                // deferred to priority 3 once the buffer empties.
+                let count = self.max_events_per_poll.min(self.window_buffer.len());
+                let batch: Vec<Event> = self.window_buffer.drain(..count).collect();
+                return Ok(batch);
             }
 
+            // No DML changes in this window — still check for truncate events
+            // which may have arrived while the DML window was empty.
+            let truncate_events = self.fetch_and_emit_truncate_events().await?;
+            if !truncate_events.is_empty() {
+                self.events_polled = self
+                    .events_polled
+                    .saturating_add(truncate_events.len() as u64);
+                self.advance_window().await?;
+                return Ok(truncate_events);
+            }
+
+            // No changes in this window — advance past it and wait.
             self.advance_window().await?;
-        }
 
-        Ok(out)
+            if std::time::Instant::now() >= deadline {
+                return Ok(vec![]);
+            }
+
+            let sleep_for = self
+                .stream
+                .poll_interval_ms
+                .min(timeout_ms.max(1))
+                .min(DEFAULT_STREAM_POLL_INTERVAL_MS);
+            tokio::time::sleep(Duration::from_millis(sleep_for)).await;
+        }
     }
 
     async fn save_position(
@@ -1172,11 +1325,21 @@ impl Source for SqlServerConnection {
 
         stream.confirm_lsn(0).await?;
 
+        // Compute the LSN distance between the CDC maximum log position and the
+        // stream start position as a proxy for capture-job backlog at handoff time.
+        let stream_watermark_gap = match self.query_max_lsn_hex().await {
+            Ok(max_lsn_hex) => lsn_hex_to_bytes(&max_lsn_hex).ok().map(|max_lsn| {
+                lsn_bytes_to_u64_distance(&max_lsn)
+                    .saturating_sub(lsn_bytes_to_u64_distance(&handoff.stream_lsn_start))
+            }),
+            Err(_) => None,
+        };
+
         Ok(HandoffResult {
             snapshot_end_ts: Some(snapshot_end),
             stream_start_ts: Some(now_millis()),
             overlap_events_dropped,
-            stream_watermark_gap: None,
+            stream_watermark_gap,
         })
     }
 
@@ -1193,7 +1356,7 @@ impl Source for SqlServerConnection {
             heartbeat: true,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
-            truncate: false,
+            truncate: self.config.capture_truncate_events,
             incremental_snapshot: true,
         }
     }
@@ -1524,6 +1687,7 @@ mod tests {
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_afters: AHashMap::new(),
+            window_buffer: Vec::new(),
         };
 
         let meta = CaptureInstanceMeta {
@@ -1624,6 +1788,7 @@ mod tests {
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_afters: AHashMap::new(),
+            window_buffer: Vec::new(),
         };
 
         let meta = CaptureInstanceMeta {
@@ -1695,6 +1860,7 @@ mod tests {
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_afters: AHashMap::new(),
+            window_buffer: Vec::new(),
         };
 
         let refreshed = vec![
@@ -1762,6 +1928,7 @@ mod tests {
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_afters: AHashMap::new(),
+            window_buffer: Vec::new(),
         };
 
         let events = handle.compute_schema_events_for_meta_refresh(&[]);
@@ -2140,5 +2307,108 @@ mod tests {
                 == Some(1)
                 && event.op == Operation::Update
         }));
+    }
+
+    /// Verifies that `map_changes_to_events` followed by the LSN sort used in
+    /// `next_events` produces strictly ordered output across two capture
+    /// instances (tables) whose events arrive out-of-LSN-order from the DB.
+    ///
+    /// Before the window-buffer fix, changes were appended per capture-instance
+    /// in poll-loop order — `table_a` events always preceded `table_b` events
+    /// regardless of commit LSN.  After the fix, the combined batch is sorted by
+    /// `(start_lsn, seqval, operation)` before delivery.
+    #[test]
+    fn cross_table_events_are_sorted_by_lsn() {
+        // table_a has a single INSERT at LSN 0003 (later).
+        let meta_a = CaptureInstanceMeta {
+            capture_instance: "dbo_table_a".into(),
+            schema: "dbo".into(),
+            table: "table_a".into(),
+            primary_key: vec!["id".into()],
+            captured_columns: vec!["id".into()],
+        };
+        let changes_a = vec![SqlServerRawChange {
+            start_lsn_hex: "0x000000230000000A0003".into(), // later LSN
+            seqval_hex: "0x00000000000000000001".into(),
+            operation: 2, // INSERT
+            ts_ms: 10,
+            row: serde_json::json!({"id": "10"}),
+        }];
+
+        // table_b has a single INSERT at LSN 0001 (earlier).
+        let meta_b = CaptureInstanceMeta {
+            capture_instance: "dbo_table_b".into(),
+            schema: "dbo".into(),
+            table: "table_b".into(),
+            primary_key: vec!["id".into()],
+            captured_columns: vec!["id".into()],
+        };
+        let changes_b = vec![SqlServerRawChange {
+            start_lsn_hex: "0x000000230000000A0001".into(), // earlier LSN
+            seqval_hex: "0x00000000000000000001".into(),
+            operation: 2, // INSERT
+            ts_ms: 5,
+            row: serde_json::json!({"id": "20"}),
+        }];
+
+        // Simulate the per-capture-instance raw changes exactly as `next_events` collects them:
+        // table_a polled first (returns LSN 0003), then table_b (LSN 0001).
+        let mut handle = SqlServerStreamHandle {
+            config: config(),
+            stream: SqlServerStream {
+                lsn_start: [0; 10],
+                lsn_end: [0xff; 10],
+                change_tables: vec!["dbo_table_a".into(), "dbo_table_b".into()],
+                poll_interval_ms: 5000,
+            },
+            metas: vec![meta_a.clone(), meta_b.clone()],
+            events_polled: 0,
+            requeued_events: Vec::new(),
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            pending_update_afters: AHashMap::new(),
+            window_buffer: Vec::new(),
+        };
+
+        // Collect all changes (as next_events does) and flatten with meta.
+        let all_changes: Vec<(CaptureInstanceMeta, Vec<SqlServerRawChange>)> = vec![
+            (meta_a, changes_a),
+            (meta_b, changes_b),
+        ];
+        let mut flat: Vec<(CaptureInstanceMeta, SqlServerRawChange)> = all_changes
+            .into_iter()
+            .flat_map(|(meta, changes)| changes.into_iter().map(move |c| (meta.clone(), c)))
+            .collect();
+
+        // Apply the same sort as next_events.
+        flat.sort_by(|(_, a), (_, b)| {
+            let ord = match (
+                parser::lsn_hex_to_bytes_opt(&a.start_lsn_hex),
+                parser::lsn_hex_to_bytes_opt(&b.start_lsn_hex),
+            ) {
+                (Some(la), Some(lb)) => compare_lsn(&la, &lb),
+                _ => std::cmp::Ordering::Equal,
+            };
+            ord.then_with(|| a.seqval_hex.cmp(&b.seqval_hex))
+                .then_with(|| a.operation.cmp(&b.operation))
+        });
+
+        // Map to events.
+        let mut events = Vec::new();
+        for (meta, change) in flat {
+            let mut batch = handle.map_changes_to_events(&meta, vec![change]).unwrap();
+            events.append(&mut batch);
+        }
+
+        // table_b's event (LSN 0001) must come before table_a's event (LSN 0003)
+        // regardless of poll order.
+        assert_eq!(events.len(), 2, "expected 2 events");
+        let offsets: Vec<&str> = events.iter().map(|e| e.source.offset.as_str()).collect();
+        assert!(
+            offsets[0] < offsets[1],
+            "events must be in ascending LSN order; got {offsets:?}"
+        );
+        // Confirm which table came first.
+        assert_eq!(events[0].table, "table_b", "table_b (earlier LSN) must be first");
+        assert_eq!(events[1].table, "table_a", "table_a (later LSN) must be second");
     }
 }

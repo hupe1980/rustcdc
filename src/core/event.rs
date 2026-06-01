@@ -13,6 +13,7 @@ pub const EVENT_ENVELOPE_VERSION: u16 = 1;
 /// CRUD-style operations emitted by a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Operation {
     Insert,
     Update,

@@ -1,9 +1,3 @@
-pub(super) fn format_capability_metric(name: &str, enabled: bool) -> String {
-    format!(
-        "cdc_runtime_source_capability{{capability=\"{name}\"}} {}\n",
-        if enabled { 1 } else { 0 }
-    )
-}
 
 pub(super) fn now_millis() -> u64 {
     std::time::SystemTime::now()

@@ -144,12 +144,32 @@ fn table_key(schema: &str, table: &str) -> String {
     format!("{schema}.{table}")
 }
 
+/// Returns a wall-clock millisecond timestamp that is guaranteed to be
+/// **monotonically non-decreasing** across concurrent calls on the same process.
+///
+/// Plain `SystemTime::now()` can go backward under NTP slew or leap-second
+/// corrections, which would silently mis-order schema history entries.  A CAS
+/// loop over a process-wide atomic clamps the returned value to
+/// `max(wall_clock, last_seen)` without requiring a mutex.
 fn current_time() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+
+    static LAST_TS_MS: AtomicU64 = AtomicU64::new(0);
+
+    let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1); // 0 would leave LAST_TS_MS stuck at 0 forever on error
+
+    let mut prev = LAST_TS_MS.load(Ordering::Acquire);
+    loop {
+        let next = wall.max(prev);
+        match LAST_TS_MS.compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
 }
 
 fn next_version(store: &SchemaStore, key: &str) -> u32 {
@@ -377,6 +397,11 @@ impl FileSchemaHistory {
 #[async_trait]
 impl SchemaHistory for InMemorySchemaHistory {
     async fn record_ddl(&mut self, ddl: DDLEvent) -> Result<u32> {
+        tracing::warn!(
+            target: "rustcdc::schema_history",
+            "InMemorySchemaHistory::record_ddl called — schema history state is held in memory \
+             and will be lost on process restart. Use FileSchemaHistory for production deployments."
+        );
         let mut store = self.schemas.write().await;
         record_ddl_in_store(&mut store, ddl, current_time())
     }

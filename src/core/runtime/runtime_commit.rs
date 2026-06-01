@@ -124,7 +124,9 @@ where
                 }
                 PostCommitSourceConfirmPolicy::FailFast => {
                     let error = Error::SourceError(format!(
-                        "post-commit source confirmation failed after durable checkpoint commit: {summary}"
+                        "post-commit source confirmation failed after durable checkpoint commit \
+                         (checkpoint is safe — replay from checkpoint is safe; only the \
+                         source-side replication slot/cursor confirmation failed): {summary}"
                     ));
                     self.record_runtime_error(
                         "runtime.commit.post_commit_confirm_fail_fast",

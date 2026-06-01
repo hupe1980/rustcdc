@@ -25,9 +25,13 @@ use crate::{Error, Result};
 pub enum ColumnMaskRule {
     /// Replace the value with its SHA-256 hex digest (32-byte hex string).
     ///
-    /// Provides irreversible pseudonymisation. Identical input values always
+    /// Provides deterministic obfuscation. Identical input values always
     /// produce the same hash, preserving joinability across events.
-    Hash,
+    ///
+    /// **Not GDPR-safe pseudonymization for low-cardinality fields** — use
+    /// a keyed variant (`HmacSha256` in `MaskHashTransform`) where compliance
+    /// requires resistance to rainbow-table attacks.
+    UnsaltedSha256,
     /// Replace the value with a static redaction string (e.g. `"***"`).
     ///
     /// Use for PII columns that must never appear in any output.
@@ -72,8 +76,15 @@ pub struct ColumnMaskRuleConfig {
 
 fn apply_mask_rule(value: &serde_json::Value, rule: &ColumnMaskRule) -> serde_json::Value {
     match rule {
-        ColumnMaskRule::Hash => {
-            let digest = Sha256::digest(value.to_string().as_bytes());
+        ColumnMaskRule::UnsaltedSha256 => {
+            // Hash the raw string value, not the JSON-encoded form, so that
+            // `UnsaltedSha256("alice")` produces the same digest as an external
+            // SHA-256("alice") computation rather than SHA-256('"alice"').
+            let input: std::borrow::Cow<str> = match value {
+                serde_json::Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                other => std::borrow::Cow::Owned(other.to_string()),
+            };
+            let digest = Sha256::digest(input.as_bytes());
             serde_json::Value::String(format!("{digest:x}"))
         }
         ColumnMaskRule::Redact(s) => serde_json::Value::String(s.clone()),
@@ -310,7 +321,7 @@ mod tests {
     fn masking_hash_replaces_value_with_sha256_hex() {
         let mask = ColumnMaskRuleConfig {
             column: "public.users.password".into(),
-            rule: ColumnMaskRule::Hash,
+            rule: ColumnMaskRule::UnsaltedSha256,
         };
         let f = ColumnFilter::from_config(&[], &[], &[mask]).unwrap();
         let mut row = serde_json::json!({"id": 1, "password": "secret"});

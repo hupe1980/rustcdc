@@ -165,3 +165,109 @@ pub(super) fn mysql_qualified_table_name_from_reference(table: &str) -> Result<S
     let (schema, name) = split_table_reference(table)?;
     Ok(mysql_qualified_table_name(schema.as_deref(), &name))
 }
+
+/// Parse the target of a `TRUNCATE [TABLE] ...` binlog query event.
+///
+/// Returns `Some((schema, table))` when the statement is a TRUNCATE and the
+/// target name is parseable. Returns `None` for unrecognised statements.
+///
+/// MySQL logs `TRUNCATE TABLE` as a `Query_log_event`. Supported forms:
+/// - `TRUNCATE TABLE \`schema\`.\`table\``
+/// - `TRUNCATE TABLE table_name`
+/// - `TRUNCATE \`schema\`.\`table\`` (`TABLE` keyword is optional per SQL standard)
+pub(super) fn parse_truncate_target(statement: &str) -> Option<(Option<String>, String)> {
+    let trimmed = statement.trim_start();
+    // Keyword detection on uppercase; identifier extraction from original bytes.
+    let upper = trimmed.to_uppercase();
+    let after_kw = upper.strip_prefix("TRUNCATE")?;
+    // Compute byte offset: len("TRUNCATE") plus however many leading spaces follow.
+    let kw_end = trimmed.len() - after_kw.len();
+    let after_kw_orig = &trimmed[kw_end..];
+    let after_kw_upper = after_kw.trim_start();
+    let spaces_after_kw = after_kw.len() - after_kw_upper.len();
+    let trimmed_after_kw = &after_kw_orig[spaces_after_kw..];
+
+    // Skip optional TABLE keyword.
+    let table_ref_orig = if trimmed_after_kw.to_uppercase().starts_with("TABLE") {
+        let s = trimmed_after_kw["TABLE".len()..].trim_start();
+        // Must have at least one whitespace/backtick between TABLE and identifier.
+        s
+    } else {
+        trimmed_after_kw
+    };
+
+    let cleaned = table_ref_orig.trim().trim_end_matches(';').trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    split_table_reference(cleaned).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_truncate_with_table_keyword_unqualified() {
+        let result = parse_truncate_target("TRUNCATE TABLE orders");
+        assert_eq!(result, Some((None, "orders".to_string())));
+    }
+
+    #[test]
+    fn parse_truncate_without_table_keyword() {
+        let result = parse_truncate_target("TRUNCATE orders");
+        assert_eq!(result, Some((None, "orders".to_string())));
+    }
+
+    #[test]
+    fn parse_truncate_qualified_backticks() {
+        let result = parse_truncate_target("TRUNCATE TABLE `mydb`.`orders`");
+        assert_eq!(result, Some((Some("mydb".to_string()), "orders".to_string())));
+    }
+
+    #[test]
+    fn parse_truncate_qualified_no_backticks() {
+        let result = parse_truncate_target("TRUNCATE TABLE mydb.orders");
+        assert_eq!(result, Some((Some("mydb".to_string()), "orders".to_string())));
+    }
+
+    #[test]
+    fn parse_truncate_mixed_case() {
+        let result = parse_truncate_target("truncate table `shop`.`line_items`");
+        assert_eq!(result, Some((Some("shop".to_string()), "line_items".to_string())));
+    }
+
+    #[test]
+    fn parse_truncate_with_trailing_semicolon() {
+        let result = parse_truncate_target("TRUNCATE TABLE orders;");
+        assert_eq!(result, Some((None, "orders".to_string())));
+    }
+
+    #[test]
+    fn parse_truncate_returns_none_for_begin() {
+        assert!(parse_truncate_target("BEGIN").is_none());
+    }
+
+    #[test]
+    fn parse_truncate_returns_none_for_drop_table() {
+        assert!(parse_truncate_target("DROP TABLE orders").is_none());
+    }
+
+    #[test]
+    fn parse_truncate_returns_none_for_empty() {
+        assert!(parse_truncate_target("").is_none());
+    }
+
+    #[test]
+    fn format_mysql_source_offset_with_gtid() {
+        let result = format_mysql_source_offset("mysql-bin.000001", 1234, "abc-def");
+        assert_eq!(result, "mysql-bin.000001:1234#gtid=abc-def");
+    }
+
+    #[test]
+    fn format_mysql_source_offset_no_gtid() {
+        let result = format_mysql_source_offset("mysql-bin.000001", 1234, "");
+        assert_eq!(result, "mysql-bin.000001:1234");
+    }
+}

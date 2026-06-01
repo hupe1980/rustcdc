@@ -77,6 +77,13 @@ struct RuntimeWasmTransform {
     runtime: Mutex<WasmRuntime>,
 }
 
+impl std::fmt::Debug for RuntimeWasmTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeWasmTransform").finish_non_exhaustive()
+    }
+}
+
+
 impl RuntimeWasmTransform {
     async fn new(config: WasmConfig) -> rustcdc::Result<Self> {
         let mut runtime = WasmRuntime::new_with_config(config)?;
@@ -96,7 +103,10 @@ impl Transform for RuntimeWasmTransform {
                 *event = *transformed;
                 Ok(true)
             }
-            TransformResult::Err(_) => Ok(false),
+            TransformResult::Filtered => Ok(false),
+            TransformResult::Err(reason) => Err(rustcdc::Error::SourceError(format!(
+                "WASM transform error: {reason}"
+            ))),
         }
     }
 

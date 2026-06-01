@@ -29,6 +29,7 @@ mod tests;
 
 /// Database dialect used for DDL parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DdlDialect {
     Postgres,
     Mysql,
@@ -47,6 +48,7 @@ impl DdlDialect {
 
 /// Normalized operation parsed from a DDL statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DdlOperation {
     CreateTable,
     AlterTable,
@@ -55,6 +57,7 @@ pub enum DdlOperation {
 
 /// Normalized ALTER TABLE schema-diff operations for replay-grade metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SchemaDiffOperation {
     AddColumn { column: ColumnDef },
     DropColumn { name: String },

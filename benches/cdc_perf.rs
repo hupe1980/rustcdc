@@ -80,6 +80,7 @@ fn dedup_by_id(mut events: Vec<Event>) -> Vec<Event> {
     events
 }
 
+#[derive(Debug)]
 struct AddTagTransform;
 
 #[async_trait]
@@ -96,6 +97,7 @@ impl Transform for AddTagTransform {
     }
 }
 
+#[derive(Debug)]
 struct NormalizeNameTransform;
 
 #[async_trait]

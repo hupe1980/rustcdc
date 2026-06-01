@@ -123,5 +123,13 @@ pub(super) enum MysqlBinlogMessage {
         binlog_file: String,
         binlog_pos: u32,
     },
+    /// A `TRUNCATE [TABLE] schema.table` statement captured from a QueryEvent.
+    Truncate {
+        schema: Option<String>,
+        table: String,
+        timestamp_ms: u64,
+        binlog_file: String,
+        binlog_pos: u32,
+    },
     Heartbeat,
 }

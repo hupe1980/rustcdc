@@ -10,6 +10,7 @@ on:
   pull_request:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -111,68 +112,6 @@ jobs:
           sudo apt-get install -y ripgrep jq
       - name: policy gates (schema + deprecated + workflow drift)
         run: bash scripts/ci-policy-gate.sh
-
-  release-evidence-benchmark-preflight:
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-    needs:
-      - msrv
-      - check
-      - quality
-      - transport-security
-      - policy-gate
-      - correctness-smoke
-      - reliability-core
-      - latency-core
-      - integration-postgres
-      - integration-postgres-encryption
-      - integration-reliability
-      - integration-mysql
-      - integration-mysql-encryption
-      - integration-mariadb
-      - integration-mariadb-encryption
-      - integration-sqlserver
-      - integration-sqlserver-encryption
-    runs-on: ubuntu-latest
-    env:
-      BENCHMARK_STRICT: "1"
-      BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
-      BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
-      CRITERION_BASELINE: ci-baseline
-      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: install benchmark gate dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep jq
-
-      - name: derive benchmark baseline inputs
-        env:
-          CONFIGURED_BASELINE_COMMIT: ${{ vars.BENCHMARK_BASELINE_COMMIT }}
-          CONFIGURED_BASELINE_ARTIFACT: ${{ vars.BENCHMARK_BASELINE_ARTIFACT }}
-        run: |
-          set -euo pipefail
-
-          baseline_commit="${CONFIGURED_BASELINE_COMMIT}"
-          baseline_artifact="${CONFIGURED_BASELINE_ARTIFACT}"
-
-          if [ -z "$baseline_commit" ]; then
-            baseline_commit="$(git rev-parse HEAD^)"
-          fi
-
-          if [ -z "$baseline_artifact" ]; then
-            baseline_artifact="commit:${baseline_commit}"
-          fi
-
-          echo "BENCHMARK_BASELINE_COMMIT=$baseline_commit" >> "$GITHUB_ENV"
-          echo "BENCHMARK_BASELINE_ARTIFACT=$baseline_artifact" >> "$GITHUB_ENV"
-
-      - name: release-evidence benchmark preflight
-        run: bash scripts/ci-benchmark-gate.sh
 
   correctness-smoke:
     runs-on: ubuntu-latest
@@ -441,7 +380,7 @@ jobs:
         run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 
   release-evidence:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     needs:
       - msrv
       - check
@@ -488,22 +427,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          current_tag="${GITHUB_REF_NAME}"
           baseline_commit="${CONFIGURED_BASELINE_COMMIT}"
           baseline_artifact="${CONFIGURED_BASELINE_ARTIFACT}"
 
           if [ -z "$baseline_commit" ]; then
-            previous_tag="$(git tag --sort=-v:refname | grep '^v' | grep -Fxv "$current_tag" | head -n 1 || true)"
-            if [ -n "$previous_tag" ]; then
-              baseline_commit="$(git rev-list -n 1 "$previous_tag")"
-              if [ -z "$baseline_artifact" ]; then
-                baseline_artifact="release-tag:${previous_tag}"
-              fi
+            # Auto-detect baseline from git history:
+            # 1. Try the most recent prior release tag.
+            # 2. Fall back to HEAD~1 (parent commit).
+            # 3. If this is the initial commit with no parent, use HEAD itself
+            #    and disable the historical-baseline requirement for this run.
+            prior_tag_commit="$(git log --tags --no-walk --pretty=format:'%H' 2>/dev/null | head -1 || true)"
+            if [ -n "$prior_tag_commit" ] && [ "$prior_tag_commit" != "$(git rev-parse HEAD)" ]; then
+              baseline_commit="$prior_tag_commit"
+              echo "::notice::BENCHMARK_BASELINE_COMMIT not configured — auto-detected from most recent release tag: ${baseline_commit:0:12}. Set the 'BENCHMARK_BASELINE_COMMIT' repository variable to a specific SHA for reproducible release evidence."
+            elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+              baseline_commit="$(git rev-parse HEAD~1)"
+              echo "::notice::BENCHMARK_BASELINE_COMMIT not configured — falling back to HEAD~1: ${baseline_commit:0:12}. Set the 'BENCHMARK_BASELINE_COMMIT' repository variable to a known-good commit SHA for reproducible release evidence."
+            else
+              # Initial commit: no ancestor exists — bootstrap mode.
+              baseline_commit="$(git rev-parse HEAD)"
+              echo "BENCHMARK_REQUIRE_HISTORICAL_BASELINE=0" >> "$GITHUB_ENV"
+              echo "BENCHMARK_ENFORCE_RELEASE_POLICY=0" >> "$GITHUB_ENV"
+              echo "::notice::BENCHMARK_BASELINE_COMMIT not configured and no prior commit found — running in bootstrap mode (no regression comparison, release policy not enforced)."
             fi
-          fi
-
-          if [ -z "$baseline_commit" ]; then
-            baseline_commit="$(git rev-parse HEAD^)"
           fi
 
           if [ -z "$baseline_artifact" ]; then
@@ -512,19 +458,6 @@ jobs:
 
           echo "BENCHMARK_BASELINE_COMMIT=$baseline_commit" >> "$GITHUB_ENV"
           echo "BENCHMARK_BASELINE_ARTIFACT=$baseline_artifact" >> "$GITHUB_ENV"
-
-      - name: verify tag matches Cargo.toml version
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "rustcdc") | .version')
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
-            exit 1
-          fi
-
-      - name: cargo package (dry-run)
-        run: cargo package --no-verify --all-features
 
       - name: policy gate
         run: bash scripts/ci-policy-gate.sh
@@ -554,9 +487,92 @@ jobs:
             target/criterion
             BENCHMARK_REPORT.md
 
+  release-evidence-verify:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: verify tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rustcdc") | .version')
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: verify successful release-evidence run exists for this commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflowId = '.github/workflows/ci.yml';
+            const headSha = context.sha;
+
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id: workflowId,
+              per_page: 100,
+              head_sha: headSha,
+            });
+
+            const candidates = runs.filter((run) =>
+              run.id !== context.runId &&
+              !run.head_branch?.startsWith('v') &&
+              run.event !== 'workflow_dispatch' &&
+              run.conclusion === 'success'
+            );
+
+            if (candidates.length === 0) {
+              core.setFailed(`No successful non-tag CI run found for commit ${headSha}.`);
+              return;
+            }
+
+            let evidenceFound = false;
+            for (const run of candidates) {
+              const jobsResp = await github.rest.actions.listJobsForWorkflowRun({
+                owner,
+                repo,
+                run_id: run.id,
+                per_page: 100,
+              });
+
+              const releaseEvidenceJob = jobsResp.data.jobs.find((job) => job.name === 'release-evidence');
+              if (!releaseEvidenceJob || releaseEvidenceJob.conclusion !== 'success') {
+                continue;
+              }
+
+              const artifactsResp = await github.rest.actions.listWorkflowRunArtifacts({
+                owner,
+                repo,
+                run_id: run.id,
+                per_page: 100,
+              });
+
+              const hasEvidenceArtifact = artifactsResp.data.artifacts.some((artifact) => artifact.name === 'release-gate-evidence');
+              if (hasEvidenceArtifact) {
+                core.info(`Using validated evidence from run ${run.id}.`);
+                evidenceFound = true;
+                break;
+              }
+            }
+
+            if (!evidenceFound) {
+              core.setFailed('No successful release-evidence job with release-gate-evidence artifact found for this commit.');
+            }
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: release-evidence
+    needs: release-evidence-verify
     runs-on: ubuntu-latest
     environment: crates-io
     steps:

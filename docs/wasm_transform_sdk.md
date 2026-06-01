@@ -38,7 +38,7 @@ Optional:
 - WASM runs sandboxed (no direct file I/O or network access).
 - Static import scanning rejects all imports outside `env.log`, `env.get_metric`, and `env.record_metric`.
 - Timeout enforced per transform invocation:
-  - default `10ms`
+  - default `50ms`
   - configurable via `WasmConfig.timeout_ms`
 - Memory limit enforced per runtime instance:
   - default `16MB`
@@ -49,6 +49,31 @@ Optional:
 - Native overhead target: `< 5x`
 - Per-event transform latency target: `< 1ms`
 - Throughput target: `> 1K events/sec per transform instance`
+
+## Threading Model and Concurrency
+
+**Each `WasmRuntime` instance is single-threaded.** Internally, the WASM execution state is protected by a `Mutex`, so concurrent calls to `transform()` on the same instance serialize — only one event is being transformed at a time.
+
+For a single-stream CDC pipeline this is not a bottleneck. However, **if you are running high-throughput multi-table pipelines with WASM transforms**, consider the following patterns:
+
+### Scaling with a WasmRuntime pool
+
+Instantiate multiple `WasmRuntime` instances (one per logical shard or per available core) and dispatch events across them. Wasmtime module compilation is the expensive step; use `WasmModule::load_from_file` once and clone the compiled module to each instance.
+
+```rust
+// Pseudo-code: pool of runtime instances
+let module = Arc::new(WasmModule::load_from_file("transform.wasm", config)?);
+let pool: Vec<_> = (0..num_cpus::get())
+    .map(|_| WasmRuntime::from_module(Arc::clone(&module)))
+    .collect();
+
+// Dispatch: pick an instance by thread-local index or round-robin.
+```
+
+### Key constraints
+- Do **not** share a single `WasmRuntime` across threads without external synchronization — doing so will serialize all transforms and nullify parallelism.
+- Each runtime instance owns its own linear memory space; guest state is not shared between pool members.
+- Memory and timeout limits apply per-instance, per-invocation.
 
 ## Rust API Reference
 Implemented in [src/wasm/runtime.rs](../src/wasm/runtime.rs):

@@ -67,6 +67,8 @@ pub struct PostgresStreamHandle {
     events_polled: u64,
     max_events_per_poll: usize,
     stream_poll_interval_ms: u64,
+    table_include_list: Vec<String>,
+    table_exclude_list: Vec<String>,
 }
 
 impl PostgresStreamHandle {
@@ -76,6 +78,8 @@ impl PostgresStreamHandle {
         provider: Box<dyn PgOutputMessageProvider>,
         max_events_per_poll: usize,
         stream_poll_interval_ms: u64,
+        table_include_list: Vec<String>,
+        table_exclude_list: Vec<String>,
     ) -> Self {
         Self {
             source_name,
@@ -88,6 +92,8 @@ impl PostgresStreamHandle {
             events_polled: 0,
             max_events_per_poll: max_events_per_poll.max(1),
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
+            table_include_list,
+            table_exclude_list,
         }
     }
 }
@@ -466,6 +472,7 @@ impl PostgresConnection {
             }
         }
 
+        self.config.transport.warn_if_insecure("postgres");
         let connect_result: Result<()> = match &self.config.transport {
             TransportConfig::Plaintext => {
                 let connect_config = self.config.build_connect_config()?;
@@ -1081,6 +1088,8 @@ mod tests {
             Box::new(provider),
             super::MAX_EVENTS_PER_POLL,
             super::STREAM_POLL_INTERVAL_MS,
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -1365,6 +1374,8 @@ mod tests {
             Box::new(provider),
             super::MAX_EVENTS_PER_POLL,
             super::STREAM_POLL_INTERVAL_MS,
+            Vec::new(),
+            Vec::new(),
         );
         let result = handle.next_events(100).await;
         assert!(result.is_err());

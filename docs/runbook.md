@@ -274,6 +274,22 @@ SHOW MASTER STATUS\G
 -- Note: GTID set for checkpoint tracking
 ```
 
+### MysqlOffset Resume Priority
+
+`MysqlOffset` tracks two parallel position fields: `gtid` (a GTID set string), and `binlog_file` + `binlog_pos` (a traditional file/position pair). Understanding which takes precedence on restart is important for recovery operations.
+
+**Resume order:**
+
+1. **GTID-mode servers** — When the server has `gtid_mode=ON` and the stored `gtid` field is non-empty, the connector resumes using the GTID set. This is the preferred path because GTID positions are server-globally unique and survive binlog rotation without ambiguity.
+
+2. **Non-GTID or empty GTID field** — When `gtid` is empty (GTID mode off, or a legacy checkpoint written before GTID support), the connector falls back to `binlog_file` + `binlog_pos`. This requires the named binlog file to still be present on the server (see [Binlog Retention Strategy](#binlog-retention-strategy)).
+
+**Operational implications:**
+
+- If you migrate a server from non-GTID to GTID mode, existing checkpoints will have an empty `gtid` field. The runtime will use the file/position fallback until at least one new checkpoint is written in GTID mode.
+- If binlog files have been purged and the checkpoint references a rotated-away file, restart will fail with a `SourceError` indicating the position is unavailable. Remedy: reset the checkpoint to an empty offset and trigger a fresh snapshot.
+- For cross-server failover (primary → replica promotion), GTID-mode checkpoints are portable; file/position checkpoints are not — they are specific to the binlog sequence of the original primary.
+
 ---
 
 ## SQL Server Source Management
@@ -386,6 +402,54 @@ First response actions:
 1. Increase `max_events_per_poll` for burst absorption.
 2. Increase `stream_poll_interval_ms` modestly (for example, 1000 -> 2000) to reduce poll churn.
 3. Validate source indexing and CDC capture table growth on SQL Server.
+
+---
+
+## Structured Log Field Schema
+
+All connector events emitted by `StructuredLogger` use the `tracing` framework and include a consistent set of structured fields. This schema is stable and suitable for log aggregation pipeline alert rules.
+
+### Common fields (present on every log record)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source_type` | `string` | Connector type (`postgres`, `mysql`, `mariadb`, `sqlserver`) |
+| `event` | `string` | Event name (see table below) |
+
+### Event names and additional fields
+
+| Event name (`event =`) | Level | Additional fields | Description |
+|---|---|---|---|
+| `source_connected` | INFO | — | Source database connection established |
+| `source_disconnected` | INFO | — | Source database connection closed |
+| `insecure_transport` | WARN | `mode`, `details` | TLS verification is disabled |
+| `connection_error` | ERROR | `error` | Connection-level error |
+| `snapshot_started` | INFO | `table` | Snapshot phase started for table |
+| `snapshot_chunk_received` | DEBUG | `table`, `chunk_size` | Snapshot batch received |
+| `snapshot_complete` | INFO | `table` | Snapshot phase completed for table |
+| `stream_started` | INFO | `offset` | Streaming replication started at offset |
+| `stream_events_received` | DEBUG | `table`, `event_count`, `offset` | Batch of stream events received |
+| `stream_error` | ERROR | `error` | Streaming-level error |
+| `checkpoint_saved` | INFO | `offset`, `committed_count` | Checkpoint durably persisted |
+| `checkpoint_loaded` | INFO | `offset`, `committed_count` | Checkpoint loaded on startup |
+| `checkpoint_error` | WARN | `error` | Checkpoint operation warning |
+| `transform_applied` | DEBUG | `transform`, `table`, `offset` | Transform stage applied to event |
+| `transform_error` | WARN | `transform`, `error` | Transform stage returned an error |
+
+> **Note:** `error` fields are sanitized by `sanitize_context()` — DSN credentials and common key=value secrets are redacted before logging. You will see `***redacted***` in place of password/token values.
+
+### Example log-aggregation filter (Loki)
+
+```logql
+{app="rustcdc"} | json | event = "checkpoint_saved" | committed_count > 0
+```
+
+### Alert rule guidance
+
+- Alert on `event = "source_disconnected"` sustained for > 30s with no `source_connected` following.
+- Alert on `event = "stream_error"` rate > 1/min.
+- Alert on `event = "checkpoint_error"` — any occurrence warrants investigation.
+- Use `committed_count` from `checkpoint_saved` to derive event throughput rate.
 
 ---
 

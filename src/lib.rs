@@ -14,12 +14,14 @@ pub mod outbox;
 pub mod schema_history;
 pub mod sink;
 pub mod source;
+#[cfg(any(test, feature = "test-harnesses"))]
 pub mod testkit;
 pub mod transform;
 pub mod wasm;
 
 pub use crate::core::{
-    fingerprint_event, AckToken, CdcRuntime, Error, Event, EventBatch, EventIdempotencyGuard,
+    fingerprint_event_stable, fingerprint_event_transient, AckToken, CdcRuntime, Error, Event,
+    EventBatch, EventIdempotencyGuard,
     EventTracer, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
     Offset, Operation, PostCommitSourceConfirmPolicy, Result, RuntimeAdminSnapshot, RuntimeConfig,
     RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider,
@@ -58,9 +60,10 @@ pub use crate::source::{PostgresConnection, PostgresSourceConfig};
 #[cfg(feature = "sqlserver")]
 pub use crate::source::{SqlServerConnection, SqlServerSourceConfig};
 pub use crate::transform::{
-    FieldMappingConfig, FieldMappingTransform, FilterField, FilterOperator, FilterProjectionConfig,
-    FilterProjectionTransform, FilterRule, MaskHashConfig, MaskHashTransform, MaskRule,
-    RouteConfig, RouteTransform, Transform, TransformPipeline, UnwrapConfig, UnwrapTransform,
+    FieldMappingConfig, FieldMappingTransform, FilterField, FilterMode, FilterOperator,
+    FilterProjectionConfig, FilterProjectionTransform, FilterRule, MaskHashConfig,
+    MaskHashTransform, MaskRule, RouteConfig, RouteTransform, Transform, TransformPipeline,
+    UnwrapConfig, UnwrapTransform,
 };
 pub use crate::wasm::{
     TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,

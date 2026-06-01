@@ -181,6 +181,31 @@ impl TransportConfig {
             _ => None,
         }
     }
+
+    /// Emit `tracing::warn!` events for any insecure TLS flags.
+    ///
+    /// Call this once per connection attempt. When `allow_invalid_certificates`
+    /// or `allow_invalid_hostnames` is set, a structured warning is emitted so
+    /// that log-aggregation pipelines and alerting rules can detect accidental
+    /// production use of insecure TLS configuration.
+    pub fn warn_if_insecure(&self, source_label: &str) {
+        if self.allow_invalid_certificates() {
+            tracing::warn!(
+                target: "rustcdc::transport::security",
+                source = source_label,
+                flag = "allow_invalid_certificates",
+                "TLS certificate verification is disabled — do not use in production"
+            );
+        }
+        if self.allow_invalid_hostnames() {
+            tracing::warn!(
+                target: "rustcdc::transport::security",
+                source = source_label,
+                flag = "allow_invalid_hostnames",
+                "TLS hostname verification is disabled — do not use in production"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

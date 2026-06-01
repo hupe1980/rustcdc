@@ -208,6 +208,45 @@ async fn process_batch(events: &[rustcdc::Event]) -> Result<usize> {
 The fingerprint includes source position, transaction sequence metadata, and
 payload shape so events that share coarse offsets remain distinguishable.
 
+### Restart Replay Window
+
+**The in-memory idempotency guard resets on every process restart.** It provides
+within-session deduplication only, not cross-restart deduplication.
+
+On restart the runtime replays all events between the last durable checkpoint and
+the current source position. Events in this window that were already delivered
+before the crash **will be re-delivered** and will not be detected as duplicates
+by the in-memory guard (because its state was lost).
+
+**Implications:**
+
+- The replay window size is bounded by your commit frequency. Committing after
+  each batch keeps the window small.
+- For sink operations that are naturally idempotent (upsert-by-PK, conditional
+  inserts, etc.) this is safe to ignore.
+- For non-idempotent sinks (append-only log ingest, payment triggers, etc.) you
+  **must** provide cross-restart deduplication at the sink layer.
+
+**Cross-restart deduplication pattern:**
+
+Use `fingerprint_event_stable` (SHA-256 based, deterministic across process
+restarts) and persist seen fingerprints in your sink's storage:
+
+```rust
+use rustcdc::idempotency::fingerprint_event_stable;
+
+// On each delivered event:
+let fingerprint = fingerprint_event_stable(&event);
+if !sink_has_seen(&fingerprint).await? {
+    sink_write(&event).await?;
+    sink_mark_seen(&fingerprint).await?;
+}
+```
+
+Unlike `fingerprint_event_transient` (which uses a per-process random seed),
+`fingerprint_event_stable` produces the same fingerprint for the same event
+across restarts, making it safe to persist and check against a durable store.
+
 ## Streaming Consumption
 
 `event_batches()` provides a stream-based consumption model for non-empty batches.
@@ -317,6 +356,65 @@ let transform = FilterProjectionTransform::new(FilterProjectionConfig {
     include_columns: Some(vec!["id".into(), "email".into()]),
     exclude_columns: None,
 })?;  // returns Err(ConfigError) for invalid filter values
+```
+
+### Content-based filtering
+
+`FilterField::AfterField(path)` and `FilterField::BeforeField(path)` match
+against fields inside the event payload using a dot-separated path (e.g. `"user.country"`).
+
+Available operators: `Eq`, `Ne`, `Contains`, `Regex`, `Lt`, `LtEq`, `Gt`, `GtEq`.
+
+```rust
+// Keep only events where after["status"] == "active"
+FilterRule::new(FilterField::AfterField("status".into()), FilterOperator::Eq, "active")
+
+// Keep events where after["amount"] > 100
+FilterRule::new(FilterField::AfterField("amount".into()), FilterOperator::Gt, "100")
+
+// Keep events matching a regex on after["email"]
+FilterRule::new(FilterField::AfterField("email".into()), FilterOperator::Regex, r"@example\.com$")
+```
+
+`FilterOperator::Regex` patterns are compiled once at construction; invalid
+patterns return `Err(ConfigError)` at `FilterProjectionTransform::new` time.
+
+### Sensitive-data masking (`MaskHashTransform`)
+
+> **⚠ GDPR / privacy warning**
+>
+> `MaskRule::Hash` (SHA-256) is **deterministic and unsalted**.  For
+> low-cardinality fields (e.g., `gender`, `country_code`, `status`) or any
+> field whose values are enumerable, an attacker can reverse the hash via a
+> pre-computed lookup table.  **Do not rely on `Hash` alone for GDPR
+> pseudonymization compliance.**
+>
+> Recommended approaches for GDPR-compliant pseudonymization:
+> - Use `MaskRule::Encrypt` (AES-256-GCM) — provides reversible but opaque tokens.
+> - Add a site-specific HMAC secret by pre-hashing `format!("{secret}:{value}")`
+>   before storing, then applying `MaskRule::Hash` on the HMAC output.
+> - Consider `MaskRule::Redact` or `MaskRule::Null` for fields that must be
+>   fully suppressed in the downstream stream.
+>
+> **Default behaviour change in 0.2**: `MaskHashConfig::default()` now uses
+> `default_rule: MaskRule::Passthrough`, meaning unlisted fields are passed
+> through unchanged.  Use `MaskHashConfig::hash_all()` if you need the old
+> "hash everything" behaviour.
+
+```rust
+use rustcdc::{MaskHashConfig, MaskHashTransform, MaskRule};
+
+// Hash only specified PII fields; leave everything else unchanged.
+let mut config = MaskHashConfig::default();
+config.mask_rules.insert("email".into(), MaskRule::Hash);
+config.mask_rules.insert("ssn".into(),   MaskRule::Null);
+
+// Encrypt a field with AES-256-GCM (requires "encryption" feature).
+#[cfg(feature = "encryption")]
+config.mask_rules.insert("credit_card".into(), MaskRule::Encrypt("my-secret".into()));
+
+// Opt-in aggressive mode: SHA-256 every field not explicitly configured.
+let aggressive = MaskHashConfig::hash_all();
 ```
 
 ## Related Documentation
