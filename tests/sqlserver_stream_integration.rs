@@ -205,28 +205,33 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
     )
     .await?;
 
-    let resumed_events = collect_events_with_deadline(
-        &mut *resumed_stream,
-        &mut admin,
-        "rustcdc_test",
-        std::time::Duration::from_secs(90),
-        false,
-    )
-    .await?;
-
-    assert!(
-        !resumed_events.is_empty(),
-        "expected resumed sqlserver stream to emit events within deadline"
-    );
-    assert!(
-        resumed_events.iter().any(|event| event
-            .after
-            .as_ref()
-            .and_then(|after| after.get("id"))
-            .map(|value| value.to_string())
-            == Some("3".into())),
-        "expected resumed stream to include insert id=3"
-    );
+    // Poll explicitly for the id=3 event rather than stopping at the first
+    // non-empty batch.  The resumed stream may emit heartbeats, schema-change
+    // events, or other non-DML events before the CDC capture pass picks up the
+    // insert, so a simple "stop on any event" strategy is inherently racy.
+    let cdc_scan_sql = "USE rustcdc_test; EXEC sys.sp_cdc_scan";
+    let resume_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut found_id3 = false;
+    while std::time::Instant::now() < resume_deadline {
+        let batch = resumed_stream.next_events(200).await?;
+        if batch.is_empty() {
+            let _ = sql_exec(&mut admin, cdc_scan_sql).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        if batch.iter().any(|event| {
+            event
+                .after
+                .as_ref()
+                .and_then(|after| after.get("id"))
+                .map(|value| value.to_string())
+                == Some("3".into())
+        }) {
+            found_id3 = true;
+            break;
+        }
+    }
+    assert!(found_id3, "expected resumed stream to include insert id=3");
 
     resumed_source.close().await;
     Ok(())
