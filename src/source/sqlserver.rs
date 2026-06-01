@@ -124,7 +124,7 @@ pub struct SqlServerSourceConfig {
     /// The trigger fires synchronously during each `TRUNCATE TABLE` statement and
     /// records the affected schema and table, together with the current CDC maximum
     /// LSN captured via `sys.fn_cdc_get_max_lsn()`.  rustcdc polls the shadow table
-    /// alongside the normal CDC change tables and emits [`Operation::Truncate`] events
+    /// alongside the normal CDC change tables and emits [`crate::Operation::Truncate`] events
     /// positioned after all DML changes at or before the captured LSN.
     ///
     /// ## Setup requirements
