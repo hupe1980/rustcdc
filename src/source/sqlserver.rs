@@ -689,8 +689,10 @@ impl StreamHandle for SqlServerStreamHandle {
         //
         // Collect changes from *all* capture instances for the current LSN
         // window, sort them by commit LSN for global cross-table ordering, then
-        // store in `window_buffer`.  The window is NOT advanced here — it is
-        // advanced in priority 3 once the buffer drains completely.
+        // store in `window_buffer`.  When all events fit in a single page the
+        // window is advanced immediately after the drain (see below).  For
+        // multi-page windows the advance is deferred to priority 3 once the
+        // buffer fully drains, keeping the at-least-once guarantee intact.
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
 
         loop {
@@ -764,10 +766,17 @@ impl StreamHandle for SqlServerStreamHandle {
                     .events_polled
                     .saturating_add(self.window_buffer.len() as u64);
 
-                // Drain the first page and return.  Window advancement is
-                // deferred to priority 3 once the buffer empties.
+                // Drain the first page and return.  If the buffer is now empty
+                // (all events fit in a single page) advance the window here so
+                // the next call queries a fresh LSN range instead of
+                // re-delivering this window indefinitely.  Multi-page batches
+                // defer the advance to priority 3 once the buffer fully drains,
+                // keeping the at-least-once guarantee intact.
                 let count = self.max_events_per_poll.min(self.window_buffer.len());
                 let batch: Vec<Event> = self.window_buffer.drain(..count).collect();
+                if self.window_buffer.is_empty() {
+                    self.advance_window().await?;
+                }
                 return Ok(batch);
             }
 
