@@ -327,16 +327,16 @@ mod tests {
     }
 
     #[test]
-    fn inline_secret_serialization_is_rejected() {
+    fn inline_secret_serializes_as_redacted() {
         let secret = SecretString::new("top-secret");
-        let error = serde_json::to_string(&secret).unwrap_err().to_string();
-        assert!(error.contains("inline secrets cannot be serialized"));
+        let json = serde_json::to_string(&secret).unwrap();
+        assert_eq!(json, r#""[REDACTED]""#);
     }
 
     #[test]
-    fn provider_secret_serialization_is_rejected() {
+    fn provider_secret_serializes_as_redacted() {
         let secret = SecretString::from_provider("static", "db/password", Arc::new(StaticProvider));
-        let error = serde_json::to_string(&secret).unwrap_err().to_string();
-        assert!(error.contains("provider-backed secrets cannot be serialized"));
+        let json = serde_json::to_string(&secret).unwrap();
+        assert_eq!(json, r#""[REDACTED]""#);
     }
 }

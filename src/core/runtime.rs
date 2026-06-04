@@ -1644,7 +1644,9 @@ mod tests {
 
         let prometheus = runtime.admin_metrics_prometheus();
         assert!(prometheus.contains("cdc_runtime_readiness"));
-        assert!(prometheus.contains("cdc_runtime_events_polled_total 1"));
+        assert!(prometheus.contains("cdc_runtime_events_polled_total"));
+        assert!(prometheus.contains("source_type=\""));
+        assert!(prometheus.contains("} 1"));
         assert!(prometheus.contains("capability=\"snapshot\""));
     }
 
