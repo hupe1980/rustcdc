@@ -109,7 +109,6 @@ struct VersionedSchema {
     schema: Option<TableSchema>,
 }
 
-/// In-memory schema-history implementation for tests and local development.
 /// In-memory schema-history backend.
 ///
 /// Suitable for tests, short-lived processes, and embeddings where DDL history

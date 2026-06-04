@@ -429,7 +429,7 @@ impl CdcRuntime {
         Ok(drained)
     }
 
-    /// Drain all in-flight events, acknowledge them, then stop the runtime cleanly.
+    /// Drain buffered in-flight events, acknowledge them, then stop the runtime cleanly.
     ///
     /// This is a convenience shortcut for the common shutdown pattern:
     ///
@@ -440,6 +440,21 @@ impl CdcRuntime {
     /// }
     /// runtime.stop().await?;
     /// ```
+    ///
+    /// # Termination semantics
+    ///
+    /// `drain_and_stop` terminates on the **first empty batch** returned by
+    /// `poll_event_batch()`. For a finite source (e.g. a snapshot or a mock),
+    /// this drains all buffered events. For a **continuous live-replication
+    /// stream**, the source will appear empty as soon as the internal buffer
+    /// drains — which may happen quickly even while the upstream database is
+    /// still producing writes. In that case `drain_and_stop` stops after the
+    /// current buffer is consumed, not after the stream is logically
+    /// exhausted.
+    ///
+    /// For continuous streams, prefer calling [`stop()`] after your consumer
+    /// loop signals shutdown, or use [`force_stop()`] if you need an
+    /// unconditional immediate halt.
     ///
     /// Returns the total number of events that were drained and committed.
     pub async fn drain_and_stop(&mut self) -> Result<usize> {

@@ -9,9 +9,15 @@ use std::sync::Arc;
 /// `Arc` allocation), which is consistent with the immutable nature of a fully
 /// constructed `ClientConfig`.
 ///
-/// Serialization is intentionally omitted — a `RustlsClientConfig` cannot be
-/// round-tripped through JSON/TOML and should only appear at runtime injection
-/// sites (tests, embedded binaries) that already hold a constructed `ClientConfig`.
+/// # Serialization
+///
+/// This type is serializable **only as a non-round-trippable placeholder**.
+/// Serialization emits the string `"<RustlsClientConfig>"` so that structs
+/// containing a `TransportConfig` (e.g. admin snapshots, tracing spans) do
+/// not panic or error during JSON serialization. Deserialization always
+/// returns an error — a `RustlsClientConfig` must be injected at runtime
+/// (e.g. from a pre-built `Arc<rustls::ClientConfig>`) and cannot be
+/// reconstructed from serialized text.
 #[cfg(feature = "tls")]
 #[derive(Clone, Debug)]
 pub struct RustlsClientConfig(pub Arc<rustls::ClientConfig>);
