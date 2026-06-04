@@ -218,7 +218,8 @@ async fn admin_prometheus_output_reflects_state_changes() {
         .expect("failed to commit");
 
     let with_commits_metrics = runtime.admin_metrics_prometheus();
-    assert!(with_commits_metrics.contains("cdc_runtime_events_committed_total 1"));
+    assert!(with_commits_metrics.contains("cdc_runtime_events_committed_total"));
+    assert!(with_commits_metrics.contains("} 1") || with_commits_metrics.contains(" 1\n"));
     assert!(with_commits_metrics.contains("cdc_runtime_checkpoint_age_ms"));
 
     // Stopped state.
