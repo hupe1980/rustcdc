@@ -63,16 +63,14 @@ async fn main() -> rustcdc::Result<()> {
                 if batch.is_empty() {
                     continue;
                 }
-                let token = batch.ack_token().ok_or_else(|| {
-                    rustcdc::Error::StateError("runtime returned non-empty batch without ack token".into())
-                })?;
+                let mode = batch.ack_mode();
 
                 for event in batch.events() {
                     println!("{}", event.to_json()?);
                     std::io::stdout().flush().map_err(rustcdc::Error::IoError)?;
                 }
 
-                runtime.commit_ack(token).await?;
+                runtime.commit_ack(mode).await?;
             }
         }
     }

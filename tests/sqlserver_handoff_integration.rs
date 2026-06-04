@@ -87,7 +87,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
 
     assert!(result.snapshot_end_ts.is_some());
     assert!(result.stream_start_ts.is_some());
-    assert!(result.overlap_events_dropped <= 1000);
+    assert!(result.overlap_events_dropped.unwrap_or(0) <= 1000);
 
     // Stream polling after handoff should remain operational even if CDC delivery is delayed.
     sqlserver_testkit::sql_exec(

@@ -3,7 +3,7 @@
 use rustcdc::{
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
     schema_history::InMemorySchemaHistory,
-    CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    AckMode, CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
 };
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -119,9 +119,9 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     let first_batch = poll_non_empty_batch(&mut runtime, 40).await?;
     assert!(first_batch.len() >= 100);
 
-    let token = first_batch
-        .ack_token()
-        .expect("non-empty batch should include ack token");
+    let AckMode::Required(token) = first_batch.ack_mode() else {
+        panic!("non-empty batch should include ack token");
+    };
     let (accepted, _remaining) = token.split_at(50)?;
     runtime.commit_ack(accepted).await?;
 
@@ -168,13 +168,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     let second_batch = poll_non_empty_batch(&mut resumed, 40).await?;
     assert!(second_batch.len() >= 50);
 
-    resumed
-        .commit_ack(
-            second_batch
-                .ack_token()
-                .expect("non-empty batch should include ack token"),
-        )
-        .await?;
+    resumed.commit_ack(second_batch.ack_mode()).await?;
     let reader_after = FileCheckpoint::new(checkpoint_dir.path());
     assert!(reader_after.get_committed_count().await? >= 100);
 
@@ -182,7 +176,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
 }
 
 async fn poll_non_empty_batch(
-    runtime: &mut CdcRuntime<FileCheckpoint, InMemorySchemaHistory>,
+    runtime: &mut CdcRuntime,
     rounds: usize,
 ) -> rustcdc::Result<rustcdc::EventBatch> {
     for _ in 0..rounds {

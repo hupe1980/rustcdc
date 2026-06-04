@@ -273,7 +273,7 @@ fn build_sqlserver_event(
         snapshot: None,
         transaction: Some(TransactionMetadata {
             tx_id: tx_id_from_seqval(seqval_hex),
-            total_events: 1,
+            total_events: Some(1),
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,

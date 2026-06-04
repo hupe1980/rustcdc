@@ -77,8 +77,11 @@ pub struct SnapshotMetadata {
 pub struct TransactionMetadata {
     /// Transaction identifier assigned by the source.
     pub tx_id: u64,
-    /// Total number of events expected in the transaction.
-    pub total_events: u32,
+    /// Total number of events expected in the transaction, if reported by the source.
+    ///
+    /// `None` when the connector does not provide a total-event count for the transaction
+    /// (most CDC protocols do not). Connectors that do know the count should set this.
+    pub total_events: Option<u32>,
     /// Zero-based position of this event within the transaction.
     pub event_index: u32,
 }
@@ -277,17 +280,19 @@ impl Event {
         }
 
         if let Some(transaction) = &self.transaction {
-            if transaction.total_events == 0 {
-                errors.push(ValidationError::new(
-                    "transaction.total_events",
-                    "total_events must be greater than zero",
-                ));
-            }
-            if transaction.event_index >= transaction.total_events {
-                errors.push(ValidationError::new(
-                    "transaction.event_index",
-                    "event_index must be lower than total_events",
-                ));
+            if let Some(total) = transaction.total_events {
+                if total == 0 {
+                    errors.push(ValidationError::new(
+                        "transaction.total_events",
+                        "total_events must be greater than zero when set",
+                    ));
+                }
+                if transaction.event_index >= total {
+                    errors.push(ValidationError::new(
+                        "transaction.event_index",
+                        "event_index must be lower than total_events",
+                    ));
+                }
             }
         }
 
@@ -343,7 +348,7 @@ mod tests {
             }),
             transaction: Some(TransactionMetadata {
                 tx_id: 42,
-                total_events: 2,
+                total_events: Some(2),
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
@@ -440,7 +445,7 @@ mod tests {
         let mut event = valid_event();
         event.transaction = Some(TransactionMetadata {
             tx_id: 9,
-            total_events: 0,
+            total_events: Some(0),
             event_index: 0,
         });
         let errors = event.validate().unwrap_err();
@@ -450,7 +455,7 @@ mod tests {
 
         event.transaction = Some(TransactionMetadata {
             tx_id: 9,
-            total_events: 2,
+            total_events: Some(2),
             event_index: 2,
         });
         let errors = event.validate().unwrap_err();

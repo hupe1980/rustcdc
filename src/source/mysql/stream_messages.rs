@@ -11,7 +11,7 @@ impl MysqlStreamHandle {
     fn tx_meta(&self) -> Option<TransactionMetadata> {
         self.current_tx_id.map(|tx_id| TransactionMetadata {
             tx_id,
-            total_events: 0,
+            total_events: None,
             event_index: self.partial_tx_events.len() as u32,
         })
     }
@@ -67,7 +67,7 @@ impl MysqlStreamHandle {
         let total = self.partial_tx_events.len() as u32;
         for (index, event) in self.partial_tx_events.iter_mut().enumerate() {
             if let Some(tx) = event.transaction.as_mut() {
-                tx.total_events = total;
+                tx.total_events = Some(total);
                 tx.event_index = index as u32;
             }
             event.ts = timestamp_ms;

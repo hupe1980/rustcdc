@@ -17,20 +17,20 @@ pub(super) fn postgres_handoff_result(
             Ok(HandoffResult {
                 snapshot_end_ts: Some(snapshot_end_ts),
                 stream_start_ts: Some(now_millis()),
-                overlap_events_dropped: 0,
+                overlap_events_dropped: None,
                 stream_watermark_gap: Some(stream_watermark_gap),
             })
         }
         (Some(snapshot_end_ts), Some(_snapshot_watermark), None) => Ok(HandoffResult {
             snapshot_end_ts: Some(snapshot_end_ts),
             stream_start_ts: None,
-            overlap_events_dropped: 0,
+            overlap_events_dropped: None,
             stream_watermark_gap: None,
         }),
         (None, None, Some(_stream_watermark)) => Ok(HandoffResult {
             snapshot_end_ts: None,
             stream_start_ts: Some(now_millis()),
-            overlap_events_dropped: 0,
+            overlap_events_dropped: None,
             stream_watermark_gap: None,
         }),
         (Some(_), None, None) => Err(Error::StateError(
@@ -46,7 +46,7 @@ pub(super) fn postgres_handoff_result(
         (None, Some(_), None) | (None, None, None) => Ok(HandoffResult {
             snapshot_end_ts: None,
             stream_start_ts: None,
-            overlap_events_dropped: 0,
+            overlap_events_dropped: None,
             stream_watermark_gap: None,
         }),
     }

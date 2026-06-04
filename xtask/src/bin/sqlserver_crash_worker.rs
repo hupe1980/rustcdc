@@ -61,10 +61,7 @@ async fn main() -> rustcdc::Result<()> {
         let batch = runtime.poll_event_batch().await?;
         if !batch.is_empty() {
             if ack_first_batch {
-                let token = batch
-                    .ack_token()
-                    .ok_or_else(|| rustcdc::Error::StateError("missing ack token".into()))?;
-                runtime.commit_ack(token).await?;
+                runtime.commit_ack(batch.ack_mode()).await?;
             }
             let ids = event_ids(&batch).join(",");
             let payload = format!(

@@ -1,12 +1,29 @@
 use super::*;
 
-impl<C, H> CdcRuntime<C, H>
-where
-    C: crate::checkpoint::Checkpoint + Send + Sync + 'static,
-    H: SchemaHistory + Send + Sync + 'static,
-{
-    /// Commit an acknowledged batch prefix represented by an opaque token.
-    pub async fn commit_ack(&mut self, token: AckToken) -> Result<()> {
+impl CdcRuntime {
+    /// Commit an acknowledged batch, advancing the checkpoint barrier.
+    ///
+    /// Accepts either an [`AckMode`] (returned by [`EventBatch::ack_mode()`]) or a
+    /// raw [`AckToken`] directly.
+    ///
+    /// When `mode` is [`AckMode::NotRequired`] (empty batch or disabled source) this
+    /// is a safe, low-cost no-op. Callers do **not** need to guard the call:
+    ///
+    /// ```no_run
+    /// # use rustcdc::CdcRuntime;
+    /// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+    /// let batch = runtime.poll_event_batch().await?;
+    /// // Always correct — no-op for empty batches, commits for non-empty ones.
+    /// runtime.commit_ack(batch.ack_mode()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn commit_ack(&mut self, mode: impl Into<AckMode>) -> Result<()> {
+        let token = match mode.into() {
+            AckMode::Required(token) => token,
+            AckMode::NotRequired => return Ok(()),
+        };
+
         let pending = self.pending_delivery.as_ref().ok_or_else(|| {
             let error = Error::CheckpointError(
                 "no in-flight batch is available for acknowledgement".into(),
@@ -56,7 +73,7 @@ where
             .tracer
             .trace_checkpoint_barrier("flushing");
         self.commit_barrier
-            .commit(&mut self.config.checkpoint)
+            .commit(&mut *self.config.checkpoint)
             .await
             .inspect_err(|error| self.record_runtime_error("runtime.commit.checkpoint", error))?;
 
@@ -175,7 +192,7 @@ where
             .saturating_add(count as u64);
 
         snapshot
-            .checkpoint(&mut self.config.checkpoint, target_committed_count)
+            .checkpoint(&mut *self.config.checkpoint, target_committed_count)
             .await
             .inspect_err(|error| {
                 self.record_runtime_error("runtime.commit.snapshot_checkpoint", error)

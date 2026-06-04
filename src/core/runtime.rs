@@ -125,6 +125,12 @@ pub struct RuntimeOptions {
     /// a separate thread or async task.
     pub dead_letter_handler:
         Option<std::sync::Arc<dyn Fn(Event, crate::core::Error) + Send + Sync>>,
+    /// Optional upper bound on serialized event bytes per batch.
+    ///
+    /// When set, the runtime will not flush a batch whose total serialized size
+    /// exceeds this value. Set to `None` (the default) to disable byte-level
+    /// throttling and rely only on `max_buffer_size`.
+    pub max_event_bytes: Option<usize>,
 }
 
 impl Default for RuntimeOptions {
@@ -150,6 +156,7 @@ impl Default for RuntimeOptions {
             ),
             connection_retry: Some(ConnectionRetryPolicy::default()),
             dead_letter_handler: None,
+            max_event_bytes: None,
         }
     }
 }
@@ -222,6 +229,15 @@ impl RuntimeOptions {
     /// up to `max_retries` times, sleeping between attempts, before propagating.
     pub fn with_connection_retry(mut self, policy: ConnectionRetryPolicy) -> Self {
         self.connection_retry = Some(policy);
+        self
+    }
+
+    /// Set an upper bound on serialized event bytes per batch.
+    ///
+    /// The runtime will not flush a batch whose total serialized size exceeds
+    /// this value. Pass `None` to remove the limit.
+    pub fn with_max_event_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_event_bytes = Some(max_bytes);
         self
     }
 }
@@ -297,6 +313,24 @@ impl Default for ConnectionRetryPolicy {
 }
 
 impl ConnectionRetryPolicy {
+    /// Set the maximum number of retries (`None` = retry indefinitely).
+    pub fn max_retries(mut self, n: Option<u32>) -> Self {
+        self.max_retries = n;
+        self
+    }
+
+    /// Set the initial delay between retries in milliseconds.
+    pub fn initial_delay_ms(mut self, ms: u64) -> Self {
+        self.initial_delay_ms = ms;
+        self
+    }
+
+    /// Set the maximum delay cap for exponential backoff in milliseconds.
+    pub fn max_delay_ms(mut self, ms: u64) -> Self {
+        self.max_delay_ms = ms;
+        self
+    }
+
     /// Validate the policy fields, returning an error for obviously wrong configurations.
     ///
     /// Constraints:
@@ -481,21 +515,37 @@ impl std::fmt::Display for RuntimeState {
 /// Embeddable admin snapshot for runtime introspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAdminSnapshot {
+    /// Connector type name (e.g. `"postgres"`, `"mysql"`). `None` when source is disabled.
     pub source_type: Option<String>,
+    /// Current lifecycle state: `"idle"`, `"running"`, `"stopping"`, or `"stopped"`.
     pub state: String,
+    /// `true` when the runtime is ready to serve events (Running + healthy source).
     pub readiness: bool,
+    /// `true` when the runtime process is alive (not permanently failed).
     pub liveness: bool,
+    /// Set of capabilities reported by the active connector.
     pub capabilities: ConnectorCapabilities,
+    /// Number of events currently held in the in-memory event buffer.
     pub buffer_depth: usize,
+    /// Number of events delivered to the caller but not yet acknowledged via `commit_ack`.
     pub in_flight_events: usize,
+    /// `true` while a snapshot phase is active (initial bulk copy in progress).
     pub snapshot_active: bool,
+    /// `true` while a CDC change-stream connection is open.
     pub stream_active: bool,
+    /// `true` once the snapshot-to-stream handoff has been completed at least once.
     pub handoff_complete: bool,
+    /// Cumulative count of events polled from the source since `start()`. Never resets.
     pub total_events_polled: u64,
+    /// Cumulative count of events committed (acknowledged) since `start()`. Never resets.
     pub total_events_committed: u64,
+    /// Cumulative count of events suppressed by the idempotency guard since `start()`. Never resets.
     pub total_events_deduplicated: u64,
+    /// Unix epoch milliseconds when `start()` was last called. `None` before first start.
     pub started_at_ms: Option<u64>,
+    /// Unix epoch milliseconds of the last successful `poll_event_batch` call. `None` if never polled.
     pub last_poll_at_ms: Option<u64>,
+    /// Unix epoch milliseconds of the last successful `commit_ack` call. `None` if never committed.
     pub last_commit_at_ms: Option<u64>,
     /// Age of the last durable checkpoint in milliseconds (None if never committed).
     pub checkpoint_age_ms: Option<u64>,
@@ -547,7 +597,68 @@ impl AckToken {
     }
 }
 
-/// Delivered runtime events paired with an opaque acknowledgement token.
+/// Describes whether an [`EventBatch`] requires an explicit checkpoint commit.
+///
+/// `commit_ack()` on [`CdcRuntime`] accepts either `AckMode` or an [`AckToken`]
+/// directly (via [`From<AckToken>`]).
+///
+/// # Contract
+///
+/// | Variant | When returned | What caller must do |
+/// |---|---|---|
+/// | `Required(token)` | Non-empty batch with at-least-once delivery active | Call `runtime.commit_ack(mode)` or `runtime.commit_ack(token)`; omitting it stalls the commit barrier and blocks further checkpoint progress. |
+/// | `NotRequired` | Empty batch, or source configured without at-least-once delivery (e.g. `RuntimeSourceConfig::Disabled`) | No action needed — omitting the call is safe and correct. |
+///
+/// # Example
+///
+/// ```no_run
+/// # use rustcdc::{CdcRuntime, AckMode};
+/// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+/// let batch = runtime.poll_event_batch().await?;
+/// // Process events ...
+/// // Then commit regardless of whether the batch was empty:
+/// runtime.commit_ack(batch.ack_mode()).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckMode {
+    /// The batch must be acknowledged; `token` carries the delivery reference.
+    Required(AckToken),
+    /// No acknowledgement is needed for this batch.
+    NotRequired,
+}
+
+impl AckMode {
+    /// Return the inner token if acknowledgement is required.
+    pub fn token(self) -> Option<AckToken> {
+        match self {
+            Self::Required(token) => Some(token),
+            Self::NotRequired => None,
+        }
+    }
+
+    /// Return `true` when the batch must be acknowledged.
+    pub fn is_required(&self) -> bool {
+        matches!(self, Self::Required(_))
+    }
+}
+
+impl From<AckToken> for AckMode {
+    fn from(token: AckToken) -> Self {
+        Self::Required(token)
+    }
+}
+
+impl From<Option<AckToken>> for AckMode {
+    fn from(opt: Option<AckToken>) -> Self {
+        match opt {
+            Some(token) => Self::Required(token),
+            None => Self::NotRequired,
+        }
+    }
+}
+
 ///
 /// Internally the events vector is reference-counted so that the runtime can
 /// keep a copy in `pending_delivery` for replay without an O(n) clone per
@@ -579,9 +690,28 @@ impl EventBatch {
         Arc::try_unwrap(self.events).unwrap_or_else(|arc| (*arc).clone())
     }
 
-    /// Return the acknowledgement token for this delivery, if any events were delivered.
-    pub fn ack_token(&self) -> Option<AckToken> {
-        self.ack_token.clone()
+    /// Return the acknowledgement mode for this batch.
+    ///
+    /// - [`AckMode::Required`] — the batch contains events and at-least-once delivery is
+    ///   active. You **must** call `runtime.commit_ack(batch.ack_mode())` to advance the
+    ///   commit barrier. Omitting the call stalls checkpoint progress indefinitely.
+    /// - [`AckMode::NotRequired`] — the batch is empty, or the source is configured without
+    ///   at-least-once delivery. Calling `commit_ack` is a safe no-op in this case.
+    ///
+    /// Passing the return value directly to `commit_ack` is always correct:
+    /// ```no_run
+    /// # use rustcdc::CdcRuntime;
+    /// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+    /// let batch = runtime.poll_event_batch().await?;
+    /// runtime.commit_ack(batch.ack_mode()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ack_mode(&self) -> AckMode {
+        match self.ack_token.clone() {
+            Some(token) => AckMode::Required(token),
+            None => AckMode::NotRequired,
+        }
     }
 
     /// Number of events in the batch.
@@ -592,6 +722,13 @@ impl EventBatch {
     /// Whether the batch is empty.
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+
+    /// Returns the smallest `ts` (milliseconds since epoch) across all events in this batch.
+    ///
+    /// Returns `None` when the batch is empty.
+    pub fn oldest_event_source_timestamp_ms(&self) -> Option<u64> {
+        self.events.iter().map(|e| e.ts).min()
     }
 }
 
@@ -685,8 +822,7 @@ impl std::fmt::Display for PostCommitSourceConfirmPolicy {
 }
 
 /// Runtime configuration for embedded execution.
-#[derive(Clone)]
-pub struct RuntimeConfig<C, H> {
+pub struct RuntimeConfig {
     /// Source configuration used by the runtime.
     pub source: RuntimeSourceConfig,
     /// Snapshot table list used on first run when no checkpoint exists.
@@ -698,22 +834,26 @@ pub struct RuntimeConfig<C, H> {
     /// snapshot + handoff path.
     pub incremental_snapshot: Option<IncrementalSnapshotConfig>,
     /// Checkpoint backend owned by the runtime.
-    pub checkpoint: C,
+    pub checkpoint: Box<dyn crate::checkpoint::Checkpoint>,
     /// Schema history backend owned by the runtime.
-    pub schema_history: H,
+    pub schema_history: Box<dyn SchemaHistory>,
     /// Explicit runtime options including observability and tuning defaults.
     pub options: RuntimeOptions,
 }
 
-impl<C, H> RuntimeConfig<C, H> {
-    /// Create a config with explicit runtime options using no-op observability defaults.
-    pub fn new(source: RuntimeSourceConfig, checkpoint: C, schema_history: H) -> Self {
+impl RuntimeConfig {
+    /// Create a config boxing the provided checkpoint and schema history implementations.
+    pub fn new<C, H>(source: RuntimeSourceConfig, checkpoint: C, schema_history: H) -> Self
+    where
+        C: crate::checkpoint::Checkpoint + 'static,
+        H: SchemaHistory + 'static,
+    {
         Self {
             source,
             snapshot_tables: Vec::new(),
             incremental_snapshot: None,
-            checkpoint,
-            schema_history,
+            checkpoint: Box::new(checkpoint),
+            schema_history: Box::new(schema_history),
             options: RuntimeOptions::default(),
         }
     }
@@ -988,8 +1128,8 @@ impl RuntimeSource {
 }
 
 /// Embedded runtime for source orchestration.
-pub struct CdcRuntime<C, H> {
-    config: RuntimeConfig<C, H>,
+pub struct CdcRuntime {
+    config: RuntimeConfig,
     state: RuntimeState,
     injected_events: VecDeque<Event>,
     pending_source_events: VecDeque<Event>,
@@ -1014,11 +1154,7 @@ pub struct CdcRuntime<C, H> {
     idempotency_guard: Option<EventIdempotencyGuard>,
 }
 
-impl<C, H> CdcRuntime<C, H>
-where
-    C: crate::checkpoint::Checkpoint + Send + Sync + 'static,
-    H: SchemaHistory + Send + Sync + 'static,
-{
+impl CdcRuntime {
     fn observability(&self) -> &RuntimeObservability {
         &self.config.options.observability
     }
@@ -1052,7 +1188,7 @@ where
     }
 
     /// Create a new runtime.
-    pub fn new(config: RuntimeConfig<C, H>) -> Result<Self> {
+    pub fn new(config: RuntimeConfig) -> Result<Self> {
         if config.options.max_buffer_size == 0 {
             return Err(Error::ConfigError(
                 "max_buffer_size must be greater than zero".into(),
@@ -1130,7 +1266,7 @@ where
         Ok(Some(guard))
     }
 
-    fn build_source(config: &RuntimeConfig<C, H>) -> Result<RuntimeSource> {
+    fn build_source(config: &RuntimeConfig) -> Result<RuntimeSource> {
         match &config.source {
             #[cfg(feature = "postgres")]
             RuntimeSourceConfig::Postgres(source) => Ok(RuntimeSource::Postgres(
@@ -1187,7 +1323,7 @@ mod tests {
             SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
         },
         ddl_capture::DdlDialect,
-        schema_history::{InMemorySchemaHistory, SchemaHistory, SchemaHistoryRetention},
+        schema_history::{InMemorySchemaHistory, SchemaHistoryRetention},
         transform::Transform,
     };
 
@@ -1195,8 +1331,8 @@ mod tests {
     use crate::checkpoint::FileCheckpoint;
 
     use super::{
-        CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, RuntimeConfig, RuntimeObservability,
-        RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
+        AckMode, CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, RuntimeConfig,
+        RuntimeObservability, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
     };
 
     #[cfg(feature = "postgres")]
@@ -1497,10 +1633,7 @@ mod tests {
         runtime.start().await.unwrap();
         runtime.enqueue_event(event()).unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let json = runtime.admin_snapshot_json().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1556,10 +1689,7 @@ mod tests {
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 1);
 
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
         assert_eq!(
             runtime
                 .config
@@ -1592,7 +1722,7 @@ mod tests {
         let first_batch = first_runtime.poll_event_batch().await.unwrap();
         assert_eq!(first_batch.len(), 2);
         first_runtime
-            .commit_ack(first_batch.ack_token().unwrap())
+            .commit_ack(first_batch.ack_mode())
             .await
             .unwrap();
         assert_eq!(checkpoint.get_committed_count().await.unwrap(), 2);
@@ -1614,7 +1744,7 @@ mod tests {
         let second_batch = second_runtime.poll_event_batch().await.unwrap();
         assert_eq!(second_batch.len(), 1);
         second_runtime
-            .commit_ack(second_batch.ack_token().unwrap())
+            .commit_ack(second_batch.ack_mode())
             .await
             .unwrap();
 
@@ -1639,10 +1769,7 @@ mod tests {
         runtime.start().await.unwrap();
         runtime.enqueue_event(event()).unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let metrics = metrics_state
             .lock()
@@ -1708,7 +1835,9 @@ mod tests {
         runtime.state = RuntimeState::Running;
         runtime.enqueue_event(event()).unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        let token = batch.ack_token().unwrap();
+        let AckMode::Required(token) = batch.ack_mode() else {
+            panic!("expected ack token")
+        };
         runtime.commit_ack(token.clone()).await.unwrap();
 
         let error = runtime.commit_ack(token).await.unwrap_err();
@@ -2050,7 +2179,7 @@ mod tests {
             Ok(crate::source::HandoffResult {
                 snapshot_end_ts: Some(1),
                 stream_start_ts: Some(2),
-                overlap_events_dropped: 0,
+                overlap_events_dropped: None,
                 stream_watermark_gap: None,
             })
         }
@@ -2077,7 +2206,7 @@ mod tests {
     fn make_runtime_with_mock_source(
         source: MockSource,
         snapshot_tables: Vec<String>,
-    ) -> CdcRuntime<InMemoryCheckpoint, crate::schema_history::InMemorySchemaHistory> {
+    ) -> CdcRuntime {
         let checkpoint = InMemoryCheckpoint::default();
         let schema_history = crate::schema_history::InMemorySchemaHistory::default();
         let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
@@ -2095,7 +2224,7 @@ mod tests {
         checkpoint_dir: &std::path::Path,
         source: MockSource,
         snapshot_tables: Vec<String>,
-    ) -> CdcRuntime<FileCheckpoint, crate::schema_history::InMemorySchemaHistory> {
+    ) -> CdcRuntime {
         let checkpoint = FileCheckpoint::new(checkpoint_dir);
         let schema_history = crate::schema_history::InMemorySchemaHistory::default();
         let config = RuntimeConfig::new(source_config, checkpoint, schema_history)
@@ -2131,10 +2260,7 @@ mod tests {
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 3);
 
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
         assert_eq!(
             runtime
                 .config
@@ -2172,7 +2298,9 @@ mod tests {
 
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        let token = batch.ack_token().unwrap();
+        let AckMode::Required(token) = batch.ack_mode() else {
+            panic!("expected ack token")
+        };
         runtime.commit_ack(token).await.unwrap();
 
         let loaded = runtime.config.checkpoint.load().await.unwrap().unwrap();
@@ -2214,24 +2342,15 @@ mod tests {
 
         let batch1 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch1.len(), 2);
-        runtime
-            .commit_ack(batch1.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch1.ack_mode()).await.unwrap();
 
         let batch2 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch2.len(), 2);
-        runtime
-            .commit_ack(batch2.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch2.ack_mode()).await.unwrap();
 
         let batch3 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch3.len(), 1);
-        runtime
-            .commit_ack(batch3.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch3.ack_mode()).await.unwrap();
 
         assert_eq!(
             runtime
@@ -2260,10 +2379,7 @@ mod tests {
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 1);
 
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
         let admin = runtime.admin_snapshot();
         assert_eq!(admin.total_events_deduplicated, 1);
     }
@@ -2290,10 +2406,7 @@ mod tests {
             .unwrap();
         assert_eq!(nonce, 1);
 
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
         let admin = runtime.admin_snapshot();
         assert_eq!(admin.total_events_deduplicated, 1);
     }
@@ -2330,10 +2443,7 @@ mod tests {
             .expect("encrypted payload should be string");
         assert!(encrypted_id.starts_with("enc:"));
 
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
         let admin = runtime.admin_snapshot();
         assert_eq!(admin.total_events_deduplicated, 1);
     }
@@ -2353,18 +2463,12 @@ mod tests {
         // Snapshot chunk.
         let chunk = runtime.poll_event_batch().await.unwrap();
         assert_eq!(chunk.len(), 2);
-        runtime
-            .commit_ack(chunk.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(chunk.ack_mode()).await.unwrap();
 
         // Handoff (snapshot done, stream continues).
         let stream_chunk = runtime.poll_event_batch().await.unwrap();
         assert_eq!(stream_chunk.len(), 1);
-        runtime
-            .commit_ack(stream_chunk.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(stream_chunk.ack_mode()).await.unwrap();
 
         runtime.stop().await.unwrap();
         assert_eq!(runtime.state(), RuntimeState::Stopped);
@@ -2571,10 +2675,7 @@ mod tests {
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 1);
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
         drop(runtime);
 
         let checkpoint = FileCheckpoint::new(checkpoint_dir.path());
@@ -2735,10 +2836,7 @@ mod tests {
 
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let lsns = confirmed
             .lock()
@@ -2772,12 +2870,9 @@ mod tests {
 
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        let error = runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .expect_err(
-                "default fail-fast policy should return an error after durable checkpoint commit",
-            );
+        let error = runtime.commit_ack(batch.ack_mode()).await.expect_err(
+            "default fail-fast policy should return an error after durable checkpoint commit",
+        );
 
         assert!(matches!(error, crate::core::Error::SourceError(_)));
 
@@ -2823,7 +2918,7 @@ mod tests {
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
         runtime
-            .commit_ack(batch.ack_token().unwrap())
+            .commit_ack(batch.ack_mode())
             .await
             .expect("continue policy should keep ack successful after durable checkpoint commit");
 
@@ -2857,7 +2952,7 @@ mod tests {
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
         let error = runtime
-            .commit_ack(batch.ack_token().unwrap())
+            .commit_ack(batch.ack_mode())
             .await
             .expect_err("ack should fail before durable commit when snapshot checkpoint fails");
 
@@ -2895,9 +2990,13 @@ mod tests {
         runtime.start().await.unwrap();
 
         let first = runtime.poll_event_batch().await.unwrap();
-        let first_token = first.ack_token().unwrap();
+        let AckMode::Required(first_token) = first.ack_mode() else {
+            panic!("expected first ack token")
+        };
         let second = runtime.poll_event_batch().await.unwrap();
-        let second_token = second.ack_token().unwrap();
+        let AckMode::Required(second_token) = second.ack_mode() else {
+            panic!("expected second ack token")
+        };
 
         assert_eq!(first.events(), second.events());
         assert_eq!(first_token, second_token);
@@ -2934,7 +3033,9 @@ mod tests {
         runtime.start().await.unwrap();
 
         let batch = runtime.poll_event_batch().await.unwrap();
-        let token = batch.ack_token().unwrap();
+        let AckMode::Required(token) = batch.ack_mode() else {
+            panic!("expected ack token")
+        };
         let (accepted, remainder) = token.split_at(2).unwrap();
 
         runtime.commit_ack(accepted).await.unwrap();
@@ -2950,12 +3051,9 @@ mod tests {
 
         let retried = runtime.poll_event_batch().await.unwrap();
         assert_eq!(retried.len(), 1);
-        assert_eq!(remainder, retried.ack_token());
+        assert_eq!(AckMode::from(remainder), retried.ack_mode());
 
-        runtime
-            .commit_ack(retried.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(retried.ack_mode()).await.unwrap();
         assert_eq!(
             runtime
                 .config
@@ -2990,10 +3088,7 @@ mod tests {
         };
 
         assert_eq!(batch.len(), 1);
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
     }
 
     #[tokio::test]
@@ -3075,10 +3170,7 @@ mod tests {
 
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let saved = runtime
             .config
@@ -3124,10 +3216,7 @@ mod tests {
 
         runtime.start().await.unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let saved = runtime
             .config
@@ -3187,10 +3276,7 @@ mod tests {
         runtime.start().await.unwrap();
         runtime.enqueue_event(event()).unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let admin = runtime.admin_snapshot();
         assert!(admin.checkpoint_age_ms.is_some());
@@ -3249,10 +3335,7 @@ mod tests {
         runtime.start().await.unwrap();
         runtime.enqueue_event(event()).unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let prometheus = runtime.admin_metrics_prometheus();
         assert!(prometheus.contains("cdc_runtime_checkpoint_age_ms"));
@@ -3269,10 +3352,7 @@ mod tests {
         runtime.start().await.unwrap();
         runtime.enqueue_event(event()).unwrap();
         let batch = runtime.poll_event_batch().await.unwrap();
-        runtime
-            .commit_ack(batch.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let json = runtime.admin_snapshot_json().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3600,8 +3680,7 @@ mod tests {
             max_delay_ms: 10,
         });
 
-        let mut runtime: CdcRuntime<InMemoryCheckpoint, InMemorySchemaHistory> =
-            CdcRuntime::new(config).unwrap();
+        let mut runtime: CdcRuntime = CdcRuntime::new(config).unwrap();
         runtime.inject_mock_source(Box::new(source));
 
         // Pre-populate a checkpoint offset so the runtime enters stream mode
@@ -3621,10 +3700,7 @@ mod tests {
         // ── First poll: delivers 1 event from the first stream ────────────
         let batch1 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch1.len(), 1, "first batch should have 1 event");
-        runtime
-            .commit_ack(batch1.ack_token().unwrap())
-            .await
-            .unwrap();
+        runtime.commit_ack(batch1.ack_mode()).await.unwrap();
 
         // ── Second poll: first stream raises a recoverable error,  ────────
         //    the runtime reconnects, and the second stream delivers 2 events.

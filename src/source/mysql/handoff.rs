@@ -97,7 +97,7 @@ pub(super) async fn mysql_handoff_result(
     Ok(HandoffResult {
         snapshot_end_ts: Some(snapshot_end),
         stream_start_ts: Some(now_millis()),
-        overlap_events_dropped: overlap_duplicates,
+        overlap_events_dropped: Some(overlap_duplicates),
         stream_watermark_gap: None,
     })
 }

@@ -263,7 +263,7 @@ mod tests {
             snapshot: None,
             transaction: Some(TransactionMetadata {
                 tx_id: 42,
-                total_events: 1,
+                total_events: Some(1),
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,

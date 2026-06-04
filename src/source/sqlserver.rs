@@ -1346,7 +1346,7 @@ impl Source for SqlServerConnection {
         Ok(HandoffResult {
             snapshot_end_ts: Some(snapshot_end),
             stream_start_ts: Some(now_millis()),
-            overlap_events_dropped,
+            overlap_events_dropped: Some(overlap_events_dropped),
             stream_watermark_gap,
         })
     }

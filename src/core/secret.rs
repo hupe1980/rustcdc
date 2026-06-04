@@ -181,21 +181,17 @@ impl fmt::Display for SecretString {
 }
 
 impl Serialize for SecretString {
-    fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+    /// Serializes as the literal string `"[REDACTED]"`.
+    ///
+    /// Secret values are **never** included in serialized output regardless of
+    /// variant.  Configs serialized to JSON, TOML, or any other format will
+    /// always see `"[REDACTED]"` in the password field, making it safe to log
+    /// config snapshots for diagnostics without leaking credentials.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        match &self.value {
-            SecretValue::Inline(_) => Err(serde::ser::Error::custom(
-                "inline secrets cannot be serialized; use provider/callback references",
-            )),
-            SecretValue::Provider { .. } => Err(serde::ser::Error::custom(
-                "provider-backed secrets cannot be serialized; store a provider reference in code",
-            )),
-            SecretValue::Callback { .. } => Err(serde::ser::Error::custom(
-                "callback-backed secrets cannot be serialized; store the callback in code",
-            )),
-        }
+        serializer.serialize_str("[REDACTED]")
     }
 }
 

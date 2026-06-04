@@ -24,7 +24,7 @@ fn snapshot_read_event(table: &str, id: i64) -> rustcdc::Event {
         }),
         transaction: Some(TransactionMetadata {
             tx_id: 0,
-            total_events: 1,
+            total_events: Some(1),
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,

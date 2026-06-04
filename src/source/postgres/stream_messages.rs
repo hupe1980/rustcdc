@@ -11,6 +11,76 @@ use super::decoder::{
 };
 use super::{format_pg_lsn, pg_timestamp_to_millis, PostgresStreamHandle};
 
+/// Resolve a PostgreSQL built-in type OID to its canonical type name.
+///
+/// Covers the ~50 most common built-in OIDs (from `pg_type` in PostgreSQL 16).
+/// Unknown OIDs fall back to `"pg_type_oid:<N>"` so existing behaviour is preserved.
+fn pg_type_name(oid: u32) -> String {
+    match oid {
+        16 => "bool".into(),
+        17 => "bytea".into(),
+        18 => "char".into(),
+        19 => "name".into(),
+        20 => "int8".into(),
+        21 => "int2".into(),
+        23 => "int4".into(),
+        25 => "text".into(),
+        26 => "oid".into(),
+        700 => "float4".into(),
+        701 => "float8".into(),
+        790 => "money".into(),
+        869 => "inet".into(),
+        650 => "cidr".into(),
+        829 => "macaddr".into(),
+        774 => "macaddr8".into(),
+        1000 => "_bool".into(),
+        1001 => "_bytea".into(),
+        1002 => "_char".into(),
+        1005 => "_int2".into(),
+        1007 => "_int4".into(),
+        1009 => "_text".into(),
+        1014 => "_bpchar".into(),
+        1015 => "_varchar".into(),
+        1016 => "_int8".into(),
+        1017 => "_point".into(),
+        1021 => "_float4".into(),
+        1022 => "_float8".into(),
+        1042 => "bpchar".into(),
+        1043 => "varchar".into(),
+        1082 => "date".into(),
+        1083 => "time".into(),
+        1114 => "timestamp".into(),
+        1115 => "_timestamp".into(),
+        1184 => "timestamptz".into(),
+        1185 => "_timestamptz".into(),
+        1186 => "interval".into(),
+        1187 => "_interval".into(),
+        1231 => "_numeric".into(),
+        1266 => "timetz".into(),
+        1560 => "bit".into(),
+        1562 => "varbit".into(),
+        1700 => "numeric".into(),
+        2278 => "void".into(),
+        2950 => "uuid".into(),
+        2951 => "_uuid".into(),
+        3802 => "jsonb".into(),
+        3807 => "_jsonb".into(),
+        114 => "json".into(),
+        199 => "_json".into(),
+        142 => "xml".into(),
+        143 => "_xml".into(),
+        3614 => "tsvector".into(),
+        3615 => "tsquery".into(),
+        600 => "point".into(),
+        601 => "lseg".into(),
+        602 => "path".into(),
+        603 => "box".into(),
+        604 => "polygon".into(),
+        718 => "circle".into(),
+        _ => format!("pg_type_oid:{oid}"),
+    }
+}
+
 impl PostgresStreamHandle {
     fn tuple_to_json(&self, relation_oid: u32, values: &[PgValue]) -> Option<serde_json::Value> {
         let relation = self.relation_map.get(&relation_oid)?;
@@ -76,7 +146,7 @@ impl PostgresStreamHandle {
     fn tx_meta(&self) -> Option<TransactionMetadata> {
         self.current_xid.map(|xid| TransactionMetadata {
             tx_id: u64::from(xid),
-            total_events: 0,
+            total_events: None,
             event_index: self.partial_tx_events.len() as u32,
         })
     }
@@ -197,7 +267,7 @@ impl PostgresStreamHandle {
                 }
                 ColumnDef {
                     name: column.name.clone(),
-                    data_type: format!("pg_type_oid:{}", column.type_oid),
+                    data_type: pg_type_name(column.type_oid),
                     nullable: !column.is_key(),
                     constraints,
                 }
@@ -252,7 +322,7 @@ impl PostgresStreamHandle {
                     let total = self.partial_tx_events.len() as u32;
                     for event in &mut self.partial_tx_events {
                         if let Some(tx) = event.transaction.as_mut() {
-                            tx.total_events = total;
+                            tx.total_events = Some(total);
                         }
                     }
                     self.events_polled += u64::from(total);

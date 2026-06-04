@@ -144,7 +144,7 @@ impl Source for MockSource {
         Ok(HandoffResult {
             snapshot_end_ts: Some(0),
             stream_start_ts: Some(0),
-            overlap_events_dropped: 0,
+            overlap_events_dropped: None,
             stream_watermark_gap: None,
         })
     }

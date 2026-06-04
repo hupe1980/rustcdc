@@ -39,7 +39,7 @@ fn postgres_crash_interrupted_transaction_fixture_fails_closed() {
             .as_ref()
             .expect("committed event should carry transaction metadata")
             .total_events,
-        1
+        Some(1)
     );
     assert_eq!(replay.events()[2].event.table, "__marker__transaction_end");
     assert_eq!(
@@ -75,7 +75,7 @@ fn mysql_crash_interrupted_transaction_fixture_fails_closed() {
             .as_ref()
             .expect("committed event should carry transaction metadata")
             .total_events,
-        1
+        Some(1)
     );
     assert_eq!(replay.events()[2].event.table, "__marker__transaction_end");
     assert_eq!(

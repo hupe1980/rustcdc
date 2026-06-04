@@ -240,7 +240,7 @@ impl ProtoEvent {
                 .as_ref()
                 .map(|t| ProtoTransactionMetadata {
                     tx_id: t.tx_id,
-                    total_events: t.total_events,
+                    total_events: t.total_events.unwrap_or(0),
                     event_index: t.event_index,
                 }),
             envelope_version: event.envelope_version as u32,
@@ -282,7 +282,7 @@ mod tests {
             }),
             transaction: Some(TransactionMetadata {
                 tx_id: 42,
-                total_events: 3,
+                total_events: Some(3),
                 event_index: 1,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,

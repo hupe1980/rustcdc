@@ -51,7 +51,7 @@ fn compile_wat(name: &str) -> tempfile::NamedTempFile {
 async fn build_runtime_with_wasm(
     wasm_path: impl AsRef<Path>,
     transform_error_policy: TransformErrorPolicy,
-) -> CdcRuntime<InMemoryCheckpoint, InMemorySchemaHistory> {
+) -> CdcRuntime {
     let transform = RuntimeWasmTransform::new(WasmConfig {
         module_path: wasm_path.as_ref().to_path_buf(),
         timeout_ms: 50,

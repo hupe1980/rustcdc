@@ -1,10 +1,6 @@
 use super::*;
 
-impl<C, H> CdcRuntime<C, H>
-where
-    C: crate::checkpoint::Checkpoint + Send + Sync + 'static,
-    H: SchemaHistory + Send + Sync + 'static,
-{
+impl CdcRuntime {
     pub async fn poll_event_batch(&mut self) -> Result<EventBatch> {
         if self.state != RuntimeState::Running {
             let error = Error::StateError("runtime is not running".into());
@@ -540,5 +536,26 @@ where
 
         self.enqueue_event(event.clone())?;
         Ok(Some(event))
+    }
+
+    /// Returns an async stream of [`EventBatch`] values that stops when `token` is cancelled.
+    ///
+    /// Each item yielded from the stream must be acknowledged via [`CdcRuntime::commit_ack`]
+    /// before the next poll to preserve at-least-once delivery guarantees.
+    ///
+    /// The stream terminates with the cancellation signal; no error is emitted for normal
+    /// cancellation. The runtime remains in `Running` state after the stream ends — call
+    /// [`CdcRuntime::stop`] or [`CdcRuntime::drain_and_stop`] to shut down cleanly.
+    pub fn event_batches_cancellable(
+        &mut self,
+        token: tokio_util::sync::CancellationToken,
+    ) -> impl futures_util::Stream<Item = Result<EventBatch>> + '_ {
+        futures_util::stream::unfold((self, token), |(runtime, token)| async move {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => None,
+                result = runtime.poll_event_batch() => Some((result, (runtime, token))),
+            }
+        })
     }
 }

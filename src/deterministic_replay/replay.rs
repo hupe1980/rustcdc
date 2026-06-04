@@ -487,7 +487,7 @@ impl ReplaySession {
         for (event_index, mut replay_event) in transaction.buffered.drain(..).enumerate() {
             replay_event.event.transaction = Some(TransactionMetadata {
                 tx_id: transaction.tx_id,
-                total_events,
+                total_events: Some(total_events),
                 event_index: event_index as u32,
             });
 
@@ -972,7 +972,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .total_events,
-            2
+            Some(2)
         );
         assert_eq!(
             session.events()[2]
@@ -1038,10 +1038,10 @@ mod tests {
         let first_tx = session.events()[1].event.transaction.as_ref().unwrap();
         let second_tx = session.events()[2].event.transaction.as_ref().unwrap();
         assert_eq!(first_tx.tx_id, 0);
-        assert_eq!(first_tx.total_events, 2);
+        assert_eq!(first_tx.total_events, Some(2));
         assert_eq!(first_tx.event_index, 0);
         assert_eq!(second_tx.tx_id, 0);
-        assert_eq!(second_tx.total_events, 2);
+        assert_eq!(second_tx.total_events, Some(2));
         assert_eq!(second_tx.event_index, 1);
     }
 

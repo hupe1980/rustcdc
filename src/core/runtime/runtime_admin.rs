@@ -9,11 +9,7 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
     }
 }
 
-impl<C, H> CdcRuntime<C, H>
-where
-    C: crate::checkpoint::Checkpoint + Send + Sync + 'static,
-    H: SchemaHistory + Send + Sync + 'static,
-{
+impl CdcRuntime {
     /// Return the current lifecycle state.
     pub fn state(&self) -> RuntimeState {
         self.state
@@ -93,12 +89,13 @@ where
         w: &mut W,
     ) -> std::io::Result<()> {
         let admin = self.admin_snapshot();
+        let source_type = admin.source_type.as_deref().unwrap_or("unknown");
 
         writeln!(
             w,
             "# HELP cdc_runtime_readiness Runtime readiness (1=ready, 0=not ready).\n\
              # TYPE cdc_runtime_readiness gauge\n\
-             cdc_runtime_readiness{{state=\"{}\"}} {}",
+             cdc_runtime_readiness{{source_type=\"{source_type}\",state=\"{}\"}} {}",
             admin.state,
             u8::from(admin.readiness)
         )?;
@@ -107,7 +104,7 @@ where
             w,
             "# HELP cdc_runtime_liveness Runtime liveness (1=alive, 0=stopped).\n\
              # TYPE cdc_runtime_liveness gauge\n\
-             cdc_runtime_liveness{{state=\"{}\"}} {}",
+             cdc_runtime_liveness{{source_type=\"{source_type}\",state=\"{}\"}} {}",
             admin.state,
             u8::from(admin.liveness)
         )?;
@@ -116,7 +113,7 @@ where
             w,
             "# HELP cdc_runtime_buffer_depth Number of buffered events waiting for delivery.\n\
              # TYPE cdc_runtime_buffer_depth gauge\n\
-             cdc_runtime_buffer_depth {}",
+             cdc_runtime_buffer_depth{{source_type=\"{source_type}\"}} {}",
             admin.buffer_depth
         )?;
 
@@ -124,7 +121,7 @@ where
             w,
             "# HELP cdc_runtime_in_flight_events Number of delivered but uncommitted events.\n\
              # TYPE cdc_runtime_in_flight_events gauge\n\
-             cdc_runtime_in_flight_events {}",
+             cdc_runtime_in_flight_events{{source_type=\"{source_type}\"}} {}",
             admin.in_flight_events
         )?;
 
@@ -132,7 +129,7 @@ where
             w,
             "# HELP cdc_runtime_events_polled_total Total events delivered by runtime batches.\n\
              # TYPE cdc_runtime_events_polled_total counter\n\
-             cdc_runtime_events_polled_total {}",
+             cdc_runtime_events_polled_total{{source_type=\"{source_type}\"}} {}",
             admin.total_events_polled
         )?;
 
@@ -140,7 +137,7 @@ where
             w,
             "# HELP cdc_runtime_events_committed_total Total events acknowledged and checkpointed.\n\
              # TYPE cdc_runtime_events_committed_total counter\n\
-             cdc_runtime_events_committed_total {}",
+             cdc_runtime_events_committed_total{{source_type=\"{source_type}\"}} {}",
             admin.total_events_committed
         )?;
 
@@ -148,7 +145,7 @@ where
             w,
             "# HELP cdc_runtime_events_deduplicated_total Total events suppressed by runtime idempotency guard.\n\
              # TYPE cdc_runtime_events_deduplicated_total counter\n\
-             cdc_runtime_events_deduplicated_total {}",
+             cdc_runtime_events_deduplicated_total{{source_type=\"{source_type}\"}} {}",
             admin.total_events_deduplicated
         )?;
 
@@ -157,7 +154,7 @@ where
                 w,
                 "# HELP cdc_runtime_checkpoint_age_ms Age of last durable checkpoint in milliseconds.\n\
                  # TYPE cdc_runtime_checkpoint_age_ms gauge\n\
-                 cdc_runtime_checkpoint_age_ms {}",
+                 cdc_runtime_checkpoint_age_ms{{source_type=\"{source_type}\"}} {}",
                 checkpoint_age_ms
             )?;
         }
@@ -167,7 +164,7 @@ where
                 w,
                 "# HELP cdc_runtime_replication_lag_ms Estimated replication lag in milliseconds (source event timestamp preferred; poll recency fallback).\n\
                  # TYPE cdc_runtime_replication_lag_ms gauge\n\
-                 cdc_runtime_replication_lag_ms {}",
+                 cdc_runtime_replication_lag_ms{{source_type=\"{source_type}\"}} {}",
                 lag_ms
             )?;
         }
@@ -196,7 +193,7 @@ where
         ] {
             writeln!(
                 w,
-                "cdc_runtime_source_capability{{capability=\"{name}\"}} {}",
+                "cdc_runtime_source_capability{{source_type=\"{source_type}\",capability=\"{name}\"}} {}",
                 u8::from(enabled)
             )?;
         }

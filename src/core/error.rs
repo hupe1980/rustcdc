@@ -3,6 +3,62 @@
 /// Shared result type for rustcdc.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Classifies the root cause of a [`Error::SourceError`].
+///
+/// Use this to drive retry policy, alerting, and circuit-breaker decisions
+/// without parsing free-form error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SourceErrorKind {
+    /// Transient network interruption (TCP reset, timeout, short disconnect).
+    NetworkTransient,
+    /// Authentication or authorisation failure (wrong credentials, privilege revoked).
+    AuthFailed,
+    /// Source schema changed in an incompatible way.
+    SchemaMismatch,
+    /// Replication slot or equivalent source-side tracking object not found.
+    SlotNotFound,
+    /// Source quota exceeded (e.g. max connections, WAL limits).
+    QuotaExceeded,
+    /// Error could not be classified into one of the above categories.
+    Unknown,
+}
+
+impl SourceErrorKind {
+    /// Returns `true` if this kind represents a condition that may resolve on retry.
+    pub fn is_recoverable(self) -> bool {
+        matches!(self, Self::NetworkTransient | Self::QuotaExceeded)
+    }
+}
+
+/// Dedicated error type for event fingerprint failures.
+///
+/// Returned by [`fingerprint_event_stable`] and [`fingerprint_event_transient`]
+/// so callers can distinguish empty-field validation from serialisation failures
+/// without inspecting free-form strings.
+///
+/// [`fingerprint_event_stable`]: crate::core::idempotency::fingerprint_event_stable
+/// [`fingerprint_event_transient`]: crate::core::idempotency::fingerprint_event_transient
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FingerprintError {
+    /// The event's `source.source_name` field is empty or whitespace.
+    #[error("cannot fingerprint event with empty source.source_name")]
+    EmptySourceName,
+    /// The event's `source.offset` field is empty or whitespace.
+    #[error("cannot fingerprint event with empty source.offset")]
+    EmptyOffset,
+    /// Serialising the event payload for hashing failed.
+    #[error("fingerprint serialisation failed: {0}")]
+    SerializationFailed(#[from] serde_json::Error),
+}
+
+impl From<FingerprintError> for Error {
+    fn from(err: FingerprintError) -> Self {
+        Self::ValidationError(vec![err.to_string()])
+    }
+}
+
 /// Top-level error type for rustcdc operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -46,6 +102,14 @@ pub enum Error {
 }
 
 impl Error {
+    /// Construct a [`Error::SourceError`] with an explicit [`SourceErrorKind`] prefix.
+    ///
+    /// The kind is embedded in the message string so the human-readable form
+    /// retains full context while still driving `is_recoverable()` correctly.
+    pub fn source_error(kind: SourceErrorKind, message: impl std::fmt::Display) -> Self {
+        Self::SourceError(format!("[{kind:?}] {message}"))
+    }
+
     /// Returns whether the error represents a transient source condition worth retrying.
     ///
     /// Only [`Error::SourceError`] and [`Error::TimeoutError`] are considered

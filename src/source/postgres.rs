@@ -537,6 +537,30 @@ impl PostgresConnection {
                     Ok(())
                 }
             }
+            #[cfg(feature = "tls")]
+            TransportConfig::RustlsConfig(rustls_cfg) => {
+                use tokio_postgres_rustls::MakeRustlsConnect;
+                let tls_connector = MakeRustlsConnect::new((*rustls_cfg.0).clone());
+                let connect_config = self.config.build_connect_config()?;
+                let (client, connection) =
+                    connect_config
+                        .connect(tls_connector)
+                        .await
+                        .map_err(|error| {
+                            Error::SourceError(format!(
+                                "postgres rustls connection failed: {error}"
+                            ))
+                        })?;
+                let connection_task = tokio::spawn(run_connection_task(connection));
+                self.validate_connected_client(&client).await?;
+                let client = Arc::new(client);
+                let heartbeat_task = self.start_heartbeat(client.clone());
+                let mut state = self.state.lock().await;
+                state.client = Some(client);
+                state.connection_task = Some(connection_task);
+                state.heartbeat_task = Some(heartbeat_task);
+                Ok(())
+            }
         };
         connect_result.inspect(|_| self.logger.source_connected())?;
         Ok(())
@@ -1419,9 +1443,9 @@ mod tests {
         let tx0 = events[0].transaction.as_ref().unwrap();
         let tx1 = events[1].transaction.as_ref().unwrap();
         assert_eq!(tx0.tx_id, 77);
-        assert_eq!(tx0.total_events, 2);
+        assert_eq!(tx0.total_events, Some(2));
         assert_eq!(tx0.event_index, 0);
-        assert_eq!(tx1.total_events, 2);
+        assert_eq!(tx1.total_events, Some(2));
         assert_eq!(tx1.event_index, 1);
     }
 
@@ -1542,7 +1566,7 @@ mod tests {
         assert_eq!(events[0].table, "big_table");
         assert_eq!(events[0].transaction.as_ref().map(|t| t.tx_id), Some(555));
         assert_eq!(
-            events[0].transaction.as_ref().map(|t| t.total_events),
+            events[0].transaction.as_ref().and_then(|t| t.total_events),
             Some(10_000)
         );
         assert_eq!(
@@ -2203,7 +2227,7 @@ mod tests {
         let result = super::postgres_handoff_result(Some(11), Some(10), None).unwrap();
         assert_eq!(result.snapshot_end_ts, Some(11));
         assert_eq!(result.stream_start_ts, None);
-        assert_eq!(result.overlap_events_dropped, 0);
+        assert_eq!(result.overlap_events_dropped, None);
         assert_eq!(result.stream_watermark_gap, None);
     }
 
@@ -2212,7 +2236,7 @@ mod tests {
         let result = super::postgres_handoff_result(None, None, Some(10)).unwrap();
         assert_eq!(result.snapshot_end_ts, None);
         assert!(result.stream_start_ts.is_some());
-        assert_eq!(result.overlap_events_dropped, 0);
+        assert_eq!(result.overlap_events_dropped, None);
         assert_eq!(result.stream_watermark_gap, None);
     }
 
@@ -2220,7 +2244,7 @@ mod tests {
     fn handoff_overlap_reports_watermark_gap_not_event_count() {
         let result = super::postgres_handoff_result(Some(25), Some(100), Some(160)).unwrap();
         assert_eq!(result.snapshot_end_ts, Some(25));
-        assert_eq!(result.overlap_events_dropped, 0);
+        assert_eq!(result.overlap_events_dropped, None);
         assert_eq!(result.stream_watermark_gap, Some(60));
         assert!(result.stream_start_ts.is_some());
     }

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(feature = "tls")]
 use std::path::Path;
@@ -15,6 +16,35 @@ use super::{
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
 const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
+
+/// Generate a unique `server_id` for each MySQL replication client instance.
+///
+/// MySQL requires each replica to have a cluster-unique `server_id` in the
+/// range `[1, 2^32-1]`. Reusing `1` (the MySQL server default) or any fixed
+/// value across multiple `rustcdc` instances causes silent event loss or
+/// eviction of the existing client. We derive a per-instance ID from process
+/// ID bits XOR'd with a monotonically incrementing counter and a compile-time
+/// hash, giving a stable-within-process but distinct-across-process spread.
+///
+/// Callers that require a specific `server_id` (e.g., for auditing or cluster
+/// reservation) should set `server_id` explicitly after constructing the
+/// default config.
+fn generate_server_id() -> u32 {
+    // Counter ensures uniqueness within a process even when the PID component
+    // happens to collide across different processes on the same host.
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let idx = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Mix PID, counter, and a compile-time seed for spread.
+    // We use a Knuth multiplicative hash to fold the 32-bit PID into the range.
+    const COMPILE_SEED: u32 = 0x9e37_79b9; // golden ratio fractional constant
+    let pid = std::process::id();
+    let mixed = pid
+        .wrapping_mul(COMPILE_SEED)
+        .wrapping_add(idx.wrapping_mul(0x6c62_272e));
+    // Ensure the result is in [1, u32::MAX] (server_id = 0 is invalid).
+    mixed.max(1)
+}
 
 impl fmt::Debug for MysqlSourceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -39,6 +69,13 @@ impl fmt::Debug for MysqlSourceConfig {
 
 impl Default for MysqlSourceConfig {
     fn default() -> Self {
+        let server_id = generate_server_id();
+        tracing::debug!(
+            target: "rustcdc::source::mysql",
+            server_id,
+            "generated unique MySQL replication server_id; \
+             override via MysqlSourceConfig::server_id if a specific value is required"
+        );
         Self {
             host: "localhost".into(),
             port: 3306,
@@ -46,7 +83,7 @@ impl Default for MysqlSourceConfig {
             password: SecretString::default(),
             auth_mode: DatabaseAuthMode::Password,
             database: String::new(),
-            server_id: 1,
+            server_id,
             gtid_mode_enabled: false,
             binlog_format_check: true,
             transport: TransportConfig::tls(),
@@ -97,7 +134,15 @@ impl MysqlSourceConfig {
         self
     }
 
-    /// Validate configuration values before a connection attempt.
+    /// Validate structural configuration values.
+    ///
+    /// This method validates all fields that do not require secret resolution
+    /// (host, port, user, transport paths, policy bounds). It intentionally does
+    /// **not** call `password.resolve()` so that configs using provider-backed or
+    /// callback-backed secrets remain valid even when the secret provider is
+    /// unavailable at config construction time.
+    ///
+    /// Password presence is verified at `connect()` time instead.
     pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
             return Err(Error::ConfigError("mysql host must not be empty".into()));
@@ -110,10 +155,14 @@ impl MysqlSourceConfig {
         if self.user.trim().is_empty() {
             return Err(Error::ConfigError("mysql user must not be empty".into()));
         }
-        if self.password.resolve()?.trim().is_empty() {
-            return Err(Error::ConfigError(
-                "mysql password must not be empty".into(),
-            ));
+        // For inline secrets we can check emptiness without triggering provider I/O.
+        // Deferred secrets (provider/callback) are validated at connect time.
+        if let Ok(pw) = self.password.expose_secret() {
+            if pw.trim().is_empty() {
+                return Err(Error::ConfigError(
+                    "mysql password must not be empty".into(),
+                ));
+            }
         }
         if matches!(self.auth_mode, DatabaseAuthMode::AwsIamToken) && !self.transport.is_tls() {
             return Err(Error::ConfigError(

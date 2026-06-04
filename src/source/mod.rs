@@ -89,7 +89,10 @@ pub struct HandoffResult {
     pub snapshot_end_ts: Option<u64>,
     pub stream_start_ts: Option<u64>,
     /// Number of overlap events dropped during handoff deduplication.
-    pub overlap_events_dropped: u64,
+    ///
+    /// `None` means the connector does not measure overlap at handoff (e.g. PostgreSQL).
+    /// `Some(0)` means the handoff was clean — no duplicate events were observed.
+    pub overlap_events_dropped: Option<u64>,
     /// Optional source-specific watermark distance observed at handoff.
     ///
     /// For PostgreSQL this is an LSN delta in bytes. Connectors that cannot
@@ -376,7 +379,7 @@ mod tests {
             Ok(HandoffResult {
                 snapshot_end_ts: Some(42),
                 stream_start_ts: Some(43),
-                overlap_events_dropped: 0,
+                overlap_events_dropped: None,
                 stream_watermark_gap: None,
             })
         }
@@ -424,7 +427,7 @@ mod tests {
         assert_eq!(stream_chunk.len(), 1);
         assert_eq!(handoff.snapshot_end_ts, Some(42));
         assert_eq!(handoff.stream_start_ts, Some(43));
-        assert_eq!(handoff.overlap_events_dropped, 0);
+        assert_eq!(handoff.overlap_events_dropped, None);
         assert_eq!(handoff.stream_watermark_gap, None);
         assert!(source.capabilities().snapshot);
     }

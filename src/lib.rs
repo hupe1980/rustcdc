@@ -17,16 +17,20 @@ pub mod source;
 #[cfg(any(test, feature = "test-harnesses"))]
 pub mod testkit;
 pub mod transform;
+#[cfg(feature = "wasm")]
 pub mod wasm;
 
+#[cfg(feature = "tls")]
+pub use crate::core::RustlsClientConfig;
 pub use crate::core::{
-    fingerprint_event_stable, fingerprint_event_transient, AckToken, CdcRuntime, Error, Event,
-    EventBatch, EventIdempotencyGuard, EventTracer, IdempotencyOptions, MetricsCollector,
-    NoOpEventTracer, NoOpMetricsCollector, Offset, Operation, PostCommitSourceConfirmPolicy,
-    Result, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability, RuntimeOptions,
-    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
-    SourceMetadata, StructuredLogger, TransactionMetadata, TransformErrorPolicy, TransportConfig,
-    ValidationError, EVENT_ENVELOPE_VERSION,
+    fingerprint_event_stable, fingerprint_event_transient, AckMode, AckToken, CdcRuntime,
+    ConnectionRetryPolicy, Error, Event, EventBatch, EventIdempotencyGuard, EventTracer,
+    FingerprintError, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
+    Offset, Operation, PostCommitSourceConfirmPolicy, Result, RuntimeAdminSnapshot, RuntimeConfig,
+    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider,
+    SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata, StructuredLogger,
+    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError,
+    EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "metrics")]
 pub use crate::core::{
@@ -36,6 +40,7 @@ pub use crate::ddl_capture::{
     CapturedDdl, DdlDialect, DdlExtractor, DdlOperation, ParsedDdlStatement, SchemaDiff,
     SchemaDiffOperation,
 };
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
 pub use crate::source::IncrementalSnapshotConfig;
 #[cfg(feature = "postgres")]
 pub use crate::source::IncrementalSnapshotHandle;
@@ -65,6 +70,7 @@ pub use crate::transform::{
     MaskHashTransform, MaskRule, RouteConfig, RouteTransform, Transform, TransformPipeline,
     UnwrapConfig, UnwrapTransform,
 };
+#[cfg(feature = "wasm")]
 pub use crate::wasm::{
     TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,
     DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,

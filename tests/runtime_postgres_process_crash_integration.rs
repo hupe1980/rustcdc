@@ -207,9 +207,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
             resumed_snapshot_ids.insert(id.to_string());
         }
 
-        runtime
-            .commit_ack(batch.ack_token().expect("ack token should exist"))
-            .await?;
+        runtime.commit_ack(batch.ack_mode()).await?;
         if resumed_snapshot_ids.len() >= (total_rows as usize).saturating_sub(marker.ids.len()) {
             break;
         }
@@ -423,9 +421,7 @@ async fn run_postgres_process_kill_replay_scenario(
         }
     }
 
-    let replay_ack = replay_batch.ack_token().expect("ack token should exist");
-
-    runtime.commit_ack(replay_ack).await?;
+    runtime.commit_ack(replay_batch.ack_mode()).await?;
 
     let reader_after = FileCheckpoint::new(checkpoint_dir.path());
     assert_eq!(
@@ -491,7 +487,7 @@ fn parse_pg_lsn(value: &str) -> rustcdc::Result<u64> {
 }
 
 async fn poll_until_batch_at_least(
-    runtime: &mut CdcRuntime<FileCheckpoint, InMemorySchemaHistory>,
+    runtime: &mut CdcRuntime,
     expected: usize,
     rounds: usize,
 ) -> rustcdc::Result<rustcdc::EventBatch> {
