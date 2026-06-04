@@ -137,9 +137,7 @@ async fn main() -> rustcdc::Result<()> {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
-                let ack = batch.ack_token().ok_or_else(|| {
-                    rustcdc::Error::StateError("runtime returned non-empty batch without ack token".into())
-                })?;
+                let ack = batch.ack_mode();
                 let batch_len = batch.len();
 
                 for mut event in batch.into_events() {

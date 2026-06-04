@@ -150,12 +150,8 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc
         batch_sizes.push(batch_len as f64);
         poll_latencies_ms.push(poll_ms);
 
-        let token = batch
-            .ack_token()
-            .expect("non-empty batch should provide ack token");
-
         let commit_start = Instant::now();
-        runtime.commit_ack(token).await?;
+        runtime.commit_ack(batch.ack_mode()).await?;
         let commit_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
         commit_latencies_ms.push(commit_ms);
 

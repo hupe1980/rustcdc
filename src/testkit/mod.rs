@@ -97,17 +97,13 @@ pub struct FixtureDiff {
 }
 
 /// Feeds a fixture through a [`CdcRuntime`] and collects the emitted events.
-pub struct ReplayRunner<'a, C, H> {
+pub struct ReplayRunner<'a> {
     fixture: Box<dyn Fixture>,
-    runtime: &'a mut CdcRuntime<C, H>,
+    runtime: &'a mut CdcRuntime,
 }
 
-impl<'a, C, H> ReplayRunner<'a, C, H>
-where
-    C: crate::checkpoint::Checkpoint + Send + Sync + 'static,
-    H: crate::schema_history::SchemaHistory + Send + Sync + 'static,
-{
-    pub fn new(fixture: Box<dyn Fixture>, runtime: &'a mut CdcRuntime<C, H>) -> Self {
+impl<'a> ReplayRunner<'a> {
+    pub fn new(fixture: Box<dyn Fixture>, runtime: &'a mut CdcRuntime) -> Self {
         Self { fixture, runtime }
     }
 
@@ -126,13 +122,9 @@ where
                                 "runtime buffer remained full without yielding events".into(),
                             ));
                         }
-                        let token = batch.ack_token().ok_or_else(|| {
-                            Error::StateError(
-                                "runtime yielded a non-empty batch without ack token".into(),
-                            )
-                        })?;
+                        let mode = batch.ack_mode();
                         output.extend(batch.into_events());
-                        self.runtime.commit_ack(token).await?;
+                        self.runtime.commit_ack(mode).await?;
                     }
                     Err(error) => return Err(error),
                 }
@@ -144,11 +136,9 @@ where
             if batch.is_empty() {
                 break;
             }
-            let token = batch.ack_token().ok_or_else(|| {
-                Error::StateError("runtime yielded a non-empty batch without ack token".into())
-            })?;
+            let mode = batch.ack_mode();
             output.extend(batch.into_events());
-            self.runtime.commit_ack(token).await?;
+            self.runtime.commit_ack(mode).await?;
         }
 
         Ok(output)
@@ -179,9 +169,9 @@ where
 // ─── Runtime conformance suites ──────────────────────────────────────────────
 
 /// A single runtime-level conformance test scenario.
-pub trait ConformanceTest<C, H> {
+pub trait ConformanceTest {
     fn name(&self) -> &str;
-    fn run(&self, runtime: &mut CdcRuntime<C, H>) -> Result<TestResult>;
+    fn run(&self, runtime: &mut CdcRuntime) -> Result<TestResult>;
 }
 
 /// Aggregate result for a full [`ConformanceSuite`] run.
@@ -194,26 +184,26 @@ pub struct SuiteResult {
 }
 
 /// Runs a collection of [`ConformanceTest`] instances and aggregates results.
-pub struct ConformanceSuite<C, H> {
-    tests: Vec<Box<dyn ConformanceTest<C, H>>>,
+pub struct ConformanceSuite {
+    tests: Vec<Box<dyn ConformanceTest>>,
 }
 
-impl<C, H> Default for ConformanceSuite<C, H> {
+impl Default for ConformanceSuite {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<C, H> ConformanceSuite<C, H> {
+impl ConformanceSuite {
     pub fn new() -> Self {
         Self { tests: Vec::new() }
     }
 
-    pub fn add_test(&mut self, test: Box<dyn ConformanceTest<C, H>>) {
+    pub fn add_test(&mut self, test: Box<dyn ConformanceTest>) {
         self.tests.push(test);
     }
 
-    pub fn run_all(&mut self, runtime: &mut CdcRuntime<C, H>) -> SuiteResult {
+    pub fn run_all(&mut self, runtime: &mut CdcRuntime) -> SuiteResult {
         let mut results = Vec::new();
         for test in &self.tests {
             let result = test.run(runtime).unwrap_or_else(|error| TestResult {
@@ -255,12 +245,12 @@ impl NotImplementedConformanceTest {
     }
 }
 
-impl<C, H> ConformanceTest<C, H> for NotImplementedConformanceTest {
+impl ConformanceTest for NotImplementedConformanceTest {
     fn name(&self) -> &str {
         self.name
     }
 
-    fn run(&self, _runtime: &mut CdcRuntime<C, H>) -> Result<TestResult> {
+    fn run(&self, _runtime: &mut CdcRuntime) -> Result<TestResult> {
         Err(Error::NotImplemented(self.name.into()))
     }
 }
@@ -325,7 +315,7 @@ mod tests {
             checkpoint,
             schema_history,
         );
-        let mut runtime = crate::core::CdcRuntime::<_, _>::new(config).unwrap();
+        let mut runtime = crate::core::CdcRuntime::new(config).unwrap();
         runtime.start().await.unwrap();
 
         let mut runner = ReplayRunner::new(Box::new(fixture.clone()), &mut runtime);
@@ -354,7 +344,7 @@ mod tests {
             schema_history,
         )
         .with_max_buffer_size(1);
-        let mut runtime = crate::core::CdcRuntime::<_, _>::new(config).unwrap();
+        let mut runtime = crate::core::CdcRuntime::new(config).unwrap();
         runtime.start().await.unwrap();
 
         let mut runner = ReplayRunner::new(Box::new(fixture.clone()), &mut runtime);
@@ -374,7 +364,7 @@ mod tests {
             checkpoint,
             schema_history,
         );
-        let mut runtime = crate::core::CdcRuntime::<_, _>::new(config).unwrap();
+        let mut runtime = crate::core::CdcRuntime::new(config).unwrap();
 
         let mut suite = ConformanceSuite::new();
         suite.add_test(Box::new(

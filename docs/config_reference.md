@@ -120,24 +120,18 @@ Prefer the associated constructors when selecting a source in embedder code:
 
 The preferred embedder surface is now batch-oriented rather than count-oriented.
 
-`poll_event_batch()` returns an `EventBatch` containing the delivered events plus an opaque `AckToken`. Re-polling before acknowledgement redelivers the same in-flight batch, which keeps retry behavior loss-safe.
+`poll_event_batch()` returns an `EventBatch` containing the delivered events plus an `AckMode`. Re-polling before acknowledgement redelivers the same in-flight batch, which keeps retry behavior loss-safe.
 
 ```rust
-use rustcdc::{CdcRuntime, EventBatch, Result};
+use rustcdc::{CdcRuntime, Result};
 
-async fn consume_once<C, H>(runtime: &mut CdcRuntime<C, H>) -> Result<()>
-where
-  C: rustcdc::checkpoint::Checkpoint + Send + Sync + 'static,
-  H: rustcdc::schema_history::SchemaHistory + Send + Sync + 'static,
-{
+async fn consume_once(runtime: &mut CdcRuntime) -> Result<()> {
   let batch = runtime.poll_event_batch().await?;
   if batch.is_empty() {
     return Ok(());
   }
 
-  if let Some(token) = batch.ack_token() {
-    runtime.commit_ack(token).await?;
-  }
+  runtime.commit_ack(batch.ack_mode()).await?;
 
   Ok(())
 }
@@ -146,8 +140,10 @@ where
 For partial acknowledgement, split the token and commit only the accepted prefix. The remaining suffix will be re-delivered on the next poll.
 
 ```rust
+use rustcdc::AckMode;
+
 let batch = runtime.poll_event_batch().await?;
-if let Some(token) = batch.ack_token() {
+if let AckMode::Required(token) = batch.ack_mode() {
   let (accepted, _retry_later) = token.split_at(10)?;
   runtime.commit_ack(accepted).await?;
 }
@@ -161,13 +157,11 @@ use futures_util::StreamExt;
 let mut batches = runtime.event_batches();
 while let Some(batch) = batches.next().await {
   let batch = batch?;
-  if let Some(token) = batch.ack_token() {
-    runtime.commit_ack(token).await?;
-  }
+  runtime.commit_ack(batch.ack_mode()).await?;
 }
 ```
 
-`poll_event_batch()` + `commit_ack(token)` is now the canonical runtime acknowledgement API.
+`poll_event_batch()` + `commit_ack(batch.ack_mode())` is now the canonical runtime acknowledgement API.
 
 ## Connector Capabilities
 
@@ -725,7 +719,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.1.5",                         // Service version
+    "0.2.0",                         // Service version
     "production",                    // Environment
 );
 

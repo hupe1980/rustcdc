@@ -1,5 +1,55 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "tls")]
+use std::sync::Arc;
+
+/// A type-erased `rustls::ClientConfig` that can be embedded in [`TransportConfig`].
+///
+/// Equality is pointer-based (two handles are equal only if they wrap the same
+/// `Arc` allocation), which is consistent with the immutable nature of a fully
+/// constructed `ClientConfig`.
+///
+/// # Serialization
+///
+/// This type is serializable **only as a non-round-trippable placeholder**.
+/// Serialization emits the string `"<RustlsClientConfig>"` so that structs
+/// containing a `TransportConfig` (e.g. admin snapshots, tracing spans) do
+/// not panic or error during JSON serialization. Deserialization always
+/// returns an error — a `RustlsClientConfig` must be injected at runtime
+/// (e.g. from a pre-built `Arc<rustls::ClientConfig>`) and cannot be
+/// reconstructed from serialized text.
+#[cfg(feature = "tls")]
+#[derive(Clone, Debug)]
+pub struct RustlsClientConfig(pub Arc<rustls::ClientConfig>);
+
+#[cfg(feature = "tls")]
+impl PartialEq for RustlsClientConfig {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl Eq for RustlsClientConfig {}
+
+#[cfg(feature = "tls")]
+impl Serialize for RustlsClientConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // RustlsClientConfig cannot be serialized to text; emit a placeholder
+        // string so JSON/tracing snapshots do not panic.
+        serializer.serialize_str("<RustlsClientConfig>")
+    }
+}
+
+#[cfg(feature = "tls")]
+impl<'de> Deserialize<'de> for RustlsClientConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "RustlsClientConfig cannot be deserialized from text; inject it at runtime",
+        ))
+    }
+}
+
 /// Transport configuration for a connector instance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -40,6 +90,27 @@ pub enum TransportConfig {
     /// (e.g., VPC-internal clusters) where all traffic is already isolated.
     /// Do **not** use plaintext over public or shared networks.
     Plaintext,
+
+    /// Use a fully-constructed `rustls::ClientConfig` injected at runtime.
+    ///
+    /// This variant is intended for advanced use-cases where the caller needs
+    /// complete control over TLS configuration that cannot be expressed through
+    /// the file-path-based [`TransportConfig::Tls`] variant — for example:
+    ///
+    /// - Custom certificate verifiers or pinning logic.
+    /// - Client certificates loaded from a hardware security module (HSM).
+    /// - Integration tests that generate ephemeral CA certificates in-process.
+    ///
+    /// Because `rustls::ClientConfig` is not serializable, this variant
+    /// serializes as the string `"<RustlsClientConfig>"` and **cannot** be
+    /// round-tripped through a config file. Inject it programmatically only.
+    ///
+    /// Requires the `tls` Cargo feature.
+    #[cfg(feature = "tls")]
+    RustlsConfig {
+        /// The pre-built rustls client configuration.
+        config: RustlsClientConfig,
+    },
 }
 
 impl Default for TransportConfig {
@@ -110,8 +181,26 @@ impl TransportConfig {
         Self::Plaintext
     }
 
+    /// Inject a pre-built `rustls::ClientConfig` directly.
+    ///
+    /// Use this when the file-path-based [`TransportConfig::Tls`] variant does
+    /// not provide the level of control you need (custom verifiers, HSM keys,
+    /// ephemeral in-process CAs, etc.).
+    ///
+    /// Requires the `tls` Cargo feature.
+    #[cfg(feature = "tls")]
+    pub fn rustls_config(config: Arc<rustls::ClientConfig>) -> Self {
+        Self::RustlsConfig {
+            config: RustlsClientConfig(config),
+        }
+    }
+
     /// Return true when TLS transport is configured.
-    pub const fn is_tls(&self) -> bool {
+    pub fn is_tls(&self) -> bool {
+        #[cfg(feature = "tls")]
+        if matches!(self, Self::RustlsConfig { .. }) {
+            return true;
+        }
         matches!(self, Self::Tls { .. })
     }
 
@@ -139,24 +228,32 @@ impl TransportConfig {
     }
 
     /// Return true when TLS certificate verification is disabled.
-    pub const fn allow_invalid_certificates(&self) -> bool {
+    ///
+    /// Always returns `false` for [`TransportConfig::RustlsConfig`] — the
+    /// injected `ClientConfig` is assumed to already encode the desired
+    /// verification policy.
+    pub fn allow_invalid_certificates(&self) -> bool {
         match self {
             Self::Tls {
                 allow_invalid_certificates,
                 ..
             } => *allow_invalid_certificates,
-            Self::Plaintext => false,
+            _ => false,
         }
     }
 
     /// Return true when TLS hostname verification is disabled.
-    pub const fn allow_invalid_hostnames(&self) -> bool {
+    ///
+    /// Always returns `false` for [`TransportConfig::RustlsConfig`] — the
+    /// injected `ClientConfig` is assumed to already encode the desired
+    /// hostname policy.
+    pub fn allow_invalid_hostnames(&self) -> bool {
         match self {
             Self::Tls {
                 allow_invalid_hostnames,
                 ..
             } => *allow_invalid_hostnames,
-            Self::Plaintext => false,
+            _ => false,
         }
     }
 

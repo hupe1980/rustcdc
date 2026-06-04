@@ -13,7 +13,7 @@ mod runtime_utils;
 mod secret;
 mod transport;
 
-pub use error::{Error, Result};
+pub use error::{Error, FingerprintError, Result, SourceErrorKind};
 pub use event::{
     Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata, ValidationError,
     EVENT_ENVELOPE_VERSION,
@@ -26,11 +26,13 @@ pub use observability::{EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetr
 #[cfg(feature = "metrics")]
 pub use otel::{MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord};
 pub use runtime::{
-    AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, IdempotencyOptions,
+    AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, IdempotencyOptions,
     PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability,
     RuntimeOptions, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
+#[cfg(feature = "tls")]
+pub use transport::RustlsClientConfig;
 pub use transport::TransportConfig;
 
 use std::fmt::Debug;

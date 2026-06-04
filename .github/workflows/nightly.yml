@@ -22,6 +22,7 @@ jobs:
       - name: Run fault injection soak matrix (includes ignored)
         run: |
           set -o pipefail
+          mkdir -p target
           cargo test --test fault_injection_soak_matrix \
             --features postgres,test-harnesses \
             -- --include-ignored 2>&1 | tee target/soak-matrix-results.txt

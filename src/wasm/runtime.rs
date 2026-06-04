@@ -3,13 +3,15 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use wasmparser::{ExternalKind, Parser, Payload, TypeRef, ValType};
-use wasmtime::{Caller, Engine, Extern, Instance, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{
+    Caller, Config, Engine, Extern, Instance, Linker, Memory, Module, Store, TypedFunc,
+};
 
 use crate::core::{Error, Event, Result};
 
@@ -68,7 +70,16 @@ pub struct WasmRuntime {
 
 struct RealWasmModule {
     timeout_ms: u64,
+    /// Kept alive so the epoch-ticker thread can call `engine.increment_epoch()`.
+    _engine: Arc<Engine>,
     inner: Mutex<RealWasmState>,
+    /// Sentinel kept alive for the lifetime of this module.
+    ///
+    /// The background epoch-ticker thread holds a `Weak` to this sentinel.
+    /// When `RealWasmModule` is dropped the strong count reaches zero, the
+    /// `Weak::upgrade()` in the ticker loop returns `None`, and the thread
+    /// exits naturally within one tick interval (≤ 1 ms).
+    _ticker_sentinel: Arc<()>,
 }
 
 struct RealWasmState {
@@ -158,7 +169,18 @@ impl WasmRuntime {
 
 impl RealWasmModule {
     fn new(module_bytes: &[u8], config: &WasmConfig) -> Result<Self> {
-        let engine = Engine::default();
+        // Enable epoch interruption so that a runaway (infinite-loop) WASM
+        // module cannot block the Tokio worker thread indefinitely.
+        // The background ticker thread increments the engine epoch every 1 ms;
+        // we set a per-call deadline of `timeout_ms` ticks so that WASM execution
+        // is forcibly interrupted after approximately `timeout_ms` milliseconds,
+        // regardless of what the WASM code is doing (including tight spin loops).
+        let mut engine_config = Config::new();
+        engine_config.epoch_interruption(true);
+        let engine = Arc::new(Engine::new(&engine_config).map_err(|error| {
+            Error::ConfigError(format!("failed to create WASM engine: {error}"))
+        })?);
+
         let module = Module::new(&engine, module_bytes).map_err(|error| {
             Error::ConfigError(format!("failed to compile WASM module: {error}"))
         })?;
@@ -215,9 +237,35 @@ impl RealWasmModule {
             shutdown,
         };
 
+        // Spawn the per-module epoch-ticker thread.
+        //
+        // The ticker increments the engine epoch every 1 ms.  Before each WASM
+        // call we set the store's epoch deadline to `timeout_ms` ticks, so the
+        // call is interrupted after ≈ `timeout_ms` milliseconds.
+        //
+        // The sentinel Arc is held by the module.  The ticker holds only a Weak
+        // reference.  When the module is dropped the Weak::upgrade() returns None
+        // and the thread exits within at most one tick (1 ms).
+        let ticker_sentinel = Arc::new(());
+        let weak_sentinel: Weak<()> = Arc::downgrade(&ticker_sentinel);
+        let ticker_engine = Arc::clone(&engine);
+        std::thread::Builder::new()
+            .name("rustcdc-wasm-epoch-ticker".into())
+            .spawn(move || {
+                while weak_sentinel.upgrade().is_some() {
+                    std::thread::sleep(Duration::from_millis(1));
+                    ticker_engine.increment_epoch();
+                }
+            })
+            .map_err(|error| {
+                Error::ConfigError(format!("failed to spawn WASM epoch ticker thread: {error}"))
+            })?;
+
         let module = Self {
             timeout_ms: config.timeout_ms,
+            _engine: engine,
             inner: Mutex::new(module_state),
+            _ticker_sentinel: ticker_sentinel,
         };
 
         module.validate_memory_limit(config.memory_limit_mb)?;
@@ -330,6 +378,10 @@ impl WasmModule for RealWasmModule {
             .lock()
             .map_err(|_| Error::StateError("WASM runtime lock poisoned".to_string()))?;
 
+        // Arm the epoch deadline so that a runaway WASM module is interrupted
+        // after approximately `timeout_ms` milliseconds by the ticker thread.
+        state.store.set_epoch_deadline(self.timeout_ms);
+
         let input_ptr = Self::alloc_and_write(&mut state, &input)?;
         let transform = state.transform.clone();
         let output_ptr = transform
@@ -390,6 +442,9 @@ impl WasmModule for RealWasmModule {
             return Ok(());
         };
 
+        // Arm epoch deadline for the init call.
+        state.store.set_epoch_deadline(self.timeout_ms);
+
         let config_payload = serde_json::json!({
             "timeout_ms": config.timeout_ms,
             "memory_limit_mb": config.memory_limit_mb,
@@ -427,6 +482,9 @@ impl WasmModule for RealWasmModule {
         let Some(shutdown) = state.shutdown.clone() else {
             return Ok(());
         };
+
+        // Arm epoch deadline for the shutdown call.
+        state.store.set_epoch_deadline(self.timeout_ms);
 
         let status = shutdown
             .call(&mut state.store, ())

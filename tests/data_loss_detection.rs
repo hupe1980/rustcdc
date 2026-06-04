@@ -42,7 +42,7 @@ fn event(id: u64) -> Event {
         }),
         transaction: Some(TransactionMetadata {
             tx_id: id / 10,
-            total_events: 1,
+            total_events: Some(1),
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
@@ -122,7 +122,7 @@ impl Source for MockSource {
         Ok(HandoffResult {
             snapshot_end_ts: Some(0),
             stream_start_ts: Some(0),
-            overlap_events_dropped: 0,
+            overlap_events_dropped: None,
             stream_watermark_gap: None,
         })
     }

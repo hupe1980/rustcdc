@@ -147,13 +147,17 @@ pub trait Checkpoint: Send + Sync {
 /// For production use, choose [`FileCheckpoint`] (single-process, local
 /// filesystem) or implement the [`Checkpoint`] trait against your own storage
 /// backend (database, object store, Redis, etc.).
+///
+/// Suitable for tests, short-lived processes, and embeddings where checkpoint
+/// state does not need to survive a restart. For production use, prefer
+/// [`FileCheckpoint`] to avoid full replay on every process restart.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryCheckpoint {
     entries: Arc<Mutex<VecDeque<StoredCheckpoint>>>,
 }
 
+#[cfg(any(test, feature = "test-harnesses"))]
 impl InMemoryCheckpoint {
-    #[cfg(test)]
     pub fn history_len(&self) -> usize {
         self.entries
             .lock()

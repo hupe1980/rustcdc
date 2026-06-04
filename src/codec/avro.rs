@@ -303,7 +303,10 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
             1,
             Box::new(AvroValue::Record(vec![
                 ("tx_id".into(), AvroValue::Long(t.tx_id as i64)),
-                ("total_events".into(), AvroValue::Int(t.total_events as i32)),
+                (
+                    "total_events".into(),
+                    AvroValue::Int(t.total_events.unwrap_or(0) as i32),
+                ),
                 ("event_index".into(), AvroValue::Int(t.event_index as i32)),
             ])),
         ),
@@ -354,7 +357,7 @@ mod tests {
             snapshot: None,
             transaction: Some(TransactionMetadata {
                 tx_id: 7,
-                total_events: 2,
+                total_events: Some(2),
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,

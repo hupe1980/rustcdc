@@ -174,9 +174,13 @@ run_async_trait_policy_check() {
 }
 
 run_cargo_profile_safety_check() {
-  # Reject any Cargo profile section that enables debug-assertions on a release-variant profile.
-  # Release-variant profiles are any profile whose name starts with "release" or contains the
-  # word "release", as well as any profile that explicitly inherits from the built-in "release".
+  # Reject any Cargo profile that enables debug-assertions = true unless it is the
+  # built-in "dev" or "test" profile (which expect debug-assertions in development).
+  #
+  # This catches release/bench/custom profiles that accidentally enable assertions,
+  # not just profiles whose name contains "release".
+  local failed=0
+
   local matches
   matches="$(rg -n 'debug-assertions\s*=\s*true' Cargo.toml 2>/dev/null || true)"
 
@@ -185,25 +189,35 @@ run_cargo_profile_safety_check() {
     return 0
   fi
 
-  # If matches exist, check whether they appear under a release-variant profile table.
-  # Extract the section context by scanning Cargo.toml for [profile.*release*] or
-  # inherits = "release" sections that also contain debug-assertions = true.
-  local profile_contexts
-  profile_contexts="$(awk '
-    /^\[profile\./ { current_section = $0 }
+  # Walk Cargo.toml: track the current [profile.<name>] section and report any
+  # debug-assertions = true that appears outside the allowed set (dev, test).
+  local bad_profiles
+  bad_profiles="$(awk '
+    /^\[profile\./ {
+      # Extract profile name from "[profile.foo]" or "[profile.foo.bar]"
+      match($0, /\[profile\.([^.\]]+)/, arr)
+      current_profile = arr[1]
+    }
     /debug-assertions\s*=\s*true/ {
-      if (current_section ~ /release/) print current_section ": " $0
+      if (current_profile != "dev" && current_profile != "test") {
+        print "[profile." current_profile "]: " $0
+      }
     }
   ' Cargo.toml || true)"
 
-  if [[ -n "$profile_contexts" ]]; then
-    echo "FAIL: debug-assertions = true found in a release-variant Cargo profile:" >&2
-    echo "$profile_contexts" >&2
-    echo "Release builds must not enable debug-assertions. Remove or gate this setting." >&2
-    exit 1
+  if [[ -n "$bad_profiles" ]]; then
+    echo "FAIL: debug-assertions = true found in non-dev/non-test Cargo profile:" >&2
+    echo "$bad_profiles" >&2
+    echo "Only [profile.dev] and [profile.test] may enable debug-assertions." >&2
+    echo "All other profiles (release, bench, custom) must use debug-assertions = false." >&2
+    failed=1
   fi
 
-  echo "Cargo profile safety check passed."
+  if [[ $failed -eq 0 ]]; then
+    echo "Cargo profile safety check passed."
+  else
+    exit 1
+  fi
 }
 
 require_match() {

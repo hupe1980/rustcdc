@@ -11,7 +11,7 @@ use serde_json::json;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Helper to create a test runtime with Disabled source.
-fn make_test_runtime() -> CdcRuntime<InMemoryCheckpoint, InMemorySchemaHistory> {
+fn make_test_runtime() -> CdcRuntime {
     let checkpoint = InMemoryCheckpoint::default();
     let schema_history = InMemorySchemaHistory::default();
     let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
@@ -61,7 +61,7 @@ async fn healthy_state_shows_zero_lag_after_recent_commit() {
     // Poll and commit immediately.
     let batch = runtime.poll_event_batch().await.expect("failed to poll");
     runtime
-        .commit_ack(batch.ack_token().unwrap())
+        .commit_ack(batch.ack_mode())
         .await
         .expect("failed to commit");
 
@@ -164,7 +164,7 @@ async fn multiple_commits_track_checkpoint_age() {
         .expect("failed to enqueue");
     let batch1 = runtime.poll_event_batch().await.expect("failed to poll");
     runtime
-        .commit_ack(batch1.ack_token().unwrap())
+        .commit_ack(batch1.ack_mode())
         .await
         .expect("failed to commit");
 
@@ -179,7 +179,7 @@ async fn multiple_commits_track_checkpoint_age() {
         .expect("failed to enqueue");
     let batch2 = runtime.poll_event_batch().await.expect("failed to poll");
     runtime
-        .commit_ack(batch2.ack_token().unwrap())
+        .commit_ack(batch2.ack_mode())
         .await
         .expect("failed to commit");
 
@@ -213,12 +213,13 @@ async fn admin_prometheus_output_reflects_state_changes() {
         .expect("failed to enqueue");
     let batch = runtime.poll_event_batch().await.expect("failed to poll");
     runtime
-        .commit_ack(batch.ack_token().unwrap())
+        .commit_ack(batch.ack_mode())
         .await
         .expect("failed to commit");
 
     let with_commits_metrics = runtime.admin_metrics_prometheus();
-    assert!(with_commits_metrics.contains("cdc_runtime_events_committed_total 1"));
+    assert!(with_commits_metrics.contains("cdc_runtime_events_committed_total"));
+    assert!(with_commits_metrics.contains("} 1") || with_commits_metrics.contains(" 1\n"));
     assert!(with_commits_metrics.contains("cdc_runtime_checkpoint_age_ms"));
 
     // Stopped state.
@@ -238,7 +239,7 @@ async fn admin_json_output_includes_all_health_fields() {
         .expect("failed to enqueue");
     let batch = runtime.poll_event_batch().await.expect("failed to poll");
     runtime
-        .commit_ack(batch.ack_token().unwrap())
+        .commit_ack(batch.ack_mode())
         .await
         .expect("failed to commit");
 

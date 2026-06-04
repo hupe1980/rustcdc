@@ -76,7 +76,7 @@ rustcdc uses **cooperative flow control**: the internal event buffer grows until
 ### How it works
 
 - `poll_event_batch()` returns events from the internal buffer.
-- `commit_ack(token)` signals that the consumer has durably processed the acknowledged batch prefix represented by `AckToken`. The runtime advances the checkpoint and frees buffer capacity.
+- `commit_ack(batch.ack_mode())` signals that the consumer has durably processed the acknowledged batch prefix. The runtime advances the checkpoint and frees buffer capacity.
 - If the consumer calls `poll_event_batch()` repeatedly without calling `commit_ack()`, the buffer fills to `max_buffer_size` and the runtime yields no new events until space is available.
 
 ### Tuning guidance
@@ -122,9 +122,11 @@ Wire it to any HTTP server of your choice.
 ```rust
 use std::sync::Arc;
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
-use rustcdc::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig, InMemoryCheckpoint, InMemorySchemaHistory};
+use rustcdc::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig};
+use rustcdc::checkpoint::InMemoryCheckpoint;
+use rustcdc::schema_history::InMemorySchemaHistory;
 
-type SharedRuntime = Arc<tokio::sync::Mutex<CdcRuntime<InMemoryCheckpoint, InMemorySchemaHistory>>>;
+type SharedRuntime = Arc<tokio::sync::Mutex<CdcRuntime>>;
 
 async fn health(State(rt): State<SharedRuntime>) -> impl IntoResponse {
     let json = match rt.lock().await.admin_snapshot_json() {
@@ -162,14 +164,11 @@ async fn main() {
     {
         state.lock().await.start().await.unwrap();
         loop {
-            let token = {
+            let batch = {
                 let mut runtime = state.lock().await;
-                let batch = runtime.poll_event_batch().await.unwrap();
-                batch.ack_token()
+                runtime.poll_event_batch().await.unwrap()
             };
-            if let Some(token) = token {
-                state.lock().await.commit_ack(token).await.unwrap();
-            }
+            state.lock().await.commit_ack(batch.ack_mode()).await.unwrap();
         }
     }
 }

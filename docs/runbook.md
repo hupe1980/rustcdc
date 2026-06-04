@@ -365,6 +365,73 @@ EXEC sys.sp_cdc_cleanup_change_tables
 GO
 ```
 
+### SQL Server TRUNCATE Capture — DDL Trigger Management
+
+`SqlServerSourceConfig::capture_truncate_events` controls whether `TRUNCATE TABLE` operations are captured as `Operation::Truncate` events. SQL Server's native CDC change tables do **not** record `TRUNCATE TABLE`; capture requires an opt-in DDL trigger that `rustcdc` installs automatically.
+
+#### Required permissions
+
+The connecting user must have the following permissions to install the trigger:
+
+```sql
+-- Verify permissions
+SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER') AS can_alter_database;
+SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TRIGGER') AS can_create_trigger;
+```
+
+If either returns `0`, grant the permissions to the CDC login:
+
+```sql
+GRANT ALTER ON DATABASE::[your_database] TO [cdc_login];
+GRANT CREATE TRIGGER TO [cdc_login];
+```
+
+#### Verify the trigger is installed
+
+After connecting with `capture_truncate_events: true`, verify the trigger exists:
+
+```sql
+SELECT
+    t.name AS trigger_name,
+    te.type_desc AS event_type,
+    t.create_date,
+    t.modify_date
+FROM sys.triggers t
+JOIN sys.trigger_events te ON t.object_id = te.object_id
+WHERE t.parent_class_desc = 'DATABASE'
+  AND t.name LIKE 'rustcdc_%';
+```
+
+Expected: one row with `trigger_name = 'rustcdc_truncate_capture'` (or similar) and `event_type = 'ALTER_TABLE'`.
+
+#### Behaviour when trigger is absent
+
+- If the trigger installation fails (insufficient permissions, quota), `connect()` returns an error. No truncate events are captured, and the connector does not start.
+- If the trigger is deleted after startup while the connector is running, subsequent `TRUNCATE TABLE` statements are silently missed. No error is surfaced at runtime. Re-connect to reinstall.
+
+#### Cleanup on decommission
+
+When removing a `rustcdc` deployment, drop the DDL trigger to avoid orphaned objects:
+
+```sql
+-- List all rustcdc DDL triggers
+SELECT name FROM sys.triggers WHERE parent_class_desc = 'DATABASE' AND name LIKE 'rustcdc_%';
+
+-- Drop the truncate capture trigger
+DROP TRIGGER IF EXISTS rustcdc_truncate_capture ON DATABASE;
+GO
+```
+
+Also verify no capture instances remain from the CDC setup:
+
+```sql
+SELECT capture_instance, source_schema, source_table
+FROM cdc.change_tables
+WHERE capture_instance LIKE 'rustcdc_%';
+```
+
+Drop them with `sys.sp_cdc_disable_table` if needed.
+
 ### SQL Server Connection and Poll Tuning
 
 `SqlServerSourceConfig` now exposes explicit concurrency/throughput controls:

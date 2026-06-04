@@ -151,6 +151,10 @@ pub struct ProtoTransactionMetadata {
     #[prost(uint64, tag = "1")]
     pub tx_id: u64,
     /// Total events in this transaction.
+    ///
+    /// **Sentinel:** `0` means "unknown" — the source connector did not know
+    /// the transaction size at begin time (e.g. PostgreSQL WAL, MySQL binlog).
+    /// Do **not** interpret `0` as an empty transaction.
     #[prost(uint32, tag = "2")]
     pub total_events: u32,
     /// Zero-based position of this event within the transaction.
@@ -240,7 +244,14 @@ impl ProtoEvent {
                 .as_ref()
                 .map(|t| ProtoTransactionMetadata {
                     tx_id: t.tx_id,
-                    total_events: t.total_events,
+                    // `total_events` is `None` when the source does not know the
+                    // transaction size at begin time (e.g. PostgreSQL logical
+                    // replication, MySQL binlog streaming).  We encode `None` as
+                    // the protobuf default value `0`.  Downstream consumers MUST
+                    // treat `total_events == 0` as "unknown" rather than "empty
+                    // transaction".  The proto field comment in `event.proto`
+                    // documents the same sentinel.
+                    total_events: t.total_events.unwrap_or(0),
                     event_index: t.event_index,
                 }),
             envelope_version: event.envelope_version as u32,
@@ -282,7 +293,7 @@ mod tests {
             }),
             transaction: Some(TransactionMetadata {
                 tx_id: 42,
-                total_events: 3,
+                total_events: Some(3),
                 event_index: 1,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,

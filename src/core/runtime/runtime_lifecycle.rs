@@ -1,10 +1,6 @@
 use super::*;
 
-impl<C, H> CdcRuntime<C, H>
-where
-    C: crate::checkpoint::Checkpoint + Send + Sync + 'static,
-    H: SchemaHistory + Send + Sync + 'static,
-{
+impl CdcRuntime {
     /// Start the runtime and initialize source handles.
     pub async fn start(&mut self) -> Result<()> {
         match self.state {
@@ -22,12 +18,12 @@ where
         }
 
         if self.config.options.schema_history_retention.is_none() {
-            tracing::error!(
-                target: "rustcdc::core::runtime",
+            return Err(Error::ConfigError(
                 "no schema_history_retention policy configured; schema history will grow \
                  unboundedly. Configure RuntimeOptions::with_schema_history_retention() to \
                  avoid resource exhaustion in DDL-heavy deployments."
-            );
+                    .into(),
+            ));
         }
 
         let committed_event_count = self
@@ -407,11 +403,18 @@ where
         drained.extend(self.buffered_events.drain(..));
         drained.extend(self.pending_source_events.drain(..));
         self.commit_barrier.clear_pending();
+        let drained_event_count = drained.len();
         for event in &drained {
             self.observability()
                 .tracer
                 .trace_event_end(&Self::event_trace_id(event), "force_stopped");
         }
+        tracing::warn!(
+            target: "rustcdc::core::runtime",
+            shutdown_mode = "forced",
+            drained_events = drained_event_count,
+            "force_stop called; uncommitted events discarded — embedder must handle replay/deduplication"
+        );
         self.delivered_not_committed = 0;
         self.source.close().await;
 
@@ -424,5 +427,47 @@ where
             .trace_checkpoint_barrier("stopped");
         self.state = RuntimeState::Stopped;
         Ok(drained)
+    }
+
+    /// Drain buffered in-flight events, acknowledge them, then stop the runtime cleanly.
+    ///
+    /// This is a convenience shortcut for the common shutdown pattern:
+    ///
+    /// ```ignore
+    /// while let Ok(batch) = runtime.poll_event_batch().await {
+    ///     if batch.is_empty() { break; }
+    ///     runtime.commit_ack(batch.ack_mode()).await?;
+    /// }
+    /// runtime.stop().await?;
+    /// ```
+    ///
+    /// # Termination semantics
+    ///
+    /// `drain_and_stop` terminates on the **first empty batch** returned by
+    /// `poll_event_batch()`. For a finite source (e.g. a snapshot or a mock),
+    /// this drains all buffered events. For a **continuous live-replication
+    /// stream**, the source will appear empty as soon as the internal buffer
+    /// drains — which may happen quickly even while the upstream database is
+    /// still producing writes. In that case `drain_and_stop` stops after the
+    /// current buffer is consumed, not after the stream is logically
+    /// exhausted.
+    ///
+    /// For continuous streams, prefer calling [`CdcRuntime::stop()`] after your consumer
+    /// loop signals shutdown, or use [`CdcRuntime::force_stop()`] if you need an
+    /// unconditional immediate halt.
+    ///
+    /// Returns the total number of events that were drained and committed.
+    pub async fn drain_and_stop(&mut self) -> Result<usize> {
+        let mut total = 0usize;
+        loop {
+            let batch = self.poll_event_batch().await?;
+            if batch.is_empty() {
+                break;
+            }
+            total = total.saturating_add(batch.len());
+            self.commit_ack(batch.ack_mode()).await?;
+        }
+        self.stop().await?;
+        Ok(total)
     }
 }

@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ahash::{AHashMap as HashMap, AHasher};
 use sha2::{Digest, Sha256};
 
-use crate::core::{Error, Event, Result};
+use crate::core::{Error, Event, FingerprintError, Result};
 
 /// Sliding-window guard that suppresses duplicate event deliveries.
 ///
@@ -101,16 +101,12 @@ impl EventIdempotencyGuard {
 ///
 /// The fingerprint includes source position and intra-transaction sequence so
 /// that events sharing coarse offsets remain distinguishable within a session.
-pub fn fingerprint_event_transient(event: &Event) -> Result<u64> {
+pub fn fingerprint_event_transient(event: &Event) -> std::result::Result<u64, FingerprintError> {
     if event.source.source_name.trim().is_empty() {
-        return Err(Error::ValidationError(vec![
-            "cannot fingerprint event with empty source.source_name".into(),
-        ]));
+        return Err(FingerprintError::EmptySourceName);
     }
     if event.source.offset.trim().is_empty() {
-        return Err(Error::ValidationError(vec![
-            "cannot fingerprint event with empty source.offset".into(),
-        ]));
+        return Err(FingerprintError::EmptyOffset);
     }
 
     let mut hasher = AHasher::default();
@@ -125,7 +121,7 @@ pub fn fingerprint_event_transient(event: &Event) -> Result<u64> {
     if let Some(tx) = &event.transaction {
         tx.tx_id.hash(&mut hasher);
         tx.event_index.hash(&mut hasher);
-        tx.total_events.hash(&mut hasher);
+        tx.total_events.unwrap_or(0).hash(&mut hasher);
     }
 
     // Hash JSON payloads without allocating an intermediate String.
@@ -153,16 +149,12 @@ pub fn fingerprint_event_transient(event: &Event) -> Result<u64> {
 /// SHA-256 is ~3–5× slower than `AHasher` on the same input.  For the runtime's
 /// internal in-process idempotency guard, prefer [`fingerprint_event_transient`].
 /// Reserve this function for cross-restart dedup use cases.
-pub fn fingerprint_event_stable(event: &Event) -> Result<String> {
+pub fn fingerprint_event_stable(event: &Event) -> std::result::Result<String, FingerprintError> {
     if event.source.source_name.trim().is_empty() {
-        return Err(Error::ValidationError(vec![
-            "cannot fingerprint event with empty source.source_name".into(),
-        ]));
+        return Err(FingerprintError::EmptySourceName);
     }
     if event.source.offset.trim().is_empty() {
-        return Err(Error::ValidationError(vec![
-            "cannot fingerprint event with empty source.offset".into(),
-        ]));
+        return Err(FingerprintError::EmptyOffset);
     }
 
     let mut digest = Sha256::new();
@@ -194,7 +186,7 @@ pub fn fingerprint_event_stable(event: &Event) -> Result<String> {
         digest.update(1u8.to_le_bytes());
         digest.update(tx.tx_id.to_le_bytes());
         digest.update(tx.event_index.to_le_bytes());
-        digest.update(tx.total_events.to_le_bytes());
+        digest.update(tx.total_events.unwrap_or(0).to_le_bytes());
     } else {
         digest.update(0u8.to_le_bytes());
     }
@@ -203,8 +195,7 @@ pub fn fingerprint_event_stable(event: &Event) -> Result<String> {
         digest.update(1u8.to_le_bytes());
         // Canonical JSON serialisation is deterministic for serde_json's Map
         // (preserves insertion order), which matches source row order.
-        let bytes = serde_json::to_vec(before)
-            .map_err(|e| Error::ValidationError(vec![format!("fingerprint before: {e}")]))?;
+        let bytes = serde_json::to_vec(before).map_err(FingerprintError::SerializationFailed)?;
         digest.update((bytes.len() as u64).to_le_bytes());
         digest.update(&bytes);
     } else {
@@ -213,8 +204,7 @@ pub fn fingerprint_event_stable(event: &Event) -> Result<String> {
 
     if let Some(after) = &event.after {
         digest.update(1u8.to_le_bytes());
-        let bytes = serde_json::to_vec(after)
-            .map_err(|e| Error::ValidationError(vec![format!("fingerprint after: {e}")]))?;
+        let bytes = serde_json::to_vec(after).map_err(FingerprintError::SerializationFailed)?;
         digest.update((bytes.len() as u64).to_le_bytes());
         digest.update(&bytes);
     } else {
@@ -308,7 +298,7 @@ mod tests {
             snapshot: None,
             transaction: tx_event_index.map(|event_index| TransactionMetadata {
                 tx_id: 42,
-                total_events: 2,
+                total_events: Some(2),
                 event_index,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,

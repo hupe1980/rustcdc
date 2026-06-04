@@ -78,22 +78,21 @@ impl SnapshotValidator {
 
                 let pk_hash = hash_primary_key_values(pk, after)?;
 
-                // Build a compact JSON representation for the PK sample (kept for diagnostics).
-                let pk_label = format_pk_label(pk, after);
-
                 // Avoid cloning table name on the hot path: look up by &str first,
                 // and only allocate an owned String for the first-seen table.
                 if let Some(state) = self.tables.get_mut(event.table.as_str()) {
                     state.rows_received = state.rows_received.saturating_add(1);
                     let is_new = state.received_pks.insert(pk_hash);
+                    // Build the PK label lazily: only format when we'll actually store it.
                     if is_new && state.pk_samples.len() < MAX_PK_SAMPLE {
-                        state.pk_samples.push(pk_label);
+                        state.pk_samples.push(format_pk_label(pk, after));
                     }
                 } else {
                     let state = self.tables.entry(event.table.clone()).or_default();
                     state.rows_received = state.rows_received.saturating_add(1);
                     state.received_pks.insert(pk_hash);
-                    state.pk_samples.push(pk_label);
+                    // First event for this table — always sample if under the limit.
+                    state.pk_samples.push(format_pk_label(pk, after));
                 }
 
                 Ok(())
@@ -293,7 +292,7 @@ mod tests {
             }),
             transaction: Some(TransactionMetadata {
                 tx_id: 0,
-                total_events: 1,
+                total_events: Some(1),
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,

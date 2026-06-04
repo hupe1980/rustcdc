@@ -109,7 +109,12 @@ struct VersionedSchema {
     schema: Option<TableSchema>,
 }
 
-/// In-memory schema-history implementation for tests and local development.
+/// In-memory schema-history backend.
+///
+/// Suitable for tests, short-lived processes, and embeddings where DDL history
+/// does not need to survive a restart. For production use with long-lived
+/// deployments, prefer [`FileSchemaHistory`] to avoid unbounded memory growth
+/// and loss on restart.
 #[derive(Debug, Clone, Default)]
 pub struct InMemorySchemaHistory {
     schemas: Arc<RwLock<SchemaStore>>,

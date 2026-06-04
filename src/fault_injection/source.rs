@@ -362,7 +362,7 @@ mod tests {
             }),
             transaction: Some(TransactionMetadata {
                 tx_id: 1,
-                total_events: 1,
+                total_events: Some(1),
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
@@ -444,7 +444,7 @@ mod tests {
             Ok(HandoffResult {
                 snapshot_end_ts: Some(1),
                 stream_start_ts: Some(2),
-                overlap_events_dropped: 0,
+                overlap_events_dropped: None,
                 stream_watermark_gap: None,
             })
         }

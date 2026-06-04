@@ -79,7 +79,10 @@ impl SqlServerSourceConfig {
         self
     }
 
-    /// Validate configuration values before a connection attempt.
+    /// Validate structural configuration values.
+    ///
+    /// Does **not** resolve deferred secrets. Password presence for
+    /// provider-backed or callback-backed secrets is verified at connect time.
     pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
             return Err(Error::ConfigError(
@@ -96,10 +99,12 @@ impl SqlServerSourceConfig {
                 "sqlserver user must not be empty".into(),
             ));
         }
-        if self.password.resolve()?.trim().is_empty() {
-            return Err(Error::ConfigError(
-                "sqlserver password must not be empty".into(),
-            ));
+        if let Ok(pw) = self.password.expose_secret() {
+            if pw.trim().is_empty() {
+                return Err(Error::ConfigError(
+                    "sqlserver password must not be empty".into(),
+                ));
+            }
         }
         if self.database.trim().is_empty() {
             return Err(Error::ConfigError(

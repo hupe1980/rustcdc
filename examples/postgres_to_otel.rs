@@ -139,7 +139,7 @@ async fn main() -> rustcdc::Result<()> {
                     continue;
                 }
 
-                let ack = batch.ack_token();
+                let ack = batch.ack_mode();
                 let batch_event_count = batch.len();
                 let events = batch.into_events();
 
@@ -175,14 +175,12 @@ async fn main() -> rustcdc::Result<()> {
                     break;
                 }
 
-                if let Some(token) = ack {
-                    let commit_start = Instant::now();
-                    runtime.commit_ack(token).await?;
-                    let latency_ms = commit_start.elapsed().as_millis() as u64;
-                    metrics.record_checkpoint_committed(batch_event_count as u64, latency_ms);
-                    logger.checkpoint_saved("runtime-managed", batch_event_count as u64);
-                    emit_log("checkpoint_saved", None, Some("runtime-managed"), "checkpoint committed");
-                }
+                let commit_start = Instant::now();
+                runtime.commit_ack(ack).await?;
+                let latency_ms = commit_start.elapsed().as_millis() as u64;
+                metrics.record_checkpoint_committed(batch_event_count as u64, latency_ms);
+                logger.checkpoint_saved("runtime-managed", batch_event_count as u64);
+                emit_log("checkpoint_saved", None, Some("runtime-managed"), "checkpoint committed");
             }
         }
     }

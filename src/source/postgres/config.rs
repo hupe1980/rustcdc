@@ -88,7 +88,10 @@ impl PostgresSourceConfig {
         self
     }
 
-    /// Validate configuration values before a connection attempt.
+    /// Validate structural configuration values.
+    ///
+    /// Does **not** resolve deferred secrets. Password presence for
+    /// provider-backed or callback-backed secrets is verified at connect time.
     pub fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
             return Err(Error::ConfigError("postgres host must not be empty".into()));
@@ -101,10 +104,12 @@ impl PostgresSourceConfig {
         if self.user.trim().is_empty() {
             return Err(Error::ConfigError("postgres user must not be empty".into()));
         }
-        if self.password.resolve()?.trim().is_empty() {
-            return Err(Error::ConfigError(
-                "postgres password must not be empty".into(),
-            ));
+        if let Ok(pw) = self.password.expose_secret() {
+            if pw.trim().is_empty() {
+                return Err(Error::ConfigError(
+                    "postgres password must not be empty".into(),
+                ));
+            }
         }
         if matches!(self.auth_mode, DatabaseAuthMode::AwsIamToken) && !self.transport.is_tls() {
             return Err(Error::ConfigError(
@@ -205,7 +210,7 @@ impl PostgresSourceConfig {
     }
 
     /// Whether TLS transport is requested by the config.
-    pub const fn tls_enabled(&self) -> bool {
+    pub fn tls_enabled(&self) -> bool {
         self.transport.is_tls()
     }
 

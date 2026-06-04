@@ -13,7 +13,7 @@ The core embedder API is centered on:
 - `RuntimeConfig` for runtime construction
 - `CdcRuntime` for lifecycle and event delivery
 - `RuntimeSourceConfig` for source selection
-- `EventBatch` and `AckToken` for loss-safe delivery semantics
+- `EventBatch` and `AckMode` for loss-safe delivery semantics
 
 ## Runtime Construction
 
@@ -105,9 +105,7 @@ async fn run_once() -> Result<()> {
   runtime.start().await?;
 
   let batch = runtime.poll_event_batch().await?;
-  if let Some(token) = batch.ack_token() {
-    runtime.commit_ack(token).await?;
-  }
+  runtime.commit_ack(batch.ack_mode()).await?;
 
   runtime.stop().await?;
   Ok(())
@@ -156,18 +154,28 @@ The event envelope is designed to support stable replay and source-agnostic proc
 
 ## Delivery And Acknowledgement Semantics
 
-`poll_event_batch()` returns an `EventBatch` that contains events and an optional `AckToken`.
+`poll_event_batch()` returns an `EventBatch` that contains events and an `AckMode`.
+
+```rust
+pub enum AckMode {
+    Required(AckToken),   // must commit; skipping risks replay on restart
+    NotRequired,          // empty batch or disabled source; commit_ack is a no-op
+}
+```
 
 Correct processing sequence:
 
 1. consume events in batch order
 2. durably commit sink side effects
-3. call `commit_ack(token)`
+3. call `commit_ack(batch.ack_mode())`
+
+`commit_ack` accepts `impl Into<AckMode>` — passing `AckMode::NotRequired` is a documented zero-cost no-op. Raw `AckToken` values are also accepted (via `From<AckToken>`).
 
 Important semantics:
 - not acknowledging after sink durability may replay already-delivered events
 - `stop()` fails fast if uncommitted events remain in-flight
-- `force_stop()` is intended for emergency drain where replay is acceptable
+- `force_stop()` is intended for emergency drain where replay is acceptable; emits a `WARN` log with `shutdown_mode = "forced"`
+- `drain_and_stop()` polls until the source is exhausted then stops cleanly
 - process termination without `stop()` can replay the in-flight batch on restart (at-least-once)
 - source confirmation failures after durable checkpoint commit now fail fast by default (`PostCommitSourceConfirmPolicy::FailFast`)
 
@@ -236,7 +244,7 @@ restarts) and persist seen fingerprints in your sink's storage:
 use rustcdc::idempotency::fingerprint_event_stable;
 
 // On each delivered event:
-let fingerprint = fingerprint_event_stable(&event);
+let fingerprint = fingerprint_event_stable(&event)?; // returns Result<String, FingerprintError>
 if !sink_has_seen(&fingerprint).await? {
     sink_write(&event).await?;
     sink_mark_seen(&fingerprint).await?;
@@ -257,10 +265,23 @@ use futures_util::StreamExt;
 let mut batches = runtime.event_batches();
 while let Some(batch) = batches.next().await {
   let batch = batch?;
-  if let Some(token) = batch.ack_token() {
-    runtime.commit_ack(token).await?;
-  }
+  runtime.commit_ack(batch.ack_mode()).await?;
 }
+```
+
+For cooperative cancellation, use `event_batches_cancellable(token)` with a `CancellationToken`:
+
+```rust
+use tokio_util::sync::CancellationToken;
+use futures_util::StreamExt;
+
+let cancel = CancellationToken::new();
+let mut batches = runtime.event_batches_cancellable(cancel.clone());
+while let Some(batch) = batches.next().await {
+  let batch = batch?;
+  runtime.commit_ack(batch.ack_mode()).await?;
+}
+// cancel.cancel() from another task unblocks the stream cleanly
 ```
 
 ## Incremental Snapshot API (DBLog Pattern)
@@ -298,14 +319,23 @@ This connector-level API is also available for MySQL and SQL Server via
 `MysqlConnection::start_incremental_snapshot(...)` and
 `SqlServerConnection::start_incremental_snapshot(...)`.
 
+## EventBatch Inspection
+
+`EventBatch` provides several inspection methods:
+
+- `batch.len()` / `batch.is_empty()` — event count
+- `batch.ack_mode()` — `AckMode::Required(token)` or `AckMode::NotRequired`
+- `batch.oldest_event_source_timestamp_ms()` — millisecond timestamp of the oldest event in the batch (for lag monitoring)
+- `batch.events()` — iterator over contained `Event` values
+
 ## Checkpoint Backends
 
 Checkpoint implementations persist source offsets and determine restart position.
 
 Built-in options include:
 
-- in-memory checkpoint storage (tests)
-- file-backed checkpoint storage
+- `InMemoryCheckpoint` — zero-config, suitable for tests and short-lived processes. State is lost on restart.
+- `FileCheckpoint` — file-backed persistence; recommended for production.
 
 Custom checkpoint backends can be implemented through the `Checkpoint` trait.
 

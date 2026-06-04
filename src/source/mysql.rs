@@ -1738,7 +1738,7 @@ mod tests {
         let tx0 = events[0].transaction.as_ref().expect("tx metadata");
         let tx2 = events[2].transaction.as_ref().expect("tx metadata");
         assert_eq!(tx0.tx_id, 77);
-        assert_eq!(tx0.total_events, 3);
+        assert_eq!(tx0.total_events, Some(3));
         assert_eq!(tx0.event_index, 0);
         assert_eq!(tx2.event_index, 2);
 
@@ -2191,7 +2191,7 @@ mod tests {
             snapshot: None,
             transaction: Some(crate::core::TransactionMetadata {
                 tx_id: 1,
-                total_events: 1,
+                total_events: Some(1),
                 event_index: 0,
             }),
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
@@ -2212,7 +2212,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.snapshot_end_ts, Some(1_700_000_000_000));
         assert!(result.stream_start_ts.is_some());
-        assert_eq!(result.overlap_events_dropped, 0);
+        assert_eq!(result.overlap_events_dropped, Some(0));
     }
 
     #[tokio::test]
@@ -2233,7 +2233,7 @@ mod tests {
             .await
             .unwrap();
         // No overlap events were prefetched from stream in this test setup.
-        assert_eq!(result.overlap_events_dropped, 0);
+        assert_eq!(result.overlap_events_dropped, Some(0));
     }
 
     #[tokio::test]
@@ -2325,7 +2325,7 @@ mod tests {
             .await
             .unwrap();
         // Different files: no byte-overlap count.
-        assert_eq!(result.overlap_events_dropped, 0);
+        assert_eq!(result.overlap_events_dropped, Some(0));
     }
 
     #[tokio::test]
@@ -2355,7 +2355,7 @@ mod tests {
             .unwrap();
 
         // id=1 appears twice in the overlap window and must be compacted.
-        assert_eq!(result.overlap_events_dropped, 1);
+        assert_eq!(result.overlap_events_dropped, Some(1));
         assert_eq!(stream.requeued.len(), 3);
         assert_eq!(
             stream.requeued[0].after.as_ref().unwrap()["id"],

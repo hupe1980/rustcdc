@@ -126,13 +126,7 @@ async fn postgres_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
             break;
         }
         snapshot_count += batch.len();
-        runtime
-            .commit_ack(
-                batch
-                    .ack_token()
-                    .expect("non-empty batch should include ack token"),
-            )
-            .await?;
+        runtime.commit_ack(batch.ack_mode()).await?;
         if snapshot_count >= 1000 {
             break;
         }
@@ -177,13 +171,7 @@ async fn postgres_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
         }
 
         stream_count += batch.len();
-        runtime
-            .commit_ack(
-                batch
-                    .ack_token()
-                    .expect("non-empty batch should include ack token"),
-            )
-            .await?;
+        runtime.commit_ack(batch.ack_mode()).await?;
         if stream_count >= 100 {
             break;
         }
