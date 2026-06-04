@@ -223,8 +223,8 @@ fn bench_parallel_snapshot_4x100k(c: &mut Criterion) {
 
 fn bench_quality_gate_targets(c: &mut Criterion) {
     let mut group = c.benchmark_group("quality_gates");
-    group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(3));
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(5));
 
     group.bench_function("snapshot_10k_rows", |b| {
         let events: Vec<Event> = (1..=10_000).map(build_event).collect();

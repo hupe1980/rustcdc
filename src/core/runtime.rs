@@ -708,8 +708,8 @@ impl EventBatch {
     /// # }
     /// ```
     pub fn ack_mode(&self) -> AckMode {
-        match self.ack_token.clone() {
-            Some(token) => AckMode::Required(token),
+        match &self.ack_token {
+            Some(token) => AckMode::Required(token.clone()),
             None => AckMode::NotRequired,
         }
     }

@@ -462,6 +462,14 @@ jobs:
       - name: policy gate
         run: bash scripts/ci-policy-gate.sh
 
+      - name: clear stale criterion baseline cache
+        run: |
+          # Remove any Criterion baseline cached from a prior crate version
+          # (Swatinem/rust-cache persists target/ across Cargo.lock-stable runs).
+          # Clearing here forces ensure_named_baseline to bootstrap against the
+          # current commit so the gate compares like-for-like.
+          rm -rf target/criterion
+
       - name: benchmark policy gate
         run: bash scripts/ci-benchmark-gate.sh
 
