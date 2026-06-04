@@ -452,8 +452,8 @@ impl CdcRuntime {
     /// current buffer is consumed, not after the stream is logically
     /// exhausted.
     ///
-    /// For continuous streams, prefer calling [`stop()`] after your consumer
-    /// loop signals shutdown, or use [`force_stop()`] if you need an
+    /// For continuous streams, prefer calling [`CdcRuntime::stop()`] after your consumer
+    /// loop signals shutdown, or use [`CdcRuntime::force_stop()`] if you need an
     /// unconditional immediate halt.
     ///
     /// Returns the total number of events that were drained and committed.
