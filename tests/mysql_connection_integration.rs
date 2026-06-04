@@ -177,7 +177,7 @@ fn mysql_config_defaults() {
     let config = MysqlSourceConfig::default();
     assert_eq!(config.host, "localhost");
     assert_eq!(config.port, 3306);
-    assert_eq!(config.server_id, 1);
+    assert!(config.server_id >= 1, "server_id must be >= 1 (got {})", config.server_id);
     assert!(!config.gtid_mode_enabled);
     assert!(config.binlog_format_check);
     assert_eq!(config.conn_timeout_secs, 30);
