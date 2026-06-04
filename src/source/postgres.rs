@@ -538,7 +538,7 @@ impl PostgresConnection {
                 }
             }
             #[cfg(feature = "tls")]
-            TransportConfig::RustlsConfig(rustls_cfg) => {
+            TransportConfig::RustlsConfig { config: rustls_cfg } => {
                 use tokio_postgres_rustls::MakeRustlsConnect;
                 let tls_connector = MakeRustlsConnect::new((*rustls_cfg.0).clone());
                 let connect_config = self.config.build_connect_config()?;

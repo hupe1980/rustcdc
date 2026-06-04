@@ -235,9 +235,9 @@ impl RuntimeOptions {
     /// Set an upper bound on serialized event bytes per batch.
     ///
     /// The runtime will not flush a batch whose total serialized size exceeds
-    /// this value. Pass `None` to remove the limit.
-    pub fn with_max_event_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_event_bytes = Some(max_bytes);
+    /// this value. Pass `None` to remove the limit (the default).
+    pub fn with_max_event_bytes(mut self, max_bytes: impl Into<Option<usize>>) -> Self {
+        self.max_event_bytes = max_bytes.into();
         self
     }
 }

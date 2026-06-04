@@ -17,18 +17,23 @@ const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
 const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
 
-/// Generate a unique `server_id` for each MySQL replication client instance.
+/// Generate a best-effort unique `server_id` for each MySQL replication client instance.
 ///
 /// MySQL requires each replica to have a cluster-unique `server_id` in the
 /// range `[1, 2^32-1]`. Reusing `1` (the MySQL server default) or any fixed
 /// value across multiple `rustcdc` instances causes silent event loss or
-/// eviction of the existing client. We derive a per-instance ID from process
-/// ID bits XOR'd with a monotonically incrementing counter and a compile-time
-/// hash, giving a stable-within-process but distinct-across-process spread.
+/// eviction of the existing client.
 ///
-/// Callers that require a specific `server_id` (e.g., for auditing or cluster
-/// reservation) should set `server_id` explicitly after constructing the
-/// default config.
+/// This function derives an ID from process ID bits combined with a
+/// monotonically incrementing counter and a compile-time constant, giving a
+/// stable-within-process spread that avoids the most common collision scenario
+/// (two replicas on the same host running the same binary).
+///
+/// **This is not a cluster-wide uniqueness guarantee.** Hash collisions across
+/// separate hosts or processes are possible, though unlikely in practice.
+/// Deployments that require strict cluster-wide uniqueness (e.g., auditing,
+/// CDC replication slot reservation) should set `server_id` explicitly after
+/// constructing the default config.
 fn generate_server_id() -> u32 {
     // Counter ensures uniqueness within a process even when the PID component
     // happens to collide across different processes on the same host.

@@ -201,6 +201,20 @@ impl<'de> Deserialize<'de> for SecretString {
         D: Deserializer<'de>,
     {
         let inline = String::deserialize(deserializer)?;
+
+        // Reject the serialization placeholder so that a round-tripped config
+        // (serialize → write file → deserialize) fails fast with a clear error
+        // instead of silently attempting to connect with "[REDACTED]" as the
+        // actual password.
+        if inline == "[REDACTED]" {
+            return Err(serde::de::Error::custom(
+                "SecretString contains the serialization placeholder \"[REDACTED]\"; \
+                 this value was produced by serializing a secret and must not be used \
+                 as a real credential. Provide the actual secret value or use \
+                 SecretString::from_provider / SecretString::from_callback.",
+            ));
+        }
+
         tracing::warn!(
             target: "rustcdc::security",
             "SecretString deserialized from inline plaintext value. \
@@ -338,5 +352,28 @@ mod tests {
         let secret = SecretString::from_provider("static", "db/password", Arc::new(StaticProvider));
         let json = serde_json::to_string(&secret).unwrap();
         assert_eq!(json, r#""[REDACTED]""#);
+    }
+
+    #[test]
+    fn redacted_placeholder_is_rejected_on_deserialize() {
+        let err = serde_json::from_str::<SecretString>(r#""[REDACTED]""#).unwrap_err();
+        assert!(
+            err.to_string().contains("serialization placeholder"),
+            "expected clear error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_of_redacted_config_fails_fast() {
+        // Simulate: serialize a struct containing a secret, write to "config", read back.
+        // The round-trip must fail at deserialization, not silently use "[REDACTED]" as password.
+        let secret = SecretString::new("real-password");
+        let serialized = serde_json::to_string(&secret).unwrap();
+        assert_eq!(serialized, r#""[REDACTED]""#);
+        // Attempting to deserialize the placeholder must be rejected.
+        assert!(
+            serde_json::from_str::<SecretString>(&serialized).is_err(),
+            "round-tripped [REDACTED] must not deserialize successfully"
+        );
     }
 }

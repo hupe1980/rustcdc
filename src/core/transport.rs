@@ -101,7 +101,10 @@ pub enum TransportConfig {
     ///
     /// Requires the `tls` Cargo feature.
     #[cfg(feature = "tls")]
-    RustlsConfig(RustlsClientConfig),
+    RustlsConfig {
+        /// The pre-built rustls client configuration.
+        config: RustlsClientConfig,
+    },
 }
 
 impl Default for TransportConfig {
@@ -181,13 +184,15 @@ impl TransportConfig {
     /// Requires the `tls` Cargo feature.
     #[cfg(feature = "tls")]
     pub fn rustls_config(config: Arc<rustls::ClientConfig>) -> Self {
-        Self::RustlsConfig(RustlsClientConfig(config))
+        Self::RustlsConfig {
+            config: RustlsClientConfig(config),
+        }
     }
 
     /// Return true when TLS transport is configured.
     pub fn is_tls(&self) -> bool {
         #[cfg(feature = "tls")]
-        if matches!(self, Self::RustlsConfig(_)) {
+        if matches!(self, Self::RustlsConfig { .. }) {
             return true;
         }
         matches!(self, Self::Tls { .. })
