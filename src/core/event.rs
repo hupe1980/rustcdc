@@ -561,6 +561,14 @@ impl Event {
             ));
         }
 
+        if self.before_is_key_only && self.before.is_none() {
+            errors.push(ValidationError::new(
+                "before_is_key_only",
+                "before_is_key_only is true but before is None; \
+                 key-only before-images must carry at least the primary-key columns in before",
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -873,6 +881,25 @@ mod tests {
             delete.validate().is_ok(),
             "DELETE should allow before_is_key_only=true"
         );
+    }
+
+    #[test]
+    fn before_is_key_only_true_requires_before_to_be_some() {
+        // before_is_key_only = true with before = None is always invalid, regardless of op.
+        for op in [Operation::Update, Operation::Delete] {
+            let mut event = valid_event();
+            event.op = op;
+            event.before = None; // ← no before image at all
+            event.before_is_key_only = true;
+            if op == Operation::Update {
+                event.after = Some(json!({"id": 1}));
+            }
+            let errors = event.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.field == "before_is_key_only"),
+                "expected before_is_key_only error when before=None for op={op:?}; got: {errors}"
+            );
+        }
     }
 
     #[test]

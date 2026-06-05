@@ -7,19 +7,21 @@ use serde::{Deserialize, Serialize};
 
 /// Diff level: what kind of change was detected.
 ///
-/// Variants are ordered from highest to lowest severity so that `>` comparisons
-/// and `sort()` calls give an intuitive "most severe first" result:
-/// `Critical > Semantic > Inconsequential > Identical`.
+/// Variants are ordered from lowest to highest severity so that standard `>`
+/// comparisons and `max()` calls work intuitively: `Critical > Semantic >
+/// Inconsequential > Identical`.
+///
+/// [`semantic_diff`] returns results sorted **descending** (most severe first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DiffLevel {
-    /// Critical structural difference (e.g., missing required field or wrong operation)
-    Critical,
-    /// Semantic change that may affect correctness (e.g., table name, data field)
-    Semantic,
-    /// Inconsequential difference (e.g., JSON key reordering)
-    Inconsequential,
     /// No difference detected
     Identical,
+    /// Inconsequential difference (e.g., JSON key reordering)
+    Inconsequential,
+    /// Semantic change that may affect correctness (e.g., table name, data field)
+    Semantic,
+    /// Critical structural difference (e.g., missing required field or wrong operation)
+    Critical,
 }
 
 impl std::fmt::Display for DiffLevel {
@@ -161,9 +163,9 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
         );
     }
 
-    // Sort by severity ascending using DiffLevel's derived Ord.
-    // Critical is the lowest discriminant (0), so sorting ascending puts Critical first.
-    diffs.sort_by_key(|d| d.level);
+    // Sort descending: highest severity (Critical) first.
+    // With Critical as the highest discriminant, Reverse wrapping gives ascending sort key.
+    diffs.sort_by_key(|d| std::cmp::Reverse(d.level));
 
     diffs
 }
