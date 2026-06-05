@@ -101,7 +101,7 @@ async fn mariadb_base_config(version: &str, server_id: u32) -> rustcdc::Result<M
 
     Ok(MariadbTestTarget {
         _container: container,
-        config: MariaDbSourceConfig(MysqlSourceConfig {
+        config: MariaDbSourceConfig::new(MysqlSourceConfig {
             host: host_string,
             port,
             user: "root".to_string(),

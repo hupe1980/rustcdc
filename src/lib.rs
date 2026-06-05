@@ -11,6 +11,7 @@ pub mod deterministic_replay;
 pub mod fault_injection;
 #[cfg(feature = "outbox")]
 pub mod outbox;
+pub mod pipeline;
 pub mod schema_history;
 pub mod sink;
 pub mod source;
@@ -24,12 +25,12 @@ pub mod wasm;
 pub use crate::core::RustlsClientConfig;
 pub use crate::core::{
     fingerprint_event_stable, fingerprint_event_transient, AckMode, AckToken, CdcRuntime,
-    ConnectionRetryPolicy, Error, Event, EventBatch, EventIdempotencyGuard, EventTracer,
+    ConnectionRetryPolicy, Error, ErrorKind, Event, EventBatch, EventIdempotencyGuard, EventTracer,
     FingerprintError, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
     Offset, Operation, PostCommitSourceConfirmPolicy, Result, RuntimeAdminSnapshot, RuntimeConfig,
     RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider,
     SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata, StructuredLogger,
-    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError,
+    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError, ValidationErrors,
     EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "metrics")]
@@ -72,7 +73,7 @@ pub use crate::transform::{
 };
 #[cfg(feature = "wasm")]
 pub use crate::wasm::{
-    TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,
+    TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime, WasmTransform,
     DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,
 };
 
@@ -82,4 +83,16 @@ pub use crate::codec::AvroEncoder;
 pub use crate::codec::CloudEventsEncoder;
 #[cfg(feature = "protobuf")]
 pub use crate::codec::ProtobufEncoder;
-pub use crate::codec::{EncodedOutput, EventEncoder, JsonEncoder, JsonPrettyEncoder};
+#[cfg(feature = "schemreg")]
+pub use crate::codec::{
+    decode_wire_format, encode_wire_format, CachedSchemaRegistry, CompatibilityLevel,
+    ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentSchemaRegistry,
+    EncodeTarget, SchemaId, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig,
+    SchemaType, SubjectNameStrategy,
+};
+pub use crate::codec::{
+    Codec, CodecOutput, EncodedOutput, EncoderCodec, EventEncoder, JsonCodec, JsonEncoder,
+    JsonPrettyEncoder,
+};
+pub use crate::pipeline::{TableRoute, TableRouter, TableRouterBuilder};
+pub use crate::sink::{FileJsonlSink, MemorySinkAdapter, SinkAdapter, StdoutSink};

@@ -262,7 +262,7 @@ async fn run_mariadb_stream_capture_insert_update_delete(
     .await
     .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let config = MariaDbSourceConfig(MysqlSourceConfig {
+    let config = MariaDbSourceConfig::new(MysqlSourceConfig {
         host,
         port,
         user: "root".to_string(),
@@ -409,7 +409,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
     }
 
-    let config = MariaDbSourceConfig(MysqlSourceConfig {
+    let config = MariaDbSourceConfig::new(MysqlSourceConfig {
         host,
         port,
         user: "root".to_string(),

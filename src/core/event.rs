@@ -11,10 +11,11 @@ use crate::core::{Error, Result};
 pub const EVENT_ENVELOPE_VERSION: u16 = 1;
 
 /// CRUD-style operations emitted by a source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Operation {
+    #[default]
     Insert,
     Update,
     Delete,
@@ -48,10 +49,93 @@ impl Operation {
             Self::Truncate => "truncate",
         }
     }
+
+    /// Returns `true` for INSERT, UPDATE, and DELETE operations.
+    ///
+    /// Use this to filter out READ, SCHEMA_CHANGE, and TRUNCATE events when
+    /// you only care about row-level data mutations.
+    #[inline]
+    pub const fn is_data_change(self) -> bool {
+        matches!(self, Self::Insert | Self::Update | Self::Delete)
+    }
+
+    /// Returns `true` for INSERT events.
+    #[inline]
+    pub const fn is_insert(self) -> bool {
+        matches!(self, Self::Insert)
+    }
+
+    /// Returns `true` for UPDATE events.
+    #[inline]
+    pub const fn is_update(self) -> bool {
+        matches!(self, Self::Update)
+    }
+
+    /// Returns `true` for DELETE events.
+    #[inline]
+    pub const fn is_delete(self) -> bool {
+        matches!(self, Self::Delete)
+    }
+
+    /// Returns `true` for READ events (emitted during snapshot).
+    #[inline]
+    pub const fn is_read(self) -> bool {
+        matches!(self, Self::Read)
+    }
+
+    /// Returns `true` for SCHEMA_CHANGE events.
+    #[inline]
+    pub const fn is_schema_change(self) -> bool {
+        matches!(self, Self::SchemaChange)
+    }
+
+    /// Returns `true` for TRUNCATE events.
+    #[inline]
+    pub const fn is_truncate(self) -> bool {
+        matches!(self, Self::Truncate)
+    }
+}
+
+impl std::str::FromStr for Operation {
+    type Err = Error;
+
+    /// Parse an `Operation` from its canonical string form.
+    ///
+    /// Accepts the same lowercase snake_case strings produced by [`Operation::to_str`] and
+    /// [`Display`](std::fmt::Display). Parsing is case-sensitive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ValidationError`] when the string does not match any known variant.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::str::FromStr;
+    /// use rustcdc::Operation;
+    ///
+    /// assert_eq!(Operation::from_str("insert").unwrap(), Operation::Insert);
+    /// assert_eq!(Operation::from_str("schema_change").unwrap(), Operation::SchemaChange);
+    /// assert!(Operation::from_str("INSERT").is_err()); // case-sensitive
+    /// ```
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "insert" => Ok(Self::Insert),
+            "update" => Ok(Self::Update),
+            "delete" => Ok(Self::Delete),
+            "read" => Ok(Self::Read),
+            "schema_change" => Ok(Self::SchemaChange),
+            "truncate" => Ok(Self::Truncate),
+            other => Err(Error::ValidationError(vec![format!(
+                "unknown operation '{}': expected one of insert, update, delete, read, schema_change, truncate",
+                other
+            )])),
+        }
+    }
 }
 
 /// Source identity and position metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SourceMetadata {
     /// Logical name of the source connector.
     pub source_name: String,
@@ -95,12 +179,107 @@ pub struct ValidationError {
     pub message: String,
 }
 
+impl Display for ValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field, self.message)
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
 impl ValidationError {
     fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             field: field.into(),
             message: message.into(),
         }
+    }
+}
+
+/// All validation failures from a single [`Event::validate`] call.
+///
+/// Returned as the `Err` variant of [`Event::validate`] so callers can access
+/// each field-level error individually or format the whole list as a single string.
+///
+/// ```
+/// use rustcdc::Event;
+///
+/// let event = Event::default(); // ts == 0 → invalid
+/// let err = event.validate().unwrap_err();
+/// // Display: semicolon-joined list of all violations
+/// println!("{err}");
+/// // Iterate individual errors
+/// for e in err.errors() {
+///     println!("  field={} msg={}", e.field, e.message);
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationErrors(Vec<ValidationError>);
+
+impl ValidationErrors {
+    fn new(errors: Vec<ValidationError>) -> Self {
+        Self(errors)
+    }
+
+    /// Returns a slice of the individual field-level validation failures.
+    pub fn errors(&self) -> &[ValidationError] {
+        &self.0
+    }
+
+    /// Consume this wrapper and return the owned error list.
+    pub fn into_errors(self) -> Vec<ValidationError> {
+        self.0
+    }
+
+    /// Number of distinct validation failures.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` when there are no validation failures.
+    ///
+    /// This is always `false` in practice — `ValidationErrors` is only
+    /// constructed when at least one error exists.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterate over individual field-level validation failures.
+    pub fn iter(&self) -> std::slice::Iter<'_, ValidationError> {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ValidationErrors {
+    type Item = &'a ValidationError;
+    type IntoIter = std::slice::Iter<'a, ValidationError>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for ValidationErrors {
+    type Item = ValidationError;
+    type IntoIter = std::vec::IntoIter<ValidationError>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl Display for ValidationErrors {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let messages: Vec<String> = self.0.iter().map(|e| e.to_string()).collect();
+        write!(f, "{}", messages.join("; "))
+    }
+}
+
+impl std::error::Error for ValidationErrors {}
+
+impl From<ValidationErrors> for Error {
+    fn from(errs: ValidationErrors) -> Self {
+        Self::ValidationError(errs.0.iter().map(|e| e.to_string()).collect())
     }
 }
 
@@ -128,6 +307,7 @@ impl ValidationError {
 ///     snapshot: None,
 ///     transaction: None,
 ///     envelope_version: EVENT_ENVELOPE_VERSION,
+///     before_is_key_only: false,
 /// };
 ///
 /// let encoded = event.to_json().unwrap();
@@ -159,6 +339,43 @@ pub struct Event {
     pub transaction: Option<TransactionMetadata>,
     /// Canonical envelope version for compatibility checks.
     pub envelope_version: u16,
+    /// Advisory flag — set to `true` when the `before` field contains only
+    /// primary-key columns rather than the full pre-image row.
+    ///
+    /// This occurs on PostgreSQL UPDATE and DELETE events when the table's
+    /// `REPLICA IDENTITY` is `DEFAULT` (the factory default). In that mode,
+    /// PostgreSQL only includes the old primary key values in the WAL record
+    /// rather than the complete before-image. Applications that compute row diffs
+    /// or need the full prior state must check this flag; when it is `true`,
+    /// `before` cannot be used as a complete row snapshot.
+    ///
+    /// Always `false` for INSERT, READ, SCHEMA_CHANGE, and TRUNCATE events, and
+    /// for all MySQL / MariaDB / SQL Server events.
+    #[serde(default)]
+    pub before_is_key_only: bool,
+}
+
+impl Default for Event {
+    /// Returns a minimal INSERT event skeleton with correct `envelope_version`.
+    ///
+    /// All fields default to empty/zero; callers must set `table`, `ts`, and
+    /// other required fields before passing the event to validation or encoding.
+    fn default() -> Self {
+        Self {
+            before: None,
+            after: None,
+            op: Operation::default(),
+            source: SourceMetadata::default(),
+            ts: 0,
+            schema: None,
+            table: String::new(),
+            primary_key: None,
+            snapshot: None,
+            transaction: None,
+            envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
+        }
+    }
 }
 
 impl Event {
@@ -167,13 +384,54 @@ impl Event {
         Ok(serde_json::to_string(self)?)
     }
 
+    /// Serialize the event to compact JSON bytes.
+    ///
+    /// Prefer this over `to_json()` when you need a `Vec<u8>` directly (e.g. for
+    /// Kafka message values, HTTP request bodies). Avoids a UTF-8 round-trip.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
     /// Deserialize an event from JSON.
     pub fn from_json(input: &str) -> Result<Self> {
         Ok(serde_json::from_str(input)?)
     }
 
+    /// Deserialize an event from JSON bytes.
+    pub fn from_json_bytes(input: &[u8]) -> Result<Self> {
+        Ok(serde_json::from_slice(input)?)
+    }
+
+    /// Return the fully-qualified table name as `"schema.table"` when a schema
+    /// is present, or just `"table"` when no schema was provided by the source.
+    ///
+    /// Useful for routing, logging, and constructing Kafka topic names.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rustcdc::{Event, Operation, EVENT_ENVELOPE_VERSION};
+    ///
+    /// let mut event = Event { table: "orders".into(), ..Event::default() };
+    /// assert_eq!(event.qualified_table_name(), "orders");
+    ///
+    /// event.schema = Some("public".into());
+    /// assert_eq!(event.qualified_table_name(), "public.orders");
+    /// ```
+    pub fn qualified_table_name(&self) -> String {
+        match &self.schema {
+            Some(schema) if !schema.is_empty() => format!("{}.{}", schema, self.table),
+            _ => self.table.clone(),
+        }
+    }
+
     /// Validate the event against the canonical envelope contract.
-    pub fn validate(&self) -> std::result::Result<(), Vec<ValidationError>> {
+    ///
+    /// Returns `Ok(())` when the event satisfies all envelope constraints.
+    /// Returns `Err(ValidationErrors)` with every violated constraint when one
+    /// or more fields fail. Use [`ValidationErrors::errors()`] to iterate the
+    /// individual failures or `Display` to format them as a joined string.
+    pub fn validate(&self) -> std::result::Result<(), ValidationErrors> {
         let mut errors = Vec::new();
 
         if self.table.trim().is_empty() {
@@ -296,23 +554,119 @@ impl Event {
             }
         }
 
+        if self.before_is_key_only && self.op != Operation::Update && self.op != Operation::Delete {
+            errors.push(ValidationError::new(
+                "before_is_key_only",
+                "before_is_key_only can only be true for UPDATE or DELETE events",
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(errors)
+            Err(ValidationErrors::new(errors))
         }
     }
 
     /// Convert validation failures into the crate's shared error type.
+    ///
+    /// Equivalent to `event.validate().map_err(Error::from)`.
     pub fn validate_or_error(&self) -> Result<()> {
-        self.validate().map_err(|errors| {
-            Error::ValidationError(
-                errors
-                    .into_iter()
-                    .map(|error| format!("{}: {}", error.field, error.message))
-                    .collect(),
-            )
-        })
+        self.validate().map_err(Error::from)
+    }
+
+    /// Returns `true` when a full pre-image row is available in `before`.
+    ///
+    /// This is `true` iff `before` is `Some` **and** `before_is_key_only` is `false`.
+    ///
+    /// Use this instead of checking `before.is_some()` alone when you need the
+    /// complete prior row state — for example, when computing row diffs or emitting
+    /// before-images to a downstream store. A `before` field that is `Some` but
+    /// `before_is_key_only == true` contains only primary-key columns and cannot
+    /// be used as a complete row snapshot.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    /// use serde_json::json;
+    ///
+    /// let mut event = Event {
+    ///     before: Some(json!({"id": 1})),
+    ///     after: Some(json!({"id": 1, "name": "bob"})),
+    ///     op: Operation::Update,
+    ///     before_is_key_only: true,
+    ///     ..Event::default()
+    /// };
+    /// event.ts = 1;
+    /// event.table = "users".into();
+    /// event.source.source_name = "pg".into();
+    ///
+    /// // Key-only before: `before` is present but partial.
+    /// assert!(!event.has_full_before());
+    ///
+    /// event.before_is_key_only = false;
+    /// assert!(event.has_full_before());
+    /// ```
+    #[inline]
+    pub fn has_full_before(&self) -> bool {
+        self.before.is_some() && !self.before_is_key_only
+    }
+
+    /// Extracts the primary-key column values from the most appropriate row image.
+    ///
+    /// Returns a JSON object containing only the columns listed in `primary_key`,
+    /// taken from `after` for INSERT / UPDATE / READ / SCHEMA_CHANGE, and from
+    /// `before` for DELETE. Returns `None` when:
+    ///
+    /// - `primary_key` is `None` or empty.
+    /// - The relevant row image (`after` or `before`) is absent or not a JSON object.
+    ///
+    /// This is the canonical source for Kafka message keys and idempotency
+    /// fingerprints derived from primary-key values alone.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    /// use serde_json::json;
+    ///
+    /// let event = Event {
+    ///     before: None,
+    ///     after: Some(json!({"id": 42, "name": "alice", "age": 30})),
+    ///     op: Operation::Insert,
+    ///     primary_key: Some(vec!["id".into()]),
+    ///     ..Event::default()
+    /// };
+    ///
+    /// let key = event.primary_key_values().unwrap();
+    /// assert_eq!(key["id"], json!(42));
+    /// assert!(key.get("name").is_none());
+    /// ```
+    pub fn primary_key_values(&self) -> Option<serde_json::Value> {
+        let keys = self.primary_key.as_deref()?;
+        if keys.is_empty() {
+            return None;
+        }
+
+        let row = match self.op {
+            Operation::Delete => self.before.as_ref(),
+            _ => self.after.as_ref().or(self.before.as_ref()),
+        };
+
+        let obj = row?.as_object()?;
+        let mut result = serde_json::Map::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = obj.get(key) {
+                result.insert(key.clone(), value.clone());
+            }
+        }
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(result))
+        }
     }
 }
 
@@ -352,6 +706,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -465,6 +820,70 @@ mod tests {
     }
 
     #[test]
+    fn before_is_key_only_rejected_on_non_update_delete_events() {
+        for op in [
+            Operation::Insert,
+            Operation::Read,
+            Operation::SchemaChange,
+            Operation::Truncate,
+        ] {
+            let mut event = valid_event();
+            event.op = op;
+            event.before_is_key_only = true;
+            // Adjust before/after to satisfy per-op contract so only the flag fires.
+            match op {
+                Operation::Insert | Operation::Read | Operation::SchemaChange => {
+                    event.before = None;
+                    event.after = Some(json!({"id": 1}));
+                }
+                Operation::Truncate => {
+                    event.before = None;
+                    event.after = None;
+                }
+                _ => {}
+            }
+            let errors = event.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.field == "before_is_key_only"),
+                "expected before_is_key_only error for op={op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn before_is_key_only_accepted_on_update_and_delete_events() {
+        // UPDATE with key-only before
+        let mut update = valid_event();
+        update.op = Operation::Update;
+        update.before = Some(json!({"id": 1}));
+        update.after = Some(json!({"id": 1, "name": "bob"}));
+        update.before_is_key_only = true;
+        assert!(
+            update.validate().is_ok(),
+            "UPDATE should allow before_is_key_only=true"
+        );
+
+        // DELETE with key-only before
+        let mut delete = valid_event();
+        delete.op = Operation::Delete;
+        delete.before = Some(json!({"id": 1}));
+        delete.after = None;
+        delete.before_is_key_only = true;
+        assert!(
+            delete.validate().is_ok(),
+            "DELETE should allow before_is_key_only=true"
+        );
+    }
+
+    #[test]
+    fn event_default_has_correct_envelope_version() {
+        let event = Event::default();
+        assert_eq!(event.envelope_version, EVENT_ENVELOPE_VERSION);
+        assert!(!event.before_is_key_only);
+        assert_eq!(event.op, Operation::Insert);
+    }
+
+    #[test]
     fn validate_or_error_maps_to_validation_error_type() {
         let mut event = valid_event();
         event.source.source_name = String::new();
@@ -477,5 +896,203 @@ mod tests {
             }
             other => panic!("expected ValidationError, got {other}"),
         }
+    }
+
+    #[test]
+    fn has_full_before_distinguishes_key_only_from_full() {
+        let base = Event {
+            before: Some(json!({"id": 1, "name": "alice"})),
+            after: Some(json!({"id": 1, "name": "bob"})),
+            op: Operation::Update,
+            before_is_key_only: false,
+            ..Event::default()
+        };
+        assert!(base.has_full_before(), "full before should return true");
+
+        let key_only = Event {
+            before_is_key_only: true,
+            ..base.clone()
+        };
+        assert!(
+            !key_only.has_full_before(),
+            "key-only before should return false"
+        );
+
+        let no_before = Event {
+            before: None,
+            before_is_key_only: false,
+            ..base
+        };
+        assert!(
+            !no_before.has_full_before(),
+            "absent before should return false"
+        );
+    }
+
+    #[test]
+    fn primary_key_values_extracts_from_after_on_insert() {
+        let event = Event {
+            after: Some(json!({"id": 42, "name": "alice", "age": 30})),
+            op: Operation::Insert,
+            primary_key: Some(vec!["id".into()]),
+            ..Event::default()
+        };
+        let kv = event.primary_key_values().unwrap();
+        assert_eq!(kv["id"], json!(42));
+        assert!(kv.get("name").is_none());
+    }
+
+    #[test]
+    fn primary_key_values_extracts_from_before_on_delete() {
+        let event = Event {
+            before: Some(json!({"id": 7, "name": "bob"})),
+            after: None,
+            op: Operation::Delete,
+            primary_key: Some(vec!["id".into()]),
+            ..Event::default()
+        };
+        let kv = event.primary_key_values().unwrap();
+        assert_eq!(kv["id"], json!(7));
+    }
+
+    #[test]
+    fn primary_key_values_returns_none_when_no_pk_defined() {
+        let event = Event {
+            after: Some(json!({"id": 1})),
+            op: Operation::Insert,
+            primary_key: None,
+            ..Event::default()
+        };
+        assert!(event.primary_key_values().is_none());
+    }
+
+    #[test]
+    fn primary_key_values_returns_none_when_pk_fields_absent_from_row() {
+        let event = Event {
+            after: Some(json!({"name": "only_name"})),
+            op: Operation::Insert,
+            primary_key: Some(vec!["id".into()]),
+            ..Event::default()
+        };
+        // "id" not present in `after`, so result should be None
+        assert!(event.primary_key_values().is_none());
+    }
+
+    #[test]
+    fn primary_key_values_handles_composite_keys() {
+        let event = Event {
+            after: Some(json!({"tenant_id": 1, "user_id": 99, "name": "charlie"})),
+            op: Operation::Insert,
+            primary_key: Some(vec!["tenant_id".into(), "user_id".into()]),
+            ..Event::default()
+        };
+        let kv = event.primary_key_values().unwrap();
+        assert_eq!(kv["tenant_id"], json!(1));
+        assert_eq!(kv["user_id"], json!(99));
+        assert!(kv.get("name").is_none());
+    }
+
+    #[test]
+    fn operation_from_str_parses_all_variants() {
+        use std::str::FromStr;
+        assert_eq!(Operation::from_str("insert").unwrap(), Operation::Insert);
+        assert_eq!(Operation::from_str("update").unwrap(), Operation::Update);
+        assert_eq!(Operation::from_str("delete").unwrap(), Operation::Delete);
+        assert_eq!(Operation::from_str("read").unwrap(), Operation::Read);
+        assert_eq!(
+            Operation::from_str("schema_change").unwrap(),
+            Operation::SchemaChange
+        );
+        assert_eq!(
+            Operation::from_str("truncate").unwrap(),
+            Operation::Truncate
+        );
+    }
+
+    #[test]
+    fn operation_from_str_rejects_unknown_and_wrong_case() {
+        use std::str::FromStr;
+        assert!(Operation::from_str("INSERT").is_err()); // case-sensitive
+        assert!(Operation::from_str("unknown").is_err());
+        assert!(Operation::from_str("").is_err());
+    }
+
+    #[test]
+    fn operation_round_trips_through_str() {
+        use std::str::FromStr;
+        for op in [
+            Operation::Insert,
+            Operation::Update,
+            Operation::Delete,
+            Operation::Read,
+            Operation::SchemaChange,
+            Operation::Truncate,
+        ] {
+            assert_eq!(
+                Operation::from_str(op.to_str()).unwrap(),
+                op,
+                "round-trip failed for {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_errors_display_joins_all_failures() {
+        let event = Event::default(); // ts == 0, table empty, source_name empty
+        let errs = event.validate().unwrap_err();
+        assert!(errs.len() >= 3); // at least ts, table, source_name
+        let display = errs.to_string();
+        assert!(display.contains("ts"));
+        assert!(display.contains("table"));
+    }
+
+    #[test]
+    fn validation_errors_iterates_individually() {
+        let event = Event::default();
+        let errs = event.validate().unwrap_err();
+        let fields: Vec<&str> = errs.iter().map(|e| e.field.as_str()).collect();
+        assert!(fields.contains(&"ts"));
+        assert!(fields.contains(&"table"));
+    }
+
+    #[test]
+    fn validation_errors_into_iter_consuming_works() {
+        let event = Event::default();
+        let errs = event.validate().unwrap_err();
+        let count = errs.len();
+        let collected: Vec<_> = errs.into_iter().collect();
+        assert_eq!(collected.len(), count);
+    }
+
+    #[test]
+    fn validation_error_implements_std_error() {
+        use std::error::Error as StdError;
+        let ve = super::ValidationError {
+            field: "ts".into(),
+            message: "must be non-zero".into(),
+        };
+        // std::error::Error is object-safe; can be used as dyn Error
+        let _: &dyn StdError = &ve;
+    }
+
+    #[test]
+    fn qualified_table_name_includes_schema_when_present() {
+        let mut event = Event {
+            table: "orders".into(),
+            ..Event::default()
+        };
+        assert_eq!(event.qualified_table_name(), "orders");
+        event.schema = Some("public".into());
+        assert_eq!(event.qualified_table_name(), "public.orders");
+    }
+
+    #[test]
+    fn qualified_table_name_ignores_empty_schema() {
+        let event = Event {
+            table: "users".into(),
+            schema: Some(String::new()),
+            ..Event::default()
+        };
+        assert_eq!(event.qualified_table_name(), "users");
     }
 }

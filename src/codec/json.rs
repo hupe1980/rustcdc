@@ -1,6 +1,6 @@
 //! JSON event encoder.
 
-use crate::codec::{EncodedOutput, EventEncoder};
+use crate::codec::{EncodedOutput, EncoderCodec, EventEncoder};
 use crate::core::{Event, Result};
 
 // ─── JsonEncoder ──────────────────────────────────────────────────────────────
@@ -49,6 +49,40 @@ impl EventEncoder for JsonPrettyEncoder {
     }
 }
 
+// ─── JsonCodec ───────────────────────────────────────────────────────────────
+
+/// Convenience type alias for an [`EncoderCodec`] backed by [`JsonEncoder`].
+///
+/// Use this when you need a [`Codec`] that produces compact JSON key+value pairs.
+/// The key is the compact-JSON serialisation of the event's primary key (via
+/// `EventEncoder::encode_key`); the value is the full compact JSON event.
+///
+/// # Example
+///
+/// ```rust
+/// use rustcdc::codec::{Codec, JsonCodec};
+/// use rustcdc::{Event, Operation, EVENT_ENVELOPE_VERSION};
+/// use serde_json::json;
+///
+/// let event = Event {
+///     after: Some(json!({"id": 42, "name": "alice"})),
+///     op: Operation::Insert,
+///     primary_key: Some(vec!["id".into()]),
+///     ..Event::default()
+/// };
+///
+/// let codec = JsonCodec::default();
+/// let out = codec.encode(&event).unwrap();
+/// assert!(out.key.is_some(), "primary key should be encoded");
+/// assert_eq!(out.content_type, "application/json");
+/// ```
+///
+/// [`Codec`]: crate::codec::Codec
+///
+/// To construct: use `JsonCodec::default()` (derives [`Default`] from [`EncoderCodec`]) or
+/// `EncoderCodec::new(JsonEncoder)`.
+pub type JsonCodec = EncoderCodec<JsonEncoder>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +105,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 

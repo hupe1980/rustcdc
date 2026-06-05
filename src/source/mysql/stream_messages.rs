@@ -50,6 +50,7 @@ impl MysqlStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -231,6 +232,7 @@ impl MysqlStreamHandle {
                             snapshot: None,
                             transaction: None,
                             envelope_version: EVENT_ENVELOPE_VERSION,
+                            before_is_key_only: false,
                         });
                         self.events_polled = self.events_polled.saturating_add(1);
                     }

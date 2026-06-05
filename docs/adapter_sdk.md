@@ -2,7 +2,9 @@
 
 ## Contract
 
-`SinkAdapter` is an async trait exposed from `testkit` for adapter development.
+`SinkAdapter` is an async trait for adapter development. It uses native `async fn in traits`
+(RPITIT, stabilised in Rust 1.75). **No `#[async_trait]` macro is required** in implementations —
+just write plain `async fn` methods.
 
 Required methods:
 - `send(&mut self, event: &Event) -> Result<()>`: accept one canonical event.

@@ -77,6 +77,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
+                    before_is_key_only: false,
                 });
             }
         } else {
@@ -114,6 +115,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
+                    before_is_key_only: false,
                 });
             }
 

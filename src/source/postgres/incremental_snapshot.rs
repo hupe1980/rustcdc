@@ -327,6 +327,7 @@ impl IncrementalSnapshotHandle {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -640,6 +641,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -685,6 +687,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
         assert!(IncrementalSnapshotHandle::extract_event_pk_fingerprint(&ev).is_none());
     }
@@ -710,6 +713,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
         assert_eq!(IncrementalSnapshotHandle::lsn_from_event(&ev), Some(lsn));
     }
@@ -792,6 +796,7 @@ mod tests {
                 }),
                 transaction: None,
                 envelope_version: EVENT_ENVELOPE_VERSION,
+                before_is_key_only: false,
             }
         };
 

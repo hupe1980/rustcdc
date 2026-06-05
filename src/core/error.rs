@@ -31,6 +31,45 @@ impl SourceErrorKind {
     }
 }
 
+/// Coarse error category for policy decisions.
+///
+/// Returned by [`Error::kind`]. Callers should match on this enum rather than
+/// on the raw [`Error`] variant to write policy logic that is robust to new
+/// error variants being added in minor releases.
+///
+/// # Example
+///
+/// ```rust
+/// use rustcdc::core::{Error, ErrorKind};
+///
+/// let err = Error::SourceError("connection reset".into());
+/// match err.kind() {
+///     ErrorKind::Transient => println!("retry with backoff"),
+///     ErrorKind::Terminal => println!("escalate to operator"),
+///     ErrorKind::Configuration => println!("fix config and restart"),
+///     _ => println!("unknown kind — treat as terminal"),
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Transient source or network condition — safe to retry with backoff.
+    ///
+    /// Covers [`Error::SourceError`] and [`Error::TimeoutError`].
+    Transient,
+    /// Permanent failure that retrying will not resolve.
+    ///
+    /// Covers [`Error::Unrecoverable`], [`Error::CheckpointError`],
+    /// [`Error::SchemaError`], [`Error::StateError`], [`Error::TransformError`],
+    /// [`Error::SerializationError`], [`Error::IoError`], and
+    /// [`Error::ValidationError`].
+    Terminal,
+    /// Invalid or incomplete configuration.
+    ///
+    /// Covers [`Error::ConfigError`] and [`Error::NotImplemented`].
+    Configuration,
+}
+
 /// Dedicated error type for event fingerprint failures.
 ///
 /// Returned by [`fingerprint_event_stable`] and [`fingerprint_event_transient`]
@@ -110,7 +149,32 @@ impl Error {
         Self::SourceError(format!("[{kind:?}] {message}"))
     }
 
+    /// Returns the coarse [`ErrorKind`] category for policy decisions.
+    ///
+    /// Use this to implement retry logic, circuit-breaker policy, and alerting
+    /// without matching on individual [`Error`] variants. Prefer `kind()` over
+    /// `is_recoverable()` when you need finer-grained routing between transient,
+    /// terminal, and configuration failures.
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::SourceError(_) | Self::TimeoutError(_) => ErrorKind::Transient,
+            Self::ConfigError(_) | Self::NotImplemented(_) => ErrorKind::Configuration,
+            Self::Unrecoverable(_)
+            | Self::CheckpointError(_)
+            | Self::SchemaError(_)
+            | Self::StateError(_)
+            | Self::TransformError(_)
+            | Self::SerializationError(_)
+            | Self::IoError(_)
+            | Self::ValidationError(_) => ErrorKind::Terminal,
+        }
+    }
+
     /// Returns whether the error represents a transient source condition worth retrying.
+    ///
+    /// Equivalent to `self.kind() == ErrorKind::Transient`. Prefer [`Error::kind`]
+    /// for new code that needs to distinguish transient from terminal from
+    /// configuration failures.
     ///
     /// Only [`Error::SourceError`] and [`Error::TimeoutError`] are considered
     /// recoverable — these are the only variants that can arise from a transient
@@ -119,7 +183,7 @@ impl Error {
     /// All other variants (config, validation, serialization, state, etc.) indicate
     /// a permanent problem that retrying will not resolve.
     pub fn is_recoverable(&self) -> bool {
-        matches!(self, Self::SourceError(_) | Self::TimeoutError(_))
+        self.kind() == ErrorKind::Transient
     }
 }
 
@@ -131,7 +195,7 @@ impl From<serde_json::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::Error;
+    use super::{Error, ErrorKind};
 
     #[test]
     fn recoverable_flag_matches_contract() {
@@ -144,6 +208,50 @@ mod tests {
         assert!(!Error::StateError("illegal transition".into()).is_recoverable());
         assert!(!Error::TransformError("crash".into()).is_recoverable());
         assert!(!Error::Unrecoverable("boom".into()).is_recoverable());
+    }
+
+    #[test]
+    fn error_kind_classifies_all_variants() {
+        assert_eq!(Error::SourceError("x".into()).kind(), ErrorKind::Transient);
+        assert_eq!(Error::TimeoutError("x".into()).kind(), ErrorKind::Transient);
+        assert_eq!(
+            Error::ConfigError("x".into()).kind(),
+            ErrorKind::Configuration
+        );
+        assert_eq!(
+            Error::NotImplemented("x".into()).kind(),
+            ErrorKind::Configuration
+        );
+        assert_eq!(
+            Error::CheckpointError("x".into()).kind(),
+            ErrorKind::Terminal
+        );
+        assert_eq!(Error::SchemaError("x".into()).kind(), ErrorKind::Terminal);
+        assert_eq!(Error::StateError("x".into()).kind(), ErrorKind::Terminal);
+        assert_eq!(
+            Error::TransformError("x".into()).kind(),
+            ErrorKind::Terminal
+        );
+        assert_eq!(Error::Unrecoverable("x".into()).kind(), ErrorKind::Terminal);
+        assert_eq!(Error::ValidationError(vec![]).kind(), ErrorKind::Terminal);
+        assert_eq!(
+            Error::SerializationError("x".into()).kind(),
+            ErrorKind::Terminal
+        );
+    }
+
+    #[test]
+    fn is_recoverable_is_consistent_with_kind() {
+        let errors = [
+            Error::SourceError("x".into()),
+            Error::TimeoutError("x".into()),
+            Error::ConfigError("x".into()),
+            Error::CheckpointError("x".into()),
+            Error::StateError("x".into()),
+        ];
+        for err in &errors {
+            assert_eq!(err.is_recoverable(), err.kind() == ErrorKind::Transient);
+        }
     }
 
     #[test]

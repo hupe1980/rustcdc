@@ -7,15 +7,22 @@
 //!
 //! # Built-in adapters
 //!
-//! * [`MemorySinkAdapter`] — holds received events in memory; intended for tests and
-//!   rapid prototyping. **Not suitable for production use.**
+//! | Adapter | Notes |
+//! |---|---|
+//! | [`MemorySinkAdapter`] | In-memory; for tests and rapid prototyping |
+//! | [`StdoutSink`] | Writes NDJSON to stdout; for local debugging and Docker deployments |
+//! | [`FileJsonlSink`] | Appends NDJSON to a file with fsync-on-close; for audit trails |
 //!
 //! # Conformance testing
 //!
 //! [`AdapterConformanceSuite`] verifies that a custom [`SinkAdapter`] implementation
 //! honours the contract (ordering, flush semantics, post-close error behaviour).
 
-use async_trait::async_trait;
+pub mod file_jsonl;
+pub mod stdout;
+
+pub use file_jsonl::FileJsonlSink;
+pub use stdout::StdoutSink;
 
 use crate::core::{Error, Event, Result};
 
@@ -26,20 +33,66 @@ use crate::core::{Error, Event, Result};
 /// Implementations must be `Send` so they can be used across async task boundaries.
 /// All methods take `&mut self` so the adapter can maintain internal state (e.g. a
 /// connection handle or an in-flight buffer) without an inner `Mutex`.
-#[async_trait]
+///
+/// # Implementing SinkAdapter
+///
+/// ```rust,no_run
+/// use rustcdc::{core::{Event, Result}, sink::SinkAdapter};
+///
+/// struct MyKafkaSink { /* ... */ }
+///
+/// impl SinkAdapter for MyKafkaSink {
+///     async fn send(&mut self, event: &Event) -> Result<()> {
+///         // Deliver event to Kafka
+///         Ok(())
+///     }
+///     async fn flush(&mut self) -> Result<()> { Ok(()) }
+///     async fn close(&mut self) -> Result<()> { Ok(()) }
+///     fn name(&self) -> &str { "kafka" }
+/// }
+/// ```
 pub trait SinkAdapter: Send {
     /// Deliver a single CDC event to the sink.
-    async fn send(&mut self, event: &Event) -> Result<()>;
+    fn send(&mut self, event: &Event) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Flush any internal write buffer, making all previously `send`-ed events
     /// durable (or at least submitted to the downstream system).
-    async fn flush(&mut self) -> Result<()>;
+    fn flush(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Perform an orderly close of the adapter.  Subsequent calls to [`send`] or
     /// [`flush`](SinkAdapter::flush) should return an error once the adapter is closed.
     ///
     /// [`send`]: SinkAdapter::send
-    async fn close(&mut self) -> Result<()>;
+    fn close(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Close the adapter, returning an error if the close takes longer than `timeout_ms`.
+    ///
+    /// This is a default convenience wrapper around [`close`] that applies a
+    /// `tokio::time::timeout`. Use this in shutdown paths where a hung sink
+    /// (e.g. a Kafka producer waiting for broker acknowledgement) must not
+    /// prevent the process from exiting.
+    ///
+    /// Returns [`Error::TimeoutError`] if the deadline is exceeded. The adapter
+    /// state is indeterminate after a timeout — treat it as permanently closed
+    /// and do not send further events.
+    ///
+    /// [`close`]: SinkAdapter::close
+    fn close_with_timeout(
+        &mut self,
+        timeout_ms: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), self.close())
+                .await
+                .map_err(|_| {
+                    Error::TimeoutError(format!(
+                        "sink '{}' close exceeded timeout ({} ms)",
+                        self.name(),
+                        timeout_ms,
+                    ))
+                })?
+        }
+    }
 
     /// Human-readable name used in logs and conformance reports.
     fn name(&self) -> &str;
@@ -102,7 +155,6 @@ impl MemorySinkAdapter {
     }
 }
 
-#[async_trait]
 impl SinkAdapter for MemorySinkAdapter {
     async fn send(&mut self, event: &Event) -> Result<()> {
         if self.closed {
@@ -179,32 +231,10 @@ pub struct TestResult {
     pub duration_ms: u64,
 }
 
-/// Conformance contract for [`SinkAdapter`] implementations.
-#[async_trait]
-pub trait AdapterConformanceTest: Send + Sync {
-    async fn single_event(
-        &self,
-        adapter: &mut dyn SinkAdapter,
-        fixture: &AdapterGoldenFixture,
-    ) -> Result<TestResult>;
-    async fn batch_send(
-        &self,
-        adapter: &mut dyn SinkAdapter,
-        fixture: &AdapterGoldenFixture,
-    ) -> Result<TestResult>;
-    async fn ordering(
-        &self,
-        adapter: &mut dyn SinkAdapter,
-        fixture: &AdapterGoldenFixture,
-    ) -> Result<TestResult>;
-    async fn crash_recovery(
-        &self,
-        adapter: &mut dyn SinkAdapter,
-        fixture: &AdapterGoldenFixture,
-    ) -> Result<TestResult>;
-}
-
-/// Default adapter conformance implementation that validates the [`SinkAdapter`] contract.
+/// Default conformance validator for [`SinkAdapter`] implementations.
+///
+/// All methods are generic over `S: SinkAdapter`, avoiding dynamic dispatch and
+/// `Box<dyn Future>` overhead. Pass a concrete adapter instance directly.
 #[derive(Debug, Clone, Default)]
 pub struct BasicAdapterConformance;
 
@@ -217,16 +247,14 @@ impl BasicAdapterConformance {
         }
     }
 
-    fn exported_len(adapter: &dyn SinkAdapter) -> Option<usize> {
+    fn exported_len<S: SinkAdapter>(adapter: &S) -> Option<usize> {
         adapter.exported_events().map(|events| events.len())
     }
-}
 
-#[async_trait]
-impl AdapterConformanceTest for BasicAdapterConformance {
-    async fn single_event(
+    /// Verify that a single event is delivered and flushed correctly.
+    pub async fn single_event<S: SinkAdapter>(
         &self,
-        adapter: &mut dyn SinkAdapter,
+        adapter: &mut S,
         fixture: &AdapterGoldenFixture,
     ) -> Result<TestResult> {
         let Some(first) = fixture.events.first() else {
@@ -259,9 +287,10 @@ impl AdapterConformanceTest for BasicAdapterConformance {
         Ok(Self::pass())
     }
 
-    async fn batch_send(
+    /// Verify that a batch of events is delivered in order.
+    pub async fn batch_send<S: SinkAdapter>(
         &self,
-        adapter: &mut dyn SinkAdapter,
+        adapter: &mut S,
         fixture: &AdapterGoldenFixture,
     ) -> Result<TestResult> {
         let before_len = Self::exported_len(adapter);
@@ -292,9 +321,10 @@ impl AdapterConformanceTest for BasicAdapterConformance {
         Ok(Self::pass())
     }
 
-    async fn ordering(
+    /// Verify that multiple events are delivered in arrival order.
+    pub async fn ordering<S: SinkAdapter>(
         &self,
-        adapter: &mut dyn SinkAdapter,
+        adapter: &mut S,
         fixture: &AdapterGoldenFixture,
     ) -> Result<TestResult> {
         let before_len = Self::exported_len(adapter);
@@ -324,9 +354,10 @@ impl AdapterConformanceTest for BasicAdapterConformance {
         Ok(Self::pass())
     }
 
-    async fn crash_recovery(
+    /// Verify that `close()` prevents further delivery and that pre-close events are durable.
+    pub async fn crash_recovery<S: SinkAdapter>(
         &self,
-        adapter: &mut dyn SinkAdapter,
+        adapter: &mut S,
         fixture: &AdapterGoldenFixture,
     ) -> Result<TestResult> {
         let Some(first_event) = fixture.events.first() else {
@@ -376,6 +407,9 @@ impl AdapterConformanceTest for BasicAdapterConformance {
 
 /// Convenience harness that runs all base adapter conformance scenarios against a
 /// single [`SinkAdapter`] + [`AdapterGoldenFixture`] pair.
+///
+/// All methods are generic over `S: SinkAdapter` — no heap allocation, no
+/// `Box<dyn Future>`, no `async-trait` dependency required.
 #[derive(Debug, Clone, Default)]
 pub struct AdapterConformanceSuite {
     harness: BasicAdapterConformance,
@@ -386,9 +420,10 @@ impl AdapterConformanceSuite {
         Self::default()
     }
 
-    pub async fn run_all(
+    /// Run all four base conformance scenarios.
+    pub async fn run_all<S: SinkAdapter>(
         &self,
-        adapter: &mut dyn SinkAdapter,
+        adapter: &mut S,
         fixture: &AdapterGoldenFixture,
     ) -> Result<Vec<TestResult>> {
         let mut results = Vec::with_capacity(4);

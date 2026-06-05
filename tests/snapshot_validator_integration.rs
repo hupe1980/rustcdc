@@ -28,6 +28,7 @@ fn snapshot_read_event(table: &str, id: i64) -> rustcdc::Event {
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }
 
@@ -55,7 +56,18 @@ fn snapshot_validator_detects_missing_rows_for_10k_snapshot() {
     assert_eq!(result.rows_expected, expected);
     assert_eq!(result.rows_received, expected - skipped.len() as u64);
     assert_eq!(result.duplicate_count, 0);
-    assert_eq!(result.missing_rows.len(), skipped.len());
+    // The validator emits one diagnostic entry per table (not per missing row).
+    // All 5 missing rows belong to the same "users" table, so there is exactly 1 entry.
+    assert_eq!(result.missing_rows.len(), 1);
+    let diag = &result.missing_rows[0];
+    assert!(
+        diag.contains("users"),
+        "diagnostic must name the table; got: {diag}"
+    );
+    assert!(
+        diag.contains(&format!("missing ~{}", skipped.len())),
+        "diagnostic must report missing count; got: {diag}"
+    );
 }
 
 #[test]

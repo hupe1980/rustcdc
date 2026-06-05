@@ -931,6 +931,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
 
         let propagated = tracer.propagate_baggage_to_event("event-123", &mut event);
@@ -1060,6 +1061,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
 
         assert!(tracer.propagate_baggage_to_event("event-before", &mut event));
@@ -1087,6 +1089,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
 
         assert!(!tracer.propagate_baggage_to_event("missing-event", &mut event));

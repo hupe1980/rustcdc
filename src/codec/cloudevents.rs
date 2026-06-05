@@ -82,6 +82,7 @@ const CE_SPEC_VERSION: &str = "1.0";
 ///     snapshot: None,
 ///     transaction: None,
 ///     envelope_version: rustcdc::EVENT_ENVELOPE_VERSION,
+///     before_is_key_only: false,
 /// };
 ///
 /// let out = encoder.encode(&event).unwrap();
@@ -147,6 +148,9 @@ impl EventEncoder for CloudEventsEncoder {
         }
         if let Some(tx) = &event.transaction {
             data.insert("transaction".into(), serde_json::to_value(tx)?);
+        }
+        if event.before_is_key_only {
+            data.insert("before_is_key_only".into(), json!(true));
         }
 
         // Assemble the CloudEvents envelope.
@@ -267,6 +271,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 

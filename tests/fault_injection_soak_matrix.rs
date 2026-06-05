@@ -49,6 +49,7 @@ fn make_event(source_name: &str, id: usize) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }
 

@@ -131,6 +131,27 @@ pub struct RuntimeOptions {
     /// exceeds this value. Set to `None` (the default) to disable byte-level
     /// throttling and rely only on `max_buffer_size`.
     pub max_event_bytes: Option<usize>,
+    /// Optional timeout applied to sink close during orderly runtime shutdown.
+    ///
+    /// When set, the runtime documentation and shutdown helpers use this value
+    /// to bound the time spent waiting for the sink to close (e.g. flushing a
+    /// Kafka transactional producer). If the sink does not close within
+    /// `sink_close_timeout_ms` milliseconds the shutdown path should surface
+    /// [`Error::TimeoutError`] to the operator rather than blocking indefinitely.
+    ///
+    /// Consumers should call [`crate::sink::SinkAdapter::close_with_timeout`] with this value
+    /// in their shutdown path:
+    ///
+    /// ```rust,ignore
+    /// if let Some(timeout_ms) = runtime_config.options.sink_close_timeout_ms {
+    ///     sink.close_with_timeout(timeout_ms).await?;
+    /// } else {
+    ///     sink.close().await?;
+    /// }
+    /// ```
+    ///
+    /// Set to `None` (default) to leave close duration unbounded.
+    pub sink_close_timeout_ms: Option<u64>,
 }
 
 impl Default for RuntimeOptions {
@@ -157,6 +178,7 @@ impl Default for RuntimeOptions {
             connection_retry: Some(ConnectionRetryPolicy::default()),
             dead_letter_handler: None,
             max_event_bytes: None,
+            sink_close_timeout_ms: None,
         }
     }
 }
@@ -240,6 +262,40 @@ impl RuntimeOptions {
         self.max_event_bytes = max_bytes.into();
         self
     }
+
+    /// Register a dead-letter handler invoked when an event is skipped under
+    /// [`TransformErrorPolicy::Skip`].
+    ///
+    /// The handler receives the original (pre-transform) [`Event`] and the
+    /// [`Error`](crate::core::Error) that caused the skip. Use this to route
+    /// discarded events to a DLQ, external error store, or alerting system.
+    ///
+    /// # Hard constraints
+    ///
+    /// **The handler runs synchronously in the runtime poll loop.** It must not
+    /// block (no `sleep`, no synchronous I/O, no blocking locks) and must not
+    /// panic. Buffer the event into an internal channel and drain asynchronously
+    /// if you need slow I/O.
+    pub fn with_dead_letter_handler(
+        mut self,
+        handler: impl Fn(Event, Error) + Send + Sync + 'static,
+    ) -> Self {
+        self.dead_letter_handler = Some(std::sync::Arc::new(handler));
+        self
+    }
+
+    /// Set a timeout for sink close during orderly runtime shutdown.
+    ///
+    /// When set, the shutdown path should call [`crate::sink::SinkAdapter::close_with_timeout`]
+    /// with this value so a hung sink (e.g. a Kafka producer waiting for broker
+    /// acknowledgement) cannot prevent the process from exiting. Returns
+    /// [`Error::TimeoutError`] if the deadline is exceeded.
+    ///
+    /// Pass `None` to leave the close duration unbounded (the default).
+    pub fn with_sink_close_timeout_ms(mut self, timeout_ms: impl Into<Option<u64>>) -> Self {
+        self.sink_close_timeout_ms = timeout_ms.into();
+        self
+    }
 }
 
 /// Runtime-level idempotency guard configuration.
@@ -284,11 +340,11 @@ impl IdempotencyOptions {
 /// ```
 /// use rustcdc::core::ConnectionRetryPolicy;
 ///
-/// let policy = ConnectionRetryPolicy {
-///     max_retries: Some(5),
-///     initial_delay_ms: 300,
-///     max_delay_ms: 10_000,
-/// };
+/// // Build with the typed constructor
+/// let policy = ConnectionRetryPolicy::new()
+///     .with_max_retries(Some(5))
+///     .with_initial_delay_ms(300)
+///     .with_max_delay_ms(10_000);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -313,20 +369,37 @@ impl Default for ConnectionRetryPolicy {
 }
 
 impl ConnectionRetryPolicy {
+    /// Construct a `ConnectionRetryPolicy` starting from the default values.
+    ///
+    /// This is the canonical constructor when struct-literal syntax is not
+    /// available (e.g. outside the crate due to `#[non_exhaustive]`).
+    ///
+    /// ```
+    /// use rustcdc::core::ConnectionRetryPolicy;
+    ///
+    /// let policy = ConnectionRetryPolicy::new()
+    ///     .with_max_retries(Some(10))
+    ///     .with_initial_delay_ms(500)
+    ///     .with_max_delay_ms(30_000);
+    /// ```
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Set the maximum number of retries (`None` = retry indefinitely).
-    pub fn max_retries(mut self, n: Option<u32>) -> Self {
+    pub fn with_max_retries(mut self, n: Option<u32>) -> Self {
         self.max_retries = n;
         self
     }
 
     /// Set the initial delay between retries in milliseconds.
-    pub fn initial_delay_ms(mut self, ms: u64) -> Self {
+    pub fn with_initial_delay_ms(mut self, ms: u64) -> Self {
         self.initial_delay_ms = ms;
         self
     }
 
     /// Set the maximum delay cap for exponential backoff in milliseconds.
-    pub fn max_delay_ms(mut self, ms: u64) -> Self {
+    pub fn with_max_delay_ms(mut self, ms: u64) -> Self {
         self.max_delay_ms = ms;
         self
     }
@@ -513,7 +586,11 @@ impl std::fmt::Display for RuntimeState {
 }
 
 /// Embeddable admin snapshot for runtime introspection.
+///
+/// This struct is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Use `..` in struct patterns and do not rely on exhaustive construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RuntimeAdminSnapshot {
     /// Connector type name (e.g. `"postgres"`, `"mysql"`). `None` when source is disabled.
     pub source_type: Option<String>,
@@ -554,7 +631,12 @@ pub struct RuntimeAdminSnapshot {
 }
 
 /// Opaque token representing an in-flight batch prefix that may be committed.
+///
+/// Dropping an `AckToken` without passing it to [`CdcRuntime::commit_ack`] will
+/// stall checkpoint progress indefinitely. The `#[must_use]` attribute ensures
+/// the compiler emits a warning if the token is silently discarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "AckToken must be passed to CdcRuntime::commit_ack(); dropping it silently stalls the commit barrier"]
 pub struct AckToken {
     delivery_id: u64,
     event_count: usize,
@@ -622,6 +704,7 @@ impl AckToken {
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "AckMode::Required must be passed to CdcRuntime::commit_ack(); ignoring it stalls the commit barrier"]
 pub enum AckMode {
     /// The batch must be acknowledged; `token` carries the delivery reference.
     Required(AckToken),
@@ -659,11 +742,27 @@ impl From<Option<AckToken>> for AckMode {
     }
 }
 
+/// A batch of CDC events delivered from [`CdcRuntime::poll_event_batch`].
 ///
 /// Internally the events vector is reference-counted so that the runtime can
 /// keep a copy in `pending_delivery` for replay without an O(n) clone per
 /// delivery.  All public accessors expose the same slice/vec API as before.
+///
+/// Implements [`IntoIterator`] for both owned and borrowed use:
+/// ```no_run
+/// # use rustcdc::CdcRuntime;
+/// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+/// let batch = runtime.poll_event_batch().await?;
+/// for event in &batch {           // borrow
+///     println!("{}", event.table);
+/// }
+/// let mode = batch.ack_mode();
+/// runtime.commit_ack(mode).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
+#[must_use = "poll_event_batch() returns an EventBatch that must be acknowledged via commit_ack()"]
 pub struct EventBatch {
     events: Arc<Vec<Event>>,
     ack_token: Option<AckToken>,
@@ -729,6 +828,95 @@ impl EventBatch {
     /// Returns `None` when the batch is empty.
     pub fn oldest_event_source_timestamp_ms(&self) -> Option<u64> {
         self.events.iter().map(|e| e.ts).min()
+    }
+
+    /// Returns the largest `ts` (milliseconds since epoch) across all events in this batch.
+    ///
+    /// Returns `None` when the batch is empty.
+    pub fn latest_event_source_timestamp_ms(&self) -> Option<u64> {
+        self.events.iter().map(|e| e.ts).max()
+    }
+
+    /// Returns `true` if any event in this batch has `before_is_key_only == true`.
+    ///
+    /// Use this to decide whether to fetch full pre-images from the source before
+    /// computing row diffs. When this returns `true`, at least one UPDATE or DELETE
+    /// event in the batch carries only primary-key columns in `before`.
+    pub fn has_key_only_befores(&self) -> bool {
+        self.events.iter().any(|e| e.before_is_key_only)
+    }
+
+    /// Returns an iterator over references to events in this batch.
+    ///
+    /// Equivalent to `batch.events().iter()`.
+    pub fn iter(&self) -> std::slice::Iter<'_, Event> {
+        self.events.iter()
+    }
+
+    /// Returns a deduplicated, sorted list of table names present in this batch.
+    ///
+    /// Useful for routing decisions, per-table metrics, and conditional sink selection.
+    ///
+    /// ```no_run
+    /// # use rustcdc::CdcRuntime;
+    /// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+    /// let batch = runtime.poll_event_batch().await?;
+    /// for table in batch.tables() {
+    ///     println!("batch contains events for table: {table}");
+    /// }
+    /// # runtime.commit_ack(batch.ack_mode()).await
+    /// # }
+    /// ```
+    pub fn tables(&self) -> Vec<&str> {
+        let mut tables: Vec<&str> = self.events.iter().map(|e| e.table.as_str()).collect();
+        tables.sort_unstable();
+        tables.dedup();
+        tables
+    }
+
+    /// Returns a deduplicated, sorted list of fully-qualified table names
+    /// (`"schema.table"` or `"table"` when no schema is set).
+    ///
+    /// Useful when routing events to Kafka topics or per-table sinks where
+    /// tables from different schemas must be distinguished.
+    pub fn qualified_tables(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .events
+            .iter()
+            .map(|e| e.qualified_table_name())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Number of events in this batch that belong to the given table.
+    ///
+    /// The `table` parameter is matched against the unqualified `event.table` field.
+    /// Use [`qualified_tables`](Self::qualified_tables) and filter `event.qualified_table_name()`
+    /// when schema disambiguation is needed.
+    pub fn event_count_for_table(&self, table: &str) -> usize {
+        self.events.iter().filter(|e| e.table == table).count()
+    }
+}
+
+impl<'a> IntoIterator for &'a EventBatch {
+    type Item = &'a Event;
+    type IntoIter = std::slice::Iter<'a, Event>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.iter()
+    }
+}
+
+impl IntoIterator for EventBatch {
+    type Item = Event;
+    type IntoIter = std::vec::IntoIter<Event>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::try_unwrap(self.events)
+            .unwrap_or_else(|arc| (*arc).clone())
+            .into_iter()
     }
 }
 
@@ -1331,7 +1519,7 @@ mod tests {
     use crate::checkpoint::FileCheckpoint;
 
     use super::{
-        AckMode, CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, RuntimeConfig,
+        AckMode, CdcRuntime, ConnectionRetryPolicy, EventBatch, IdempotencyOptions, RuntimeConfig,
         RuntimeObservability, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
     };
 
@@ -1359,6 +1547,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -3796,5 +3985,108 @@ mod tests {
             matches!(err, crate::core::Error::ConfigError(_)),
             "expected ConfigError, got {err:?}"
         );
+    }
+
+    // ── EventBatch accessor tests ─────────────────────────────────────────────
+
+    fn make_batch_events() -> Arc<Vec<Event>> {
+        use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+        use serde_json::json;
+        Arc::new(vec![
+            Event {
+                table: "orders".into(),
+                schema: Some("public".into()),
+                op: Operation::Insert,
+                after: Some(json!({"id": 1})),
+                ts: 1,
+                source: SourceMetadata {
+                    source_name: "pg".into(),
+                    offset: "1".into(),
+                    timestamp: 1,
+                },
+                envelope_version: EVENT_ENVELOPE_VERSION,
+                ..Event::default()
+            },
+            Event {
+                table: "orders".into(),
+                schema: Some("public".into()),
+                op: Operation::Update,
+                before: Some(json!({"id": 2})),
+                after: Some(json!({"id": 2, "name": "bob"})),
+                ts: 2,
+                source: SourceMetadata {
+                    source_name: "pg".into(),
+                    offset: "2".into(),
+                    timestamp: 2,
+                },
+                envelope_version: EVENT_ENVELOPE_VERSION,
+                ..Event::default()
+            },
+            Event {
+                table: "users".into(),
+                schema: Some("auth".into()),
+                op: Operation::Insert,
+                after: Some(json!({"id": 10})),
+                ts: 3,
+                source: SourceMetadata {
+                    source_name: "pg".into(),
+                    offset: "3".into(),
+                    timestamp: 3,
+                },
+                envelope_version: EVENT_ENVELOPE_VERSION,
+                ..Event::default()
+            },
+        ])
+    }
+
+    #[test]
+    fn event_batch_tables_returns_sorted_deduplicated_names() {
+        let batch = EventBatch {
+            events: make_batch_events(),
+            ack_token: None,
+        };
+        let tables = batch.tables();
+        assert_eq!(tables, vec!["orders", "users"]);
+    }
+
+    #[test]
+    fn event_batch_qualified_tables_includes_schema() {
+        let batch = EventBatch {
+            events: make_batch_events(),
+            ack_token: None,
+        };
+        let tables = batch.qualified_tables();
+        assert_eq!(tables, vec!["auth.users", "public.orders"]);
+    }
+
+    #[test]
+    fn event_batch_event_count_for_table() {
+        let batch = EventBatch {
+            events: make_batch_events(),
+            ack_token: None,
+        };
+        assert_eq!(batch.event_count_for_table("orders"), 2);
+        assert_eq!(batch.event_count_for_table("users"), 1);
+        assert_eq!(batch.event_count_for_table("nonexistent"), 0);
+    }
+
+    #[test]
+    fn event_batch_iter_and_into_iter_yield_same_events() {
+        let events = make_batch_events();
+        let batch = EventBatch {
+            events: events.clone(),
+            ack_token: None,
+        };
+        let via_iter: Vec<&Event> = batch.iter().collect();
+        let via_into_iter: Vec<Event> = EventBatch {
+            events,
+            ack_token: None,
+        }
+        .into_iter()
+        .collect();
+        assert_eq!(via_iter.len(), via_into_iter.len());
+        for (borrowed, owned) in via_iter.iter().zip(via_into_iter.iter()) {
+            assert_eq!(*borrowed, owned);
+        }
     }
 }

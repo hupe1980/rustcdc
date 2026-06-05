@@ -302,6 +302,7 @@ mod tests {
                 event_index,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 

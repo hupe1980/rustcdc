@@ -36,6 +36,7 @@ fn build_event(id: u64) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }
 

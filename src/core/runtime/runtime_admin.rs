@@ -39,10 +39,12 @@ impl CdcRuntime {
             buffer_depth: self.buffered_events.len()
                 + self.injected_events.len()
                 + self.pending_source_events.len(),
-            in_flight_events: self
-                .pending_delivery
-                .as_ref()
-                .map_or(0, |pending| pending.events.len()),
+            in_flight_events: self.pending_delivery.as_ref().map_or(0, |pending| {
+                pending
+                    .events
+                    .len()
+                    .saturating_sub(pending.committed_prefix)
+            }),
             snapshot_active: self.snapshot.is_some(),
             stream_active: self.stream.is_some(),
             handoff_complete: self.handoff_complete,
