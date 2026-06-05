@@ -75,11 +75,12 @@ impl fmt::Debug for MysqlSourceConfig {
 impl Default for MysqlSourceConfig {
     fn default() -> Self {
         let server_id = generate_server_id();
-        tracing::debug!(
+        tracing::warn!(
             target: "rustcdc::source::mysql",
             server_id,
-            "generated unique MySQL replication server_id; \
-             override via MysqlSourceConfig::server_id if a specific value is required"
+            "auto-generated MySQL replication server_id; \
+             this value must be unique across all replicas in the cluster — \
+             set MysqlSourceConfig::server_id explicitly in production"
         );
         Self {
             host: "localhost".into(),
@@ -316,5 +317,47 @@ impl MysqlSourceConfig {
         }
 
         Ok(ssl_opts)
+    }
+
+    /// Verify that the target MySQL/MariaDB instance is currently acting as a primary
+    /// (i.e. is not a read-only replica).
+    ///
+    /// Issues a single `SELECT @@global.read_only` query: if the variable is `0`
+    /// the server is a primary and this method returns `Ok(true)`. If it is `1`
+    /// the server is read-only (replica/standby) and this method returns `Ok(false)`.
+    ///
+    /// CDC requires write access for binlog replication. Call this before creating
+    /// or resuming a replication stream whenever topology changes are possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SourceError`] if the connection or query fails.
+    pub async fn check_is_primary(&self) -> Result<bool> {
+        use mysql_async::{prelude::Queryable as _, Pool};
+
+        let opts = self.build_pool_opts()?;
+        let pool = Pool::new(opts);
+        let mut conn = pool.get_conn().await.map_err(|e| {
+            Error::SourceError(format!("check_is_primary: mysql connection failed: {e}"))
+        })?;
+
+        let row: mysql_async::Row = conn
+            .query_first("SELECT @@global.read_only")
+            .await
+            .map_err(|e| Error::SourceError(format!("check_is_primary: query failed: {e}")))?
+            .ok_or_else(|| {
+                Error::SourceError("check_is_primary: @@global.read_only returned no rows".into())
+            })?;
+
+        let read_only: u8 = row.get(0).ok_or_else(|| {
+            Error::SourceError(
+                "check_is_primary: could not read @@global.read_only column value".into(),
+            )
+        })?;
+
+        // Disconnect the pool cleanly before returning.
+        pool.disconnect().await.ok();
+
+        Ok(read_only == 0)
     }
 }

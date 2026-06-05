@@ -173,21 +173,32 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         })
     }
 
     fn build_update_event(&self, update: &PgUpdate, lsn: u64) -> Option<Event> {
         let after = self.tuple_to_json(update.relation_oid, &update.new_tuple)?;
-        let before = update
+
+        // If `old_tuple` is present we have the full pre-image (REPLICA IDENTITY FULL).
+        // Otherwise fall back to `key_tuple` which contains only PK columns
+        // (REPLICA IDENTITY DEFAULT). In the fallback case we set `before_is_key_only`
+        // so consumers know not to treat the before image as a complete row.
+        let (before, before_is_key_only) = if let Some(before) = update
             .old_tuple
             .as_deref()
             .and_then(|t| self.tuple_to_json(update.relation_oid, t))
-            .or_else(|| {
-                update
-                    .key_tuple
-                    .as_deref()
-                    .and_then(|t| self.tuple_to_json(update.relation_oid, t))
-            });
+        {
+            (Some(before), false)
+        } else {
+            let key_before = update
+                .key_tuple
+                .as_deref()
+                .and_then(|t| self.tuple_to_json(update.relation_oid, t));
+            let is_key_only = key_before.is_some();
+            (key_before, is_key_only)
+        };
+
         Some(Event {
             before,
             after: Some(after),
@@ -200,20 +211,25 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only,
         })
     }
 
     fn build_delete_event(&self, delete: &PgDelete, lsn: u64) -> Option<Event> {
-        let before = delete
+        let (before, before_is_key_only) = if let Some(before) = delete
             .old_tuple
             .as_deref()
             .and_then(|t| self.tuple_to_json(delete.relation_oid, t))
-            .or_else(|| {
-                delete
-                    .key_tuple
-                    .as_deref()
-                    .and_then(|t| self.tuple_to_json(delete.relation_oid, t))
-            });
+        {
+            (Some(before), false)
+        } else {
+            let key_before = delete
+                .key_tuple
+                .as_deref()
+                .and_then(|t| self.tuple_to_json(delete.relation_oid, t));
+            let is_key_only = key_before.is_some();
+            (key_before, is_key_only)
+        };
         Some(Event {
             before,
             after: None,
@@ -226,6 +242,7 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only,
         })
     }
 
@@ -245,6 +262,7 @@ impl PostgresStreamHandle {
                 snapshot: None,
                 transaction: self.tx_meta(),
                 envelope_version: EVENT_ENVELOPE_VERSION,
+                before_is_key_only: false,
             })
             .collect()
     }

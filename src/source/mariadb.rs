@@ -27,7 +27,12 @@ use super::mysql::{
 ///
 /// A thin newtype over [`MysqlSourceConfig`] with `server_flavor` defaulting to
 /// `ServerFlavor::MariaDb`. All fields are identical; access them via `Deref` or
-/// destructure via [`MariaDbSourceConfig::into_inner`].
+/// [`DerefMut`], or consume via [`MariaDbSourceConfig::into_inner`].
+///
+/// The inner `MysqlSourceConfig` is intentionally not public: use `Deref`
+/// (i.e., `&*config` or `config.deref()`) for shared access and `DerefMut` for
+/// mutation. This preserves the freedom to decouple the two types in a future
+/// release without a semver break.
 ///
 /// # Example
 ///
@@ -45,7 +50,7 @@ use super::mysql::{
 /// ```
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MariaDbSourceConfig(pub MysqlSourceConfig);
+pub struct MariaDbSourceConfig(pub(crate) MysqlSourceConfig);
 
 impl Default for MariaDbSourceConfig {
     fn default() -> Self {
@@ -89,9 +94,26 @@ impl From<MysqlSourceConfig> for MariaDbSourceConfig {
 }
 
 impl MariaDbSourceConfig {
+    /// Construct a [`MariaDbSourceConfig`] from a [`MysqlSourceConfig`].
+    ///
+    /// The inner config's `server_flavor` is forced to [`ServerFlavor::MariaDb`]
+    /// regardless of what value was set on the input.
+    pub fn new(mut config: MysqlSourceConfig) -> Self {
+        config.server_flavor = ServerFlavor::MariaDb;
+        Self(config)
+    }
+
     /// Unwrap into the inner [`MysqlSourceConfig`].
     pub fn into_inner(self) -> MysqlSourceConfig {
         self.0
+    }
+
+    /// Borrow the inner [`MysqlSourceConfig`].
+    ///
+    /// Prefer using `Deref` (`&*config`) for most access patterns. This method
+    /// exists as a named alternative for contexts where explicit intent is clearer.
+    pub fn as_mysql_config(&self) -> &MysqlSourceConfig {
+        &self.0
     }
 
     /// Override the host name.

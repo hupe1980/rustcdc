@@ -3,7 +3,10 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
     time::Duration,
 };
 
@@ -49,7 +52,16 @@ pub enum TransformResult {
 
 #[async_trait]
 pub trait WasmModule: Send + Sync {
-    async fn transform(&self, event: &Event) -> Result<Option<Event>>;
+    /// Execute the WASM transform on a pre-serialised JSON event payload.
+    ///
+    /// The caller is responsible for serialising the event and validating the
+    /// payload size against the configured memory limit *before* calling this
+    /// method. `WasmRuntime::transform` does both steps automatically; use that
+    /// method unless you have a specific reason to call the module directly.
+    ///
+    /// Returns the transformed event, or `None` when the module filtered
+    /// (dropped) the event.
+    async fn transform_bytes(&self, event_json: &[u8]) -> Result<Option<Event>>;
     fn timeout_ms(&self) -> u64;
 
     async fn init(&self, _config: &WasmConfig) -> Result<()> {
@@ -70,16 +82,19 @@ pub struct WasmRuntime {
 
 struct RealWasmModule {
     timeout_ms: u64,
-    /// Kept alive so the epoch-ticker thread can call `engine.increment_epoch()`.
+    /// Kept alive so the epoch-ticker task can call `engine.increment_epoch()`.
     _engine: Arc<Engine>,
     inner: Mutex<RealWasmState>,
     /// Sentinel kept alive for the lifetime of this module.
     ///
-    /// The background epoch-ticker thread holds a `Weak` to this sentinel.
+    /// The background epoch-ticker task holds a `Weak` to this sentinel.
     /// When `RealWasmModule` is dropped the strong count reaches zero, the
-    /// `Weak::upgrade()` in the ticker loop returns `None`, and the thread
+    /// `Weak::upgrade()` in the ticker loop returns `None`, and the task
     /// exits naturally within one tick interval (≤ 1 ms).
     _ticker_sentinel: Arc<()>,
+    /// Guards against spawning the ticker task more than once across repeated
+    /// `init()` calls (e.g. after `shutdown()` + re-`init()`).
+    ticker_started: AtomicBool,
 }
 
 struct RealWasmState {
@@ -131,12 +146,23 @@ impl WasmRuntime {
             self.init().await?;
         }
 
-        validate_event_within_memory_limit(event, self.config.memory_limit_mb)?;
+        // Serialise the event once and validate its size before handing bytes
+        // to the WASM module.  This avoids a second serialisation inside the
+        // module's hot path.
+        let event_json = serde_json::to_vec(event)?;
+        let limit_bytes = self.config.memory_limit_mb.saturating_mul(1024 * 1024);
+        if (event_json.len() as u64) > limit_bytes {
+            return Err(Error::TransformError(format!(
+                "event payload exceeds configured WASM memory limit ({} bytes > {} bytes)",
+                event_json.len(),
+                limit_bytes
+            )));
+        }
 
         let effective_timeout_ms = self.module.timeout_ms().min(self.config.timeout_ms).max(1);
         let operation = tokio::time::timeout(
             Duration::from_millis(effective_timeout_ms),
-            self.module.transform(event),
+            self.module.transform_bytes(&event_json),
         )
         .await
         .map_err(|_| {
@@ -237,35 +263,17 @@ impl RealWasmModule {
             shutdown,
         };
 
-        // Spawn the per-module epoch-ticker thread.
-        //
-        // The ticker increments the engine epoch every 1 ms.  Before each WASM
-        // call we set the store's epoch deadline to `timeout_ms` ticks, so the
-        // call is interrupted after ≈ `timeout_ms` milliseconds.
-        //
-        // The sentinel Arc is held by the module.  The ticker holds only a Weak
-        // reference.  When the module is dropped the Weak::upgrade() returns None
-        // and the thread exits within at most one tick (1 ms).
+        // Sentinel for the epoch-ticker task lifecycle.  The task is spawned
+        // lazily in `init()` so that construction remains synchronous and does
+        // not require a running Tokio runtime.
         let ticker_sentinel = Arc::new(());
-        let weak_sentinel: Weak<()> = Arc::downgrade(&ticker_sentinel);
-        let ticker_engine = Arc::clone(&engine);
-        std::thread::Builder::new()
-            .name("rustcdc-wasm-epoch-ticker".into())
-            .spawn(move || {
-                while weak_sentinel.upgrade().is_some() {
-                    std::thread::sleep(Duration::from_millis(1));
-                    ticker_engine.increment_epoch();
-                }
-            })
-            .map_err(|error| {
-                Error::ConfigError(format!("failed to spawn WASM epoch ticker thread: {error}"))
-            })?;
 
         let module = Self {
             timeout_ms: config.timeout_ms,
             _engine: engine,
             inner: Mutex::new(module_state),
             _ticker_sentinel: ticker_sentinel,
+            ticker_started: AtomicBool::new(false),
         };
 
         module.validate_memory_limit(config.memory_limit_mb)?;
@@ -371,28 +379,27 @@ where
 
 #[async_trait]
 impl WasmModule for RealWasmModule {
-    async fn transform(&self, event: &Event) -> Result<Option<Event>> {
-        let input = serde_json::to_vec(event)?;
+    async fn transform_bytes(&self, event_json: &[u8]) -> Result<Option<Event>> {
         let mut state = self
             .inner
             .lock()
             .map_err(|_| Error::StateError("WASM runtime lock poisoned".to_string()))?;
 
         // Arm the epoch deadline so that a runaway WASM module is interrupted
-        // after approximately `timeout_ms` milliseconds by the ticker thread.
+        // after approximately `timeout_ms` milliseconds by the ticker task.
         state.store.set_epoch_deadline(self.timeout_ms);
 
-        let input_ptr = Self::alloc_and_write(&mut state, &input)?;
+        let input_ptr = Self::alloc_and_write(&mut state, event_json)?;
         let transform = state.transform.clone();
         let output_ptr = transform
             .call(
                 &mut state.store,
                 (
                     input_ptr,
-                    i32::try_from(input.len()).map_err(|_| {
+                    i32::try_from(event_json.len()).map_err(|_| {
                         Error::TransformError(format!(
                             "WASM input length exceeds i32: {}",
-                            input.len()
+                            event_json.len()
                         ))
                     })?,
                 ),
@@ -434,6 +441,36 @@ impl WasmModule for RealWasmModule {
     }
 
     async fn init(&self, config: &WasmConfig) -> Result<()> {
+        // Start the epoch-ticker Tokio task the first time init() is called.
+        // Using compare_exchange ensures we spawn at most one task even if
+        // init() is called repeatedly (e.g. after shutdown + re-init).
+        if self
+            .ticker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // The ticker task increments the engine epoch every 1 ms.
+            // Before each WASM call we set the store's epoch deadline to
+            // `timeout_ms` ticks so that execution is interrupted after
+            // ≈ `timeout_ms` milliseconds regardless of what the WASM code does.
+            //
+            // The task holds only a Weak reference to the sentinel Arc.
+            // When RealWasmModule is dropped the strong count falls to zero,
+            // Weak::upgrade() returns None, and the task exits within one
+            // tick (≤ 1 ms) — no dedicated OS thread is consumed.
+            let weak_sentinel: Weak<()> = Arc::downgrade(&self._ticker_sentinel);
+            let ticker_engine = Arc::clone(&self._engine);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    if weak_sentinel.upgrade().is_none() {
+                        break;
+                    }
+                    ticker_engine.increment_epoch();
+                }
+            });
+        }
+
         let mut state = self
             .inner
             .lock()
@@ -571,7 +608,7 @@ fn validate_wasm_contract(module_bytes: &[u8]) -> Result<()> {
                 }
             }
             Payload::ImportSection(imports) => {
-                for entry in imports {
+                for entry in imports.into_imports() {
                     let import = entry.map_err(|error| {
                         Error::ConfigError(format!("invalid wasm import entry: {error}"))
                     })?;
@@ -726,19 +763,6 @@ fn validate_export_signature(
     Ok(())
 }
 
-fn validate_event_within_memory_limit(event: &Event, memory_limit_mb: u64) -> Result<()> {
-    let serialized = serde_json::to_vec(event)?;
-    let limit_bytes = memory_limit_mb.saturating_mul(1024 * 1024);
-    if (serialized.len() as u64) > limit_bytes {
-        return Err(Error::TransformError(format!(
-            "event payload exceeds configured WASM memory limit ({} bytes > {} bytes)",
-            serialized.len(),
-            limit_bytes
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -772,12 +796,13 @@ mod tests {
 
     #[async_trait]
     impl WasmModule for MockWasmModule {
-        async fn transform(&self, event: &Event) -> Result<Option<Event>> {
+        async fn transform_bytes(&self, event_json: &[u8]) -> Result<Option<Event>> {
             self.transform_calls.fetch_add(1, Ordering::Relaxed);
             if self.transform_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.transform_delay_ms)).await;
             }
-            Ok(Some(event.clone()))
+            let event = serde_json::from_slice::<Event>(event_json)?;
+            Ok(Some(event))
         }
 
         fn timeout_ms(&self) -> u64 {
@@ -812,6 +837,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 

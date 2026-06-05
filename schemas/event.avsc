@@ -96,6 +96,12 @@
       "type": "int",
       "default": 1,
       "doc": "Canonical envelope schema version. Currently always 1."
+    },
+    {
+      "name": "before_is_key_only",
+      "type": "boolean",
+      "default": false,
+      "doc": "True when 'before' contains only primary-key columns (PostgreSQL DEFAULT REPLICA IDENTITY on UPDATE or DELETE). Always false for INSERT, READ, SCHEMA_CHANGE, TRUNCATE, and all non-PostgreSQL events."
     }
   ]
 }

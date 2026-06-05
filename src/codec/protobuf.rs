@@ -58,6 +58,7 @@ const CONTENT_TYPE: &str = "application/x-protobuf";
 ///     snapshot: None,
 ///     transaction: None,
 ///     envelope_version: EVENT_ENVELOPE_VERSION,
+///     before_is_key_only: false,
 /// };
 /// let out = encoder.encode(&event).unwrap();
 /// assert_eq!(out.content_type, "application/x-protobuf");
@@ -202,6 +203,9 @@ pub struct ProtoEvent {
     /// Canonical envelope schema version.
     #[prost(uint32, tag = "11")]
     pub envelope_version: u32,
+    /// True when `before` contains only primary-key columns (PostgreSQL DEFAULT REPLICA IDENTITY).
+    #[prost(bool, tag = "12")]
+    pub before_is_key_only: bool,
 }
 
 impl ProtoEvent {
@@ -255,6 +259,7 @@ impl ProtoEvent {
                     event_index: t.event_index,
                 }),
             envelope_version: event.envelope_version as u32,
+            before_is_key_only: event.before_is_key_only,
         })
     }
 
@@ -297,6 +302,7 @@ mod tests {
                 event_index: 1,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -317,6 +323,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -365,6 +372,8 @@ mod tests {
         assert_eq!(tx.tx_id, 42);
         assert_eq!(tx.total_events, 3);
         assert_eq!(tx.event_index, 1);
+
+        assert!(!decoded.before_is_key_only);
     }
 
     #[test]
@@ -392,6 +401,16 @@ mod tests {
             let proto = ProtoEvent::from_event(&ev).unwrap();
             assert_eq!(proto.op, expected as i32, "op mismatch for {op:?}");
         }
+    }
+
+    #[test]
+    fn before_is_key_only_round_trips_through_proto() {
+        let mut event = full_event();
+        event.before_is_key_only = true;
+        let proto = ProtoEvent::from_event(&event).unwrap();
+        let bytes = proto.encode_to_vec();
+        let decoded = ProtoEvent::from_bytes(&bytes).unwrap();
+        assert!(decoded.before_is_key_only);
     }
 
     #[test]

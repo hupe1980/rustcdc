@@ -139,6 +139,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -250,6 +251,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
         // Must not error — cleanup rows must be passed through (or filtered upstream).
         assert!(
@@ -278,6 +280,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
         assert!(
             transform.apply(&mut e).await.unwrap(),
@@ -313,6 +316,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
         assert!(transform.apply(&mut e).await.unwrap());
         // Table must NOT be rewritten — Update should pass through unchanged.

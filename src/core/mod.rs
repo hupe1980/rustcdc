@@ -13,10 +13,10 @@ mod runtime_utils;
 mod secret;
 mod transport;
 
-pub use error::{Error, FingerprintError, Result, SourceErrorKind};
+pub use error::{Error, ErrorKind, FingerprintError, Result, SourceErrorKind};
 pub use event::{
     Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata, ValidationError,
-    EVENT_ENVELOPE_VERSION,
+    ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
 pub use idempotency::{
     fingerprint_event_stable, fingerprint_event_transient, EventIdempotencyGuard,

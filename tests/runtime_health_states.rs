@@ -41,6 +41,7 @@ fn make_event_with_id(id: u64) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: rustcdc::core::EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }
 

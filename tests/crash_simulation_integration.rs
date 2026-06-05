@@ -28,6 +28,7 @@ fn create_test_event(index: u64, table: &str) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }
 
@@ -48,6 +49,7 @@ fn create_postgres_stream_event(index: u64) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }
 

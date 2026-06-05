@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.88 or newer
+- Rust 1.92 or newer
 - Cargo
 - Docker if you want to run connector-backed integration tests with testcontainers
 

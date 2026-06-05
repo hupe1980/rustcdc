@@ -7,11 +7,11 @@ The repository includes canonical event contracts, checkpoint safety primitives,
 
 Active development. Core connector/runtime library paths are implemented and validated by unit and integration suites.
 
-Current crate release: 0.2.0.
+Current crate release: 0.3.0.
 
 ## MSRV 🛠️
 
-This crate targets Rust 1.88 or newer, matching the `rust-version` declared in `Cargo.toml`.
+This crate targets Rust 1.92 or newer, matching the `rust-version` declared in `Cargo.toml`.
 
 ## Build 📦
 

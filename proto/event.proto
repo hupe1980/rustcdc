@@ -101,4 +101,8 @@ message Event {
   TransactionMetadata transaction = 10;
   // Canonical envelope schema version. Currently always 1.
   uint32 envelope_version = 11;
+  // True when `before` contains only primary-key columns rather than the full
+  // pre-image row. Occurs on PostgreSQL UPDATE and DELETE events when the table's
+  // REPLICA IDENTITY is DEFAULT. Always false for non-UPDATE/DELETE or non-PostgreSQL events.
+  bool before_is_key_only = 12;
 }

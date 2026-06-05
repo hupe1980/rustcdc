@@ -1,5 +1,6 @@
 //! `Transform`-trait adapter for `WasmRuntime`.
 
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
 ///
 /// ```rust,ignore
 /// use rustcdc::wasm::{WasmConfig, WasmTransform};
-/// use rustcdc::transform::{BoxTransform, TransformPipeline};
+/// use rustcdc::transform::TransformPipeline;
 ///
 /// let transform = WasmTransform::new(WasmConfig {
 ///     module_path: "my_transform.wasm".into(),
@@ -22,7 +23,7 @@ use crate::{
 ///     memory_limit_mb: 16,
 /// }).await?;
 /// let mut pipeline = TransformPipeline::default();
-/// pipeline.add_transform(BoxTransform::new(transform));
+/// pipeline.add_transform(Box::new(transform));
 /// ```
 pub struct WasmTransform {
     runtime: Mutex<WasmRuntime>,
@@ -49,8 +50,17 @@ impl WasmTransform {
     }
 }
 
+impl std::fmt::Debug for WasmTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmTransform")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
 impl Transform for WasmTransform {
-    async fn apply<'a>(&'a self, event: &'a mut Event) -> Result<bool> {
+    async fn apply(&self, event: &mut Event) -> Result<bool> {
         let mut guard = self.runtime.lock().await;
         match guard.transform(event).await? {
             TransformResult::Ok(transformed) => {
@@ -58,8 +68,9 @@ impl Transform for WasmTransform {
                 Ok(true)
             }
             TransformResult::Filtered => Ok(false),
-            TransformResult::Err(reason) => Err(crate::core::Error::SourceError(format!(
-                "WASM transform returned error: {reason}"
+            TransformResult::Err(reason) => Err(crate::core::Error::TransformError(format!(
+                "wasm/{}: {reason}",
+                self.name
             ))),
         }
     }

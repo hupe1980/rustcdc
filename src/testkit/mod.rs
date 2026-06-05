@@ -20,8 +20,8 @@
 
 // Re-export the public sink API so callers importing via `testkit` continue to work.
 pub use crate::sink::{
-    AdapterConformanceSuite, AdapterConformanceTest, AdapterGoldenFixture, BasicAdapterConformance,
-    MemorySinkAdapter, SinkAdapter, TestResult,
+    AdapterConformanceSuite, AdapterGoldenFixture, BasicAdapterConformance, MemorySinkAdapter,
+    SinkAdapter, TestResult,
 };
 
 use std::{
@@ -267,8 +267,8 @@ mod tests {
         core::{Event, Operation, RuntimeConfig, SourceMetadata, EVENT_ENVELOPE_VERSION},
         schema_history::InMemorySchemaHistory,
         testkit::{
-            AdapterConformanceSuite, AdapterConformanceTest, AdapterGoldenFixture,
-            BasicAdapterConformance, ConformanceSuite, Fixture, JsonFixture, MemorySinkAdapter,
+            AdapterConformanceSuite, AdapterGoldenFixture, BasicAdapterConformance,
+            ConformanceSuite, Fixture, JsonFixture, MemorySinkAdapter,
             NotImplementedConformanceTest, ReplayRunner, SinkAdapter,
         },
     };
@@ -290,6 +290,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -381,7 +382,6 @@ mod tests {
         closed: bool,
     }
 
-    #[async_trait::async_trait]
     impl SinkAdapter for MockSinkAdapter {
         async fn send(&mut self, event: &Event) -> crate::core::Result<()> {
             if self.closed {

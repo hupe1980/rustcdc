@@ -277,6 +277,7 @@ fn build_sqlserver_event(
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }
 
@@ -374,5 +375,6 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
+        before_is_key_only: false,
     }
 }

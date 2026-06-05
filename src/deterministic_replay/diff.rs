@@ -6,16 +6,33 @@ use crate::core::Event;
 use serde::{Deserialize, Serialize};
 
 /// Diff level: what kind of change was detected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Variants are ordered from lowest to highest severity so that standard `>`
+/// comparisons and `max()` calls work intuitively: `Critical > Semantic >
+/// Inconsequential > Identical`.
+///
+/// [`semantic_diff`] returns results sorted **descending** (most severe first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DiffLevel {
     /// No difference detected
     Identical,
-    /// Inconsequential difference (e.g., timestamp, internal IDs)
+    /// Inconsequential difference (e.g., JSON key reordering)
     Inconsequential,
-    /// Semantic change that may affect correctness (e.g., table name, operation type)
+    /// Semantic change that may affect correctness (e.g., table name, data field)
     Semantic,
-    /// Critical structural difference (e.g., missing required field)
+    /// Critical structural difference (e.g., missing required field or wrong operation)
     Critical,
+}
+
+impl std::fmt::Display for DiffLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Critical => "critical",
+            Self::Semantic => "semantic",
+            Self::Inconsequential => "inconsequential",
+            Self::Identical => "identical",
+        })
+    }
 }
 
 /// Semantic difference between two events.
@@ -32,6 +49,16 @@ pub struct EventDiff {
 
     /// Path to the changed field in dot notation (e.g., "after.id", "source.timestamp")
     pub paths: Vec<String>,
+}
+
+impl std::fmt::Display for EventDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.level, self.summary)?;
+        if !self.paths.is_empty() {
+            write!(f, " ({})", self.paths.join(", "))?;
+        }
+        Ok(())
+    }
 }
 
 impl EventDiff {
@@ -122,13 +149,23 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
     let before_diff = compare_json_fields(&old.before, &new.before, "before");
     diffs.extend(before_diff);
 
-    // Sort by severity
-    diffs.sort_by_key(|d| match d.level {
-        DiffLevel::Identical => 0,
-        DiffLevel::Inconsequential => 1,
-        DiffLevel::Semantic => 2,
-        DiffLevel::Critical => 3,
-    });
+    if old.before_is_key_only != new.before_is_key_only {
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Semantic,
+                format!(
+                    "before_is_key_only changed from {} to {}",
+                    old.before_is_key_only, new.before_is_key_only
+                ),
+                vec![],
+            )
+            .with_path("before_is_key_only"),
+        );
+    }
+
+    // Sort descending: highest severity (Critical) first.
+    // With Critical as the highest discriminant, Reverse wrapping gives ascending sort key.
+    diffs.sort_by_key(|d| std::cmp::Reverse(d.level));
 
     diffs
 }
@@ -238,6 +275,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
 
         let mut new = old.clone();
@@ -266,6 +304,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
 
         let mut new = old.clone();

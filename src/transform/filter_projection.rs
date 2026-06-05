@@ -399,6 +399,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -753,6 +754,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
         assert!(
             transform.apply(&mut e).await.unwrap(),
@@ -792,6 +794,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         };
         assert!(
             !transform.apply(&mut e).await.unwrap(),

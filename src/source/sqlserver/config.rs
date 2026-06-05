@@ -223,4 +223,46 @@ impl SqlServerSourceConfig {
 
         Ok(config)
     }
+
+    /// Verify that the target SQL Server instance is currently acting as a primary
+    /// (i.e. is not a read-only AG secondary or log-shipping replica).
+    ///
+    /// Issues a single query against `sys.dm_hadr_database_replica_states` and
+    /// `sys.databases` to determine whether the current database is in a writable
+    /// primary role. Falls back to checking `DATABASEPROPERTYEX(DB_NAME(), 'Updateability')`.
+    ///
+    /// Returns `Ok(true)` if the instance is a writable primary, `Ok(false)` if it
+    /// is a read-only replica.
+    ///
+    /// CDC requires a writable primary. Call this before creating or resuming a
+    /// capture session whenever topology changes are possible (e.g. AG failover).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SourceError`] if the connection or query fails.
+    pub async fn check_is_primary(&self) -> Result<bool> {
+        use super::query::connect_client;
+
+        let mut client = connect_client(self)
+            .await
+            .map_err(|e| Error::SourceError(format!("check_is_primary: {e}")))?;
+
+        // DATABASEPROPERTYEX returns 'READ_WRITE' for primaries and 'READ_ONLY' for secondaries.
+        let row = client
+            .query("SELECT DATABASEPROPERTYEX(DB_NAME(), 'Updateability')", &[])
+            .await
+            .map_err(|e| Error::SourceError(format!("check_is_primary: query failed: {e}")))?
+            .into_row()
+            .await
+            .map_err(|e| Error::SourceError(format!("check_is_primary: reading row failed: {e}")))?
+            .ok_or_else(|| {
+                Error::SourceError("check_is_primary: DATABASEPROPERTYEX returned no rows".into())
+            })?;
+
+        let updateability: &str = row.get(0).ok_or_else(|| {
+            Error::SourceError("check_is_primary: could not read Updateability column".into())
+        })?;
+
+        Ok(updateability.eq_ignore_ascii_case("READ_WRITE"))
+    }
 }

@@ -133,6 +133,12 @@ pub const AVRO_SCHEMA: &str = r#"{
       "type": "int",
       "default": 1,
       "doc": "Canonical envelope schema version. Currently always 1."
+    },
+    {
+      "name": "before_is_key_only",
+      "type": "boolean",
+      "default": false,
+      "doc": "True when 'before' contains only primary-key columns (PostgreSQL DEFAULT REPLICA IDENTITY). Always false for non-UPDATE or non-PostgreSQL events."
     }
   ]
 }"#;
@@ -197,11 +203,12 @@ fn op_avro_symbol(op: Operation) -> &'static str {
 ///     snapshot: None,
 ///     transaction: None,
 ///     envelope_version: EVENT_ENVELOPE_VERSION,
+///     before_is_key_only: false,
 /// };
 /// let out = encoder.encode(&event).unwrap();
 /// assert_eq!(out.content_type, "avro/binary");
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AvroEncoder {
     schema: Schema,
 }
@@ -328,6 +335,10 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
             "envelope_version".into(),
             AvroValue::Int(event.envelope_version as i32),
         ),
+        (
+            "before_is_key_only".into(),
+            AvroValue::Boolean(event.before_is_key_only),
+        ),
     ]))
 }
 
@@ -361,6 +372,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -385,6 +397,7 @@ mod tests {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            before_is_key_only: false,
         }
     }
 
@@ -493,5 +506,27 @@ mod tests {
         // The schema name should be "Event"
         let json = enc.schema().canonical_form();
         assert!(json.contains("Event"), "schema should contain 'Event'");
+    }
+
+    #[test]
+    fn before_is_key_only_flag_round_trips() {
+        let enc = AvroEncoder::new().unwrap();
+        let mut event = update_event();
+        event.before_is_key_only = true;
+        let out = enc.encode(&event).unwrap();
+
+        let mut reader = out.bytes.as_slice();
+        let decoded = from_avro_datum(enc.schema(), &mut reader, None).unwrap();
+
+        if let AvroValue::Record(fields) = decoded {
+            let flag = fields
+                .iter()
+                .find(|(k, _)| k == "before_is_key_only")
+                .map(|(_, v)| v.clone())
+                .unwrap_or(AvroValue::Null);
+            assert_eq!(flag, AvroValue::Boolean(true));
+        } else {
+            panic!("expected Record");
+        }
     }
 }

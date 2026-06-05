@@ -561,6 +561,79 @@ impl FileCheckpoint {
 
         Ok(())
     }
+
+    /// Seed a checkpoint file directly from raw offset bytes and an event count.
+    ///
+    /// This is useful for migrations, disaster recovery, and integration testing
+    /// where a known-good offset needs to be injected into a checkpoint directory
+    /// without going through a live [`Checkpoint::save`] cycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir` — directory that would be passed to [`FileCheckpoint::new`]
+    /// * `source_type` — source identifier, e.g. `"postgres"` or `"mysql"`
+    /// * `offset_bytes` — raw bytes as returned by [`Offset::encode`]
+    /// * `committed_event_count` — event counter to persist in the record
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::core::Error::CheckpointError`] if the directory does not exist, is not
+    /// writable, or if `offset_bytes` cannot be parsed as JSON.
+    pub fn restore_from_record(
+        dir: &Path,
+        source_type: &str,
+        offset_bytes: Vec<u8>,
+        committed_event_count: u64,
+    ) -> Result<()> {
+        use std::io::Write as _;
+
+        if !dir.exists() {
+            return Err(crate::core::Error::CheckpointError(format!(
+                "checkpoint directory does not exist: {}",
+                dir.display()
+            )));
+        }
+        if !dir.is_dir() {
+            return Err(crate::core::Error::CheckpointError(format!(
+                "checkpoint path is not a directory: {}",
+                dir.display()
+            )));
+        }
+
+        let offset_value: serde_json::Value =
+            serde_json::from_slice(&offset_bytes).map_err(|e| {
+                crate::core::Error::CheckpointError(format!(
+                    "restore_from_record: offset_bytes are not valid JSON: {e}"
+                ))
+            })?;
+
+        let record = FileCheckpointRecord {
+            checkpoint_format_version: FILE_CHECKPOINT_FORMAT_VERSION,
+            source_type: source_type.to_string(),
+            committed_event_count,
+            offset: offset_value,
+        };
+
+        let final_path = dir.join(format!("checkpoint_{source_type}.json"));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let temp_path = dir.join(format!("checkpoint_{source_type}.{stamp}.tmp"));
+
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(crate::core::Error::from)?;
+        let payload = serde_json::to_vec_pretty(&record)?;
+        file.write_all(&payload).map_err(crate::core::Error::from)?;
+        file.sync_all().map_err(crate::core::Error::from)?;
+        drop(file);
+
+        fs::rename(&temp_path, &final_path).map_err(crate::core::Error::from)?;
+        Ok(())
+    }
 }
 
 #[async_trait]

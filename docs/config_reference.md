@@ -398,11 +398,12 @@ connection failures with truncated exponential backoff:
 use rustcdc::core::ConnectionRetryPolicy;
 
 let config = RuntimeConfig::new(source, checkpoint, schema_history)
-    .with_connection_retry(ConnectionRetryPolicy {
-        max_retries: Some(5),    // None retries indefinitely
-        initial_delay_ms: 300,   // first retry after 300 ms
-        max_delay_ms: 10_000,    // backoff capped at 10 s
-    });
+    .with_connection_retry(
+        ConnectionRetryPolicy::new()
+            .with_max_retries(Some(5))    // None retries indefinitely
+            .with_initial_delay_ms(300)   // first retry after 300 ms
+            .with_max_delay_ms(10_000),   // backoff capped at 10 s
+    );
 ```
 
 Only `SourceError` and `TimeoutError` trigger retry. Fatal errors (`ConfigError`,
@@ -719,7 +720,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.2.0",                         // Service version
+    "0.3.0",                         // Service version
     "production",                    // Environment
 );
 

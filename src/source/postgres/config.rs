@@ -225,4 +225,117 @@ impl PostgresSourceConfig {
             .connect_timeout(Duration::from_secs(self.conn_timeout_secs));
         Ok(config)
     }
+
+    /// Verify that the target PostgreSQL instance is currently acting as a primary.
+    ///
+    /// Issues a single `SELECT pg_is_in_recovery()` query: if the function returns
+    /// `false` the server is a primary and this method returns `Ok(true)`. If it
+    /// returns `true` the server is a replica/standby and this method returns
+    /// `Ok(false)`.
+    /// Verify that the target PostgreSQL instance is currently acting as a primary.
+    ///
+    /// Issues a single `SELECT pg_is_in_recovery()` query: if the function returns
+    /// `false` the server is a primary and this method returns `Ok(true)`. If it
+    /// returns `true` the server is a replica/standby and this method returns
+    /// `Ok(false)`.
+    ///
+    /// CDC requires a writable primary for logical replication. Call this before
+    /// creating or resuming a replication stream whenever topology changes are
+    /// possible (e.g. after a failover).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SourceError`] if the connection or query fails.
+    pub async fn check_is_primary(&self) -> Result<bool> {
+        let connect_config = self.build_connect_config()?;
+        query_is_primary(connect_config, &self.transport).await
+    }
+}
+
+/// Run `SELECT pg_is_in_recovery()` over a fresh short-lived connection.
+///
+/// Each TLS variant produces a distinct `Connection<_, T>` type, so we split
+/// into a helper that resolves early per branch rather than trying to unify
+/// the return type in a single `match` expression.
+async fn query_is_primary(
+    connect_config: PgConnectConfig,
+    transport: &crate::core::TransportConfig,
+) -> Result<bool> {
+    async fn run_query(client: tokio_postgres::Client) -> Result<bool> {
+        let row = client
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await
+            .map_err(|e| Error::SourceError(format!("check_is_primary: query failed: {e}")))?;
+        let is_in_recovery: bool = row.get(0);
+        Ok(!is_in_recovery)
+    }
+
+    match transport {
+        crate::core::TransportConfig::Plaintext => {
+            let (client, connection) = connect_config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|e| {
+                    Error::SourceError(format!(
+                        "check_is_primary: postgres plaintext connection failed: {e}"
+                    ))
+                })?;
+            let handle = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let result = run_query(client).await;
+            handle.abort();
+            result
+        }
+        #[cfg(feature = "tls")]
+        crate::core::TransportConfig::Tls {
+            ca_cert_path,
+            client_cert_path,
+            client_key_path,
+            ..
+        } => {
+            use tokio_postgres_rustls::MakeRustlsConnect;
+            let tls_config = super::query::build_tls_client_config(
+                ca_cert_path.as_deref(),
+                client_cert_path.as_deref(),
+                client_key_path.as_deref(),
+            )?;
+            let (client, connection) = connect_config
+                .connect(MakeRustlsConnect::new(tls_config))
+                .await
+                .map_err(|e| {
+                    Error::SourceError(format!(
+                        "check_is_primary: postgres tls connection failed: {e}"
+                    ))
+                })?;
+            let handle = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let result = run_query(client).await;
+            handle.abort();
+            result
+        }
+        #[cfg(feature = "tls")]
+        crate::core::TransportConfig::RustlsConfig { config: rustls_cfg } => {
+            use tokio_postgres_rustls::MakeRustlsConnect;
+            let (client, connection) = connect_config
+                .connect(MakeRustlsConnect::new((*rustls_cfg.0).clone()))
+                .await
+                .map_err(|e| {
+                    Error::SourceError(format!(
+                        "check_is_primary: postgres rustls connection failed: {e}"
+                    ))
+                })?;
+            let handle = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let result = run_query(client).await;
+            handle.abort();
+            result
+        }
+        #[cfg(not(feature = "tls"))]
+        _ => Err(Error::ConfigError(
+            "check_is_primary: TLS transport requires crate feature 'tls'".into(),
+        )),
+    }
 }
