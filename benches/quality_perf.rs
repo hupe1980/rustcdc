@@ -224,8 +224,12 @@ fn bench_parallel_snapshot_4x100k(c: &mut Criterion) {
 
 fn bench_quality_gate_targets(c: &mut Criterion) {
     let mut group = c.benchmark_group("quality_gates");
-    group.sample_size(20);
-    group.measurement_time(std::time::Duration::from_secs(5));
+    // Use the same sampling parameters as the main benchmark suite so that
+    // per-measurement confidence intervals are tight enough to support the
+    // ±5 % regression gate. The former values (20 samples / 5 s) produced
+    // wide intervals that caused spurious CI failures from machine-load drift.
+    group.sample_size(30);
+    group.measurement_time(std::time::Duration::from_secs(8));
 
     group.bench_function("snapshot_10k_rows", |b| {
         let events: Vec<Event> = (1..=10_000).map(build_event).collect();

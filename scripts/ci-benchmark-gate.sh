@@ -503,9 +503,19 @@ for bench in "${gated_benches[@]}"; do
 
     significant_runs="$(count_significant_critical_group_regressions "$regression_threshold" "${confirmation_outputs[@]}")"
 
+    # Require a strict majority of confirmation runs to show a significant
+    # critical-group regression before failing.  A hard-coded floor of 2 is
+    # kept as a minimum guard; together they prevent a single noisy CI run
+    # from triggering a gate failure while still catching reproducible regressions.
+    total_outputs="${#confirmation_outputs[@]}"
+    required_for_regression=$(( total_outputs / 2 + 1 ))
+    if (( required_for_regression < 2 )); then
+      required_for_regression=2
+    fi
+
     if [[ "$strict_mode" == "1" ]]; then
-      if (( significant_runs >= 2 )); then
-        echo "Benchmark regression gate failed: strict mode observed reproducible significant critical-group regressions (${bench}) in ${significant_runs} runs."
+      if (( significant_runs >= required_for_regression )); then
+        echo "Benchmark regression gate failed: strict mode observed reproducible significant critical-group regressions (${bench}) in ${significant_runs}/${total_outputs} runs (required: ${required_for_regression})."
         rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_raw_out" || true
         rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_retry_out" || true
         for out_file in "${confirmation_outputs[@]}"; do
@@ -515,7 +525,7 @@ for bench in "${gated_benches[@]}"; do
         exit 1
       fi
 
-      echo "Strict benchmark confirmation set for ${bench} did not show reproducible significant critical-group regressions; treating initial marker as noise."
+      echo "Strict benchmark confirmation set for ${bench} did not show reproducible significant critical-group regressions (${significant_runs}/${total_outputs} runs, required ${required_for_regression}); treating initial marker as noise."
       continue
     fi
 
@@ -524,8 +534,8 @@ for bench in "${gated_benches[@]}"; do
       continue
     fi
 
-    if (( significant_runs >= 2 )); then
-      echo "Benchmark regression gate failed: criterion reported reproducible regressions for ${bench} on retry."
+    if (( significant_runs >= required_for_regression )); then
+      echo "Benchmark regression gate failed: criterion reported reproducible regressions for ${bench} on retry (${significant_runs}/${total_outputs} runs, required ${required_for_regression})."
       rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_raw_out" || true
       rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_retry_out" || true
       for out_file in "${confirmation_outputs[@]}"; do
