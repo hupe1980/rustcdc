@@ -11,7 +11,7 @@ Current crate release: 0.3.0.
 
 ## MSRV 🛠️
 
-This crate targets Rust 1.88 or newer, matching the `rust-version` declared in `Cargo.toml`.
+This crate targets Rust 1.92 or newer, matching the `rust-version` declared in `Cargo.toml`.
 
 ## Build 📦
 
