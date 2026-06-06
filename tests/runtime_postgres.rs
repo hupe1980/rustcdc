@@ -66,8 +66,8 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
               payload TEXT NOT NULL
             );
             ALTER TABLE public.runtime_users REPLICA IDENTITY FULL;
-            DROP PUBLICATION IF EXISTS cdc_runtime_pub;
-            CREATE PUBLICATION cdc_runtime_pub FOR TABLE public.runtime_users;
+            DROP PUBLICATION IF EXISTS rustcdc_runtime_pub;
+            CREATE PUBLICATION rustcdc_runtime_pub FOR TABLE public.runtime_users;
             ",
         )
         .await
@@ -81,8 +81,8 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
         user: "postgres".to_string(),
         password: "postgres".into(),
         database: "cdc".to_string(),
-        replication_slot_name: "cdc_runtime_slot".to_string(),
-        publication_name: "cdc_runtime_pub".to_string(),
+        replication_slot_name: "rustcdc_runtime_slot".to_string(),
+        publication_name: "rustcdc_runtime_pub".to_string(),
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -134,7 +134,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     let saved_offset = PostgresOffset::from_bytes(&saved.encode()?)?;
     let target_lsn = format_pg_lsn(saved_offset.lsn);
     let advance_sql = format!(
-        "SELECT end_lsn::text FROM pg_replication_slot_advance('cdc_runtime_slot', '{target_lsn}'::pg_lsn)"
+        "SELECT end_lsn::text FROM pg_replication_slot_advance('rustcdc_runtime_slot', '{target_lsn}'::pg_lsn)"
     );
     admin_client
         .query_one(&advance_sql, &[])

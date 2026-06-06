@@ -55,7 +55,6 @@ async fn pass_through_fixture_is_conformant() {
     let transformed = match result {
         WasmTransformResult::Ok(event) => event,
         WasmTransformResult::Filtered => panic!("unexpected filter-out on passthrough fixture"),
-        WasmTransformResult::Err(message) => panic!("unexpected error result: {message}"),
     };
 
     assert_eq!(transformed.table, "users");

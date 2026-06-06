@@ -11,39 +11,60 @@ The runtime provides a concrete execution engine with static contract validation
 - `get_metric(ptr: i32) -> i64`
 - `record_metric(ptr: i32, value: i64)`
 
+Any import outside this set is rejected at load time by static analysis.
+
 ### Guest exports
 
-Required:
+**Required:**
 - `memory`
-- `alloc(len: i32) -> i32`
-- `transform(event_ptr: i32, event_len: i32) -> i32`
-- `output_len() -> i32`
+- `alloc(size: i32) -> i32` — allocate `size` bytes; must never return 0 (address 0 is reserved)
+- `dealloc(ptr: i32, size: i32)` — release the region `[ptr .. ptr+size)`
+- `transform(event_ptr: i32, event_len: i32) -> i64` — see return semantics below
+- `rustcdc_abi_version() -> i32` — must return `2`
 
-Optional:
+**Optional:**
 - `init(config_ptr: i32, config_len: i32) -> i32`
 - `shutdown() -> i32`
 
+Missing required exports or a wrong `rustcdc_abi_version` return value are hard errors at load time.
+
+### `transform` return semantics
+
+The return value is a packed `i64`:
+
+| Value | Meaning |
+|---|---|
+| `0` | Drop the event (filter-out). No output memory is allocated. |
+| `(out_ptr << 32) \| out_len` | Transformed event. High 32 bits: output pointer. Low 32 bits: output byte length. |
+
+- `out_ptr` must be > 0 (address 0 is reserved).
+- `out_len` must be > 0 when a non-zero packed value is returned.
+- The bytes at `[out_ptr .. out_ptr+out_len)` must deserialise into canonical `Event` JSON.
+- The host calls `dealloc(out_ptr, out_len)` after reading the output.
+
+### Memory ownership
+
+1. Host calls `alloc(event_len)` → gets `input_ptr`.
+2. Host writes serialised `Event` JSON into `[input_ptr .. input_ptr+event_len)`.
+3. Host calls `transform(input_ptr, event_len)` → gets packed `i64`.
+4. Host calls `dealloc(input_ptr, event_len)` unconditionally.
+5. If packed ≠ 0, host reads output, then calls `dealloc(out_ptr, out_len)`.
+
 ## Event and Memory Model
-- Event serialization format: JSON.
-- Host calls `alloc` to reserve guest memory, then writes serialized bytes into guest linear memory.
-- `transform` input is a pointer/length pair to canonical `Event` JSON.
-- `transform` return semantics:
-  - `-1`: filtered event (host returns `None`)
-  - `>= 0`: output pointer in guest memory
-  - `< -1`: transform failure
-- Host calls `output_len()` after successful `transform` to read exactly that many bytes from returned output pointer.
-- Successful output bytes must deserialize into canonical `Event` JSON.
+- Event serialisation format: JSON.
+- Input and output events must both be canonical `Event` JSON.
+- Address 0 is reserved; `alloc` must never return it.
 
 ## Security and Reliability
 - WASM runs sandboxed (no direct file I/O or network access).
-- Static import scanning rejects all imports outside `env.log`, `env.get_metric`, and `env.record_metric`.
+- Static import scanning rejects all imports outside the three `env.*` functions above.
 - Timeout enforced per transform invocation:
   - default `50ms`
   - configurable via `WasmConfig.timeout_ms`
 - Memory limit enforced per runtime instance:
   - default `16MB`
   - configurable via `WasmConfig.memory_limit_mb`
-- Panics are treated as transform failures and surfaced as runtime errors.
+- Traps are surfaced as `Error::TransformError` at the call site.
 
 ## Performance Targets
 - Native overhead target: `< 5x`
@@ -58,14 +79,14 @@ For a single-stream CDC pipeline this is not a bottleneck. However, **if you are
 
 ### Scaling with a WasmRuntime pool
 
-Instantiate multiple `WasmRuntime` instances (one per logical shard or per available core) and dispatch events across them. Wasmtime module compilation is the expensive step; use `WasmModule::load_from_file` once and clone the compiled module to each instance.
+Instantiate multiple `WasmRuntime` instances (one per logical shard or per available core) and dispatch events across them. Wasmtime module compilation is the expensive step; compile once and share the bytes.
 
 ```rust
 // Pseudo-code: pool of runtime instances
-let module = Arc::new(WasmModule::load_from_file("transform.wasm", config)?);
+let wasm_bytes = std::fs::read("transform.wasm")?;
 let pool: Vec<_> = (0..num_cpus::get())
-    .map(|_| WasmRuntime::from_module(Arc::clone(&module)))
-    .collect();
+    .map(|_| WasmRuntime::new_with_config(config.clone()))
+    .collect::<Result<Vec<_>, _>>()?;
 
 // Dispatch: pick an instance by thread-local index or round-robin.
 ```
@@ -79,52 +100,53 @@ let pool: Vec<_> = (0..num_cpus::get())
 Implemented in [src/wasm/runtime.rs](../src/wasm/runtime.rs):
 - `WasmRuntime`
   - `new(wasm_module_path: &str) -> Result<Self>`
+  - `new_with_config(config: WasmConfig) -> Result<Self>`
   - `init(&mut self) -> Result<()>`
   - `transform(&mut self, event: &Event) -> Result<TransformResult>`
   - `shutdown(&mut self) -> Result<()>`
-- `WasmModule`
-  - `async fn transform(&self, event: &Event) -> Result<Option<Event>>`
-  - `fn timeout_ms(&self) -> u64`
+  - `config(&self) -> &WasmConfig`
+  - `module_size_bytes(&self) -> usize`
 - `TransformResult`
-  - `Ok(Event)`
-  - `Err(String)`
+  - `Ok(Box<Event>)` — transformed event
+  - `Filtered` — event was dropped by the module (normal outcome)
 - `WasmConfig`
-  - `{ module_path, timeout_ms, memory_limit_mb }`
+  - `{ module_path: PathBuf, timeout_ms: u64, memory_limit_mb: u64 }`
 
-## Example Guest Transform Skeleton (ABI shape)
+## Example Guest Transform Skeleton (Rust)
+
 ```rust
+use std::sync::atomic::{AtomicI32, Ordering};
+
+static HEAP: AtomicI32 = AtomicI32::new(8); // address 0 is reserved
+
+#[no_mangle]
+pub extern "C" fn rustcdc_abi_version() -> i32 { 2 }
+
 #[no_mangle]
 pub extern "C" fn alloc(len: i32) -> i32 {
-  let mut buf = Vec::<u8>::with_capacity(len as usize);
-  let ptr = buf.as_mut_ptr();
-  std::mem::forget(buf);
-  ptr as i32
+    HEAP.fetch_add(len, Ordering::Relaxed)
 }
 
 #[no_mangle]
-pub extern "C" fn output_len() -> i32 {
-  LAST_OUTPUT_LEN.load(std::sync::atomic::Ordering::Relaxed)
+pub extern "C" fn dealloc(_ptr: i32, _len: i32) {} // no-op for bump allocator
+
+#[no_mangle]
+pub extern "C" fn init(_config_ptr: i32, _config_len: i32) -> i32 { 0 }
+
+#[no_mangle]
+pub extern "C" fn transform(event_ptr: i32, event_len: i32) -> i64 {
+    // 1. Read input bytes from [event_ptr .. event_ptr+event_len).
+    // 2. Parse, transform, serialise output.
+    // 3. Allocate output buffer via alloc(out_len).
+    // 4. Write output bytes into buffer.
+    // 5. Return packed: (out_ptr as i64) << 32 | (out_len as i64)
+    //    or 0 to drop the event.
+    let _ = (event_ptr, event_len);
+    0 // drop the event (example: filter everything)
 }
 
 #[no_mangle]
-pub extern "C" fn init(_config_ptr: i32, _config_len: i32) -> i32 {
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn transform(event_ptr: i32, event_len: i32) -> i32 {
-  let _ = (event_ptr, event_len);
-  // Parse input bytes -> Event JSON, produce transformed Event JSON,
-  // allocate output in linear memory, store length for output_len(), return pointer.
-  -1
-}
-
-#[no_mangle]
-pub extern "C" fn shutdown() -> i32 {
-    0
-}
-
-static LAST_OUTPUT_LEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub extern "C" fn shutdown() -> i32 { 0 }
 ```
 
 ## Compilation Instructions

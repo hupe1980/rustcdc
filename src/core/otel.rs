@@ -124,47 +124,47 @@ impl OTelMetricsCollector {
         let meter = meter_provider.meter("rustcdc");
         let instruments = MetricsInstruments {
             events_processed: meter
-                .u64_counter("cdc.events.processed")
+                .u64_counter("rustcdc.events.processed")
                 .with_description("Processed CDC events")
                 .build(),
             events_filtered: meter
-                .u64_counter("cdc.events.filtered")
+                .u64_counter("rustcdc.events.filtered")
                 .with_description("Filtered CDC events")
                 .build(),
             errors: meter
-                .u64_counter("cdc.errors")
+                .u64_counter("rustcdc.errors")
                 .with_description("CDC processing errors")
                 .build(),
             checkpoint_committed: meter
-                .u64_counter("cdc.checkpoint.committed_count")
+                .u64_counter("rustcdc.checkpoint.committed_count")
                 .with_description("Committed checkpoint event count")
                 .build(),
             replication_lag_ms: meter
-                .u64_gauge("cdc.replication_lag_ms")
+                .u64_gauge("rustcdc.replication_lag_ms")
                 .with_description("Replication lag in milliseconds")
                 .build(),
             replication_lag_events: meter
-                .u64_gauge("cdc.replication_lag_events")
+                .u64_gauge("rustcdc.replication_lag_events")
                 .with_description("Replication lag in events")
                 .build(),
             checkpoint_offset: meter
-                .u64_gauge("cdc.checkpoint_offset")
+                .u64_gauge("rustcdc.checkpoint_offset")
                 .with_description("Checkpoint offset surrogate value")
                 .build(),
             buffer_size: meter
-                .u64_gauge("cdc.buffer_size")
+                .u64_gauge("rustcdc.buffer_size")
                 .with_description("In-flight event buffer size")
                 .build(),
             snapshot_progress: meter
-                .u64_gauge("cdc.snapshot_progress_percent")
+                .u64_gauge("rustcdc.snapshot_progress_percent")
                 .with_description("Snapshot progress percentage")
                 .build(),
             event_processing_duration: meter
-                .u64_histogram("cdc.event_processing_duration_ms")
+                .u64_histogram("rustcdc.event_processing_duration_ms")
                 .with_description("End-to-end event processing duration")
                 .build(),
             checkpoint_commit_duration: meter
-                .u64_histogram("cdc.checkpoint_commit_duration_ms")
+                .u64_histogram("rustcdc.checkpoint_commit_duration_ms")
                 .with_description("Checkpoint commit duration")
                 .build(),
         };
@@ -199,7 +199,7 @@ impl OTelMetricsCollector {
     pub fn record_events_processed(&self, op: Operation, count: u64) {
         if let Ok(mut state) = self.state.lock() {
             let op_name = op.to_string();
-            let metric_key = format!("cdc.events.processed[op={op_name}]");
+            let metric_key = format!("rustcdc.events.processed[op={op_name}]");
             let entry = state
                 .counters
                 .entry(metric_key)
@@ -219,7 +219,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             let entry = state
                 .counters
-                .entry("cdc.events.filtered".to_string())
+                .entry("rustcdc.events.filtered".to_string())
                 .or_insert((0, HashMap::new()));
             entry.0 = entry.0.saturating_add(count);
 
@@ -233,7 +233,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             state
                 .gauges
-                .insert("cdc.replication_lag_ms".to_string(), lag_ms as f64);
+                .insert("rustcdc.replication_lag_ms".to_string(), lag_ms as f64);
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.replication_lag_ms.record(lag_ms, &[]);
@@ -246,7 +246,7 @@ impl OTelMetricsCollector {
             let surrogate = offset.len() as u64;
             state
                 .gauges
-                .insert("cdc.checkpoint_offset".to_string(), surrogate as f64);
+                .insert("rustcdc.checkpoint_offset".to_string(), surrogate as f64);
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.checkpoint_offset.record(surrogate, &[]);
@@ -258,7 +258,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             state
                 .histograms
-                .entry("cdc.event_processing_duration_ms".to_string())
+                .entry("rustcdc.event_processing_duration_ms".to_string())
                 .or_insert_with(Vec::new)
                 .push(duration_ms);
 
@@ -274,7 +274,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             state
                 .histograms
-                .entry("cdc.checkpoint_commit_duration_ms".to_string())
+                .entry("rustcdc.checkpoint_commit_duration_ms".to_string())
                 .or_insert_with(Vec::new)
                 .push(duration_ms);
 
@@ -290,7 +290,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             state
                 .gauges
-                .insert("cdc.buffer_size".to_string(), size as f64);
+                .insert("rustcdc.buffer_size".to_string(), size as f64);
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.buffer_size.record(size, &[]);
@@ -300,9 +300,10 @@ impl OTelMetricsCollector {
 
     pub fn record_snapshot_progress(&self, percent: u64) {
         if let Ok(mut state) = self.state.lock() {
-            state
-                .gauges
-                .insert("cdc.snapshot_progress_percent".to_string(), percent as f64);
+            state.gauges.insert(
+                "rustcdc.snapshot_progress_percent".to_string(),
+                percent as f64,
+            );
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.snapshot_progress.record(percent, &[]);
@@ -341,7 +342,7 @@ impl MetricsCollector for OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             let entry = state
                 .counters
-                .entry("cdc.checkpoint.committed_count".to_string())
+                .entry("rustcdc.checkpoint.committed_count".to_string())
                 .or_insert((0, HashMap::new()));
             entry.0 = entry.0.saturating_add(event_count);
 
@@ -355,9 +356,10 @@ impl MetricsCollector for OTelMetricsCollector {
     fn record_replication_lag_ms(&self, lag_ms: u64, lag_events: u64) {
         self.record_replication_lag_gauge_ms(lag_ms);
         if let Ok(mut state) = self.state.lock() {
-            state
-                .gauges
-                .insert("cdc.replication_lag_events".to_string(), lag_events as f64);
+            state.gauges.insert(
+                "rustcdc.replication_lag_events".to_string(),
+                lag_events as f64,
+            );
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments
@@ -370,7 +372,7 @@ impl MetricsCollector for OTelMetricsCollector {
     fn record_error(&self, error: &Error, context: &str) {
         let error_class = error_metric_class(error);
         if let Ok(mut state) = self.state.lock() {
-            let metric_key = format!("cdc.errors[context={context}]");
+            let metric_key = format!("rustcdc.errors[context={context}]");
             let entry = state
                 .counters
                 .entry(metric_key)
@@ -444,14 +446,14 @@ impl MetricsReport {
     pub fn total_events_processed(&self) -> u64 {
         self.counters
             .iter()
-            .filter(|(name, _)| name.starts_with("cdc.events.processed"))
+            .filter(|(name, _)| name.starts_with("rustcdc.events.processed"))
             .map(|(_, (count, _))| count)
             .sum()
     }
 
     pub fn avg_event_processing_latency(&self) -> Option<f64> {
         self.histograms
-            .get("cdc.event_processing_duration_ms")
+            .get("rustcdc.event_processing_duration_ms")
             .and_then(|values| {
                 if values.is_empty() {
                     None
@@ -632,7 +634,7 @@ impl OTelEventTracer {
         let mut attrs = HashMap::new();
         attrs.insert("source.table".to_string(), table.to_string());
         attrs.insert("snapshot.row_count".to_string(), row_count.to_string());
-        self.start_span(span_id, "cdc.snapshot", attrs);
+        self.start_span(span_id, "rustcdc.snapshot", attrs);
     }
 
     pub fn start_snapshot_chunk_span(
@@ -647,7 +649,12 @@ impl OTelEventTracer {
         attrs.insert("source.table".to_string(), table.to_string());
         attrs.insert("snapshot.chunk_index".to_string(), chunk_index.to_string());
         attrs.insert("snapshot.chunk_size".to_string(), chunk_size.to_string());
-        self.start_span_with_parent(span_id, "cdc.snapshot.chunk", attrs, Some(snapshot_span_id));
+        self.start_span_with_parent(
+            span_id,
+            "rustcdc.snapshot.chunk",
+            attrs,
+            Some(snapshot_span_id),
+        );
     }
 
     pub fn start_stream_span(&self, span_id: &str, table: Option<&str>, events_count: u64) {
@@ -657,7 +664,7 @@ impl OTelEventTracer {
             "source.table".to_string(),
             table.unwrap_or("n/a").to_string(),
         );
-        self.start_span(span_id, "cdc.stream", attrs);
+        self.start_span(span_id, "rustcdc.stream", attrs);
     }
 
     pub fn start_transform_span(
@@ -673,7 +680,7 @@ impl OTelEventTracer {
             "source.table".to_string(),
             table.unwrap_or("n/a").to_string(),
         );
-        self.start_span_with_parent(span_id, "cdc.event.transform", attrs, parent_span_id);
+        self.start_span_with_parent(span_id, "rustcdc.event.transform", attrs, parent_span_id);
     }
 
     pub fn start_checkpoint_commit_span(&self, span_id: &str, events_count: u64) {
@@ -683,7 +690,7 @@ impl OTelEventTracer {
             events_count.to_string(),
         );
         attrs.insert("source.table".to_string(), "n/a".to_string());
-        self.start_span(span_id, "cdc.checkpoint.commit", attrs);
+        self.start_span(span_id, "rustcdc.checkpoint.commit", attrs);
     }
 
     pub fn start_handoff_span(
@@ -701,7 +708,7 @@ impl OTelEventTracer {
             attrs.insert("handoff.stream_watermark_gap".to_string(), gap.to_string());
         }
         attrs.insert("source.table".to_string(), "n/a".to_string());
-        self.start_span(span_id, "cdc.handoff", attrs);
+        self.start_span(span_id, "rustcdc.handoff", attrs);
     }
 
     pub fn export_spans(&self) -> std::result::Result<Vec<SpanRecord>, String> {
@@ -783,7 +790,7 @@ impl EventTracer for OTelEventTracer {
         let mut attributes = HashMap::new();
         attributes.insert("event.id".to_string(), event_id.to_string());
         attributes.insert("source.table".to_string(), "n/a".to_string());
-        self.start_span(event_id, "cdc.event.transform", attributes);
+        self.start_span(event_id, "rustcdc.event.transform", attributes);
     }
 
     fn trace_event_end(&self, event_id: &str, status: &str) {
@@ -795,7 +802,7 @@ impl EventTracer for OTelEventTracer {
         let mut attributes = HashMap::new();
         attributes.insert("checkpoint.state".to_string(), state.to_string());
         attributes.insert("source.table".to_string(), "n/a".to_string());
-        self.start_span(&span_id, "cdc.checkpoint.commit", attributes);
+        self.start_span(&span_id, "rustcdc.checkpoint.commit", attributes);
         self.end_span(&span_id);
     }
 }
@@ -828,7 +835,7 @@ mod tests {
         collector.record_events_filtered(2);
         let report = collector.export_metrics().unwrap();
         assert_eq!(report.total_events_processed(), 15);
-        assert_eq!(report.get_counter("cdc.events.filtered"), Some(2));
+        assert_eq!(report.get_counter("rustcdc.events.filtered"), Some(2));
     }
 
     #[test]
@@ -850,10 +857,13 @@ mod tests {
         collector.record_buffer_size(500);
         collector.record_snapshot_progress(75);
         let report = collector.export_metrics().unwrap();
-        assert_eq!(report.get_gauge("cdc.replication_lag_ms"), Some(1_000.0));
-        assert_eq!(report.get_gauge("cdc.buffer_size"), Some(500.0));
         assert_eq!(
-            report.get_gauge("cdc.snapshot_progress_percent"),
+            report.get_gauge("rustcdc.replication_lag_ms"),
+            Some(1_000.0)
+        );
+        assert_eq!(report.get_gauge("rustcdc.buffer_size"), Some(500.0));
+        assert_eq!(
+            report.get_gauge("rustcdc.snapshot_progress_percent"),
             Some(75.0)
         );
     }
@@ -872,11 +882,11 @@ mod tests {
         let tracer = OTelEventTracer::new().with_source_type("postgres");
         let mut attrs = HashMap::new();
         attrs.insert("source.table".to_string(), "users".to_string());
-        tracer.start_span("event-1", "cdc.snapshot.chunk", attrs);
+        tracer.start_span("event-1", "rustcdc.snapshot.chunk", attrs);
         tracer.end_span("event-1");
         let spans = tracer.export_spans().unwrap();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].name, "cdc.snapshot.chunk");
+        assert_eq!(spans[0].name, "rustcdc.snapshot.chunk");
         assert_eq!(
             spans[0].attributes.get("source.type"),
             Some(&"postgres".to_string())
@@ -889,7 +899,7 @@ mod tests {
         tracer.trace_checkpoint_barrier("commit_started");
         let spans = tracer.export_spans().unwrap();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].name, "cdc.checkpoint.commit");
+        assert_eq!(spans[0].name, "rustcdc.checkpoint.commit");
     }
 
     #[test]
@@ -903,7 +913,7 @@ mod tests {
         let spans = tracer.export_spans().unwrap();
         assert_eq!(spans.len(), 2);
         let chunk = spans.iter().find(|span| span.span_id == "chunk-1").unwrap();
-        assert_eq!(chunk.name, "cdc.snapshot.chunk");
+        assert_eq!(chunk.name, "rustcdc.snapshot.chunk");
         assert_eq!(
             chunk.attributes.get("parent.span_id"),
             Some(&"snapshot-root".to_string())
@@ -955,17 +965,20 @@ mod tests {
 
         let report = collector.export_metrics().unwrap();
         assert_eq!(
-            report.get_counter("cdc.checkpoint.committed_count"),
+            report.get_counter("rustcdc.checkpoint.committed_count"),
             Some(7)
         );
-        assert_eq!(report.get_gauge("cdc.replication_lag_events"), Some(3.0));
         assert_eq!(
-            report.get_histogram_percentile("cdc.event_processing_duration_ms", 50.0),
+            report.get_gauge("rustcdc.replication_lag_events"),
+            Some(3.0)
+        );
+        assert_eq!(
+            report.get_histogram_percentile("rustcdc.event_processing_duration_ms", 50.0),
             Some(29)
         );
         assert!(report
             .counters
-            .contains_key("cdc.errors[context=runtime.poll]"));
+            .contains_key("rustcdc.errors[context=runtime.poll]"));
     }
 
     #[test]
@@ -977,13 +990,13 @@ mod tests {
             counters: HashMap::new(),
             gauges: HashMap::new(),
             histograms: HashMap::from([(
-                "cdc.event_processing_duration_ms".to_string(),
+                "rustcdc.event_processing_duration_ms".to_string(),
                 Vec::new(),
             )]),
         };
 
         assert_eq!(
-            report.get_histogram_percentile("cdc.event_processing_duration_ms", 95.0),
+            report.get_histogram_percentile("rustcdc.event_processing_duration_ms", 95.0),
             None
         );
         assert_eq!(report.avg_event_processing_latency(), None);
@@ -1003,11 +1016,13 @@ mod tests {
         tracer.end_span("handoff-1");
 
         let spans = tracer.export_spans().unwrap();
-        assert!(spans.iter().any(|span| span.name == "cdc.event.transform"));
         assert!(spans
             .iter()
-            .any(|span| span.name == "cdc.checkpoint.commit"));
-        assert!(spans.iter().any(|span| span.name == "cdc.handoff"));
+            .any(|span| span.name == "rustcdc.event.transform"));
+        assert!(spans
+            .iter()
+            .any(|span| span.name == "rustcdc.checkpoint.commit"));
+        assert!(spans.iter().any(|span| span.name == "rustcdc.handoff"));
 
         let transform = spans
             .iter()

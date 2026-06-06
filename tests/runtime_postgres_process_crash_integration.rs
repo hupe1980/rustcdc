@@ -92,8 +92,8 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
               payload TEXT NOT NULL
             );
             ALTER TABLE public.runtime_crash_snapshot_users REPLICA IDENTITY FULL;
-            DROP PUBLICATION IF EXISTS cdc_runtime_crash_snapshot_pub;
-            CREATE PUBLICATION cdc_runtime_crash_snapshot_pub FOR TABLE public.runtime_crash_snapshot_users;
+            DROP PUBLICATION IF EXISTS rustcdc_runtime_crash_snapshot_pub;
+            CREATE PUBLICATION rustcdc_runtime_crash_snapshot_pub FOR TABLE public.runtime_crash_snapshot_users;
             TRUNCATE TABLE public.runtime_crash_snapshot_users;
             ",
         )
@@ -103,7 +103,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
     let _lsn_text: String = admin_client
         .query_one(
             "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&"cdc_runtime_crash_snapshot_slot"],
+            &[&"rustcdc_runtime_crash_snapshot_slot"],
         )
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
@@ -128,8 +128,8 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
         port,
         checkpoint_dir.path(),
         &marker_file,
-        "cdc_runtime_crash_snapshot_slot",
-        "cdc_runtime_crash_snapshot_pub",
+        "rustcdc_runtime_crash_snapshot_slot",
+        "rustcdc_runtime_crash_snapshot_pub",
         Some("public.runtime_crash_snapshot_users"),
         true,
     )?;
@@ -155,7 +155,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
     admin_client
         .query_one(
             "SELECT end_lsn::text FROM pg_replication_slot_advance($1, pg_current_wal_lsn())",
-            &[&"cdc_runtime_crash_snapshot_slot"],
+            &[&"rustcdc_runtime_crash_snapshot_slot"],
         )
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
@@ -166,8 +166,8 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
         user: "postgres".to_string(),
         password: "postgres".into(),
         database: "cdc".to_string(),
-        replication_slot_name: "cdc_runtime_crash_snapshot_slot".to_string(),
-        publication_name: "cdc_runtime_crash_snapshot_pub".to_string(),
+        replication_slot_name: "rustcdc_runtime_crash_snapshot_slot".to_string(),
+        publication_name: "rustcdc_runtime_crash_snapshot_pub".to_string(),
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -291,8 +291,8 @@ async fn run_postgres_process_kill_replay_scenario(
               payload TEXT NOT NULL
             );
             ALTER TABLE public.runtime_crash_users REPLICA IDENTITY FULL;
-            DROP PUBLICATION IF EXISTS cdc_runtime_crash_pub;
-            CREATE PUBLICATION cdc_runtime_crash_pub FOR TABLE public.runtime_crash_users;
+            DROP PUBLICATION IF EXISTS rustcdc_runtime_crash_pub;
+            CREATE PUBLICATION rustcdc_runtime_crash_pub FOR TABLE public.runtime_crash_users;
             TRUNCATE TABLE public.runtime_crash_users;
             ",
         )
@@ -304,7 +304,7 @@ async fn run_postgres_process_kill_replay_scenario(
     let lsn_text: String = admin_client
         .query_one(
             "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&"cdc_runtime_crash_slot"],
+            &[&"rustcdc_runtime_crash_slot"],
         )
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
@@ -319,7 +319,7 @@ async fn run_postgres_process_kill_replay_scenario(
         .save(
             &PostgresOffset {
                 lsn: baseline_lsn,
-                slot_name: "cdc_runtime_crash_slot".to_string(),
+                slot_name: "rustcdc_runtime_crash_slot".to_string(),
             },
             0,
         )
@@ -341,8 +341,8 @@ async fn run_postgres_process_kill_replay_scenario(
         port,
         checkpoint_dir.path(),
         &marker_file,
-        "cdc_runtime_crash_slot",
-        "cdc_runtime_crash_pub",
+        "rustcdc_runtime_crash_slot",
+        "rustcdc_runtime_crash_pub",
         None,
         false,
     )?;
@@ -363,8 +363,8 @@ async fn run_postgres_process_kill_replay_scenario(
         user: "postgres".to_string(),
         password: "postgres".into(),
         database: "cdc".to_string(),
-        replication_slot_name: "cdc_runtime_crash_slot".to_string(),
-        publication_name: "cdc_runtime_crash_pub".to_string(),
+        replication_slot_name: "rustcdc_runtime_crash_slot".to_string(),
+        publication_name: "rustcdc_runtime_crash_pub".to_string(),
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,

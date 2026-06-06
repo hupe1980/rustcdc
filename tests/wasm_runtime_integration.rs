@@ -105,9 +105,6 @@ impl Transform for RuntimeWasmTransform {
                 Ok(true)
             }
             TransformResult::Filtered => Ok(false),
-            TransformResult::Err(reason) => Err(rustcdc::Error::SourceError(format!(
-                "WASM transform error: {reason}"
-            ))),
         }
     }
 

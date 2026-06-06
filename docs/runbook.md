@@ -188,7 +188,7 @@ systemctl start rustcdc
 ```bash
 #!/bin/bash
 # Check runtime lag every hour (milliseconds)
-LAG_MS=$(curl -s http://localhost:9090/metrics | awk '/^cdc_runtime_replication_lag_ms / {print $2; exit}')
+LAG_MS=$(curl -s http://localhost:9090/metrics | awk '/^rustcdc_runtime_replication_lag_ms / {print $2; exit}')
 
 if [ -n "$LAG_MS" ] && [ "$LAG_MS" -gt 30000 ]; then  # 30 seconds
   echo "WARNING: rustcdc replication lag exceeds 30s" | mail -s "rustcdc Alert" ops@company.com
@@ -451,7 +451,7 @@ Recommended starting profiles:
 Rollout guidance:
 
 1. Change one knob set at a time.
-2. Observe `cdc_runtime_replication_lag_ms`, checkpoint progression, and source CPU.
+2. Observe `rustcdc_runtime_replication_lag_ms`, checkpoint progression, and source CPU.
 3. Revert if lag drops but source CPU or lock contention spikes.
 
 ### SQL Server Tail-Latency Watch (p99)
@@ -528,25 +528,25 @@ All connector events emitted by `StructuredLogger` use the `tracing` framework a
 
 | Metric | Threshold | Action |
 |--------|-----------|--------|
-| `cdc_runtime_replication_lag_ms` | > 30000 ms | Investigate source/database lag, downstream throughput, and checkpoint commits |
-| `cdc_runtime_events_committed_total` | No increase for 5 min | Check stream connectivity; may indicate stalled progress |
-| `cdc_runtime_liveness` | == 0 | Runtime stopped or unhealthy; investigate process and startup logs |
+| `rustcdc_runtime_replication_lag_ms` | > 30000 ms | Investigate source/database lag, downstream throughput, and checkpoint commits |
+| `rustcdc_runtime_events_committed_total` | No increase for 5 min | Check stream connectivity; may indicate stalled progress |
+| `rustcdc_runtime_liveness` | == 0 | Runtime stopped or unhealthy; investigate process and startup logs |
 
 **Warning (Alert, No Page):**
 
 | Metric | Threshold | Action |
 |--------|-----------|--------|
-| `cdc_runtime_replication_lag_ms` | > 10000 ms | Monitor; lag is growing and may approach retention risk window |
-| `cdc_runtime_checkpoint_age_ms` | > 10000 ms | Commit progression is stale; check checkpoint backend and consumer ack flow |
-| `cdc_runtime_events_polled_total` | Deviation > 20% from 1h baseline | Throughput anomaly; check source and transform paths |
+| `rustcdc_runtime_replication_lag_ms` | > 10000 ms | Monitor; lag is growing and may approach retention risk window |
+| `rustcdc_runtime_checkpoint_age_ms` | > 10000 ms | Commit progression is stale; check checkpoint backend and consumer ack flow |
+| `rustcdc_runtime_events_polled_total` | Deviation > 20% from 1h baseline | Throughput anomaly; check source and transform paths |
 
 **Informational (Dashboard Only):**
 
 | Metric | Baseline |
 |--------|----------|
-| `cdc_runtime_events_polled_total` | Should be monotonically increasing |
-| `cdc_runtime_in_flight_events` | Should remain bounded; sustained growth indicates ack stalls |
-| `cdc_runtime_buffer_depth` | Should remain bounded relative to workload |
+| `rustcdc_runtime_events_polled_total` | Should be monotonically increasing |
+| `rustcdc_runtime_in_flight_events` | Should remain bounded; sustained growth indicates ack stalls |
+| `rustcdc_runtime_buffer_depth` | Should remain bounded relative to workload |
 
 ### Prometheus Example Configuration
 
@@ -556,21 +556,21 @@ groups:
     interval: 30s
     rules:
       - alert: CdcReplicationLagCritical
-        expr: cdc_runtime_replication_lag_ms > 30000  # 30s
+        expr: rustcdc_runtime_replication_lag_ms > 30000  # 30s
         for: 5m
         annotations:
           summary: "rustcdc replication lag critical ({{ $value }} ms)"
           action: "Check source database; verify checkpoint commits; investigate network/storage"
 
       - alert: CdcRuntimeStopped
-        expr: cdc_runtime_liveness == 0
+        expr: rustcdc_runtime_liveness == 0
         for: 1m
         annotations:
           summary: "rustcdc runtime is not live"
           action: "Check process health, startup logs, and source connectivity"
 
       - alert: CdcCheckpointStalled
-        expr: increase(cdc_runtime_events_committed_total[5m]) == 0
+        expr: increase(rustcdc_runtime_events_committed_total[5m]) == 0
         for: 5m
         annotations:
           summary: "rustcdc checkpoint not advancing"
@@ -609,7 +609,7 @@ SQLCMDPASSWORD="${SQLCMDPASSWORD:?set from secret manager}" sqlcmd -S "$SQLSERVE
 journalctl -u rustcdc -n 50 --no-pager | grep -i "error\|warn"
 
 # 5. Verify metrics are flowing
-curl -s http://localhost:9090/metrics | grep cdc_ | head -20
+curl -s http://localhost:9090/metrics | grep rustcdc_ | head -20
 ```
 
 ### Checkpoint Owner-Lease Conflict Recovery

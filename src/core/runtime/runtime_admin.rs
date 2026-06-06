@@ -95,68 +95,68 @@ impl CdcRuntime {
 
         writeln!(
             w,
-            "# HELP cdc_runtime_readiness Runtime readiness (1=ready, 0=not ready).\n\
-             # TYPE cdc_runtime_readiness gauge\n\
-             cdc_runtime_readiness{{source_type=\"{source_type}\",state=\"{}\"}} {}",
+            "# HELP rustcdc_runtime_readiness Runtime readiness (1=ready, 0=not ready).\n\
+             # TYPE rustcdc_runtime_readiness gauge\n\
+             rustcdc_runtime_readiness{{source_type=\"{source_type}\",state=\"{}\"}} {}",
             admin.state,
             u8::from(admin.readiness)
         )?;
 
         writeln!(
             w,
-            "# HELP cdc_runtime_liveness Runtime liveness (1=alive, 0=stopped).\n\
-             # TYPE cdc_runtime_liveness gauge\n\
-             cdc_runtime_liveness{{source_type=\"{source_type}\",state=\"{}\"}} {}",
+            "# HELP rustcdc_runtime_liveness Runtime liveness (1=alive, 0=stopped).\n\
+             # TYPE rustcdc_runtime_liveness gauge\n\
+             rustcdc_runtime_liveness{{source_type=\"{source_type}\",state=\"{}\"}} {}",
             admin.state,
             u8::from(admin.liveness)
         )?;
 
         writeln!(
             w,
-            "# HELP cdc_runtime_buffer_depth Number of buffered events waiting for delivery.\n\
-             # TYPE cdc_runtime_buffer_depth gauge\n\
-             cdc_runtime_buffer_depth{{source_type=\"{source_type}\"}} {}",
+            "# HELP rustcdc_runtime_buffer_depth Number of buffered events waiting for delivery.\n\
+             # TYPE rustcdc_runtime_buffer_depth gauge\n\
+             rustcdc_runtime_buffer_depth{{source_type=\"{source_type}\"}} {}",
             admin.buffer_depth
         )?;
 
         writeln!(
             w,
-            "# HELP cdc_runtime_in_flight_events Number of delivered but uncommitted events.\n\
-             # TYPE cdc_runtime_in_flight_events gauge\n\
-             cdc_runtime_in_flight_events{{source_type=\"{source_type}\"}} {}",
+            "# HELP rustcdc_runtime_in_flight_events Number of delivered but uncommitted events.\n\
+             # TYPE rustcdc_runtime_in_flight_events gauge\n\
+             rustcdc_runtime_in_flight_events{{source_type=\"{source_type}\"}} {}",
             admin.in_flight_events
         )?;
 
         writeln!(
             w,
-            "# HELP cdc_runtime_events_polled_total Total events delivered by runtime batches.\n\
-             # TYPE cdc_runtime_events_polled_total counter\n\
-             cdc_runtime_events_polled_total{{source_type=\"{source_type}\"}} {}",
+            "# HELP rustcdc_runtime_events_polled_total Total events delivered by runtime batches.\n\
+             # TYPE rustcdc_runtime_events_polled_total counter\n\
+             rustcdc_runtime_events_polled_total{{source_type=\"{source_type}\"}} {}",
             admin.total_events_polled
         )?;
 
         writeln!(
             w,
-            "# HELP cdc_runtime_events_committed_total Total events acknowledged and checkpointed.\n\
-             # TYPE cdc_runtime_events_committed_total counter\n\
-             cdc_runtime_events_committed_total{{source_type=\"{source_type}\"}} {}",
+            "# HELP rustcdc_runtime_events_committed_total Total events acknowledged and checkpointed.\n\
+             # TYPE rustcdc_runtime_events_committed_total counter\n\
+             rustcdc_runtime_events_committed_total{{source_type=\"{source_type}\"}} {}",
             admin.total_events_committed
         )?;
 
         writeln!(
             w,
-            "# HELP cdc_runtime_events_deduplicated_total Total events suppressed by runtime idempotency guard.\n\
-             # TYPE cdc_runtime_events_deduplicated_total counter\n\
-             cdc_runtime_events_deduplicated_total{{source_type=\"{source_type}\"}} {}",
+            "# HELP rustcdc_runtime_events_deduplicated_total Total events suppressed by runtime idempotency guard.\n\
+             # TYPE rustcdc_runtime_events_deduplicated_total counter\n\
+             rustcdc_runtime_events_deduplicated_total{{source_type=\"{source_type}\"}} {}",
             admin.total_events_deduplicated
         )?;
 
         if let Some(checkpoint_age_ms) = admin.checkpoint_age_ms {
             writeln!(
                 w,
-                "# HELP cdc_runtime_checkpoint_age_ms Age of last durable checkpoint in milliseconds.\n\
-                 # TYPE cdc_runtime_checkpoint_age_ms gauge\n\
-                 cdc_runtime_checkpoint_age_ms{{source_type=\"{source_type}\"}} {}",
+                "# HELP rustcdc_runtime_checkpoint_age_ms Age of last durable checkpoint in milliseconds.\n\
+                 # TYPE rustcdc_runtime_checkpoint_age_ms gauge\n\
+                 rustcdc_runtime_checkpoint_age_ms{{source_type=\"{source_type}\"}} {}",
                 checkpoint_age_ms
             )?;
         }
@@ -164,17 +164,17 @@ impl CdcRuntime {
         if let Some(lag_ms) = admin.replication_lag_ms {
             writeln!(
                 w,
-                "# HELP cdc_runtime_replication_lag_ms Estimated replication lag in milliseconds (source event timestamp preferred; poll recency fallback).\n\
-                 # TYPE cdc_runtime_replication_lag_ms gauge\n\
-                 cdc_runtime_replication_lag_ms{{source_type=\"{source_type}\"}} {}",
+                "# HELP rustcdc_runtime_replication_lag_ms Estimated replication lag in milliseconds (source event timestamp preferred; poll recency fallback).\n\
+                 # TYPE rustcdc_runtime_replication_lag_ms gauge\n\
+                 rustcdc_runtime_replication_lag_ms{{source_type=\"{source_type}\"}} {}",
                 lag_ms
             )?;
         }
 
         writeln!(
             w,
-            "# HELP cdc_runtime_source_capability Connector capability flags.\n\
-             # TYPE cdc_runtime_source_capability gauge"
+            "# HELP rustcdc_runtime_source_capability Connector capability flags.\n\
+             # TYPE rustcdc_runtime_source_capability gauge"
         )?;
 
         for (name, enabled) in [
@@ -195,7 +195,7 @@ impl CdcRuntime {
         ] {
             writeln!(
                 w,
-                "cdc_runtime_source_capability{{source_type=\"{source_type}\",capability=\"{name}\"}} {}",
+                "rustcdc_runtime_source_capability{{source_type=\"{source_type}\",capability=\"{name}\"}} {}",
                 u8::from(enabled)
             )?;
         }
