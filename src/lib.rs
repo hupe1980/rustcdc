@@ -95,4 +95,7 @@ pub use crate::codec::{
     JsonPrettyEncoder,
 };
 pub use crate::pipeline::{TableRoute, TableRouter, TableRouterBuilder};
-pub use crate::sink::{FileJsonlSink, MemorySinkAdapter, SinkAdapter, StdoutSink};
+pub use crate::sink::{
+    BoxedSink, FanOutSinkAdapter, FileJsonlSink, FileJsonlSinkConfig, MemorySinkAdapter,
+    SinkAdapter, SinkDeliveryGuarantee, StdoutSink,
+};
