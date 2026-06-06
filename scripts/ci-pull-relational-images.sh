@@ -7,13 +7,14 @@ set -euo pipefail
 #   bash scripts/ci-pull-relational-images.sh 12-alpine 14-alpine 15-alpine 16-alpine
 #   bash scripts/ci-pull-relational-images.sh --relational-smoke
 
-# Non-postgres smoke images. Postgres tags are passed explicitly as positional args.
+# Non-postgres, non-sqlserver smoke images.
+# Postgres tags are passed explicitly as positional args.
+# SQL Server is handled separately via --sqlserver-soft (soft failure on MCR downtime).
 NON_POSTGRES_RELATIONAL_SMOKE_IMAGES=(
   "mysql:8.0"
   "mysql:8.1"
   "mariadb:10.6"
   "mariadb:10.11"
-  "mcr.microsoft.com/mssql/server:2019-latest"
 )
 
 pull_with_retry() {
@@ -49,6 +50,20 @@ if [[ "${1:-}" == "--relational-smoke" ]]; then
     pull_with_retry "$image"
     echo "prepared ${image}"
   done
+  exit 0
+fi
+
+# Pull the SQL Server image with a soft failure: if MCR is unavailable
+# (rate-limit, access denial, or retired tag), warn and exit 0 so that
+# pre-pull failures do not block unrelated CI lanes.  The sqlserver tests
+# themselves emit a "SKIP:" sentinel when the image cannot be pulled.
+if [[ "${1:-}" == "--sqlserver-soft" ]]; then
+  image="mcr.microsoft.com/mssql/server:${2:-2022-latest}"
+  if pull_with_retry "$image"; then
+    echo "prepared ${image}"
+  else
+    echo "WARNING: could not pull ${image} — sqlserver tests will be skipped" >&2
+  fi
   exit 0
 fi
 

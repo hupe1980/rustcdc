@@ -78,7 +78,11 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let sqlserver = sqlserver_testkit::start_sqlserver_container("2019-latest").await?;
+    let sqlserver = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
+        Ok(c) => c,
+        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let (sql_host, sql_port) = sqlserver_testkit::host_and_port(&sqlserver).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(

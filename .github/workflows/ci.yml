@@ -125,7 +125,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres image (public ecr mirror)
         run: bash scripts/ci-pull-relational-images.sh 16-alpine
-      - name: pre-pull mysql/mariadb/sqlserver images
+      - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: contract compatibility smoke
         run: cargo test --test compatibility_contract --all-features
@@ -359,6 +359,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration'
         run: cargo test --test ${{ matrix.suite }} --features sqlserver
@@ -376,6 +378,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
       - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
         run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 
