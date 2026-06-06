@@ -16,8 +16,16 @@
     global.set $heap
     local.get $ptr)
 
-  ;; ABI v2: dealloc is a no-op for bump allocator.
-  (func (export "dealloc") (param i32) (param i32))
+  ;; Dealloc: reset heap to base when the base allocation (ptr == 8) is freed.
+  ;; Prevents heap exhaustion on long Criterion runs.
+  (func (export "dealloc") (param $ptr i32) (param $size i32)
+    local.get $ptr
+    i32.const 8
+    i32.eq
+    if
+      i32.const 8
+      global.set $heap
+    end)
 
   (func (export "rustcdc_abi_version") (result i32)
     i32.const 2)
