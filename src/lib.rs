@@ -91,8 +91,8 @@ pub use crate::codec::{
     SchemaType, SubjectNameStrategy,
 };
 pub use crate::codec::{
-    Codec, CodecOutput, EncodedOutput, EncoderCodec, EventEncoder, JsonCodec, JsonEncoder,
-    JsonPrettyEncoder,
+    BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec, EventEncoder, JsonCodec,
+    JsonEncoder, JsonPrettyEncoder,
 };
 pub use crate::pipeline::{TableRoute, TableRouter, TableRouterBuilder};
 pub use crate::sink::{

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Weak,
     },
     time::Duration,
 };
@@ -20,12 +20,34 @@ use crate::core::{Error, Event, Result};
 
 pub const DEFAULT_WASM_TIMEOUT_MS: u64 = 50;
 pub const DEFAULT_WASM_MEMORY_LIMIT_MB: u64 = 16;
+/// Default number of concurrent WASM instances in the pool.
+pub const DEFAULT_WASM_INSTANCE_POOL_SIZE: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct WasmConfig {
     pub module_path: PathBuf,
     pub timeout_ms: u64,
     pub memory_limit_mb: u64,
+    /// Number of concurrent WASM instances.
+    ///
+    /// When greater than 1, a pool of independent `wasmtime::Store` instances is
+    /// maintained. Concurrent transform calls are distributed across pool slots
+    /// via a semaphore. Each slot runs single-threaded; transforms within one slot
+    /// are sequential while different slots run concurrently.
+    ///
+    /// Default: `1` (equivalent to the original single-instance behaviour).
+    pub instance_pool_size: usize,
+    /// Cooperative async yield interval in fuel units.
+    ///
+    /// When `Some(n)`, wasmtime's fuel mechanism is enabled and the Tokio
+    /// executor receives a yield point approximately every `n` WASM instructions
+    /// per `call_async` call. Prevents CPU-bound WASM from monopolising a thread
+    /// between epoch ticks.
+    ///
+    /// `None` (default) disables fuel; epoch-based hard interruption still applies.
+    ///
+    /// Recommended starting value: `10_000` (≈ 10 µs @ 1 GHz instruction rate).
+    pub fuel_async_yield_interval: Option<u64>,
 }
 
 impl Default for WasmConfig {
@@ -34,6 +56,8 @@ impl Default for WasmConfig {
             module_path: PathBuf::new(),
             timeout_ms: DEFAULT_WASM_TIMEOUT_MS,
             memory_limit_mb: DEFAULT_WASM_MEMORY_LIMIT_MB,
+            instance_pool_size: DEFAULT_WASM_INSTANCE_POOL_SIZE,
+            fuel_async_yield_interval: None,
         }
     }
 }
@@ -80,9 +104,16 @@ pub struct WasmRuntime {
 
 struct RealWasmModule {
     timeout_ms: u64,
+    /// When `Some(n)`, fuel consumption is enabled and `call_async` yields to
+    /// the Tokio executor every `n` WASM instructions.
+    fuel_async_yield_interval: Option<u64>,
     /// Kept alive so the epoch-ticker task can call `engine.increment_epoch()`.
     _engine: Arc<Engine>,
-    inner: Mutex<RealWasmState>,
+    /// Instance pool. All slots are compiled from the same `Module`.
+    /// The semaphore count equals pool size, guaranteeing a free slot is
+    /// always available once a permit is acquired.
+    pool: Vec<tokio::sync::Mutex<RealWasmState>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
     /// Sentinel kept alive for the lifetime of this module.
     ///
     /// The background epoch-ticker task holds a `Weak` to this sentinel.
@@ -203,6 +234,12 @@ impl RealWasmModule {
         // regardless of what the WASM code is doing (including tight spin loops).
         let mut engine_config = Config::new();
         engine_config.epoch_interruption(true);
+        // Enable fuel tracking only when the caller opts in to cooperative yielding.
+        // Fuel adds a per-instruction counter overhead unnecessary when epoch alone suffices.
+        let fuel_yield: Option<u64> = config.fuel_async_yield_interval.filter(|&n| n > 0);
+        if fuel_yield.is_some() {
+            engine_config.consume_fuel(true);
+        }
         let engine = Arc::new(Engine::new(&engine_config).map_err(|error| {
             Error::ConfigError(format!("failed to create WASM engine: {error}"))
         })?);
@@ -238,8 +275,82 @@ impl RealWasmModule {
                 Error::ConfigError(format!("failed to bind env.record_metric: {error}"))
             })?;
 
-        let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).map_err(|error| {
+        // Call rustcdc_abi_version() before the epoch ticker starts so that
+        // incompatible modules are rejected at load time, not at first invocation.
+        {
+            let mut probe_store = Store::new(&engine, ());
+            let probe_instance =
+                linker
+                    .instantiate(&mut probe_store, &module)
+                    .map_err(|error| {
+                        Error::ConfigError(format!(
+                            "failed to instantiate WASM module for ABI probe: {error}"
+                        ))
+                    })?;
+            let version_fn = get_typed_func::<(), i32>(
+                &mut probe_store,
+                &probe_instance,
+                "rustcdc_abi_version",
+            )?;
+            probe_store.set_epoch_deadline(config.timeout_ms);
+            let reported = version_fn.call(&mut probe_store, ()).map_err(|e| {
+                Error::ConfigError(format!("rustcdc_abi_version() call failed: {e}"))
+            })?;
+            const CURRENT_ABI_VERSION: i32 = 2;
+            if reported != CURRENT_ABI_VERSION {
+                return Err(Error::ConfigError(format!(
+                    "WASM module reports ABI version {reported} but host requires \
+                     {CURRENT_ABI_VERSION}. Rebuild the module against the rustcdc \
+                     WASM ABI documentation."
+                )));
+            }
+        }
+
+        let pool_size = config.instance_pool_size.max(1);
+        let mut pool = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let state = Self::create_instance_state(&engine, &module, &linker, fuel_yield)?;
+            pool.push(tokio::sync::Mutex::new(state));
+        }
+
+        // Sentinel for the epoch-ticker task lifecycle.  The task is spawned
+        // lazily in `init()` so that construction remains synchronous and does
+        // not require a running Tokio runtime.
+        let ticker_sentinel = Arc::new(());
+
+        let module = Self {
+            timeout_ms: config.timeout_ms,
+            fuel_async_yield_interval: fuel_yield,
+            _engine: engine,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+            pool,
+            _ticker_sentinel: ticker_sentinel,
+            ticker_started: AtomicBool::new(false),
+        };
+
+        module.validate_memory_limit(config.memory_limit_mb)?;
+        Ok(module)
+    }
+
+    /// Create one `RealWasmState` (a single `Store` + `Instance`) from the shared engine.
+    fn create_instance_state(
+        engine: &Engine,
+        module: &Module,
+        linker: &Linker<()>,
+        fuel_async_yield_interval: Option<u64>,
+    ) -> Result<RealWasmState> {
+        let mut store = Store::new(engine, ());
+        if let Some(interval) = fuel_async_yield_interval {
+            store
+                .set_fuel(u64::MAX)
+                .map_err(|e| Error::ConfigError(format!("failed to set WASM fuel: {e}")))?;
+            store
+                .fuel_async_yield_interval(Some(interval))
+                .map_err(|e| {
+                    Error::ConfigError(format!("failed to set fuel yield interval: {e}"))
+                })?;
+        }
+        let instance = linker.instantiate(&mut store, module).map_err(|error| {
             Error::ConfigError(format!("failed to instantiate WASM module: {error}"))
         })?;
 
@@ -253,27 +364,7 @@ impl RealWasmModule {
         let init = optional_typed_func::<(i32, i32), i32>(&mut store, &instance, "init")?;
         let shutdown = optional_typed_func::<(), i32>(&mut store, &instance, "shutdown")?;
 
-        // Call rustcdc_abi_version() before the epoch ticker starts so that
-        // incompatible modules are rejected at load time, not at first invocation.
-        {
-            let version_fn =
-                get_typed_func::<(), i32>(&mut store, &instance, "rustcdc_abi_version")?;
-            // Arm the epoch deadline so the probe call is not immediately interrupted.
-            store.set_epoch_deadline(config.timeout_ms);
-            let reported = version_fn.call(&mut store, ()).map_err(|e| {
-                Error::ConfigError(format!("rustcdc_abi_version() call failed: {e}"))
-            })?;
-            const CURRENT_ABI_VERSION: i32 = 2;
-            if reported != CURRENT_ABI_VERSION {
-                return Err(Error::ConfigError(format!(
-                    "WASM module reports ABI version {reported} but host requires \
-                     {CURRENT_ABI_VERSION}. Rebuild the module against the rustcdc \
-                     WASM ABI documentation."
-                )));
-            }
-        }
-
-        let module_state = RealWasmState {
+        Ok(RealWasmState {
             store,
             memory,
             alloc,
@@ -281,30 +372,20 @@ impl RealWasmModule {
             transform,
             init,
             shutdown,
-        };
-
-        // Sentinel for the epoch-ticker task lifecycle.  The task is spawned
-        // lazily in `init()` so that construction remains synchronous and does
-        // not require a running Tokio runtime.
-        let ticker_sentinel = Arc::new(());
-
-        let module = Self {
-            timeout_ms: config.timeout_ms,
-            _engine: engine,
-            inner: Mutex::new(module_state),
-            _ticker_sentinel: ticker_sentinel,
-            ticker_started: AtomicBool::new(false),
-        };
-
-        module.validate_memory_limit(config.memory_limit_mb)?;
-        Ok(module)
+        })
     }
 
     fn validate_memory_limit(&self, limit_mb: u64) -> Result<()> {
+        // All pool slots share the same module memory layout; checking the first is sufficient.
+        // Use try_lock (sync) — called from synchronous `new()` before any concurrent access.
         let state = self
-            .inner
-            .lock()
-            .map_err(|_| Error::StateError("WASM runtime lock poisoned".to_string()))?;
+            .pool
+            .first()
+            .expect("pool is non-empty")
+            .try_lock()
+            .map_err(|_| {
+                Error::StateError("WASM runtime pool lock busy during validation".to_string())
+            })?;
         let limit_bytes = limit_mb.saturating_mul(1024 * 1024);
         let current = state.memory.data_size(&state.store) as u64;
         if current > limit_bytes {
@@ -402,14 +483,31 @@ where
 #[async_trait]
 impl WasmModule for RealWasmModule {
     async fn transform_bytes(&self, event_json: &[u8]) -> Result<Option<Event>> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| Error::StateError("WASM runtime lock poisoned".to_string()))?;
+        // Acquire a permit — blocks until a pool slot is available.
+        let _permit =
+            self.semaphore.acquire().await.map_err(|_| {
+                Error::StateError("WASM instance pool semaphore closed".to_string())
+            })?;
+
+        // The semaphore guarantees exactly one free slot; try_lock() is sync.
+        let mut state = None;
+        for slot in &self.pool {
+            if let Ok(guard) = slot.try_lock() {
+                state = Some(guard);
+                break;
+            }
+        }
+        let mut state = state.expect("WASM semaphore invariant violated: no free pool slot found");
 
         // Arm the epoch deadline so that a runaway WASM module is interrupted
         // after approximately `timeout_ms` milliseconds by the ticker task.
         state.store.set_epoch_deadline(self.timeout_ms);
+        if self.fuel_async_yield_interval.is_some() {
+            state
+                .store
+                .set_fuel(u64::MAX)
+                .map_err(|e| Error::TransformError(format!("WASM fuel refill failed: {e}")))?;
+        }
 
         let input_len = i32::try_from(event_json.len()).map_err(|_| {
             Error::TransformError(format!(
@@ -425,13 +523,13 @@ impl WasmModule for RealWasmModule {
 
         let transform = state.transform.clone();
         let packed = transform
-            .call(&mut state.store, (input_ptr, input_len))
+            .call_async(&mut state.store, (input_ptr, input_len))
+            .await
             .map_err(|error| {
                 Error::TransformError(format!("WASM transform call failed: {error}"))
             })?;
 
         // Always dealloc the input region, even on event-drop or error.
-        // Ignore dealloc errors — the store is discarded on any subsequent error anyway.
         let _ = dealloc.call(&mut state.store, (input_ptr, input_len));
 
         // Return value 0 means "drop this event".
@@ -450,15 +548,12 @@ impl WasmModule for RealWasmModule {
             )));
         }
         if output_len <= 0 {
-            // Non-zero packed value with zero/negative length is malformed.
             return Err(Error::TransformError(format!(
                 "WASM transform returned non-zero pointer with invalid length {output_len}"
             )));
         }
 
         let output = Self::read_output(&mut state, output_ptr, output_len)?;
-
-        // Dealloc the output region after copying the bytes out.
         let _ = dealloc.call(&mut state.store, (output_ptr, output_len));
 
         let transformed = serde_json::from_slice::<Event>(&output).map_err(|error| {
@@ -475,23 +570,11 @@ impl WasmModule for RealWasmModule {
     }
 
     async fn init(&self, config: &WasmConfig) -> Result<()> {
-        // Start the epoch-ticker Tokio task the first time init() is called.
-        // Using compare_exchange ensures we spawn at most one task even if
-        // init() is called repeatedly (e.g. after shutdown + re-init).
         if self
             .ticker_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            // The ticker task increments the engine epoch every 1 ms.
-            // Before each WASM call we set the store's epoch deadline to
-            // `timeout_ms` ticks so that execution is interrupted after
-            // ≈ `timeout_ms` milliseconds regardless of what the WASM code does.
-            //
-            // The task holds only a Weak reference to the sentinel Arc.
-            // When RealWasmModule is dropped the strong count falls to zero,
-            // Weak::upgrade() returns None, and the task exits within one
-            // tick (≤ 1 ms) — no dedicated OS thread is consumed.
             let weak_sentinel: Weak<()> = Arc::downgrade(&self._ticker_sentinel);
             let ticker_engine = Arc::clone(&self._engine);
             tokio::spawn(async move {
@@ -505,17 +588,6 @@ impl WasmModule for RealWasmModule {
             });
         }
 
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| Error::StateError("WASM runtime lock poisoned".to_string()))?;
-        let Some(init) = state.init.clone() else {
-            return Ok(());
-        };
-
-        // Arm epoch deadline for the init call.
-        state.store.set_epoch_deadline(self.timeout_ms);
-
         let config_payload = serde_json::json!({
             "timeout_ms": config.timeout_ms,
             "memory_limit_mb": config.memory_limit_mb,
@@ -524,46 +596,67 @@ impl WasmModule for RealWasmModule {
         let config_len = i32::try_from(config_bytes.len()).map_err(|_| {
             Error::ConfigError("WASM init config payload exceeds i32 length".to_string())
         })?;
-        let ptr = Self::alloc_and_write(&mut state, &config_bytes)?;
 
-        let status = init
-            .call(&mut state.store, (ptr, config_len))
-            .map_err(|error| Error::ConfigError(format!("WASM init call failed: {error}")))?;
+        for slot in &self.pool {
+            let mut state = slot.lock().await;
 
-        // Dealloc the config buffer after the call completes.
-        let dealloc = state.dealloc.clone();
-        let _ = dealloc.call(&mut state.store, (ptr, config_len));
+            let Some(init) = state.init.clone() else {
+                continue;
+            };
 
-        if status != 0 {
-            return Err(Error::ConfigError(format!(
-                "WASM init returned non-zero status: {status}"
-            )));
+            state.store.set_epoch_deadline(self.timeout_ms);
+            if self.fuel_async_yield_interval.is_some() {
+                state
+                    .store
+                    .set_fuel(u64::MAX)
+                    .map_err(|e| Error::ConfigError(format!("WASM fuel refill failed: {e}")))?;
+            }
+            let ptr = Self::alloc_and_write(&mut state, &config_bytes)?;
+
+            let status = init
+                .call_async(&mut state.store, (ptr, config_len))
+                .await
+                .map_err(|error| Error::ConfigError(format!("WASM init call failed: {error}")))?;
+
+            let dealloc = state.dealloc.clone();
+            let _ = dealloc.call(&mut state.store, (ptr, config_len));
+
+            if status != 0 {
+                return Err(Error::ConfigError(format!(
+                    "WASM init returned non-zero status: {status}"
+                )));
+            }
         }
-
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| Error::StateError("WASM runtime lock poisoned".to_string()))?;
-        let Some(shutdown) = state.shutdown.clone() else {
-            return Ok(());
-        };
+        for slot in &self.pool {
+            let mut state = slot.lock().await;
 
-        // Arm epoch deadline for the shutdown call.
-        state.store.set_epoch_deadline(self.timeout_ms);
+            let Some(shutdown) = state.shutdown.clone() else {
+                continue;
+            };
 
-        let status = shutdown
-            .call(&mut state.store, ())
-            .map_err(|error| Error::StateError(format!("WASM shutdown call failed: {error}")))?;
-        if status != 0 {
-            return Err(Error::StateError(format!(
-                "WASM shutdown returned non-zero status: {status}"
-            )));
+            state.store.set_epoch_deadline(self.timeout_ms);
+            if self.fuel_async_yield_interval.is_some() {
+                state
+                    .store
+                    .set_fuel(u64::MAX)
+                    .map_err(|e| Error::StateError(format!("WASM fuel refill failed: {e}")))?;
+            }
+            let status = shutdown
+                .call_async(&mut state.store, ())
+                .await
+                .map_err(|error| {
+                    Error::StateError(format!("WASM shutdown call failed: {error}"))
+                })?;
+            if status != 0 {
+                return Err(Error::StateError(format!(
+                    "WASM shutdown returned non-zero status: {status}"
+                )));
+            }
         }
-
         Ok(())
     }
 }
@@ -984,6 +1077,8 @@ mod tests {
             module_path: module_path.clone(),
             timeout_ms: 10,
             memory_limit_mb: DEFAULT_WASM_MEMORY_LIMIT_MB,
+            instance_pool_size: 1,
+            fuel_async_yield_interval: None,
         })
         .expect("runtime")
         .with_module(Arc::new(MockWasmModule::new(50)));
@@ -1006,6 +1101,8 @@ mod tests {
             module_path: module_path.clone(),
             timeout_ms: DEFAULT_WASM_TIMEOUT_MS,
             memory_limit_mb: 1,
+            instance_pool_size: 1,
+            fuel_async_yield_interval: None,
         })
         .expect("runtime")
         .with_module(Arc::new(MockWasmModule::new(0)));

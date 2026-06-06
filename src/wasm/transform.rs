@@ -21,6 +21,8 @@ use crate::{
 ///     module_path: "my_transform.wasm".into(),
 ///     timeout_ms: 10,
 ///     memory_limit_mb: 16,
+///     instance_pool_size: 1,
+///     fuel_async_yield_interval: None,
 /// }).await?;
 /// let mut pipeline = TransformPipeline::default();
 /// pipeline.add_transform(Box::new(transform));

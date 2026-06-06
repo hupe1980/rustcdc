@@ -256,6 +256,17 @@ pub trait Codec: Send + Sync {
 
     /// The MIME content type for every successful `value` byte sequence.
     fn content_type(&self) -> &'static str;
+
+    /// Wrap `self` in a [`BoxedCodec`], erasing the concrete type.
+    ///
+    /// Enables storing heterogeneous codecs without a shared enum or generic
+    /// parameters on the containing struct.  Requires `Self: 'static`.
+    fn boxed(self) -> BoxedCodec
+    where
+        Self: Sized + 'static,
+    {
+        BoxedCodec::new(self)
+    }
 }
 
 /// A [`Codec`] adapter that wraps any [`EventEncoder`].
@@ -317,6 +328,46 @@ impl<E: EventEncoder> Codec for EncoderCodec<E> {
 
     fn content_type(&self) -> &'static str {
         self.encoder.content_type()
+    }
+}
+
+// ─── BoxedCodec ───────────────────────────────────────────────────────────────
+
+/// A type-erased [`Codec`] that wraps any concrete codec behind a single type.
+///
+/// `BoxedCodec` removes the need for generic parameters when storing or
+/// passing codecs across pipeline stages that support multiple encodings
+/// (JSON, CloudEvents, Avro, …) without a shared enum.
+///
+/// # Construction
+///
+/// ```rust
+/// use rustcdc::codec::{BoxedCodec, Codec, JsonCodec};
+///
+/// // Via the .boxed() convenience method (preferred):
+/// let codec: BoxedCodec = JsonCodec::default().boxed();
+///
+/// // Or explicitly:
+/// let codec = BoxedCodec::new(JsonCodec::default());
+/// ```
+pub struct BoxedCodec(Box<dyn Codec>);
+
+impl BoxedCodec {
+    /// Wrap any [`Codec`] implementation in a type-erased `BoxedCodec`.
+    ///
+    /// Prefer [`Codec::boxed`] for ergonomic construction.
+    pub fn new<C: Codec + 'static>(codec: C) -> Self {
+        Self(Box::new(codec))
+    }
+}
+
+impl Codec for BoxedCodec {
+    fn encode(&self, event: &Event) -> Result<CodecOutput> {
+        self.0.encode(event)
+    }
+
+    fn content_type(&self) -> &'static str {
+        self.0.content_type()
     }
 }
 
@@ -409,5 +460,26 @@ mod tests {
         let out = codec.encode(&event).unwrap();
         assert!(out.key.is_some());
         assert_eq!(out.content_type, "application/json");
+    }
+
+    #[test]
+    fn boxed_codec_erases_type_and_encodes() {
+        use crate::codec::json::JsonCodec;
+        let codec: BoxedCodec = JsonCodec::default().boxed();
+        let mut event = sample_event();
+        event.primary_key = Some(vec!["id".into()]);
+        event.after = Some(serde_json::json!({"id": 42}));
+        let out = codec.encode(&event).unwrap();
+        assert_eq!(out.content_type, "application/json");
+        assert!(out.key.is_some());
+    }
+
+    #[test]
+    fn boxed_codec_new_works() {
+        use crate::codec::json::JsonCodec;
+        let codec = BoxedCodec::new(JsonCodec::default());
+        let event = sample_event();
+        let out = codec.encode(&event).unwrap();
+        assert!(!out.value.is_empty());
     }
 }

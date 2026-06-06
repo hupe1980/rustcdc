@@ -45,6 +45,8 @@ async fn pass_through_fixture_is_conformant() {
         module_path: wasm_path,
         timeout_ms: 10,
         memory_limit_mb: 16,
+        instance_pool_size: 1,
+        fuel_async_yield_interval: None,
     })
     .expect("create runtime");
 
