@@ -60,7 +60,12 @@ async fn otel_tracing_exports_hierarchy_and_crash_retry_to_jaeger() -> rustcdc::
     let mut stream_attrs = HashMap::new();
     stream_attrs.insert("source.table".to_string(), "public.users".to_string());
     stream_attrs.insert("stream.events_count".to_string(), "42".to_string());
-    tracer.start_span_with_parent("stream-1", "cdc.stream", stream_attrs, Some("handoff-1"));
+    tracer.start_span_with_parent(
+        "stream-1",
+        "rustcdc.stream",
+        stream_attrs,
+        Some("handoff-1"),
+    );
 
     tracer.start_transform_span(
         "transform-crash",
@@ -145,14 +150,15 @@ fn payload_contains_required_hierarchy_and_retry(payload: &Value) -> bool {
             continue;
         };
 
-        snapshot_parent_ok |= child_relation_exists(spans, "cdc.snapshot", "cdc.snapshot.chunk");
-        handoff_stream_ok |= child_relation_exists(spans, "cdc.handoff", "cdc.stream");
+        snapshot_parent_ok |=
+            child_relation_exists(spans, "rustcdc.snapshot", "rustcdc.snapshot.chunk");
+        handoff_stream_ok |= child_relation_exists(spans, "rustcdc.handoff", "rustcdc.stream");
 
         for span in spans {
             if span
                 .get("operationName")
                 .and_then(Value::as_str)
-                .is_none_or(|name| name != "cdc.event.transform")
+                .is_none_or(|name| name != "rustcdc.event.transform")
             {
                 continue;
             }

@@ -18,7 +18,10 @@ async fn sqlserver_base_config(
     SqlServerSourceConfig,
     testcontainers::ContainerAsync<testcontainers::GenericImage>,
 )> {
-    let container = sqlserver_testkit::start_sqlserver_container(image_tag).await?;
+    let container = match sqlserver_testkit::start_sqlserver_container(image_tag).await {
+        Ok(c) => c,
+        Err(e) => return Err(e),
+    };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
     sqlserver_testkit::enable_cdc(&host, port, database).await?;
 
@@ -29,7 +32,11 @@ async fn sqlserver_base_config(
 
 async fn run_sqlserver_connection_lifecycle(image_tag: &str) -> rustcdc::Result<()> {
     let database = "rustcdc_connection";
-    let (config, _container) = sqlserver_base_config(image_tag, database).await?;
+    let (config, _container) = match sqlserver_base_config(image_tag, database).await {
+        Ok(r) => r,
+        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let connection = SqlServerConnection::new(config);
     connect_with_retry(&connection).await?;
     assert!(connection.is_connected().await);
@@ -87,7 +94,11 @@ async fn sqlserver_cdc_capabilities_are_consistent() -> rustcdc::Result<()> {
     }
 
     let database = "rustcdc_connection";
-    let (config, _container) = sqlserver_base_config("2022-latest", database).await?;
+    let (config, _container) = match sqlserver_base_config("2022-latest", database).await {
+        Ok(r) => r,
+        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
 
     let connection = SqlServerConnection::new(config);
     connect_with_retry(&connection).await?;

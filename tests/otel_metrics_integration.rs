@@ -114,7 +114,8 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> rus
             .await
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-        if body.contains("cdc_events_processed_total") && body.contains("cdc_events_filtered_total")
+        if body.contains("rustcdc_events_processed_total")
+            && body.contains("rustcdc_events_filtered_total")
         {
             metrics_text = body;
             break;
@@ -130,18 +131,18 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> rus
 
     let insert_total = metric_value(
         &metrics_text,
-        "cdc_events_processed_total",
+        "rustcdc_events_processed_total",
         &["operation=\"insert\""],
     )
     .unwrap_or(0.0);
     let update_total = metric_value(
         &metrics_text,
-        "cdc_events_processed_total",
+        "rustcdc_events_processed_total",
         &["operation=\"update\""],
     )
     .unwrap_or(0.0);
     let filtered_total =
-        metric_value(&metrics_text, "cdc_events_filtered_total", &[]).unwrap_or(0.0);
+        metric_value(&metrics_text, "rustcdc_events_filtered_total", &[]).unwrap_or(0.0);
 
     assert!(
         insert_total >= 500.0,
@@ -156,8 +157,8 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> rus
         "expected filtered counter >= 500, got {filtered_total}"
     );
     assert!(
-        metric_value(&metrics_text, "cdc_replication_lag_ms", &[]).is_some(),
-        "expected cdc_replication_lag_ms gauge in exported metrics"
+        metric_value(&metrics_text, "rustcdc_replication_lag_ms", &[]).is_some(),
+        "expected rustcdc_replication_lag_ms gauge in exported metrics"
     );
 
     Ok(())

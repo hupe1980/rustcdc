@@ -12,28 +12,39 @@ A module is conformant only if it satisfies all requirements in this document.
 
 - `memory`
 - `alloc(i32) -> i32`
-- `transform(i32, i32) -> i32`
-- `output_len() -> i32`
+- `dealloc(i32, i32)`
+- `transform(i32, i32) -> i64`
+- `rustcdc_abi_version() -> i32` — must return `2`
 
 ### Optional exports
 
 - `init(i32, i32) -> i32`
 - `shutdown() -> i32`
 
-Missing required exports are a hard conformance failure.
+Missing required exports or a wrong `rustcdc_abi_version` return value are hard conformance failures.
 
 ## Return Code Requirements
 
-`transform` return codes:
+`transform` return value is a packed `i64`:
 
-- `-1`: event filtered
-- `>= 0`: pointer to output payload
-- `< -1`: guest transform failure
+| Value | Meaning |
+|---|---|
+| `0` | Event dropped (filter-out) |
+| `(out_ptr << 32) \| out_len` | Transformed event; `out_ptr > 0`, `out_len > 0` |
+
+Returning a non-zero packed value with `out_ptr == 0` or `out_len <= 0` is a conformance failure.
 
 `init` and `shutdown` return codes:
 
 - `0`: success
 - non-zero: lifecycle failure
+
+## Memory Ownership Requirements
+
+- `alloc` must never return 0 (address 0 is reserved).
+- The guest must own and manage memory for the output region until the host has read it.
+- The host calls `dealloc(input_ptr, input_len)` after `transform` returns.
+- The host calls `dealloc(out_ptr, out_len)` after reading the output (if packed ≠ 0).
 
 ## Import Requirements
 
@@ -47,9 +58,9 @@ Any additional import is a conformance failure.
 
 ## Data Contract Requirements
 
-- input payload must be canonical `Event` JSON
-- successful output payload must be canonical `Event` JSON
-- `output_len()` must match exact output byte length
+- Input payload must be canonical `Event` JSON.
+- Successful output payload must be canonical `Event` JSON.
+- Output pointer and length must address a valid, readable region of linear memory.
 
 Malformed output payloads are conformance failures.
 
@@ -57,9 +68,9 @@ Malformed output payloads are conformance failures.
 
 The module must execute correctly under runtime constraints:
 
-- memory cap configured by host
-- timeout budget configured by host
-- sandboxed execution without direct file or network access
+- Memory cap configured by host (`WasmConfig.memory_limit_mb`, default 16 MiB).
+- Timeout budget configured by host (`WasmConfig.timeout_ms`, default 50 ms).
+- Sandboxed execution without direct file or network access.
 
 Timeout and trap handling must not produce undefined behavior.
 
@@ -82,11 +93,13 @@ Reference artifacts:
 
 A module is conformant when:
 
-1. required exports are present and correctly typed
-2. no forbidden imports are present
-3. lifecycle and transform return contracts are satisfied
-4. output payload and length contracts are satisfied
-5. conformance tests pass in the target embedding project
+1. All required exports are present and correctly typed.
+2. `rustcdc_abi_version()` returns `2`.
+3. No forbidden imports are present.
+4. Memory ownership and `dealloc` contracts are satisfied.
+5. Lifecycle and transform return contracts are satisfied.
+6. Output payload deserialises into canonical `Event` JSON.
+7. Conformance tests pass in the target embedding project.
 
 ## Related Documentation
 

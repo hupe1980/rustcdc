@@ -1832,8 +1832,8 @@ mod tests {
         assert_eq!(parsed["total_events_committed"], 1);
 
         let prometheus = runtime.admin_metrics_prometheus();
-        assert!(prometheus.contains("cdc_runtime_readiness"));
-        assert!(prometheus.contains("cdc_runtime_events_polled_total"));
+        assert!(prometheus.contains("rustcdc_runtime_readiness"));
+        assert!(prometheus.contains("rustcdc_runtime_events_polled_total"));
         assert!(prometheus.contains("source_type=\""));
         assert!(prometheus.contains("} 1"));
         assert!(prometheus.contains("capability=\"snapshot\""));
@@ -3529,8 +3529,8 @@ mod tests {
         runtime.commit_ack(batch.ack_mode()).await.unwrap();
 
         let prometheus = runtime.admin_metrics_prometheus();
-        assert!(prometheus.contains("cdc_runtime_checkpoint_age_ms"));
-        assert!(prometheus.contains("cdc_runtime_replication_lag_ms"));
+        assert!(prometheus.contains("rustcdc_runtime_checkpoint_age_ms"));
+        assert!(prometheus.contains("rustcdc_runtime_replication_lag_ms"));
     }
 
     #[tokio::test]

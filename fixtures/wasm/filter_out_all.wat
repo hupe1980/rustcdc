@@ -1,43 +1,36 @@
+;; ABI v2 filter-all transform fixture.
+;;
+;; Returns 0 unconditionally to signal that every event should be dropped.
 (module
   (memory (export "memory") 1)
-  (global $heap (mut i32) (i32.const 1024))
+
+  ;; Bump allocator starting at offset 8 (address 0 is reserved).
+  (global $heap (mut i32) (i32.const 8))
 
   (func (export "alloc") (param $len i32) (result i32)
     (local $ptr i32)
-    (local $next i32)
-    (local $limit i32)
     global.get $heap
-    local.set $ptr
-
-    local.get $ptr
+    local.tee $ptr
     local.get $len
     i32.add
-    local.set $next
-
-    memory.size
-    i32.const 16
-    i32.shl
-    local.set $limit
-
-    local.get $next
-    local.get $limit
-    i32.gt_u
-    if
-      i32.const 1024
-      local.set $ptr
-      local.get $ptr
-      local.get $len
-      i32.add
-      local.set $next
-    end
-
-    local.get $next
     global.set $heap
     local.get $ptr)
 
-  (func (export "output_len") (result i32)
-    i32.const 0)
+  ;; Dealloc: reset heap to base when the base allocation (ptr == 8) is freed.
+  ;; Prevents heap exhaustion on long Criterion runs.
+  (func (export "dealloc") (param $ptr i32) (param $size i32)
+    local.get $ptr
+    i32.const 8
+    i32.eq
+    if
+      i32.const 8
+      global.set $heap
+    end)
 
-  (func (export "transform") (param i32 i32) (result i32)
-    i32.const -1)
+  (func (export "rustcdc_abi_version") (result i32)
+    i32.const 2)
+
+  ;; Return 0 = drop the event.
+  (func (export "transform") (param i32) (param i32) (result i64)
+    i64.const 0)
 )

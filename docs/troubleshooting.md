@@ -220,13 +220,13 @@ WARNING checkpoint latency exceeding 1s
    grep "buffer_size" /var/log/rustcdc/structured.log | tail -20
    
    # From runtime admin metrics
-   curl http://localhost:9090/metrics | grep "cdc_runtime_buffer_depth"
+   curl http://localhost:9090/metrics | grep "rustcdc_runtime_buffer_depth"
    ```
 
 2. **Check checkpoint commit latency:**
    ```bash
    # From runtime admin metrics
-   curl http://localhost:9090/metrics | grep "cdc_runtime_checkpoint_age_ms"
+   curl http://localhost:9090/metrics | grep "rustcdc_runtime_checkpoint_age_ms"
    # p95 should be < 1s
    ```
 
@@ -308,7 +308,7 @@ WARNING snapshot progress stalled (no new chunks for 30s)
 
    ```bash
    # From runtime admin metrics
-   curl http://localhost:9090/metrics | grep "cdc_runtime_replication_lag_ms"
+   curl http://localhost:9090/metrics | grep "rustcdc_runtime_replication_lag_ms"
    # Should usually stay < 10000 ms; sustained > 30000 ms is critical
    ```
 
@@ -349,7 +349,7 @@ WARNING snapshot progress stalled (no new chunks for 30s)
 5. **Check transform pipeline overhead:**
    ```bash
    # From metrics
-   curl http://otel-collector:9090/metrics | grep "cdc_transform_duration"
+   curl http://otel-collector:9090/metrics | grep "rustcdc_transform_duration"
    # p95 should be < 1ms per event
    ```
 
@@ -430,7 +430,7 @@ ERROR detected missing event (event_id=12346 skipped)
 1. **Verify checkpoint is committing:**
    ```bash
    # From runtime admin metrics
-   curl http://localhost:9090/metrics | grep "cdc_runtime_events_committed_total"
+   curl http://localhost:9090/metrics | grep "rustcdc_runtime_events_committed_total"
    # Should be monotonically increasing; if stalled, commits have stopped
    ```
 
@@ -451,7 +451,7 @@ ERROR detected missing event (event_id=12346 skipped)
 4. **Check for transform filtering:**
    ```bash
    # From metrics
-   curl http://otel-collector:9090/metrics | grep "cdc_events_filtered"
+   curl http://otel-collector:9090/metrics | grep "rustcdc_events_filtered"
    # Should be intentional drops; not unexpected
    ```
 
@@ -567,7 +567,7 @@ WARNING events filtered by transform (count=50)
 
 ```bash
 # 1. Health check
-curl http://localhost:9090/metrics | grep -E "cdc_runtime_events_polled_total|cdc_runtime_events_committed_total" | head -5
+curl http://localhost:9090/metrics | grep -E "rustcdc_runtime_events_polled_total|rustcdc_runtime_events_committed_total" | head -5
 
 # 2. Recent errors
 journalctl -u rustcdc -f | grep -i "error\|warn"
@@ -590,7 +590,7 @@ top -p $(pgrep -f rustcdc)
 ps aux | grep rustcdc | awk '{print $2, $3, $4, $6}'
 
 # 7. Detailed metrics
-curl http://otel-collector:9090/metrics | grep cdc_ | sort
+curl http://otel-collector:9090/metrics | grep rustcdc_ | sort
 
 # 8. OTel trace export check
 curl -s http://otel-collector:4317/...  # Check exporter is responding
@@ -611,7 +611,7 @@ grep "timestamp" /var/log/rustcdc/structured.log | tail -1
 # Calculates duration of log file
 
 # Export metrics trend
-journalctl -u rustcdc -S "2 hours ago" | grep "cdc_" > metrics_export.log
+journalctl -u rustcdc -S "2 hours ago" | grep "rustcdc_" > metrics_export.log
 ```
 
 ### Interactive Debugging

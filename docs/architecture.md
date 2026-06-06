@@ -90,7 +90,7 @@ rustcdc is designed to be extended through typed interfaces:
 
 - `Checkpoint` for offset persistence backends
 - `SchemaHistory` for schema state persistence
-- `SinkAdapter` for sink-side delivery adapters
+- `SinkAdapter` for sink-side delivery adapters; `BoxedSink` for type-erased storage; `FanOutSinkAdapter` for concurrent multi-sink fan-out
 - WASM transform ABI for sandboxed transform logic
 
 ## Observability Model

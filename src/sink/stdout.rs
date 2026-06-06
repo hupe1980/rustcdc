@@ -43,12 +43,24 @@ use crate::sink::SinkAdapter;
 pub struct StdoutSink {
     closed: bool,
     events_sent: u64,
+    pretty: bool,
 }
 
 impl StdoutSink {
-    /// Create a new `StdoutSink`.
+    /// Create a new `StdoutSink` that writes compact (single-line) JSON.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a `StdoutSink` that writes pretty-printed JSON.
+    ///
+    /// Useful for human-readable development output and terminal piping.
+    /// For machine-consumption pipelines, prefer [`StdoutSink::new`].
+    pub fn with_pretty() -> Self {
+        Self {
+            pretty: true,
+            ..Self::default()
+        }
     }
 
     /// Total number of events sent through this sink (not reset on flush).
@@ -62,7 +74,11 @@ impl SinkAdapter for StdoutSink {
         if self.closed {
             return Err(Error::StateError("StdoutSink is closed".into()));
         }
-        let mut bytes = serde_json::to_vec(event)?;
+        let mut bytes = if self.pretty {
+            serde_json::to_vec_pretty(event)?
+        } else {
+            serde_json::to_vec(event)?
+        };
         bytes.push(b'\n');
         let stdout = io::stdout();
         let mut handle = stdout.lock();

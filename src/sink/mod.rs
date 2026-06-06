@@ -11,20 +11,102 @@
 //! |---|---|
 //! | [`MemorySinkAdapter`] | In-memory; for tests and rapid prototyping |
 //! | [`StdoutSink`] | Writes NDJSON to stdout; for local debugging and Docker deployments |
-//! | [`FileJsonlSink`] | Appends NDJSON to a file with fsync-on-close; for audit trails |
+//! | [`FileJsonlSink`] | Appends NDJSON to a file with async I/O, batching, and rotation |
+//! | [`FanOutSinkAdapter`] | Delivers each event to every child sink **concurrently** |
+//! | [`BoxedSink`] | Type-erased heap-allocated adapter for dynamic dispatch |
+//!
+//! # Delivery contract
+//!
+//! Every `SinkAdapter` implementation advertises its delivery guarantee via
+//! [`SinkAdapter::delivery_guarantee`].  Adapters that support transactional
+//! checkpoint barriers should also override
+//! [`transactional_checkpoint_barrier_capable`](SinkAdapter::transactional_checkpoint_barrier_capable)
+//! and the three barrier methods.
+//!
+//! # Dynamic dispatch
+//!
+//! `SinkAdapter` is not object-safe (it uses RPITIT).  Use [`BoxedSink`] for
+//! `Box<dyn …>` style dispatch and [`FanOutSinkAdapter`] to fan out to a
+//! heterogeneous set of sinks.
 //!
 //! # Conformance testing
 //!
 //! [`AdapterConformanceSuite`] verifies that a custom [`SinkAdapter`] implementation
 //! honours the contract (ordering, flush semantics, post-close error behaviour).
 
+pub mod fan_out;
 pub mod file_jsonl;
 pub mod stdout;
 
-pub use file_jsonl::FileJsonlSink;
+pub use fan_out::FanOutSinkAdapter;
+pub use file_jsonl::{FileJsonlSink, FileJsonlSinkConfig};
 pub use stdout::StdoutSink;
 
 use crate::core::{Error, Event, Result};
+
+// ─── SinkDeliveryGuarantee ────────────────────────────────────────────────────
+
+/// The delivery guarantee an adapter can offer to the pipeline.
+///
+/// When multiple sinks are composed (e.g. [`FanOutSinkAdapter`], a router),
+/// the effective guarantee of the composition is the **weakest** of all members.
+///
+/// # Ordering
+///
+/// `AtLeastOnce` < `AtLeastOnceIdempotent` < `EffectivelyOnce`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SinkDeliveryGuarantee {
+    /// Events are delivered at least once; duplicate delivery is possible.
+    ///
+    /// This is the default for most adapters.  Downstream consumers must
+    /// deduplicate if idempotency is required.
+    #[default]
+    AtLeastOnce,
+
+    /// Events are delivered at least once but the adapter guarantees that
+    /// retrying the same event is idempotent (e.g. upsert-by-key semantics).
+    ///
+    /// Suitable for sinks that de-duplicate by event key or version.
+    AtLeastOnceIdempotent,
+
+    /// Events are delivered exactly once when paired with transactional
+    /// checkpoint barriers (see [`SinkAdapter::transactional_checkpoint_barrier_capable`]).
+    ///
+    /// Requires the adapter to implement the full barrier protocol.
+    EffectivelyOnce,
+}
+
+impl SinkDeliveryGuarantee {
+    /// Numeric strength: higher is stronger.
+    fn strength(self) -> u8 {
+        match self {
+            Self::AtLeastOnce => 0,
+            Self::AtLeastOnceIdempotent => 1,
+            Self::EffectivelyOnce => 2,
+        }
+    }
+
+    /// Return the weaker of `self` and `other`.
+    ///
+    /// Used when composing sinks — the composed delivery contract is only as
+    /// strong as the weakest participant.
+    pub fn weakest(self, other: Self) -> Self {
+        if self.strength() <= other.strength() {
+            self
+        } else {
+            other
+        }
+    }
+
+    /// Human-readable label for use in metrics and logs.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::AtLeastOnce => "at_least_once",
+            Self::AtLeastOnceIdempotent => "at_least_once_idempotent",
+            Self::EffectivelyOnce => "effectively_once",
+        }
+    }
+}
 
 // ─── SinkAdapter ─────────────────────────────────────────────────────────────
 
@@ -33,6 +115,32 @@ use crate::core::{Error, Event, Result};
 /// Implementations must be `Send` so they can be used across async task boundaries.
 /// All methods take `&mut self` so the adapter can maintain internal state (e.g. a
 /// connection handle or an in-flight buffer) without an inner `Mutex`.
+///
+/// # Required methods
+///
+/// Implement at minimum: [`send`], [`flush`], [`close`], [`name`].
+///
+/// # Optional capability declarations
+///
+/// Override [`delivery_guarantee`], [`idempotent_delivery_capable`],
+/// [`transactional_checkpoint_barrier_capable`], [`queue_depth`],
+/// [`flush_tick_interval`], and [`preflight_check`] to advertise capabilities
+/// and hints to the runtime.
+///
+/// # Checkpoint barrier protocol
+///
+/// Adapters that support effectively-once delivery must override
+/// [`transactional_checkpoint_barrier_capable`] → `true` and implement all
+/// three barrier methods.  The protocol is:
+///
+/// 1. [`begin_checkpoint_barrier`] — prepare for a checkpoint commit.
+/// 2. [`commit_checkpoint_barrier`] — durable commit.
+/// 3. [`abort_checkpoint_barrier`] — roll back on failure.
+///
+/// # Object-safe wrapper
+///
+/// This trait is **not** object-safe (uses RPITIT).  Use [`BoxedSink`] when you
+/// need `Box<dyn …>` dispatch.
 ///
 /// # Implementing SinkAdapter
 ///
@@ -51,7 +159,23 @@ use crate::core::{Error, Event, Result};
 ///     fn name(&self) -> &str { "kafka" }
 /// }
 /// ```
+///
+/// [`send`]: SinkAdapter::send
+/// [`flush`]: SinkAdapter::flush
+/// [`close`]: SinkAdapter::close
+/// [`name`]: SinkAdapter::name
+/// [`delivery_guarantee`]: SinkAdapter::delivery_guarantee
+/// [`idempotent_delivery_capable`]: SinkAdapter::idempotent_delivery_capable
+/// [`transactional_checkpoint_barrier_capable`]: SinkAdapter::transactional_checkpoint_barrier_capable
+/// [`queue_depth`]: SinkAdapter::queue_depth
+/// [`flush_tick_interval`]: SinkAdapter::flush_tick_interval
+/// [`preflight_check`]: SinkAdapter::preflight_check
+/// [`begin_checkpoint_barrier`]: SinkAdapter::begin_checkpoint_barrier
+/// [`commit_checkpoint_barrier`]: SinkAdapter::commit_checkpoint_barrier
+/// [`abort_checkpoint_barrier`]: SinkAdapter::abort_checkpoint_barrier
 pub trait SinkAdapter: Send {
+    // ── Required ─────────────────────────────────────────────────────────────
+
     /// Deliver a single CDC event to the sink.
     fn send(&mut self, event: &Event) -> impl std::future::Future<Output = Result<()>> + Send;
 
@@ -65,18 +189,116 @@ pub trait SinkAdapter: Send {
     /// [`send`]: SinkAdapter::send
     fn close(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
 
-    /// Close the adapter, returning an error if the close takes longer than `timeout_ms`.
+    /// Human-readable name used in logs and conformance reports.
+    fn name(&self) -> &str;
+
+    // ── Delivery contract ─────────────────────────────────────────────────────
+
+    /// The delivery guarantee this adapter offers.
     ///
-    /// This is a default convenience wrapper around [`close`] that applies a
-    /// `tokio::time::timeout`. Use this in shutdown paths where a hung sink
-    /// (e.g. a Kafka producer waiting for broker acknowledgement) must not
-    /// prevent the process from exiting.
+    /// Default: [`SinkDeliveryGuarantee::AtLeastOnce`].
+    fn delivery_guarantee(&self) -> SinkDeliveryGuarantee {
+        SinkDeliveryGuarantee::AtLeastOnce
+    }
+
+    /// Whether the adapter can deliver an event idempotently (e.g. upsert by key).
     ///
-    /// Returns [`Error::TimeoutError`] if the deadline is exceeded. The adapter
-    /// state is indeterminate after a timeout — treat it as permanently closed
-    /// and do not send further events.
+    /// Default: `false`.
+    fn idempotent_delivery_capable(&self) -> bool {
+        false
+    }
+
+    /// Whether the adapter supports the transactional checkpoint barrier protocol.
     ///
-    /// [`close`]: SinkAdapter::close
+    /// Adapters that return `true` here **must** implement
+    /// [`begin_checkpoint_barrier`](SinkAdapter::begin_checkpoint_barrier),
+    /// [`commit_checkpoint_barrier`](SinkAdapter::commit_checkpoint_barrier), and
+    /// [`abort_checkpoint_barrier`](SinkAdapter::abort_checkpoint_barrier).
+    ///
+    /// Default: `false`.
+    fn transactional_checkpoint_barrier_capable(&self) -> bool {
+        false
+    }
+
+    // ── Runtime hints ─────────────────────────────────────────────────────────
+
+    /// Current number of events buffered in-memory and not yet flushed.
+    ///
+    /// Used by the runtime to observe back-pressure.  Return `None` when the
+    /// adapter does not maintain an internal buffer.
+    ///
+    /// Default: `None`.
+    fn queue_depth(&self) -> Option<usize> {
+        None
+    }
+
+    /// Suggest how often the runtime should call [`flush`](SinkAdapter::flush)
+    /// on a time basis (e.g. when the sink batches events by time window).
+    ///
+    /// The runtime will arrange for periodic flushing no less often than this
+    /// interval.  Return `None` to leave flushing entirely to the runtime's
+    /// checkpoint / batch schedule.
+    ///
+    /// Default: `None`.
+    fn flush_tick_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    // ── Checkpoint barrier ────────────────────────────────────────────────────
+
+    /// Begin a transactional checkpoint barrier.
+    ///
+    /// Called before the pipeline commits a checkpoint offset to durable
+    /// storage.  The adapter should hold new sends buffered until
+    /// [`commit_checkpoint_barrier`](SinkAdapter::commit_checkpoint_barrier) or
+    /// [`abort_checkpoint_barrier`](SinkAdapter::abort_checkpoint_barrier) is called.
+    ///
+    /// Default: no-op `Ok(())`.
+    fn begin_checkpoint_barrier(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    /// Commit the in-flight checkpoint barrier.
+    ///
+    /// The adapter should atomically make buffered events durable and release
+    /// the barrier.
+    ///
+    /// Default: no-op `Ok(())`.
+    fn commit_checkpoint_barrier(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    /// Abort the in-flight checkpoint barrier and discard buffered events.
+    ///
+    /// Called when a downstream failure makes the current checkpoint
+    /// uncompletable.
+    ///
+    /// Default: no-op `Ok(())`.
+    fn abort_checkpoint_barrier(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    // ── Connectivity validation ────────────────────────────────────────────────
+
+    /// Validate that the sink can accept events before the pipeline starts.
+    ///
+    /// The runtime calls this once during startup.  Use it to fail-fast on
+    /// misconfigured endpoints, missing credentials, or unreachable services.
+    ///
+    /// Default: no-op `Ok(())`.
+    fn preflight_check(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    // ── Convenience wrappers ──────────────────────────────────────────────────
+
+    /// Close the adapter, returning [`Error::TimeoutError`] if the close takes
+    /// longer than `timeout_ms` milliseconds.
+    ///
+    /// Use this in shutdown paths where a hung sink must not prevent the process
+    /// from exiting.  The adapter state is indeterminate after a timeout.
     fn close_with_timeout(
         &mut self,
         timeout_ms: u64,
@@ -94,8 +316,7 @@ pub trait SinkAdapter: Send {
         }
     }
 
-    /// Human-readable name used in logs and conformance reports.
-    fn name(&self) -> &str;
+    // ── Inspection hooks ──────────────────────────────────────────────────────
 
     /// Optional inspection hook for deterministic conformance assertions.
     ///
@@ -114,6 +335,179 @@ pub trait SinkAdapter: Send {
     /// [`close`]: SinkAdapter::close
     fn is_closed(&self) -> Option<bool> {
         None
+    }
+}
+
+// ─── ErasedSink (private) ─────────────────────────────────────────────────────
+//
+// Object-safe version of SinkAdapter used internally by BoxedSink.
+// Not part of the public API.
+
+type BoxFut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+trait ErasedSink: Send {
+    fn erased_send<'a>(&'a mut self, event: &'a Event) -> BoxFut<'a>;
+    fn erased_flush<'a>(&'a mut self) -> BoxFut<'a>;
+    fn erased_close<'a>(&'a mut self) -> BoxFut<'a>;
+    fn erased_name(&self) -> &str;
+    fn erased_delivery_guarantee(&self) -> SinkDeliveryGuarantee;
+    fn erased_idempotent_delivery_capable(&self) -> bool;
+    fn erased_transactional_checkpoint_barrier_capable(&self) -> bool;
+    fn erased_queue_depth(&self) -> Option<usize>;
+    fn erased_flush_tick_interval(&self) -> Option<std::time::Duration>;
+    fn erased_is_closed(&self) -> Option<bool>;
+    fn erased_exported_events(&self) -> Option<&[Event]>;
+    fn erased_begin_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a>;
+    fn erased_commit_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a>;
+    fn erased_abort_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a>;
+    fn erased_preflight_check<'a>(&'a mut self) -> BoxFut<'a>;
+}
+
+impl<T: SinkAdapter> ErasedSink for T {
+    fn erased_send<'a>(&'a mut self, event: &'a Event) -> BoxFut<'a> {
+        Box::pin(self.send(event))
+    }
+    fn erased_flush<'a>(&'a mut self) -> BoxFut<'a> {
+        Box::pin(self.flush())
+    }
+    fn erased_close<'a>(&'a mut self) -> BoxFut<'a> {
+        Box::pin(self.close())
+    }
+    fn erased_name(&self) -> &str {
+        self.name()
+    }
+    fn erased_delivery_guarantee(&self) -> SinkDeliveryGuarantee {
+        self.delivery_guarantee()
+    }
+    fn erased_idempotent_delivery_capable(&self) -> bool {
+        self.idempotent_delivery_capable()
+    }
+    fn erased_transactional_checkpoint_barrier_capable(&self) -> bool {
+        self.transactional_checkpoint_barrier_capable()
+    }
+    fn erased_queue_depth(&self) -> Option<usize> {
+        self.queue_depth()
+    }
+    fn erased_flush_tick_interval(&self) -> Option<std::time::Duration> {
+        self.flush_tick_interval()
+    }
+    fn erased_is_closed(&self) -> Option<bool> {
+        self.is_closed()
+    }
+    fn erased_exported_events(&self) -> Option<&[Event]> {
+        self.exported_events()
+    }
+    fn erased_begin_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a> {
+        Box::pin(self.begin_checkpoint_barrier())
+    }
+    fn erased_commit_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a> {
+        Box::pin(self.commit_checkpoint_barrier())
+    }
+    fn erased_abort_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a> {
+        Box::pin(self.abort_checkpoint_barrier())
+    }
+    fn erased_preflight_check<'a>(&'a mut self) -> BoxFut<'a> {
+        Box::pin(self.preflight_check())
+    }
+}
+
+// ─── BoxedSink ────────────────────────────────────────────────────────────────
+
+/// A heap-allocated, type-erased [`SinkAdapter`] for dynamic dispatch.
+///
+/// Use this when the concrete adapter type is not known at compile time, or
+/// when you need to store a heterogeneous collection of sinks (e.g. in a
+/// [`FanOutSinkAdapter`] or a router).
+///
+/// Created with [`BoxedSink::new`].
+///
+/// ```rust,no_run
+/// use rustcdc::sink::{BoxedSink, MemorySinkAdapter, SinkAdapter};
+///
+/// let inner = MemorySinkAdapter::new("mem");
+/// let mut sink: BoxedSink = BoxedSink::new(inner);
+/// // sink can now be stored in a Vec<BoxedSink>
+/// ```
+pub struct BoxedSink(Box<dyn ErasedSink>);
+
+impl BoxedSink {
+    /// Wrap `sink` in a type-erased [`BoxedSink`].
+    ///
+    /// The concrete type `S` must be `'static` so it can outlive any particular
+    /// call site.
+    pub fn new<S: SinkAdapter + 'static>(sink: S) -> Self {
+        Self(Box::new(sink))
+    }
+}
+
+impl std::fmt::Debug for BoxedSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoxedSink")
+            .field("name", &self.0.erased_name())
+            .field("closed", &self.0.erased_is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SinkAdapter for BoxedSink {
+    async fn send(&mut self, event: &Event) -> Result<()> {
+        self.0.erased_send(event).await
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.0.erased_flush().await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.0.erased_close().await
+    }
+
+    fn name(&self) -> &str {
+        self.0.erased_name()
+    }
+
+    fn delivery_guarantee(&self) -> SinkDeliveryGuarantee {
+        self.0.erased_delivery_guarantee()
+    }
+
+    fn idempotent_delivery_capable(&self) -> bool {
+        self.0.erased_idempotent_delivery_capable()
+    }
+
+    fn transactional_checkpoint_barrier_capable(&self) -> bool {
+        self.0.erased_transactional_checkpoint_barrier_capable()
+    }
+
+    fn queue_depth(&self) -> Option<usize> {
+        self.0.erased_queue_depth()
+    }
+
+    fn flush_tick_interval(&self) -> Option<std::time::Duration> {
+        self.0.erased_flush_tick_interval()
+    }
+
+    fn is_closed(&self) -> Option<bool> {
+        self.0.erased_is_closed()
+    }
+
+    fn exported_events(&self) -> Option<&[Event]> {
+        self.0.erased_exported_events()
+    }
+
+    async fn begin_checkpoint_barrier(&mut self) -> Result<()> {
+        self.0.erased_begin_checkpoint_barrier().await
+    }
+
+    async fn commit_checkpoint_barrier(&mut self) -> Result<()> {
+        self.0.erased_commit_checkpoint_barrier().await
+    }
+
+    async fn abort_checkpoint_barrier(&mut self) -> Result<()> {
+        self.0.erased_abort_checkpoint_barrier().await
+    }
+
+    async fn preflight_check(&mut self) -> Result<()> {
+        self.0.erased_preflight_check().await
     }
 }
 
@@ -187,6 +581,8 @@ impl SinkAdapter for MemorySinkAdapter {
     fn is_closed(&self) -> Option<bool> {
         Some(self.closed)
     }
+
+    // delivery_guarantee, idempotent_delivery_capable, etc. use defaults.
 }
 
 // ─── Conformance testing ─────────────────────────────────────────────────────

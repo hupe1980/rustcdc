@@ -199,14 +199,16 @@ async fn admin_prometheus_output_reflects_state_changes() {
 
     // Idle state.
     let idle_metrics = runtime.admin_metrics_prometheus();
-    assert!(idle_metrics.contains("cdc_runtime_readiness") && idle_metrics.contains(" 0"));
-    assert!(idle_metrics.contains("cdc_runtime_liveness") && idle_metrics.contains(" 1"));
+    assert!(idle_metrics.contains("rustcdc_runtime_readiness") && idle_metrics.contains(" 0"));
+    assert!(idle_metrics.contains("rustcdc_runtime_liveness") && idle_metrics.contains(" 1"));
 
     // Running state.
     runtime.start().await.expect("failed to start");
     let running_metrics = runtime.admin_metrics_prometheus();
-    assert!(running_metrics.contains("cdc_runtime_readiness") && running_metrics.contains(" 1"));
-    assert!(running_metrics.contains("cdc_runtime_liveness") && running_metrics.contains(" 1"));
+    assert!(
+        running_metrics.contains("rustcdc_runtime_readiness") && running_metrics.contains(" 1")
+    );
+    assert!(running_metrics.contains("rustcdc_runtime_liveness") && running_metrics.contains(" 1"));
 
     // With committed events.
     runtime
@@ -219,15 +221,17 @@ async fn admin_prometheus_output_reflects_state_changes() {
         .expect("failed to commit");
 
     let with_commits_metrics = runtime.admin_metrics_prometheus();
-    assert!(with_commits_metrics.contains("cdc_runtime_events_committed_total"));
+    assert!(with_commits_metrics.contains("rustcdc_runtime_events_committed_total"));
     assert!(with_commits_metrics.contains("} 1") || with_commits_metrics.contains(" 1\n"));
-    assert!(with_commits_metrics.contains("cdc_runtime_checkpoint_age_ms"));
+    assert!(with_commits_metrics.contains("rustcdc_runtime_checkpoint_age_ms"));
 
     // Stopped state.
     runtime.stop().await.expect("failed to stop");
     let stopped_metrics = runtime.admin_metrics_prometheus();
-    assert!(stopped_metrics.contains("cdc_runtime_readiness") && stopped_metrics.contains(" 0"));
-    assert!(stopped_metrics.contains("cdc_runtime_liveness") && stopped_metrics.contains(" 0"));
+    assert!(
+        stopped_metrics.contains("rustcdc_runtime_readiness") && stopped_metrics.contains(" 0")
+    );
+    assert!(stopped_metrics.contains("rustcdc_runtime_liveness") && stopped_metrics.contains(" 0"));
 }
 
 #[tokio::test]

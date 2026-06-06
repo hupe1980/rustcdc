@@ -47,6 +47,8 @@ cargo doc --no-deps
 - In-memory schema history and validator
 - Embedded runtime with batch/ack delivery model
 - PostgreSQL, MySQL, MariaDB, and SQL Server source connectors
+- Sink adapter traits: `SinkAdapter`, `SinkDeliveryGuarantee`, `BoxedSink`, `FanOutSinkAdapter`
+- Built-in sinks: `StdoutSink`, `FileJsonlSink` (async, batched, rotating), `MemorySinkAdapter`
 - Fixture replay and conformance harness foundations
 
 ## Known Limits

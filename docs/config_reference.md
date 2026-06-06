@@ -720,7 +720,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.3.0",                         // Service version
+    "0.4.0",                         // Service version
     "production",                    // Environment
 );
 
@@ -739,31 +739,31 @@ let config = RuntimeConfig::new(...)
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `cdc_runtime_readiness` | Gauge | Runtime readiness (1 ready, 0 not ready) |
-| `cdc_runtime_liveness` | Gauge | Runtime liveness (1 alive, 0 stopped) |
-| `cdc_runtime_buffer_depth` | Gauge | Buffered events waiting for delivery |
-| `cdc_runtime_in_flight_events` | Gauge | Delivered but uncommitted events |
-| `cdc_runtime_events_polled_total` | Counter | Total events delivered by runtime batches |
-| `cdc_runtime_events_committed_total` | Counter | Total acknowledged and checkpointed events |
-| `cdc_runtime_events_deduplicated_total` | Counter | Total events suppressed by idempotency guard |
-| `cdc_runtime_checkpoint_age_ms` | Gauge | Age of last durable checkpoint |
-| `cdc_runtime_replication_lag_ms` | Gauge | Estimated source lag in milliseconds |
+| `rustcdc_runtime_readiness` | Gauge | Runtime readiness (1 ready, 0 not ready) |
+| `rustcdc_runtime_liveness` | Gauge | Runtime liveness (1 alive, 0 stopped) |
+| `rustcdc_runtime_buffer_depth` | Gauge | Buffered events waiting for delivery |
+| `rustcdc_runtime_in_flight_events` | Gauge | Delivered but uncommitted events |
+| `rustcdc_runtime_events_polled_total` | Counter | Total events delivered by runtime batches |
+| `rustcdc_runtime_events_committed_total` | Counter | Total acknowledged and checkpointed events |
+| `rustcdc_runtime_events_deduplicated_total` | Counter | Total events suppressed by idempotency guard |
+| `rustcdc_runtime_checkpoint_age_ms` | Gauge | Age of last durable checkpoint |
+| `rustcdc_runtime_replication_lag_ms` | Gauge | Estimated source lag in milliseconds |
 
 ### OpenTelemetry Exported Metrics (`OTelMetricsCollector`)
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `cdc.events.processed` | Counter | Total events successfully processed |
-| `cdc.events.filtered` | Counter | Events dropped by transform pipeline |
-| `cdc.errors` | Counter | Total errors encountered |
-| `cdc.checkpoint.committed_count` | Counter | Total events committed to checkpoint |
-| `cdc.replication_lag_ms` | Gauge | Estimated replication lag in milliseconds |
-| `cdc.replication_lag_events` | Gauge | Estimated events not yet consumed |
-| `cdc.checkpoint_offset` | Gauge | Current checkpoint offset (source-specific encoding) |
-| `cdc.buffer_size` | Gauge | Current buffered event count |
-| `cdc.snapshot_progress` | Gauge | Current snapshot completion percentage |
-| `cdc.event_processing_duration` | Histogram | Event processing latency (ms) |
-| `cdc.checkpoint_commit_duration` | Histogram | Checkpoint commit latency (ms) |
+| `rustcdc.events.processed` | Counter | Total events successfully processed |
+| `rustcdc.events.filtered` | Counter | Events dropped by transform pipeline |
+| `rustcdc.errors` | Counter | Total errors encountered |
+| `rustcdc.checkpoint.committed_count` | Counter | Total events committed to checkpoint |
+| `rustcdc.replication_lag_ms` | Gauge | Estimated replication lag in milliseconds |
+| `rustcdc.replication_lag_events` | Gauge | Estimated events not yet consumed |
+| `rustcdc.checkpoint_offset` | Gauge | Current checkpoint offset (source-specific encoding) |
+| `rustcdc.buffer_size` | Gauge | Current buffered event count |
+| `rustcdc.snapshot_progress` | Gauge | Current snapshot completion percentage |
+| `rustcdc.event_processing_duration` | Histogram | Event processing latency (ms) |
+| `rustcdc.checkpoint_commit_duration` | Histogram | Checkpoint commit latency (ms) |
 
 ### Structured Log Fields
 
@@ -880,10 +880,10 @@ let mysql_tls = mysql_cfg.with_tls_transport();
 
 ### Monitoring Checklist
 
-- [ ] Alert on `cdc_runtime_replication_lag_ms > 30000` (30s)
-- [ ] Alert on `cdc_runtime_liveness == 0`
-- [ ] Alert on `cdc_runtime_checkpoint_age_ms > 10000`
-- [ ] Alert on `cdc_runtime_events_polled_total` trend deviation > 20%
+- [ ] Alert on `rustcdc_runtime_replication_lag_ms > 30000` (30s)
+- [ ] Alert on `rustcdc_runtime_liveness == 0`
+- [ ] Alert on `rustcdc_runtime_checkpoint_age_ms > 10000`
+- [ ] Alert on `rustcdc_runtime_events_polled_total` trend deviation > 20%
 - [ ] Dashboard: Replication lag trend over 24h
 - [ ] Dashboard: Event processing rate (events/sec)
 - [ ] Dashboard: Checkpoint commit latency distribution

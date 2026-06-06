@@ -68,10 +68,6 @@ impl Transform for WasmTransform {
                 Ok(true)
             }
             TransformResult::Filtered => Ok(false),
-            TransformResult::Err(reason) => Err(crate::core::Error::TransformError(format!(
-                "wasm/{}: {reason}",
-                self.name
-            ))),
         }
     }
 

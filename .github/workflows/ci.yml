@@ -125,7 +125,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres image (public ecr mirror)
         run: bash scripts/ci-pull-relational-images.sh 16-alpine
-      - name: pre-pull mysql/mariadb/sqlserver images
+      - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: contract compatibility smoke
         run: cargo test --test compatibility_contract --all-features
@@ -283,6 +283,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mysql_process_crash_integration'
         run: cargo test --test ${{ matrix.suite }} --features mysql
@@ -300,6 +302,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
         run: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
 
@@ -320,6 +324,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mariadb_process_crash_integration'
         run: cargo test --test ${{ matrix.suite }} --features mariadb
@@ -337,6 +343,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
         run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
 
@@ -359,6 +367,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration'
         run: cargo test --test ${{ matrix.suite }} --features sqlserver
@@ -376,6 +386,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
       - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
         run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 

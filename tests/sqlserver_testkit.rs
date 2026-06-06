@@ -21,10 +21,41 @@ pub fn skip_docker_test(case_label: &str) -> bool {
     true
 }
 
+/// Returns `true` when `err` is the sentinel produced by
+/// [`start_sqlserver_container`] for an image-pull failure.
+///
+/// Use this to skip a test when the SQL Server image is unavailable in CI
+/// (MCR downtime, rate-limit, retired tag) rather than failing the suite:
+///
+/// ```rust,ignore
+/// let container = sqlserver_testkit::start_sqlserver_container("2022-latest").await;
+/// let container = match container {
+///     Ok(c) => c,
+///     Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+///     Err(e) => return Err(e),
+/// };
+/// ```
+pub fn is_skip_error(err: &rustcdc::Error) -> bool {
+    err.to_string().starts_with("SKIP:")
+}
+
+/// Returns `true` when the error message indicates that the container image
+/// could not be pulled from the registry (rate-limit, access denial, network
+/// partition, or retired tag).
+fn is_image_pull_failure(err: &rustcdc::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("failed to pull")
+        || msg.contains("pull access denied")
+        || msg.contains("does not exist or may require")
+        || msg.contains("status code 404")
+        || msg.contains("request is blocked")
+        || msg.contains("toomanyrequests")
+}
+
 pub async fn start_sqlserver_container(
     image_tag: &str,
 ) -> rustcdc::Result<ContainerAsync<GenericImage>> {
-    GenericImage::new("mcr.microsoft.com/mssql/server", image_tag)
+    match GenericImage::new("mcr.microsoft.com/mssql/server", image_tag)
         .with_exposed_port(1433.tcp())
         .with_env_var("ACCEPT_EULA", "Y")
         .with_env_var("MSSQL_SA_PASSWORD", SQLSERVER_SA_PASSWORD)
@@ -32,6 +63,20 @@ pub async fn start_sqlserver_container(
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
+    {
+        Ok(container) => Ok(container),
+        Err(err) if is_image_pull_failure(&err) => {
+            eprintln!(
+                "skipping sqlserver test: could not pull \
+                 'mcr.microsoft.com/mssql/server:{image_tag}' — \
+                 MCR may be unavailable or the tag may be retired."
+            );
+            Err(rustcdc::Error::SourceError(format!(
+                "SKIP: sqlserver image pull failed: {err}"
+            )))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub async fn host_and_port(

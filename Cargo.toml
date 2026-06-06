@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.92"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -64,7 +64,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["macros", "rt", "signal", "sync", "time"] }
+tokio = { version = "1.48.0", features = ["macros", "rt", "signal", "sync", "time", "fs", "io-util"] }
 tracing = "0.1.41"
 regex = "1.11.1"
 wasmparser = { version = "0.246", optional = true }

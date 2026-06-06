@@ -46,8 +46,6 @@ pub enum TransformResult {
     ///
     /// This is a normal, expected outcome — not an error. The event should be silently dropped.
     Filtered,
-    /// The WASM module returned an error message.
-    Err(String),
 }
 
 #[async_trait]
@@ -101,8 +99,10 @@ struct RealWasmState {
     store: Store<()>,
     memory: Memory,
     alloc: TypedFunc<i32, i32>,
-    transform: TypedFunc<(i32, i32), i32>,
-    output_len: TypedFunc<(), i32>,
+    /// Release a previously-allocated memory region.
+    dealloc: TypedFunc<(i32, i32), ()>,
+    /// Packed `(out_ptr << 32) | out_len`; returns 0 to drop the event.
+    transform: TypedFunc<(i32, i32), i64>,
     init: Option<TypedFunc<(i32, i32), i32>>,
     shutdown: Option<TypedFunc<(), i32>>,
 }
@@ -248,17 +248,37 @@ impl RealWasmModule {
             .ok_or_else(|| Error::ConfigError("WASM module missing memory export".to_string()))?;
 
         let alloc = get_typed_func::<i32, i32>(&mut store, &instance, "alloc")?;
-        let transform = get_typed_func::<(i32, i32), i32>(&mut store, &instance, "transform")?;
-        let output_len = get_typed_func::<(), i32>(&mut store, &instance, "output_len")?;
+        let dealloc = get_typed_func::<(i32, i32), ()>(&mut store, &instance, "dealloc")?;
+        let transform = get_typed_func::<(i32, i32), i64>(&mut store, &instance, "transform")?;
         let init = optional_typed_func::<(i32, i32), i32>(&mut store, &instance, "init")?;
         let shutdown = optional_typed_func::<(), i32>(&mut store, &instance, "shutdown")?;
+
+        // Call rustcdc_abi_version() before the epoch ticker starts so that
+        // incompatible modules are rejected at load time, not at first invocation.
+        {
+            let version_fn =
+                get_typed_func::<(), i32>(&mut store, &instance, "rustcdc_abi_version")?;
+            // Arm the epoch deadline so the probe call is not immediately interrupted.
+            store.set_epoch_deadline(config.timeout_ms);
+            let reported = version_fn.call(&mut store, ()).map_err(|e| {
+                Error::ConfigError(format!("rustcdc_abi_version() call failed: {e}"))
+            })?;
+            const CURRENT_ABI_VERSION: i32 = 2;
+            if reported != CURRENT_ABI_VERSION {
+                return Err(Error::ConfigError(format!(
+                    "WASM module reports ABI version {reported} but host requires \
+                     {CURRENT_ABI_VERSION}. Rebuild the module against the rustcdc \
+                     WASM ABI documentation."
+                )));
+            }
+        }
 
         let module_state = RealWasmState {
             store,
             memory,
             alloc,
+            dealloc,
             transform,
-            output_len,
             init,
             shutdown,
         };
@@ -309,9 +329,10 @@ impl RealWasmModule {
             .call(&mut state.store, len)
             .map_err(|error| Error::TransformError(format!("WASM alloc call failed: {error}")))?;
 
-        if ptr < 0 {
+        // Address 0 is reserved; treat as alloc failure.
+        if ptr <= 0 {
             return Err(Error::TransformError(format!(
-                "WASM alloc returned negative pointer: {ptr}"
+                "WASM alloc returned invalid pointer {ptr} (address 0 is reserved)"
             )));
         }
 
@@ -323,9 +344,10 @@ impl RealWasmModule {
     }
 
     fn read_output(state: &mut RealWasmState, ptr: i32, len: i32) -> Result<Vec<u8>> {
-        if ptr < 0 {
+        // Address 0 is reserved; reject zero and negative pointers.
+        if ptr <= 0 {
             return Err(Error::TransformError(format!(
-                "WASM output pointer is negative: {ptr}"
+                "WASM output pointer is invalid: {ptr} (address 0 is reserved)"
             )));
         }
         if len < 0 {
@@ -389,43 +411,55 @@ impl WasmModule for RealWasmModule {
         // after approximately `timeout_ms` milliseconds by the ticker task.
         state.store.set_epoch_deadline(self.timeout_ms);
 
+        let input_len = i32::try_from(event_json.len()).map_err(|_| {
+            Error::TransformError(format!(
+                "WASM input length exceeds i32: {}",
+                event_json.len()
+            ))
+        })?;
+
+        // Clone once; used twice below (input dealloc + output dealloc).
+        let dealloc = state.dealloc.clone();
+
         let input_ptr = Self::alloc_and_write(&mut state, event_json)?;
+
         let transform = state.transform.clone();
-        let output_ptr = transform
-            .call(
-                &mut state.store,
-                (
-                    input_ptr,
-                    i32::try_from(event_json.len()).map_err(|_| {
-                        Error::TransformError(format!(
-                            "WASM input length exceeds i32: {}",
-                            event_json.len()
-                        ))
-                    })?,
-                ),
-            )
+        let packed = transform
+            .call(&mut state.store, (input_ptr, input_len))
             .map_err(|error| {
                 Error::TransformError(format!("WASM transform call failed: {error}"))
             })?;
 
-        if output_ptr == -1 {
+        // Always dealloc the input region, even on event-drop or error.
+        // Ignore dealloc errors — the store is discarded on any subsequent error anyway.
+        let _ = dealloc.call(&mut state.store, (input_ptr, input_len));
+
+        // Return value 0 means "drop this event".
+        if packed == 0 {
             return Ok(None);
         }
-        if output_ptr < -1 {
+
+        // Decode the packed return: high 32 bits = output ptr, low 32 bits = output length.
+        let output_ptr = (packed >> 32) as i32;
+        let output_len = (packed & 0xFFFF_FFFF) as i32;
+
+        if output_ptr <= 0 {
             return Err(Error::TransformError(format!(
-                "WASM transform returned failure code: {output_ptr}"
+                "WASM transform returned invalid output pointer {output_ptr} \
+                 (address 0 is reserved)"
+            )));
+        }
+        if output_len <= 0 {
+            // Non-zero packed value with zero/negative length is malformed.
+            return Err(Error::TransformError(format!(
+                "WASM transform returned non-zero pointer with invalid length {output_len}"
             )));
         }
 
-        let output_len_fn = state.output_len.clone();
-        let output_len = output_len_fn.call(&mut state.store, ()).map_err(|error| {
-            Error::TransformError(format!("WASM output_len call failed: {error}"))
-        })?;
         let output = Self::read_output(&mut state, output_ptr, output_len)?;
 
-        if output.is_empty() {
-            return Ok(None);
-        }
+        // Dealloc the output region after copying the bytes out.
+        let _ = dealloc.call(&mut state.store, (output_ptr, output_len));
 
         let transformed = serde_json::from_slice::<Event>(&output).map_err(|error| {
             Error::TransformError(format!(
@@ -487,21 +521,19 @@ impl WasmModule for RealWasmModule {
             "memory_limit_mb": config.memory_limit_mb,
         });
         let config_bytes = serde_json::to_vec(&config_payload)?;
+        let config_len = i32::try_from(config_bytes.len()).map_err(|_| {
+            Error::ConfigError("WASM init config payload exceeds i32 length".to_string())
+        })?;
         let ptr = Self::alloc_and_write(&mut state, &config_bytes)?;
 
         let status = init
-            .call(
-                &mut state.store,
-                (
-                    ptr,
-                    i32::try_from(config_bytes.len()).map_err(|_| {
-                        Error::ConfigError(
-                            "WASM init config payload exceeds i32 length".to_string(),
-                        )
-                    })?,
-                ),
-            )
+            .call(&mut state.store, (ptr, config_len))
             .map_err(|error| Error::ConfigError(format!("WASM init call failed: {error}")))?;
+
+        // Dealloc the config buffer after the call completes.
+        let dealloc = state.dealloc.clone();
+        let _ = dealloc.call(&mut state.store, (ptr, config_len));
+
         if status != 0 {
             return Err(Error::ConfigError(format!(
                 "WASM init returned non-zero status: {status}"
@@ -661,11 +693,12 @@ fn validate_wasm_contract(module_bytes: &[u8]) -> Result<()> {
         }
     }
 
-    let required_func_exports = ["alloc", "transform", "output_len"];
+    let required_func_exports = ["alloc", "dealloc", "transform", "rustcdc_abi_version"];
     for name in required_func_exports {
         if !exported_funcs.contains_key(name) {
             return Err(Error::ConfigError(format!(
-                "WASM module missing required export '{name}'"
+                "WASM module missing required export '{name}'. \
+                 See the rustcdc WASM ABI documentation."
             )));
         }
     }
@@ -684,16 +717,27 @@ fn validate_wasm_contract(module_bytes: &[u8]) -> Result<()> {
         &[ValType::I32],
         &[ValType::I32],
     )?;
+    // transform(ptr: i32, len: i32) -> i64  (packed out_ptr<<32 | out_len)
     validate_export_signature(
         "transform",
         &exported_funcs,
         &function_type_indices,
         &type_sigs,
         &[ValType::I32, ValType::I32],
-        &[ValType::I32],
+        &[ValType::I64],
     )?;
+    // dealloc(ptr: i32, size: i32)
     validate_export_signature(
-        "output_len",
+        "dealloc",
+        &exported_funcs,
+        &function_type_indices,
+        &type_sigs,
+        &[ValType::I32, ValType::I32],
+        &[],
+    )?;
+    // rustcdc_abi_version() -> i32
+    validate_export_signature(
+        "rustcdc_abi_version",
         &exported_funcs,
         &function_type_indices,
         &type_sigs,
@@ -853,21 +897,47 @@ mod tests {
     fn minimal_conformant_wat() -> &'static str {
         r#"(module
                         (memory (export "memory") 1)
-                        (global $heap (mut i32) (i32.const 1024))
-                        (global $out_len (mut i32) (i32.const 0))
+                        (global $heap (mut i32) (i32.const 8))
                         (func (export "alloc") (param $len i32) (result i32)
                             (local $ptr i32)
                             global.get $heap
-                            local.set $ptr
-                            global.get $heap
+                            local.tee $ptr
                             local.get $len
                             i32.add
                             global.set $heap
                             local.get $ptr)
-                        (func (export "output_len") (result i32)
-                            global.get $out_len)
-                        (func (export "transform") (param i32 i32) (result i32)
-                            i32.const -1))"#
+                        (func (export "dealloc") (param i32) (param i32))
+                        (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+                        (func (export "transform") (param i32 i32) (result i64)
+                            i64.const 0))"#
+    }
+
+    #[tokio::test]
+    async fn rejects_module_missing_rustcdc_abi_version() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.wasm");
+        write_wat_module(
+            &module_path,
+            r#"(module
+                (memory (export "memory") 1)
+                (global $heap (mut i32) (i32.const 8))
+                (func (export "alloc") (param $len i32) (result i32)
+                    (local $ptr i32)
+                    global.get $heap
+                    local.tee $ptr
+                    local.get $len
+                    i32.add
+                    global.set $heap
+                    local.get $ptr)
+                (func (export "dealloc") (param i32) (param i32))
+                (func (export "transform") (param i32 i32) (result i64)
+                    i64.const 0))"#,
+        );
+        let result = WasmRuntime::new(module_path.to_str().expect("utf8"));
+        assert!(
+            matches!(result, Err(Error::ConfigError(ref msg)) if msg.contains("missing required")),
+            "expected module without rustcdc_abi_version to be rejected"
+        );
     }
 
     #[tokio::test]
@@ -960,9 +1030,10 @@ mod tests {
             r#"(module
                 (import "env" "fd_write" (func (param i32 i32 i32 i32) (result i32)))
                 (memory (export "memory") 1)
-                (func (export "alloc") (param i32) (result i32) i32.const 0)
-                (func (export "output_len") (result i32) i32.const 0)
-                (func (export "transform") (param i32 i32) (result i32) i32.const -1))"#,
+                (func (export "alloc") (param i32) (result i32) i32.const 8)
+                (func (export "dealloc") (param i32) (param i32))
+                (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+                (func (export "transform") (param i32 i32) (result i64) i64.const 0))"#,
         );
 
         let result = WasmRuntime::new(module_path.to_str().expect("utf8"));
@@ -973,16 +1044,17 @@ mod tests {
     async fn rejects_module_missing_required_exports() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let module_path = temp_dir.path().join("module.wasm");
+        // Missing alloc, dealloc, rustcdc_abi_version — only has transform.
         write_wat_module(
             &module_path,
             r#"(module
                 (memory (export "memory") 1)
-                (func (export "transform") (param i32 i32) (result i32) i32.const -1))"#,
+                (func (export "transform") (param i32 i32) (result i64) i64.const 0))"#,
         );
 
         let result = WasmRuntime::new(module_path.to_str().expect("utf8"));
         assert!(
-            matches!(result, Err(Error::ConfigError(message)) if message.contains("missing required export"))
+            matches!(result, Err(Error::ConfigError(ref message)) if message.contains("missing required"))
         );
     }
 
@@ -990,18 +1062,20 @@ mod tests {
     async fn rejects_module_with_invalid_transform_signature() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let module_path = temp_dir.path().join("module.wasm");
+        // All required exports present but transform returns i32 instead of i64.
         write_wat_module(
             &module_path,
             r#"(module
                 (memory (export "memory") 1)
-                (func (export "alloc") (param i32) (result i32) i32.const 0)
-                (func (export "output_len") (result i32) i32.const 0)
+                (func (export "alloc") (param i32) (result i32) i32.const 8)
+                (func (export "dealloc") (param i32) (param i32))
+                (func (export "rustcdc_abi_version") (result i32) i32.const 2)
                 (func (export "transform") (param i32) (result i32) i32.const 0))"#,
         );
 
         let result = WasmRuntime::new(module_path.to_str().expect("utf8"));
         assert!(
-            matches!(result, Err(Error::ConfigError(message)) if message.contains("invalid signature"))
+            matches!(result, Err(Error::ConfigError(ref message)) if message.contains("invalid signature"))
         );
     }
 }
