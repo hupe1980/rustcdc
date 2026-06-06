@@ -47,8 +47,12 @@ fi
 
 if [[ "${1:-}" == "--relational-smoke" ]]; then
   for image in "${NON_POSTGRES_RELATIONAL_SMOKE_IMAGES[@]}"; do
-    pull_with_retry "$image"
-    echo "prepared ${image}"
+    # Pull from the ECR public mirror (no Docker Hub rate-limits / auth required)
+    # and re-tag to the bare name so testcontainers finds it in the local cache.
+    ecr_image="public.ecr.aws/docker/library/${image}"
+    pull_with_retry "$ecr_image"
+    docker tag "$ecr_image" "$image"
+    echo "prepared ${image} from ${ecr_image}"
   done
   exit 0
 fi
