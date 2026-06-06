@@ -263,6 +263,14 @@ impl FileJsonlSink {
     /// Atomically rename the active file to a timestamped archive and open a
     /// fresh active file at the original path.
     ///
+    /// ## Restart-safety invariant
+    ///
+    /// After rotation the original configured `path` always refers to the
+    /// **current active file**.  On process restart, `open_with(path, ...)` opens
+    /// this file and appends to it — no events are lost and no gap is created.
+    /// The archive files are named `<stem>.<timestamp_ms>.<rotation_count>.<ext>`
+    /// and are never touched again by this sink instance.
+    ///
     /// Uses `tokio::fs::OpenOptions` for the new-file open to avoid blocking
     /// the executor on slow or network-backed filesystems.
     async fn rotate(&mut self) -> Result<()> {
@@ -319,6 +327,14 @@ fn rotated_path(path: &Path, timestamp_ms: u128, rotation_count: u64) -> PathBuf
 impl SinkAdapter for FileJsonlSink {
     fn name(&self) -> &str {
         "file-jsonl"
+    }
+
+    /// Current number of events in the in-memory pending batch.
+    ///
+    /// Used by the runtime for back-pressure observation.  Returns `Some(0)`
+    /// when all pending events have been flushed to the OS page cache.
+    fn queue_depth(&self) -> Option<usize> {
+        Some(self.pending_lines.len())
     }
 
     async fn send(&mut self, event: &Event) -> Result<()> {
