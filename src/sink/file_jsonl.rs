@@ -222,9 +222,16 @@ impl FileJsonlSink {
     }
 
     /// Write a pre-formatted line (including the trailing `\n`) to the buffered
-    /// writer, rotating the active file first if the size threshold is met.
+    /// writer, rotating the active file first if writing the line would push the
+    /// cumulative byte count past the configured size threshold.
+    ///
+    /// The `bytes_written > 0` guard prevents producing empty rotated files on
+    /// the very first write or immediately after a prior rotation.
     async fn write_line(&mut self, line: &[u8]) -> Result<()> {
-        if self.rotate_size_bytes > 0 && self.bytes_written >= self.rotate_size_bytes {
+        if self.rotate_size_bytes > 0
+            && self.bytes_written > 0
+            && self.bytes_written + line.len() as u64 > self.rotate_size_bytes
+        {
             self.rotate().await?;
         }
         self.writer.write_all(line).await.map_err(Error::IoError)?;
@@ -248,11 +255,17 @@ impl FileJsonlSink {
     }
 
     /// Drain the pending batch to disk and flush.
+    ///
+    /// Uses `drain(..)` rather than `mem::take` so the backing allocation of
+    /// `pending_lines` is preserved for the next batch, avoiding reallocation
+    /// on the hot path.
     async fn flush_pending(&mut self) -> Result<()> {
         if self.pending_lines.is_empty() {
             return self.flush_writer().await;
         }
-        let batch = std::mem::take(&mut self.pending_lines);
+        // Drain preserves the Vec's capacity; collect into a local vec so we
+        // can call async methods on &mut self inside the loop below.
+        let batch: Vec<Vec<u8>> = self.pending_lines.drain(..).collect();
         self.pending_bytes = 0;
         for line in batch {
             self.write_line(&line).await?;
@@ -364,6 +377,14 @@ impl SinkAdapter for FileJsonlSink {
             return Ok(());
         }
         self.flush_pending().await?;
+        // Force a final sync_data() regardless of the fsync_every cadence.
+        // close() is always a durability boundary — the caller must be able to
+        // rely on all events being on stable storage after this returns.
+        self.writer
+            .get_ref()
+            .sync_data()
+            .await
+            .map_err(Error::IoError)?;
         self.closed = true;
         Ok(())
     }

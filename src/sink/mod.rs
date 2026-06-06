@@ -12,7 +12,7 @@
 //! | [`MemorySinkAdapter`] | In-memory; for tests and rapid prototyping |
 //! | [`StdoutSink`] | Writes NDJSON to stdout; for local debugging and Docker deployments |
 //! | [`FileJsonlSink`] | Appends NDJSON to a file with async I/O, batching, and rotation |
-//! | [`FanOutSinkAdapter`] | Delivers each event to every child sink in sequence |
+//! | [`FanOutSinkAdapter`] | Delivers each event to every child sink **concurrently** |
 //! | [`BoxedSink`] | Type-erased heap-allocated adapter for dynamic dispatch |
 //!
 //! # Delivery contract

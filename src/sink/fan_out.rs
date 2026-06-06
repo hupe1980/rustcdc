@@ -7,9 +7,10 @@ use crate::sink::{BoxedSink, SinkAdapter, SinkDeliveryGuarantee};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-/// Drive every `future` concurrently; return the first error encountered, or
-/// `Ok(())` when all succeed.  All futures run to completion regardless of
-/// individual failures.
+/// Drive every `future` concurrently; return the first `Err` in **input
+/// position order** (not completion-time order), or `Ok(())` when all succeed.
+/// All futures run to completion regardless of individual failures — no future
+/// is cancelled when another returns an error.
 async fn join_first_err<I, F>(futures: I) -> Result<()>
 where
     I: IntoIterator<Item = F>,
@@ -29,14 +30,23 @@ where
 ///
 /// ## Concurrency model
 ///
-/// `send`, `flush`, `close`, `commit_checkpoint_barrier`, and
-/// `abort_checkpoint_barrier` drive all children simultaneously.  This means:
+/// `send`, `flush`, `close`, `commit_checkpoint_barrier`,
+/// `abort_checkpoint_barrier`, and `preflight_check` drive all children
+/// **simultaneously** — they all receive the call at the same time rather than
+/// one after another.  This means:
 ///
-/// * **Latency** = `max(child_latencies)` rather than `Σ(child_latencies)`.
-/// * A **slow or stuck** child cannot starve progress in any other child.
-/// * **Ordering** within each individual sink is preserved: event *N* is
-///   delivered to all sinks concurrently; the fan-out awaits all of them
-///   before processing event *N+1*.
+/// * **Latency per operation** = `max(child_latencies)` rather than
+///   `Σ(child_latencies)`.  A fast child is not held back by a slow sibling
+///   *within the same operation*.
+/// * **Ordering within each individual sink is preserved**: event *N* is
+///   delivered to all children concurrently; the fan-out awaits all of them
+///   before processing event *N+1*, so each child sees a contiguous,
+///   in-order stream.
+/// * **A permanently stuck child will block the fan-out**: `join_all` awaits
+///   every child.  If a child hangs indefinitely, the enclosing operation
+///   hangs too.  Use `SinkAdapter::close_with_timeout` on the
+///   `FanOutSinkAdapter` itself to apply a bounded shutdown deadline, or
+///   ensure individual children have their own internal timeouts.
 ///
 /// `preflight_check` also runs concurrently, so all connectivity failures are
 /// surfaced in one startup pass rather than one-at-a-time.
@@ -52,7 +62,10 @@ where
 /// ## Error semantics
 ///
 /// Even when one child returns an error, all remaining children still receive
-/// the call.  The caller receives the **first** error encountered.
+/// the call — no child is skipped or cancelled.  The caller receives the
+/// **first error by input position** (i.e., the error from the lowest-index
+/// failing child), not necessarily the one that failed first in wall-clock
+/// time.
 ///
 /// ## Delivery guarantee
 ///
@@ -118,7 +131,7 @@ impl SinkAdapter for FanOutSinkAdapter {
     /// Send `event` to every child sink **concurrently**.
     ///
     /// All children receive the event regardless of individual failures.
-    /// Returns the first error encountered.
+    /// Returns the first error by input position after all children complete.
     async fn send(&mut self, event: &Event) -> Result<()> {
         join_first_err(self.sinks.iter_mut().map(|s| s.send(event))).await
     }
@@ -126,16 +139,21 @@ impl SinkAdapter for FanOutSinkAdapter {
     /// Flush every child sink **concurrently**.
     ///
     /// All children are flushed regardless of individual failures.
-    /// Returns the first error encountered.
+    /// Returns the first error by input position after all children complete.
     async fn flush(&mut self) -> Result<()> {
         join_first_err(self.sinks.iter_mut().map(|s| s.flush())).await
     }
 
     /// Close every child sink **concurrently**.
     ///
-    /// All children are closed regardless of individual failures (a hung close
-    /// on one child never prevents others from closing).
-    /// Returns the first error encountered.
+    /// All children receive the `close()` call simultaneously; a slow child
+    /// does not delay the *start* of another child's close.  However, the
+    /// fan-out awaits **all** children before returning, so a permanently hung
+    /// child will stall the overall close.  Apply
+    /// [`SinkAdapter::close_with_timeout`] on the `FanOutSinkAdapter` itself
+    /// for a bounded shutdown deadline.
+    ///
+    /// Returns the first error by input position after all children complete.
     async fn close(&mut self) -> Result<()> {
         join_first_err(self.sinks.iter_mut().map(|s| s.close())).await
     }
