@@ -283,6 +283,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mysql_process_crash_integration'
         run: cargo test --test ${{ matrix.suite }} --features mysql
@@ -300,6 +302,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
         run: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
 
@@ -320,6 +324,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mariadb_process_crash_integration'
         run: cargo test --test ${{ matrix.suite }} --features mariadb
@@ -337,6 +343,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: pre-pull mysql/mariadb images
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
         run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
 
