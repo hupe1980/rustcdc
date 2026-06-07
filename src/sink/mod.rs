@@ -372,7 +372,12 @@ pub trait SinkAdapter: Send {
     /// Whether the adapter has been closed.
     ///
     /// Returns `true` after [`close`] has been called.  The default implementation
-    /// always returns `false` — adapters that track closed state should override this.
+    /// always returns `false`.
+    ///
+    /// **Adapters that need to pass [`BasicAdapterConformance`] checks must override
+    /// this method** — the `crash_recovery` conformance test asserts that `is_closed()`
+    /// returns `true` after `close()` is called.  Relying on the default will cause
+    /// conformance failures.
     ///
     /// [`close`]: SinkAdapter::close
     fn is_closed(&self) -> bool {

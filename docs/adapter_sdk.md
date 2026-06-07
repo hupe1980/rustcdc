@@ -142,22 +142,22 @@ database or a Kafka topic with transactions enabled).
 
 ### Responsibility split
 
-The **runtime** is responsible for:
-- Calling `begin_checkpoint_barrier()` before the commit window opens.
-- Calling `commit_checkpoint_barrier()` after the checkpoint is durable.
-- Calling `abort_checkpoint_barrier()` on any error in the commit window.
+> **Important:** The runtime does **not** call `begin_checkpoint_barrier`, `commit_checkpoint_barrier`,
+> or `abort_checkpoint_barrier` automatically. No runtime code drives the barrier.
+> The **embedder** must call these methods explicitly around the commit path.
+> The barrier methods are pure hooks on the `SinkAdapter` trait — they exist so the embedder
+> can drive them in a coordinated sequence with `commit_ack`.
+
+The **embedder** is responsible for:
+- Calling `sink.begin_checkpoint_barrier()` before the commit window opens.
+- Calling `sink.commit_checkpoint_barrier()` after `runtime.commit_ack(...)` succeeds.
+- Calling `sink.abort_checkpoint_barrier()` on any error in the commit window.
 
 The **sink** is responsible for:
 - Opening a transaction (or writing to a transactional staging area) on `begin_checkpoint_barrier`.
 - Making all `send()` calls part of that transaction during the window.
 - Committing the transaction atomically with the checkpoint on `commit_checkpoint_barrier`.
 - Rolling back on `abort_checkpoint_barrier`.
-
-> **Important:** The runtime does **not** orchestrate the barrier automatically. The embedder
-> must drive the barrier calls explicitly around the commit path. The barrier methods are hooks
-> — the runtime calls them at the right lifecycle points when the sink advertises
-> `EffectivelyOnce` via `delivery_guarantee()` and
-> `transactional_checkpoint_barrier_capable()` returns `true`.
 
 ### Minimal implementation skeleton
 

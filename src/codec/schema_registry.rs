@@ -801,9 +801,13 @@ where
     /// Keyless events (TRUNCATE, SCHEMA_CHANGE, tables without a declared primary
     /// key) produce `{"key": null}`, matching Debezium's behaviour.
     ///
-    /// Returns `None` only when the encoding itself panics (should not occur in
-    /// practice for well-formed events).
-    pub async fn encode_event_key(&self, event: &Event) -> Option<bytes::Bytes> {
+    /// # Errors
+    ///
+    /// Returns `Err` if the schema registry client fails to resolve the key schema
+    /// ID or if the Confluent wire-framing step fails.  These are typically
+    /// transient registry or network errors; callers should propagate or log them
+    /// rather than silently dropping the key.
+    pub async fn encode_event_key(&self, event: &Event) -> Result<bytes::Bytes> {
         let key_json = event
             .primary_key_values()
             .and_then(|v| serde_json::to_string(&v).ok());
@@ -811,7 +815,7 @@ where
         self.key_encoder
             .encode(&key_value, &self.topic, EncodeTarget::Key)
             .await
-            .ok()
+            .map_err(|e| Error::SourceError(format!("json schema encode event key: {e}")))
     }
 
     /// Cached schema ID for the value subject, or `None` if not yet resolved.
