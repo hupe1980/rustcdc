@@ -36,7 +36,7 @@ pub fn skip_docker_test(case_label: &str) -> bool {
 /// };
 /// ```
 pub fn is_skip_error(err: &rustcdc::Error) -> bool {
-    err.to_string().starts_with("SKIP:")
+    matches!(err, rustcdc::Error::SourceError(msg) if msg.starts_with("SKIP:"))
 }
 
 /// Returns `true` when the error message indicates that the container image
