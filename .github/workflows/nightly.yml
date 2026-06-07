@@ -27,6 +27,11 @@ jobs:
             --features postgres,test-harnesses \
             -- --include-ignored 2>&1 | tee target/soak-matrix-results.txt
         env:
+          # Intentionally set to "0" for nightly soak: this run executes
+          # long-duration ignored tests (e.g. extended fault injection) on
+          # ephemeral CI runners without a persisted Criterion baseline.
+          # Authoritative release-policy enforcement (BENCHMARK_ENFORCE_RELEASE_POLICY=1)
+          # runs exclusively in the release-evidence job on push/PR.
           BENCHMARK_ENFORCE_RELEASE_POLICY: "0"
       - name: Upload soak results
         if: always()

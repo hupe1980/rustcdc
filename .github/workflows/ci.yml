@@ -165,7 +165,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: reliability core suite (${{ matrix.suite }})
-        run: cargo test --test ${{ matrix.suite }} --features postgres,test-harnesses
+        run: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   latency-core:
     runs-on: ubuntu-latest
@@ -260,8 +260,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --test ${{ matrix.suite }} --features postgres,test-harnesses
-        run: cargo test --test ${{ matrix.suite }} --features postgres,test-harnesses
+      - name: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
+        run: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   integration-mysql:
     runs-on: ubuntu-latest

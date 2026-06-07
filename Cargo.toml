@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.92"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -19,8 +19,9 @@ default-members = ["."]
 resolver = "2"
 
 [features]
-# Default production profile with PostgreSQL source support and TLS transport enabled.
-default = ["postgres", "tls", "wasm"]
+# Default production profile: PostgreSQL source with TLS. Lean by design — no JIT runtime in the
+# default binary. Add --features wasm explicitly if WASM transforms are needed.
+default = ["postgres", "tls"]
 # Enable PostgreSQL-specific source implementations.
 postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
 # Enable MySQL-specific source implementations.
@@ -52,9 +53,9 @@ cloudevents = []
 protobuf = ["dep:prost"]
 # Enable Apache Avro binary encoding via apache-avro.
 avro = ["dep:apache-avro"]
-# Enable Confluent Schema Registry integration (Avro wire framing, schema registration/lookup,
+# Enable Confluent Schema Registry integration (Avro, JSON Schema wire framing, schema registration/lookup,
 # subject naming strategies). Delegates HTTP, caching, and wire format to the `schemreg` crate.
-schemreg = ["dep:schemreg", "dep:apache-avro"]
+schemreg = ["dep:schemreg", "dep:apache-avro", "dep:bytes", "avro"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -89,7 +90,8 @@ rustls-native-certs = { version = "0.8", optional = true }
 tokio-rustls = { version = "0.25", optional = true }
 prost = { version = "0.13", optional = true }
 apache-avro = { version = "0.17", optional = true }
-schemreg = { version = "0.3", default-features = false, features = ["confluent"], optional = true }
+bytes = { version = "1", optional = true }
+schemreg = { version = "0.3", default-features = false, features = ["confluent", "json"], optional = true }
 
 [dev-dependencies]
 criterion = "0.7.0"
@@ -109,6 +111,15 @@ harness = false
 [[bench]]
 name = "cdc_perf"
 harness = false
+required-features = ["wasm"]
+
+[[test]]
+name = "wasm_conformance_contract"
+required-features = ["wasm"]
+
+[[test]]
+name = "wasm_runtime_integration"
+required-features = ["wasm"]
 
 [[test]]
 name = "fault_injection_soak_matrix"

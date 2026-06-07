@@ -238,6 +238,19 @@ pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease>
                     // Atomically replace the stale lease using write-to-temp + rename.
                     // This eliminates the TOCTOU window between `remove` and `create_new`.
                     atomic_write_lease(lock_path, &lease_content).map_err(Error::from)?;
+
+                    // Post-rename race check: POSIX rename(2) is atomic but not exclusive.
+                    // Two processes that both observe the same dead PID can race through
+                    // atomic_write_lease; the last rename wins. Re-read and verify that
+                    // our own hostname:PID is in the file before proceeding as owner.
+                    let winner = fs::read_to_string(lock_path).unwrap_or_default();
+                    if parse_lease(&winner) != Some((hostname.to_owned(), owner_pid)) {
+                        return Err(Error::StateError(format!(
+                            "{store_label} owner lease conflict for '{parent_dir}': \
+                             lost stale-lease takeover race to a concurrent process. \
+                             Retry, or use a dedicated {store_label} directory per runtime instance."
+                        )));
+                    }
                 }
                 Some((ref host, pid)) if host != hostname => {
                     // Different host — do NOT attempt liveness check: the PID namespace
@@ -347,6 +360,7 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn format_and_parse_round_trip() {
@@ -382,5 +396,156 @@ mod tests {
     fn parse_rejects_empty() {
         assert!(parse_lease("").is_none());
         assert!(parse_lease("  ").is_none());
+    }
+
+    // ── acquire() tests ──────────────────────────────────────────────────────
+
+    /// Fresh directory: acquire creates the lease file and returns an OwnerLease.
+    #[test]
+    fn acquire_creates_new_lease() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("test.owner");
+        let lease = acquire(&lock_path, "test").unwrap();
+        assert_eq!(lease.lock_path, lock_path);
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        let (host, pid) = parse_lease(&contents).unwrap();
+        assert_eq!(host, current_hostname());
+        assert_eq!(pid, std::process::id());
+        // OwnerLease::drop removes the file.
+        drop(lease);
+        assert!(!lock_path.exists());
+    }
+
+    /// Same process acquiring the same path twice must succeed (re-entrant).
+    #[test]
+    fn acquire_is_reentrant_within_same_process() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("test.owner");
+        let lease1 = acquire(&lock_path, "test").unwrap();
+        let lease2 = acquire(&lock_path, "test").unwrap();
+        drop(lease1);
+        // After first drop the ref-count is 1; file should still exist.
+        assert!(lock_path.exists());
+        drop(lease2);
+        // After second drop the ref-count hits 0; file is removed.
+        assert!(!lock_path.exists());
+    }
+
+    /// A lease held by a live PID must be refused.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_live_pid_lease() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("test.owner");
+        // PID 1 (init/launchd) is always alive.
+        let live_lease = format_lease(current_hostname(), 1);
+        std::fs::write(&lock_path, live_lease.as_bytes()).unwrap();
+        let result = acquire(&lock_path, "test");
+        assert!(result.is_err(), "expected conflict error for live PID");
+    }
+
+    /// A stale (dead-process) lease must be auto-cleared and the caller takes ownership.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_clears_stale_dead_pid_lease() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("test.owner");
+        let stale = format_lease(current_hostname(), u32::MAX);
+        std::fs::write(&lock_path, stale.as_bytes()).unwrap();
+        let lease = acquire(&lock_path, "test").unwrap();
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        let (host, pid) = parse_lease(&contents).unwrap();
+        assert_eq!(host, current_hostname());
+        assert_eq!(pid, std::process::id());
+        drop(lease);
+    }
+
+    /// `acquire()` exercises the post-rename check on the winner (success) path:
+    /// the process clears a stale dead-PID lease, atomically renames its own
+    /// content into place, re-reads, and confirms the file contains its own
+    /// `HOSTNAME:PID` before returning `OwnerLease`.
+    ///
+    /// This test verifies that the post-rename check code path is actually
+    /// reached and passes when the current process wins the rename race.
+    ///
+    /// The *loser* path (another process overwrites the file between our rename
+    /// and our re-read) cannot be exercised deterministically in a single-process
+    /// unit test — that scenario requires two real processes racing at the OS
+    /// rename layer and is covered at the integration level.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_winner_path_exercises_post_rename_check() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("test.owner");
+
+        // Precondition: stale dead-process lease is present.
+        let stale = format_lease(current_hostname(), u32::MAX);
+        std::fs::write(&lock_path, stale.as_bytes()).unwrap();
+
+        // acquire() must: (a) detect the dead PID, (b) call atomic_write_lease,
+        // (c) re-read and confirm HOSTNAME:PID is ours, (d) return Ok(OwnerLease).
+        let lease = acquire(&lock_path, "test")
+            .expect("acquire should succeed when clearing a stale dead-PID lease");
+
+        // Post-condition: the file contains exactly our hostname and PID, proving
+        // the post-rename check ran and confirmed the winner state.
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        let (host, pid) = parse_lease(&contents)
+            .expect("lease file must contain a valid HOSTNAME:PID after acquire");
+        assert_eq!(host, current_hostname(), "lease hostname must be ours");
+        assert_eq!(pid, std::process::id(), "lease PID must be ours");
+
+        drop(lease); // RAII cleanup removes the lock file
+        assert!(
+            !lock_path.exists(),
+            "lock file should be removed when the last OwnerLease is dropped"
+        );
+    }
+
+    /// Validates the `parse_lease` comparison logic used by the post-rename race
+    /// check inside `acquire()`.
+    ///
+    /// Specifically: a lease token containing a *foreign* PID must not compare
+    /// equal to `Some((current_hostname(), current_pid))`, while a token
+    /// containing our own hostname and PID must.  This is the predicate
+    /// `acquire()` evaluates after the atomic rename to decide whether it won
+    /// or lost the takeover race.
+    ///
+    /// This test exercises the predicate in isolation; the full `acquire()` code
+    /// path for the winner case is covered by
+    /// `acquire_winner_path_exercises_post_rename_check`.
+    #[cfg(unix)]
+    #[test]
+    fn post_rename_check_predicate_accepts_own_pid_rejects_foreign() {
+        let our_content = format_lease(current_hostname(), std::process::id());
+        let foreign_content = format_lease(current_hostname(), u32::MAX);
+
+        // Our own hostname:PID passes the check.
+        assert_eq!(
+            parse_lease(&our_content),
+            Some((current_hostname().to_owned(), std::process::id())),
+            "own lease token must parse to (our_hostname, our_pid)"
+        );
+        // A foreign PID fails the check — the process would correctly return Err.
+        assert_ne!(
+            parse_lease(&foreign_content),
+            Some((current_hostname().to_owned(), std::process::id())),
+            "foreign lease token must not match (our_hostname, our_pid)"
+        );
+    }
+
+    /// Ref-count increments and decrements are balanced; file is removed at zero.
+    #[test]
+    fn ref_count_increment_decrement_balanced() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("refcount.owner");
+        std::fs::write(&lock_path, b"dummy").unwrap();
+
+        increment_lease_ref(&lock_path);
+        increment_lease_ref(&lock_path);
+        assert_eq!(decrement_lease_ref(&lock_path), 1);
+        assert_eq!(decrement_lease_ref(&lock_path), 0);
+        // Decrementing past zero should return 0 and not panic.
+        assert_eq!(decrement_lease_ref(&lock_path), 0);
     }
 }

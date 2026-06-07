@@ -128,6 +128,26 @@ impl SinkAdapter for FanOutSinkAdapter {
         "fan-out"
     }
 
+    fn is_closed(&self) -> bool {
+        self.sinks.iter().all(|s| s.is_closed())
+    }
+
+    fn delivery_metrics(&self) -> Option<crate::sink::SinkDeliveryMetrics> {
+        let mut any = false;
+        let mut agg = crate::sink::SinkDeliveryMetrics::default();
+        for s in &self.sinks {
+            if let Some(m) = s.delivery_metrics() {
+                agg.merge(&m);
+                any = true;
+            }
+        }
+        if any {
+            Some(agg)
+        } else {
+            None
+        }
+    }
+
     /// Send `event` to every child sink **concurrently**.
     ///
     /// All children receive the event regardless of individual failures.

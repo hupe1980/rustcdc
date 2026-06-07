@@ -9,6 +9,7 @@ use crate::{
     checkpoint::{CommitBarrier, GenericOffset},
     ddl_capture::{parse_ddl_statement, DdlDialect},
     schema_history::{SchemaHistory, SchemaHistoryRetention},
+    sink::{BoxedSink, SinkAdapter},
     source::{
         ConnectorCapabilities, HandoffResult, IncrementalSnapshotConfig, SnapshotHandle,
         StreamHandle,
@@ -131,24 +132,15 @@ pub struct RuntimeOptions {
     /// exceeds this value. Set to `None` (the default) to disable byte-level
     /// throttling and rely only on `max_buffer_size`.
     pub max_event_bytes: Option<usize>,
-    /// Optional timeout applied to sink close during orderly runtime shutdown.
+    /// Timeout applied to sink close during orderly runtime shutdown.
     ///
-    /// When set, the runtime documentation and shutdown helpers use this value
-    /// to bound the time spent waiting for the sink to close (e.g. flushing a
-    /// Kafka transactional producer). If the sink does not close within
-    /// `sink_close_timeout_ms` milliseconds the shutdown path should surface
-    /// [`Error::TimeoutError`] to the operator rather than blocking indefinitely.
+    /// When a sink is registered via [`CdcRuntime::register_sink`], this
+    /// timeout is enforced automatically during [`CdcRuntime::stop`],
+    /// [`CdcRuntime::force_stop`], and [`CdcRuntime::drain_and_stop`].
     ///
-    /// Consumers should call [`crate::sink::SinkAdapter::close_with_timeout`] with this value
-    /// in their shutdown path:
-    ///
-    /// ```rust,ignore
-    /// if let Some(timeout_ms) = runtime_config.options.sink_close_timeout_ms {
-    ///     sink.close_with_timeout(timeout_ms).await?;
-    /// } else {
-    ///     sink.close().await?;
-    /// }
-    /// ```
+    /// If the sink does not close within `sink_close_timeout_ms` milliseconds,
+    /// the shutdown path surfaces [`crate::core::Error::TimeoutError`] to the
+    /// operator rather than blocking indefinitely.
     ///
     /// Set to `None` (default) to leave close duration unbounded.
     pub sink_close_timeout_ms: Option<u64>,
@@ -275,12 +267,61 @@ impl RuntimeOptions {
     /// **The handler runs synchronously in the runtime poll loop.** It must not
     /// block (no `sleep`, no synchronous I/O, no blocking locks) and must not
     /// panic. Buffer the event into an internal channel and drain asynchronously
-    /// if you need slow I/O.
+    /// if you need slow I/O, or use [`RuntimeOptions::with_dead_letter_handler_async`]
+    /// to automatically spawn the handler as a detached Tokio task.
     pub fn with_dead_letter_handler(
         mut self,
         handler: impl Fn(Event, Error) + Send + Sync + 'static,
     ) -> Self {
         self.dead_letter_handler = Some(std::sync::Arc::new(handler));
+        self
+    }
+
+    /// Register an **async** dead-letter handler invoked when an event is skipped
+    /// under [`TransformErrorPolicy::Skip`].
+    ///
+    /// Unlike [`with_dead_letter_handler`](Self::with_dead_letter_handler), this
+    /// variant spawns the handler as a **detached [`tokio::task`]** so the async
+    /// future can await slow I/O (network writes, channel sends, file appends)
+    /// without blocking the CDC poll loop.
+    ///
+    /// # Ordering
+    ///
+    /// Because each invocation is spawned as an independent task, handler calls
+    /// for different events may execute concurrently and may complete out-of-order
+    /// relative to each other. If strict ordering matters, use a bounded channel
+    /// inside the handler and drain it sequentially from a single background task.
+    ///
+    /// # Panics
+    ///
+    /// The spawned task is detached (`tokio::spawn`); a panic inside the handler
+    /// future will abort only that task, not the CDC runtime.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use rustcdc::{core::RuntimeOptions, TransformErrorPolicy};
+    ///
+    /// let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    /// let options = RuntimeOptions::default()
+    ///     .with_transform_error_policy(TransformErrorPolicy::Skip)
+    ///     .with_dead_letter_handler_async(move |event, error| {
+    ///         let tx = tx.clone();
+    ///         async move {
+    ///             // Can await here safely — runs in a separate task.
+    ///             let _ = tx.send((event, error));
+    ///         }
+    ///     });
+    /// // Drive rx in a background task to drain the DLQ.
+    /// ```
+    pub fn with_dead_letter_handler_async<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Event, Error) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.dead_letter_handler = Some(std::sync::Arc::new(move |event, error| {
+            tokio::spawn(handler(event, error));
+        }));
         self
     }
 
@@ -1340,6 +1381,13 @@ pub struct CdcRuntime {
     last_checkpoint_saved_at_ms: Option<u64>,
     transform_pipeline: TransformPipeline,
     idempotency_guard: Option<EventIdempotencyGuard>,
+    /// Registered sink that is closed (with the configured timeout) during
+    /// [`stop`](CdcRuntime::stop), [`force_stop`](CdcRuntime::force_stop), and
+    /// [`drain_and_stop`](CdcRuntime::drain_and_stop).
+    ///
+    /// Wrapped in `Mutex` so that `CdcRuntime` remains `Sync` (required by
+    /// `BoxStream::boxed` used in the poll path).
+    registered_sink: Option<std::sync::Mutex<BoxedSink>>,
 }
 
 impl CdcRuntime {
@@ -1436,6 +1484,7 @@ impl CdcRuntime {
             last_checkpoint_saved_at_ms: None,
             transform_pipeline: TransformPipeline::default(),
             idempotency_guard,
+            registered_sink: None,
         })
     }
 
@@ -1479,6 +1528,30 @@ impl CdcRuntime {
     /// Add a transform stage applied to polled events.
     pub fn add_transform(&mut self, transform: Box<dyn crate::transform::Transform>) {
         self.transform_pipeline.add_transform(transform);
+    }
+
+    /// Register a sink to be closed (with the configured timeout) during
+    /// [`stop`](CdcRuntime::stop), [`force_stop`](CdcRuntime::force_stop), and
+    /// [`drain_and_stop`](CdcRuntime::drain_and_stop).
+    ///
+    /// The timeout is read from [`RuntimeOptions::sink_close_timeout_ms`] at
+    /// shutdown time. If no timeout is configured, [`SinkAdapter::close`] is
+    /// called without a deadline.
+    ///
+    /// Replaces any previously registered sink. The replaced sink is **dropped**
+    /// without being closed — call `close` on it first if graceful close matters.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut sink = MyKafkaSink::new(config);
+    /// runtime.register_sink(sink);
+    /// runtime.start().await?;
+    /// // …poll loop…
+    /// runtime.stop().await?; // closes the registered sink with configured timeout
+    /// ```
+    pub fn register_sink<S: crate::sink::SinkAdapter + 'static>(&mut self, sink: S) {
+        self.registered_sink = Some(std::sync::Mutex::new(BoxedSink::new(sink)));
     }
 
     /// Replace the runtime source with a mock for testing.

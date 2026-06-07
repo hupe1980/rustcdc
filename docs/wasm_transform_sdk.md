@@ -162,3 +162,46 @@ cargo build --release --target wasm32-unknown-unknown
 ## Non-Goals
 - No full WASI runtime integration.
 - No cross-module orchestration.
+
+---
+
+## ABI Versioning and Deprecation Policy
+
+The WASM guest ABI is versioned via the `rustcdc_abi_version()` export. The **current ABI is v2**.
+
+### Guarantees
+
+| Guarantee | Policy |
+|---|---|
+| **Breaking ABI bumps** | Only introduced in **minor or major** crate version increments (never in patch releases). |
+| **Minimum notice period** | A new ABI version is introduced as an **opt-in** accepted version first, alongside the current version. The old ABI version is accepted for at least **one full minor-version cycle** (i.e., until the next minor release after the new ABI stabilises). |
+| **Breaking rejection** | The old ABI is rejected (hard load error) only in the **next major crate version** after the deprecation notice period ends. |
+| **Deprecation announcement** | Announced via `CHANGELOG.md`, the crate-level `#[doc]` on `validate_wasm_contract`, and a `tracing::warn!` at module load time when a deprecated-but-still-accepted version is detected. |
+
+### Current version history
+
+| ABI Version | Introduced | Status | Crate version range |
+|---|---|---|---|
+| v1 | < 0.5 | **Removed** (rejected at load) | < 0.5.0 |
+| v2 | 0.5.0 | **Current** | ≥ 0.5.0 |
+
+### Migration guide: v2 → v3 (future)
+
+When ABI v3 is introduced:
+
+1. The runtime will accept **both v2 and v3** modules and emit a `WARN` log for v2 modules.
+2. Guest modules must update `rustcdc_abi_version()` to return `3` and adapt to any changed calling convention documented in the v3 release notes.
+3. After one minor-version cycle, v2 modules will be **rejected at load time** with a structured `Error::ConfigError` explaining the required migration.
+
+### Checking your module's ABI version
+
+```bash
+# Inspect a compiled WASM module's exports:
+wasm-objdump -x your_transform.wasm | grep rustcdc_abi_version
+```
+
+Or verify at runtime — the loader surfaces the detected version in the error message on rejection:
+```
+Error: ConfigError("WASM module ABI version mismatch: got 1, expected 2. \
+                    Recompile against rustcdc >= 0.5.0 or use the abi_version = 2 skeleton.")
+```

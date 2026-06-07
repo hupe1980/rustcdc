@@ -7,7 +7,7 @@ The repository includes canonical event contracts, checkpoint safety primitives,
 
 Active development. Core connector/runtime library paths are implemented and validated by unit and integration suites.
 
-Current crate release: 0.5.0.
+Current crate release: 0.6.0.
 
 ## MSRV 🛠️
 
@@ -20,11 +20,12 @@ cargo build
 cargo build --features postgres
 ```
 
-Default profile enables `postgres` + `tls`.
+Default profile enables `postgres` + `tls`. WASM transforms are **opt-in** (`--features wasm`).
 
 ## Feature Profiles ⚙️
 
-- default profile: secure-by-default build with `postgres` + `tls`
+- default profile: `postgres` + `tls` (lean, no JIT runtime in the default binary)
+- `--features wasm`: WASM transform sandbox via wasmtime (~15 MB release binary overhead; opt-in by design)
 - `--features postgres`: PostgreSQL connector profile (TLS transport is required and enabled transitively)
 - `--features mysql`: MySQL connector profile (TLS transport is required and enabled transitively)
 - `--features mariadb`: MariaDB connector profile (reuses the MySQL transport stack with MariaDB source identity)

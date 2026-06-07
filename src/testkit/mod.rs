@@ -411,8 +411,8 @@ mod tests {
             Some(&self.events)
         }
 
-        fn is_closed(&self) -> Option<bool> {
-            Some(self.closed)
+        fn is_closed(&self) -> bool {
+            self.closed
         }
     }
 

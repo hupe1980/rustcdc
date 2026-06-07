@@ -108,6 +108,38 @@ impl SinkDeliveryGuarantee {
     }
 }
 
+// ─── SinkDeliveryMetrics ──────────────────────────────────────────────────────
+
+/// A snapshot of delivery counters exposed by a [`SinkAdapter`] for observability.
+///
+/// Returned by [`SinkAdapter::delivery_metrics`].  All counters accumulate
+/// monotonically — they are never reset during the adapter's lifetime.
+///
+/// For composed adapters ([`FanOutSinkAdapter`], [`TableRouter`](crate::pipeline::TableRouter))
+/// the values are the sum of all child counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SinkDeliveryMetrics {
+    /// Total events successfully delivered since the adapter was created.
+    pub events_sent: u64,
+    /// Total events that resulted in an unrecovered error.
+    pub events_errored: u64,
+    /// Total retry attempts (across all events, including retries that ultimately succeeded).
+    pub events_retried: u64,
+    /// The offset string of the last successfully delivered event, if tracked by this adapter.
+    pub last_delivered_offset: Option<String>,
+}
+
+impl SinkDeliveryMetrics {
+    /// Merge `other` into `self` by summing counters.
+    ///
+    /// `last_delivered_offset` is not merged — it is only meaningful per leaf sink.
+    pub fn merge(&mut self, other: &Self) {
+        self.events_sent = self.events_sent.saturating_add(other.events_sent);
+        self.events_errored = self.events_errored.saturating_add(other.events_errored);
+        self.events_retried = self.events_retried.saturating_add(other.events_retried);
+    }
+}
+
 // ─── SinkAdapter ─────────────────────────────────────────────────────────────
 
 /// Trait for sending CDC events to a downstream system.
@@ -327,14 +359,41 @@ pub trait SinkAdapter: Send {
         None
     }
 
-    /// Optional closed-state hook for conformance assertions.
+    /// Snapshot of delivery counters for observability.
     ///
-    /// Return `Some(true)` after [`close`] has been called, `Some(false)` before,
-    /// or `None` if the adapter cannot track closed state.
+    /// Override to expose per-sink metrics to admin endpoints or Prometheus scrapers.
+    /// Returns `None` when the adapter does not track delivery counters.
+    ///
+    /// Default: `None`.
+    fn delivery_metrics(&self) -> Option<SinkDeliveryMetrics> {
+        None
+    }
+
+    /// Whether the adapter has been closed.
+    ///
+    /// Returns `true` after [`close`] has been called.  The default implementation
+    /// always returns `false`.
+    ///
+    /// **Adapters that need to pass [`BasicAdapterConformance`] checks must override
+    /// this method** — the `crash_recovery` conformance test asserts that `is_closed()`
+    /// returns `true` after `close()` is called.  Relying on the default will cause
+    /// conformance failures.
     ///
     /// [`close`]: SinkAdapter::close
-    fn is_closed(&self) -> Option<bool> {
-        None
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    // ── Convenience ───────────────────────────────────────────────────────────
+
+    /// Wrap this adapter in a type-erased [`BoxedSink`].
+    ///
+    /// Shorthand for [`BoxedSink::new(self)`](BoxedSink::new).
+    fn boxed(self) -> BoxedSink
+    where
+        Self: Sized + 'static,
+    {
+        BoxedSink::new(self)
     }
 }
 
@@ -355,7 +414,8 @@ trait ErasedSink: Send {
     fn erased_transactional_checkpoint_barrier_capable(&self) -> bool;
     fn erased_queue_depth(&self) -> Option<usize>;
     fn erased_flush_tick_interval(&self) -> Option<std::time::Duration>;
-    fn erased_is_closed(&self) -> Option<bool>;
+    fn erased_delivery_metrics(&self) -> Option<SinkDeliveryMetrics>;
+    fn erased_is_closed(&self) -> bool;
     fn erased_exported_events(&self) -> Option<&[Event]>;
     fn erased_begin_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a>;
     fn erased_commit_checkpoint_barrier<'a>(&'a mut self) -> BoxFut<'a>;
@@ -391,7 +451,10 @@ impl<T: SinkAdapter> ErasedSink for T {
     fn erased_flush_tick_interval(&self) -> Option<std::time::Duration> {
         self.flush_tick_interval()
     }
-    fn erased_is_closed(&self) -> Option<bool> {
+    fn erased_delivery_metrics(&self) -> Option<SinkDeliveryMetrics> {
+        self.delivery_metrics()
+    }
+    fn erased_is_closed(&self) -> bool {
         self.is_closed()
     }
     fn erased_exported_events(&self) -> Option<&[Event]> {
@@ -486,7 +549,11 @@ impl SinkAdapter for BoxedSink {
         self.0.erased_flush_tick_interval()
     }
 
-    fn is_closed(&self) -> Option<bool> {
+    fn delivery_metrics(&self) -> Option<SinkDeliveryMetrics> {
+        self.0.erased_delivery_metrics()
+    }
+
+    fn is_closed(&self) -> bool {
         self.0.erased_is_closed()
     }
 
@@ -578,8 +645,8 @@ impl SinkAdapter for MemorySinkAdapter {
         Some(&self.events)
     }
 
-    fn is_closed(&self) -> Option<bool> {
-        Some(self.closed)
+    fn is_closed(&self) -> bool {
+        self.closed
     }
 
     // delivery_guarantee, idempotent_delivery_capable, etc. use defaults.
@@ -769,12 +836,10 @@ impl BasicAdapterConformance {
         adapter.flush().await?;
         adapter.close().await?;
 
-        if let Some(is_closed) = adapter.is_closed() {
-            if !is_closed {
-                return Err(Error::StateError(
-                    "crash_recovery conformance expected adapter to report closed state".into(),
-                ));
-            }
+        if !adapter.is_closed() {
+            return Err(Error::StateError(
+                "crash_recovery conformance expected adapter to report closed state".into(),
+            ));
         }
 
         if let Some(before) = before_len {

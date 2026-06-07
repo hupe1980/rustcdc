@@ -18,6 +18,19 @@ fn skip_postgres_version_matrix_case() -> bool {
     true
 }
 
+/// Returns `true` when the error message indicates that the container image
+/// could not be pulled from the registry (rate-limit, access denial, network
+/// partition, or retired tag).
+fn is_image_pull_failure(err: &rustcdc::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("failed to pull")
+        || msg.contains("pull access denied")
+        || msg.contains("does not exist or may require")
+        || msg.contains("status code 404")
+        || msg.contains("request is blocked")
+        || msg.contains("toomanyrequests")
+}
+
 macro_rules! postgres_version_test {
     ($name:ident, $image_tag:literal, $slot_name:literal, $publication_name:literal, $table_name:literal, $label:literal) => {
         #[tokio::test]
@@ -26,13 +39,25 @@ macro_rules! postgres_version_test {
                 return Ok(());
             }
 
-            run_postgres_version_connection_test(
+            match run_postgres_version_connection_test(
                 $image_tag,
                 $slot_name,
                 $publication_name,
                 $table_name,
             )
-            .await?;
+            .await
+            {
+                Ok(()) => {}
+                Err(ref e) if is_image_pull_failure(e) => {
+                    eprintln!(
+                        "skipping postgres version matrix test for {}: image pull failed — \
+                         Docker Hub may be unavailable or the tag may be retired.",
+                        $image_tag
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
 
             println!($label);
             Ok(())
