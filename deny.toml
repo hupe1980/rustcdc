@@ -1,0 +1,57 @@
+# cargo-deny configuration for rustcdc.
+#
+# Enforced by `cargo deny check` in the `policy-gate` CI job on every PR.
+# All vulnerabilities and yanked crates are denied by default (cargo-deny 0.19
+# behaviour: advisory checks are always enabled, the ignore list is the only
+# override mechanism).
+#
+# When adding a new ignore entry:
+#   1. Include the RUSTSEC ID and the exact package chain that introduces it.
+#   2. State why it cannot be fixed today (upstream blocker / dev-dep only).
+#   3. Remove the entry as soon as the upstream releases a fix.
+
+[advisories]
+ignore = [
+    # ── dev-dependency: testcontainers / astral-tokio-tar ────────────────────
+    # All four advisories below affect `astral-tokio-tar`, a transitive dep of
+    # `testcontainers 0.25.x` (dev-dep only; not present in production builds).
+    # The fix requires `astral-tokio-tar >= 0.6.1`, which needs a testcontainers
+    # release that bumps its own dep.
+    { id = "RUSTSEC-2026-0066", reason = "dev-dep only: testcontainers -> astral-tokio-tar 0.5.6; blocked on testcontainers upstream releasing astral-tokio-tar >=0.6.0" },
+    { id = "RUSTSEC-2026-0112", reason = "dev-dep only: testcontainers -> astral-tokio-tar 0.5.6; blocked on testcontainers upstream releasing astral-tokio-tar >=0.6.1" },
+    { id = "RUSTSEC-2026-0113", reason = "dev-dep only: testcontainers -> astral-tokio-tar 0.5.6; blocked on testcontainers upstream releasing astral-tokio-tar >=0.6.1" },
+    { id = "RUSTSEC-2026-0145", reason = "dev-dep only: testcontainers 0.25.x itself; blocked on testcontainers upstream release" },
+    { id = "RUSTSEC-2025-0134", reason = "dev-dep only: testcontainers 0.25.x itself; blocked on testcontainers upstream release" },
+    # ── dev-dependency: sqlx / rsa ───────────────────────────────────────────
+    # RUSTSEC-2023-0071 (RSA Marvin timing side-channel) affects rsa 0.9.x,
+    # pulled in by sqlx-mysql which is a dev-dep (integration test helper only).
+    # rustcdc production code paths perform no RSA operations.
+    # Remove when sqlx >= 0.9 migration is completed.
+    { id = "RUSTSEC-2023-0071", reason = "dev-dep only: sqlx -> sqlx-mysql -> rsa 0.9.x; no RSA in production paths; blocked on sqlx 0.9 migration" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "OpenSSL",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

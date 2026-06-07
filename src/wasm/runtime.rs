@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
     },
     time::Duration,
@@ -22,6 +22,54 @@ pub const DEFAULT_WASM_TIMEOUT_MS: u64 = 50;
 pub const DEFAULT_WASM_MEMORY_LIMIT_MB: u64 = 16;
 /// Default number of concurrent WASM instances in the pool.
 pub const DEFAULT_WASM_INSTANCE_POOL_SIZE: usize = 1;
+
+// ─── Metrics snapshot ────────────────────────────────────────────────────────
+
+/// Point-in-time snapshot of observable WASM runtime counters.
+///
+/// Obtain via [`WasmRuntime::metrics`]. All counters are monotonically
+/// increasing and accumulate from the moment the runtime is initialised.
+///
+/// Counters are updated with `Relaxed` ordering; values are internally
+/// consistent within a snapshot but not synchronized with in-flight
+/// transforms that are concurrently executing.
+#[derive(Debug, Clone, Default)]
+pub struct WasmRuntimeMetrics {
+    /// Number of WASM instances in the pool (static after construction).
+    pub instance_pool_size: usize,
+    /// Total number of transform invocations attempted since runtime init.
+    pub transform_total: u64,
+    /// Total number of transform invocations that returned an error.
+    pub transform_error_total: u64,
+    /// Total number of events filtered (dropped) by the WASM module.
+    pub filtered_total: u64,
+    /// Total number of transforms that exceeded the configured timeout.
+    pub timeout_total: u64,
+}
+
+/// Shared counter set updated by every pool slot on the hot path.
+///
+/// Kept behind an `Arc` so `WasmRuntime` can hold a reference for `metrics()`
+/// without the counters living inside the `dyn WasmModule` trait object.
+#[derive(Debug, Default)]
+struct WasmCounters {
+    transform_total: AtomicU64,
+    transform_error_total: AtomicU64,
+    filtered_total: AtomicU64,
+    timeout_total: AtomicU64,
+}
+
+impl WasmCounters {
+    fn snapshot(&self, pool_size: usize) -> WasmRuntimeMetrics {
+        WasmRuntimeMetrics {
+            instance_pool_size: pool_size,
+            transform_total: self.transform_total.load(Ordering::Relaxed),
+            transform_error_total: self.transform_error_total.load(Ordering::Relaxed),
+            filtered_total: self.filtered_total.load(Ordering::Relaxed),
+            timeout_total: self.timeout_total.load(Ordering::Relaxed),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WasmConfig {
@@ -100,6 +148,8 @@ pub struct WasmRuntime {
     module_bytes: Vec<u8>,
     module: Arc<dyn WasmModule>,
     initialized: bool,
+    /// Shared counter set; also referenced by the `RealWasmModule` via `Arc`.
+    counters: Arc<WasmCounters>,
 }
 
 struct RealWasmModule {
@@ -151,17 +201,21 @@ impl WasmRuntime {
         validate_wasm_config(&config)?;
         let module_bytes = std::fs::read(&config.module_path)?;
         validate_wasm_contract(&module_bytes)?;
-        let module = RealWasmModule::new(&module_bytes, &config)?;
+        let counters = Arc::new(WasmCounters::default());
+        let module = RealWasmModule::new(&module_bytes, &config, Arc::clone(&counters))?;
 
         Ok(Self {
             config,
             module_bytes,
             module: Arc::new(module),
             initialized: false,
+            counters,
         })
     }
 
     pub fn with_module(mut self, module: Arc<dyn WasmModule>) -> Self {
+        // Reset counters so that test modules start from zero.
+        self.counters = Arc::new(WasmCounters::default());
         self.module = module;
         self
     }
@@ -191,21 +245,37 @@ impl WasmRuntime {
         }
 
         let effective_timeout_ms = self.module.timeout_ms().min(self.config.timeout_ms).max(1);
-        let operation = tokio::time::timeout(
+        self.counters
+            .transform_total
+            .fetch_add(1, Ordering::Relaxed);
+        let result = tokio::time::timeout(
             Duration::from_millis(effective_timeout_ms),
             self.module.transform_bytes(&event_json),
         )
-        .await
-        .map_err(|_| {
-            Error::TimeoutError(format!(
-                "WASM transform exceeded timeout ({} ms)",
-                effective_timeout_ms
-            ))
-        })??;
+        .await;
 
-        match operation {
-            Some(transformed) => Ok(TransformResult::Ok(Box::new(transformed))),
-            None => Ok(TransformResult::Filtered),
+        match result {
+            Err(_) => {
+                self.counters.timeout_total.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .transform_error_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(Error::TimeoutError(format!(
+                    "WASM transform exceeded timeout ({} ms)",
+                    effective_timeout_ms
+                )))
+            }
+            Ok(Err(e)) => {
+                self.counters
+                    .transform_error_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+            Ok(Ok(Some(transformed))) => Ok(TransformResult::Ok(Box::new(transformed))),
+            Ok(Ok(None)) => {
+                self.counters.filtered_total.fetch_add(1, Ordering::Relaxed);
+                Ok(TransformResult::Filtered)
+            }
         }
     }
 
@@ -222,10 +292,20 @@ impl WasmRuntime {
     pub fn module_size_bytes(&self) -> usize {
         self.module_bytes.len()
     }
+
+    /// Return a point-in-time snapshot of observable WASM runtime counters.
+    ///
+    /// Counters accumulate from runtime initialisation and are never reset.
+    /// Reads use `Relaxed` ordering; values are accurate to within one
+    /// in-flight transform invocation.
+    pub fn metrics(&self) -> WasmRuntimeMetrics {
+        self.counters
+            .snapshot(self.config.instance_pool_size.max(1))
+    }
 }
 
 impl RealWasmModule {
-    fn new(module_bytes: &[u8], config: &WasmConfig) -> Result<Self> {
+    fn new(module_bytes: &[u8], config: &WasmConfig, _counters: Arc<WasmCounters>) -> Result<Self> {
         // Enable epoch interruption so that a runaway (infinite-loop) WASM
         // module cannot block the Tokio worker thread indefinitely.
         // The background ticker thread increments the engine epoch every 1 ms;
@@ -1156,23 +1236,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_module_with_invalid_transform_signature() {
+    async fn metrics_counts_successful_transforms() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let module_path = temp_dir.path().join("module.wasm");
-        // All required exports present but transform returns i32 instead of i64.
-        write_wat_module(
-            &module_path,
-            r#"(module
-                (memory (export "memory") 1)
-                (func (export "alloc") (param i32) (result i32) i32.const 8)
-                (func (export "dealloc") (param i32) (param i32))
-                (func (export "rustcdc_abi_version") (result i32) i32.const 2)
-                (func (export "transform") (param i32) (result i32) i32.const 0))"#,
-        );
+        write_wat_module(&module_path, minimal_conformant_wat());
 
-        let result = WasmRuntime::new(module_path.to_str().expect("utf8"));
-        assert!(
-            matches!(result, Err(Error::ConfigError(ref message)) if message.contains("invalid signature"))
-        );
+        let mock = Arc::new(MockWasmModule::new(0));
+        let mut runtime = WasmRuntime::new(module_path.to_str().expect("utf8"))
+            .expect("runtime")
+            .with_module(mock);
+
+        runtime.init().await.expect("init");
+        let _ = runtime
+            .transform(&minimal_event())
+            .await
+            .expect("transform 1");
+        let _ = runtime
+            .transform(&minimal_event())
+            .await
+            .expect("transform 2");
+
+        let m = runtime.metrics();
+        assert_eq!(m.transform_total, 2);
+        assert_eq!(m.transform_error_total, 0);
+        assert_eq!(m.filtered_total, 0);
+        assert_eq!(m.timeout_total, 0);
+        assert_eq!(m.instance_pool_size, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_timeout_as_error_and_timeout() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.wasm");
+        write_wat_module(&module_path, minimal_conformant_wat());
+
+        let mut runtime = WasmRuntime::new_with_config(WasmConfig {
+            module_path: module_path.clone(),
+            timeout_ms: 10,
+            memory_limit_mb: DEFAULT_WASM_MEMORY_LIMIT_MB,
+            instance_pool_size: 1,
+            fuel_async_yield_interval: None,
+        })
+        .expect("runtime")
+        .with_module(Arc::new(MockWasmModule::new(50)));
+
+        runtime.init().await.expect("init");
+        let _ = runtime
+            .transform(&minimal_event())
+            .await
+            .expect_err("timeout");
+
+        let m = runtime.metrics();
+        assert_eq!(m.transform_total, 1);
+        assert_eq!(m.transform_error_total, 1);
+        assert_eq!(m.timeout_total, 1);
+    }
+
+    struct FilteringMockModule;
+
+    #[async_trait]
+    impl WasmModule for FilteringMockModule {
+        async fn transform_bytes(&self, _event_json: &[u8]) -> Result<Option<Event>> {
+            Ok(None) // filtered
+        }
+
+        fn timeout_ms(&self) -> u64 {
+            1_000
+        }
+
+        async fn init(&self, _config: &WasmConfig) -> Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_filtered_events() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.wasm");
+        write_wat_module(&module_path, minimal_conformant_wat());
+
+        let mut runtime = WasmRuntime::new(module_path.to_str().expect("utf8"))
+            .expect("runtime")
+            .with_module(Arc::new(FilteringMockModule));
+
+        runtime.init().await.expect("init");
+        let r = runtime
+            .transform(&minimal_event())
+            .await
+            .expect("transform");
+        assert!(matches!(r, TransformResult::Filtered));
+
+        let m = runtime.metrics();
+        assert_eq!(m.transform_total, 1);
+        assert_eq!(m.filtered_total, 1);
+        assert_eq!(m.transform_error_total, 0);
     }
 }

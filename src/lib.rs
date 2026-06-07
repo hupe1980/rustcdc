@@ -73,8 +73,8 @@ pub use crate::transform::{
 };
 #[cfg(feature = "wasm")]
 pub use crate::wasm::{
-    TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime, WasmTransform,
-    DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,
+    TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,
+    WasmRuntimeMetrics, WasmTransform, DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,
 };
 
 #[cfg(feature = "avro")]

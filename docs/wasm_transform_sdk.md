@@ -106,6 +106,13 @@ Implemented in [src/wasm/runtime.rs](../src/wasm/runtime.rs):
   - `shutdown(&mut self) -> Result<()>`
   - `config(&self) -> &WasmConfig`
   - `module_size_bytes(&self) -> usize`
+  - `metrics(&self) -> WasmRuntimeMetrics` — point-in-time counter snapshot; see [`WasmRuntimeMetrics`] below
+- `WasmRuntimeMetrics`
+  - `instance_pool_size: usize` — number of WASM instances in the pool (static after construction)
+  - `transform_total: u64` — total invocations attempted since init
+  - `transform_error_total: u64` — total invocations that returned an error
+  - `filtered_total: u64` — total events dropped (filtered) by the module
+  - `timeout_total: u64` — total invocations that exceeded the configured timeout
 - `TransformResult`
   - `Ok(Box<Event>)` — transformed event
   - `Filtered` — event was dropped by the module (normal outcome)

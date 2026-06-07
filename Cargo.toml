@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.92"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -87,7 +87,7 @@ tokio-util = { version = "0.7.16", features = ["compat"] }
 rustls = { version = "0.23.19", default-features = false, features = ["std", "ring"], optional = true }
 rustls-pemfile = { version = "2.0", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
-tokio-rustls = { version = "0.25", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
 prost = { version = "0.13", optional = true }
 apache-avro = { version = "0.17", optional = true }
 bytes = { version = "1", optional = true }
@@ -95,9 +95,9 @@ schemreg = { version = "0.3", default-features = false, features = ["confluent",
 
 [dev-dependencies]
 criterion = "0.7.0"
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json"] }
 tempfile = "3.23.0"
-testcontainers = "0.25.2"
+testcontainers = "0.25"
 tokio-test = "0.4.4"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "std", "json"] }
 reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls"] }

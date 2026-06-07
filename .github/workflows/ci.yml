@@ -112,6 +112,13 @@ jobs:
           sudo apt-get install -y ripgrep jq
       - name: policy gates (schema + deprecated + workflow drift)
         run: bash scripts/ci-policy-gate.sh
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check (advisories + licenses + bans + sources)
+        run: cargo deny check
 
   correctness-smoke:
     runs-on: ubuntu-latest
@@ -431,6 +438,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep jq
+          cargo install cargo-deny --locked
 
       - name: derive benchmark baseline inputs
         env:
@@ -473,6 +481,9 @@ jobs:
 
       - name: policy gate
         run: bash scripts/ci-policy-gate.sh
+
+      - name: cargo deny check (advisories + licenses + bans + sources)
+        run: cargo deny check
 
       - name: clear stale criterion baseline cache
         run: |
