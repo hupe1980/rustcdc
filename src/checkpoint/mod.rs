@@ -6,9 +6,9 @@ pub(crate) mod owner_lease;
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::Write as _,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -173,16 +173,8 @@ pub struct FileCheckpoint {
     pub checkpoint_dir: PathBuf,
     /// Unix file mode used when creating checkpoint files.
     pub file_mode: u32,
-    lease: Mutex<Option<FileCheckpointLease>>,
+    lease: Mutex<Option<owner_lease::OwnerLease>>,
 }
-
-#[derive(Debug, Clone)]
-struct FileCheckpointLease {
-    lock_path: PathBuf,
-}
-
-static FILE_CHECKPOINT_LEASE_REFS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
-    OnceLock::new();
 
 impl FileCheckpoint {
     const OWNER_LEASE_FILENAME: &str = ".rustcdc_checkpoint.owner";
@@ -204,35 +196,6 @@ impl FileCheckpoint {
         self.checkpoint_dir.join(Self::OWNER_LEASE_FILENAME)
     }
 
-    fn lease_ref_counts() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
-        FILE_CHECKPOINT_LEASE_REFS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-    }
-
-    fn increment_lease_ref(lock_path: &Path) {
-        if let Ok(mut refs) = Self::lease_ref_counts().lock() {
-            let entry = refs.entry(lock_path.to_path_buf()).or_insert(0);
-            *entry = entry.saturating_add(1);
-        }
-    }
-
-    fn decrement_lease_ref(lock_path: &Path) -> usize {
-        let Ok(mut refs) = Self::lease_ref_counts().lock() else {
-            return 0;
-        };
-
-        let Some(entry) = refs.get_mut(lock_path) else {
-            return 0;
-        };
-
-        if *entry > 1 {
-            *entry -= 1;
-            *entry
-        } else {
-            refs.remove(lock_path);
-            0
-        }
-    }
-
     fn ensure_owner_lease(&self) -> Result<()> {
         let mut lease = self.lease.lock().map_err(|_| {
             crate::core::Error::CheckpointError(
@@ -247,128 +210,34 @@ impl FileCheckpoint {
         self.ensure_directory()?;
 
         let lock_path = self.lease_path();
-        let owner_pid = std::process::id();
-        let owner_hostname = owner_lease::current_hostname();
-        let owner_lease_str = owner_lease::format_lease(owner_hostname, owner_pid);
+        let acquired = owner_lease::acquire(&lock_path, "checkpoint")
+            .map_err(|e| crate::core::Error::CheckpointError(e.to_string()))?;
 
-        let create_result = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&lock_path);
-
-        match create_result {
-            Ok(mut lock_file) => {
-                self.write_permissions(&lock_file)?;
-                lock_file
-                    .write_all(owner_lease_str.as_bytes())
-                    .map_err(crate::core::Error::from)?;
-                lock_file.sync_all().map_err(crate::core::Error::from)?;
-                // Warn if checkpoint files already exist in this directory — a
-                // new lease on a non-empty directory may indicate a multi-process
-                // scenario or an unclean handoff from a previous instance.
-                let has_existing_checkpoints = fs::read_dir(&self.checkpoint_dir)
-                    .ok()
-                    .map(|entries| {
-                        entries.flatten().any(|e| {
-                            let name = e.file_name();
-                            let n = name.to_string_lossy();
-                            n.ends_with(".json") && n != "owner.lock"
-                        })
-                    })
-                    .unwrap_or(false);
-                if has_existing_checkpoints {
-                    tracing::warn!(
-                        target: "rustcdc::checkpoint",
-                        checkpoint_dir = %self.checkpoint_dir.display(),
-                        owner_pid = owner_pid,
-                        "checkpoint directory already contains checkpoint files — new process is \
-                         taking over. Ensure no other runtime instance is running against this \
-                         directory to avoid concurrent write corruption."
-                    );
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let parsed = fs::read_to_string(&lock_path)
-                    .ok()
-                    .and_then(|contents| owner_lease::parse_lease(&contents));
-
-                match parsed {
-                    Some((ref host, pid)) if host == owner_hostname && pid == owner_pid => {
-                        // Current process on this host already owns the lease.
-                    }
-                    Some((ref host, pid)) if host != owner_hostname => {
-                        tracing::error!(
-                            target: "rustcdc::checkpoint",
-                            checkpoint_dir = %self.checkpoint_dir.display(),
-                            lease_host = %host,
-                            lease_pid = pid,
-                            current_host = %owner_hostname,
-                            "cross-host checkpoint owner lease detected — NFS sharing not supported"
-                        );
-                        return Err(crate::core::Error::CheckpointError(format!(
-                            "checkpoint owner lease conflict for '{}': lease belongs to host '{}' \
-                             pid {}. Cross-host NFS sharing is not supported; use a dedicated \
-                             checkpoint directory per runtime instance.",
-                            self.checkpoint_dir.display(),
-                            host,
-                            pid
-                        )));
-                    }
-                    Some((_, pid)) if !Self::is_pid_alive(pid) => {
-                        tracing::warn!(
-                            target: "rustcdc::checkpoint",
-                            checkpoint_dir = %self.checkpoint_dir.display(),
-                            stale_owner_pid = pid,
-                            "clearing stale checkpoint owner lease left by dead process"
-                        );
-                        // Atomic replace: write-to-tmp then rename, eliminating the
-                        // TOCTOU window in a naive remove→create_new sequence.
-                        owner_lease::atomic_write_lease(&lock_path, &owner_lease_str)
-                            .map_err(crate::core::Error::from)?;
-                    }
-                    _ => {
-                        return Err(crate::core::Error::CheckpointError(format!(
-                            "checkpoint owner lease conflict for '{}': lock owned by another \
-                             process. Use a dedicated checkpoint directory per runtime process.",
-                            self.checkpoint_dir.display(),
-                        )));
-                    }
-                }
-            }
-            Err(error) => return Err(crate::core::Error::from(error)),
+        // Warn if checkpoint files already exist — a new lease on a non-empty
+        // directory may indicate an unclean handoff from a previous instance.
+        let has_existing_checkpoints = fs::read_dir(&self.checkpoint_dir)
+            .ok()
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    let name = e.file_name();
+                    let n = name.to_string_lossy();
+                    n.ends_with(".json") && n != "owner.lock"
+                })
+            })
+            .unwrap_or(false);
+        if has_existing_checkpoints {
+            tracing::warn!(
+                target: "rustcdc::checkpoint",
+                checkpoint_dir = %self.checkpoint_dir.display(),
+                owner_pid = std::process::id(),
+                "checkpoint directory already contains checkpoint files — new process is \
+                 taking over. Ensure no other runtime instance is running against this \
+                 directory to avoid concurrent write corruption."
+            );
         }
 
-        Self::increment_lease_ref(&lock_path);
-        *lease = Some(FileCheckpointLease { lock_path });
+        *lease = Some(acquired);
         Ok(())
-    }
-
-    /// Check whether a process with the given PID is currently alive.
-    ///
-    /// Uses `ps -p <pid>` which exits 0 when the PID exists (regardless of
-    /// permissions to signal it) and exits non-zero when the PID is absent.
-    /// This correctly distinguishes ESRCH (dead) from EPERM (alive but
-    /// unowned) — unlike `kill -0` which returns non-zero for both.
-    ///
-    /// On non-Unix platforms, conservatively returns `true` to avoid
-    /// accidentally clearing leases held by live processes.
-    fn is_pid_alive(pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("ps")
-                .args(["-p", &pid.to_string()])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(true) // conservatively assume alive on error
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = pid;
-            true // cannot check without platform API; conserve existing behavior
-        }
     }
 
     fn checkpoint_path(&self, source_type: &str) -> PathBuf {
@@ -703,15 +572,11 @@ impl Checkpoint for FileCheckpoint {
 
 impl Drop for FileCheckpoint {
     fn drop(&mut self) {
-        let Ok(mut lease) = self.lease.lock() else {
-            return;
-        };
-        let Some(current_lease) = lease.take() else {
-            return;
-        };
-
-        if Self::decrement_lease_ref(&current_lease.lock_path) == 0 {
-            let _ = fs::remove_file(current_lease.lock_path);
+        // OwnerLease::drop handles ref-count decrement and lease file removal.
+        // Take while holding the Mutex to prevent a concurrent ensure_owner_lease
+        // from re-acquiring between the take and the OwnerLease drop.
+        if let Ok(mut guard) = self.lease.lock() {
+            drop(guard.take());
         }
     }
 }

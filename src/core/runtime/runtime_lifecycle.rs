@@ -371,6 +371,24 @@ impl CdcRuntime {
             .tracer
             .trace_checkpoint_barrier("stopped");
         self.state = RuntimeState::Stopped;
+
+        if let Some(mutex) = self.registered_sink.take() {
+            let mut sink = mutex
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let result = if let Some(timeout_ms) = self.config.options.sink_close_timeout_ms {
+                sink.close_with_timeout(timeout_ms).await
+            } else {
+                sink.close().await
+            };
+            if let Err(ref e) = result {
+                self.observability()
+                    .metrics
+                    .record_error(e, "runtime.stop.sink_close");
+            }
+            result?;
+        }
+
         Ok(Vec::new())
     }
 
@@ -426,6 +444,24 @@ impl CdcRuntime {
             .tracer
             .trace_checkpoint_barrier("stopped");
         self.state = RuntimeState::Stopped;
+
+        if let Some(mutex) = self.registered_sink.take() {
+            let mut sink = mutex
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let result = if let Some(timeout_ms) = self.config.options.sink_close_timeout_ms {
+                sink.close_with_timeout(timeout_ms).await
+            } else {
+                sink.close().await
+            };
+            if let Err(ref e) = result {
+                self.observability()
+                    .metrics
+                    .record_error(e, "runtime.force_stop.sink_close");
+            }
+            result?;
+        }
+
         Ok(drained)
     }
 

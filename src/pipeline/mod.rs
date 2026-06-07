@@ -27,7 +27,8 @@
 //!     .route("public.orders", MemorySinkAdapter::new("orders"))
 //!     .route("public.products", MemorySinkAdapter::new("products"))
 //!     .default(MemorySinkAdapter::new("fallback"))
-//!     .build();
+//!     .build()
+//!     .expect("valid patterns");
 //! ```
 //!
 //! [`SinkAdapter`]: crate::sink::SinkAdapter
@@ -35,4 +36,6 @@
 
 pub mod router;
 
-pub use router::{TableRoute, TableRouter, TableRouterBuilder};
+pub use router::{
+    table_matches, HeterogeneousTableRouter, TableRoute, TableRouter, TableRouterBuilder,
+};

@@ -2,7 +2,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -50,6 +53,9 @@ impl OTelConfig {
 pub struct OTelMetricsCollector {
     state: Arc<Mutex<MetricsState>>,
     sdk: Option<Arc<MetricsSdk>>,
+    /// Lockless hot-path counter for events processed. Updated on every poll
+    /// loop iteration without acquiring the `state` mutex.
+    events_processed_total: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,6 +101,7 @@ impl OTelMetricsCollector {
         Self {
             state: Arc::new(Mutex::new(state)),
             sdk: None,
+            events_processed_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -197,6 +204,10 @@ impl OTelMetricsCollector {
     }
 
     pub fn record_events_processed(&self, op: Operation, count: u64) {
+        // Hot path: increment the lockless total first, without acquiring the mutex.
+        self.events_processed_total
+            .fetch_add(count, Ordering::Relaxed);
+
         if let Ok(mut state) = self.state.lock() {
             let op_name = op.to_string();
             let metric_key = format!("rustcdc.events.processed[op={op_name}]");
@@ -323,7 +334,18 @@ impl OTelMetricsCollector {
         })
     }
 
+    /// Return the total number of events processed, read atomically without
+    /// acquiring the `Mutex<MetricsState>`.
+    ///
+    /// Useful for high-frequency polling (e.g. Prometheus hot scrape paths) where
+    /// the per-operation breakdown from [`export_metrics`](Self::export_metrics)
+    /// is not needed.
+    pub fn events_processed_total(&self) -> u64 {
+        self.events_processed_total.load(Ordering::Relaxed)
+    }
+
     pub fn reset(&self) {
+        self.events_processed_total.store(0, Ordering::Relaxed);
         if let Ok(mut state) = self.state.lock() {
             state.counters.clear();
             state.gauges.clear();

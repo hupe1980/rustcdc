@@ -44,6 +44,8 @@ pub struct StdoutSink {
     closed: bool,
     events_sent: u64,
     pretty: bool,
+    /// When `Some`, every sent event is appended here for test inspection.
+    captured: Option<Vec<Event>>,
 }
 
 impl StdoutSink {
@@ -59,6 +61,18 @@ impl StdoutSink {
     pub fn with_pretty() -> Self {
         Self {
             pretty: true,
+            ..Self::default()
+        }
+    }
+
+    /// Create a `StdoutSink` that also buffers every sent event in memory.
+    ///
+    /// Intended for **testing only** — the buffer grows unbounded. Call
+    /// [`exported_events`](SinkAdapter::exported_events) on the sink to
+    /// inspect captured events after delivery.
+    pub fn with_capture() -> Self {
+        Self {
+            captured: Some(Vec::new()),
             ..Self::default()
         }
     }
@@ -86,6 +100,9 @@ impl SinkAdapter for StdoutSink {
             .write_all(&bytes)
             .map_err(|e| Error::StateError(format!("StdoutSink write: {e}")))?;
         self.events_sent += 1;
+        if let Some(ref mut buf) = self.captured {
+            buf.push(event.clone());
+        }
         Ok(())
     }
 
@@ -116,8 +133,19 @@ impl SinkAdapter for StdoutSink {
         "stdout"
     }
 
-    fn is_closed(&self) -> Option<bool> {
-        Some(self.closed)
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn delivery_metrics(&self) -> Option<crate::sink::SinkDeliveryMetrics> {
+        Some(crate::sink::SinkDeliveryMetrics {
+            events_sent: self.events_sent,
+            ..Default::default()
+        })
+    }
+
+    fn exported_events(&self) -> Option<&[Event]> {
+        self.captured.as_deref()
     }
 }
 
@@ -149,14 +177,14 @@ mod tests {
     #[test]
     fn is_closed_starts_false() {
         let sink = StdoutSink::new();
-        assert_eq!(sink.is_closed(), Some(false));
+        assert!(!sink.is_closed());
     }
 
     #[tokio::test]
     async fn is_closed_true_after_close() {
         let mut sink = StdoutSink::new();
         sink.close().await.unwrap();
-        assert_eq!(sink.is_closed(), Some(true));
+        assert!(sink.is_closed());
     }
 
     #[tokio::test]

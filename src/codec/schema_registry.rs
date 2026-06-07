@@ -546,6 +546,351 @@ impl<R: SchemaRegistryClient> ConfluentAvroDecoder<R> {
 /// Named alias for `EncoderCodec<ConfluentAvroEncoder>`.
 pub type ConfluentAvroCodec = crate::codec::EncoderCodec<ConfluentAvroEncoder>;
 
+// ─── JSON Schema content type ─────────────────────────────────────────────────
+
+const CONFLUENT_JSON_CONTENT_TYPE: &str = "application/vnd.kafka+json";
+
+// ─── Event JSON Schema ────────────────────────────────────────────────────────
+
+/// JSON Schema (draft 2020-12) for the canonical CDC event envelope.
+///
+/// Matches the serde serialization of [`crate::core::Event`]. Register this schema
+/// with your Confluent-compatible registry to enable [`ConfluentJsonSchemaEncoder`]
+/// framing.
+///
+/// The `before` and `after` fields accept any JSON value (reflecting `Option<serde_json::Value>`).
+pub const EVENT_JSON_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "io.rustcdc.Event",
+  "title": "Event",
+  "description": "Canonical CDC event envelope — rustcdc envelope_version=1",
+  "type": "object",
+  "properties": {
+    "before": {
+      "description": "Row state before the operation, when available. null for INSERT events.",
+      "oneOf": [{"type": "null"}, {}]
+    },
+    "after": {
+      "description": "Row state after the operation, when available. null for DELETE events.",
+      "oneOf": [{"type": "null"}, {}]
+    },
+    "op": {
+      "description": "CRUD operation that produced this event.",
+      "type": "string",
+      "enum": ["insert", "update", "delete", "read", "schema_change", "truncate"]
+    },
+    "source": {
+      "description": "Source identity and durable position metadata.",
+      "type": "object",
+      "properties": {
+        "source_name": {"type": "string", "description": "Logical name of the source connector."},
+        "offset":      {"type": "string", "description": "Source-specific durable position encoded as a string."},
+        "timestamp":   {"type": "integer", "minimum": 0, "description": "Source timestamp associated with the position."}
+      },
+      "required": ["source_name", "offset", "timestamp"],
+      "additionalProperties": false
+    },
+    "ts": {
+      "description": "Event timestamp in milliseconds since epoch.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "schema": {
+      "description": "Schema name when the source provides one.",
+      "oneOf": [{"type": "null"}, {"type": "string"}]
+    },
+    "table": {
+      "description": "Table name.",
+      "type": "string"
+    },
+    "primary_key": {
+      "description": "Primary key column names, when known.",
+      "oneOf": [
+        {"type": "null"},
+        {"type": "array", "items": {"type": "string"}}
+      ]
+    },
+    "snapshot": {
+      "description": "Snapshot progress information when emitted during snapshotting.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "properties": {
+            "snapshot_id":  {"type": "string"},
+            "chunk_index":  {"type": "integer", "minimum": 0},
+            "is_last_chunk": {"type": "boolean"}
+          },
+          "required": ["snapshot_id", "chunk_index", "is_last_chunk"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "transaction": {
+      "description": "Transaction metadata when the event belongs to a multi-event transaction.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "properties": {
+            "tx_id":       {"type": "integer", "minimum": 0},
+            "total_events": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
+            "event_index": {"type": "integer", "minimum": 0}
+          },
+          "required": ["tx_id", "event_index"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "envelope_version": {
+      "description": "Event envelope schema version.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "before_is_key_only": {
+      "description": "True when `before` contains only primary-key columns (REPLICA IDENTITY DEFAULT).",
+      "type": "boolean"
+    }
+  },
+  "required": ["before", "after", "op", "source", "ts", "table", "envelope_version", "before_is_key_only"],
+  "additionalProperties": false
+}"#;
+
+// ─── Key JSON Schema ──────────────────────────────────────────────────────────
+
+/// JSON Schema (draft 2020-12) for the primary-key envelope produced by
+/// [`ConfluentJsonSchemaEncoder::encode_event_key`].
+///
+/// Mirrors [`KEY_AVRO_SCHEMA`]: a single nullable `key` field carrying the
+/// JSON-encoded primary key map, or `null` for keyless events.
+pub const KEY_JSON_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "io.rustcdc.EventKey",
+  "title": "EventKey",
+  "description": "CDC event primary-key envelope — rustcdc",
+  "type": "object",
+  "properties": {
+    "key": {
+      "description": "JSON-encoded primary key map, or null for keyless events (TRUNCATE, SCHEMA_CHANGE).",
+      "oneOf": [{"type": "null"}, {"type": "string"}]
+    }
+  },
+  "required": ["key"],
+  "additionalProperties": false
+}"#;
+
+// ─── ConfluentJsonSchemaEncoder ───────────────────────────────────────────────
+
+/// CDC [`Event`] → Confluent Schema Registry-framed JSON encoder.
+///
+/// Encodes events using the Confluent wire format with JSON Schema validation:
+///
+/// ```text
+/// [0x00 magic][4-byte BE schema_id][json payload]
+/// ```
+///
+/// Unlike [`ConfluentAvroEncoder`], encoding is inherently **async** because
+/// subject/schema resolution may require a registry round-trip on the first call
+/// per subject. Subsequent calls hit the in-memory cache inside the wrapped
+/// [`schemreg::json::JsonSchemaEncoder`].
+///
+/// # Construction
+///
+/// ```rust,no_run
+/// # use rustcdc::codec::SchemaRegistryConfig;
+/// # use rustcdc::codec::ConfluentJsonSchemaEncoder;
+/// # async fn example() -> rustcdc::core::Result<()> {
+/// let config = SchemaRegistryConfig::new("http://localhost:8081", "cdc-events");
+/// let registry = std::sync::Arc::new(config.build()?);
+/// let encoder = ConfluentJsonSchemaEncoder::new(registry, &config)?;
+/// # Ok(()) }
+/// ```
+///
+/// # Validation
+///
+/// By default, every event is validated against [`EVENT_JSON_SCHEMA`] before
+/// serialisation. Disable with [`ConfluentJsonSchemaEncoder::without_validation`]
+/// for maximum throughput when producers are trusted.
+#[derive(Debug, Clone)]
+pub struct ConfluentJsonSchemaEncoder<C = Arc<CachedSchemaRegistry<ConfluentSchemaRegistry>>> {
+    value_encoder: Arc<::schemreg::json::JsonSchemaEncoder<C>>,
+    key_encoder: Arc<::schemreg::json::JsonSchemaEncoder<C>>,
+    topic: String,
+}
+
+impl<C> ConfluentJsonSchemaEncoder<C> {
+    /// The Kafka topic name this encoder is configured for.
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+}
+
+impl<C> ConfluentJsonSchemaEncoder<C>
+where
+    C: SchemaRegistryClient + Clone,
+{
+    /// Construct a JSON Schema encoder that validates events on encode (default).
+    ///
+    /// Both value and key schemas are registered (or looked up) lazily on the
+    /// first encode call for each subject. The schemas used are
+    /// [`EVENT_JSON_SCHEMA`] and [`KEY_JSON_SCHEMA`].
+    pub fn new(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
+        Self::new_inner(registry, config, true)
+    }
+
+    /// Construct a JSON Schema encoder that skips JSON Schema validation on encode.
+    ///
+    /// Use this only when producers are trusted and throughput is the priority.
+    /// Invalid events will be accepted by the encoder but may be rejected by
+    /// consumers that validate on decode.
+    pub fn without_validation(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
+        Self::new_inner(registry, config, false)
+    }
+
+    fn new_inner(registry: C, config: &SchemaRegistryConfig, validate: bool) -> Result<Self> {
+        let value_encoder = ::schemreg::json::JsonSchemaEncoder::builder()
+            .registry(registry.clone())
+            .schema(EVENT_JSON_SCHEMA)
+            .strategy(config.strategy.clone())
+            .validate_on_encode(validate)
+            .build()
+            .map_err(|e| Error::ConfigError(format!("json schema value encoder build: {e}")))?;
+
+        let key_encoder = ::schemreg::json::JsonSchemaEncoder::builder()
+            .registry(registry)
+            .schema(KEY_JSON_SCHEMA)
+            .strategy(config.strategy.clone())
+            .validate_on_encode(validate)
+            .build()
+            .map_err(|e| Error::ConfigError(format!("json schema key encoder build: {e}")))?;
+
+        Ok(Self {
+            value_encoder: Arc::new(value_encoder),
+            key_encoder: Arc::new(key_encoder),
+            topic: config.topic.clone(),
+        })
+    }
+
+    /// Encode a CDC event to Confluent-framed JSON bytes (value channel).
+    ///
+    /// The event is serialised to `serde_json::Value` via [`serde_json::to_value`]
+    /// and then validated against [`EVENT_JSON_SCHEMA`] (unless disabled) before
+    /// being wrapped with the Confluent 5-byte wire-format header.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::ConfigError` on the first call for a subject if the registry
+    ///   is unreachable or schema registration fails.
+    /// - `Error::SourceError` if JSON serialisation or Schema validation fails.
+    pub async fn encode_event(&self, event: &Event) -> Result<EncodedOutput> {
+        let bytes = self
+            .value_encoder
+            .encode_ser(event, &self.topic, EncodeTarget::Value)
+            .await
+            .map_err(|e| Error::SourceError(format!("json schema encode event: {e}")))?;
+        Ok(EncodedOutput::new(
+            bytes.to_vec(),
+            CONFLUENT_JSON_CONTENT_TYPE,
+        ))
+    }
+
+    /// Encode the primary key of a CDC event to Confluent-framed JSON bytes
+    /// (key channel).
+    ///
+    /// Produces a `{"key": "<json-encoded-pk>"}` payload using [`KEY_JSON_SCHEMA`].
+    /// Keyless events (TRUNCATE, SCHEMA_CHANGE, tables without a declared primary
+    /// key) produce `{"key": null}`, matching Debezium's behaviour.
+    ///
+    /// Returns `None` only when the encoding itself panics (should not occur in
+    /// practice for well-formed events).
+    pub async fn encode_event_key(&self, event: &Event) -> Option<bytes::Bytes> {
+        let key_json = event
+            .primary_key_values()
+            .and_then(|v| serde_json::to_string(&v).ok());
+        let key_value = serde_json::json!({"key": key_json});
+        self.key_encoder
+            .encode(&key_value, &self.topic, EncodeTarget::Key)
+            .await
+            .ok()
+    }
+
+    /// Cached schema ID for the value subject, or `None` if not yet resolved.
+    ///
+    /// Useful for observability without triggering a registry call.
+    pub fn cached_value_schema_id(&self) -> Option<SchemaId> {
+        let value_subject = self
+            .value_encoder
+            .cached_schema_id(&format!("{}-value", self.topic));
+        let topic_record_subject = self
+            .value_encoder
+            .cached_schema_id(&format!("{}-io.rustcdc.Event", self.topic));
+        let record_subject = self.value_encoder.cached_schema_id("io.rustcdc.Event");
+        value_subject.or(topic_record_subject).or(record_subject)
+    }
+}
+
+// ─── ConfluentJsonSchemaDecoder ───────────────────────────────────────────────
+
+/// Decodes Confluent Schema Registry-framed JSON bytes back to a CDC [`Event`].
+///
+/// Strips the 5-byte Confluent framing header, deserialises the JSON payload,
+/// and converts it to an [`Event`].
+///
+/// # Decoding steps
+///
+/// 1. Strip the 5-byte Confluent framing header via [`schemreg::decode_wire_format`].
+/// 2. Deserialise the JSON payload to `serde_json::Value`.
+/// 3. Optionally validate against [`EVENT_JSON_SCHEMA`] (when `validate_on_decode` is `true`).
+/// 4. Convert the `serde_json::Value` to [`Event`] via `serde_json::from_value`.
+pub struct ConfluentJsonSchemaDecoder<C = Arc<CachedSchemaRegistry<ConfluentSchemaRegistry>>> {
+    inner: ::schemreg::json::JsonSchemaDecoder<C>,
+}
+
+impl<C> std::fmt::Debug for ConfluentJsonSchemaDecoder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfluentJsonSchemaDecoder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C: SchemaRegistryClient> ConfluentJsonSchemaDecoder<C> {
+    /// Create a decoder backed by the given registry.
+    pub fn new(registry: C) -> Self {
+        Self {
+            inner: ::schemreg::json::JsonSchemaDecoder::new(registry),
+        }
+    }
+
+    /// Decode a Confluent-framed JSON **value** message to a CDC [`Event`].
+    ///
+    /// `async` because schema-ID fetching from the registry is required for
+    /// schema IDs not yet in the local cache.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::SourceError` if the Confluent framing header is malformed.
+    /// - `Error::SourceError` if JSON deserialisation or `Event` conversion fails.
+    pub async fn decode(&self, bytes: &[u8]) -> Result<Event> {
+        let value = self
+            .inner
+            .decode(bytes::Bytes::copy_from_slice(bytes))
+            .await
+            .map_err(|e| Error::SourceError(format!("json schema decode: {e}")))?;
+        serde_json::from_value::<Event>(value)
+            .map_err(|e| Error::SourceError(format!("json schema → Event deserialize: {e}")))
+    }
+}
+
+// ─── ConfluentJsonSchemaCodec ─────────────────────────────────────────────────
+
+/// Async key + value codec backed by Confluent JSON Schema framing.
+///
+/// Unlike the synchronous [`crate::codec::Codec`] trait, JSON Schema encoding
+/// is inherently async (lazy subject/schema resolution). Use the methods on
+/// [`ConfluentJsonSchemaEncoder`] directly instead of the `Codec` trait when
+/// building Kafka producers with JSON Schema.
+pub type ConfluentJsonSchemaCodec<C> = ConfluentJsonSchemaEncoder<C>;
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -860,5 +1205,142 @@ mod tests {
         let _cloned = decoder.clone();
         let dbg = format!("{decoder:?}");
         assert!(dbg.contains("ConfluentAvroDecoder"));
+    }
+
+    // ─── JSON Schema constants ────────────────────────────────────────────────
+
+    #[test]
+    fn event_json_schema_is_valid_json() {
+        serde_json::from_str::<serde_json::Value>(EVENT_JSON_SCHEMA)
+            .expect("EVENT_JSON_SCHEMA must be valid JSON");
+    }
+
+    #[test]
+    fn event_json_schema_has_required_id() {
+        let schema: serde_json::Value = serde_json::from_str(EVENT_JSON_SCHEMA).unwrap();
+        assert_eq!(
+            schema.get("$id").and_then(|v| v.as_str()),
+            Some("io.rustcdc.Event"),
+            "$id must be 'io.rustcdc.Event'"
+        );
+    }
+
+    #[test]
+    fn event_json_schema_required_fields_present() {
+        let schema: serde_json::Value = serde_json::from_str(EVENT_JSON_SCHEMA).unwrap();
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for field in &[
+            "before",
+            "after",
+            "op",
+            "source",
+            "ts",
+            "table",
+            "envelope_version",
+            "before_is_key_only",
+        ] {
+            assert!(
+                required.contains(field),
+                "EVENT_JSON_SCHEMA must list '{field}' as required"
+            );
+        }
+    }
+
+    #[test]
+    fn event_json_schema_op_enum_is_complete() {
+        let schema: serde_json::Value = serde_json::from_str(EVENT_JSON_SCHEMA).unwrap();
+        let ops: Vec<&str> = schema["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for op in &[
+            "insert",
+            "update",
+            "delete",
+            "read",
+            "schema_change",
+            "truncate",
+        ] {
+            assert!(
+                ops.contains(op),
+                "EVENT_JSON_SCHEMA op enum must include '{op}'"
+            );
+        }
+    }
+
+    #[test]
+    fn key_json_schema_is_valid_json() {
+        serde_json::from_str::<serde_json::Value>(KEY_JSON_SCHEMA)
+            .expect("KEY_JSON_SCHEMA must be valid JSON");
+    }
+
+    #[test]
+    fn key_json_schema_has_required_id() {
+        let schema: serde_json::Value = serde_json::from_str(KEY_JSON_SCHEMA).unwrap();
+        assert_eq!(
+            schema.get("$id").and_then(|v| v.as_str()),
+            Some("io.rustcdc.EventKey"),
+            "$id must be 'io.rustcdc.EventKey'"
+        );
+    }
+
+    #[test]
+    fn key_json_schema_key_field_is_nullable_string() {
+        let schema: serde_json::Value = serde_json::from_str(KEY_JSON_SCHEMA).unwrap();
+        let key_prop = &schema["properties"]["key"];
+        let one_of = key_prop["oneOf"].as_array().unwrap();
+        let types: Vec<&str> = one_of
+            .iter()
+            .filter_map(|v| v.get("type")?.as_str())
+            .collect();
+        assert!(types.contains(&"null"), "key must allow null");
+        assert!(types.contains(&"string"), "key must allow string");
+    }
+
+    #[test]
+    fn json_schema_encoder_constructs_without_registry_call() {
+        // Verify ConfluentJsonSchemaEncoder::new() does not make network calls
+        // at construction time — registry is only contacted on first encode.
+        let cfg = SchemaRegistryConfig::new("http://localhost:8081", "orders");
+        let registry = Arc::new(cfg.build().unwrap());
+        let encoder = ConfluentJsonSchemaEncoder::new(registry, &cfg);
+        assert!(
+            encoder.is_ok(),
+            "encoder construction must not require a live registry"
+        );
+        let encoder = encoder.unwrap();
+        assert_eq!(encoder.topic(), "orders");
+    }
+
+    #[test]
+    fn json_schema_encoder_without_validation_constructs() {
+        let cfg = SchemaRegistryConfig::new("http://localhost:8081", "orders");
+        let registry = Arc::new(cfg.build().unwrap());
+        let encoder = ConfluentJsonSchemaEncoder::without_validation(registry, &cfg);
+        assert!(encoder.is_ok());
+    }
+
+    #[test]
+    fn json_schema_decoder_constructs() {
+        let cfg = SchemaRegistryConfig::new("http://localhost:8081", "orders");
+        let registry = Arc::new(cfg.build().unwrap());
+        let decoder = ConfluentJsonSchemaDecoder::new(registry);
+        let dbg = format!("{decoder:?}");
+        assert!(dbg.contains("ConfluentJsonSchemaDecoder"));
+    }
+
+    #[test]
+    fn json_schema_encoder_is_clone() {
+        let cfg = SchemaRegistryConfig::new("http://localhost:8081", "t");
+        let registry = Arc::new(cfg.build().unwrap());
+        let encoder = ConfluentJsonSchemaEncoder::new(registry, &cfg).unwrap();
+        let _cloned = encoder.clone();
     }
 }

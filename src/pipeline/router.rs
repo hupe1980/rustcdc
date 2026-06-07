@@ -2,8 +2,10 @@
 //!
 //! See [`TableRouter`] for the main entry point.
 
+use futures_util::future::join_all;
+
 use crate::core::{Error, Event, Result};
-use crate::sink::SinkAdapter;
+use crate::sink::{BoxedSink, SinkAdapter, SinkDeliveryGuarantee, SinkDeliveryMetrics};
 
 // ─── Glob helpers ─────────────────────────────────────────────────────────────
 
@@ -56,7 +58,7 @@ fn glob_match(pat: &[u8], s: &[u8]) -> bool {
 /// | `"schema.table"` | exact qualified match                            |
 /// | `"table"`        | exact bare-table match (no schema)               |
 /// | `"pre*"`         | tables starting with `pre` (bare or right-side)  |
-fn table_matches(pattern: &str, table_key: &str) -> bool {
+pub fn table_matches(pattern: &str, table_key: &str) -> bool {
     // A bare "*" is a true catch-all.
     if pattern == "*" {
         return true;
@@ -84,7 +86,22 @@ fn table_matches(pattern: &str, table_key: &str) -> bool {
     }
 }
 
-// ─── TableRoute ───────────────────────────────────────────────────────────────
+/// A type alias for a [`TableRouter`] that accepts heterogeneous sink types.
+///
+/// Every concrete sink is wrapped in a [`BoxedSink`] before being added via the
+/// builder, enabling routes to different downstream systems in one router:
+///
+/// ```rust,no_run
+/// use rustcdc::pipeline::HeterogeneousTableRouter;
+/// use rustcdc::sink::{MemorySinkAdapter, SinkAdapter};
+///
+/// let router = HeterogeneousTableRouter::builder("demo")
+///     .route("public.orders", MemorySinkAdapter::new("orders").boxed())
+///     .route("public.audit", MemorySinkAdapter::new("audit").boxed())
+///     .build()
+///     .expect("valid patterns");
+/// ```
+pub type HeterogeneousTableRouter = TableRouter<BoxedSink>;
 
 /// A single entry in a [`TableRouter`]: a glob pattern paired with a sink.
 #[derive(Debug)]
@@ -155,8 +172,48 @@ impl<S: SinkAdapter> TableRouterBuilder<S> {
         self
     }
 
-    /// Build the [`TableRouter`].
-    pub fn build(self) -> TableRouter<S> {
+    /// Build the [`TableRouter`], validating all route patterns.
+    ///
+    /// Returns [`Error::ConfigError`] when:
+    /// - any pattern is empty,
+    /// - two routes share the same pattern (likely a misconfiguration),
+    /// - a dotted pattern has an empty schema or table segment (e.g. `".orders"`, `"public."`).
+    ///
+    /// Use [`build_unchecked`](Self::build_unchecked) when patterns are compile-time
+    /// constants and you prefer a panicking shorthand.
+    pub fn build(self) -> Result<TableRouter<S>> {
+        let mut errors: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for route in &self.routes {
+            let pat = route.pattern.as_str();
+            if pat.is_empty() {
+                errors.push("empty pattern".into());
+            } else if !seen.insert(pat) {
+                errors.push(format!("duplicate pattern '{pat}'"));
+            } else if let Some(dot) = pat.find('.') {
+                let (schema, rest) = pat.split_at(dot);
+                let table = &rest[1..];
+                if schema.is_empty() || table.is_empty() {
+                    errors.push(format!(
+                        "malformed pattern '{pat}': schema and table segments must both be non-empty"
+                    ));
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(Error::ConfigError(format!(
+                "TableRouterBuilder '{}': invalid route pattern(s): {}",
+                self.name,
+                errors.join(", "),
+            )));
+        }
+        Ok(self.build_unchecked())
+    }
+
+    /// Build the [`TableRouter`] without pattern validation.
+    ///
+    /// Prefer [`build`](Self::build) unless patterns are guaranteed valid at compile time.
+    pub fn build_unchecked(self) -> TableRouter<S> {
         TableRouter {
             name: self.name,
             routes: self.routes,
@@ -196,7 +253,8 @@ impl<S: SinkAdapter> TableRouterBuilder<S> {
 ///     .route("public.orders", MemorySinkAdapter::new("orders"))
 ///     .route("public.products", MemorySinkAdapter::new("products"))
 ///     .default(MemorySinkAdapter::new("fallback"))
-///     .build();
+///     .build()
+///     .expect("valid patterns");
 /// ```
 #[derive(Debug)]
 pub struct TableRouter<S> {
@@ -247,6 +305,32 @@ impl<S: SinkAdapter> TableRouter<S> {
             }
         }
         self.default.as_ref()
+    }
+
+    /// Return the glob pattern that would match `event`, if any.
+    ///
+    /// Returns the pattern string of the first matching route.  Returns `None` when
+    /// no route matches and no default sink is configured.
+    /// When the default sink would receive the event, returns `"*"`.
+    pub fn matched_pattern_for(&self, event: &Event) -> Option<&str> {
+        let key = event.qualified_table_name();
+        for route in &self.routes {
+            if table_matches(&route.pattern, &key) {
+                return Some(&route.pattern);
+            }
+        }
+        if self.default.is_some() {
+            Some("*")
+        } else {
+            None
+        }
+    }
+
+    /// Iterate over all configured route patterns in evaluation order.
+    ///
+    /// Does not include the implicit default sink.
+    pub fn pattern_names(&self) -> impl Iterator<Item = &str> {
+        self.routes.iter().map(|r| r.pattern.as_str())
     }
 
     /// Flush all sinks (routes + default).
@@ -326,6 +410,182 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    // ── Delivery contract ─────────────────────────────────────────────────────
+    // Capability hooks delegate to children and reduce to the appropriate aggregate.
+
+    fn delivery_guarantee(&self) -> SinkDeliveryGuarantee {
+        let mut g = SinkDeliveryGuarantee::EffectivelyOnce;
+        let mut has_sink = false;
+        for route in &self.routes {
+            g = g.weakest(route.sink.delivery_guarantee());
+            has_sink = true;
+        }
+        if let Some(ref d) = self.default {
+            g = g.weakest(d.delivery_guarantee());
+            has_sink = true;
+        }
+        if has_sink {
+            g
+        } else {
+            SinkDeliveryGuarantee::default()
+        }
+    }
+
+    fn idempotent_delivery_capable(&self) -> bool {
+        self.routes
+            .iter()
+            .all(|r| r.sink.idempotent_delivery_capable())
+            && self
+                .default
+                .as_ref()
+                .is_none_or(|d| d.idempotent_delivery_capable())
+    }
+
+    fn transactional_checkpoint_barrier_capable(&self) -> bool {
+        !self.routes.is_empty()
+            && self
+                .routes
+                .iter()
+                .all(|r| r.sink.transactional_checkpoint_barrier_capable())
+            && self
+                .default
+                .as_ref()
+                .is_none_or(|d| d.transactional_checkpoint_barrier_capable())
+    }
+
+    fn queue_depth(&self) -> Option<usize> {
+        let mut total: usize = 0;
+        let mut any = false;
+        for route in &self.routes {
+            if let Some(d) = route.sink.queue_depth() {
+                total = total.saturating_add(d);
+                any = true;
+            }
+        }
+        if let Some(ref d) = self.default {
+            if let Some(depth) = d.queue_depth() {
+                total = total.saturating_add(depth);
+                any = true;
+            }
+        }
+        if any {
+            Some(total)
+        } else {
+            None
+        }
+    }
+
+    fn flush_tick_interval(&self) -> Option<std::time::Duration> {
+        self.routes
+            .iter()
+            .filter_map(|r| r.sink.flush_tick_interval())
+            .chain(self.default.iter().filter_map(|d| d.flush_tick_interval()))
+            .min()
+    }
+
+    fn delivery_metrics(&self) -> Option<SinkDeliveryMetrics> {
+        let mut any = false;
+        let mut agg = SinkDeliveryMetrics::default();
+        for route in &self.routes {
+            if let Some(m) = route.sink.delivery_metrics() {
+                agg.merge(&m);
+                any = true;
+            }
+        }
+        if let Some(ref d) = self.default {
+            if let Some(m) = d.delivery_metrics() {
+                agg.merge(&m);
+                any = true;
+            }
+        }
+        if any {
+            Some(agg)
+        } else {
+            None
+        }
+    }
+
+    // ── Checkpoint barrier (2PC semantics) ────────────────────────────────────
+    // begin: sequential with compensating aborts on failure (two-phase commit).
+    // commit / abort / preflight: concurrent (mirror FanOutSinkAdapter).
+
+    async fn begin_checkpoint_barrier(&mut self) -> Result<()> {
+        let n = self.routes.len();
+        for i in 0..n {
+            if let Err(e) = self.routes[i].sink.begin_checkpoint_barrier().await {
+                // Compensate: abort already-begun routes in reverse order.
+                for j in (0..i).rev() {
+                    let _ = self.routes[j].sink.abort_checkpoint_barrier().await;
+                }
+                return Err(e);
+            }
+        }
+        if let Some(ref mut d) = self.default {
+            if let Err(e) = d.begin_checkpoint_barrier().await {
+                for j in (0..n).rev() {
+                    let _ = self.routes[j].sink.abort_checkpoint_barrier().await;
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn commit_checkpoint_barrier(&mut self) -> Result<()> {
+        type B<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+        let mut futs: Vec<B<'_>> = self
+            .routes
+            .iter_mut()
+            .map(|r| -> B<'_> { Box::pin(r.sink.commit_checkpoint_barrier()) })
+            .collect();
+        if let Some(ref mut d) = self.default {
+            futs.push(Box::pin(d.commit_checkpoint_barrier()));
+        }
+        join_all(futs)
+            .await
+            .into_iter()
+            .find(|r| r.is_err())
+            .unwrap_or(Ok(()))
+    }
+
+    async fn abort_checkpoint_barrier(&mut self) -> Result<()> {
+        type B<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+        let mut futs: Vec<B<'_>> = self
+            .routes
+            .iter_mut()
+            .map(|r| -> B<'_> { Box::pin(r.sink.abort_checkpoint_barrier()) })
+            .collect();
+        if let Some(ref mut d) = self.default {
+            futs.push(Box::pin(d.abort_checkpoint_barrier()));
+        }
+        join_all(futs)
+            .await
+            .into_iter()
+            .find(|r| r.is_err())
+            .unwrap_or(Ok(()))
+    }
+
+    async fn preflight_check(&mut self) -> Result<()> {
+        type B<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+        let mut futs: Vec<B<'_>> = self
+            .routes
+            .iter_mut()
+            .map(|r| -> B<'_> { Box::pin(r.sink.preflight_check()) })
+            .collect();
+        if let Some(ref mut d) = self.default {
+            futs.push(Box::pin(d.preflight_check()));
+        }
+        join_all(futs)
+            .await
+            .into_iter()
+            .find(|r| r.is_err())
+            .unwrap_or(Ok(()))
     }
 }
 
@@ -440,7 +700,8 @@ mod tests {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("public.orders", MemorySinkAdapter::new("orders"))
             .route("public.products", MemorySinkAdapter::new("products"))
-            .build();
+            .build()
+            .expect("valid test routes");
 
         let event = make_event(Some("public"), "orders");
         router.send(&event).await.unwrap();
@@ -456,7 +717,8 @@ mod tests {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("public.orders", MemorySinkAdapter::new("orders"))
             .default(MemorySinkAdapter::new("fallback"))
-            .build();
+            .build()
+            .expect("valid test routes");
 
         let event = make_event(Some("public"), "customers");
         router.send(&event).await.unwrap();
@@ -478,7 +740,8 @@ mod tests {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("public.orders", MemorySinkAdapter::new("orders"))
             .drop_unrouted(true)
-            .build();
+            .build()
+            .expect("valid test routes");
 
         // no default, drop_unrouted = true
         let event = make_event(Some("public"), "unrelated");
@@ -491,7 +754,8 @@ mod tests {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("strict")
             .route("public.orders", MemorySinkAdapter::new("orders"))
             .drop_unrouted(false) // explicit strict mode
-            .build();
+            .build()
+            .expect("valid test routes");
 
         let event = make_event(Some("public"), "unrelated");
         let result = router.send(&event).await;
@@ -506,7 +770,8 @@ mod tests {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("*", MemorySinkAdapter::new("catch-all"))
             .route("public.orders", MemorySinkAdapter::new("orders"))
-            .build();
+            .build()
+            .expect("valid test routes");
 
         let event = make_event(Some("public"), "orders");
         router.send(&event).await.unwrap();
@@ -520,7 +785,8 @@ mod tests {
     async fn flush_all_propagates_errors() {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("*", MemorySinkAdapter::new("a"))
-            .build();
+            .build()
+            .expect("valid test routes");
         // MemorySinkAdapter flush always succeeds — this just verifies no panic.
         router.flush_all().await.unwrap();
     }
@@ -529,7 +795,8 @@ mod tests {
     async fn sink_adapter_send_after_close_returns_error() {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("*", MemorySinkAdapter::new("a"))
-            .build();
+            .build()
+            .expect("valid test routes");
         router.close().await.unwrap();
         let event = make_event(Some("public"), "orders");
         assert!(router.send(&event).await.is_err());
@@ -540,7 +807,8 @@ mod tests {
         let router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("public.orders", MemorySinkAdapter::new("orders"))
             .default(MemorySinkAdapter::new("fallback"))
-            .build();
+            .build()
+            .expect("valid test routes");
 
         let orders_event = make_event(Some("public"), "orders");
         let other_event = make_event(Some("public"), "customers");
@@ -556,7 +824,8 @@ mod tests {
     async fn glob_prefix_route_matches_multiple_tables() {
         let mut router: TableRouter<MemorySinkAdapter> = TableRouter::builder("test")
             .route("public.order*", MemorySinkAdapter::new("orders"))
-            .build();
+            .build()
+            .expect("valid test routes");
 
         router
             .send(&make_event(Some("public"), "orders"))

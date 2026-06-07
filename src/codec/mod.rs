@@ -88,9 +88,10 @@ pub use protobuf::ProtobufEncoder;
 #[cfg(feature = "schemreg")]
 pub use schema_registry::{
     decode_wire_format, encode_wire_format, CachedSchemaRegistry, CompatibilityLevel,
-    ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentSchemaRegistry,
-    EncodeTarget, SchemaId, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig,
-    SchemaType, SubjectNameStrategy,
+    ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
+    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentSchemaRegistry, EncodeTarget,
+    SchemaId, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType,
+    SubjectNameStrategy, EVENT_JSON_SCHEMA, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
 };
 
 use crate::core::{Event, Result};

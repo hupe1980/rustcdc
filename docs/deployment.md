@@ -102,6 +102,22 @@ rustcdc uses **cooperative flow control**: the internal event buffer grows until
 
 For MySQL and SQL Server deployments, use the same runtime pattern with source-specific config and operational prerequisites from [config_reference.md](config_reference.md) and [runbook.md](runbook.md).
 
+### SQL Server: Supported Versions
+
+| SQL Server Version | Status |
+|---|---|
+| 2022 | ✅ CI-tested on every push/PR (`mcr.microsoft.com/mssql/server:2022-latest`) |
+| 2019 | ⚠️ Not CI-tested; protocol-compatible (same `sys.fn_cdc_get_all_changes_*` API). Manual validation recommended before production use. |
+| 2017 | ⚠️ Not CI-tested; CDC tables and change-tracking APIs available but not verified in the CI matrix. |
+| 2016 and earlier | ❌ Not supported. CDC change table API behaviour on older versions has not been validated. |
+
+The prerequisite probe in `src/source/sqlserver/prereq.rs` checks for:
+- `is_cdc_enabled` on the target database.
+- `db_owner`, `sysadmin`, or `db_ddladmin` role membership.
+- Server major version ≥ 14 (SQL Server 2017). Versions below this are rejected at startup with a structured `Error::ConfigError`.
+
+If you require SQL Server 2019 coverage in CI, add the `mcr.microsoft.com/mssql/server:2019-latest` image to the `integration-sqlserver` matrix in `.github/workflows/ci.yml`.
+
 ## Related Documentation
 
 - [getting_started.md](getting_started.md)

@@ -389,8 +389,15 @@ impl SinkAdapter for FileJsonlSink {
         Ok(())
     }
 
-    fn is_closed(&self) -> Option<bool> {
-        Some(self.closed)
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn delivery_metrics(&self) -> Option<crate::sink::SinkDeliveryMetrics> {
+        Some(crate::sink::SinkDeliveryMetrics {
+            events_sent: self.events_sent,
+            ..Default::default()
+        })
     }
 }
 

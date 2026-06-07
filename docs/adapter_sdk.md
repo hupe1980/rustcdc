@@ -22,7 +22,8 @@ Optional capability methods (all default to no-op / `false`):
 - `preflight_check()`: connectivity validation called once at startup.
 - `close_with_timeout(ms)`: pre-built graceful close with timeout (no override needed).
 - `exported_events() -> Option<&[Event]>`: for in-memory/test adapters; enables conformance assertions.
-- `is_closed() -> Option<bool>`: closed-state hook used by conformance suite.
+- `delivery_metrics() -> Option<SinkDeliveryMetrics>`: snapshot of delivery counters (`events_sent`, `events_errored`, `events_retried`, `last_delivered_offset`) for admin endpoints and Prometheus scrapers. `SinkDeliveryMetrics::merge()` is provided for composed sinks.
+- `is_closed() -> bool`: closed-state hook used by conformance suite; defaults to `false`.
 
 Behavioral expectations:
 - Preserve event ordering per `send` call sequence.
@@ -38,7 +39,8 @@ Behavioral expectations:
 4. Redact credentials from logs and debug output.
 5. Surface recoverable versus unrecoverable errors using `rustcdc::Error` variants.
 6. Override `delivery_guarantee` if your sink can offer stronger-than-default guarantees.
-7. Wrap in `BoxedSink::new(your_sink)` when you need type-erased storage or `FanOutSinkAdapter` composition.
+7. Override `delivery_metrics` to expose per-sink counters to admin/observability endpoints.
+8. Use `your_sink.boxed()` (or `BoxedSink::new(your_sink)`) when you need type-erased storage or `FanOutSinkAdapter` / `TableRouter<BoxedSink>` composition.
 
 Recommended pattern:
 - `send`: enqueue and optionally batch.
@@ -95,22 +97,32 @@ async fn validate_adapter() -> rustcdc::Result<()> {
 }
 ```
 
-## Dynamic Dispatch and Fan-Out
+## Dynamic Dispatch, Fan-Out, and Routing
 
 To store sinks heterogeneously or compose multiple sinks:
 
 ```rust,no_run
 use rustcdc::sink::{BoxedSink, FanOutSinkAdapter, MemorySinkAdapter, SinkAdapter};
+use rustcdc::pipeline::HeterogeneousTableRouter;
 
-// Type-erase any SinkAdapter:
-let boxed: BoxedSink = BoxedSink::new(MemorySinkAdapter::new("mem"));
+// Type-erase any SinkAdapter (two equivalent spellings):
+let boxed: BoxedSink = MemorySinkAdapter::new("mem").boxed();
+let boxed2: BoxedSink = BoxedSink::new(MemorySinkAdapter::new("mem2"));
 
 // Fan out to multiple sinks concurrently:
 let fan = FanOutSinkAdapter::new(vec![
-    BoxedSink::new(MemorySinkAdapter::new("a")),
-    BoxedSink::new(MemorySinkAdapter::new("b")),
+    MemorySinkAdapter::new("a").boxed(),
+    MemorySinkAdapter::new("b").boxed(),
 ]);
 // fan.send(event) drives all children concurrently; latency = max(children)
+
+// Route events by table name to heterogeneous sinks:
+let router = HeterogeneousTableRouter::builder("demo")
+    .route("public.orders", MemorySinkAdapter::new("orders").boxed())
+    .route("public.audit", MemorySinkAdapter::new("audit").boxed())
+    .default(MemorySinkAdapter::new("fallback").boxed())
+    .build()
+    .expect("valid patterns");
 ```
 
 ## Notes
@@ -119,3 +131,159 @@ let fan = FanOutSinkAdapter::new(vec![
 - All optional capability methods have no-op defaults; override only what your sink actually supports.
 - Retry policies and delivery semantics are the responsibility of the embedding application.
 - `MemorySinkAdapter` is exported from the crate root for convenience in tests.
+
+## EffectivelyOnce Delivery: Barrier Protocol
+
+`SinkDeliveryGuarantee::EffectivelyOnce` is the strongest guarantee available. It requires
+the sink to participate in a **two-phase checkpoint barrier** so that the runtime and the sink
+advance their durable state atomically — no event is lost on crash, and no event is emitted
+twice to the downstream system (assuming the downstream is a transactional target such as a
+database or a Kafka topic with transactions enabled).
+
+### Responsibility split
+
+The **runtime** is responsible for:
+- Calling `begin_checkpoint_barrier()` before the commit window opens.
+- Calling `commit_checkpoint_barrier()` after the checkpoint is durable.
+- Calling `abort_checkpoint_barrier()` on any error in the commit window.
+
+The **sink** is responsible for:
+- Opening a transaction (or writing to a transactional staging area) on `begin_checkpoint_barrier`.
+- Making all `send()` calls part of that transaction during the window.
+- Committing the transaction atomically with the checkpoint on `commit_checkpoint_barrier`.
+- Rolling back on `abort_checkpoint_barrier`.
+
+> **Important:** The runtime does **not** orchestrate the barrier automatically. The embedder
+> must drive the barrier calls explicitly around the commit path. The barrier methods are hooks
+> — the runtime calls them at the right lifecycle points when the sink advertises
+> `EffectivelyOnce` via `delivery_guarantee()` and
+> `transactional_checkpoint_barrier_capable()` returns `true`.
+
+### Minimal implementation skeleton
+
+```rust,no_run
+use rustcdc::sink::{SinkAdapter, SinkDeliveryGuarantee};
+use rustcdc::{Event, Result};
+
+/// A sink that writes to a transactional target and participates in the
+/// checkpoint barrier protocol to provide EffectivelyOnce delivery.
+pub struct TransactionalSink {
+    name: String,
+    pending: Vec<Event>,
+    in_barrier: bool,
+    closed: bool,
+}
+
+impl TransactionalSink {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            pending: Vec::new(),
+            in_barrier: false,
+            closed: false,
+        }
+    }
+
+    async fn begin_transaction(&mut self) -> Result<()> {
+        // Open a database transaction, Kafka transaction, etc.
+        self.in_barrier = true;
+        Ok(())
+    }
+
+    async fn commit_transaction(&mut self) -> Result<()> {
+        // Commit all pending events atomically with the checkpoint.
+        self.pending.clear();
+        self.in_barrier = false;
+        Ok(())
+    }
+
+    async fn rollback_transaction(&mut self) -> Result<()> {
+        self.pending.clear();
+        self.in_barrier = false;
+        Ok(())
+    }
+}
+
+impl SinkAdapter for TransactionalSink {
+    async fn send(&mut self, event: &Event) -> Result<()> {
+        // Buffer into the open transaction.
+        self.pending.push(event.clone());
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        // Flush pending events within the current transaction (no commit yet).
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        if self.in_barrier {
+            self.rollback_transaction().await?;
+        }
+        self.closed = true;
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn delivery_guarantee(&self) -> SinkDeliveryGuarantee {
+        SinkDeliveryGuarantee::EffectivelyOnce
+    }
+
+    fn transactional_checkpoint_barrier_capable(&self) -> bool {
+        true
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    async fn begin_checkpoint_barrier(&mut self) -> Result<()> {
+        self.begin_transaction().await
+    }
+
+    async fn commit_checkpoint_barrier(&mut self) -> Result<()> {
+        self.commit_transaction().await
+    }
+
+    async fn abort_checkpoint_barrier(&mut self) -> Result<()> {
+        self.rollback_transaction().await
+    }
+}
+```
+
+### Embedder-side barrier orchestration
+
+```rust,no_run
+# use rustcdc::{CdcRuntime, sink::SinkAdapter};
+async fn run(mut runtime: CdcRuntime, mut sink: impl SinkAdapter) -> rustcdc::Result<()> {
+    loop {
+        let batch = runtime.poll_event_batch().await?;
+        if batch.is_empty() {
+            break;
+        }
+        // Send all events in the batch to the sink.
+        for event in batch.events() {
+            sink.send(event).await?;
+        }
+        // Open the barrier — sink begins its transaction.
+        sink.begin_checkpoint_barrier().await?;
+        // Commit the checkpoint durably.
+        match runtime.commit_ack(batch.ack_mode()).await {
+            Ok(_) => {
+                // Checkpoint is durable — commit the sink transaction.
+                sink.commit_checkpoint_barrier().await?;
+            }
+            Err(e) => {
+                // Checkpoint failed — roll back the sink transaction.
+                sink.abort_checkpoint_barrier().await?;
+                return Err(e);
+            }
+        }
+    }
+    sink.close().await?;
+    Ok(())
+}
+```

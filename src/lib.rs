@@ -86,16 +86,19 @@ pub use crate::codec::ProtobufEncoder;
 #[cfg(feature = "schemreg")]
 pub use crate::codec::{
     decode_wire_format, encode_wire_format, CachedSchemaRegistry, CompatibilityLevel,
-    ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentSchemaRegistry,
-    EncodeTarget, SchemaId, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig,
-    SchemaType, SubjectNameStrategy,
+    ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
+    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentSchemaRegistry, EncodeTarget,
+    SchemaId, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType,
+    SubjectNameStrategy, EVENT_JSON_SCHEMA, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
 };
 pub use crate::codec::{
     BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec, EventEncoder, JsonCodec,
     JsonEncoder, JsonPrettyEncoder,
 };
-pub use crate::pipeline::{TableRoute, TableRouter, TableRouterBuilder};
+pub use crate::pipeline::{
+    table_matches, HeterogeneousTableRouter, TableRoute, TableRouter, TableRouterBuilder,
+};
 pub use crate::sink::{
     BoxedSink, FanOutSinkAdapter, FileJsonlSink, FileJsonlSinkConfig, MemorySinkAdapter,
-    SinkAdapter, SinkDeliveryGuarantee, StdoutSink,
+    SinkAdapter, SinkDeliveryGuarantee, SinkDeliveryMetrics, StdoutSink,
 };
