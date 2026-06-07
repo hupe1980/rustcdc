@@ -161,6 +161,20 @@ pub(super) fn build_tls_root_store(ca_cert_path: Option<&str>) -> Result<rustls:
     Ok(root_store)
 }
 
+/// Return the process-level `CryptoProvider` if the embedder has registered one
+/// via [`rustls::crypto::CryptoProvider::install_default`], otherwise fall back
+/// to `ring`. Using a registered default lets embedders choose `aws-lc-rs` (e.g.
+/// for FIPS) without requiring source-level changes in rustcdc.
+///
+/// This function must never call `install_default()` — that is process-global
+/// mutation that belongs solely to the embedder / binary entry point.
+#[cfg(feature = "tls")]
+fn resolve_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| rustls::crypto::ring::default_provider().into())
+}
+
 /// Build a `rustls::ClientConfig` with optional mTLS client certificate.
 ///
 /// When `client_cert_path` and `client_key_path` are both `Some`, mutual TLS
@@ -216,7 +230,11 @@ pub(super) fn build_tls_client_config(
                     ))
                 })?;
 
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(resolve_crypto_provider())
+                .with_safe_default_protocol_versions()
+                .map_err(|error| {
+                    Error::ConfigError(format!("TLS protocol configuration failed: {error}"))
+                })?
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|error| {
@@ -231,8 +249,15 @@ pub(super) fn build_tls_client_config(
         (None, Some(_)) => Err(Error::ConfigError(
             "mTLS requires both client_cert_path and client_key_path".into(),
         )),
-        (None, None) => Ok(rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()),
+        (None, None) => {
+            let config = rustls::ClientConfig::builder_with_provider(resolve_crypto_provider())
+                .with_safe_default_protocol_versions()
+                .map_err(|error| {
+                    Error::ConfigError(format!("TLS protocol configuration failed: {error}"))
+                })?
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            Ok(config)
+        }
     }
 }
