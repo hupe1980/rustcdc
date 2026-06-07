@@ -25,7 +25,7 @@ default = ["postgres", "tls"]
 # Enable PostgreSQL-specific source implementations.
 postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
 # Enable MySQL-specific source implementations.
-mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "tls"]
+mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "mysql_async/ring", "tls"]
 # Enable MariaDB CDC support. Uses the MySQL binlog connector under the hood;
 # MariaDB-specific protocol differences (GTID format, system variable names,
 # capability flags) are handled transparently by the shared connector code.
@@ -87,7 +87,7 @@ tokio-util = { version = "0.7.16", features = ["compat"] }
 rustls = { version = "0.23.19", default-features = false, features = ["std", "ring"], optional = true }
 rustls-pemfile = { version = "2.0", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
-tokio-rustls = { version = "0.26", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 prost = { version = "0.13", optional = true }
 apache-avro = { version = "0.17", optional = true }
 bytes = { version = "1", optional = true }
