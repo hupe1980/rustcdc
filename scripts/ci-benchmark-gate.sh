@@ -290,14 +290,30 @@ record_baseline_fallback_bench() {
   esac
 }
 
+# Return the --features flag(s) required for a named bench target, or empty.
+# Keep this list in sync with [[bench]] required-features in Cargo.toml.
+bench_required_features() {
+  case "$1" in
+    cdc_perf) echo "--features wasm" ;;
+    *)        echo "" ;;
+  esac
+}
+
 run_bench() {
   local bench_name="$1"
   local out_file="$2"
   local mode="${3:-compare}"
   local allow_missing_baseline_retry="${4:-1}"
   local baseline_args=()
-  local cargo_args=(
-    cargo bench --bench "$bench_name" --
+  local features_arg
+  features_arg="$(bench_required_features "$bench_name")"
+  local cargo_args=()
+  if [[ -n "$features_arg" ]]; then
+    cargo_args=(cargo bench --bench "$bench_name" $features_arg --)
+  else
+    cargo_args=(cargo bench --bench "$bench_name" --)
+  fi
+  cargo_args+=(
     --sample-size "$bench_sample_size"
     --measurement-time "$bench_measurement_secs"
     --warm-up-time "$bench_warm_up_secs"
@@ -371,8 +387,11 @@ run_preheat() {
   local bench_name="$1"
   local run_index="$2"
   local out_file="target/benchmark-ci-gate-preheat-${bench_name}-${run_index}.txt"
+  local features_arg
+  features_arg="$(bench_required_features "$bench_name")"
   echo "Running preheat benchmark pass ${run_index} for ${bench_name} to reduce first-run jitter..."
-  cargo bench --bench "$bench_name" -- --sample-size 10 --measurement-time 2 --warm-up-time 1 > "$out_file"
+  # shellcheck disable=SC2086
+  cargo bench --bench "$bench_name" $features_arg -- --sample-size 10 --measurement-time 2 --warm-up-time 1 > "$out_file"
 }
 
 collect_regressions() {
