@@ -213,8 +213,8 @@ reliability_suites=(
   "reliability deterministic replay golden fixtures|deterministic_replay_golden_fixtures|postgres,test-harnesses"
   "reliability runtime health states|runtime_health_states|postgres,test-harnesses"
   "reliability fault injection soak matrix|fault_injection_soak_matrix|postgres,test-harnesses"
-  "reliability wasm runtime integration|wasm_runtime_integration|postgres,test-harnesses"
-  "reliability wasm conformance contract|wasm_conformance_contract|postgres,test-harnesses"
+  "reliability wasm runtime integration|wasm_runtime_integration|postgres,wasm,test-harnesses"
+  "reliability wasm conformance contract|wasm_conformance_contract|postgres,wasm,test-harnesses"
 )
 
 for entry in "${postgres_suites[@]}"; do
