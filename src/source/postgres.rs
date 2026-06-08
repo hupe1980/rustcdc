@@ -772,17 +772,10 @@ impl StreamHandle for PostgresStreamHandle {
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
-            let elapsed = started.elapsed();
-            // Each poll_xlog_data call must complete within the remaining time budget.
-            // When timeout_ms == 0 (single-shot) we still impose a backstop so the SQL
-            // query can never block the caller indefinitely.
-            let poll_timeout = if timeout_ms == 0 {
-                Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS)
-            } else {
-                timeout
-                    .saturating_sub(elapsed)
-                    .max(Duration::from_millis(1))
-            };
+            // Always use the backstop as the per-query ceiling — it prevents indefinite
+            // hangs without shrinking to near-zero as the outer budget drains.
+            // The outer timeout_ms contract is enforced by the elapsed-time check below.
+            let poll_timeout = Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS);
 
             let xlog_data = self
                 .provider

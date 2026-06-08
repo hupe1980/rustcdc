@@ -19,7 +19,7 @@ services:
       timeout: 3s
       retries: 20
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - ./docker/initdb/01_cdc_setup.sql:/docker-entrypoint-initdb.d/01_cdc_setup.sql:ro
 
