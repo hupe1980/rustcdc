@@ -479,6 +479,12 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             )
             .await;
 
+        // Always reset statement_timeout to 0 (no limit) after the poll completes,
+        // regardless of outcome. The `Arc<Client>` is shared with snapshot chunk
+        // queries (incremental snapshot) and the confirm_lsn advance query — those
+        // must not inherit the short streaming poll budget.
+        let _ = self.client.execute("SET statement_timeout = 0", &[]).await;
+
         let rows = match result {
             Ok(rows) => rows,
             Err(ref e) if e.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) => {

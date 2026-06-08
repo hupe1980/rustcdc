@@ -9,7 +9,6 @@ use super::decoder::LivePgOutputMessageProvider;
 use super::{
     decode_stream_resume_lsn, query_current_wal_lsn, reconcile_stream_resume_lsn_with_retry,
     PostgresConnection, PostgresStream, PostgresStreamHandle, StreamState,
-    DEFAULT_POLL_BACKSTOP_MS,
 };
 
 pub(super) async fn start_postgres_stream(
@@ -44,25 +43,6 @@ pub(super) async fn start_postgres_stream(
     } else {
         stream.lsn_position = query_current_wal_lsn(&client).await?;
     }
-
-    // Reset statement_timeout to the backstop ceiling after any LSN-reconciliation
-    // queries (which run without a timeout ceiling). Each poll_xlog_data call will
-    // lower this value for its own duration, then this ceiling acts as the default
-    // between explicit per-call overrides.
-    //
-    // 0 = no server-side limit (default); we impose our own backstop here so that
-    // the streaming connection can never block indefinitely even in degenerate cases.
-    client
-        .execute(
-            &format!("SET statement_timeout = {DEFAULT_POLL_BACKSTOP_MS}"),
-            &[],
-        )
-        .await
-        .map_err(|e| {
-            Error::SourceError(format!(
-                "failed setting statement_timeout on streaming connection: {e}"
-            ))
-        })?;
 
     stream.replication_status = StreamState::Streaming;
     {
