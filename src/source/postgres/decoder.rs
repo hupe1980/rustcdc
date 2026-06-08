@@ -455,46 +455,46 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
     ) -> Result<Vec<PgOutputXLogData>> {
         // pg_logical_slot_peek_binary_changes expects upto_nchanges as int4.
         let capped = i32::try_from(max_messages.max(1)).unwrap_or(i32::MAX);
-        let cancel_token = self.client.cancel_token();
-        // Clone owned values so the async-move future does not borrow `self`.
-        let client = self.client.clone();
-        let slot_name = self.slot_name.clone();
-        let pub_name = self.publication_name.clone();
-        let query_fut = async move {
-            client
-                .query(
-                    "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
-                     $2, 'proto_version', '1', 'publication_names', $3)",
-                    &[
-                        &slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
-                        &capped,
-                        &pub_name,
-                    ],
-                )
-                .await
-        };
 
-        let rows = match tokio::time::timeout(poll_timeout, query_fut).await {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(e)) => {
+        // Enforce the per-poll time budget server-side via statement_timeout.
+        // This produces a proper QueryCanceled response over the normal protocol,
+        // leaving the connection in a valid state — unlike dropping the query
+        // future mid-flight which can corrupt the tokio-postgres connection.
+        let timeout_ms = u64::try_from(poll_timeout.as_millis()).unwrap_or(u64::MAX);
+        self.client
+            .execute(&format!("SET statement_timeout = {timeout_ms}"), &[])
+            .await
+            .map_err(|e| Error::SourceError(format!("failed setting statement_timeout: {e}")))?;
+
+        let result = self
+            .client
+            .query(
+                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
+                 $2, 'proto_version', '1', 'publication_names', $3)",
+                &[
+                    &self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &capped,
+                    &self.publication_name,
+                ],
+            )
+            .await;
+
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(ref e) if e.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) => {
+                tracing::debug!(
+                    target: "rustcdc::source::postgres",
+                    slot = %self.slot_name,
+                    timeout_ms,
+                    "postgres poll_xlog_data hit statement_timeout; returning empty batch",
+                );
+                return Ok(vec![]);
+            }
+            Err(e) => {
                 return Err(parser::map_pgoutput_poll_error(
                     &self.slot_name,
                     &e.to_string(),
                 ));
-            }
-            Err(_elapsed) => {
-                // The SQL query exceeded its time budget. Cancel it server-side so
-                // the connection is returned to a ready state before the next poll.
-                // cancel_query uses a separate TCP connection and can safely use NoTls
-                // even when the main connection is TLS-encrypted.
-                let _ = cancel_token.cancel_query(tokio_postgres::NoTls).await;
-                tracing::debug!(
-                    target: "rustcdc::source::postgres",
-                    slot = %self.slot_name,
-                    timeout_ms = poll_timeout.as_millis(),
-                    "postgres poll_xlog_data timed out; query cancelled",
-                );
-                return Ok(vec![]);
             }
         };
 
