@@ -40,6 +40,17 @@ impl Default for SecretString {
 }
 
 impl PartialEq for SecretString {
+    /// Compare two `SecretString` values for equality.
+    ///
+    /// # Security
+    ///
+    /// For `Inline` secrets this comparison exposes the raw secret value to the
+    /// CPU's branch predictor and is **not constant-time**. It is safe for
+    /// configuration deduplication (the intended use case) but **must not** be
+    /// used for authentication token comparison, HMAC verification, or any
+    /// context where timing oracles are a threat model. Use
+    /// `subtle::ConstantTimeEq` (or equivalent) for security-sensitive equality
+    /// checks.
     fn eq(&self, other: &Self) -> bool {
         self.kind_and_descriptor() == other.kind_and_descriptor()
     }

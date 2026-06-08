@@ -27,7 +27,11 @@ impl fmt::Debug for PostgresSourceConfig {
             .field("publication_name", &self.publication_name)
             .field("conn_timeout_secs", &self.conn_timeout_secs)
             .field("stream_poll_interval_ms", &self.stream_poll_interval_ms)
-            .field("max_events_per_poll", &self.max_events_per_poll);
+            .field("max_events_per_poll", &self.max_events_per_poll)
+            .field(
+                "slot_idle_advance_interval_ms",
+                &self.slot_idle_advance_interval_ms,
+            );
         debug.field("transport", &self.transport);
         debug.finish()
     }
@@ -50,6 +54,7 @@ impl Default for PostgresSourceConfig {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             table_include_list: Vec::new(),
             table_exclude_list: Vec::new(),
+            slot_idle_advance_interval_ms: Self::default_slot_idle_advance_interval_ms(),
         }
     }
 }
@@ -58,6 +63,12 @@ impl PostgresSourceConfig {
     /// Return the connector name used by the source abstraction.
     pub const fn source_type() -> &'static str {
         "postgres"
+    }
+
+    /// Default idle WAL advance interval (30 s). Used as the serde `default`
+    /// when deserializing configs that predate this field.
+    pub const fn default_slot_idle_advance_interval_ms() -> u64 {
+        30_000
     }
 
     /// Enable AWS IAM token-based database authentication mode.

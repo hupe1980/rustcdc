@@ -49,11 +49,25 @@ pub(super) async fn start_postgres_stream(
         let mut state = connection.state.lock().await;
         state.stream_start_watermark = Some(stream.lsn_position);
     }
+    // When resuming from a checkpoint the checkpoint LSN is the last durably
+    // confirmed WAL position, so it is the correct lower bound for skip-guard.
+    // When starting fresh (no checkpoint) stream.lsn_position was set to
+    // query_current_wal_lsn() — a value HIGHER than the slot's current
+    // confirmed_flush_lsn.  If we pass that high value as confirmed_lsn, every
+    // confirm_lsn call for historical events (which have lower LSNs) hits the
+    // `lsn <= self.confirmed_lsn` guard and returns without advancing the slot,
+    // causing an infinite replay loop.  Use 0 on fresh start so the slot is
+    // advanced as historical batches are acknowledged.
+    let initial_confirmed_lsn = if resume_from.is_some() {
+        stream.lsn_position
+    } else {
+        0
+    };
     let provider = Box::new(LivePgOutputMessageProvider {
         client,
         slot_name: stream.slot_name.clone(),
         publication_name: stream.publication_name.clone(),
-        confirmed_lsn: stream.lsn_position,
+        confirmed_lsn: initial_confirmed_lsn,
     });
     Ok(Box::new(PostgresStreamHandle::new(
         connection.source_type().to_string(),
@@ -61,6 +75,7 @@ pub(super) async fn start_postgres_stream(
         provider,
         connection.max_events_per_poll,
         connection.stream_poll_interval_ms,
+        connection.slot_idle_advance_interval_ms,
         connection.config.table_include_list.clone(),
         connection.config.table_exclude_list.clone(),
     )))

@@ -669,6 +669,12 @@ pub struct RuntimeAdminSnapshot {
     pub checkpoint_age_ms: Option<u64>,
     /// Estimated replication lag from source in milliseconds (None if not available).
     pub replication_lag_ms: Option<u64>,
+    /// Replication slot WAL lag in bytes (`pg_current_wal_lsn - confirmed_flush_lsn`).
+    ///
+    /// Only populated for PostgreSQL sources after the first idle-advance call.
+    /// `None` means the lag has not yet been measured (the slot may still be behind).
+    /// `Some(0)` means the slot is fully caught up to the current WAL write position.
+    pub replication_slot_lag_bytes: Option<u64>,
 }
 
 /// Opaque token representing an in-flight batch prefix that may be committed.
@@ -1414,6 +1420,17 @@ impl CdcRuntime {
                 .metrics
                 .record_replication_lag_ms(lag_ms, lag_events);
         }
+
+        // Record slot lag bytes if available from the last idle-advance cycle.
+        if let Some(lag_bytes) = self
+            .stream
+            .as_ref()
+            .and_then(|s| s.replication_slot_lag_bytes())
+        {
+            self.observability()
+                .metrics
+                .record_replication_slot_lag_bytes(lag_bytes);
+        }
     }
 
     fn event_trace_id(event: &Event) -> String {
@@ -1667,6 +1684,8 @@ mod tests {
                 .expect("recording metrics mutex should not be poisoned");
             state.replication_lag_calls += 1;
         }
+
+        fn record_replication_slot_lag_bytes(&self, _lag_bytes: u64) {}
 
         fn record_error(&self, _error: &crate::core::Error, context: &str) {
             let mut state = self
@@ -3138,7 +3157,13 @@ mod tests {
             "default fail-fast policy should return an error after durable checkpoint commit",
         );
 
-        assert!(matches!(error, crate::core::Error::SourceError(_)));
+        assert!(matches!(
+            error,
+            crate::core::Error::PostCommitConfirmFailed {
+                checkpoint_safe: true,
+                ..
+            }
+        ));
 
         assert_eq!(
             runtime

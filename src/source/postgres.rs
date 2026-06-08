@@ -54,11 +54,10 @@ const HEARTBEAT_SECS: u64 = 60;
 const DEFAULT_SNAPSHOT_CHUNK_SIZE: usize = 5_000;
 const STREAM_POLL_INTERVAL_MS: u64 = 50;
 const MAX_EVENTS_PER_POLL: usize = 1_000;
+
 /// Maximum time a single `poll_xlog_data` SQL query may run when `timeout_ms == 0`.
 /// Prevents indefinite blocking on the "single-shot, return immediately" code-path.
 const DEFAULT_POLL_BACKSTOP_MS: u64 = 30_000;
-
-// ─── PostgresStreamHandle ───────────────────────────────────────────────────
 pub struct PostgresStreamHandle {
     source_name: String,
     stream: PostgresStream,
@@ -70,17 +69,29 @@ pub struct PostgresStreamHandle {
     events_polled: u64,
     max_events_per_poll: usize,
     stream_poll_interval_ms: u64,
+    /// Milliseconds between idle WAL advances (0 = disabled).
+    slot_idle_advance_interval_ms: u64,
+    /// Tracks when `idle_advance` was last called to gate the advance interval.
+    last_idle_advance_at: Option<std::time::Instant>,
+    /// Most recently observed WAL lag in bytes from the last `idle_advance` call.
+    ///
+    /// `0` before the first idle advance is executed.
+    /// Exposed via `replication_slot_lag_bytes()` and forwarded to the metrics
+    /// collector as `rustcdc_replication_slot_lag_bytes`.
+    last_slot_lag_bytes: u64,
     table_include_list: Vec<String>,
     table_exclude_list: Vec<String>,
 }
 
 impl PostgresStreamHandle {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source_name: String,
         stream: PostgresStream,
         provider: Box<dyn PgOutputMessageProvider>,
         max_events_per_poll: usize,
         stream_poll_interval_ms: u64,
+        slot_idle_advance_interval_ms: u64,
         table_include_list: Vec<String>,
         table_exclude_list: Vec<String>,
     ) -> Self {
@@ -95,6 +106,9 @@ impl PostgresStreamHandle {
             events_polled: 0,
             max_events_per_poll: max_events_per_poll.max(1),
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
+            slot_idle_advance_interval_ms,
+            last_idle_advance_at: None,
+            last_slot_lag_bytes: 0,
             table_include_list,
             table_exclude_list,
         }
@@ -428,6 +442,19 @@ pub struct PostgresSourceConfig {
     /// Ignored when [`table_include_list`](PostgresSourceConfig::table_include_list) is non-empty.
     /// An empty list means no tables are excluded.
     pub table_exclude_list: Vec<String>,
+    /// Interval in milliseconds between WAL slot idle-advance calls.
+    ///
+    /// When no committed events are delivered (e.g., during bursts of rolled-back
+    /// transactions or when the upstream database is idle), the replication slot's
+    /// `confirmed_flush_lsn` stays pinned and PostgreSQL cannot recycle WAL segments.
+    /// Setting this interval causes the connector to periodically call
+    /// `pg_replication_slot_advance(pg_current_wal_lsn())` when no events have
+    /// been observed for the configured duration.
+    ///
+    /// - Set to `0` to disable idle advances (not recommended for long-lived streams).
+    /// - Default: 30 000 ms.
+    #[serde(default = "PostgresSourceConfig::default_slot_idle_advance_interval_ms")]
+    pub slot_idle_advance_interval_ms: u64,
 }
 
 /// PostgreSQL connector lifecycle manager.
@@ -437,30 +464,35 @@ pub struct PostgresConnection {
     state: Arc<Mutex<ConnectionState>>,
     stream_poll_interval_ms: u64,
     max_events_per_poll: usize,
+    slot_idle_advance_interval_ms: u64,
 }
 
 impl PostgresConnection {
     pub fn new(config: PostgresSourceConfig) -> Self {
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
         let max_events_per_poll = config.max_events_per_poll.max(1);
+        let slot_idle_advance_interval_ms = config.slot_idle_advance_interval_ms;
         Self {
             config,
             logger: StructuredLogger::new("postgres"),
             state: Arc::new(Mutex::new(ConnectionState::default())),
             stream_poll_interval_ms,
             max_events_per_poll,
+            slot_idle_advance_interval_ms,
         }
     }
 
     pub fn with_logger(config: PostgresSourceConfig, logger: StructuredLogger) -> Self {
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
         let max_events_per_poll = config.max_events_per_poll.max(1);
+        let slot_idle_advance_interval_ms = config.slot_idle_advance_interval_ms;
         Self {
             config,
             logger,
             state: Arc::new(Mutex::new(ConnectionState::default())),
             stream_poll_interval_ms,
             max_events_per_poll,
+            slot_idle_advance_interval_ms,
         }
     }
 
@@ -731,7 +763,12 @@ impl Source for PostgresConnection {
             snapshot_checkpoint_resume: true,
             handoff: true,
             ddl_capture: true,
-            heartbeat: true,
+            // heartbeat = false: the SELECT 1 keepalive prevents TCP idle-timeout
+            // but does NOT send a pgoutput StandbyStatusUpdate to the primary.
+            // WAL keepalive is handled instead by the idle_advance mechanism
+            // (slot_idle_advance_interval_ms) which periodically calls
+            // pg_replication_slot_advance(pg_current_wal_lsn()).
+            heartbeat: false,
             tls: cfg!(feature = "tls"),
             schema_introspection: true,
             truncate: true,
@@ -782,6 +819,11 @@ impl StreamHandle for PostgresStreamHandle {
                 .poll_xlog_data(self.max_events_per_poll, poll_timeout)
                 .await?;
             if !xlog_data.is_empty() {
+                // Got WAL data — reset the idle advance timer so the interval is
+                // measured from the last active period, not from the last call.
+                self.last_idle_advance_at = Some(std::time::Instant::now());
+
+                let lsn_before = self.stream.lsn_position;
                 let events = self.process_messages(xlog_data).await?;
                 if !events.is_empty() {
                     tracing::debug!(
@@ -792,7 +834,31 @@ impl StreamHandle for PostgresStreamHandle {
                     );
                     return Ok(events);
                 }
-                // Got only metadata messages (RELATION, etc.) — continue polling.
+                // No user-visible events were produced (e.g. filtered-table transactions
+                // or schema-only messages), but lsn_position may have advanced via a
+                // COMMIT in process_messages.  If we leave the provider's confirmed_lsn
+                // behind, pg_logical_slot_peek_binary_changes returns the exact same
+                // batch on every subsequent poll — creating an infinite busy-poll loop.
+                // Advance the slot now so the next peek starts past these rows.
+                if self.stream.lsn_position > lsn_before {
+                    self.provider.confirm_lsn(self.stream.lsn_position).await?;
+                }
+            } else if self.slot_idle_advance_interval_ms > 0 {
+                // Empty batch: no committed events this poll cycle. Periodically
+                // advance the replication slot to the current WAL write position so
+                // PostgreSQL can reclaim WAL segments that would otherwise accumulate
+                // indefinitely during aborted-transaction storms or idle periods.
+                let threshold =
+                    std::time::Duration::from_millis(self.slot_idle_advance_interval_ms);
+                let should_advance = self
+                    .last_idle_advance_at
+                    .map(|t| t.elapsed() >= threshold)
+                    .unwrap_or(true);
+                if should_advance {
+                    let lag_bytes = self.provider.idle_advance().await?;
+                    self.last_slot_lag_bytes = lag_bytes;
+                    self.last_idle_advance_at = Some(std::time::Instant::now());
+                }
             }
 
             if timeout_ms == 0 || started.elapsed() >= timeout {
@@ -821,6 +887,16 @@ impl StreamHandle for PostgresStreamHandle {
 
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
         self.provider.confirm_lsn(lsn).await
+    }
+
+    fn replication_slot_lag_bytes(&self) -> Option<u64> {
+        // Return None before the first idle advance so callers can distinguish
+        // "not yet measured" from "measured and zero".
+        if self.last_slot_lag_bytes == 0 && self.last_idle_advance_at.is_none() {
+            None
+        } else {
+            Some(self.last_slot_lag_bytes)
+        }
     }
 }
 
@@ -1121,6 +1197,7 @@ mod tests {
             Box::new(provider),
             super::MAX_EVENTS_PER_POLL,
             super::STREAM_POLL_INTERVAL_MS,
+            0, // idle advance disabled in unit tests
             Vec::new(),
             Vec::new(),
         )
@@ -1407,6 +1484,7 @@ mod tests {
             Box::new(provider),
             super::MAX_EVENTS_PER_POLL,
             super::STREAM_POLL_INTERVAL_MS,
+            0, // idle advance disabled in unit tests
             Vec::new(),
             Vec::new(),
         );
@@ -1825,7 +1903,7 @@ mod tests {
         let capabilities = connection.capabilities();
         assert!(capabilities.snapshot);
         assert!(capabilities.handoff);
-        assert!(capabilities.heartbeat);
+        assert!(!capabilities.heartbeat);
         assert!(capabilities.ddl_capture);
     }
 
@@ -2256,5 +2334,60 @@ mod tests {
         assert_eq!(result.overlap_events_dropped, None);
         assert_eq!(result.stream_watermark_gap, Some(60));
         assert!(result.stream_start_ts.is_some());
+    }
+
+    /// Regression test: when all events in a batch are filtered out (e.g. the
+    /// transaction only touches excluded tables), process_messages returns empty
+    /// but the COMMIT still advances `lsn_position`.  next_events must call
+    /// confirm_lsn on the new position so that the next pg_logical_slot_peek_binary_changes
+    /// call returns fresh WAL rows rather than endlessly replaying the same batch.
+    #[tokio::test]
+    async fn stream_filtered_tx_advances_confirmed_lsn() {
+        const OID: u32 = 99;
+        // A single transaction on table "excluded_table".  The stream handle is
+        // configured with an include-list that does NOT contain this table, so
+        // process_messages will produce zero user events but the COMMIT still
+        // moves lsn_position from 0 → 1100.
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                800,
+                build_relation(OID, "public", "excluded_table", &[("id", true)]),
+            ),
+            xlog(800, build_begin(1000, 0, 42)),
+            xlog(900, build_insert(OID, &[Some("1")])),
+            xlog(1000, build_commit(900, 1100, 0)),
+        ]]);
+        let confirmed_lsn = provider.confirmed_lsn.clone();
+
+        // Build a stream handle that only allows "allowed_table" — "excluded_table" is filtered.
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            0,                                   // idle advance disabled in unit tests
+            vec!["public.allowed_table".into()], // include-list excludes "excluded_table"
+            Vec::new(),
+        );
+
+        // next_events times out with no events (batch is filtered) but must have
+        // called confirm_lsn to unblock subsequent peeks.
+        let events = handle.next_events(5).await.unwrap();
+        assert!(events.is_empty(), "filtered batch should yield no events");
+        assert_eq!(
+            handle.stream.lsn_position, 1100,
+            "lsn_position must advance even when all events are filtered"
+        );
+        assert_eq!(
+            *confirmed_lsn.lock().await,
+            1100,
+            "confirm_lsn must be called with the new lsn_position to unblock next peek"
+        );
     }
 }

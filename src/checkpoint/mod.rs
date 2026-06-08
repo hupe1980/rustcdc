@@ -319,11 +319,20 @@ impl FileCheckpoint {
             )));
         }
 
-        records.sort_by(|(left_time, left_path, _), (right_time, right_path, _)| {
-            left_time
-                .cmp(right_time)
-                .then_with(|| left_path.cmp(right_path))
-        });
+        records.sort_by(
+            |(left_time, _, left_record), (right_time, _, right_record)| {
+                left_time.cmp(right_time).then_with(|| {
+                    // On filesystems with coarse mtime resolution (FAT32: 2s, some NFS: 1s)
+                    // two checkpoint files can share an identical mtime. Break ties by
+                    // committed_event_count (higher = more progress = more recent) so we
+                    // always resume from the furthest durable position rather than
+                    // falling back to filesystem-dependent path ordering.
+                    left_record
+                        .committed_event_count
+                        .cmp(&right_record.committed_event_count)
+                })
+            },
+        );
 
         Ok(records.pop().map(|(_, _, record)| record))
     }

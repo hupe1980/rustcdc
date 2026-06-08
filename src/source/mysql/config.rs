@@ -1,5 +1,4 @@
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(feature = "tls")]
 use std::path::Path;
@@ -16,40 +15,6 @@ use super::{
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
 const MAX_MAX_EVENTS_PER_POLL: usize = 100_000;
-
-/// Generate a best-effort unique `server_id` for each MySQL replication client instance.
-///
-/// MySQL requires each replica to have a cluster-unique `server_id` in the
-/// range `[1, 2^32-1]`. Reusing `1` (the MySQL server default) or any fixed
-/// value across multiple `rustcdc` instances causes silent event loss or
-/// eviction of the existing client.
-///
-/// This function derives an ID from process ID bits combined with a
-/// monotonically incrementing counter and a compile-time constant, giving a
-/// stable-within-process spread that avoids the most common collision scenario
-/// (two replicas on the same host running the same binary).
-///
-/// **This is not a cluster-wide uniqueness guarantee.** Hash collisions across
-/// separate hosts or processes are possible, though unlikely in practice.
-/// Deployments that require strict cluster-wide uniqueness (e.g., auditing,
-/// CDC replication slot reservation) should set `server_id` explicitly after
-/// constructing the default config.
-fn generate_server_id() -> u32 {
-    // Counter ensures uniqueness within a process even when the PID component
-    // happens to collide across different processes on the same host.
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let idx = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    // Mix PID, counter, and a compile-time seed for spread.
-    // We use a Knuth multiplicative hash to fold the 32-bit PID into the range.
-    const COMPILE_SEED: u32 = 0x9e37_79b9; // golden ratio fractional constant
-    let pid = std::process::id();
-    let mixed = pid
-        .wrapping_mul(COMPILE_SEED)
-        .wrapping_add(idx.wrapping_mul(0x6c62_272e));
-    // Ensure the result is in [1, u32::MAX] (server_id = 0 is invalid).
-    mixed.max(1)
-}
 
 impl fmt::Debug for MysqlSourceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,14 +39,6 @@ impl fmt::Debug for MysqlSourceConfig {
 
 impl Default for MysqlSourceConfig {
     fn default() -> Self {
-        let server_id = generate_server_id();
-        tracing::warn!(
-            target: "rustcdc::source::mysql",
-            server_id,
-            "auto-generated MySQL replication server_id; \
-             this value must be unique across all replicas in the cluster — \
-             set MysqlSourceConfig::server_id explicitly in production"
-        );
         Self {
             host: "localhost".into(),
             port: 3306,
@@ -89,7 +46,12 @@ impl Default for MysqlSourceConfig {
             password: SecretString::default(),
             auth_mode: DatabaseAuthMode::Password,
             database: String::new(),
-            server_id,
+            // server_id = 0 is deliberately unset. MySQL treats 0 as "not assigned"
+            // and rustcdc's validate() rejects it with a clear error, forcing the
+            // operator to choose a cluster-unique value before connecting.
+            // Auto-generation was removed because PID-hash collisions caused silent
+            // event loss in multi-instance deployments with no recoverable signal.
+            server_id: 0,
             gtid_mode_enabled: false,
             binlog_format_check: true,
             transport: TransportConfig::tls(),
@@ -99,6 +61,7 @@ impl Default for MysqlSourceConfig {
             table_include_list: Vec::new(),
             table_exclude_list: Vec::new(),
             server_flavor: ServerFlavor::Mysql,
+            handoff_overlap_drain_budget_ms: Self::default_handoff_overlap_drain_budget_ms(),
         }
     }
 }
@@ -110,6 +73,13 @@ impl MysqlSourceConfig {
     /// `server_flavor` is `ServerFlavor::MariaDb`.
     pub fn source_type(&self) -> &'static str {
         self.server_flavor.source_name()
+    }
+
+    /// Default wall-clock budget for handoff overlap drain: 8 × the default
+    /// stream poll interval (8 × 50 ms = 400 ms). Used as the serde `default`
+    /// when deserializing configs that predate this field.
+    pub const fn default_handoff_overlap_drain_budget_ms() -> u64 {
+        STREAM_POLL_INTERVAL_MS * 8
     }
 
     /// Enable AWS IAM token-based database authentication mode.
@@ -182,7 +152,12 @@ impl MysqlSourceConfig {
         }
         if self.server_id == 0 {
             return Err(Error::ConfigError(
-                "mysql server_id must be greater than zero".into(),
+                "mysql server_id must be set explicitly to a cluster-unique value in \
+                 [1, 4294967295]. The default of 0 is intentionally unset — \
+                 MySQL silently evicts any existing replica that shares your server_id, \
+                 causing silent event loss. See the rustcdc docs for server_id \
+                 uniqueness requirements."
+                    .into(),
             ));
         }
         if self.conn_timeout_secs == 0 {

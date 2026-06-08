@@ -82,6 +82,9 @@ struct MetricsInstruments {
     checkpoint_committed: Counter<u64>,
     replication_lag_ms: Gauge<u64>,
     replication_lag_events: Gauge<u64>,
+    /// Replication slot WAL lag in bytes (`pg_current_wal_lsn - confirmed_flush_lsn`).
+    /// Updated by the idle-advance path; `0` when no idle advance has occurred yet.
+    replication_slot_lag_bytes: Gauge<u64>,
     checkpoint_offset: Gauge<u64>,
     buffer_size: Gauge<u64>,
     snapshot_progress: Gauge<u64>,
@@ -153,6 +156,14 @@ impl OTelMetricsCollector {
             replication_lag_events: meter
                 .u64_gauge("rustcdc.replication_lag_events")
                 .with_description("Replication lag in events")
+                .build(),
+            replication_slot_lag_bytes: meter
+                .u64_gauge("rustcdc.replication_slot_lag_bytes")
+                .with_description(
+                    "Replication slot WAL lag in bytes (pg_current_wal_lsn - confirmed_flush_lsn). \
+                     Non-zero during idle periods indicates healthy idle-advance; \
+                     monotonically growing indicates a stalled slot.",
+                )
                 .build(),
             checkpoint_offset: meter
                 .u64_gauge("rustcdc.checkpoint_offset")
@@ -248,6 +259,20 @@ impl OTelMetricsCollector {
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.replication_lag_ms.record(lag_ms, &[]);
+            }
+        }
+    }
+
+    pub fn record_replication_slot_lag_bytes_gauge(&self, lag_bytes: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.gauges.insert(
+                "rustcdc.replication_slot_lag_bytes".to_string(),
+                lag_bytes as f64,
+            );
+            if let Some(sdk) = &self.sdk {
+                sdk.instruments
+                    .replication_slot_lag_bytes
+                    .record(lag_bytes, &[]);
             }
         }
     }
@@ -391,6 +416,10 @@ impl MetricsCollector for OTelMetricsCollector {
         }
     }
 
+    fn record_replication_slot_lag_bytes(&self, lag_bytes: u64) {
+        self.record_replication_slot_lag_bytes_gauge(lag_bytes);
+    }
+
     fn record_error(&self, error: &Error, context: &str) {
         let error_class = error_metric_class(error);
         if let Ok(mut state) = self.state.lock() {
@@ -432,6 +461,7 @@ fn error_metric_class(error: &Error) -> &'static str {
         Error::StateError(_) => "state",
         Error::TransformError(_) => "transform",
         Error::NotImplemented(_) => "not_implemented",
+        Error::PostCommitConfirmFailed { .. } => "post_commit_confirm_failed",
     }
 }
 

@@ -437,6 +437,20 @@ pub(super) trait PgOutputMessageProvider: Send + Sync {
         poll_timeout: Duration,
     ) -> Result<Vec<PgOutputXLogData>>;
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()>;
+    /// Advance the replication slot to the current WAL LSN during idle periods.
+    ///
+    /// Called when no events have been delivered for `slot_idle_advance_interval_ms`.
+    /// Prevents PostgreSQL from accumulating WAL indefinitely when there are no
+    /// committed events (e.g., aborted-transaction bursts, idle upstream).
+    ///
+    /// Returns the current WAL lag in bytes (`pg_current_wal_lsn - confirmed_flush_lsn`)
+    /// after the advance (or `0` if the slot is already current). This value is
+    /// forwarded to the metrics collector as `rustcdc_replication_slot_lag_bytes`.
+    ///
+    /// The default implementation returns `Ok(0)`, used by test doubles.
+    async fn idle_advance(&mut self) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 pub(super) struct LivePgOutputMessageProvider {
@@ -523,13 +537,14 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         }
 
         let lsn_text = parser::format_pg_lsn(lsn);
-        let escaped_slot = self.slot_name.replace('\'', "''");
-        let escaped_lsn = lsn_text.replace('\'', "''");
-        let advance_sql = format!(
-            "SELECT 1 FROM pg_replication_slot_advance('{escaped_slot}'::name, '{escaped_lsn}'::pg_lsn)"
-        );
         self.client
-            .query_opt(&advance_sql, &[])
+            .query_opt(
+                "SELECT 1 FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
+                &[
+                    &self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &lsn_text as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
             .await
             .map_err(|error| {
                 Error::SourceError(format!(
@@ -539,6 +554,57 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             })?;
         self.confirmed_lsn = lsn;
         Ok(())
+    }
+
+    async fn idle_advance(&mut self) -> Result<u64> {
+        // Query the current write-ahead log LSN and advance the replication slot
+        // to that position. This releases WAL segments that PostgreSQL would
+        // otherwise retain indefinitely when no committed events are flowing.
+        let rows = self
+            .client
+            .query("SELECT pg_current_wal_lsn()::text", &[])
+            .await
+            .map_err(|e| {
+                Error::SourceError(format!(
+                    "idle advance: failed querying current WAL LSN: {e}"
+                ))
+            })?;
+
+        let Some(row) = rows.first() else {
+            return Ok(0);
+        };
+        let lsn_text: String = row.get(0);
+        let current_lsn = parser::parse_pg_lsn(&lsn_text)?;
+
+        // Compute lag before advancing so we return the pre-advance slack.
+        let lag_bytes = current_lsn.saturating_sub(self.confirmed_lsn);
+
+        if current_lsn > self.confirmed_lsn {
+            self.client
+                .query_opt(
+                    "SELECT 1 FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
+                    &[
+                        &self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
+                        &lsn_text as &(dyn tokio_postgres::types::ToSql + Sync),
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    Error::SourceError(format!(
+                        "idle advance: failed advancing slot '{}' to {}: {e}",
+                        self.slot_name, lsn_text
+                    ))
+                })?;
+            self.confirmed_lsn = current_lsn;
+            tracing::debug!(
+                target: "rustcdc::source::postgres",
+                slot = %self.slot_name,
+                lsn = %lsn_text,
+                lag_bytes,
+                "postgres replication slot advanced during idle period",
+            );
+        }
+        Ok(lag_bytes)
     }
 }
 

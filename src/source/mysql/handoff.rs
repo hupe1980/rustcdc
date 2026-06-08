@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::{
     checkpoint::MysqlOffset,
     core::{Error, Result},
@@ -16,6 +18,7 @@ pub(super) async fn mysql_handoff_result(
     stream: &mut dyn StreamHandle,
     snapshot_wm: MysqlOffset,
     stream_wm: MysqlOffset,
+    overlap_drain_budget_ms: u64,
 ) -> Result<HandoffResult> {
     let handoff = MysqlHandoff {
         snapshot_binlog_file: snapshot_wm.binlog_file,
@@ -41,14 +44,32 @@ pub(super) async fn mysql_handoff_result(
     // Finish the snapshot (commits the consistent-read transaction).
     let snapshot_end = snapshot.finish().await?.snapshot_end_ts;
 
-    // Read overlap events once and deduplicate by primary key (last writer wins).
-    // Then requeue retained events so downstream consumption order is preserved.
+    // Drain overlap events within the configured wall-clock budget, then
+    // deduplicate by primary key (last writer wins) and requeue for delivery.
+    // A budget of 0 means unlimited drain time.
+    let drain_deadline = (overlap_drain_budget_ms > 0)
+        .then(|| Instant::now() + std::time::Duration::from_millis(overlap_drain_budget_ms));
     let mut overlap_events = Vec::new();
     let mut non_overlap_events = Vec::new();
     let mut overlap_phase_complete = false;
     let mut polls = 0_usize;
 
-    while !overlap_phase_complete && polls < 8 {
+    while !overlap_phase_complete {
+        // Check wall-clock budget before each poll.
+        if let Some(deadline) = drain_deadline {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    target: "rustcdc::source::mysql",
+                    polls,
+                    budget_ms = overlap_drain_budget_ms,
+                    overlap_events_so_far = overlap_events.len(),
+                    "mysql handoff overlap drain budget exhausted; residual overlap events may \
+                     contain duplicates — increase handoff_overlap_drain_budget_ms or verify \
+                     traffic volume at handoff time",
+                );
+                break;
+            }
+        }
         polls += 1;
         let batch = stream.next_events(0).await?;
         if batch.is_empty() {

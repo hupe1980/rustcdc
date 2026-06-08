@@ -72,7 +72,17 @@ impl CdcRuntime {
                     // If stream is None (reconnect failed on a previous attempt), try to
                     // reconnect before polling again.
                     if self.stream.is_none() {
-                        self.source.close().await;
+                        if let Err(_elapsed) = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(30),
+                            self.source.close(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                target: "rustcdc::core::runtime",
+                                "source close timed out during reconnect; proceeding with reconnect regardless",
+                            );
+                        }
                         if let Err(connect_error) = self.source.connect().await {
                             tracing::warn!(
                                 target: "rustcdc::core::runtime",
@@ -165,7 +175,17 @@ impl CdcRuntime {
                             // from the last durable checkpoint offset to preserve at-least-once
                             // delivery without data loss.
                             self.stream = None;
-                            self.source.close().await;
+                            if let Err(_elapsed) = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(30),
+                                self.source.close(),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    target: "rustcdc::core::runtime",
+                                    "source close timed out during retry reconnect; proceeding with reconnect regardless",
+                                );
+                            }
                             if let Err(connect_error) = self.source.connect().await {
                                 tracing::warn!(
                                     target: "rustcdc::core::runtime",
@@ -451,6 +471,20 @@ impl CdcRuntime {
             self.observability()
                 .metrics
                 .record_event_processed(event.op, latency_ms);
+            // FR-3: Structured per-event trace including tx_id and WAL offset.
+            // At tracing::trace level so production deployments are not flooded;
+            // operators can enable it per-target for deep debugging.
+            tracing::trace!(
+                target: "rustcdc::core::runtime",
+                table = %event.table,
+                op = %event.op,
+                offset = %event.source.offset,
+                tx_id = event.transaction.as_ref().map(|tx| tx.tx_id),
+                event_index = event.transaction.as_ref().map(|tx| tx.event_index),
+                source_ts,
+                latency_ms,
+                "event delivered to caller",
+            );
         }
         if let Some(latest_source_ts) = events
             .iter()

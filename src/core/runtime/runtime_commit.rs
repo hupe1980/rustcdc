@@ -140,11 +140,10 @@ impl CdcRuntime {
                     );
                 }
                 PostCommitSourceConfirmPolicy::FailFast => {
-                    let error = Error::SourceError(format!(
-                        "post-commit source confirmation failed after durable checkpoint commit \
-                         (checkpoint is safe — replay from checkpoint is safe; only the \
-                         source-side replication slot/cursor confirmation failed): {summary}"
-                    ));
+                    let error = Error::PostCommitConfirmFailed {
+                        checkpoint_safe: true,
+                        detail: summary.clone(),
+                    };
                     self.record_runtime_error(
                         "runtime.commit.post_commit_confirm_fail_fast",
                         &error,

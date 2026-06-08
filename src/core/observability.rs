@@ -10,6 +10,15 @@ pub trait MetricsCollector: Send + Sync {
     fn record_checkpoint_committed(&self, event_count: u64, latency_ms: u64);
     /// Record replication lag in milliseconds and events.
     fn record_replication_lag_ms(&self, lag_ms: u64, lag_events: u64);
+    /// Record replication slot lag in bytes (`pg_current_wal_lsn - confirmed_flush_lsn`).
+    ///
+    /// This is the single most operationally critical signal for PostgreSQL CDC deployments:
+    /// it measures WAL accumulation on the primary that cannot be recycled until the slot
+    /// advances. A non-zero value during prolonged idle periods indicates the idle-advance
+    /// mechanism is working; a monotonically growing value indicates the slot is stalled.
+    ///
+    /// Only populated for PostgreSQL sources; always `0` for other connectors.
+    fn record_replication_slot_lag_bytes(&self, lag_bytes: u64);
     /// Record a typed error with an execution context label.
     fn record_error(&self, error: &Error, context: &str);
 }
@@ -32,6 +41,7 @@ impl MetricsCollector for NoOpMetricsCollector {
     fn record_event_processed(&self, _op: Operation, _latency_ms: u64) {}
     fn record_checkpoint_committed(&self, _event_count: u64, _latency_ms: u64) {}
     fn record_replication_lag_ms(&self, _lag_ms: u64, _lag_events: u64) {}
+    fn record_replication_slot_lag_bytes(&self, _lag_bytes: u64) {}
     fn record_error(&self, _error: &Error, _context: &str) {}
 }
 
@@ -56,6 +66,7 @@ mod tests {
         metrics.record_event_processed(Operation::Insert, 1);
         metrics.record_checkpoint_committed(10, 5);
         metrics.record_replication_lag_ms(42, 7);
+        metrics.record_replication_slot_lag_bytes(1024);
         metrics.record_error(&Error::ConfigError("bad".into()), "test");
 
         let tracer = NoOpEventTracer;

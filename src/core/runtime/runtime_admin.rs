@@ -56,6 +56,10 @@ impl CdcRuntime {
             last_commit_at_ms: self.last_commit_at_ms,
             checkpoint_age_ms,
             replication_lag_ms: self.estimate_replication_lag_ms(),
+            replication_slot_lag_bytes: self
+                .stream
+                .as_ref()
+                .and_then(|s| s.replication_slot_lag_bytes()),
         }
     }
 
@@ -168,6 +172,16 @@ impl CdcRuntime {
                  # TYPE rustcdc_runtime_replication_lag_ms gauge\n\
                  rustcdc_runtime_replication_lag_ms{{source_type=\"{source_type}\"}} {}",
                 lag_ms
+            )?;
+        }
+
+        if let Some(lag_bytes) = admin.replication_slot_lag_bytes {
+            writeln!(
+                w,
+                "# HELP rustcdc_replication_slot_lag_bytes PostgreSQL replication slot WAL lag in bytes (pg_current_wal_lsn - confirmed_flush_lsn). Non-zero during idle periods is expected; monotonically growing indicates a stalled slot.\n\
+                 # TYPE rustcdc_replication_slot_lag_bytes gauge\n\
+                 rustcdc_replication_slot_lag_bytes{{source_type=\"{source_type}\"}} {}",
+                lag_bytes
             )?;
         }
 

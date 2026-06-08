@@ -213,6 +213,17 @@ pub trait StreamHandle: Send + Sync {
     /// Confirm that all messages up to `lsn` have been durably consumed.
     /// Prevents WAL retention bloat on replication slots.
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()>;
+    /// Return the most recently observed replication slot WAL lag in bytes.
+    ///
+    /// Populated by the idle-advance path (`pg_current_wal_lsn - confirmed_flush_lsn`)
+    /// for PostgreSQL sources. Returns `None` for all other connectors and before
+    /// the first idle-advance call completes.
+    ///
+    /// Use this value for the `rustcdc_replication_slot_lag_bytes` metric and
+    /// `RuntimeAdminSnapshot::replication_slot_lag_bytes`.
+    fn replication_slot_lag_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[async_trait]

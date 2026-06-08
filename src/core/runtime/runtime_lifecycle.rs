@@ -116,11 +116,20 @@ impl CdcRuntime {
                         )
                         .await?,
                 );
-                let stream_resume_from =
-                    self.stream_resume_offset_for_snapshot_checkpoint(offset.as_ref())?;
+                let stream_resume_from = self
+                    .stream_resume_offset_for_snapshot_checkpoint(offset.as_ref())?
+                    .ok_or_else(|| {
+                        Error::StateError(
+                            "cannot resume streaming after snapshot checkpoint: no \
+                             'snapshot_watermark' LSN was found in the checkpoint payload. \
+                             Streaming without a known start position risks a data-loss window. \
+                             Re-run the snapshot from scratch to obtain a fresh watermark."
+                                .into(),
+                        )
+                    })?;
                 self.stream = Some(
                     self.source
-                        .start_stream(stream_resume_from.as_deref())
+                        .start_stream(Some(stream_resume_from.as_ref()))
                         .await?,
                 );
                 self.handoff_complete = false;

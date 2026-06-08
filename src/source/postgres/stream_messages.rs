@@ -331,6 +331,16 @@ impl PostgresStreamHandle {
             let msg = decode_pgoutput_message(&item.data)?;
             match msg {
                 PgOutputMessage::Begin(begin) => {
+                    if self.current_xid.is_some() {
+                        tracing::warn!(
+                            target: "rustcdc::source::postgres",
+                            prev_xid = ?self.current_xid,
+                            new_xid = begin.xid,
+                            partial_events_discarded = self.partial_tx_events.len(),
+                            "received BEGIN while a transaction was already in-flight; \
+                             discarding partial events — possible stream reset or protocol edge case",
+                        );
+                    }
                     self.current_xid = Some(begin.xid);
                     self.current_commit_ts = pg_timestamp_to_millis(begin.commit_timestamp_us);
                     self.partial_tx_events.clear();
@@ -344,6 +354,13 @@ impl PostgresStreamHandle {
                         }
                     }
                     self.events_polled += u64::from(total);
+                    tracing::trace!(
+                        target: "rustcdc::source::postgres",
+                        tx_id = self.current_xid,
+                        commit_lsn = commit.end_lsn,
+                        event_count = total,
+                        "postgres transaction committed",
+                    );
                     committed.append(&mut self.partial_tx_events);
                     self.current_xid = None;
                     self.current_commit_ts = 0;

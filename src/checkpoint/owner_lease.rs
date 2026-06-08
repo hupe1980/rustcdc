@@ -201,6 +201,22 @@ pub(crate) fn atomic_write_lease(lock_path: &Path, content: &str) -> std::io::Re
 pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease> {
     let owner_pid = std::process::id();
     let hostname = current_hostname();
+
+    // Warn when hostname resolution fell back to "unknown". Two processes on
+    // different hosts that both fail hostname resolution will write identical
+    // lease tokens — defeating the cross-host safety guarantee.
+    if hostname == "unknown" {
+        tracing::warn!(
+            target: "rustcdc::owner_lease",
+            store_label,
+            store_dir = %lock_path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+            "hostname resolved to 'unknown' (HOSTNAME env var unset and `hostname` command failed); \
+             cross-host exclusive-write guarantee is degraded — two processes on different hosts may \
+             both acquire the same lease. Use a dedicated {store_label} directory per runtime instance \
+             or set the HOSTNAME environment variable explicitly.",
+        );
+    }
+
     let lease_content = format_lease(hostname, owner_pid);
 
     let create_result = OpenOptions::new()

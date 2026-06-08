@@ -134,6 +134,22 @@ pub struct MysqlSourceConfig {
     /// Ignored when [`table_include_list`](MysqlSourceConfig::table_include_list) is non-empty.
     /// An empty list means no tables are excluded.
     pub table_exclude_list: Vec<String>,
+    /// Wall-clock budget in milliseconds for draining overlap events during snapshot-to-stream
+    /// handoff deduplication.
+    ///
+    /// During handoff, the connector polls the stream for events that overlap between the
+    /// snapshot consistent-read LSN and the stream start position. For high-traffic tables
+    /// with large batches, a hard poll-count cap can be exhausted before overlap is fully
+    /// drained, silently delivering duplicate rows.
+    ///
+    /// This budget replaces the legacy hard-coded `polls < 8` cap with an explicit
+    /// wall-clock limit. When the budget is exhausted with remaining overlap events,
+    /// a `tracing::warn!` is emitted with the residual count.
+    ///
+    /// Set to `0` to disable the budget (unlimited drain time — not recommended
+    /// for latency-sensitive deployments). Default: `stream_poll_interval_ms * 8`.
+    #[serde(default = "MysqlSourceConfig::default_handoff_overlap_drain_budget_ms")]
+    pub handoff_overlap_drain_budget_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -984,7 +1000,14 @@ impl Source for MysqlConnection {
             )
         })?;
 
-        mysql_handoff_result(snapshot, stream, snapshot_wm, stream_wm).await
+        mysql_handoff_result(
+            snapshot,
+            stream,
+            snapshot_wm,
+            stream_wm,
+            self.config.handoff_overlap_drain_budget_ms,
+        )
+        .await
     }
 
     fn source_type(&self) -> &str {

@@ -138,6 +138,30 @@ pub enum Error {
     /// Feature not implemented in the current phase.
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    /// Source slot/cursor confirmation failed after a durable checkpoint commit.
+    ///
+    /// The checkpoint **is safe** — replay from the last checkpoint is correct and
+    /// will not lose events. Only the source-side replication slot advancement failed.
+    ///
+    /// Use this variant to distinguish post-commit confirmation failures from
+    /// pre-commit source errors that require immediate rollback/replay attention.
+    ///
+    /// # Handling
+    ///
+    /// - Under [`crate::PostCommitSourceConfirmPolicy::FailFast`] this error is returned
+    ///   to the caller of `commit_ack`. The runtime remains usable — subsequent
+    ///   calls to `poll_event_batch` will trigger reconnection and the slot will
+    ///   be re-confirmed on the next successful poll cycle.
+    /// - Under [`crate::PostCommitSourceConfirmPolicy::Continue`] this variant is never
+    ///   returned; failures are logged and silently skipped.
+    #[error("post-commit confirm failed (checkpoint is safe — replay is safe): {detail}")]
+    PostCommitConfirmFailed {
+        /// Always `true`: the checkpoint was durably committed before confirmation
+        /// was attempted. Replay from the last checkpoint is safe.
+        checkpoint_safe: bool,
+        /// Human-readable summary of all confirmation failures in this commit.
+        detail: String,
+    },
 }
 
 impl Error {
@@ -166,7 +190,8 @@ impl Error {
             | Self::TransformError(_)
             | Self::SerializationError(_)
             | Self::IoError(_)
-            | Self::ValidationError(_) => ErrorKind::Terminal,
+            | Self::ValidationError(_)
+            | Self::PostCommitConfirmFailed { .. } => ErrorKind::Terminal,
         }
     }
 
@@ -208,6 +233,20 @@ mod tests {
         assert!(!Error::StateError("illegal transition".into()).is_recoverable());
         assert!(!Error::TransformError("crash".into()).is_recoverable());
         assert!(!Error::Unrecoverable("boom".into()).is_recoverable());
+    }
+
+    #[test]
+    fn post_commit_confirm_failed_is_terminal_and_not_recoverable() {
+        let err = Error::PostCommitConfirmFailed {
+            checkpoint_safe: true,
+            detail: "slot advance failed".into(),
+        };
+        assert_eq!(err.kind(), ErrorKind::Terminal);
+        assert!(!err.is_recoverable());
+        // Display must not expose the raw slot name or LSN
+        let display = err.to_string();
+        assert!(display.contains("checkpoint is safe"));
+        assert!(display.contains("replay is safe"));
     }
 
     #[test]
