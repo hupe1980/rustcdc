@@ -4,7 +4,7 @@
 //! logical replication pgoutput protocol.  It is intentionally kept free of any
 //! connection-management or snapshot logic so that it can be read and tested in isolation.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio_postgres::Client;
@@ -425,7 +425,17 @@ pub(super) struct PgOutputXLogData {
 
 #[async_trait]
 pub(super) trait PgOutputMessageProvider: Send + Sync {
-    async fn poll_xlog_data(&mut self, max_messages: usize) -> Result<Vec<PgOutputXLogData>>;
+    /// Poll for up to `max_messages` decoded WAL rows.
+    ///
+    /// The implementation **must** return within `poll_timeout`. For the
+    /// SQL-polling backend this is enforced via [`tokio::time::timeout`] plus a
+    /// server-side query cancellation so the underlying connection is always
+    /// returned to a ready state before the next call.
+    async fn poll_xlog_data(
+        &mut self,
+        max_messages: usize,
+        poll_timeout: Duration,
+    ) -> Result<Vec<PgOutputXLogData>>;
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()>;
 }
 
@@ -438,17 +448,55 @@ pub(super) struct LivePgOutputMessageProvider {
 
 #[async_trait]
 impl PgOutputMessageProvider for LivePgOutputMessageProvider {
-    async fn poll_xlog_data(&mut self, max_messages: usize) -> Result<Vec<PgOutputXLogData>> {
+    async fn poll_xlog_data(
+        &mut self,
+        max_messages: usize,
+        poll_timeout: Duration,
+    ) -> Result<Vec<PgOutputXLogData>> {
         // pg_logical_slot_peek_binary_changes expects upto_nchanges as int4.
         let capped = i32::try_from(max_messages.max(1)).unwrap_or(i32::MAX);
-        let rows = self
-            .client
-            .query(
-                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, $2, 'proto_version', '1', 'publication_names', $3)",
-                &[&self.slot_name, &capped, &self.publication_name],
-            )
-            .await
-            .map_err(|error| parser::map_pgoutput_poll_error(&self.slot_name, &error.to_string()))?;
+        let cancel_token = self.client.cancel_token();
+        // Clone owned values so the async-move future does not borrow `self`.
+        let client = self.client.clone();
+        let slot_name = self.slot_name.clone();
+        let pub_name = self.publication_name.clone();
+        let query_fut = async move {
+            client
+                .query(
+                    "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
+                     $2, 'proto_version', '1', 'publication_names', $3)",
+                    &[
+                        &slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
+                        &capped,
+                        &pub_name,
+                    ],
+                )
+                .await
+        };
+
+        let rows = match tokio::time::timeout(poll_timeout, query_fut).await {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                return Err(parser::map_pgoutput_poll_error(
+                    &self.slot_name,
+                    &e.to_string(),
+                ));
+            }
+            Err(_elapsed) => {
+                // The SQL query exceeded its time budget. Cancel it server-side so
+                // the connection is returned to a ready state before the next poll.
+                // cancel_query uses a separate TCP connection and can safely use NoTls
+                // even when the main connection is TLS-encrypted.
+                let _ = cancel_token.cancel_query(tokio_postgres::NoTls).await;
+                tracing::debug!(
+                    target: "rustcdc::source::postgres",
+                    slot = %self.slot_name,
+                    timeout_ms = poll_timeout.as_millis(),
+                    "postgres poll_xlog_data timed out; query cancelled",
+                );
+                return Ok(vec![]);
+            }
+        };
 
         let mut messages = Vec::with_capacity(rows.len());
         for row in rows {

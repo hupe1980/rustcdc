@@ -257,10 +257,12 @@ WARNING checkpoint latency exceeding 1s
 **Expected behavior — not a bug:**
 
 SQL Server CDC is **polling-based**.  rustcdc calls `cdc.fn_cdc_get_all_changes_*`
-at a configurable interval (`stream_poll_interval_ms`, default 5 000 ms).  Unlike
-PostgreSQL logical replication (push-based, near-zero propagation), SQL Server
-events are only visible after the next poll cycle **and** after the SQL Server CDC
-capture agent has written them to the change tables (typically < 5 s on an idle server).
+at a configurable interval (`stream_poll_interval_ms`, default 5 000 ms).  The
+PostgreSQL connector also uses short-interval SQL polling
+(`pg_logical_slot_peek_binary_changes`, default 50 ms with a per-poll bounded
+timeout), but its much shorter default interval means p99 latency is typically
+well under 100 ms.  SQL Server CDC adds the capture agent delay on top of the
+poll interval, which is why the latency profile looks so different.
 
 Expected latency profile:
 

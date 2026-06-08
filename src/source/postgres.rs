@@ -54,6 +54,9 @@ const HEARTBEAT_SECS: u64 = 60;
 const DEFAULT_SNAPSHOT_CHUNK_SIZE: usize = 5_000;
 const STREAM_POLL_INTERVAL_MS: u64 = 50;
 const MAX_EVENTS_PER_POLL: usize = 1_000;
+/// Maximum time a single `poll_xlog_data` SQL query may run when `timeout_ms == 0`.
+/// Prevents indefinite blocking on the "single-shot, return immediately" code-path.
+const DEFAULT_POLL_BACKSTOP_MS: u64 = 30_000;
 
 // ─── PostgresStreamHandle ───────────────────────────────────────────────────
 pub struct PostgresStreamHandle {
@@ -769,9 +772,21 @@ impl StreamHandle for PostgresStreamHandle {
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
+            let elapsed = started.elapsed();
+            // Each poll_xlog_data call must complete within the remaining time budget.
+            // When timeout_ms == 0 (single-shot) we still impose a backstop so the SQL
+            // query can never block the caller indefinitely.
+            let poll_timeout = if timeout_ms == 0 {
+                Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS)
+            } else {
+                timeout
+                    .saturating_sub(elapsed)
+                    .max(Duration::from_millis(1))
+            };
+
             let xlog_data = self
                 .provider
-                .poll_xlog_data(self.max_events_per_poll)
+                .poll_xlog_data(self.max_events_per_poll, poll_timeout)
                 .await?;
             if !xlog_data.is_empty() {
                 let events = self.process_messages(xlog_data).await?;
@@ -997,6 +1012,7 @@ mod tests {
         async fn poll_xlog_data(
             &mut self,
             _max: usize,
+            _poll_timeout: std::time::Duration,
         ) -> crate::core::Result<Vec<PgOutputXLogData>> {
             Ok(self.batches.pop_front().unwrap_or_default())
         }

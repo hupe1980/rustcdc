@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 rust-version = "1.92"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"

@@ -69,7 +69,10 @@ This protects correctness during long-running snapshots with concurrent writes.
 
 ### PostgreSQL
 
-- stream decoding uses logical replication (`pgoutput`)
+- stream decoding uses `pg_logical_slot_peek_binary_changes` with `pgoutput` format
+- each poll call is bounded by a per-call timeout; slow or stalled queries are
+  cancelled server-side via `CancelRequest` so the connection is always returned
+  to a ready state before the next poll
 - runtime tracks in-memory and persisted LSN progress
 - replication slot advancement follows durable commit progression
 - startup guards detect slot/checkpoint divergence
