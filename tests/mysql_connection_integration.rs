@@ -177,10 +177,11 @@ fn mysql_config_defaults() {
     let config = MysqlSourceConfig::default();
     assert_eq!(config.host, "localhost");
     assert_eq!(config.port, 3306);
-    assert!(
-        config.server_id >= 1,
-        "server_id must be >= 1 (got {})",
-        config.server_id
+    // server_id defaults to 0 (unset) — callers must assign a cluster-unique
+    // value before use. validate() will reject 0 with a clear error message.
+    assert_eq!(
+        config.server_id, 0,
+        "default server_id must be 0 (unset) to force explicit assignment"
     );
     assert!(!config.gtid_mode_enabled);
     assert!(config.binlog_format_check);
