@@ -539,7 +539,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         let lsn_text = parser::format_pg_lsn(lsn);
         self.client
             .query_opt(
-                "SELECT 1 FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
+                "SELECT 1 FROM pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
                 &[
                     &self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
                     &lsn_text as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -582,7 +582,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         if current_lsn > self.confirmed_lsn {
             self.client
                 .query_opt(
-                    "SELECT 1 FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
+                    "SELECT 1 FROM pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
                     &[
                         &self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
                         &lsn_text as &(dyn tokio_postgres::types::ToSql + Sync),
