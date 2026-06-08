@@ -2195,6 +2195,11 @@ mod tests {
         batches: TestDeque<Vec<Event>>,
         confirmed_lsns: Arc<Mutex<Vec<u64>>>,
         confirm_lsn_error: Option<String>,
+        /// When `Some`, replay this batch on every `next_events` call until
+        /// `confirm_lsn` succeeds — simulates a Postgres replication slot that
+        /// is stuck at a fixed position because `pg_replication_slot_advance`
+        /// was never called (BUG-5 scenario).
+        replay_batch: Option<Vec<Event>>,
     }
 
     impl MockStreamHandle {
@@ -2207,13 +2212,26 @@ mod tests {
                 batches: batches.into_iter().collect(),
                 confirmed_lsns,
                 confirm_lsn_error,
+                replay_batch: None,
             }
+        }
+
+        fn with_replay_batch(mut self, batch: Vec<Event>) -> Self {
+            self.replay_batch = Some(batch);
+            self
         }
     }
 
     #[async_trait::async_trait]
     impl crate::source::StreamHandle for MockStreamHandle {
         async fn next_events(&mut self, _timeout_ms: u64) -> crate::core::Result<Vec<Event>> {
+            // If replay mode is active, return the fixed batch on every call
+            // regardless of whether the queue has been drained.  This mirrors
+            // `pg_logical_slot_peek_binary_changes` semantics: the slot does not
+            // advance until `pg_replication_slot_advance` is called (confirm_lsn).
+            if let Some(batch) = &self.replay_batch {
+                return Ok(batch.clone());
+            }
             Ok(self.batches.pop_front().unwrap_or_default())
         }
 
@@ -2228,6 +2246,8 @@ mod tests {
             if let Some(message) = &self.confirm_lsn_error {
                 return Err(crate::core::Error::SourceError(message.clone()));
             }
+            // Successful confirmation clears replay mode — the slot has advanced.
+            self.replay_batch = None;
             self.confirmed_lsns
                 .lock()
                 .map_err(|_| {
@@ -2313,6 +2333,10 @@ mod tests {
         snapshot_checkpoint_error: Option<String>,
         snapshot_checkpoint_payload: Option<Vec<u8>>,
         snapshot_checkpoint_source_type: String,
+        /// When set, `start_stream` produces a handle that replays this batch on
+        /// every `next_events` call until `confirm_lsn` succeeds.  Used to
+        /// simulate a stuck Postgres replication slot (BUG-5).
+        replay_batch: Option<Vec<Event>>,
     }
 
     impl MockSource {
@@ -2328,6 +2352,7 @@ mod tests {
                 snapshot_checkpoint_error: None,
                 snapshot_checkpoint_payload: None,
                 snapshot_checkpoint_source_type: "mock_snapshot".to_string(),
+                replay_batch: None,
             }
         }
 
@@ -2346,12 +2371,26 @@ mod tests {
                 snapshot_checkpoint_error: None,
                 snapshot_checkpoint_payload: None,
                 snapshot_checkpoint_source_type: "mock_snapshot".to_string(),
+                replay_batch: None,
             }
         }
 
         #[cfg(feature = "postgres")]
         fn with_confirm_lsn_error(mut self, message: impl Into<String>) -> Self {
             self.confirm_lsn_error = Some(message.into());
+            self
+        }
+
+        /// Configure the mock stream to replay a fixed batch on every `next_events`
+        /// call until `confirm_lsn` succeeds.  Simulates a Postgres replication slot
+        /// that is stuck at a fixed WAL position because the advance query failed
+        /// (BUG-5 scenario).
+        #[cfg(feature = "postgres")]
+        fn with_replay_stream(mut self, batch: Vec<Event>) -> Self {
+            // Set the replay_batch field; start_stream wires this into
+            // MockStreamHandle::with_replay_batch so that every next_events
+            // call returns the same batch until confirm_lsn succeeds.
+            self.replay_batch = Some(batch);
             self
         }
 
@@ -2447,11 +2486,15 @@ mod tests {
                 )
             })? = resume_source;
 
-            Ok(Box::new(MockStreamHandle::new(
+            let mut handle = MockStreamHandle::new(
                 self.stream_batches.clone(),
                 Arc::clone(&self.confirmed_lsns),
                 self.confirm_lsn_error.clone(),
-            )))
+            );
+            if let Some(batch) = &self.replay_batch {
+                handle = handle.with_replay_batch(batch.clone());
+            }
+            Ok(Box::new(handle))
         }
 
         async fn perform_handoff(
@@ -3221,6 +3264,162 @@ mod tests {
             1
         );
         assert_eq!(runtime.admin_snapshot().in_flight_events, 0);
+    }
+
+    /// Regression test for BUG-5 (cdc-server report): when `confirm_lsn` fails after a durable
+    /// commit under the default `FailFast` policy, the slot is never advanced.  On the next poll,
+    /// the source replays the same events.  With the runtime idempotency guard active, all replayed
+    /// events are deduplicated → `EventBatch::empty()` → the caller's `commit_ack` is a no-op →
+    /// the slot stays unadvanced forever.
+    ///
+    /// This test verifies that the runtime correctly surfaces `PostCommitConfirmFailed` on the
+    /// first attempt so the caller has a chance to handle it (e.g. retry or reconnect), and that
+    /// a second call to `poll_event_batch` after the error returns the same events again (replay)
+    /// when the idempotency guard is disabled — proving the source is still live and not silently
+    /// stuck.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn bug5_confirm_lsn_failure_surfaces_error_for_caller_to_handle() {
+        let mut evt = event();
+        evt.source.source_name = "postgres".into();
+        evt.source.offset = "16/001A0000".into();
+
+        // Use replay mode: same batch returned on every poll until confirm_lsn succeeds.
+        // Idempotency guard disabled so the test can inspect raw replay behaviour.
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
+            .with_idempotency_disabled();
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.source = RuntimeSource::Mock(Box::new(
+            MockSource::stream_only(vec![])
+                .with_replay_stream(vec![evt.clone()])
+                .with_confirm_lsn_error("simulated slot advance failure"),
+        ));
+
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new("mock", b"offset".to_vec()),
+                0,
+            )
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+
+        // First poll: events delivered.
+        let batch1 = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(batch1.len(), 1, "first poll should deliver the event");
+
+        // Commit fails because confirm_lsn fails; slot not advanced.
+        let err = runtime
+            .commit_ack(batch1.ack_mode())
+            .await
+            .expect_err("FailFast policy must surface PostCommitConfirmFailed");
+        assert!(
+            matches!(
+                err,
+                crate::core::Error::PostCommitConfirmFailed {
+                    checkpoint_safe: true,
+                    ..
+                }
+            ),
+            "expected PostCommitConfirmFailed, got {err:?}"
+        );
+
+        // The checkpoint WAS durably committed (checkpoint_safe = true).
+        assert_eq!(
+            runtime
+                .config
+                .checkpoint
+                .get_committed_count()
+                .await
+                .unwrap(),
+            1,
+            "checkpoint must be durable even though confirm_lsn failed"
+        );
+
+        // Second poll: slot still at old position → same event replayed.
+        // Without idempotency guard this is visible as a non-empty batch.
+        let batch2 = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(
+            batch2.len(),
+            1,
+            "replayed batch must be visible when idempotency guard is disabled"
+        );
+    }
+
+    /// Regression test for BUG-5 — deadlock variant: when `confirm_lsn` fails under `FailFast`
+    /// and the runtime idempotency guard IS active, the replayed events are silently deduplicated,
+    /// returning `EventBatch::empty()` on every subsequent poll.  The caller's `commit_ack` is a
+    /// no-op and the slot never advances — a permanent, silent zero-progress cycle with no error.
+    ///
+    /// This test demonstrates the deadlock so it can be caught and addressed (e.g. by retrying
+    /// the pending confirmation LSN on the next idle cycle, or by clearing the idempotency guard
+    /// fingerprints for events whose LSN has not been confirmed).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn bug5_idempotency_guard_and_confirm_lsn_failure_causes_silent_stall() {
+        let mut evt = event();
+        evt.source.source_name = "postgres".into();
+        evt.source.offset = "16/001A0000".into();
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        // Default options: FailFast + idempotency guard enabled.
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.source = RuntimeSource::Mock(Box::new(
+            MockSource::stream_only(vec![])
+                .with_replay_stream(vec![evt.clone()])
+                .with_confirm_lsn_error("simulated slot advance failure"),
+        ));
+
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new("mock", b"offset".to_vec()),
+                0,
+            )
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+
+        // First poll: events delivered (not yet seen by idempotency guard).
+        let batch1 = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(batch1.len(), 1);
+
+        // Commit fails: confirm_lsn failure → PostCommitConfirmFailed, slot not advanced.
+        let err = runtime.commit_ack(batch1.ack_mode()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::core::Error::PostCommitConfirmFailed { .. }
+        ));
+
+        // Second poll: slot still at old position → same events replayed.
+        // But the idempotency guard already saw these fingerprints → all suppressed.
+        // The result is an empty batch — silent zero-progress.
+        let batch2 = runtime.poll_event_batch().await.unwrap();
+        assert!(
+            batch2.is_empty(),
+            "BUG-5: idempotency guard suppresses replayed events after confirm_lsn failure, \
+             producing a silent empty batch that causes an infinite no-progress loop"
+        );
+
+        // Demonstrate the stall: commit_ack on empty batch is a no-op, checkpoint unchanged.
+        runtime.commit_ack(batch2.ack_mode()).await.unwrap();
+        assert_eq!(
+            runtime
+                .config
+                .checkpoint
+                .get_committed_count()
+                .await
+                .unwrap(),
+            1,
+            "checkpoint count must remain at 1 (no new events committed, slot never advanced)"
+        );
     }
 
     #[tokio::test]
