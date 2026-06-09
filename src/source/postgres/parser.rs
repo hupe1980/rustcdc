@@ -187,6 +187,9 @@ pub(super) fn decode_stream_resume_lsn(
     Ok(saved.lsn)
 }
 
+/// Test helper: verifies the divergence-detection logic in isolation.
+/// Production code self-heals via `query::reconcile_stream_resume_lsn_with_retry`.
+#[cfg(test)]
 pub(super) fn reconcile_stream_resume_lsn(
     checkpoint_lsn: u64,
     slot_confirmed_lsn: u64,

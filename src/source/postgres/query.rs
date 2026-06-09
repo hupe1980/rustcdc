@@ -4,7 +4,7 @@ use tokio_postgres::Client;
 
 use crate::core::{Error, Result};
 
-use super::parser::{parse_pg_lsn, reconcile_stream_resume_lsn};
+use super::parser::{format_pg_lsn, parse_pg_lsn};
 
 pub(super) async fn query_primary_key_columns_and_types(
     client: &Client,
@@ -70,7 +70,47 @@ pub(super) async fn reconcile_stream_resume_lsn_with_retry(
         }
     }
 
-    reconcile_stream_resume_lsn(checkpoint_lsn, last_slot_lsn, slot_name)
+    // The checkpoint is ahead of the slot's confirmed_flush_lsn.  This happens
+    // when a previous `confirm_lsn` call succeeded at the checkpoint layer but
+    // failed to advance the replication slot (e.g. transient network error,
+    // Postgres restart, or the type-casting bug fixed in 0.6.4).  Rather than
+    // returning a fatal "operator intervention required" error that causes an
+    // infinite restart loop, self-heal by advancing the slot to the checkpoint
+    // position.  The checkpoint guarantees those events were durably processed,
+    // so advancing the slot is safe and correct.
+    tracing::warn!(
+        target: "rustcdc::source::postgres",
+        slot_name,
+        checkpoint_lsn = %format_pg_lsn(checkpoint_lsn),
+        slot_confirmed_lsn = %format_pg_lsn(last_slot_lsn),
+        "replication slot behind checkpoint after confirm_lsn failure; \
+         self-healing by advancing slot to checkpoint LSN",
+    );
+    advance_replication_slot(client, slot_name, checkpoint_lsn).await?;
+    Ok(checkpoint_lsn)
+}
+
+/// Advance a replication slot to the given LSN.  Used both during startup
+/// self-healing (see `reconcile_stream_resume_lsn_with_retry`) and by
+/// [`super::decoder::LivePgOutputMessageProvider::confirm_lsn`].
+pub(super) async fn advance_replication_slot(
+    client: &Client,
+    slot_name: &str,
+    lsn: u64,
+) -> Result<()> {
+    let lsn_str = format_pg_lsn(lsn);
+    client
+        .query(
+            "SELECT 1 FROM pg_replication_slot_advance($1::text::name, $2::text::pg_lsn)",
+            &[&slot_name.to_string(), &lsn_str],
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed to advance replication slot '{slot_name}' to LSN {lsn_str}: {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 pub(super) async fn query_current_wal_lsn(client: &Client) -> Result<u64> {

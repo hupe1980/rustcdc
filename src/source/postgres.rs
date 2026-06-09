@@ -948,15 +948,6 @@ fn decode_stream_resume_lsn(
     parser::decode_stream_resume_lsn(source_type, configured_slot_name, resume_from)
 }
 
-#[cfg(test)]
-fn reconcile_stream_resume_lsn(
-    checkpoint_lsn: u64,
-    slot_confirmed_lsn: u64,
-    slot_name: &str,
-) -> Result<u64> {
-    parser::reconcile_stream_resume_lsn(checkpoint_lsn, slot_confirmed_lsn, slot_name)
-}
-
 async fn reconcile_stream_resume_lsn_with_retry(
     client: &Client,
     checkpoint_lsn: u64,
@@ -1008,6 +999,14 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    fn reconcile_stream_resume_lsn(
+        checkpoint_lsn: u64,
+        slot_confirmed_lsn: u64,
+        slot_name: &str,
+    ) -> crate::core::Result<u64> {
+        super::parser::reconcile_stream_resume_lsn(checkpoint_lsn, slot_confirmed_lsn, slot_name)
+    }
 
     use async_trait::async_trait;
     use tokio::sync::Mutex;
@@ -1715,23 +1714,17 @@ mod tests {
 
     #[test]
     fn stream_resume_alignment_accepts_exact_match() {
-        assert_eq!(
-            super::reconcile_stream_resume_lsn(42, 42, "slot").unwrap(),
-            42
-        );
+        assert_eq!(reconcile_stream_resume_lsn(42, 42, "slot").unwrap(), 42);
     }
 
     #[test]
     fn stream_resume_alignment_accepts_checkpoint_behind_slot() {
-        assert_eq!(
-            super::reconcile_stream_resume_lsn(41, 42, "slot").unwrap(),
-            41
-        );
+        assert_eq!(reconcile_stream_resume_lsn(41, 42, "slot").unwrap(), 41);
     }
 
     #[test]
     fn stream_resume_alignment_rejects_checkpoint_ahead_of_slot() {
-        let error = super::reconcile_stream_resume_lsn(43, 42, "slot").unwrap_err();
+        let error = reconcile_stream_resume_lsn(43, 42, "slot").unwrap_err();
         assert!(matches!(error, crate::core::Error::CheckpointError(_)));
     }
 
