@@ -720,7 +720,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.6.6",                         // Service version
+    "0.6.7",                         // Service version
     "production",                    // Environment
 );
 

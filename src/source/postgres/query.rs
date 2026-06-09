@@ -6,6 +6,24 @@ use crate::core::{Error, Result};
 
 use super::parser::{format_pg_lsn, parse_pg_lsn};
 
+/// Abstraction over the two Postgres I/O operations required by startup slot
+/// reconciliation.  Allows the self-heal logic to be unit-tested without a
+/// live database connection.
+pub(super) trait ReconcileOps {
+    async fn query_confirmed_lsn(&self, slot_name: &str) -> Result<u64>;
+    async fn advance_slot(&self, slot_name: &str, lsn: u64) -> Result<()>;
+}
+
+impl ReconcileOps for Client {
+    async fn query_confirmed_lsn(&self, slot_name: &str) -> Result<u64> {
+        query_slot_confirmed_lsn(self, slot_name).await
+    }
+
+    async fn advance_slot(&self, slot_name: &str, lsn: u64) -> Result<()> {
+        advance_replication_slot(self, slot_name, lsn).await
+    }
+}
+
 pub(super) async fn query_primary_key_columns_and_types(
     client: &Client,
     schema: &str,
@@ -55,11 +73,23 @@ pub(super) async fn reconcile_stream_resume_lsn_with_retry(
     attempts: usize,
     retry_delay: Duration,
 ) -> Result<u64> {
+    reconcile_with_ops(client, checkpoint_lsn, slot_name, attempts, retry_delay).await
+}
+
+/// Core reconciliation logic, decoupled from I/O for unit-testability.
+/// See [`reconcile_stream_resume_lsn_with_retry`] for the production entry point.
+async fn reconcile_with_ops(
+    ops: &impl ReconcileOps,
+    checkpoint_lsn: u64,
+    slot_name: &str,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<u64> {
     let attempts = attempts.max(1);
     let mut last_slot_lsn = 0_u64;
 
     for attempt in 0..attempts {
-        let slot_lsn = query_slot_confirmed_lsn(client, slot_name).await?;
+        let slot_lsn = ops.query_confirmed_lsn(slot_name).await?;
         last_slot_lsn = slot_lsn;
         if checkpoint_lsn <= slot_lsn {
             return Ok(checkpoint_lsn);
@@ -86,7 +116,7 @@ pub(super) async fn reconcile_stream_resume_lsn_with_retry(
         "replication slot behind checkpoint after confirm_lsn failure; \
          self-healing by advancing slot to checkpoint LSN",
     );
-    advance_replication_slot(client, slot_name, checkpoint_lsn).await?;
+    ops.advance_slot(slot_name, checkpoint_lsn).await?;
     Ok(checkpoint_lsn)
 }
 
@@ -299,5 +329,133 @@ pub(super) fn build_tls_client_config(
                 .with_no_client_auth();
             Ok(config)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    // ── Mock ReconcileOps ─────────────────────────────────────────────────────
+
+    struct MockReconcileOps {
+        /// LSN values returned by successive `query_confirmed_lsn` calls (FIFO).
+        slot_lsn_sequence: Arc<Mutex<Vec<u64>>>,
+        /// Records each `(slot_name, lsn)` pair passed to `advance_slot`.
+        advance_calls: Arc<Mutex<Vec<(String, u64)>>>,
+    }
+
+    impl MockReconcileOps {
+        fn new(slot_lsns: Vec<u64>) -> Self {
+            Self {
+                slot_lsn_sequence: Arc::new(Mutex::new(slot_lsns)),
+                advance_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn advance_calls_snapshot(&self) -> Vec<(String, u64)> {
+            self.advance_calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ReconcileOps for MockReconcileOps {
+        async fn query_confirmed_lsn(&self, _slot_name: &str) -> Result<u64> {
+            let mut seq = self.slot_lsn_sequence.lock().unwrap();
+            if seq.is_empty() {
+                return Err(Error::SourceError(
+                    "mock: no more slot LSN values configured".into(),
+                ));
+            }
+            Ok(seq.remove(0))
+        }
+
+        async fn advance_slot(&self, slot_name: &str, lsn: u64) -> Result<()> {
+            self.advance_calls
+                .lock()
+                .unwrap()
+                .push((slot_name.to_string(), lsn));
+            Ok(())
+        }
+    }
+
+    // ── reconcile_with_ops tests ──────────────────────────────────────────────
+
+    /// Normal path: checkpoint == slot_lsn → returns immediately, no advance.
+    #[tokio::test]
+    async fn reconcile_returns_checkpoint_when_slot_equals_checkpoint() {
+        let ops = MockReconcileOps::new(vec![100]);
+        let result = reconcile_with_ops(&ops, 100, "demo_slot", 3, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(result, 100);
+        assert!(
+            ops.advance_calls_snapshot().is_empty(),
+            "no advance when slot == checkpoint"
+        );
+    }
+
+    /// Normal path: slot ahead of checkpoint → returns checkpoint, no advance.
+    #[tokio::test]
+    async fn reconcile_returns_checkpoint_when_slot_is_ahead() {
+        let ops = MockReconcileOps::new(vec![200]); // slot at 200, checkpoint at 100
+        let result = reconcile_with_ops(&ops, 100, "demo_slot", 1, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(result, 100);
+        assert!(
+            ops.advance_calls_snapshot().is_empty(),
+            "no advance when slot is ahead of checkpoint"
+        );
+    }
+
+    /// Self-heal path: checkpoint > slot after all retries → advance is called.
+    #[tokio::test]
+    async fn reconcile_self_heals_when_checkpoint_ahead_of_slot() {
+        let ops = MockReconcileOps::new(vec![50]); // slot at 50, checkpoint at 100
+        let result = reconcile_with_ops(&ops, 100, "demo_slot", 1, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(result, 100, "self-heal must return checkpoint_lsn");
+        let calls = ops.advance_calls_snapshot();
+        assert_eq!(calls.len(), 1, "advance must be called exactly once");
+        assert_eq!(
+            calls[0],
+            ("demo_slot".to_string(), 100),
+            "advance must target checkpoint_lsn"
+        );
+    }
+
+    /// Retry path: slot catches up on second attempt → returns without advancing.
+    #[tokio::test]
+    async fn reconcile_short_circuits_when_slot_catches_up_during_retry() {
+        // First query: slot behind. Second query: slot caught up.
+        let ops = MockReconcileOps::new(vec![50, 100]);
+        let result = reconcile_with_ops(&ops, 100, "demo_slot", 3, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(result, 100);
+        assert!(
+            ops.advance_calls_snapshot().is_empty(),
+            "no advance when slot eventually catches up within retry budget"
+        );
+    }
+
+    /// Retry exhaustion: slot stays behind across all attempts → single advance.
+    #[tokio::test]
+    async fn reconcile_advances_once_after_all_retries_fail() {
+        let ops = MockReconcileOps::new(vec![50, 50, 50]);
+        let result = reconcile_with_ops(&ops, 100, "demo_slot", 3, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(result, 100);
+        let calls = ops.advance_calls_snapshot();
+        assert_eq!(
+            calls.len(),
+            1,
+            "advance must be called exactly once after retries"
+        );
+        assert_eq!(calls[0].1, 100);
     }
 }

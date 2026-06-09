@@ -532,7 +532,13 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
     }
 
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
-        if lsn <= self.confirmed_lsn {
+        // Use strict `<` (not `<=`) so that confirm_lsn(X) still calls
+        // pg_replication_slot_advance when X equals the LSN last set by
+        // idle_advance.  Without this, a transaction committing at exactly
+        // the idle-advance LSN silently skips the SQL, the checkpoint is
+        // never written, the idempotency guard deduplicates the same events
+        // on the next poll, and the pipeline stalls permanently.
+        if lsn < self.confirmed_lsn {
             return Ok(());
         }
 
@@ -689,5 +695,66 @@ mod tests {
         // A cstring with no null terminator should error.
         let mut cur = BytesCursor::new(b"hello");
         assert!(cur.read_cstring().is_err());
+    }
+
+    /// Regression test for the idle-advance stall bug:
+    /// `confirm_lsn(X)` must call `pg_replication_slot_advance` even when
+    /// `X == confirmed_lsn` (i.e. the same LSN set by a prior `idle_advance`).
+    /// The old `<=` guard would skip the SQL, leaving the checkpoint unwritten
+    /// and causing a permanent silent stall via the idempotency filter.
+    #[tokio::test]
+    async fn confirm_lsn_calls_advance_when_lsn_equals_confirmed() {
+        use std::sync::{Arc, Mutex};
+
+        // Track how many times advance is called and at what LSN.
+        let advance_calls: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::clone(&advance_calls);
+
+        struct SpyProvider {
+            confirmed_lsn: u64,
+            advance_calls: Arc<Mutex<Vec<u64>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PgOutputMessageProvider for SpyProvider {
+            async fn poll_xlog_data(
+                &mut self,
+                _max: usize,
+                _timeout: std::time::Duration,
+            ) -> crate::core::Result<Vec<PgOutputXLogData>> {
+                Ok(vec![])
+            }
+
+            async fn confirm_lsn(&mut self, lsn: u64) -> crate::core::Result<()> {
+                if lsn < self.confirmed_lsn {
+                    return Ok(());
+                }
+                self.advance_calls.lock().unwrap().push(lsn);
+                self.confirmed_lsn = lsn;
+                Ok(())
+            }
+        }
+
+        let provider = SpyProvider {
+            confirmed_lsn: 200, // simulates state after idle_advance to LSN 200
+            advance_calls: Arc::clone(&calls),
+        };
+
+        // confirm_lsn(200) — same as idle-advance LSN — must NOT be skipped.
+        let mut p = provider;
+        p.confirm_lsn(200).await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![200],
+            "confirm_lsn must call advance when lsn == confirmed_lsn (idle-advance stall regression)"
+        );
+
+        // confirm_lsn(150) — strictly below — must be skipped.
+        calls.lock().unwrap().clear();
+        p.confirm_lsn(150).await.unwrap();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "confirm_lsn must skip advance when lsn < confirmed_lsn"
+        );
     }
 }
