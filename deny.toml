@@ -30,18 +30,21 @@ ignore = [
     # We do not directly parse PEM files; rustls-pemfile is a transitive dep via rustcdc/tonic.
     { id = "RUSTSEC-2025-0134" },
 
-    # RUSTSEC-2026-0049: rustls-webpki 0.102.x — faulty CRL revocation check (limited impact).
-    # Affected path: rustls-webpki 0.102.8 -> rustls 0.22.4 -> tokio-rustls -> rustcdc 0.3.0.
-    # We do not use CRL-based certificate revocation; RUSTSEC notes the bug is latent in normal
-    # use and requires an attacker to compromise a trusted issuing authority. Upgrade blocked
-    # until rustcdc bumps to rustls-webpki >=0.103.10.
-    { id = "RUSTSEC-2026-0049" },
-
     # RUSTSEC-2026-0098 / RUSTSEC-2026-0099: rustls-webpki 0.101.x and 0.102.x TLS issues.
     # Affected path: rustls-webpki -> rustls -> tokio-rustls -> rustcdc 0.3.0 (transitive).
     # Upgrade to rustls-webpki >=0.103.12 blocked until rustcdc releases a compatible version.
     { id = "RUSTSEC-2026-0098" },
     { id = "RUSTSEC-2026-0099" },
+
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 — quadratic duplicate-attribute
+    # check and unbounded namespace-declaration allocation (both DoS-class, no memory unsafety).
+    # Affected paths: quick-xml 0.38.x <- opendal 0.55 (pinned by iceberg-storage-opendal ^0.55)
+    # and quick-xml 0.37.x <- reqsign 0.16 (pinned by opendal 0.55). Neither parent can reach
+    # quick-xml >=0.41 within semver. Exposure is limited to parsing XML responses from the
+    # *configured* cloud-storage endpoints (S3/Azure APIs), not arbitrary user input.
+    # Remove when opendal/reqsign release with quick-xml >=0.41 and iceberg follows.
+    { id = "RUSTSEC-2026-0194" },
+    { id = "RUSTSEC-2026-0195" },
 
     # RUSTSEC-2026-0104: rustls-webpki 0.102.x panic in CRL parsing via BorrowedCertRevocationList::from_der.
     # Affected path: rustls-webpki 0.102.8 -> rustls 0.22.4 -> tokio-rustls -> rustcdc 0.3.0.
@@ -55,14 +58,15 @@ ignore = [
 version = 2
 allow = [
     "MIT",
+    # MIT-0: MIT No Attribution (OSI approved; strictly more permissive than MIT).
+    # Used by borrow-or-share (via fluent-uri -> jsonschema -> schemreg -> rustcdc).
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
-    "OpenSSL",
     "Zlib",
     "CC0-1.0",
     # CDLA-Permissive-2.0: Community Data License Agreement Permissive.
@@ -138,7 +142,6 @@ skip = [
     { name = "rustls-native-certs" },
     { name = "rustls-pemfile" },
     { name = "rustls-webpki" },
-    { name = "rustc-hash" },
     { name = "security-framework" },
     { name = "sha2" },
     { name = "tokio-rustls" },
@@ -150,7 +153,6 @@ skip = [
     #   - heck: proc-macro utility; old clap vs new strum versions
     #   - indexmap / itertools / ordered-float: krafka 0.10 (rdkafka) pulls 1.x;
     #       iceberg-rust and opendal pull 2.x
-    #   - opendal: state-backend uses 0.52.x; iceberg-rust bundles an older opendal
     #   - linux-raw-sys / rustix: nix ecosystem version split between io-uring
     #       backends and standard async runtimes
     #   - openssl-probe: rdkafka pulls a version; rustls-native-certs pulls another
@@ -165,15 +167,11 @@ skip = [
     { name = "darling_core" },
     { name = "darling_macro" },
     { name = "foldhash" },
-    { name = "heck" },
     { name = "indexmap" },
     { name = "itertools" },
-    { name = "linux-raw-sys" },
     { name = "openssl-probe" },
-    { name = "opendal" },
     { name = "ordered-float" },
     { name = "quick-xml" },
-    { name = "rustix" },
     { name = "serde_spanned" },
     { name = "socket2" },
     { name = "thiserror" },
@@ -191,6 +189,9 @@ skip = [
     { name = "typed-builder-macro" },
     { name = "wasm-encoder" },
     { name = "whoami" },
+    # syn 2.x vs 3.x: proc-macro ecosystem mid-transition; both versions are
+    # compile-time only.
+    { name = "syn" },
 ]
 
 # ── Sources ───────────────────────────────────────────────────────────────────

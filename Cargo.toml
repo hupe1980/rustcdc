@@ -78,7 +78,7 @@ arrow-schema = "57.1"
 parquet = "57.1"
 
 # Storage abstraction (E02-S03)
-opendal = { version = "0.51", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
+opendal = { version = "0.55", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
 
 [dev-dependencies]
 tempfile = "3"
