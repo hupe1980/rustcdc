@@ -653,8 +653,7 @@ impl StreamHandle for SqlServerStreamHandle {
     async fn next_events(&mut self, timeout_ms: u64) -> Result<Vec<Event>> {
         // ── Priority 1: flush snapshot-handoff requeued events ─────────────────
         if !self.requeued_events.is_empty() {
-            let drained = self.requeued_events.drain(..).collect::<Vec<_>>();
-            return Ok(drained);
+            return Ok(std::mem::take(&mut self.requeued_events));
         }
 
         // ── Priority 2: flush schema-change events ──────────────────────────────

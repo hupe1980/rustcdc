@@ -9,7 +9,7 @@ The repository includes canonical event contracts, checkpoint safety primitives,
 plus 16 integration suites running against real PostgreSQL 16, MySQL 8.0/8.1, MariaDB 10.5/10.6
 and SQL Server 2022 containers.
 
-Current crate release: 0.7.0 — see [CHANGELOG.md](CHANGELOG.md) for breaking changes.
+Current crate release: 0.7.0.
 
 ### Handling partial payloads
 
