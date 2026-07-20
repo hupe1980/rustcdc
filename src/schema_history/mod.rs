@@ -339,9 +339,7 @@ impl FileSchemaHistory {
 
         fs::rename(&tmp_path, self.path.as_path())?;
 
-        if let Some(parent) = self.path.parent() {
-            fs::File::open(parent)?.sync_all()?;
-        }
+        crate::core::durability::fsync_parent_directory(self.path.as_path())?;
 
         Ok(())
     }
@@ -720,6 +718,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

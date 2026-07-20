@@ -391,6 +391,8 @@ impl SqlServerIncrementalSnapshotHandle {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -490,11 +492,17 @@ impl SqlServerIncrementalSnapshotHandle {
             }
         }
         if stream_events.is_empty() {
+            // Must be `is_ge`, not `is_gt`. `high_wm` was captured from this same
+            // query moments earlier, and `fn_cdc_get_max_lsn()` only advances on
+            // write traffic. On an idle database `current == high_wm` forever, so
+            // `is_gt` never returns true, the window never closes, and the
+            // incremental snapshot stalls permanently in ChunkCollect. Reaching the
+            // high watermark is what closes the window; exceeding it is not required.
             let current = {
                 let mut client = self.client.lock().await;
                 query_max_lsn(&mut client).await?
             };
-            return Ok(compare_lsn(&current, high_wm).is_gt());
+            return Ok(compare_lsn(&current, high_wm).is_ge());
         }
         Ok(false)
     }
@@ -749,6 +757,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

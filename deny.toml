@@ -1,6 +1,17 @@
 # cargo-deny configuration for rustcdc.
 #
 # Enforced by `cargo deny check` in the `policy-gate` CI job on every PR.
+
+[graph]
+# Resolve the dependency graph with every feature enabled.
+#
+# Without this, cargo-deny builds the graph from `default = ["postgres", "tls"]`
+# only, so every optional dependency is invisible to the advisory, license, and
+# ban checks — including the two highest-risk subtrees in the project: the
+# wasmtime/cranelift JIT and the aes-gcm/hkdf/hmac crypto stack, plus mysql_async,
+# tiberius, opentelemetry, prost, apache-avro and schemreg. A RUSTSEC advisory
+# against any of them would not have failed the gate.
+all-features = true
 # All vulnerabilities and yanked crates are denied by default (cargo-deny 0.19
 # behaviour: advisory checks are always enabled, the ignore list is the only
 # override mechanism).
@@ -28,6 +39,51 @@ ignore = [
     # rustcdc production code paths perform no RSA operations.
     # Remove when sqlx >= 0.9 migration is completed.
     { id = "RUSTSEC-2023-0071", reason = "dev-dep only: sqlx -> sqlx-mysql -> rsa 0.9.x; no RSA in production paths; blocked on sqlx 0.9 migration" },
+
+    # ── PRODUCTION dependency: sqlserver feature -> tiberius -> rustls 0.21 ──
+    #
+    # Unlike every entry above, these are NOT dev-dep only. They are reachable in
+    # production builds that enable the `sqlserver` feature, and they sit in the
+    # SQL Server TLS certificate-verification path.
+    #
+    # Chain: rustcdc -> tiberius 0.12.3 -> tokio-rustls 0.24.1 -> rustls 0.21.12
+    #        -> rustls-webpki 0.101.7
+    #
+    # Upstream blocker: tiberius 0.12.3 is the latest release and hard-pins
+    # `tokio-rustls = "0.24.0"`. The advisories are fixed only in
+    # rustls-webpki >= 0.103.12, which requires rustls 0.23 — not semver-reachable
+    # from tiberius' pin. rustcdc's own TLS stack is already rustls 0.23.19; this
+    # old copy exists solely inside tiberius.
+    #
+    # Reachability assessed per advisory rather than blanket-ignored:
+    #
+    #   RUSTSEC-2026-0104 (panic parsing certificate revocation lists):
+    #     NOT reachable. Triggered only when parsing a CRL. rustcdc never
+    #     configures a CRL, and tiberius exposes no API to supply one, so no CRL
+    #     is ever parsed on this path.
+    #
+    #   RUSTSEC-2026-0098 (URI name constraints ignored and therefore accepted):
+    #     Same class as 0099 below, and the same preconditions: reachable only
+    #     after signature verification, and only exploitable given CA misissuance.
+    #     webpki 0.101 provides no API for asserting URI names in the first place,
+    #     and rustcdc asserts none, so no rustcdc code path depends on a URI name
+    #     constraint being honoured.
+    #
+    #   RUSTSEC-2026-0099 (name constraints accepted for wildcard names):
+    #     Reachable in principle — it is in the server-certificate verification
+    #     path rustcdc uses. Exploitation additionally requires a CA the client
+    #     already trusts to have MISISSUED a wildcard certificate that escapes a
+    #     name constraint, and is only reached after signature verification
+    #     succeeds. Deployments that pin a private CA via
+    #     `TransportConfig::tls_with_ca_cert_path(...)` and do not rely on
+    #     name-constrained intermediates are not materially exposed.
+    #
+    # Users who cannot accept this should not enable the `sqlserver` feature.
+    # Documented in docs/security.md. Remove both entries as soon as tiberius
+    # releases against rustls 0.23.
+    { id = "RUSTSEC-2026-0098", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; URI names are never asserted by rustcdc; requires CA misissuance to exploit; see docs/security.md" },
+    { id = "RUSTSEC-2026-0099", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; requires CA misissuance to exploit; see docs/security.md" },
+    { id = "RUSTSEC-2026-0104", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; unreachable because rustcdc never parses CRLs and tiberius exposes no CRL API; see docs/security.md" },
 ]
 
 [licenses]
@@ -44,6 +100,12 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    # MIT with the attribution clause removed — strictly more permissive than
+    # plain MIT, which is already allowed. Introduced by `borrow-or-share`.
+    "MIT-0",
+    # Permissive license used by `webpki-roots` for the Mozilla root-certificate
+    # *data set* (not code). Permits use and redistribution without restriction.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

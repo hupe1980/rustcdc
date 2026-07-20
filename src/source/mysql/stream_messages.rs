@@ -4,7 +4,8 @@ use crate::{
 };
 
 use super::{
-    parser::format_mysql_source_offset, MysqlBinlogMessage, MysqlRowChange, MysqlStreamHandle,
+    parser::format_mysql_source_offset, query::merge_gtid_into_set, MysqlBinlogMessage,
+    MysqlRowChange, MysqlStreamHandle,
 };
 
 impl MysqlStreamHandle {
@@ -51,6 +52,8 @@ impl MysqlStreamHandle {
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -156,7 +159,11 @@ impl MysqlStreamHandle {
                     self.stream.binlog_pos = binlog_pos;
                 }
                 MysqlBinlogMessage::Gtid { gtid } => {
-                    self.stream.gtid = gtid;
+                    // Union, never overwrite — see `merge_gtid_into_set`. Replacing the
+                    // executed set with a single GTID makes the checkpoint claim the
+                    // replica has executed only that one transaction, so resuming from
+                    // it replays everything before it.
+                    self.stream.gtid = merge_gtid_into_set(&self.stream.gtid, &gtid);
                 }
                 MysqlBinlogMessage::Ddl {
                     captured,
@@ -233,6 +240,8 @@ impl MysqlStreamHandle {
                             transaction: None,
                             envelope_version: EVENT_ENVELOPE_VERSION,
                             before_is_key_only: false,
+                            unavailable_columns: Vec::new(),
+                            before_unavailable_columns: Vec::new(),
                         });
                         self.events_polled = self.events_polled.saturating_add(1);
                     }

@@ -29,6 +29,8 @@ fn create_test_event(index: u64, table: &str) -> Event {
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 
@@ -50,6 +52,8 @@ fn create_postgres_stream_event(index: u64) -> Event {
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 

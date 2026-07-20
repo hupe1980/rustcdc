@@ -34,6 +34,20 @@ Replace these placeholders with your environment equivalents:
 
 If your deployment does not provide these wrappers, see `docs/deployment.md` first and wire health/metrics/service controls before applying this runbook verbatim.
 
+> **rustcdc ships no binary.** There is no `[[bin]]` target and no `src/main.rs`; `systemctl stop
+> rustcdc` and `curl localhost:9090/metrics` refer to **your** wrapper, not to anything this crate
+> installs. In particular:
+>
+> - **Nothing flushes on SIGTERM unless you implement it.** Graceful drain is
+>   `CdcRuntime::drain_and_stop()` — which returns the drained events and commits them, so **you
+>   must consume the returned `Vec<Event>`**; dropping it is unrecoverable data loss. Use
+>   `stop()` (refuses while events are uncommitted) or `force_stop()` (discards explicitly, returns
+>   them for replay) if you do not intend to process them.
+> - **No HTTP server is provided.** The crate exposes `admin_snapshot_json()` and a Prometheus text
+>   *renderer*; binding a port is the embedder's job.
+> - **Restart does not drain automatically.** Any "will drain pending events before restart"
+>   behaviour is a property of your supervisor.
+
 ---
 
 ## PostgreSQL Source Management
@@ -122,29 +136,25 @@ SELECT
   (('x' || split_part(pg_current_wal_lsn()::text, '/', 2))::bit(32)::bigint);
 ")
 
-cat > /var/rustcdc/checkpoint_postgres.json.new <<EOF
-{
-  "checkpoint_format_version": 1,
-  "source_type": "postgres",
-  "committed_event_count": 0,
-  "offset": {
-    "lsn": $CURRENT_LSN_HEX,
-    "slot_name": "rustcdc_postgres_new"
-  }
-}
-EOF
+#    Seed a replacement checkpoint. Checkpoint files carry an integrity checksum, so
+#    they cannot be written correctly by hand — use the bundled tool, which also writes
+#    atomically, applies the required 0600 mode, and fsyncs the directory.
+#
+#    Do this only while the connector is STOPPED. Seeding a position AHEAD of what was
+#    actually delivered downstream skips every event in between, permanently. When in
+#    doubt seed behind: the delivery contract is at-least-once, so downstream must
+#    already tolerate duplicates.
+cargo run --example seed_checkpoint --features postgres -- \
+  --dir /var/rustcdc \
+  --source-type postgres \
+  --committed-event-count 0 \
+  --offset "{\"lsn\": $CURRENT_LSN_HEX, \"slot_name\": \"rustcdc_postgres_new\"}"
 
-# Validate checkpoint schema before swapping it in.
-cat /var/rustcdc/checkpoint_postgres.json.new | jq -e '
-  .checkpoint_format_version == 1 and
-  .source_type == "postgres" and
-  (.committed_event_count | type == "number") and
-  (.offset.lsn | type == "number") and
-  (.offset.slot_name | type == "string")
-'
+# Confirm the runtime will accept it before restarting the service. A checkpoint that
+# fails its integrity check is rejected at load, so verify now rather than at startup.
+jq -e '.checkpoint_format_version == 1 and .content_checksum != null' \
+  /var/rustcdc/checkpoint_postgres.json
 
-# Atomically replace the active checkpoint file.
-mv /var/rustcdc/checkpoint_postgres.json.new /var/rustcdc/checkpoint_postgres.json
 #    b) Optionally create new replication slot on PostgreSQL
 psql -U cdc_user -d your_database -c "SELECT * FROM pg_create_logical_replication_slot('rustcdc_postgres_new', 'pgoutput');"
 
@@ -528,9 +538,52 @@ All connector events emitted by `StructuredLogger` use the `tracing` framework a
 
 | Metric | Threshold | Action |
 |--------|-----------|--------|
+| **`rustcdc_replication_slot_lag_bytes`** (PostgreSQL) | **Sustained growth over 15 min, or > 25% of free `pg_wal` volume** | **The single most operationally critical PostgreSQL CDC signal.** A slot pins WAL *and* catalog xmin; unbounded growth ends in a full `pg_wal` volume or, in the extreme, a transaction-ID-wraparound shutdown of the **primary**. See [PostgreSQL WAL retention](#postgresql-source-management). Distinguish *idle-nonzero* (normal) from *monotonically growing* (act now) — alert on the derivative, not the level. |
 | `rustcdc_runtime_replication_lag_ms` | > 30000 ms | Investigate source/database lag, downstream throughput, and checkpoint commits |
 | `rustcdc_runtime_events_committed_total` | No increase for 5 min | Check stream connectivity; may indicate stalled progress |
 | `rustcdc_runtime_liveness` | == 0 | Runtime stopped or unhealthy; investigate process and startup logs |
+
+### Health Verdict — "idle" vs. "stalled"
+
+`RuntimeState` alone cannot answer whether a connector is *healthy*. It has only
+`Idle | Running | Stopping | Stopped`, and `Idle` there means *not yet started*. A connector
+streaming from a quiet database and one hung on a dead socket both report `state=running`,
+`readiness=true`, and flat counters.
+
+`RuntimeAdminSnapshot::health` resolves that ambiguity. It is a `HealthVerdict`:
+
+| Verdict | Meaning | Alert? |
+|---|---|---|
+| `Healthy` | The poll loop is turning and committed progress is current. | No |
+| `Idle` | The loop is turning, but the source has produced nothing. Normal for a quiet database. | No |
+| `Stalled { reason }` | Progress has stopped for a reason the runtime can name. | **Yes** |
+| `NotRunning` | The runtime has not been started, or has stopped. | No — but check it was intentional |
+
+`HealthVerdict::is_alertable()` returns `true` for exactly `Stalled`, so an embedder's health
+endpoint can gate on it directly. The verdict is derived from three independent signals, checked
+in this order, and `reason` names both the condition and the remedy:
+
+1. **Unconfirmed source position** — a checkpoint committed but the source-side confirmation
+   (`confirmed_flush_lsn` and equivalents) failed repeatedly. Retention keeps growing at the
+   source even though the consumer is making progress.
+2. **Poll loop stuck** — `now - last_poll_at_ms` exceeds `max_poll_wait_ms × 6` (floor 30s).
+   The connector is blocked in the source, typically a dead socket.
+3. **Consumer stall** — events were polled but not committed, and `last_commit_at_ms` is stale.
+   The embedder has stopped calling `commit_ack`; this is *not* a source problem.
+
+The same verdict is exposed on the Prometheus surface as a set of gauges of which exactly one
+is `1`, so an alert rule is unambiguous:
+
+```promql
+rustcdc_runtime_health{verdict="stalled"} == 1
+```
+
+Alert on that expression. Do not alert on flat `events_committed_total` alone — it fires on every
+quiet period.
+
+Pair it with `rustcdc_runtime_events_skipped_total`: any non-zero value means events were dropped
+by the transform error policy rather than delivered, which is silent data loss unless a
+dead-letter handler is recording them.
 
 **Warning (Alert, No Page):**
 
@@ -685,6 +738,56 @@ mysql --defaults-extra-file=/etc/rustcdc/mysql-admin.cnf -e "DROP USER 'cdc_user
 ---
 
 ## Disaster Recovery
+
+### Scenario 0: Forcing a Re-Snapshot
+
+Several procedures below end in "re-snapshot the affected tables". This is that procedure.
+It is needed whenever the source can no longer supply the changes the checkpoint says we
+still need — the connector detects each of these and stops with an `Unrecoverable` error
+naming the cause:
+
+- PostgreSQL: replication slot dropped or invalidated (`invalidation_reason` non-NULL).
+- MySQL/MariaDB: binlogs purged past the checkpointed GTID position.
+- SQL Server: CDC cleanup purged change rows past the checkpointed LSN (error 313).
+
+**Steps:**
+
+1. **Stop the pipeline.** Do not skip this — a running connector will re-create state
+   underneath you.
+
+2. **Remove BOTH checkpoint files for the source.** A stream checkpoint and a snapshot
+   checkpoint coexist, and deleting only the stream one leaves the snapshot checkpoint to
+   be picked up on restart:
+   ```bash
+   rm -f /var/rustcdc/checkpoint_<source>.json \
+         /var/rustcdc/checkpoint_<source>_snapshot.json
+   ```
+   `<source>` is `postgres`, `mysql`, `mariadb`, or `sqlserver`. **Note MariaDB writes
+   `checkpoint_mariadb.json`, not `checkpoint_mysql.json`.**
+
+3. **Re-provision source-side capture state** where it was lost:
+   ```sql
+   -- PostgreSQL: recreate the slot (add failover for PG17+ multi-node clusters)
+   SELECT pg_create_logical_replication_slot('rustcdc_slot', 'pgoutput');
+   SELECT pg_create_logical_replication_slot('rustcdc_slot', 'pgoutput', false, false, true);
+
+   -- SQL Server: verify the capture instance still exists and the Agent jobs are running
+   SELECT capture_instance, start_lsn FROM cdc.change_tables;
+   EXEC sys.sp_cdc_help_jobs;
+   ```
+
+4. **Restart with `snapshot_tables` configured** for the affected tables. The connector
+   performs a fresh snapshot, then hands off to streaming at the snapshot watermark.
+
+5. **Expect duplicates downstream, not gaps.** The re-snapshot re-emits every row of the
+   affected tables. Sinks must be idempotent (upsert on primary key); this is the
+   at-least-once contract, not a bug.
+
+> **Prevention is retention.** Every trigger above is "the source discarded data before we
+> read it". Size retention against your worst-case downtime:
+> PostgreSQL `max_slot_wal_keep_size` (and monitor `rustcdc_replication_slot_lag_bytes`),
+> MySQL `binlog_expire_logs_seconds`, SQL Server
+> `sys.sp_cdc_change_job @job_type='cleanup', @retention = ...`.
 
 ### Scenario 1: Source Database Becomes Unavailable
 

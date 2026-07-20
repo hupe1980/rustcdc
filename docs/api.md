@@ -147,10 +147,96 @@ Key fields include:
 
 `Operation::Truncate` is emitted when a `TRUNCATE` statement removes all rows from a table.
 `before` and `after` are always `None` for truncate events. Only connectors that advertise
-`ConnectorCapabilities::truncate` emit this variant (currently: PostgreSQL).
+`ConnectorCapabilities::truncate` emit this variant (PostgreSQL, MySQL, MariaDB, and
+SQL Server when `capture_truncate_events` is enabled).
 `Operation::to_str()` returns a `&'static str` for zero-allocation display and comparison.
 
 The event envelope is designed to support stable replay and source-agnostic processing.
+
+### Partial payloads — read this before writing a sink
+
+Some events do not carry a complete row. Applying one as if it were complete is the classic
+CDC corruption: you write `NULL` over a column that never changed. **The library gives you an
+API that cannot express that write — use it instead of reading `after` directly.**
+
+#### `Event::row_write()` — the safe path
+
+`row_write()` folds the payload, the missing columns and the primary key into the single
+write that is correct for the event:
+
+```rust
+use rustcdc::{Event, RowWrite};
+
+match event.row_write() {
+    // The payload is complete. Write every column.
+    RowWrite::Replace { key, row } => sink.replace(key, row),
+
+    // The payload is INCOMPLETE. Write only `columns`; leave every other column in the
+    // target row untouched. In SQL: `UPDATE ... SET <columns> WHERE <key>` — never an
+    // upsert built from the full column list.
+    RowWrite::Merge { key, columns, .. } => sink.update_only(key, columns),
+
+    RowWrite::Delete { key } => sink.delete(key),
+    RowWrite::Truncate => sink.truncate(),
+
+    // DDL, or no addressable row (no primary key). Nothing to write.
+    RowWrite::None { reason } => log_unwritable(reason),
+    _ => {}
+}
+```
+
+`RowWrite::Merge` hands you only the columns that are actually present, so there is no
+placeholder value available to write by mistake. `RowWrite::is_partial()` returns `true` for
+exactly that variant — branch on it if your sink cannot express a partial update (an
+append-only file, a whole-document replace).
+
+The enum is `#[non_exhaustive]`; match with a wildcard arm.
+
+#### The underlying fields
+
+`row_write()` is derived from these. Read them directly only if you need finer control.
+
+##### `unavailable_columns: Vec<String>`
+
+Columns that exist on the table but whose value the source **could not supply** for the
+`after` image. They are **absent** from `after` — not `null`. Without this list the two are
+indistinguishable.
+
+The concrete case is **PostgreSQL unchanged-TOAST**: when a large value (roughly >8 KB —
+`text`, `bytea`, `jsonb`) is not modified by an `UPDATE`, PostgreSQL omits it from the WAL
+entirely and pgoutput sends a `'u'` placeholder. The value is unrecoverable; reading it back
+out-of-band would race concurrent writes and return a value from a different point in time.
+
+> ⚠️ **`REPLICA IDENTITY FULL` does not avoid this.** Replica identity governs the *old*
+> tuple only. The after-image still omits unmodified TOASTed values under every replica
+> identity setting. `FULL` gives you a complete before-image (see `before_is_key_only`
+> below); it does not make `after` complete.
+
+This is also why the failure mode is so late-breaking: it only begins once rows cross the
+TOAST threshold, typically long after the pipeline was validated against small test rows.
+
+##### `before_unavailable_columns: Vec<String>`
+
+The same thing for the `before` image, tracked **separately**, because the two sets are not
+the same. A TOASTed column that *was* modified arrives present in `after` and absent from
+`before`. Merging the lists would mark a column that genuinely changed as unwritable and
+silently drop the update — so they are never merged.
+
+Only relevant if you consume the before-image (computing diffs, building compensating
+writes). A column listed here had *some* prior value; the source could not report it. Do not
+read its absence as "was NULL".
+
+##### `before_is_key_only: bool`
+
+`true` when `before` holds only the primary-key columns rather than a complete pre-image.
+Occurs on PostgreSQL `UPDATE`/`DELETE` when the table's `REPLICA IDENTITY` is `DEFAULT` (the
+PostgreSQL default). Code that computes row diffs or needs full prior state must check this —
+when `true`, `before` is not a row snapshot. Set `REPLICA IDENTITY FULL` on the table to get a
+complete before-image, at the cost of larger WAL volume and therefore more replication-slot
+retention pressure.
+
+`before_unavailable_columns` is always empty when this is `true`: a key-only before-image
+omits its non-key columns by design, not because of TOAST.
 
 ## Delivery And Acknowledgement Semantics
 
@@ -349,6 +435,36 @@ The runtime exposes embeddable control-plane state and metrics surfaces:
 
 Use these methods for health endpoints, diagnostics views, and lightweight observability bridges.
 
+### Health verdict
+
+`RuntimeAdminSnapshot::health` is a `HealthVerdict` — the runtime's own answer to "is this
+connector making progress?", which `RuntimeState` cannot give you (`state = Running` covers both
+a quiet database and a hung socket).
+
+```rust
+use rustcdc::HealthVerdict;
+
+let snapshot = runtime.admin_snapshot();
+match &snapshot.health {
+    HealthVerdict::Healthy | HealthVerdict::Idle => { /* serve 200 */ }
+    HealthVerdict::Stalled { reason } => {
+        // `reason` names the condition and the remedy.
+        eprintln!("cdc stalled: {reason}");
+    }
+    HealthVerdict::NotRunning => { /* not started, or stopped */ }
+    _ => {}
+}
+```
+
+`HealthVerdict::is_alertable()` returns `true` for exactly `Stalled`, so a readiness handler can
+gate on it without matching every variant. The enum is `#[non_exhaustive]` — match with a
+wildcard arm.
+
+`Stalled` is raised for an unconfirmed source position, a poll loop that has not completed within
+`max_poll_wait_ms × 6` (floor 30s), or polled-but-uncommitted events with a stale last commit —
+that last case meaning the embedder stopped calling `commit_ack`, not a source fault. See
+[Operations Runbook](runbook.md#health-verdict--idle-vs-stalled) for the alerting rules.
+
 ## Connection Retry Policy
 
 For transient source connectivity failures, configure `ConnectionRetryPolicy` via
@@ -411,20 +527,34 @@ patterns return `Err(ConfigError)` at `FilterProjectionTransform::new` time.
 
 ### Sensitive-data masking (`MaskHashTransform`)
 
+The available rules are `MaskRule::UnsaltedSha256`, `Redact(String)`, `Null`, `Truncate(usize)`
+and `Passthrough`, plus `HmacSha256(SecretString)`, `Encrypt(..)` and `Decrypt(..)` behind the
+`encryption` feature. (There is no `MaskRule::Hash`.)
+
 > **⚠ GDPR / privacy warning**
 >
-> `MaskRule::Hash` (SHA-256) is **deterministic and unsalted**.  For
+> `MaskRule::UnsaltedSha256` is, as the name says, **deterministic and unsalted**.  For
 > low-cardinality fields (e.g., `gender`, `country_code`, `status`) or any
 > field whose values are enumerable, an attacker can reverse the hash via a
-> pre-computed lookup table.  **Do not rely on `Hash` alone for GDPR
+> pre-computed lookup table.  **Do not rely on it alone for GDPR
 > pseudonymization compliance.**
 >
 > Recommended approaches for GDPR-compliant pseudonymization:
-> - Use `MaskRule::Encrypt` (AES-256-GCM) — provides reversible but opaque tokens.
-> - Add a site-specific HMAC secret by pre-hashing `format!("{secret}:{value}")`
->   before storing, then applying `MaskRule::Hash` on the HMAC output.
+> - Use **`MaskRule::HmacSha256(secret)`** — a keyed hash with a site-specific secret.
+>   This is the shipped, supported way to get salted pseudonymization; do not hand-roll it
+>   by pre-hashing `format!("{secret}:{value}")`.
+> - Use `MaskRule::Encrypt` (AES-256-GCM) when you need reversible but opaque tokens.
+>   Note the current wire format is `enc:<nonce>:<ciphertext>` with no key id, so key rotation
+>   is not yet a graceful migration, and ciphertexts are not bound to their column or row.
 > - Consider `MaskRule::Redact` or `MaskRule::Null` for fields that must be
 >   fully suppressed in the downstream stream.
+>
+> **Rules match by exact dotted JSON path**, against a `default_rule` of `Passthrough`.
+> A typo, an upstream column rename, or a path-mutating transform (`FieldMappingTransform`,
+> `UnwrapTransform`) placed *earlier* in the pipeline will therefore cause masking to
+> silently do nothing. Rules targeting object- or array-valued fields are currently not
+> applied — only scalars are matched. Order `MaskHashTransform` before any path-mutating
+> transform, and verify masking with a test.
 >
 > **Default behaviour change in 0.2**: `MaskHashConfig::default()` now uses
 > `default_rule: MaskRule::Passthrough`, meaning unlisted fields are passed
@@ -436,7 +566,7 @@ use rustcdc::{MaskHashConfig, MaskHashTransform, MaskRule};
 
 // Hash only specified PII fields; leave everything else unchanged.
 let mut config = MaskHashConfig::default();
-config.mask_rules.insert("email".into(), MaskRule::Hash);
+config.mask_rules.insert("email".into(), MaskRule::UnsaltedSha256);
 config.mask_rules.insert("ssn".into(),   MaskRule::Null);
 
 // Encrypt a field with AES-256-GCM (requires "encryption" feature).

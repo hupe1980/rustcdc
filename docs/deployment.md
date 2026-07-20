@@ -71,13 +71,42 @@ Recommended baseline controls:
 
 ## Backpressure and Slow-Consumer Behavior
 
-rustcdc uses **cooperative flow control**: the internal event buffer grows until it reaches `max_buffer_size`, at which point the runtime pauses ingestion and blocks the poll loop until the consumer catches up via `commit_ack()`.
+rustcdc uses **cooperative flow control**: the internal event buffer grows until it reaches `max_buffer_size`, at which point the runtime **returns an error** rather than accepting more work.
 
 ### How it works
 
 - `poll_event_batch()` returns events from the internal buffer.
 - `commit_ack(batch.ack_mode())` signals that the consumer has durably processed the acknowledged batch prefix. The runtime advances the checkpoint and frees buffer capacity.
-- If the consumer calls `poll_event_batch()` repeatedly without calling `commit_ack()`, the buffer fills to `max_buffer_size` and the runtime yields no new events until space is available.
+- If the consumer calls `poll_event_batch()` repeatedly without calling `commit_ack()`, the buffer fills to `max_buffer_size` and the next call returns **`Error::Backpressure`**, whose `ErrorKind` is **`ErrorKind::Backpressure`**.
+
+### Backpressure is not a failure — handle it accordingly
+
+```rust
+match runtime.poll_event_batch().await {
+    Ok(batch) => { /* process, then commit_ack */ }
+    Err(error) if error.kind() == ErrorKind::Backpressure => {
+        // Normal flow control. Acknowledge the outstanding batch, then retry the
+        // same call — it will succeed. Do NOT treat this as fatal.
+    }
+    Err(error) if error.is_recoverable() => { /* transient source issue: retry with backoff */ }
+    Err(error) => return Err(error), // genuinely terminal
+}
+```
+
+> **Match on `ErrorKind`, not on message text.** Backpressure previously surfaced as
+> `Error::StateError`, which maps to `ErrorKind::Terminal` — documented as *"a permanent
+> problem that retrying will not resolve"*. An embedder following that guidance would shut
+> the pipeline down on entirely routine buffer pressure. It now has its own kind so the
+> two are distinguishable.
+
+### Limiting batch size in bytes
+
+`RuntimeOptions::max_event_bytes` bounds the **serialized size** of a delivered batch, in
+addition to the `max_buffer_size` event count. Set it when the downstream has a hard
+message-size limit (Kafka `max.message.bytes`, SQS 256 KB, and so on).
+
+A single event larger than the whole budget is still delivered on its own — refusing it
+would stall the pipeline permanently on one oversized row with no way to make progress.
 
 ### Tuning guidance
 

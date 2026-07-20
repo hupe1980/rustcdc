@@ -82,6 +82,8 @@ async fn postgres_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
         database: "cdc".to_string(),
         replication_slot_name: "stream_test_slot".to_string(),
         publication_name: "stream_test_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -329,6 +331,8 @@ async fn postgres_stream_resume_from_lsn() -> rustcdc::Result<()> {
         database: "cdc".to_string(),
         replication_slot_name: "resume_stream_slot".to_string(),
         publication_name: "resume_stream_test_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,

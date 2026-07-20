@@ -176,6 +176,22 @@ impl Default for RuntimeOptions {
 }
 
 impl RuntimeOptions {
+    /// Runtime options with every setting at its default.
+    ///
+    /// `RuntimeOptions` is `#[non_exhaustive]`, so struct-literal syntax is unavailable
+    /// outside this crate. Start here (or from [`RuntimeOptions::default`], which is
+    /// equivalent) and chain the `with_*` builders.
+    ///
+    /// ```
+    /// use rustcdc::RuntimeOptions;
+    ///
+    /// let options = RuntimeOptions::new().with_max_buffer_size(4096);
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Replace the observability configuration.
     pub fn with_observability(mut self, observability: RuntimeObservability) -> Self {
         self.observability = observability;
@@ -615,6 +631,60 @@ pub enum RuntimeState {
     Stopped,
 }
 
+/// Derived health verdict — what an operator actually needs to page on.
+///
+/// [`RuntimeState`] alone cannot answer the question that matters during an incident.
+/// A connector streaming normally from a quiet database and one hung on a dead socket
+/// both report `state = running` with flat counters and `readiness = true`; the two are
+/// indistinguishable, so "no events for 10 minutes" is either completely fine or a
+/// production outage and the operator cannot tell which.
+///
+/// This composes the three signals that *do* distinguish them — poll recency,
+/// polled-versus-committed divergence, and source-side lag growth — into one verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HealthVerdict {
+    /// Running and making progress: events polled and committed recently.
+    Healthy,
+    /// Running correctly with nothing to do — the source genuinely has no changes.
+    ///
+    /// Distinguished from [`Stalled`](HealthVerdict::Stalled) by the poll loop still
+    /// completing on schedule and source-side lag not growing.
+    Idle,
+    /// Running, but something is wrong and progress has stopped or is degrading.
+    ///
+    /// `reason` names which signal fired, so an alert can route without a human first
+    /// correlating three metrics by hand.
+    Stalled {
+        /// Human-readable description of the specific stall condition detected.
+        reason: String,
+    },
+    /// Not running: never started, stopping, or stopped.
+    NotRunning,
+}
+
+impl HealthVerdict {
+    /// Whether this verdict warrants operator attention.
+    ///
+    /// [`Idle`](HealthVerdict::Idle) is deliberately **not** alertable: a quiet database
+    /// is the single most common cause of "no events", and paging on it trains operators
+    /// to ignore the alert.
+    pub fn is_alertable(&self) -> bool {
+        matches!(self, Self::Stalled { .. })
+    }
+
+    /// Short stable label for metrics and dashboards.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Idle => "idle",
+            Self::Stalled { .. } => "stalled",
+            Self::NotRunning => "not_running",
+        }
+    }
+}
+
 impl std::fmt::Display for RuntimeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -659,6 +729,17 @@ pub struct RuntimeAdminSnapshot {
     pub total_events_committed: u64,
     /// Cumulative count of events suppressed by the idempotency guard since `start()`. Never resets.
     pub total_events_deduplicated: u64,
+    /// Events permanently dropped by [`TransformErrorPolicy::Skip`].
+    ///
+    /// **Any non-zero value means data was lost.** A skipped event is dropped *and* the
+    /// checkpoint advances past it, so it is never replayed. Alert on any increase.
+    pub total_events_skipped: u64,
+    /// Derived health verdict.
+    ///
+    /// Use this for alerting rather than composing `state`, counters and timestamps by
+    /// hand — `state` alone cannot distinguish a healthy idle connector from a stalled
+    /// one. See [`HealthVerdict::is_alertable`].
+    pub health: HealthVerdict,
     /// Unix epoch milliseconds when `start()` was last called. `None` before first start.
     pub started_at_ms: Option<u64>,
     /// Unix epoch milliseconds of the last successful `poll_event_batch` call. `None` if never polled.
@@ -812,6 +893,14 @@ impl From<Option<AckToken>> for AckMode {
 #[must_use = "poll_event_batch() returns an EventBatch that must be acknowledged via commit_ack()"]
 pub struct EventBatch {
     events: Arc<Vec<Event>>,
+    /// Index of the first event in this batch within `events`.
+    ///
+    /// A redelivered batch is the *uncommitted suffix* of an in-flight delivery. Taking
+    /// that suffix used to deep-clone the whole slice on every re-poll; sharing the
+    /// `Arc` and carrying an offset makes redelivery allocation-free. The repository's
+    /// own `benches/cdc_perf.rs` benchmarked exactly this trade-off and showed the
+    /// shared-view variant faster — the result was simply never applied to production.
+    offset: usize,
     ack_token: Option<AckToken>,
 }
 
@@ -819,21 +908,27 @@ impl EventBatch {
     fn empty() -> Self {
         Self {
             events: Arc::new(Vec::new()),
+            offset: 0,
             ack_token: None,
         }
     }
 
     /// Borrow the delivered events.
     pub fn events(&self) -> &[Event] {
-        &self.events
+        &self.events[self.offset..]
     }
 
     /// Consume the batch and return its events.
     ///
-    /// If the runtime has already committed and dropped its internal reference
-    /// (via `commit_ack`) this is zero-copy; otherwise the vector is cloned.
+    /// Zero-copy when this batch covers the whole buffer and the runtime has already
+    /// dropped its internal reference (via `commit_ack`); otherwise the events are
+    /// cloned out of the shared buffer.
     pub fn into_events(self) -> Vec<Event> {
-        Arc::try_unwrap(self.events).unwrap_or_else(|arc| (*arc).clone())
+        if self.offset == 0 {
+            Arc::try_unwrap(self.events).unwrap_or_else(|arc| (*arc).clone())
+        } else {
+            self.events[self.offset..].to_vec()
+        }
     }
 
     /// Return the acknowledgement mode for this batch.
@@ -862,26 +957,26 @@ impl EventBatch {
 
     /// Number of events in the batch.
     pub fn len(&self) -> usize {
-        self.events.len()
+        self.events.len() - self.offset
     }
 
     /// Whether the batch is empty.
     pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
+        self.len() == 0
     }
 
     /// Returns the smallest `ts` (milliseconds since epoch) across all events in this batch.
     ///
     /// Returns `None` when the batch is empty.
     pub fn oldest_event_source_timestamp_ms(&self) -> Option<u64> {
-        self.events.iter().map(|e| e.ts).min()
+        self.events().iter().map(|e| e.ts).min()
     }
 
     /// Returns the largest `ts` (milliseconds since epoch) across all events in this batch.
     ///
     /// Returns `None` when the batch is empty.
     pub fn latest_event_source_timestamp_ms(&self) -> Option<u64> {
-        self.events.iter().map(|e| e.ts).max()
+        self.events().iter().map(|e| e.ts).max()
     }
 
     /// Returns `true` if any event in this batch has `before_is_key_only == true`.
@@ -890,14 +985,14 @@ impl EventBatch {
     /// computing row diffs. When this returns `true`, at least one UPDATE or DELETE
     /// event in the batch carries only primary-key columns in `before`.
     pub fn has_key_only_befores(&self) -> bool {
-        self.events.iter().any(|e| e.before_is_key_only)
+        self.events().iter().any(|e| e.before_is_key_only)
     }
 
     /// Returns an iterator over references to events in this batch.
     ///
     /// Equivalent to `batch.events().iter()`.
     pub fn iter(&self) -> std::slice::Iter<'_, Event> {
-        self.events.iter()
+        self.events().iter()
     }
 
     /// Returns a deduplicated, sorted list of table names present in this batch.
@@ -915,7 +1010,7 @@ impl EventBatch {
     /// # }
     /// ```
     pub fn tables(&self) -> Vec<&str> {
-        let mut tables: Vec<&str> = self.events.iter().map(|e| e.table.as_str()).collect();
+        let mut tables: Vec<&str> = self.events().iter().map(|e| e.table.as_str()).collect();
         tables.sort_unstable();
         tables.dedup();
         tables
@@ -943,7 +1038,7 @@ impl EventBatch {
     /// Use [`qualified_tables`](Self::qualified_tables) and filter `event.qualified_table_name()`
     /// when schema disambiguation is needed.
     pub fn event_count_for_table(&self, table: &str) -> usize {
-        self.events.iter().filter(|e| e.table == table).count()
+        self.events().iter().filter(|e| e.table == table).count()
     }
 }
 
@@ -952,7 +1047,7 @@ impl<'a> IntoIterator for &'a EventBatch {
     type IntoIter = std::slice::Iter<'a, Event>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.events.iter()
+        self.events().iter()
     }
 }
 
@@ -1384,6 +1479,13 @@ pub struct CdcRuntime {
     total_events_polled: u64,
     total_events_committed: u64,
     total_events_deduplicated: u64,
+    /// Events dropped by [`TransformErrorPolicy::Skip`].
+    ///
+    /// The docs promised a `transform_error_skipped_count` metric that did not exist
+    /// anywhere in the crate, so an operator following them built an alert on a metric
+    /// that was never emitted. Skipped events are unrecoverable (the checkpoint advances
+    /// past them), which makes this the one counter that must not be missing.
+    total_events_skipped: u64,
     last_checkpoint_saved_at_ms: Option<u64>,
     transform_pipeline: TransformPipeline,
     idempotency_guard: Option<EventIdempotencyGuard>,
@@ -1394,7 +1496,36 @@ pub struct CdcRuntime {
     /// Wrapped in `Mutex` so that `CdcRuntime` remains `Sync` (required by
     /// `BoxStream::boxed` used in the poll path).
     registered_sink: Option<std::sync::Mutex<BoxedSink>>,
+    /// LSN that was durably checkpointed but which the source refused to confirm.
+    ///
+    /// A failed `confirm_lsn` leaves the source replaying events the runtime has
+    /// already committed. The idempotency guard then suppresses every one of them —
+    /// they were fingerprinted on the first pass — so the poll loop returns empty
+    /// forever while liveness and readiness both report healthy. That is a silent,
+    /// unbounded stall, and on PostgreSQL it accumulates WAL on the primary.
+    ///
+    /// Retaining the LSN lets the next poll retry the confirmation before dedup runs,
+    /// which is what breaks the loop. If it cannot be confirmed, the runtime reports
+    /// not-ready and fails loud rather than idling.
+    pending_confirmation_lsn: Option<u64>,
+    /// Consecutive polls that produced events but had every one suppressed by the
+    /// idempotency guard while `pending_confirmation_lsn` was set.
+    unconfirmed_stall_polls: u32,
 }
+
+/// Consecutive fully-suppressed polls tolerated before a stalled, unconfirmed
+/// source position is escalated from a warning to a hard error.
+pub(crate) const UNCONFIRMED_STALL_POLL_LIMIT: u32 = 3;
+
+/// Multiple of `max_poll_wait_ms` after which a non-completing poll is a stall.
+///
+/// Generous on purpose: a slow-but-working poll must never be reported as stalled, or
+/// the verdict becomes noise and operators stop trusting it.
+const HEALTH_POLL_STALL_MULTIPLIER: u64 = 6;
+
+/// Floor for the stall threshold, so a very small `max_poll_wait_ms` cannot produce a
+/// threshold short enough to fire on normal scheduling jitter.
+const HEALTH_MIN_POLL_STALL_MS: u64 = 30_000;
 
 impl CdcRuntime {
     fn observability(&self) -> &RuntimeObservability {
@@ -1454,6 +1585,31 @@ impl CdcRuntime {
             ));
         }
 
+        // `Skip` without somewhere to put the skipped events is silent data loss.
+        //
+        // A skipped event never reaches the commit barrier, so it never gets an offset
+        // — but the events *after* it do, and `commit` persists the last accepted
+        // offset, which is past the skipped one. The event is therefore never replayed
+        // on restart: it is gone permanently. Out of the box the only trace was a
+        // `warn!` log line.
+        //
+        // Requiring a dead-letter handler makes that a deliberate, captured routing
+        // decision rather than an invisible one.
+        if matches!(
+            config.options.transform_error_policy,
+            TransformErrorPolicy::Skip
+        ) && config.options.dead_letter_handler.is_none()
+        {
+            return Err(Error::ConfigError(
+                "TransformErrorPolicy::Skip requires a dead-letter handler. A skipped event \
+                 is dropped *and* the checkpoint advances past it, so it is never replayed — \
+                 without a handler the event is lost permanently with only a log line. \
+                 Configure RuntimeOptions::with_dead_letter_handler(...) to capture skipped \
+                 events, or use TransformErrorPolicy::Halt to stop on transform errors."
+                    .into(),
+            ));
+        }
+
         let capabilities = config.source.capabilities();
         // Skip capability checks for Disabled sources (used in tests with mock sources).
         if !matches!(config.source, RuntimeSourceConfig::Disabled) {
@@ -1498,7 +1654,10 @@ impl CdcRuntime {
             total_events_polled: 0,
             total_events_committed: 0,
             total_events_deduplicated: 0,
+            total_events_skipped: 0,
             last_checkpoint_saved_at_ms: None,
+            pending_confirmation_lsn: None,
+            unconfirmed_stall_polls: 0,
             transform_pipeline: TransformPipeline::default(),
             idempotency_guard,
             registered_sink: None,
@@ -1597,8 +1756,9 @@ mod tests {
     use crate::{
         checkpoint::{Checkpoint, InMemoryCheckpoint},
         core::{
-            Event, EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector, Operation,
-            SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+            Event, EventTracer, HealthVerdict, MetricsCollector, NoOpEventTracer,
+            NoOpMetricsCollector, Operation, SnapshotMetadata, SourceMetadata,
+            EVENT_ENVELOPE_VERSION,
         },
         ddl_capture::DdlDialect,
         schema_history::{InMemorySchemaHistory, SchemaHistoryRetention},
@@ -1638,6 +1798,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -2174,17 +2336,64 @@ mod tests {
         assert!(matches!(error, crate::core::Error::TransformError(_)));
     }
 
+    /// `Skip` without a dead-letter handler is silent data loss, and is rejected.
+    ///
+    /// A skipped event never reaches the commit barrier, so it gets no offset — but the
+    /// events after it do, and `commit` persists the last accepted offset, which is past
+    /// the skipped one. The event is therefore never replayed on restart. Out of the box
+    /// the only trace was a `warn!` line.
     #[tokio::test]
-    async fn transform_error_policy_skip_drops_failing_event() {
+    async fn transform_error_policy_skip_requires_a_dead_letter_handler() {
         let checkpoint = InMemoryCheckpoint::default();
         let schema_history = InMemorySchemaHistory::default();
         let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
             .with_transform_error_policy(TransformErrorPolicy::Skip);
+
+        let error = match CdcRuntime::new(config) {
+            Err(error) => error,
+            Ok(_) => panic!("Skip without a dead-letter handler must be rejected"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("dead-letter handler"), "{message}");
+        assert!(message.contains("never replayed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn transform_error_policy_skip_routes_to_dead_letter_and_counts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::clone(&captured);
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
+                .with_transform_error_policy(TransformErrorPolicy::Skip);
+        config.options = config
+            .options
+            .with_dead_letter_handler(move |_event, _error| {
+                sink.fetch_add(1, Ordering::Relaxed);
+            });
+
         let mut runtime = CdcRuntime::new(config).unwrap();
         runtime.add_transform(Box::new(FailTransform));
 
         let events = runtime.apply_transforms(vec![event()]).await.unwrap();
-        assert!(events.is_empty());
+        assert!(
+            events.is_empty(),
+            "the failing event is dropped from the batch"
+        );
+        assert_eq!(
+            captured.load(Ordering::Relaxed),
+            1,
+            "the skipped event must reach the dead-letter handler"
+        );
+        assert_eq!(
+            runtime.admin_snapshot().total_events_skipped,
+            1,
+            "skipped events must be counted — any non-zero value means data was lost"
+        );
     }
 
     // ─── Mock source infrastructure ─────────────────────────────────────────
@@ -2194,7 +2403,8 @@ mod tests {
     struct MockStreamHandle {
         batches: TestDeque<Vec<Event>>,
         confirmed_lsns: Arc<Mutex<Vec<u64>>>,
-        confirm_lsn_error: Option<String>,
+        /// Shared so a test can clear it mid-run, simulating the source recovering.
+        confirm_lsn_error: Arc<Mutex<Option<String>>>,
         /// When `Some`, replay this batch on every `next_events` call until
         /// `confirm_lsn` succeeds — simulates a Postgres replication slot that
         /// is stuck at a fixed position because `pg_replication_slot_advance`
@@ -2206,7 +2416,7 @@ mod tests {
         fn new(
             batches: Vec<Vec<Event>>,
             confirmed_lsns: Arc<Mutex<Vec<u64>>>,
-            confirm_lsn_error: Option<String>,
+            confirm_lsn_error: Arc<Mutex<Option<String>>>,
         ) -> Self {
             Self {
                 batches: batches.into_iter().collect(),
@@ -2243,8 +2453,13 @@ mod tests {
         }
 
         async fn confirm_lsn(&mut self, lsn: u64) -> crate::core::Result<()> {
-            if let Some(message) = &self.confirm_lsn_error {
-                return Err(crate::core::Error::SourceError(message.clone()));
+            let configured_error = self
+                .confirm_lsn_error
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            if let Some(message) = configured_error {
+                return Err(crate::core::Error::SourceError(message));
             }
             // Successful confirmation clears replay mode — the slot has advanced.
             self.replay_batch = None;
@@ -2329,7 +2544,7 @@ mod tests {
         last_snapshot_resume_source: Arc<Mutex<Option<String>>>,
         last_snapshot_resume_payload: Arc<Mutex<Option<Vec<u8>>>>,
         last_stream_resume_source: Arc<Mutex<Option<String>>>,
-        confirm_lsn_error: Option<String>,
+        confirm_lsn_error: Arc<Mutex<Option<String>>>,
         snapshot_checkpoint_error: Option<String>,
         snapshot_checkpoint_payload: Option<Vec<u8>>,
         snapshot_checkpoint_source_type: String,
@@ -2348,7 +2563,7 @@ mod tests {
                 last_snapshot_resume_source: Arc::new(Mutex::new(None)),
                 last_snapshot_resume_payload: Arc::new(Mutex::new(None)),
                 last_stream_resume_source: Arc::new(Mutex::new(None)),
-                confirm_lsn_error: None,
+                confirm_lsn_error: Arc::new(Mutex::new(None)),
                 snapshot_checkpoint_error: None,
                 snapshot_checkpoint_payload: None,
                 snapshot_checkpoint_source_type: "mock_snapshot".to_string(),
@@ -2367,7 +2582,7 @@ mod tests {
                 last_snapshot_resume_source: Arc::new(Mutex::new(None)),
                 last_snapshot_resume_payload: Arc::new(Mutex::new(None)),
                 last_stream_resume_source: Arc::new(Mutex::new(None)),
-                confirm_lsn_error: None,
+                confirm_lsn_error: Arc::new(Mutex::new(None)),
                 snapshot_checkpoint_error: None,
                 snapshot_checkpoint_payload: None,
                 snapshot_checkpoint_source_type: "mock_snapshot".to_string(),
@@ -2376,9 +2591,15 @@ mod tests {
         }
 
         #[cfg(feature = "postgres")]
-        fn with_confirm_lsn_error(mut self, message: impl Into<String>) -> Self {
-            self.confirm_lsn_error = Some(message.into());
+        fn with_confirm_lsn_error(self, message: impl Into<String>) -> Self {
+            *self.confirm_lsn_error.lock().unwrap() = Some(message.into());
             self
+        }
+
+        /// Handle for clearing the simulated failure mid-run.
+        #[cfg(feature = "postgres")]
+        fn confirm_lsn_error_handle(&self) -> Arc<Mutex<Option<String>>> {
+            Arc::clone(&self.confirm_lsn_error)
         }
 
         /// Configure the mock stream to replay a fixed batch on every `next_events`
@@ -2489,7 +2710,7 @@ mod tests {
             let mut handle = MockStreamHandle::new(
                 self.stream_batches.clone(),
                 Arc::clone(&self.confirmed_lsns),
-                self.confirm_lsn_error.clone(),
+                Arc::clone(&self.confirm_lsn_error),
             );
             if let Some(batch) = &self.replay_batch {
                 handle = handle.with_replay_batch(batch.clone());
@@ -3350,17 +3571,20 @@ mod tests {
         );
     }
 
-    /// Regression test for BUG-5 — deadlock variant: when `confirm_lsn` fails under `FailFast`
-    /// and the runtime idempotency guard IS active, the replayed events are silently deduplicated,
-    /// returning `EventBatch::empty()` on every subsequent poll.  The caller's `commit_ack` is a
-    /// no-op and the slot never advances — a permanent, silent zero-progress cycle with no error.
+    /// A `confirm_lsn` failure must never become a *silent* stall.
     ///
-    /// This test demonstrates the deadlock so it can be caught and addressed (e.g. by retrying
-    /// the pending confirmation LSN on the next idle cycle, or by clearing the idempotency guard
-    /// fingerprints for events whose LSN has not been confirmed).
+    /// Previously: the source kept replaying already-committed events, the idempotency
+    /// guard suppressed all of them (they were fingerprinted on the first pass), and
+    /// every poll returned `EventBatch::empty()` while liveness and readiness both
+    /// reported healthy — an unbounded no-progress loop that accumulated WAL on the
+    /// PostgreSQL primary with no error, no metric, and no log above `debug`.
+    ///
+    /// Now the runtime retains the unconfirmed LSN, retries it before dedup runs on
+    /// each poll, reports `readiness: false` while it is outstanding, and escalates to
+    /// a hard `Unrecoverable` error once the no-progress loop is demonstrated.
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    async fn bug5_idempotency_guard_and_confirm_lsn_failure_causes_silent_stall() {
+    async fn confirm_lsn_failure_escalates_instead_of_stalling_silently() {
         let mut evt = event();
         evt.source.source_name = "postgres".into();
         evt.source.offset = "16/001A0000".into();
@@ -3398,27 +3622,499 @@ mod tests {
             crate::core::Error::PostCommitConfirmFailed { .. }
         ));
 
-        // Second poll: slot still at old position → same events replayed.
-        // But the idempotency guard already saw these fingerprints → all suppressed.
-        // The result is an empty batch — silent zero-progress.
-        let batch2 = runtime.poll_event_batch().await.unwrap();
+        // The unconfirmed position must be retained and surfaced as not-ready. This is
+        // the signal that was entirely missing before: an operator polling health saw
+        // `readiness: true` throughout the stall.
         assert!(
-            batch2.is_empty(),
-            "BUG-5: idempotency guard suppresses replayed events after confirm_lsn failure, \
-             producing a silent empty batch that causes an infinite no-progress loop"
+            !runtime.admin_snapshot().readiness,
+            "a durably committed but unconfirmed source position must report not-ready"
         );
 
-        // Demonstrate the stall: commit_ack on empty batch is a no-op, checkpoint unchanged.
-        runtime.commit_ack(batch2.ack_mode()).await.unwrap();
-        assert_eq!(
+        // Subsequent polls replay the same events and the guard suppresses them. That
+        // is tolerated briefly (the confirmation is retried each poll), but it must not
+        // be tolerated indefinitely.
+        let mut escalated = None;
+        for _ in 0..super::UNCONFIRMED_STALL_POLL_LIMIT + 1 {
+            match runtime.poll_event_batch().await {
+                Ok(batch) => assert!(
+                    batch.is_empty(),
+                    "replayed events are suppressed while the position is unconfirmed"
+                ),
+                Err(error) => {
+                    escalated = Some(error);
+                    break;
+                }
+            }
+        }
+
+        let error = escalated.expect(
+            "a persistent no-progress loop must escalate to a hard error, not idle forever",
+        );
+        assert!(
+            matches!(error, crate::core::Error::Unrecoverable(_)),
+            "expected Unrecoverable, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("not making progress"),
+            "the error must name the failure mode: {message}"
+        );
+        assert!(
+            message.contains("Operator action required"),
+            "the error must tell the operator what to do: {message}"
+        );
+    }
+
+    /// Connector-emitted schema-change events must land in the durable schema history.
+    ///
+    /// Previously `record_ddl` had exactly one caller (`capture_ddl_statement`), which
+    /// itself had no non-test callers — so the schema history was never populated in
+    /// any production path, while `start()` nonetheless refused to run without a
+    /// retention policy for it. The connectors synthesize `Operation::SchemaChange`
+    /// events directly, so the runtime now records them where every connector's events
+    /// converge.
+    #[tokio::test]
+    async fn connector_schema_change_events_populate_the_schema_history() {
+        use crate::core::Operation;
+
+        let mut ddl_event = event();
+        ddl_event.op = Operation::SchemaChange;
+        ddl_event.table = "users".into();
+        ddl_event.before = None;
+        // Shape matches what the connectors actually emit: the synthesized
+        // schema-change payload carries `result_schema` alongside the statement.
+        ddl_event.after = Some(serde_json::json!({
+            "ddl_type": "CREATE_TABLE",
+            "schema": "public",
+            "table": "users",
+            "statement": "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT)",
+            "result_schema": {
+                "schema": "public",
+                "table": "users",
+                "columns": [
+                    {"name": "id", "data_type": "BIGINT", "nullable": false,
+                     "constraints": ["PRIMARY KEY"]},
+                    {"name": "email", "data_type": "TEXT", "nullable": true,
+                     "constraints": []},
+                ],
+                "primary_keys": ["id"],
+                "version": 0,
+            },
+        }));
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        assert!(
             runtime
                 .config
-                .checkpoint
-                .get_committed_count()
+                .schema_history
+                .latest_schema("public.users")
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none(),
+            "history must start empty"
+        );
+
+        runtime.enqueue_event(ddl_event).unwrap();
+        let batch = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(
+            batch.len(),
             1,
-            "checkpoint count must remain at 1 (no new events committed, slot never advanced)"
+            "the schema-change event still reaches the consumer"
+        );
+
+        let recorded = runtime
+            .config
+            .schema_history
+            .latest_schema("public.users")
+            .await
+            .unwrap();
+        assert!(
+            recorded.is_some(),
+            "a connector-emitted schema change must be recorded in the schema history"
+        );
+    }
+
+    /// `max_event_bytes` must actually bound the batch.
+    ///
+    /// It was previously declared, defaulted, settable and documented as a flush limit
+    /// — and never read anywhere. An operator setting it to protect a downstream with
+    /// a hard message-size limit got no protection and no warning.
+    #[tokio::test]
+    async fn max_event_bytes_bounds_the_delivered_batch() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        // Small enough that only a couple of events fit per batch.
+        config.options.max_event_bytes = Some(600);
+        config.options.max_buffer_size = 100;
+
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        for index in 0..20 {
+            let mut event = event();
+            event.source.offset = format!("offset-{index}");
+            event.after = Some(serde_json::json!({ "id": index, "blob": "x".repeat(200) }));
+            runtime.enqueue_event(event).unwrap();
+        }
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        assert!(
+            !batch.is_empty(),
+            "the byte budget must not stall delivery entirely"
+        );
+        assert!(
+            batch.len() < 20,
+            "the byte budget must cut the batch below the event-count limit, got {}",
+            batch.len()
+        );
+    }
+
+    /// A single event larger than the whole budget must still be delivered.
+    ///
+    /// Refusing would stall the pipeline permanently on one oversized row, with no way
+    /// for the caller to make progress.
+    #[tokio::test]
+    async fn max_event_bytes_still_delivers_a_single_oversized_event() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        config.options.max_event_bytes = Some(16);
+
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        let mut oversized = event();
+        oversized.after = Some(serde_json::json!({ "blob": "x".repeat(10_000) }));
+        runtime.enqueue_event(oversized).unwrap();
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(
+            batch.len(),
+            1,
+            "an event larger than the entire budget must still be delivered"
+        );
+    }
+
+    /// Backpressure must be its own `ErrorKind`, not `Terminal`.
+    ///
+    /// It previously surfaced as `StateError` → `ErrorKind::Terminal`, documented as
+    /// "a permanent problem that retrying will not resolve" — so an embedder following
+    /// the crate's own retry guidance would shut the pipeline down on routine flow
+    /// control.
+    #[tokio::test]
+    async fn buffer_full_reports_backpressure_not_terminal() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        config.options.max_buffer_size = 2;
+
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        // Fill the commit barrier without acknowledging, then keep enqueuing until the
+        // runtime pushes back. Both the enqueue guard and the commit-barrier guard are
+        // flow control and must report the same kind.
+        let error = loop {
+            if let Err(error) = runtime.enqueue_event(event()) {
+                break error;
+            }
+            match runtime.poll_event_batch().await {
+                Ok(batch) if batch.is_empty() => {
+                    panic!("runtime yielded nothing and never pushed back")
+                }
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            error.kind(),
+            crate::core::ErrorKind::Backpressure,
+            "backpressure must not be classified Terminal: {error:?}"
+        );
+        assert!(
+            !error.is_recoverable(),
+            "backpressure is not a transient source condition either"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("acknowledge"),
+            "the error must tell the caller how to clear it: {message}"
+        );
+    }
+
+    /// Redelivery after a partial ack must expose exactly the uncommitted suffix.
+    ///
+    /// `EventBatch` now shares the delivery's buffer and carries an offset instead of
+    /// deep-cloning the suffix on every re-poll. That makes redelivery allocation-free,
+    /// but it also means `events()`, `len()` and `into_events()` must all respect the
+    /// offset — getting any of them wrong would re-deliver already-committed events.
+    #[tokio::test]
+    async fn redelivered_batch_view_excludes_committed_prefix() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        for index in 0..5 {
+            let mut event = event();
+            event.source.offset = format!("offset-{index}");
+            runtime.enqueue_event(event).unwrap();
+        }
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(batch.len(), 5);
+
+        // Commit only the first two.
+        let AckMode::Required(token) = batch.ack_mode() else {
+            panic!("expected an ack token")
+        };
+        let (first_two, _rest) = token.split_at(2).unwrap();
+        runtime.commit_ack(first_two).await.unwrap();
+
+        let redelivered = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(
+            redelivered.len(),
+            3,
+            "only the uncommitted suffix redelivers"
+        );
+        assert_eq!(redelivered.events().len(), 3, "events() honours the offset");
+        assert_eq!(
+            redelivered.events()[0].source.offset,
+            "offset-2",
+            "redelivery must resume after the committed prefix"
+        );
+
+        let owned = redelivered.into_events();
+        assert_eq!(owned.len(), 3, "into_events() honours the offset");
+        assert_eq!(owned[0].source.offset, "offset-2");
+        assert_eq!(owned[2].source.offset, "offset-4");
+    }
+
+    /// The health verdict must separate "quiet source" from "stuck pipeline".
+    ///
+    /// `RuntimeState` cannot: a connector streaming from an idle database and one hung
+    /// on a dead socket both report `state = running` with flat counters. An operator
+    /// seeing "no events for 10 minutes" could not tell which, so the signal was
+    /// unusable for alerting.
+    #[tokio::test]
+    async fn health_verdict_distinguishes_idle_from_stalled() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+
+        // Not started.
+        assert_eq!(runtime.admin_snapshot().health, HealthVerdict::NotRunning);
+        assert!(!runtime.admin_snapshot().health.is_alertable());
+
+        runtime.start().await.unwrap();
+
+        // Running, nothing to do: idle, and deliberately NOT alertable. Paging on a
+        // quiet database is what trains operators to ignore the alert.
+        let idle = runtime.admin_snapshot().health;
+        assert_eq!(idle, HealthVerdict::Idle);
+        assert!(
+            !idle.is_alertable(),
+            "a quiet source must not page anyone: {idle:?}"
+        );
+
+        // Events flowing and committed: healthy.
+        runtime.enqueue_event(event()).unwrap();
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+        assert_eq!(runtime.admin_snapshot().health, HealthVerdict::Healthy);
+
+        // Stopped.
+        runtime.stop().await.unwrap();
+        assert_eq!(runtime.admin_snapshot().health, HealthVerdict::NotRunning);
+    }
+
+    /// A consumer that stops acknowledging is a stall, and must say so.
+    ///
+    /// This is the case that looks identical to source idleness in the raw counters:
+    /// the source is fine, the poll loop is fine, and nothing is committing.
+    #[tokio::test]
+    async fn health_verdict_reports_a_consumer_that_stopped_acknowledging() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        config.options.max_poll_wait_ms = 1;
+
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        runtime.enqueue_event(event()).unwrap();
+        let _delivered = runtime.poll_event_batch().await.unwrap();
+        // Deliberately no commit_ack.
+
+        // Backdate the last commit past the stall threshold to simulate elapsed time
+        // without sleeping.
+        runtime.last_commit_at_ms = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default()
+                .saturating_sub(10 * 60 * 1000),
+        );
+
+        let health = runtime.admin_snapshot().health;
+        match &health {
+            HealthVerdict::Stalled { reason } => {
+                assert!(
+                    reason.contains("commit_ack"),
+                    "the reason must name the remedy: {reason}"
+                );
+                assert!(
+                    reason.contains("not committed"),
+                    "the reason must name the condition: {reason}"
+                );
+            }
+            other => panic!("expected a stall verdict, got {other:?}"),
+        }
+        assert!(health.is_alertable());
+    }
+
+    /// An unconfirmed committed position must dominate the verdict.
+    ///
+    /// It is the most severe condition — the source retains its log (WAL on a
+    /// PostgreSQL primary) until it clears — so it must be reported even when other
+    /// signals look fine.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn health_verdict_reports_an_unconfirmed_source_position() {
+        let mut evt = event();
+        evt.source.source_name = "postgres".into();
+        evt.source.offset = "16/001A0000".into();
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.source = RuntimeSource::Mock(Box::new(
+            MockSource::stream_only(vec![])
+                .with_replay_stream(vec![evt])
+                .with_confirm_lsn_error("simulated slot advance failure"),
+        ));
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new("mock", b"offset".to_vec()),
+                0,
+            )
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        let _ = runtime.commit_ack(batch.ack_mode()).await;
+
+        let health = runtime.admin_snapshot().health;
+        match &health {
+            HealthVerdict::Stalled { reason } => assert!(
+                reason.contains("could not be confirmed"),
+                "the reason must name the unconfirmed position: {reason}"
+            ),
+            other => panic!("expected a stall verdict, got {other:?}"),
+        }
+    }
+
+    /// The Prometheus surface must expose exactly one active health verdict.
+    #[tokio::test]
+    async fn prometheus_output_exposes_the_health_verdict() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        let text = runtime.admin_metrics_prometheus();
+        let active = text
+            .lines()
+            .filter(|line| line.starts_with("rustcdc_runtime_health{") && line.ends_with(" 1"))
+            .count();
+        assert_eq!(
+            active, 1,
+            "exactly one verdict must be active so an alert rule is unambiguous:\n{text}"
+        );
+        assert!(
+            text.contains("rustcdc_runtime_events_skipped_total"),
+            "the skipped-event counter must be exposed: any non-zero value means data loss"
+        );
+    }
+
+    /// Startup must not refuse to run merely because retention is unconfigured.
+    #[tokio::test]
+    async fn start_succeeds_without_a_schema_history_retention_policy() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut config = config;
+        config.options.schema_history_retention = None;
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime
+            .start()
+            .await
+            .expect("missing retention must warn, not block startup");
+    }
+
+    /// The happy path of the same mechanism: once the source accepts the confirmation,
+    /// the runtime clears the pending position and returns to ready.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn recovered_confirm_lsn_clears_the_pending_position_and_restores_readiness() {
+        let mut evt = event();
+        evt.source.source_name = "postgres".into();
+        evt.source.offset = "16/001A0000".into();
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        let source = MockSource::stream_only(vec![])
+            .with_replay_stream(vec![evt.clone()])
+            .with_confirm_lsn_error("simulated slot advance failure");
+        let failure_handle = source.confirm_lsn_error_handle();
+        runtime.source = RuntimeSource::Mock(Box::new(source));
+
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new("mock", b"offset".to_vec()),
+                0,
+            )
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        let _ = runtime.commit_ack(batch.ack_mode()).await;
+        assert!(runtime.pending_confirmation_lsn.is_some());
+        assert!(!runtime.admin_snapshot().readiness);
+
+        // Source recovers: the next poll's retry succeeds.
+        *failure_handle.lock().unwrap() = None;
+        let _replayed = runtime.poll_event_batch().await.unwrap();
+
+        assert!(
+            runtime.pending_confirmation_lsn.is_none(),
+            "a successful retry must clear the pending position"
+        );
+        assert!(
+            runtime.admin_snapshot().readiness,
+            "readiness must recover once the position is confirmed"
         );
     }
 
@@ -4340,6 +5036,7 @@ mod tests {
     fn event_batch_tables_returns_sorted_deduplicated_names() {
         let batch = EventBatch {
             events: make_batch_events(),
+            offset: 0,
             ack_token: None,
         };
         let tables = batch.tables();
@@ -4350,6 +5047,7 @@ mod tests {
     fn event_batch_qualified_tables_includes_schema() {
         let batch = EventBatch {
             events: make_batch_events(),
+            offset: 0,
             ack_token: None,
         };
         let tables = batch.qualified_tables();
@@ -4360,6 +5058,7 @@ mod tests {
     fn event_batch_event_count_for_table() {
         let batch = EventBatch {
             events: make_batch_events(),
+            offset: 0,
             ack_token: None,
         };
         assert_eq!(batch.event_count_for_table("orders"), 2);
@@ -4372,11 +5071,13 @@ mod tests {
         let events = make_batch_events();
         let batch = EventBatch {
             events: events.clone(),
+            offset: 0,
             ack_token: None,
         };
         let via_iter: Vec<&Event> = batch.iter().collect();
         let via_into_iter: Vec<Event> = EventBatch {
             events,
+            offset: 0,
             ack_token: None,
         }
         .into_iter()

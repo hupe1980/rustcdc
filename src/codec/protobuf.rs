@@ -59,6 +59,8 @@ const CONTENT_TYPE: &str = "application/x-protobuf";
 ///     transaction: None,
 ///     envelope_version: EVENT_ENVELOPE_VERSION,
 ///     before_is_key_only: false,
+///     unavailable_columns: Vec::new(),
+///     before_unavailable_columns: Vec::new(),
 /// };
 /// let out = encoder.encode(&event).unwrap();
 /// assert_eq!(out.content_type, "application/x-protobuf");
@@ -206,6 +208,14 @@ pub struct ProtoEvent {
     /// True when `before` contains only primary-key columns (PostgreSQL DEFAULT REPLICA IDENTITY).
     #[prost(bool, tag = "12")]
     pub before_is_key_only: bool,
+    /// Columns absent from `after` because the source could not supply them
+    /// (PostgreSQL unchanged-TOAST). Absent, not null — see `Event::unavailable_columns`.
+    #[prost(string, repeated, tag = "13")]
+    pub unavailable_columns: Vec<String>,
+    /// The same, for `before`. Never merged with `unavailable_columns` — the two sets
+    /// differ, and merging them marks genuinely-changed columns as unwritable.
+    #[prost(string, repeated, tag = "14")]
+    pub before_unavailable_columns: Vec<String>,
 }
 
 impl ProtoEvent {
@@ -260,6 +270,8 @@ impl ProtoEvent {
                 }),
             envelope_version: event.envelope_version as u32,
             before_is_key_only: event.before_is_key_only,
+            unavailable_columns: event.unavailable_columns.clone(),
+            before_unavailable_columns: event.before_unavailable_columns.clone(),
         })
     }
 
@@ -303,6 +315,8 @@ mod tests {
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -324,6 +338,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

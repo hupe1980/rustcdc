@@ -201,9 +201,50 @@ impl SqlServerSourceConfig {
         if self.transport.is_tls() {
             config.encryption(tiberius::EncryptionLevel::Required);
 
-            if self.transport.allow_invalid_certificates()
-                || self.transport.allow_invalid_hostnames()
+            // See the equivalent guard in the MySQL connector: tiberius builds its own
+            // TLS stack and cannot consume a pre-built `rustls::ClientConfig`. Ignoring
+            // one would silently discard a pinning verifier or HSM-backed client
+            // certificate while `is_tls()` continues to report `true`.
+            if matches!(self.transport, TransportConfig::RustlsConfig { .. }) {
+                return Err(Error::ConfigError(
+                    "sqlserver transport was given a pre-built rustls ClientConfig \
+                     (TransportConfig::RustlsConfig), but the SQL Server driver constructs its \
+                     own TLS stack and cannot consume one. Applying it is impossible, and \
+                     ignoring it would silently discard whatever the config carries — commonly \
+                     a certificate-pinning verifier or an HSM-backed client certificate — while \
+                     still reporting TLS as enabled. Use TransportConfig::tls() or \
+                     tls_with_ca_cert_path(...) for SQL Server instead."
+                        .into(),
+                ));
+            }
+
+            // `allow_invalid_hostnames` must NOT reach `trust_cert()`.
+            //
+            // tiberius' `trust_cert()` disables the *entire* certificate chain check,
+            // not just SAN/hostname matching. Treating hostname relaxation as implying
+            // full trust silently escalates a narrow, common accommodation (AG
+            // listeners, `host\instance` names, IP-based connections) into "accept any
+            // certificate from anyone" — and, via the `else if` below, also discards the
+            // operator's configured `ca_cert_path`. Since tiberius cannot express
+            // hostname-only relaxation, reject the combination loudly instead of
+            // widening it.
+            if self.transport.allow_invalid_hostnames()
+                && !self.transport.allow_invalid_certificates()
             {
+                return Err(Error::ConfigError(
+                    "sqlserver transport sets allow_invalid_hostnames without \
+                     allow_invalid_certificates, but the SQL Server driver cannot skip \
+                     hostname verification while still validating the certificate chain. \
+                     Honouring this as requested is impossible; applying it would silently \
+                     disable chain validation entirely and ignore any configured \
+                     ca_cert_path. Either fix the certificate's SAN to match the \
+                     connection host, or set allow_invalid_certificates = true to \
+                     acknowledge that all certificate validation is disabled."
+                        .into(),
+                ));
+            }
+
+            if self.transport.allow_invalid_certificates() {
                 config.trust_cert();
             } else if let Some(ca_path) = self
                 .transport

@@ -308,6 +308,8 @@ impl From<ValidationErrors> for Error {
 ///     transaction: None,
 ///     envelope_version: EVENT_ENVELOPE_VERSION,
 ///     before_is_key_only: false,
+///     unavailable_columns: Vec::new(),
+///     before_unavailable_columns: Vec::new(),
 /// };
 ///
 /// let encoded = event.to_json().unwrap();
@@ -353,6 +355,121 @@ pub struct Event {
     /// for all MySQL / MariaDB / SQL Server events.
     #[serde(default)]
     pub before_is_key_only: bool,
+    /// Columns that exist on the table but whose value the source could not supply.
+    ///
+    /// These columns are **absent** from `before`/`after` — not `null`. Without this
+    /// list the two cases are indistinguishable, which is the classic CDC data-loss
+    /// footgun: a consumer performing a full-row upsert from `after` writes `NULL`
+    /// (or the column default) over a value that never actually changed.
+    ///
+    /// The concrete case today is **PostgreSQL unchanged-TOAST**. When a large value
+    /// (roughly >8 KB: text, bytea, jsonb) is not modified by an UPDATE, PostgreSQL
+    /// omits it from the WAL record entirely and pgoutput sends the `'u'` placeholder.
+    /// The value cannot be recovered — reading it back from the table out-of-band
+    /// would race concurrent writes and yield a value from a different point in time,
+    /// so there is no safe way to fill it in.
+    ///
+    /// **A consumer that writes whole rows must exclude these columns from the write**
+    /// (e.g. omit them from the `SET` clause of an upsert) rather than writing NULL.
+    ///
+    /// Empty for every event whose `after` image is complete.
+    ///
+    /// This list describes **`after` only**. The before-image has its own holes, tracked
+    /// separately by [`Event::before_unavailable_columns`] — they are not the same set. A
+    /// TOASTed column that *was* modified arrives present in `after` and `'u'` in
+    /// `before`, so merging the two lists would mark a column that genuinely changed as
+    /// unwritable and silently drop the update.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_columns: Vec<String>,
+    /// Columns absent from `before` for the same reason as [`Event::unavailable_columns`].
+    ///
+    /// Only relevant to consumers that use the before-image — computing diffs, or
+    /// building compensating writes. A column listed here had *some* prior value; the
+    /// source simply could not report it. Do not read its absence as "was NULL".
+    ///
+    /// Always empty when [`Event::before_is_key_only`] is `true`: a key-only before-image
+    /// is already known to be incomplete, and its non-key columns are absent by design
+    /// rather than by TOAST.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_unavailable_columns: Vec<String>,
+}
+
+/// Why an [`Event`] yields no row write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NoRowWrite {
+    /// A DDL event. It changes the table, not any row.
+    SchemaChange,
+    /// The event carries no row payload where one was expected.
+    MissingPayload,
+    /// The write needs a primary key to target a row, and the event has none.
+    ///
+    /// Either `primary_key` is unset, or the key columns are absent from the payload.
+    /// A keyless partial payload cannot be applied safely at all: there is no way to
+    /// address the row *and* no way to reconstruct the missing columns.
+    MissingPrimaryKey,
+}
+
+/// The only row write that is correct for a given [`Event`].
+///
+/// Obtain one with [`Event::row_write`]. The point of this type is that the
+/// data-corrupting write is not expressible: when a payload is incomplete you get
+/// [`RowWrite::Merge`], which hands you *only* the columns that are actually present,
+/// so there is nothing to accidentally write `NULL` from.
+///
+/// See the module documentation on [`Event::unavailable_columns`] for why incomplete
+/// payloads occur.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum RowWrite<'a> {
+    /// The payload is a complete row. Write every column.
+    ///
+    /// `key` is `None` when the event declares no primary key — append-only sinks can
+    /// still insert; keyed sinks should treat that as a configuration error.
+    Replace {
+        /// Primary-key columns and values, when the event declares a key.
+        key: Option<serde_json::Value>,
+        /// The complete row.
+        row: &'a serde_json::Value,
+    },
+    /// The payload is **incomplete**. Write only `columns`, and leave every other column
+    /// in the target row untouched.
+    ///
+    /// In SQL terms this is `UPDATE ... SET <columns> WHERE <key>` — never an upsert
+    /// built from the full column list, and never `INSERT ... ON CONFLICT DO UPDATE SET`
+    /// with a column list wider than `columns`.
+    Merge {
+        /// Primary-key columns and values identifying the row to update.
+        key: serde_json::Value,
+        /// The columns whose values the source did supply. Write exactly these.
+        columns: &'a serde_json::Value,
+        /// Columns the source could not supply. Their current values in the target row
+        /// are still correct and must be preserved.
+        unavailable_columns: &'a [String],
+    },
+    /// Delete the row identified by `key`.
+    Delete {
+        /// Primary-key columns and values identifying the row to delete.
+        key: serde_json::Value,
+    },
+    /// Remove every row in the table.
+    Truncate,
+    /// No row write applies.
+    None {
+        /// Why.
+        reason: NoRowWrite,
+    },
+}
+
+impl RowWrite<'_> {
+    /// `true` when applying this write requires preserving columns already in the target
+    /// row — i.e. it is a [`RowWrite::Merge`].
+    ///
+    /// A sink that cannot express a partial update (an append-only file, a full-row
+    /// document replace) must branch on this rather than flattening the payload.
+    pub fn is_partial(&self) -> bool {
+        matches!(self, Self::Merge { .. })
+    }
 }
 
 impl Default for Event {
@@ -374,11 +491,84 @@ impl Default for Event {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 }
 
 impl Event {
+    /// The one row write that is correct for this event.
+    ///
+    /// Prefer this over reading [`Event::after`] directly in a sink. It folds
+    /// [`Event::unavailable_columns`] and the primary key into a single decision, so the
+    /// classic CDC corruption — upserting a full row from a payload that was missing
+    /// columns, writing `NULL` over values that never changed — cannot be written by
+    /// accident.
+    ///
+    /// ```
+    /// use rustcdc::core::{Event, Operation, RowWrite};
+    /// use serde_json::json;
+    ///
+    /// # fn sink(event: &Event) {
+    /// match event.row_write() {
+    ///     RowWrite::Replace { key, row } => { /* write every column */ }
+    ///     RowWrite::Merge { key, columns, .. } => { /* UPDATE SET only `columns` */ }
+    ///     RowWrite::Delete { key } => { /* delete by key */ }
+    ///     RowWrite::Truncate => { /* clear the table */ }
+    ///     RowWrite::None { reason } => { /* DDL, or no addressable row */ }
+    ///     _ => {}
+    /// }
+    /// # }
+    /// ```
+    pub fn row_write(&self) -> RowWrite<'_> {
+        match self.op {
+            Operation::Truncate => RowWrite::Truncate,
+            Operation::SchemaChange => RowWrite::None {
+                reason: NoRowWrite::SchemaChange,
+            },
+            Operation::Delete => match self.primary_key_values() {
+                Some(key) => RowWrite::Delete { key },
+                // Without a key there is no way to name the row to remove. Deleting on a
+                // guess is worse than surfacing the gap.
+                None => RowWrite::None {
+                    reason: NoRowWrite::MissingPrimaryKey,
+                },
+            },
+            Operation::Insert | Operation::Update | Operation::Read => {
+                let Some(row) = self.after.as_ref() else {
+                    return RowWrite::None {
+                        reason: NoRowWrite::MissingPayload,
+                    };
+                };
+                if self.unavailable_columns.is_empty() {
+                    return RowWrite::Replace {
+                        key: self.primary_key_values(),
+                        row,
+                    };
+                }
+                match self.primary_key_values() {
+                    Some(key) => RowWrite::Merge {
+                        key,
+                        columns: row,
+                        unavailable_columns: &self.unavailable_columns,
+                    },
+                    None => RowWrite::None {
+                        reason: NoRowWrite::MissingPrimaryKey,
+                    },
+                }
+            }
+        }
+    }
+
+    /// `true` when `after` holds every column of the row.
+    ///
+    /// `false` means some columns are absent and their prior values must be preserved —
+    /// see [`Event::unavailable_columns`].
+    pub fn has_complete_after_image(&self) -> bool {
+        self.unavailable_columns.is_empty()
+    }
+
     /// Serialize the event to compact JSON.
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string(self)?)
@@ -569,6 +759,51 @@ impl Event {
             ));
         }
 
+        // "Unavailable" means *absent*. A column that is both listed and present is a
+        // contradiction, and the dangerous reading wins: a sink that trusts the payload
+        // writes whatever placeholder is sitting there. Each list is checked against its
+        // own image — they describe different sets and must never be merged.
+        let contradicts = |columns: &[String], row: &Option<serde_json::Value>| {
+            let Some(object) = row.as_ref().and_then(serde_json::Value::as_object) else {
+                return false;
+            };
+            columns.iter().any(|column| object.contains_key(column))
+        };
+
+        if contradicts(&self.unavailable_columns, &self.after) {
+            errors.push(ValidationError::new(
+                "unavailable_columns",
+                "a column listed in unavailable_columns must be absent from after; \
+                 emitting it with a placeholder value defeats the purpose of the list",
+            ));
+        }
+
+        if contradicts(&self.before_unavailable_columns, &self.before) {
+            errors.push(ValidationError::new(
+                "before_unavailable_columns",
+                "a column listed in before_unavailable_columns must be absent from before; \
+                 emitting it with a placeholder value defeats the purpose of the list",
+            ));
+        }
+
+        if self.before_is_key_only && !self.before_unavailable_columns.is_empty() {
+            errors.push(ValidationError::new(
+                "before_unavailable_columns",
+                "before_unavailable_columns must be empty when before_is_key_only is true; \
+                 a key-only before-image omits non-key columns by design, not by TOAST",
+            ));
+        }
+
+        if matches!(self.op, Operation::Truncate | Operation::SchemaChange)
+            && !(self.unavailable_columns.is_empty() && self.before_unavailable_columns.is_empty())
+        {
+            errors.push(ValidationError::new(
+                "unavailable_columns",
+                "unavailable_columns must be empty for TRUNCATE and SCHEMA_CHANGE events, \
+                 which carry no row payload",
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -604,6 +839,7 @@ impl Event {
     ///     after: Some(json!({"id": 1, "name": "bob"})),
     ///     op: Operation::Update,
     ///     before_is_key_only: true,
+    ///     unavailable_columns: Vec::new(),
     ///     ..Event::default()
     /// };
     /// event.ts = 1;
@@ -685,8 +921,8 @@ mod tests {
     use crate::core::Error;
 
     use super::{
-        Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
-        EVENT_ENVELOPE_VERSION,
+        Event, NoRowWrite, Operation, RowWrite, SnapshotMetadata, SourceMetadata,
+        TransactionMetadata, EVENT_ENVELOPE_VERSION,
     };
 
     fn valid_event() -> Event {
@@ -715,6 +951,8 @@ mod tests {
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -932,12 +1170,16 @@ mod tests {
             after: Some(json!({"id": 1, "name": "bob"})),
             op: Operation::Update,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
             ..Event::default()
         };
         assert!(base.has_full_before(), "full before should return true");
 
         let key_only = Event {
             before_is_key_only: true,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
             ..base.clone()
         };
         assert!(
@@ -948,12 +1190,143 @@ mod tests {
         let no_before = Event {
             before: None,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
             ..base
         };
         assert!(
             !no_before.has_full_before(),
             "absent before should return false"
         );
+    }
+
+    /// The core guarantee: an incomplete payload never yields a whole-row write.
+    #[test]
+    fn an_incomplete_payload_yields_a_merge_not_a_replace() {
+        let mut event = valid_event();
+        event.op = Operation::Update;
+        event.primary_key = Some(vec!["id".into()]);
+        // `body` is a TOASTed column PostgreSQL did not ship. It is absent, not null.
+        event.before = Some(json!({"id": 1}));
+        event.before_is_key_only = true;
+        event.after = Some(json!({"id": 1, "title": "new title"}));
+        event.unavailable_columns = vec!["body".into()];
+        event
+            .validate()
+            .expect("this is a well-formed partial payload");
+
+        match event.row_write() {
+            RowWrite::Merge {
+                key,
+                columns,
+                unavailable_columns,
+            } => {
+                assert_eq!(key, json!({"id": 1}));
+                assert_eq!(columns, &json!({"id": 1, "title": "new title"}));
+                assert_eq!(unavailable_columns, ["body".to_string()]);
+                assert!(
+                    columns.get("body").is_none(),
+                    "the unavailable column must not be reachable as a value to write"
+                );
+            }
+            other => panic!("a partial payload must never produce a full-row write: {other:?}"),
+        }
+        assert!(event.row_write().is_partial());
+        assert!(!event.has_complete_after_image());
+    }
+
+    #[test]
+    fn a_complete_payload_yields_a_replace() {
+        let mut event = valid_event();
+        event.op = Operation::Update;
+        event.primary_key = Some(vec!["id".into()]);
+        event.after = Some(json!({"id": 1, "title": "t", "body": "b"}));
+
+        match event.row_write() {
+            RowWrite::Replace { key, row } => {
+                assert_eq!(key, Some(json!({"id": 1})));
+                assert_eq!(row, &json!({"id": 1, "title": "t", "body": "b"}));
+            }
+            other => panic!("expected a full-row write, got {other:?}"),
+        }
+        assert!(!event.row_write().is_partial());
+        assert!(event.has_complete_after_image());
+    }
+
+    /// A partial payload with no key can be applied neither wholly nor partially.
+    #[test]
+    fn an_incomplete_payload_without_a_key_yields_no_write() {
+        let mut event = valid_event();
+        event.op = Operation::Update;
+        event.primary_key = None;
+        event.after = Some(json!({"title": "t"}));
+        event.unavailable_columns = vec!["body".into()];
+
+        assert_eq!(
+            event.row_write(),
+            RowWrite::None {
+                reason: NoRowWrite::MissingPrimaryKey
+            }
+        );
+    }
+
+    #[test]
+    fn delete_and_truncate_and_ddl_map_to_their_own_writes() {
+        let mut delete = valid_event();
+        delete.op = Operation::Delete;
+        delete.primary_key = Some(vec!["id".into()]);
+        delete.after = None;
+        delete.before = Some(json!({"id": 7}));
+        assert_eq!(
+            delete.row_write(),
+            RowWrite::Delete {
+                key: json!({"id": 7})
+            }
+        );
+
+        let mut truncate = valid_event();
+        truncate.op = Operation::Truncate;
+        truncate.after = None;
+        assert_eq!(truncate.row_write(), RowWrite::Truncate);
+
+        let mut ddl = valid_event();
+        ddl.op = Operation::SchemaChange;
+        ddl.after = None;
+        assert_eq!(
+            ddl.row_write(),
+            RowWrite::None {
+                reason: NoRowWrite::SchemaChange
+            }
+        );
+    }
+
+    /// Listing a column as unavailable while also emitting it is a contradiction, and the
+    /// dangerous reading — trust the payload — is the one a sink would take.
+    #[test]
+    fn a_column_that_is_both_unavailable_and_present_fails_validation() {
+        let mut event = valid_event();
+        event.op = Operation::Update;
+        event.after = Some(json!({"id": 1, "body": "__unavailable__"}));
+        event.unavailable_columns = vec!["body".into()];
+
+        let errors = event.validate().expect_err("this must not validate");
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "unavailable_columns"));
+    }
+
+    #[test]
+    fn truncate_events_may_not_carry_unavailable_columns() {
+        let mut event = valid_event();
+        event.op = Operation::Truncate;
+        event.before = None;
+        event.after = None;
+        event.unavailable_columns = vec!["body".into()];
+
+        let errors = event.validate().expect_err("this must not validate");
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "unavailable_columns"));
     }
 
     #[test]

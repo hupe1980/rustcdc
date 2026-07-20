@@ -128,6 +128,37 @@ pub struct CapturedDdl {
 }
 
 impl CapturedDdl {
+    /// Reconstruct a [`CapturedDdl`] from the `after` payload of a schema-change event.
+    ///
+    /// This is the inverse of [`CapturedDdl::to_event`] and exists so the runtime can
+    /// record connector-synthesized schema-change events into the durable schema
+    /// history. The connectors build these events directly rather than going through
+    /// [`CapturedDdl`], so the payload is the only common representation.
+    ///
+    /// Returns `None` when the payload is not a schema-change envelope — i.e. when
+    /// `ddl_type`, `schema`, `table` or `statement` is missing or not a string.
+    pub fn from_event_payload(after: &serde_json::Value) -> Option<Self> {
+        let object = after.as_object()?;
+        let string_field = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+
+        Some(Self {
+            ddl_type: string_field("ddl_type")?.to_string(),
+            schema: string_field("schema").unwrap_or_default().to_string(),
+            table: string_field("table")?.to_string(),
+            statement: string_field("statement").unwrap_or_default().to_string(),
+            result_schema: object
+                .get("result_schema")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            schema_diff: object
+                .get("schema_diff")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            ts: object
+                .get("ts")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        })
+    }
+
     /// Convert a captured DDL into a SchemaHistory DDLEvent for persistence.
     pub fn to_schema_event(&self) -> Option<DDLEvent> {
         match self.ddl_type.as_str() {
@@ -202,6 +233,8 @@ impl CapturedDdl {
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 }

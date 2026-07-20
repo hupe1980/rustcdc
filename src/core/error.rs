@@ -68,6 +68,21 @@ pub enum ErrorKind {
     ///
     /// Covers [`Error::ConfigError`] and [`Error::NotImplemented`].
     Configuration,
+    /// The runtime cannot accept more events until the caller acknowledges what it
+    /// already has.
+    ///
+    /// **This is normal flow control, not a failure.** Retry after calling
+    /// [`commit_ack`](crate::CdcRuntime::commit_ack) on the outstanding batch; the
+    /// same call will then succeed.
+    ///
+    /// It is a distinct kind because the alternative misleads: backpressure used to
+    /// surface as [`Error::StateError`] and therefore as [`ErrorKind::Terminal`],
+    /// documented as *"a permanent problem that retrying will not resolve"*. An
+    /// embedder following that guidance shuts the pipeline down on entirely routine
+    /// flow control.
+    ///
+    /// Covers [`Error::Backpressure`].
+    Backpressure,
 }
 
 /// Dedicated error type for event fingerprint failures.
@@ -129,6 +144,11 @@ pub enum Error {
     /// Fatal state that requires restart or operator intervention.
     #[error("unrecoverable error: {0}")]
     Unrecoverable(String),
+    /// The runtime's in-flight buffer is full; acknowledge outstanding events first.
+    ///
+    /// Normal flow control, not a failure — see [`ErrorKind::Backpressure`].
+    #[error("backpressure: {0}")]
+    Backpressure(String),
     /// Invalid runtime state or illegal transition.
     #[error("state error: {0}")]
     StateError(String),
@@ -182,6 +202,7 @@ impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Self::SourceError(_) | Self::TimeoutError(_) => ErrorKind::Transient,
+            Self::Backpressure(_) => ErrorKind::Backpressure,
             Self::ConfigError(_) | Self::NotImplemented(_) => ErrorKind::Configuration,
             Self::Unrecoverable(_)
             | Self::CheckpointError(_)

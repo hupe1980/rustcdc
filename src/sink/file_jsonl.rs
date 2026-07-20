@@ -263,9 +263,10 @@ impl FileJsonlSink {
         if self.pending_lines.is_empty() {
             return self.flush_writer().await;
         }
-        // Drain preserves the Vec's capacity; collect into a local vec so we
-        // can call async methods on &mut self inside the loop below.
-        let batch: Vec<Vec<u8>> = self.pending_lines.drain(..).collect();
+        // Take the buffer wholesale so we can call async methods on &mut self in the
+        // loop below. This moves the allocation rather than copying each line into a
+        // fresh one; `pending_lines` regrows on the next push.
+        let batch: Vec<Vec<u8>> = std::mem::take(&mut self.pending_lines);
         self.pending_bytes = 0;
         for line in batch {
             self.write_line(&line).await?;
@@ -432,6 +433,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

@@ -10,7 +10,7 @@
 //! each worker completes a chunk.
 //!
 //! For the state-of-the-art approach to non-blocking snapshot, see the roadmap item
-//! for watermark-based incremental snapshotting (DBLog pattern, G-05 in FINDINGS.md).
+//! for watermark-based incremental snapshotting (DBLog watermark pattern).
 
 use std::sync::{Arc, Mutex};
 
@@ -267,6 +267,8 @@ mod tests {
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }];
 
         state
@@ -297,6 +299,8 @@ mod tests {
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }];
 
         state.record_chunk_events("users", events, None).unwrap();

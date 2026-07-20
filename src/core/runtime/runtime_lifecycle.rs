@@ -18,12 +18,17 @@ impl CdcRuntime {
         }
 
         if self.config.options.schema_history_retention.is_none() {
-            return Err(Error::ConfigError(
+            // Warn rather than refuse to start. Schema history now grows only in
+            // response to actual DDL on captured tables, which is rare in most
+            // deployments — refusing to start over an unbounded-growth risk that may
+            // never materialize is disproportionate, and it previously forced every
+            // operator to configure retention for a subsystem nothing populated.
+            tracing::warn!(
+                target: "rustcdc::core::runtime",
                 "no schema_history_retention policy configured; schema history will grow \
-                 unboundedly. Configure RuntimeOptions::with_schema_history_retention() to \
-                 avoid resource exhaustion in DDL-heavy deployments."
-                    .into(),
-            ));
+                 without bound in DDL-heavy deployments. Configure \
+                 RuntimeOptions::with_schema_history_retention() to bound it.",
+            );
         }
 
         let committed_event_count = self
@@ -195,7 +200,24 @@ impl CdcRuntime {
 
         #[cfg(feature = "mysql")]
         if mysql_family {
-            let offset = Self::mysql_stream_offset_from_snapshot_checkpoint(snapshot_checkpoint)?;
+            // The flavor determines the checkpoint file name, so it must travel with
+            // the offset — see `MysqlOffset::source_flavor`.
+            let flavor = {
+                #[cfg(feature = "mariadb")]
+                {
+                    if matches!(&self.config.source, RuntimeSourceConfig::MariaDb(_)) {
+                        "mariadb"
+                    } else {
+                        "mysql"
+                    }
+                }
+                #[cfg(not(feature = "mariadb"))]
+                {
+                    "mysql"
+                }
+            };
+            let offset =
+                Self::mysql_stream_offset_from_snapshot_checkpoint(snapshot_checkpoint, flavor)?;
             #[cfg(feature = "mariadb")]
             if matches!(&self.config.source, RuntimeSourceConfig::MariaDb(_)) {
                 return Ok(Some(Box::new(GenericOffset::new(
@@ -250,6 +272,7 @@ impl CdcRuntime {
     #[cfg(feature = "mysql")]
     fn mysql_stream_offset_from_snapshot_checkpoint(
         snapshot_checkpoint: &dyn Offset,
+        source_flavor: &str,
     ) -> Result<MysqlOffset> {
         let payload = snapshot_checkpoint.encode()?;
         let value: serde_json::Value = serde_json::from_slice(&payload)
@@ -277,11 +300,12 @@ impl CdcRuntime {
             .unwrap_or_default()
             .to_string();
 
-        Ok(MysqlOffset {
-            gtid,
+        Ok(MysqlOffset::new(
+            source_flavor,
             binlog_file,
             binlog_pos,
-        })
+            gtid,
+        ))
     }
 
     #[cfg(feature = "sqlserver")]
@@ -501,18 +525,32 @@ impl CdcRuntime {
     /// loop signals shutdown, or use [`CdcRuntime::force_stop()`] if you need an
     /// unconditional immediate halt.
     ///
-    /// Returns the total number of events that were drained and committed.
-    pub async fn drain_and_stop(&mut self) -> Result<usize> {
-        let mut total = 0usize;
+    /// Returns the drained events, in delivery order, after committing them.
+    ///
+    /// # You must consume the returned events
+    ///
+    /// `drain_and_stop` acknowledges each batch it polls, which advances the durable
+    /// checkpoint (and, for connectors that support it, the source-side confirmation
+    /// such as the PostgreSQL replication slot) **past** those events. They will not
+    /// be replayed on restart. Returning them is therefore the only way they reach a
+    /// consumer — dropping the returned `Vec` is unrecoverable data loss.
+    ///
+    /// If you do not intend to process the drained events, call
+    /// [`CdcRuntime::stop()`] instead, which refuses to stop while events are
+    /// uncommitted, or [`CdcRuntime::force_stop()`], which discards them explicitly.
+    #[must_use = "drain_and_stop commits the returned events; dropping them loses data permanently"]
+    pub async fn drain_and_stop(&mut self) -> Result<Vec<Event>> {
+        let mut drained: Vec<Event> = Vec::new();
         loop {
             let batch = self.poll_event_batch().await?;
             if batch.is_empty() {
                 break;
             }
-            total = total.saturating_add(batch.len());
-            self.commit_ack(batch.ack_mode()).await?;
+            let ack = batch.ack_mode();
+            drained.extend(batch.into_events());
+            self.commit_ack(ack).await?;
         }
         self.stop().await?;
-        Ok(total)
+        Ok(drained)
     }
 }

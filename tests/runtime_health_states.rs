@@ -42,6 +42,8 @@ fn make_event_with_id(id: u64) -> Event {
         transaction: None,
         envelope_version: rustcdc::core::EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 

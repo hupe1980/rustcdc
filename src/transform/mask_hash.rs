@@ -102,15 +102,56 @@ impl MaskHashTransform {
         Self { config }
     }
 
-    fn apply_payload(&self, payload: &mut Option<Value>) -> Result<()> {
+    fn apply_payload(&self, payload: &mut Option<Value>, table: &str) -> Result<()> {
         if let Some(value) = payload {
             let mut path_buf = String::new();
-            self.walk_value(value, &mut path_buf)?;
+            self.walk_value(value, &mut path_buf, table)?;
         }
         Ok(())
     }
 
-    fn walk_value(&self, value: &mut Value, path: &mut String) -> Result<()> {
+    /// Resolve the rule for a JSON path, honouring a trailing-segment `*` wildcard.
+    ///
+    /// Tries the exact path first, then the path with its final segment replaced by
+    /// `*`. This is what makes variable-length arrays coverable: array elements address
+    /// as `emails.0`, `emails.1`, … so without a wildcard an operator would have to
+    /// enumerate indices they cannot know in advance, and any row with more elements
+    /// than they guessed would leak the remainder.
+    ///
+    /// `emails.*` masks every element; `profile.*` masks every field of an object one
+    /// level down.
+    fn lookup_rule(&self, path: &str) -> Option<&MaskRule> {
+        if let Some(rule) = self.config.mask_rules.get(path) {
+            return Some(rule);
+        }
+        let (prefix, _) = path.rsplit_once('.')?;
+        self.config.mask_rules.get(&format!("{prefix}.*"))
+    }
+
+    fn walk_value(&self, value: &mut Value, path: &mut String, table: &str) -> Result<()> {
+        // A rule targeting a container applies to the container as a whole.
+        //
+        // Previously only the scalar arm consulted `mask_rules`, so a rule on an
+        // object- or array-valued field was accepted at construction and then did
+        // nothing. That is a silent PII leak in exactly the case operators most expect
+        // to be covered: a `jsonb` column such as `profile` holding `{"ssn": ...,
+        // "dob": ...}` masked with a rule on `"profile"` passed straight through.
+        //
+        // Arrays were worse: elements address as `emails.0`, `emails.1`, … so covering
+        // a variable-length array required enumerating indices the operator cannot know
+        // in advance, and a row with three emails leaked the third.
+        //
+        // Checking here first means a container rule masks the whole subtree; without a
+        // container rule the walk descends as before, so per-leaf rules still work.
+        if !path.is_empty() && matches!(value, Value::Object(_) | Value::Array(_)) {
+            if let Some(rule) = self.config.mask_rules.get(path.as_str()) {
+                if !matches!(rule, MaskRule::Passthrough) {
+                    *value = apply_rule(value, rule, &field_aad(table, path))?;
+                    return Ok(());
+                }
+            }
+        }
+
         match value {
             Value::Object(map) => {
                 for (key, child) in map.iter_mut() {
@@ -119,7 +160,7 @@ impl MaskHashTransform {
                         path.push('.');
                     }
                     path.push_str(key);
-                    self.walk_value(child, path)?;
+                    self.walk_value(child, path, table)?;
                     path.truncate(prev);
                 }
             }
@@ -131,19 +172,17 @@ impl MaskHashTransform {
                         path.push('.');
                     }
                     let _ = write!(path, "{index}");
-                    self.walk_value(child, path)?;
+                    self.walk_value(child, path, table)?;
                     path.truncate(prev);
                 }
             }
             _ => {
                 if !path.is_empty() {
                     let rule = self
-                        .config
-                        .mask_rules
-                        .get(path.as_str())
+                        .lookup_rule(path.as_str())
                         .unwrap_or(&self.config.default_rule);
                     if !matches!(rule, MaskRule::Passthrough) {
-                        *value = apply_rule(value, rule)?;
+                        *value = apply_rule(value, rule, &field_aad(table, path))?;
                     }
                 }
             }
@@ -152,11 +191,32 @@ impl MaskHashTransform {
     }
 }
 
+/// Associated data binding a ciphertext to the field it came from.
+///
+/// AES-GCM authenticates *integrity* but not *context*. Without AAD a ciphertext is
+/// valid anywhere under the same key, so an attacker with write access to the sink — a
+/// far weaker position than compromising the database — could copy the encrypted
+/// `salary` blob from one row into another, or move an `ssn` ciphertext into the
+/// `phone` column, and it would decrypt cleanly and be emitted as authentic. Binding
+/// table + JSON path makes both substitutions fail authentication.
+#[cfg(feature = "encryption")]
+fn field_aad(table: &str, path: &str) -> String {
+    format!("rustcdc/v1|{table}|{path}")
+}
+
+/// Non-encryption builds do not use the AAD, but the call sites are shared.
+#[cfg(not(feature = "encryption"))]
+fn field_aad(_table: &str, _path: &str) -> String {
+    String::new()
+}
+
 #[async_trait]
 impl Transform for MaskHashTransform {
     async fn apply(&self, event: &mut Event) -> Result<bool> {
-        self.apply_payload(&mut event.before)?;
-        self.apply_payload(&mut event.after)?;
+        // Bind ciphertexts to the table they came from — see `field_aad`.
+        let table = event.qualified_table_name();
+        self.apply_payload(&mut event.before, &table)?;
+        self.apply_payload(&mut event.after, &table)?;
         Ok(true)
     }
 
@@ -165,7 +225,12 @@ impl Transform for MaskHashTransform {
     }
 }
 
-fn apply_rule(value: &Value, rule: &MaskRule) -> Result<Value> {
+fn apply_rule(value: &Value, rule: &MaskRule, aad: &str) -> Result<Value> {
+    // Only the Encrypt/Decrypt rules consume the associated data, and those are gated
+    // behind the `encryption` feature.
+    #[cfg(not(feature = "encryption"))]
+    let _ = aad;
+
     Ok(match rule {
         MaskRule::Passthrough => unreachable!("Passthrough is handled before apply_rule"),
         MaskRule::UnsaltedSha256 => {
@@ -190,9 +255,9 @@ fn apply_rule(value: &Value, rule: &MaskRule) -> Result<Value> {
             _ => value.clone(),
         },
         #[cfg(feature = "encryption")]
-        MaskRule::Encrypt(secret) => encrypt_value(value, secret)?,
+        MaskRule::Encrypt(secret) => encrypt_value(value, secret, aad)?,
         #[cfg(feature = "encryption")]
-        MaskRule::Decrypt(secret) => decrypt_value(value, secret)?,
+        MaskRule::Decrypt(secret) => decrypt_value(value, secret, aad)?,
     })
 }
 
@@ -208,7 +273,7 @@ fn value_as_hash_input(value: &Value) -> std::borrow::Cow<'_, str> {
 }
 
 #[cfg(feature = "encryption")]
-fn encrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
+fn encrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Value> {
     use aes_gcm::{
         aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
         Aes256Gcm, Nonce,
@@ -223,18 +288,27 @@ fn encrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
     let mut nonce = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload {
+                msg: plaintext.as_ref(),
+                aad: aad.as_bytes(),
+            },
+        )
         .map_err(|error| Error::TransformError(format!("encryption failed: {error}")))?;
 
+    // `v1` is a key/format generation marker. Without it, rotating the secret makes
+    // every existing ciphertext undecryptable rather than gracefully migratable,
+    // because nothing in the payload says which key produced it.
     Ok(Value::String(format!(
-        "enc:{}:{}",
+        "enc:v1:{}:{}",
         STANDARD.encode(nonce),
         STANDARD.encode(ciphertext)
     )))
 }
 
 #[cfg(feature = "encryption")]
-fn decrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
+fn decrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Value> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
@@ -260,8 +334,21 @@ fn decrypt_value(value: &Value, secret: &SecretString) -> Result<Value> {
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|error| Error::TransformError(format!("invalid encryption key: {error}")))?;
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-        .map_err(|error| Error::TransformError(format!("decryption failed: {error}")))?;
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload {
+                msg: ciphertext.as_ref(),
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|error| {
+            Error::TransformError(format!(
+                "decryption failed: {error}. If the ciphertext is intact and the key is \
+                 correct, this means the value is being decrypted in a different context \
+                 than it was encrypted in — a different table or a different field. \
+                 Ciphertexts are bound to their origin so they cannot be relocated."
+            ))
+        })?;
 
     serde_json::from_slice(&plaintext).map_err(|error| {
         Error::TransformError(format!("decrypted payload is not valid JSON: {error}"))
@@ -292,22 +379,36 @@ fn derive_encryption_key(secret: &SecretString) -> Result<[u8; 32]> {
 }
 
 /// Parses an encrypted field payload in the format
-/// `enc:<nonce_b64>:<ciphertext_b64>`.
+/// `enc:v1:<nonce_b64>:<ciphertext_b64>`.
+///
+/// The `v1` generation marker exists so the key/format can be rotated: without it,
+/// nothing in the payload identifies which key produced a given ciphertext, so
+/// changing the secret orphans every existing value instead of allowing a migration.
+///
 /// Returns `(nonce_b64, ciphertext_b64)` on success.
 #[cfg(feature = "encryption")]
 fn parse_encrypted_payload(input: &str) -> Result<(&str, &str)> {
-    let input = input.strip_prefix("enc:").ok_or_else(|| {
-        Error::TransformError("encrypted payload must match format enc:<nonce>:<ciphertext>".into())
+    const EXPECTED: &str = "encrypted payload must match format enc:v1:<nonce>:<ciphertext>";
+
+    let rest = input
+        .strip_prefix("enc:")
+        .ok_or_else(|| Error::TransformError(EXPECTED.into()))?;
+
+    let rest = rest.strip_prefix("v1:").ok_or_else(|| {
+        // Name the unsupported generation rather than reporting a generic parse error,
+        // so an operator who rotates the format gets an actionable message.
+        let generation = rest.split(':').next().unwrap_or_default();
+        Error::TransformError(format!(
+            "unsupported encrypted payload generation '{generation}': this build understands \
+             only 'v1'. {EXPECTED}"
+        ))
     })?;
-    let sep = input.find(':').ok_or_else(|| {
-        Error::TransformError("encrypted payload must match format enc:<nonce>:<ciphertext>".into())
-    })?;
-    let (nonce, rest) = input.split_at(sep);
-    let ciphertext = &rest[1..];
+
+    let (nonce, ciphertext) = rest
+        .split_once(':')
+        .ok_or_else(|| Error::TransformError(EXPECTED.into()))?;
     if nonce.is_empty() || ciphertext.is_empty() {
-        return Err(Error::TransformError(
-            "encrypted payload must match format enc:<nonce>:<ciphertext>".into(),
-        ));
+        return Err(Error::TransformError(EXPECTED.into()));
     }
     Ok((nonce, ciphertext))
 }
@@ -323,6 +424,59 @@ mod tests {
     use serde_json::json;
 
     use super::{MaskHashConfig, MaskHashTransform, MaskRule};
+
+    /// A rule on an object- or array-valued field must actually apply.
+    ///
+    /// Previously only the scalar arm consulted `mask_rules`, so such a rule was
+    /// accepted at construction and then silently did nothing — a PII leak in exactly
+    /// the case operators most expect to be covered (a `jsonb` column of PII masked by
+    /// naming the column).
+    #[tokio::test]
+    async fn mask_rule_on_a_container_field_is_applied() {
+        let mut config = MaskHashConfig::default();
+        config
+            .mask_rules
+            .insert("profile".into(), MaskRule::Redact("***".into()));
+        let transform = MaskHashTransform::new(config);
+
+        let mut event = event();
+        transform.apply(&mut event).await.unwrap();
+
+        let after = event.after.as_ref().unwrap();
+        assert_eq!(
+            after.get("profile").unwrap(),
+            "***",
+            "a rule naming a container must mask the whole subtree"
+        );
+        // Untargeted fields are untouched.
+        assert_eq!(after.get("email").unwrap(), "alice@example.com");
+    }
+
+    /// Array elements address as `field.0`, `field.1`, … so a variable-length array is
+    /// uncoverable without a wildcard: any row with more elements than the operator
+    /// enumerated leaks the remainder.
+    #[tokio::test]
+    async fn wildcard_rule_masks_every_array_element() {
+        let mut config = MaskHashConfig::default();
+        config
+            .mask_rules
+            .insert("emails.*".into(), MaskRule::Redact("***".into()));
+        let transform = MaskHashTransform::new(config);
+
+        let mut event = event();
+        event.after = Some(json!({
+            "id": 1,
+            "emails": ["a@example.com", "b@example.com", "c@example.com"],
+        }));
+        transform.apply(&mut event).await.unwrap();
+
+        let emails = event.after.as_ref().unwrap().get("emails").unwrap();
+        assert_eq!(
+            emails,
+            &json!(["***", "***", "***"]),
+            "every element must be masked regardless of array length"
+        );
+    }
 
     fn event() -> Event {
         Event {
@@ -346,6 +500,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -533,7 +689,76 @@ mod tests {
 
         let error = decrypt.apply(&mut malformed_event).await.unwrap_err();
         let message = format!("{error}");
-        assert!(message.contains("enc:<nonce>:<ciphertext>"));
+        assert!(message.contains("enc:v1:<nonce>:<ciphertext>"), "{message}");
+    }
+
+    /// A ciphertext must not be relocatable to another field or table.
+    ///
+    /// AES-GCM authenticates integrity but not context, so without associated data an
+    /// attacker with write access to the *sink* — a far weaker position than
+    /// compromising the database — could move an encrypted `salary` blob into another
+    /// row, or an `ssn` ciphertext into the `phone` column, and it would decrypt
+    /// cleanly and be emitted as authentic.
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn ciphertext_cannot_be_moved_to_another_field_or_table() {
+        let secret = || SecretString::new("field-key");
+
+        let mut encrypt_rules = HashMap::new();
+        encrypt_rules.insert("email".into(), MaskRule::Encrypt(secret()));
+        let encrypt = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: encrypt_rules,
+            default_rule: MaskRule::Passthrough,
+        });
+
+        let mut source_event = event();
+        source_event.before = None;
+        encrypt.apply(&mut source_event).await.unwrap();
+        let ciphertext = source_event
+            .after
+            .as_ref()
+            .unwrap()
+            .get("email")
+            .unwrap()
+            .clone();
+
+        let mut decrypt_rules = HashMap::new();
+        decrypt_rules.insert("email".into(), MaskRule::Decrypt(secret()));
+        decrypt_rules.insert("phone".into(), MaskRule::Decrypt(secret()));
+        let decrypt = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: decrypt_rules,
+            default_rule: MaskRule::Passthrough,
+        });
+
+        // Same field, same table: decrypts.
+        let mut same = event();
+        same.before = None;
+        same.after = Some(json!({"id": 1, "email": ciphertext.clone()}));
+        decrypt.apply(&mut same).await.unwrap();
+        assert_eq!(
+            same.after.as_ref().unwrap().get("email").unwrap(),
+            "alice@example.com"
+        );
+
+        // Relocated to a different column: must fail authentication.
+        let mut moved_field = event();
+        moved_field.before = None;
+        moved_field.after = Some(json!({"id": 1, "phone": ciphertext.clone()}));
+        let error = decrypt
+            .apply(&mut moved_field)
+            .await
+            .expect_err("a ciphertext moved to another column must not decrypt");
+        assert!(format!("{error}").contains("different"), "{error}");
+
+        // Same column, different table: must also fail.
+        let mut moved_table = event();
+        moved_table.before = None;
+        moved_table.table = "audit".into();
+        moved_table.after = Some(json!({"id": 1, "email": ciphertext}));
+        decrypt
+            .apply(&mut moved_table)
+            .await
+            .expect_err("a ciphertext moved to another table must not decrypt");
     }
 
     #[cfg(feature = "encryption")]

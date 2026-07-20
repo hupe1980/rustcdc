@@ -13,7 +13,8 @@ use std::{
 use async_trait::async_trait;
 use wasmparser::{ExternalKind, Parser, Payload, TypeRef, ValType};
 use wasmtime::{
-    Caller, Config, Engine, Extern, Instance, Linker, Memory, Module, Store, TypedFunc,
+    Caller, Config, Engine, Extern, Instance, Linker, Memory, Module, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc,
 };
 
 use crate::core::{Error, Event, Result};
@@ -177,7 +178,7 @@ struct RealWasmModule {
 }
 
 struct RealWasmState {
-    store: Store<()>,
+    store: Store<StoreLimits>,
     memory: Memory,
     alloc: TypedFunc<i32, i32>,
     /// Release a previously-allocated memory region.
@@ -333,14 +334,14 @@ impl RealWasmModule {
             .func_wrap(
                 "env",
                 "log",
-                |_caller: Caller<'_, ()>, _level: i32, _ptr: i32, _len: i32| {},
+                |_caller: Caller<'_, StoreLimits>, _level: i32, _ptr: i32, _len: i32| {},
             )
             .map_err(|error| Error::ConfigError(format!("failed to bind env.log: {error}")))?;
         linker
             .func_wrap(
                 "env",
                 "get_metric",
-                |_caller: Caller<'_, ()>, _ptr: i32| -> i64 { 0 },
+                |_caller: Caller<'_, StoreLimits>, _ptr: i32| -> i64 { 0 },
             )
             .map_err(|error| {
                 Error::ConfigError(format!("failed to bind env.get_metric: {error}"))
@@ -349,16 +350,36 @@ impl RealWasmModule {
             .func_wrap(
                 "env",
                 "record_metric",
-                |_caller: Caller<'_, ()>, _ptr: i32, _value: i64| {},
+                |_caller: Caller<'_, StoreLimits>, _ptr: i32, _value: i64| {},
             )
             .map_err(|error| {
                 Error::ConfigError(format!("failed to bind env.record_metric: {error}"))
             })?;
 
-        // Call rustcdc_abi_version() before the epoch ticker starts so that
-        // incompatible modules are rejected at load time, not at first invocation.
-        {
-            let mut probe_store = Store::new(&engine, ());
+        // Call rustcdc_abi_version() at load time so that incompatible modules are
+        // rejected here rather than at first invocation.
+        //
+        // The probe runs attacker-controlled guest code, so it needs a working
+        // interrupt. `set_epoch_deadline` alone is inert unless something is
+        // *incrementing* the epoch — the long-lived ticker is only spawned later, in
+        // `init()`, so a module whose `rustcdc_abi_version` is an infinite loop would
+        // spin here forever. This is a synchronous `call()` on a non-async store, so
+        // neither `tokio::time::timeout` nor task cancellation can reach it; the epoch
+        // is the only mechanism that can. Run a dedicated ticker for the probe's
+        // lifetime and stop it immediately afterwards.
+        let probe_ticker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_ticker = {
+            let engine = Arc::clone(&engine);
+            let stop = Arc::clone(&probe_ticker_stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    engine.increment_epoch();
+                }
+            })
+        };
+        let probe_result = (|| -> Result<()> {
+            let mut probe_store = Store::new(&engine, StoreLimits::default());
             let probe_instance =
                 linker
                     .instantiate(&mut probe_store, &module)
@@ -384,12 +405,24 @@ impl RealWasmModule {
                      WASM ABI documentation."
                 )));
             }
-        }
+            Ok(())
+        })();
+
+        // Always stop the probe ticker, including on the error paths above.
+        probe_ticker_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = probe_ticker.join();
+        probe_result?;
 
         let pool_size = config.instance_pool_size.max(1);
         let mut pool = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
-            let state = Self::create_instance_state(&engine, &module, &linker, fuel_yield)?;
+            let state = Self::create_instance_state(
+                &engine,
+                &module,
+                &linker,
+                fuel_yield,
+                config.memory_limit_mb,
+            )?;
             pool.push(tokio::sync::Mutex::new(state));
         }
 
@@ -416,10 +449,23 @@ impl RealWasmModule {
     fn create_instance_state(
         engine: &Engine,
         module: &Module,
-        linker: &Linker<()>,
+        linker: &Linker<StoreLimits>,
         fuel_async_yield_interval: Option<u64>,
+        memory_limit_mb: u64,
     ) -> Result<RealWasmState> {
-        let mut store = Store::new(engine, ());
+        // Enforce `memory_limit_mb` on the *guest* via a ResourceLimiter.
+        //
+        // Checking the module's declared initial memory at load time bounds nothing:
+        // `memory.grow` at runtime is unconstrained, so without this a module could
+        // grow to the wasm32 ceiling of 4 GiB per pool slot and OOM the host. wasmtime
+        // never shrinks linear memory, so growth is monotonic for the process lifetime.
+        // A limiter makes an over-limit `memory.grow` return -1 to the guest, which is
+        // the allocation failure a well-behaved module already has to handle.
+        let limit_bytes =
+            usize::try_from(memory_limit_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
+        let limits = StoreLimitsBuilder::new().memory_size(limit_bytes).build();
+        let mut store = Store::new(engine, limits);
+        store.limiter(|limits| limits);
         if let Some(interval) = fuel_async_yield_interval {
             store
                 .set_fuel(u64::MAX)
@@ -527,7 +573,7 @@ impl RealWasmModule {
 }
 
 fn get_typed_func<Params, Results>(
-    store: &mut Store<()>,
+    store: &mut Store<StoreLimits>,
     instance: &Instance,
     name: &str,
 ) -> Result<TypedFunc<Params, Results>>
@@ -541,7 +587,7 @@ where
 }
 
 fn optional_typed_func<Params, Results>(
-    store: &mut Store<()>,
+    store: &mut Store<StoreLimits>,
     instance: &Instance,
     name: &str,
 ) -> Result<Option<TypedFunc<Params, Results>>>
@@ -1055,6 +1101,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -1196,6 +1244,54 @@ mod tests {
             .await
             .expect_err("memory limit error");
         assert!(matches!(error, Error::TransformError(_)));
+    }
+
+    #[tokio::test]
+    async fn memory_limit_bounds_guest_memory_grow() {
+        // The test above only covers the *input event size* pre-check. This one covers
+        // the actual hazard: a module that calls `memory.grow` at runtime. Without a
+        // ResourceLimiter on the Store, `memory_limit_mb` bounds nothing and a guest can
+        // grow to the wasm32 ceiling of 4 GiB per pool slot and OOM the host.
+        //
+        // The module below traps if `memory.grow` *succeeds*, so the test fails loudly
+        // if the limiter ever stops being installed.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.wasm");
+        write_wat_module(
+            &module_path,
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "alloc") (param i32) (result i32) i32.const 8)
+                (func (export "dealloc") (param i32) (param i32))
+                (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+                (func (export "transform") (param i32 i32) (result i64)
+                    ;; Request 600 additional 64 KiB pages (~39 MB), far beyond the
+                    ;; 1 MB limit. A limited store returns -1; unlimited returns the
+                    ;; previous page count (>= 0), which we turn into a trap.
+                    (if (i32.ne (memory.grow (i32.const 600)) (i32.const -1))
+                        (then unreachable))
+                    i64.const 0))"#,
+        );
+
+        let mut runtime = WasmRuntime::new_with_config(WasmConfig {
+            module_path: module_path.clone(),
+            timeout_ms: DEFAULT_WASM_TIMEOUT_MS,
+            memory_limit_mb: 1,
+            instance_pool_size: 1,
+            fuel_async_yield_interval: None,
+        })
+        .expect("runtime");
+        // NOTE: deliberately no `.with_module(MockWasmModule)` — the mock bypasses
+        // wasmtime entirely, so it cannot exercise the limiter.
+        runtime.init().await.expect("init");
+
+        // `memory.grow` is refused, so the guest takes the `i64.const 0` path and the
+        // event is filtered — no trap, no host OOM.
+        let result = runtime
+            .transform(&minimal_event())
+            .await
+            .expect("grow must be refused, not trap the host");
+        assert!(matches!(result, TransformResult::Filtered));
     }
 
     #[tokio::test]

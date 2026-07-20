@@ -106,6 +106,8 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
         database: "cdc".to_string(),
         replication_slot_name: "cdc_latency_evidence_slot".to_string(),
         publication_name: "cdc_latency_evidence_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,

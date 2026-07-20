@@ -2,5 +2,6 @@
   "checkpoint_format_version": 1,
   "source_type": "sqlserver",
   "committed_event_count": 65,
-  "offset": "0x0000002A0000019B0010"
+  "offset": "0x0000002A0000019B0010",
+  "content_checksum": "493caf7114d3223f696b60a9ff9a4f1eddb5b67bcc118136fb0eb1d9d95403cb"
 }

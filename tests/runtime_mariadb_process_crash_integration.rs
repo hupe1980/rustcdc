@@ -75,6 +75,12 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
         .with_cmd(vec![
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
+            // MariaDB defaults binlog_row_metadata to NO_LOG, MySQL to MINIMAL —
+            // neither carries column names or primary-key flags, so events would be
+            // emitted with positional placeholder keys and no key. connect() rejects
+            // that, so the test server must match a valid production configuration.
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
             "--server-id=1",
         ])
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -241,6 +247,12 @@ async fn run_mariadb_process_kill_replay_scenario(
         .with_cmd(vec![
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
+            // MariaDB defaults binlog_row_metadata to NO_LOG, MySQL to MINIMAL —
+            // neither carries column names or primary-key flags, so events would be
+            // emitted with positional placeholder keys and no key. connect() rejects
+            // that, so the test server must match a valid production configuration.
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
             "--server-id=1",
         ])
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -298,6 +310,7 @@ async fn run_mariadb_process_kill_replay_scenario(
         gtid: baseline_gtid,
         binlog_file: baseline_file,
         binlog_pos: baseline_pos,
+        source_flavor: "mysql".into(),
     };
     let baseline_bytes = serde_json::to_vec(&baseline_offset)
         .map_err(|error| rustcdc::Error::CheckpointError(error.to_string()))?;

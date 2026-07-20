@@ -37,6 +37,8 @@ fn build_event(id: u64) -> Event {
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 
@@ -125,7 +127,7 @@ impl Transform for NormalizeNameTransform {
 
 fn bench_event_json_roundtrip(c: &mut Criterion) {
     let payload = build_event(1);
-    c.bench_function("event_json_roundtrip", |b| {
+    c.bench_function("cdc_perf/event_json_roundtrip", |b| {
         b.iter(|| {
             let encoded = black_box(&payload).to_json().expect("serialize event");
             Event::from_json(&encoded).expect("deserialize event")
@@ -140,7 +142,7 @@ fn bench_transform_pipeline(c: &mut Criterion) {
         .expect("build tokio runtime");
     let pipeline = build_transform_pipeline();
 
-    c.bench_function("transform_pipeline_two_stages", |b| {
+    c.bench_function("cdc_perf/transform_pipeline_two_stages", |b| {
         b.iter(|| {
             let event = build_event(black_box(100));
             let transformed = runtime
@@ -152,7 +154,7 @@ fn bench_transform_pipeline(c: &mut Criterion) {
 }
 
 fn bench_snapshot_10k_rows(c: &mut Criterion) {
-    let mut group = c.benchmark_group("snapshot_validator");
+    let mut group = c.benchmark_group("cdc_perf/snapshot_validator");
     let size = 10_000_u64;
     let events: Vec<Event> = (1..=size).map(build_event).collect();
     group.throughput(Throughput::Elements(size));
@@ -176,7 +178,7 @@ fn bench_stream_1k_events(c: &mut Criterion) {
         .expect("build tokio runtime");
     let mut pipeline = build_transform_pipeline();
 
-    let mut group = c.benchmark_group("stream_events");
+    let mut group = c.benchmark_group("cdc_perf/stream_events");
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("stream_1k_events", |b| {
         b.iter(|| run_pipeline_batch(&runtime, &mut pipeline, black_box(1_000)))
@@ -191,7 +193,7 @@ fn bench_full_cycle_snapshot_stream_handoff(c: &mut Criterion) {
         .expect("build tokio runtime");
     let mut pipeline = build_transform_pipeline();
 
-    c.bench_function("full_cycle_snapshot_stream_handoff", |b| {
+    c.bench_function("cdc_perf/full_cycle_snapshot_stream_handoff", |b| {
         b.iter(|| {
             let snapshot_events: Vec<Event> = (1..=10_000).map(build_event).collect();
             let mut validator = SnapshotValidator::new();
@@ -210,7 +212,7 @@ fn bench_full_cycle_snapshot_stream_handoff(c: &mut Criterion) {
 }
 
 fn bench_parallel_snapshot_4x100k(c: &mut Criterion) {
-    c.bench_function("parallel_snapshot_4_tables_100k", |b| {
+    c.bench_function("cdc_perf/parallel_snapshot_4_tables_100k", |b| {
         b.iter(|| {
             for table_idx in 0..4_u64 {
                 let table_name = format!("users_{table_idx}");
@@ -235,7 +237,7 @@ fn bench_parallel_snapshot_4x100k(c: &mut Criterion) {
 fn bench_event_buffering(c: &mut Criterion) {
     use std::collections::VecDeque;
 
-    c.bench_function("event_buffer_push_pop_1k", |b| {
+    c.bench_function("cdc_perf/event_buffer_push_pop_1k", |b| {
         b.iter(|| {
             let mut buffered = VecDeque::with_capacity(1_000);
             for idx in 1..=1_000_u64 {
@@ -255,7 +257,7 @@ fn bench_event_buffering(c: &mut Criterion) {
 fn bench_partial_redelivery_clone_guardrails(c: &mut Criterion) {
     let events: Arc<[Event]> = Arc::from((1..=5_000_u64).map(build_event).collect::<Vec<_>>());
 
-    let mut group = c.benchmark_group("partial_redelivery_guardrails");
+    let mut group = c.benchmark_group("cdc_perf/partial_redelivery_guardrails");
     group.throughput(Throughput::Elements(5_000));
 
     group.bench_function("shared_backing_slice_view", |b| {
@@ -284,7 +286,7 @@ fn bench_partial_redelivery_clone_guardrails(c: &mut Criterion) {
 }
 
 fn bench_quality_gate_targets(c: &mut Criterion) {
-    let mut group = c.benchmark_group("quality_gates");
+    let mut group = c.benchmark_group("cdc_perf/quality_gates");
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(3));
 
@@ -372,7 +374,7 @@ fn bench_wasm_transform_pass_through(c: &mut Criterion) {
 
     let event = build_event(1);
 
-    let mut group = c.benchmark_group("wasm_transform");
+    let mut group = c.benchmark_group("cdc_perf/wasm_transform");
     group.throughput(Throughput::Elements(1));
     group.bench_function("pass_through_single_event", |b| {
         b.iter(|| {
@@ -423,7 +425,7 @@ fn bench_wasm_transform_filter_all(c: &mut Criterion) {
 
     let event = build_event(1);
 
-    c.bench_function("wasm_filter_all_single_event", |b| {
+    c.bench_function("cdc_perf/wasm_filter_all_single_event", |b| {
         b.iter(|| {
             rt.block_on(runtime.transform(black_box(&event)))
                 .expect("wasm transform filter")

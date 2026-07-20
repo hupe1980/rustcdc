@@ -36,6 +36,7 @@ mod stream_start;
 mod stream_window;
 
 use self::connection_lifecycle::connect_sqlserver_with_probe;
+use self::parser::SqlServerCdcCursor;
 use self::snapshot_chunk::next_sqlserver_snapshot_chunk;
 use self::snapshot_finalize::{checkpoint_sqlserver_snapshot, finish_sqlserver_snapshot};
 use self::snapshot_start::{
@@ -174,6 +175,26 @@ pub struct SqlServerStream {
     pub lsn_end: [u8; 10],
     pub change_tables: Vec<String>,
     pub poll_interval_ms: u64,
+    /// Resume point *within* the current window, set when a poll could not read the
+    /// whole window because `max_events_per_poll` truncated the result set.
+    ///
+    /// While this is `Some`, the window is re-queried from the cursor rather than
+    /// advanced — advancing would skip the unread remainder permanently.
+    pub(crate) cursor: Option<parser::SqlServerCdcCursor>,
+}
+
+/// Total order over a CDC row position, matching the server-side
+/// `ORDER BY __$start_lsn, __$seqval, __$operation`.
+fn cursor_ordering(left: &SqlServerCdcCursor, right: &SqlServerCdcCursor) -> std::cmp::Ordering {
+    match (
+        parser::lsn_hex_to_bytes_opt(&left.lsn_hex),
+        parser::lsn_hex_to_bytes_opt(&right.lsn_hex),
+    ) {
+        (Some(a), Some(b)) => compare_lsn(&a, &b),
+        _ => left.lsn_hex.cmp(&right.lsn_hex),
+    }
+    .then_with(|| left.seqval_hex.cmp(&right.seqval_hex))
+    .then_with(|| left.operation.cmp(&right.operation))
 }
 
 #[derive(Debug, Clone)]
@@ -218,7 +239,7 @@ pub struct SqlServerStreamHandle {
     /// matching before-image arrives, then merge them into a single `Event` with both
     /// `before` and `after` populated.  This buffer persists across poll boundaries so
     /// a pair split by `max_events_per_poll` is handled correctly.
-    pending_update_afters: AHashMap<(String, String), (serde_json::Value, u64)>,
+    pending_update_befores: AHashMap<(String, String), (serde_json::Value, u64)>,
     /// Events collected from all capture instances in the current LSN window, sorted by
     /// LSN and waiting to be delivered in pages.
     ///
@@ -407,6 +428,7 @@ fn build_cdc_poll_sql(
     max_events_per_poll: usize,
     start_lsn_hex: &str,
     end_lsn_hex: &str,
+    cursor: Option<&SqlServerCdcCursor>,
 ) -> String {
     parser::build_cdc_poll_sql(
         capture_instance,
@@ -414,6 +436,7 @@ fn build_cdc_poll_sql(
         max_events_per_poll,
         start_lsn_hex,
         end_lsn_hex,
+        cursor,
     )
 }
 
@@ -625,35 +648,12 @@ async fn load_primary_key_columns_for_instance(
 
 impl SqlServerStreamHandle {}
 
-fn decode_sqlserver_cell_to_json(row: &tiberius::Row, index: usize) -> serde_json::Value {
-    if let Ok(Some(text)) = row.try_get::<&str, _>(index) {
-        return serde_json::Value::String(text.to_string());
-    }
-    if let Ok(Some(number)) = row.try_get::<i64, _>(index) {
-        return serde_json::Value::Number(number.into());
-    }
-    if let Ok(Some(number)) = row.try_get::<i32, _>(index) {
-        return serde_json::Value::Number((number as i64).into());
-    }
-    if let Ok(Some(number)) = row.try_get::<f64, _>(index) {
-        if let Some(value) = serde_json::Number::from_f64(number) {
-            return serde_json::Value::Number(value);
-        }
-    }
-    if let Ok(Some(boolean)) = row.try_get::<bool, _>(index) {
-        return serde_json::Value::Bool(boolean);
-    }
-
-    serde_json::Value::Null
-}
-
 #[async_trait]
 impl StreamHandle for SqlServerStreamHandle {
     async fn next_events(&mut self, timeout_ms: u64) -> Result<Vec<Event>> {
         // ── Priority 1: flush snapshot-handoff requeued events ─────────────────
         if !self.requeued_events.is_empty() {
-            let drained = self.requeued_events.drain(..).collect::<Vec<_>>();
-            return Ok(drained);
+            return Ok(std::mem::take(&mut self.requeued_events));
         }
 
         // ── Priority 2: flush schema-change events ──────────────────────────────
@@ -701,6 +701,16 @@ impl StreamHandle for SqlServerStreamHandle {
             let metas_snapshot = self.metas.clone();
             let mut all_changes: Vec<(CaptureInstanceMeta, Vec<SqlServerRawChange>)> = Vec::new();
 
+            // Resume point for a window that could not be read in one poll.
+            //
+            // Each capture instance is queried with its own `TOP (max_events_per_poll)`,
+            // so instances truncate at different positions. The only globally safe
+            // resume point is the **minimum** last-row position across all instances
+            // that returned a full page: past that point, some truncated instance has
+            // rows we have not read. Rows beyond the cursor are dropped from this batch
+            // and re-read next poll, so the cut costs neither a gap nor a duplicate.
+            let mut truncation_cursor: Option<SqlServerCdcCursor> = None;
+
             for meta in &metas_snapshot {
                 let changes = self
                     .fetch_changes_for_capture_instance(
@@ -709,6 +719,25 @@ impl StreamHandle for SqlServerStreamHandle {
                         self.max_events_per_poll,
                     )
                     .await?;
+
+                // A full page means `TOP` cut the result set — unread rows remain in
+                // this window. Advancing past them would lose them permanently, and
+                // silently: `events_polled` would report a plausible count.
+                if changes.len() >= self.max_events_per_poll {
+                    if let Some(last) = changes.last() {
+                        let candidate = SqlServerCdcCursor {
+                            lsn_hex: last.start_lsn_hex.clone(),
+                            seqval_hex: last.seqval_hex.clone(),
+                            operation: last.operation,
+                        };
+                        truncation_cursor = Some(match truncation_cursor {
+                            Some(existing) if cursor_ordering(&existing, &candidate).is_le() => {
+                                existing
+                            }
+                            _ => candidate,
+                        });
+                    }
+                }
                 if !changes.is_empty() {
                     all_changes.push((meta.clone(), changes));
                 }
@@ -736,6 +765,21 @@ impl StreamHandle for SqlServerStreamHandle {
                     ord.then_with(|| a.seqval_hex.cmp(&b.seqval_hex))
                         .then_with(|| a.operation.cmp(&b.operation))
                 });
+
+                // Drop everything past the truncation cursor. Those rows belong to a
+                // later poll; keeping them would deliver rows that sort *after* unread
+                // rows from a truncated instance, so a crash between the two would
+                // leave a permanent hole.
+                if let Some(cursor) = truncation_cursor.as_ref() {
+                    flat.retain(|(_, change)| {
+                        let position = SqlServerCdcCursor {
+                            lsn_hex: change.start_lsn_hex.clone(),
+                            seqval_hex: change.seqval_hex.clone(),
+                            operation: change.operation,
+                        };
+                        cursor_ordering(&position, cursor).is_le()
+                    });
+                }
 
                 // Map sorted raw changes to Events.  UPDATE op=3/op=4 pairs share
                 // the same (start_lsn, seqval) key, so the after-image (op=3)
@@ -775,7 +819,21 @@ impl StreamHandle for SqlServerStreamHandle {
                 let count = self.max_events_per_poll.min(self.window_buffer.len());
                 let batch: Vec<Event> = self.window_buffer.drain(..count).collect();
                 if self.window_buffer.is_empty() {
-                    self.advance_window().await?;
+                    if let Some(cursor) = truncation_cursor {
+                        // Unread rows remain inside this window. Record where we stopped
+                        // and re-query the SAME window from there — do not advance past it.
+                        tracing::debug!(
+                            target: "rustcdc::source::sqlserver",
+                            lsn = %cursor.lsn_hex,
+                            seqval = %cursor.seqval_hex,
+                            operation = cursor.operation,
+                            "sqlserver CDC window truncated by max_events_per_poll; \
+                             resuming mid-window at the recorded cursor",
+                        );
+                        self.stream.cursor = Some(cursor);
+                    } else {
+                        self.advance_window().await?;
+                    }
                 }
                 return Ok(batch);
             }
@@ -811,9 +869,17 @@ impl StreamHandle for SqlServerStreamHandle {
         &self,
         checkpoint: &mut dyn crate::checkpoint::Checkpoint,
     ) -> Result<()> {
+        // When a window was only partially read, the checkpoint must carry the
+        // within-window cursor as well. Persisting only the LSN would make a
+        // mid-window position unrepresentable, so a restart would either re-read the
+        // whole window (duplicates) or, with the window advanced, skip the remainder.
+        let encoded = match self.stream.cursor.as_ref() {
+            Some(cursor) => cursor.encode(),
+            None => lsn_bytes_to_hex(&self.stream.lsn_start),
+        };
         let offset = GenericOffset::new(
             "sqlserver",
-            serde_json::to_vec(&lsn_bytes_to_hex(&self.stream.lsn_start))
+            serde_json::to_vec(&encoded)
                 .map_err(|error| Error::SerializationError(error.to_string()))?,
         );
         checkpoint.save(&offset, self.events_polled).await
@@ -1675,9 +1741,16 @@ mod tests {
 
     #[test]
     fn lsn_hex_round_trip() {
-        let value = "0x000000230000015A0004";
-        let bytes = lsn_hex_to_bytes(value).unwrap();
-        assert_eq!(lsn_bytes_to_hex(&bytes), value);
+        // Parsing accepts either case; rendering normalizes to lowercase so it matches
+        // `sys.fn_varbintohexstr`, which is what every LSN read back from the server
+        // looks like.
+        let bytes = lsn_hex_to_bytes("0x000000230000015A0004").unwrap();
+        assert_eq!(lsn_bytes_to_hex(&bytes), "0x000000230000015a0004");
+        assert_eq!(
+            lsn_hex_to_bytes("0x000000230000015a0004").unwrap(),
+            bytes,
+            "lowercase must parse to the same bytes as uppercase"
+        );
     }
 
     #[test]
@@ -1689,12 +1762,13 @@ mod tests {
                 lsn_end: [0; 10],
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
+                cursor: None,
             },
             metas: vec![],
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
-            pending_update_afters: AHashMap::new(),
+            pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
         };
 
@@ -1706,7 +1780,10 @@ mod tests {
             captured_columns: vec!["id".into(), "name".into()],
         };
 
-        // A realistic CDC window: INSERT, UPDATE (op=3 after-image then op=4 before-image), DELETE.
+        // A realistic CDC window: INSERT, UPDATE (op=3 before-image then op=4 after-image), DELETE.
+        //
+        // Per `cdc.fn_cdc_get_all_changes_<capture_instance>`: op=3 carries the captured
+        // column values BEFORE the update, op=4 carries the values AFTER the update.
         let changes = vec![
             // INSERT — op=2: full row is the after-image.
             SqlServerRawChange {
@@ -1716,21 +1793,21 @@ mod tests {
                 ts_ms: 1,
                 row: serde_json::json!({"id": "1", "name": "alice"}),
             },
-            // UPDATE after-image (op=3) — new values, arrives first in ASC ORDER BY.
+            // UPDATE before-image (op=3) — OLD values, arrives first in ASC ORDER BY.
             SqlServerRawChange {
                 start_lsn_hex: "0x000000230000015A0004".into(),
                 seqval_hex: "0x000000230000015A0005".into(),
                 operation: 3,
                 ts_ms: 2,
-                row: serde_json::json!({"id": "1", "name": "alice-v2"}),
+                row: serde_json::json!({"id": "1", "name": "alice"}),
             },
-            // UPDATE before-image (op=4) — old values, arrives second; same (lsn, seqval).
+            // UPDATE after-image (op=4) — NEW values, arrives second; same (lsn, seqval).
             SqlServerRawChange {
                 start_lsn_hex: "0x000000230000015A0004".into(),
                 seqval_hex: "0x000000230000015A0005".into(),
                 operation: 4,
                 ts_ms: 2,
-                row: serde_json::json!({"id": "1", "name": "alice"}),
+                row: serde_json::json!({"id": "1", "name": "alice-v2"}),
             },
             // DELETE — op=1: full row is the before-image.
             SqlServerRawChange {
@@ -1754,17 +1831,17 @@ mod tests {
             Some(serde_json::json!({"id": "1", "name": "alice"}))
         );
 
-        // UPDATE — before=old values (op=4), after=new values (op=3)
+        // UPDATE — before=old values (op=3), after=new values (op=4)
         assert_eq!(events[1].op, Operation::Update);
         assert_eq!(
             events[1].before,
             Some(serde_json::json!({"id": "1", "name": "alice"})),
-            "UPDATE before should hold the OLD row (op=4)"
+            "UPDATE before should hold the OLD row (op=3)"
         );
         assert_eq!(
             events[1].after,
             Some(serde_json::json!({"id": "1", "name": "alice-v2"})),
-            "UPDATE after should hold the NEW row (op=3)"
+            "UPDATE after should hold the NEW row (op=4)"
         );
 
         // DELETE
@@ -1781,8 +1858,8 @@ mod tests {
 
     #[test]
     fn update_pair_split_across_polls_merges_correctly() {
-        // Verifies that an op=3 buffered at end of one poll window is correctly merged
-        // when the matching op=4 arrives in the next poll.
+        // Verifies that an op=3 before-image buffered at the end of one poll window is
+        // correctly merged when the matching op=4 after-image arrives in the next poll.
         let mut handle = SqlServerStreamHandle {
             config: config(),
             stream: SqlServerStream {
@@ -1790,12 +1867,13 @@ mod tests {
                 lsn_end: [0; 10],
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
+                cursor: None,
             },
             metas: vec![],
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
-            pending_update_afters: AHashMap::new(),
+            pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
         };
 
@@ -1807,28 +1885,28 @@ mod tests {
             captured_columns: vec!["id".into(), "name".into()],
         };
 
-        // Poll 1: only the op=3 after-image arrives.
+        // Poll 1: only the op=3 before-image (OLD values) arrives.
         let poll1 = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000015A0004".into(),
             seqval_hex: "0x000000230000015A0005".into(),
             operation: 3,
             ts_ms: 10,
-            row: serde_json::json!({"id": "1", "name": "alice-v2"}),
+            row: serde_json::json!({"id": "1", "name": "alice"}),
         }];
         let events1 = handle.map_changes_to_events(&meta, poll1).unwrap();
         assert!(
             events1.is_empty(),
             "op=3 alone should be buffered, not emitted"
         );
-        assert_eq!(handle.pending_update_afters.len(), 1);
+        assert_eq!(handle.pending_update_befores.len(), 1);
 
-        // Poll 2: the op=4 before-image arrives; should merge with the buffered op=3.
+        // Poll 2: the op=4 after-image (NEW values) arrives; merges with the buffered op=3.
         let poll2 = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000015A0004".into(),
             seqval_hex: "0x000000230000015A0005".into(),
             operation: 4,
             ts_ms: 10,
-            row: serde_json::json!({"id": "1", "name": "alice"}),
+            row: serde_json::json!({"id": "1", "name": "alice-v2"}),
         }];
         let events2 = handle.map_changes_to_events(&meta, poll2).unwrap();
         assert_eq!(events2.len(), 1);
@@ -1842,7 +1920,7 @@ mod tests {
             Some(serde_json::json!({"id": "1", "name": "alice-v2"}))
         );
         assert!(
-            handle.pending_update_afters.is_empty(),
+            handle.pending_update_befores.is_empty(),
             "buffer should be drained after merge"
         );
     }
@@ -1856,6 +1934,7 @@ mod tests {
                 lsn_end: [1; 10],
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
+                cursor: None,
             },
             metas: vec![CaptureInstanceMeta {
                 capture_instance: "dbo_users".into(),
@@ -1867,7 +1946,7 @@ mod tests {
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
-            pending_update_afters: AHashMap::new(),
+            pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
         };
 
@@ -1924,6 +2003,7 @@ mod tests {
                 lsn_end: [2; 10],
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
+                cursor: None,
             },
             metas: vec![CaptureInstanceMeta {
                 capture_instance: "dbo_users".into(),
@@ -1935,7 +2015,7 @@ mod tests {
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
-            pending_update_afters: AHashMap::new(),
+            pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
         };
 
@@ -2004,12 +2084,78 @@ mod tests {
             128,
             "0x01",
             "0x02",
+            None,
         );
 
         assert!(sql.contains("SELECT TOP (128)"));
-        assert!(sql.contains("[id], [name]"));
+        assert!(sql.contains("c.[id] AS [id]"), "{sql}");
+        assert!(sql.contains("c.[name] AS [name]"), "{sql}");
         assert!(sql.contains("fn_cdc_get_all_changes_dbo_users"));
-        assert!(sql.contains("ORDER BY __$start_lsn, __$seqval, __$operation"));
+        assert!(
+            sql.contains("ORDER BY c.__$start_lsn, c.__$seqval, c.__$operation"),
+            "{sql}"
+        );
+        // Values must be serialized server-side, not decoded through a client-side
+        // type ladder that silently nulls anything it does not recognise.
+        assert!(
+            sql.contains("FOR JSON PATH, WITHOUT_ARRAY_WRAPPER"),
+            "{sql}"
+        );
+        // Commit time must come from the LSN→time mapping, not the poll wall-clock.
+        assert!(sql.contains("fn_cdc_map_lsn_to_time"), "{sql}");
+        // With no cursor there must be no WHERE clause narrowing the window.
+        assert!(!sql.contains("WHERE"), "{sql}");
+    }
+
+    #[test]
+    fn cdc_poll_sql_builder_resumes_from_a_within_window_cursor() {
+        let cursor = SqlServerCdcCursor {
+            lsn_hex: "0x0000002a".into(),
+            seqval_hex: "0x0000002b".into(),
+            operation: 3,
+        };
+        let sql = build_cdc_poll_sql(
+            "dbo_users",
+            &["id".to_string()],
+            128,
+            "0x01",
+            "0x02",
+            Some(&cursor),
+        );
+
+        // Strict lexicographic (lsn, seqval, operation) — `operation` must be part of
+        // the key, because op=3/op=4 share one (lsn, seqval) and a two-part cursor
+        // would skip the op=4 after-image when a batch boundary falls between them.
+        assert!(sql.contains("c.__$start_lsn > CONVERT"), "{sql}");
+        assert!(sql.contains("c.__$seqval > CONVERT"), "{sql}");
+        assert!(sql.contains("c.__$operation > 3"), "{sql}");
+    }
+
+    #[test]
+    fn cdc_cursor_round_trips_through_the_checkpoint_offset() {
+        let cursor = SqlServerCdcCursor {
+            lsn_hex: "0x0000002a0000015a0002".into(),
+            seqval_hex: "0x0000002a0000015a0003".into(),
+            operation: 4,
+        };
+        let encoded = cursor.encode();
+        assert_eq!(
+            SqlServerCdcCursor::decode(&encoded),
+            Some(cursor),
+            "cursor must survive a checkpoint round trip"
+        );
+
+        // A bare LSN is the window-boundary form and carries no cursor.
+        assert_eq!(SqlServerCdcCursor::decode("0x0000002a0000015a0002"), None);
+    }
+
+    #[test]
+    fn lsn_hex_is_lowercase_to_match_server_rendering() {
+        // `sys.fn_varbintohexstr` emits lowercase. Mixing cases breaks the truncate
+        // comparison under a binary collation and the window-buffer sort by offset.
+        let hex = lsn_bytes_to_hex(&[0x0A, 0xBC, 0xDE, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(hex, hex.to_lowercase(), "LSN hex must be lowercase");
+        assert!(hex.starts_with("0x0abcde"), "{hex}");
     }
 
     #[test]
@@ -2291,6 +2437,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
 
         let mut updated = base.clone();
@@ -2369,12 +2517,13 @@ mod tests {
                 lsn_end: [0xff; 10],
                 change_tables: vec!["dbo_table_a".into(), "dbo_table_b".into()],
                 poll_interval_ms: 5000,
+                cursor: None,
             },
             metas: vec![meta_a.clone(), meta_b.clone()],
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
-            pending_update_afters: AHashMap::new(),
+            pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
         };
 

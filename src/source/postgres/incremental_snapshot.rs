@@ -328,6 +328,8 @@ impl IncrementalSnapshotHandle {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -642,6 +644,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -688,6 +692,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
         assert!(IncrementalSnapshotHandle::extract_event_pk_fingerprint(&ev).is_none());
     }
@@ -714,6 +720,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
         assert_eq!(IncrementalSnapshotHandle::lsn_from_event(&ev), Some(lsn));
     }
@@ -797,6 +805,8 @@ mod tests {
                 transaction: None,
                 envelope_version: EVENT_ENVELOPE_VERSION,
                 before_is_key_only: false,
+                unavailable_columns: Vec::new(),
+                before_unavailable_columns: Vec::new(),
             }
         };
 

@@ -29,6 +29,8 @@ fn snapshot_read_event(table: &str, id: i64) -> rustcdc::Event {
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 

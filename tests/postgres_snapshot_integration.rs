@@ -111,6 +111,8 @@ async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         database: "cdc".to_string(),
         replication_slot_name: "snapshot_test_slot".to_string(),
         publication_name: "snapshot_test_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -291,6 +293,8 @@ async fn postgres_incremental_snapshot_reads_all_seed_rows_once() -> rustcdc::Re
         database: "cdc".to_string(),
         replication_slot_name: "incremental_snapshot_slot".to_string(),
         publication_name: "incremental_snapshot_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -448,6 +452,8 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         database: "cdc".to_string(),
         replication_slot_name: "resumable_snapshot_slot".to_string(),
         publication_name: "resumable_snapshot_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -661,6 +667,8 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         database: "cdc".to_string(),
         replication_slot_name: "resume_mutation_slot".to_string(),
         publication_name: "resume_mutation_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -905,6 +913,8 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
         database: "cdc".to_string(),
         replication_slot_name: "resume_boundary_slot".to_string(),
         publication_name: "resume_boundary_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -1133,6 +1143,8 @@ async fn postgres_snapshot_empty_table() -> rustcdc::Result<()> {
         database: "cdc".to_string(),
         replication_slot_name: "empty_snapshot_slot".to_string(),
         publication_name: "empty_snapshot_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -1254,6 +1266,8 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::R
         database: "cdc".to_string(),
         replication_slot_name: "concurrent_snapshot_slot".to_string(),
         publication_name: "concurrent_snapshot_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,

@@ -31,6 +31,21 @@ pub trait EventTracer: Send + Sync {
     fn trace_event_end(&self, event_id: &str, status: &str);
     /// Trace the current state of the checkpoint barrier.
     fn trace_checkpoint_barrier(&self, state: &str);
+
+    /// Whether this tracer does anything with the events it is given.
+    ///
+    /// Returning `false` lets the runtime skip work performed *solely* to feed the
+    /// tracer. That work is not trivial: producing a trace id costs two `String`
+    /// allocations per event, and the commit path used to deep-clone every committed
+    /// event — both `serde_json::Value` trees — purely so it could hand them to
+    /// `trace_event_end`. With the default [`NoOpEventTracer`] every byte of that was
+    /// discarded, on the hottest path in the library.
+    ///
+    /// Defaults to `true`, so a tracer that does not override it keeps working
+    /// unchanged.
+    fn is_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// No-op metrics collector used by default in tests and skeleton deployments.
@@ -53,6 +68,12 @@ impl EventTracer for NoOpEventTracer {
     fn trace_event_start(&self, _event_id: &str) {}
     fn trace_event_end(&self, _event_id: &str, _status: &str) {}
     fn trace_checkpoint_barrier(&self, _state: &str) {}
+
+    /// Discards everything, so the runtime should not build trace ids or clone events
+    /// to feed it.
+    fn is_enabled(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -5,5 +5,6 @@
   "offset": {
     "lsn": 123456,
     "slot_name": "compat_slot"
-  }
+  },
+  "content_checksum": "9445774724c7b2535f25af972150288277dedef7a7f887f3cee40cc8e73d13c3"
 }
