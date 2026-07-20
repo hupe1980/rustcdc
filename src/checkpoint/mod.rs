@@ -508,7 +508,7 @@ impl FileCheckpoint {
     }
 
     fn sync_parent_directory(&self, file_path: &Path) -> Result<()> {
-        fsync_parent_directory(file_path)
+        crate::core::durability::fsync_parent_directory(file_path)
     }
 
     fn validate_monotonic_progress(
@@ -642,7 +642,7 @@ impl FileCheckpoint {
         fs::rename(&temp_path, &final_path).map_err(crate::core::Error::from)?;
         // fsync the directory so the rename itself survives a crash — without this the
         // seeded checkpoint can vanish on ext4/xfs even though this call returned Ok.
-        fsync_parent_directory(&final_path)?;
+        crate::core::durability::fsync_parent_directory(&final_path)?;
         Ok(())
     }
 }
@@ -658,24 +658,6 @@ fn set_checkpoint_file_mode(file: &File, mode: u32) -> Result<()> {
     }
     #[cfg(not(unix))]
     let _ = (file, mode);
-    Ok(())
-}
-
-/// fsync the parent directory of `file_path` so a preceding rename is durable.
-/// No-op on non-unix platforms, where directories cannot be opened as files.
-fn fsync_parent_directory(file_path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let Some(parent) = file_path.parent() else {
-            return Ok(());
-        };
-
-        let directory = File::open(parent).map_err(crate::core::Error::from)?;
-        directory.sync_all().map_err(crate::core::Error::from)?;
-    }
-    #[cfg(not(unix))]
-    let _ = file_path;
-
     Ok(())
 }
 

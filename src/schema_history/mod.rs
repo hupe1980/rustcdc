@@ -339,9 +339,7 @@ impl FileSchemaHistory {
 
         fs::rename(&tmp_path, self.path.as_path())?;
 
-        if let Some(parent) = self.path.parent() {
-            fs::File::open(parent)?.sync_all()?;
-        }
+        crate::core::durability::fsync_parent_directory(self.path.as_path())?;
 
         Ok(())
     }

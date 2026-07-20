@@ -1,5 +1,6 @@
 //! Core event, error, offset, observability, and runtime primitives.
 
+pub(crate) mod durability;
 mod error;
 mod event;
 mod idempotency;
