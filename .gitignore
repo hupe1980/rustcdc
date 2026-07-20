@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Tooling caches
+/.cargo/
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Custom
+FINDINGS.md
+REVIEW.md
+REFACTOR.md

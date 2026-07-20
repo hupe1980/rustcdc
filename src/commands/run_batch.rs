@@ -1,0 +1,544 @@
+use futures::{StreamExt, TryStreamExt};
+
+use crate::cli::CheckpointParityMode;
+use crate::config::schema::DeliveryContract;
+use crate::error::{AppError, ConfigError};
+use crate::pipeline::transform;
+use rustcdc::sink::SinkAdapter;
+
+use super::run_metrics::{
+    observe_latency_histogram_bucket, CorrectnessSample, LATENCY_HISTOGRAM_BUCKETS_MS,
+};
+
+#[derive(Debug, Default)]
+pub(super) struct BatchPrepareStats {
+    pub(super) transform_ops_total: u64,
+    pub(super) transform_latency_ms_total: u64,
+    pub(super) transform_latency_ms_last: u64,
+    pub(super) transform_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    pub(super) prepare_ops_total: u64,
+    pub(super) prepare_latency_ms_total: u64,
+    pub(super) prepare_latency_ms_last: u64,
+    pub(super) prepare_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SinkDeliveryStats {
+    pub(super) sink_send_ops_total: u64,
+    pub(super) sink_send_latency_ms_total: u64,
+    pub(super) sink_send_latency_ms_last: u64,
+    pub(super) sink_send_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    pub(super) sink_flush_ops_total: u64,
+    pub(super) sink_flush_latency_ms_total: u64,
+    pub(super) sink_flush_latency_ms_last: u64,
+    pub(super) sink_flush_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+}
+
+#[derive(Debug, Default)]
+pub(super) struct BatchProcessingStats {
+    pub(super) prepare: BatchPrepareStats,
+    pub(super) delivery: SinkDeliveryStats,
+    pub(super) committed_correctness_samples: Vec<CorrectnessSample>,
+    pub(super) checkpoint_parity_requested: bool,
+    pub(super) checkpoint_parity_effective: bool,
+    pub(super) runtime_ack_commit_executed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CheckpointParityPlan {
+    pub(super) requested: bool,
+    pub(super) effective: bool,
+}
+
+pub(super) fn checkpoint_parity_plan(
+    mode: CheckpointParityMode,
+    sink: &crate::pipeline::router::TableRouter,
+) -> CheckpointParityPlan {
+    let sink_supports_barrier = sink.transactional_checkpoint_barrier_capable();
+    match mode {
+        CheckpointParityMode::Auto => CheckpointParityPlan {
+            requested: sink_supports_barrier,
+            effective: sink_supports_barrier,
+        },
+        CheckpointParityMode::Enabled => CheckpointParityPlan {
+            requested: true,
+            effective: sink_supports_barrier,
+        },
+        CheckpointParityMode::Disabled => CheckpointParityPlan {
+            requested: false,
+            effective: false,
+        },
+    }
+}
+
+/// Validate that `checkpoint_parity_mode` is compatible with `delivery_contract`
+/// and the sink's capabilities.  Must be called once at startup, before the
+/// batch loop begins.
+///
+/// # Errors
+///
+/// Returns `Err` when `delivery_contract = effectively_once`,
+/// `checkpoint_parity_mode = enabled`, and the sink does not support
+/// transactional checkpoint barriers.  Silently degrading in this scenario
+/// would violate the operator's expressed delivery guarantee (CR-016).
+pub(super) fn validate_parity_contract(
+    mode: CheckpointParityMode,
+    sink: &crate::pipeline::router::TableRouter,
+    delivery_contract: DeliveryContract,
+) -> Result<(), AppError> {
+    if mode == CheckpointParityMode::Enabled
+        && !sink.transactional_checkpoint_barrier_capable()
+        && delivery_contract == DeliveryContract::EffectivelyOnce
+    {
+        return Err(AppError::Config(Box::new(ConfigError::InvalidState(
+            "checkpoint_parity_mode = enabled requires a sink that supports \
+             transactional checkpoint barriers for effectively_once delivery, \
+             but the configured sink does not.  Either use a Kafka sink, \
+             set checkpoint_parity_mode = auto, or downgrade the delivery \
+             contract."
+                .to_string(),
+        ))));
+    }
+    Ok(())
+}
+
+enum PreparedEvent {
+    Event(rustcdc::core::Event),
+}
+
+#[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
+pub(super) async fn process_batch_events(
+    sink: &mut crate::pipeline::router::TableRouter,
+    events: impl IntoIterator<Item = rustcdc::core::Event>,
+    transform_pipeline: &transform::TransformPipeline,
+    max_event_bytes: usize,
+    prepare_parallelism: usize,
+    flush_interval: usize,
+    sink_delivery_queue_capacity: usize,
+    sink_send_timeout_ms: u64,
+    sink_flush_timeout_ms: u64,
+) -> Result<BatchProcessingStats, AppError> {
+    struct EventPrepareResult {
+        prepared_event: Option<PreparedEvent>,
+        correctness_sample: Option<CorrectnessSample>,
+        transform_latency_ms: u64,
+        prepare_latency_ms: u64,
+    }
+
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<PreparedEvent>(sink_delivery_queue_capacity.max(1));
+
+    // `move` + the explicit `drop(tx)` below are load-bearing. The consumer's exit
+    // condition is `rx.recv() == None`, which only happens once every sender is
+    // gone. Capturing `tx` by reference (the pre-`move` behaviour) left the
+    // original sender alive in this function's scope for as long as
+    // `try_join!` ran — and `try_join!` was waiting on the consumer, which was
+    // waiting on `recv()`. The result was a deadlock on every batch: all events
+    // of the first batch were delivered, then the pipeline hung forever with no
+    // checkpoint written and no error logged.
+    let producer = async move {
+        let mut per_event_results = futures::stream::iter(events.into_iter().map(|event| async {
+            let prepare_started = std::time::Instant::now();
+
+            let transform_started = std::time::Instant::now();
+            let transformed = transform_pipeline.apply(event).await?;
+            let transform_latency_ms = transform_started.elapsed().as_millis() as u64;
+            let correctness_sample = transformed.as_ref().map(CorrectnessSample::from_event);
+
+            let prepared_event = transformed.map(PreparedEvent::Event);
+
+            Ok::<EventPrepareResult, AppError>(EventPrepareResult {
+                prepared_event,
+                correctness_sample,
+                transform_latency_ms,
+                prepare_latency_ms: prepare_started.elapsed().as_millis() as u64,
+            })
+        }))
+        .buffered(prepare_parallelism.max(1));
+
+        let mut stats = BatchPrepareStats::default();
+        let mut committed_correctness_samples = Vec::new();
+        while let Some(event_result) = per_event_results.try_next().await? {
+            stats.transform_ops_total = stats.transform_ops_total.saturating_add(1);
+            stats.transform_latency_ms_total = stats
+                .transform_latency_ms_total
+                .saturating_add(event_result.transform_latency_ms);
+            stats.transform_latency_ms_last = event_result.transform_latency_ms;
+            observe_latency_histogram_bucket(
+                &mut stats.transform_latency_ms_buckets,
+                event_result.transform_latency_ms,
+            );
+
+            stats.prepare_ops_total = stats.prepare_ops_total.saturating_add(1);
+            stats.prepare_latency_ms_total = stats
+                .prepare_latency_ms_total
+                .saturating_add(event_result.prepare_latency_ms);
+            stats.prepare_latency_ms_last = event_result.prepare_latency_ms;
+            observe_latency_histogram_bucket(
+                &mut stats.prepare_latency_ms_buckets,
+                event_result.prepare_latency_ms,
+            );
+
+            if let Some(prepared_event) = event_result.prepared_event {
+                tx.send(prepared_event).await.map_err(|_| {
+                    AppError::Other("sink delivery queue closed unexpectedly".to_string())
+                })?;
+            }
+
+            if let Some(sample) = event_result.correctness_sample {
+                committed_correctness_samples.push(sample);
+            }
+        }
+
+        // Close the delivery channel so the consumer's `recv()` observes
+        // end-of-batch and exits. A completed future inside `try_join!` is not
+        // dropped until the join resolves, so relying on the future's drop to
+        // release the sender would deadlock — the drop must be explicit.
+        drop(tx);
+
+        Ok::<(BatchPrepareStats, Vec<CorrectnessSample>), AppError>((
+            stats,
+            committed_correctness_samples,
+        ))
+    };
+
+    let consumer = async {
+        let mut stats = SinkDeliveryStats::default();
+        let mut buffered_since_flush = 0usize;
+        let flush_interval = flush_interval.max(1);
+        let mut flush_ticker = sink.flush_tick_interval().map(tokio::time::interval);
+        if let Some(ticker) = flush_ticker.as_mut() {
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
+
+        loop {
+            let maybe_event = if let Some(ticker) = flush_ticker.as_mut() {
+                tokio::select! {
+                    event = rx.recv() => event,
+                    _ = ticker.tick() => {
+                        if buffered_since_flush > 0 {
+                            let sink_flush_started = std::time::Instant::now();
+                            flush_sink_with_timeout(sink, sink_flush_timeout_ms).await?;
+                            let sink_flush_latency_ms = sink_flush_started.elapsed().as_millis() as u64;
+                            record_sink_flush(&mut stats, sink_flush_latency_ms);
+                            buffered_since_flush = 0;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                rx.recv().await
+            };
+
+            let Some(prepared_event) = maybe_event else {
+                break;
+            };
+
+            let sink_send_started = std::time::Instant::now();
+            send_prepared_event_with_timeout(
+                sink,
+                prepared_event,
+                max_event_bytes,
+                sink_send_timeout_ms,
+            )
+            .await?;
+
+            let sink_send_latency_ms = sink_send_started.elapsed().as_millis() as u64;
+            stats.sink_send_ops_total = stats.sink_send_ops_total.saturating_add(1);
+            stats.sink_send_latency_ms_total = stats
+                .sink_send_latency_ms_total
+                .saturating_add(sink_send_latency_ms);
+            stats.sink_send_latency_ms_last = sink_send_latency_ms;
+            observe_latency_histogram_bucket(
+                &mut stats.sink_send_latency_ms_buckets,
+                sink_send_latency_ms,
+            );
+
+            buffered_since_flush += 1;
+            if buffered_since_flush >= flush_interval {
+                let sink_flush_started = std::time::Instant::now();
+                flush_sink_with_timeout(sink, sink_flush_timeout_ms).await?;
+
+                let sink_flush_latency_ms = sink_flush_started.elapsed().as_millis() as u64;
+                record_sink_flush(&mut stats, sink_flush_latency_ms);
+                buffered_since_flush = 0;
+            }
+        }
+
+        if buffered_since_flush > 0 {
+            let sink_flush_started = std::time::Instant::now();
+            flush_sink_with_timeout(sink, sink_flush_timeout_ms).await?;
+
+            let sink_flush_latency_ms = sink_flush_started.elapsed().as_millis() as u64;
+            record_sink_flush(&mut stats, sink_flush_latency_ms);
+        }
+
+        Ok::<SinkDeliveryStats, AppError>(stats)
+    };
+
+    let ((prepare_stats, committed_correctness_samples), delivery_stats) =
+        tokio::try_join!(producer, consumer)?;
+
+    Ok(BatchProcessingStats {
+        prepare: prepare_stats,
+        delivery: delivery_stats,
+        committed_correctness_samples,
+        checkpoint_parity_requested: false,
+        checkpoint_parity_effective: false,
+        runtime_ack_commit_executed: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
+pub(super) async fn process_batch_events_with_optional_checkpoint_barrier(
+    sink: &mut crate::pipeline::router::TableRouter,
+    events: impl IntoIterator<Item = rustcdc::core::Event>,
+    transform_pipeline: &transform::TransformPipeline,
+    max_event_bytes: usize,
+    prepare_parallelism: usize,
+    flush_interval: usize,
+    sink_delivery_queue_capacity: usize,
+    sink_send_timeout_ms: u64,
+    sink_flush_timeout_ms: u64,
+    checkpoint_parity_mode: CheckpointParityMode,
+) -> Result<BatchProcessingStats, AppError> {
+    let plan = checkpoint_parity_plan(checkpoint_parity_mode, sink);
+
+    if !plan.requested {
+        let mut stats = process_batch_events(
+            sink,
+            events,
+            transform_pipeline,
+            max_event_bytes,
+            prepare_parallelism,
+            flush_interval,
+            sink_delivery_queue_capacity,
+            sink_send_timeout_ms,
+            sink_flush_timeout_ms,
+        )
+        .await?;
+        stats.checkpoint_parity_requested = false;
+        stats.checkpoint_parity_effective = false;
+        stats.runtime_ack_commit_executed = false;
+        return Ok(stats);
+    }
+
+    if !plan.effective {
+        tracing::warn!(
+            sink = sink.name(),
+            "checkpoint parity requested, but sink does not support transactional checkpoint barriers"
+        );
+        let mut stats = process_batch_events(
+            sink,
+            events,
+            transform_pipeline,
+            max_event_bytes,
+            prepare_parallelism,
+            flush_interval,
+            sink_delivery_queue_capacity,
+            sink_send_timeout_ms,
+            sink_flush_timeout_ms,
+        )
+        .await?;
+        stats.checkpoint_parity_requested = true;
+        stats.checkpoint_parity_effective = false;
+        stats.runtime_ack_commit_executed = false;
+        return Ok(stats);
+    }
+
+    sink.begin_checkpoint_barrier()
+        .await
+        .map_err(AppError::from)?;
+
+    match process_batch_events(
+        sink,
+        events,
+        transform_pipeline,
+        max_event_bytes,
+        prepare_parallelism,
+        flush_interval,
+        sink_delivery_queue_capacity,
+        sink_send_timeout_ms,
+        sink_flush_timeout_ms,
+    )
+    .await
+    {
+        Ok(mut stats) => match sink.commit_checkpoint_barrier().await {
+            Ok(()) => {
+                stats.checkpoint_parity_requested = true;
+                stats.checkpoint_parity_effective = true;
+                stats.runtime_ack_commit_executed = false;
+                Ok(stats)
+            }
+            Err(commit_err) => {
+                if let Err(abort_err) = sink.abort_checkpoint_barrier().await {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "transactional checkpoint barrier abort failed after commit failure"
+                    );
+                }
+                Err(AppError::from(commit_err))
+            }
+        },
+        Err(err) => {
+            if let Err(abort_err) = sink.abort_checkpoint_barrier().await {
+                tracing::warn!(
+                    error = %abort_err,
+                    "transactional checkpoint barrier abort failed after batch delivery error"
+                );
+            }
+            Err(err)
+        }
+    }
+}
+
+fn record_sink_flush(stats: &mut SinkDeliveryStats, sink_flush_latency_ms: u64) {
+    stats.sink_flush_ops_total = stats.sink_flush_ops_total.saturating_add(1);
+    stats.sink_flush_latency_ms_total = stats
+        .sink_flush_latency_ms_total
+        .saturating_add(sink_flush_latency_ms);
+    stats.sink_flush_latency_ms_last = sink_flush_latency_ms;
+    observe_latency_histogram_bucket(
+        &mut stats.sink_flush_latency_ms_buckets,
+        sink_flush_latency_ms,
+    );
+}
+
+async fn send_prepared_event_with_timeout(
+    sink: &mut crate::pipeline::router::TableRouter,
+    prepared_event: PreparedEvent,
+    max_event_bytes: usize,
+    sink_send_timeout_ms: u64,
+) -> Result<(), AppError> {
+    let PreparedEvent::Event(event) = prepared_event;
+    enforce_event_size_limit(
+        &serde_json::to_vec(&event).map_err(|e| {
+            AppError::Other(format!("failed to serialize event for size check: {e}"))
+        })?,
+        max_event_bytes,
+    )?;
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(sink_send_timeout_ms),
+        sink.send(&event),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(AppError::Runtime(err)),
+        Err(_) => Err(AppError::Other(format!(
+            "sink send operation timed out after {} ms",
+            sink_send_timeout_ms
+        ))),
+    }
+}
+
+pub(super) async fn flush_sink_with_timeout(
+    sink: &mut crate::pipeline::router::TableRouter,
+    sink_flush_timeout_ms: u64,
+) -> Result<(), AppError> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(sink_flush_timeout_ms),
+        sink.flush(),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(AppError::from(err)),
+        Err(_) => Err(AppError::Other(format!(
+            "sink flush operation timed out after {} ms",
+            sink_flush_timeout_ms
+        ))),
+    }
+}
+
+pub(super) fn enforce_event_size_limit(
+    event_json: &[u8],
+    max_event_bytes: usize,
+) -> Result<(), AppError> {
+    let size = event_json.len();
+
+    if size > max_event_bytes {
+        return Err(AppError::Other(format!(
+            "event payload size {} exceeds runtime.max_event_bytes {}",
+            size, max_event_bytes
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn encode_event_json_bytes(
+    event: &rustcdc::core::Event,
+    max_event_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
+    let event_json = serde_json::to_vec(event).map_err(|e| {
+        AppError::Other(format!("failed to serialize event for sink delivery: {e}"))
+    })?;
+
+    enforce_event_size_limit(&event_json, max_event_bytes)?;
+    Ok(event_json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_batch_events;
+    use crate::config::schema::{SinkConfig, StdoutSinkConfig, TransformRuntimeConfig};
+    use crate::pipeline::transform::TransformPipeline;
+    use rustcdc::core::{Event, Operation, SourceMetadata};
+    use serde_json::json;
+
+    fn sample_event(id: u64) -> Event {
+        Event {
+            before: None,
+            after: Some(json!({"id": id, "name": "batch"})),
+            op: Operation::Insert,
+            source: SourceMetadata {
+                source_name: "postgres".to_string(),
+                offset: format!("0/AA{id:04X}"),
+                timestamp: id + 1,
+            },
+            ts: id + 1,
+            schema: Some("public".to_string()),
+            table: "users".to_string(),
+            primary_key: Some(vec!["id".to_string()]),
+            ..Event::default()
+        }
+    }
+
+    /// Deadlock regression (the original BUG.md stall): the consumer half of the
+    /// prepare/deliver pipeline exits only when the delivery channel closes. If the
+    /// producer does not drop its sender on completion, `try_join!` waits on a
+    /// consumer that waits on `recv()` — forever, for every batch, empty or not.
+    #[tokio::test]
+    async fn process_batch_events_completes_for_empty_and_nonempty_batches() {
+        let binding = crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()))
+            .await
+            .expect("stdout binding");
+        let mut router = crate::pipeline::router::single(binding);
+        let pipeline = TransformPipeline::from_config(TransformRuntimeConfig::default(), vec![])
+            .expect("pipeline");
+
+        for events in [Vec::new(), vec![sample_event(1), sample_event(2)]] {
+            let batch_len = events.len();
+            let stats = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                process_batch_events(
+                    &mut router,
+                    events,
+                    &pipeline,
+                    1 << 20, // max_event_bytes
+                    4,       // prepare_parallelism
+                    1,       // flush_interval (demo posture: flush every event)
+                    1024,    // sink_delivery_queue_capacity
+                    1_000,   // sink_send_timeout_ms
+                    1_000,   // sink_flush_timeout_ms
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("process_batch_events deadlocked (batch_len={batch_len})"))
+            .expect("batch must succeed");
+            assert_eq!(stats.delivery.sink_send_ops_total, batch_len as u64);
+        }
+    }
+}

@@ -1,0 +1,200 @@
+# cargo-deny policy (https://embarkstudios.github.io/cargo-deny/)
+# Run: cargo deny check
+# CI: add `cargo deny check` to the pre-release gate.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# ── Advisories ────────────────────────────────────────────────────────────────
+[advisories]
+# Deny any crate with an unmitigated security advisory.
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # RUSTSEC-2024-0436: paste 1.x — proc-macro soundness issue, no safe upgrade available.
+    # Risk: compile-time only; no runtime code executed from paste macros in our codebase.
+    # Blocked until upstream paste releases a fixed version.
+    { id = "RUSTSEC-2024-0436" },
+
+    # RUSTSEC-2023-0071: rsa 0.9.x — Marvin timing side-channel in PKCS#1 v1.5 decryption.
+    # No safe upgrade available. We do not use RSA decryption in any hot path; rsa is a
+    # transitive dependency pulled in by rustcdc crypto feature. Track upstream fix.
+    { id = "RUSTSEC-2023-0071" },
+
+    # RUSTSEC-2025-0134: rustls-pemfile 1.x and 2.x — no safe upgrade available upstream.
+    # We do not directly parse PEM files; rustls-pemfile is a transitive dep via rustcdc/tonic.
+    { id = "RUSTSEC-2025-0134" },
+
+    # RUSTSEC-2026-0049: rustls-webpki 0.102.x — faulty CRL revocation check (limited impact).
+    # Affected path: rustls-webpki 0.102.8 -> rustls 0.22.4 -> tokio-rustls -> rustcdc 0.3.0.
+    # We do not use CRL-based certificate revocation; RUSTSEC notes the bug is latent in normal
+    # use and requires an attacker to compromise a trusted issuing authority. Upgrade blocked
+    # until rustcdc bumps to rustls-webpki >=0.103.10.
+    { id = "RUSTSEC-2026-0049" },
+
+    # RUSTSEC-2026-0098 / RUSTSEC-2026-0099: rustls-webpki 0.101.x and 0.102.x TLS issues.
+    # Affected path: rustls-webpki -> rustls -> tokio-rustls -> rustcdc 0.3.0 (transitive).
+    # Upgrade to rustls-webpki >=0.103.12 blocked until rustcdc releases a compatible version.
+    { id = "RUSTSEC-2026-0098" },
+    { id = "RUSTSEC-2026-0099" },
+
+    # RUSTSEC-2026-0104: rustls-webpki 0.102.x panic in CRL parsing via BorrowedCertRevocationList::from_der.
+    # Affected path: rustls-webpki 0.102.8 -> rustls 0.22.4 -> tokio-rustls -> rustcdc 0.3.0.
+    # We do not use CRL-based certificate revocation; applications that do not use CRLs are not affected.
+    # Upgrade to rustls-webpki >=0.103.13 blocked until rustcdc releases a compatible version.
+    { id = "RUSTSEC-2026-0104" },
+]
+
+# ── Licenses ──────────────────────────────────────────────────────────────────
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "OpenSSL",
+    "Zlib",
+    "CC0-1.0",
+    # CDLA-Permissive-2.0: Community Data License Agreement Permissive.
+    # Used by webpki-roots (trusted root CA certificates bundle).
+    # Permissive — permits use, reproduction, modification, and redistribution.
+    "CDLA-Permissive-2.0",
+]
+
+[[licenses.clarify]]
+# ring uses a custom OpenSSL-adjacent license — pre-approved.
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ── Bans ──────────────────────────────────────────────────────────────────────
+[bans]
+# Deny duplicate major versions of the same crate to prevent supply-chain
+# confusion; use `skip` to allow intentional duplication with justification.
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+# Crates that must never appear in the dependency graph.
+deny = [
+    # Deprecated / unmaintained TLS backends.
+    { name = "native-tls" },
+    { name = "openssl-sys" },
+    # Avoid the unsound `atty` crate (GHSA-g98v-hv3f-hcfr).
+    { name = "atty" },
+    # Prefer tokio channels; remove crossbeam if it sneaks in.
+    # { name = "crossbeam-channel" },
+]
+
+# ── Skip justification guide ───────────────────────────────────────────────
+# To audit new duplicates:  cargo tree -d 2>/dev/null | grep '(*)'
+# To see why a crate is duplicated: cargo tree -d -i <crate-name>
+# Every skip entry must cite the root-cause dependency in a group comment.
+# Remove entries when the upstream diamond is resolved.
+# ──────────────────────────────────────────────────────────────────────────
+skip = [
+    # OpenTelemetry/tonic axum diamond (tonic 0.12 needs axum 0.7, cdc needs 0.8)
+    { name = "axum" },
+    { name = "axum-core" },
+    { name = "matchit" },
+    { name = "tower" },
+    # Crypto / TLS version diamonds.
+    # Root causes:
+    #   - rustls / tokio-rustls: krafka 0.10 (rdkafka) pulls 0.22.x; rustcdc pulls 0.23.x
+    #   - base64: various old crates use 0.13.x; new crates use 0.21.x+
+    #   - sha2 / hmac / md-5 / digest / block-buffer / crypto-common / cpufeatures:
+    #       old sqlx / ring vs newer aws-lc-rs / rustcrypto ecosystem split
+    #   - rand / rand_chacha / rand_core / getrandom: sqlx and tokio use older 0.8.x;
+    #       newer crates use 0.9.x — resolve when sqlx upgrades rand
+    #   - hashbrown / rustc-hash / foldhash: indexmap 1.x vs 2.x diamond (via krafka)
+    #   - const-oid / core-foundation / security-framework: rustls-native-certs version splits
+    #   - rustls-native-certs / rustls-pemfile / rustls-webpki / webpki-roots:
+    #       tonic 0.12 pins older versions; direct deps use newer
+    { name = "base64" },
+    { name = "block-buffer" },
+    { name = "const-oid" },
+    { name = "core-foundation" },
+    { name = "cpufeatures" },
+    { name = "crypto-common" },
+    { name = "digest" },
+    { name = "getrandom" },
+    { name = "hashbrown" },
+    { name = "hmac" },
+    { name = "md-5" },
+    { name = "rand" },
+    { name = "rand_chacha" },
+    { name = "rand_core" },
+    { name = "rustls" },
+    { name = "rustls-native-certs" },
+    { name = "rustls-pemfile" },
+    { name = "rustls-webpki" },
+    { name = "rustc-hash" },
+    { name = "security-framework" },
+    { name = "sha2" },
+    { name = "tokio-rustls" },
+    { name = "webpki-roots" },
+    # Miscellaneous minor version diamonds in shared utilities.
+    # Root causes:
+    #   - darling / darling_core / darling_macro: proc-macro crates used by both
+    #       old and new serde/derive crates in the graph
+    #   - heck: proc-macro utility; old clap vs new strum versions
+    #   - indexmap / itertools / ordered-float: krafka 0.10 (rdkafka) pulls 1.x;
+    #       iceberg-rust and opendal pull 2.x
+    #   - opendal: state-backend uses 0.52.x; iceberg-rust bundles an older opendal
+    #   - linux-raw-sys / rustix: nix ecosystem version split between io-uring
+    #       backends and standard async runtimes
+    #   - openssl-probe: rdkafka pulls a version; rustls-native-certs pulls another
+    #   - quick-xml: opendal vs serde-xml-rs use different minor versions
+    #   - socket2: older tokio vs newer tokio/hyper version split
+    #   - serde_spanned / toml / toml_datetime / winnow: figment uses toml 0.5.x;
+    #       other crates use toml 0.8.x
+    #   - thiserror / thiserror-impl: macro + runtime split from old vs new anyhow
+    #       transitive chains (safe — no runtime code, pure proc-macro crate)
+    #   - foldhash: hashbrown 0.14 vs 0.15 internal hasher change
+    { name = "darling" },
+    { name = "darling_core" },
+    { name = "darling_macro" },
+    { name = "foldhash" },
+    { name = "heck" },
+    { name = "indexmap" },
+    { name = "itertools" },
+    { name = "linux-raw-sys" },
+    { name = "openssl-probe" },
+    { name = "opendal" },
+    { name = "ordered-float" },
+    { name = "quick-xml" },
+    { name = "rustix" },
+    { name = "serde_spanned" },
+    { name = "socket2" },
+    { name = "thiserror" },
+    { name = "thiserror-impl" },
+    { name = "toml" },
+    { name = "toml_datetime" },
+    { name = "winnow" },
+    # schemreg/avro feature diamond: schemreg 0.3 (via rustcdc) pins older apache-avro,
+    # lz4_flex, strum*, typed-builder*, wasm-encoder, whoami than iceberg/wasmtime pull.
+    { name = "apache-avro" },
+    { name = "lz4_flex" },
+    { name = "strum" },
+    { name = "strum_macros" },
+    { name = "typed-builder" },
+    { name = "typed-builder-macro" },
+    { name = "wasm-encoder" },
+    { name = "whoami" },
+]
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,232 @@
+groups:
+  - name: rustcdc_slo_alerts
+    rules:
+      - alert: RUSTCDCReadinessRateLow
+        expr: >
+          rate(rustcdc_readiness_ready_total[5m])
+          / rate(rustcdc_readiness_checks_total[5m]) < 0.999
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: rustcdc readiness rate is below SLO threshold (99.9%)
+          description: >
+            The ratio of ready probes to total probes over the last 5 minutes
+            has dropped below 99.9%.  Check source connectivity and circuit
+            breaker state.
+
+      - alert: RUSTCDCCheckpointAgeHigh
+        expr: rustcdc_checkpoint_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC checkpoint age is too high
+
+      - alert: RUSTCDCAdminAPILatencyHigh
+        expr: histogram_quantile(0.99, rustcdc_admin_api_duration_seconds_bucket) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC admin API latency is high
+
+      - alert: RUSTCDCRestartRecoverySlow
+        expr: rustcdc_restart_recovery_duration_seconds > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC restart recovery is taking too long
+
+      - alert: RUSTCDCAdminManifestReloadFailed
+        expr: rustcdc_admin_manifest_reload_failures_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin manifest reload failed
+
+      - alert: RUSTCDCAdminControlPlaneDown
+        expr: rustcdc_admin_control_plane_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin control plane is down
+
+      - alert: RUSTCDCAdminManifestStaleBlocked
+        expr: rustcdc_admin_manifest_stale_blocked == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin manifest is stale and blocked
+
+      - alert: RUSTCDCAdminRevokedTokenUseDetected
+        expr: increase(rustcdc_admin_revoked_token_use_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Revoked token use detected on CDC admin API
+
+      - alert: RUSTCDCAdminShutdownCompletionErrors
+        expr: rustcdc_admin_shutdown_completion_errors_total > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC admin shutdown completed with errors
+
+      - alert: RUSTCDCReconciliationRecoveryDetected
+        expr: rustcdc_reconciliation_recovery_detected_total > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC reconciliation recovery was triggered
+
+      - alert: RUSTCDCReconciliationRecoveryProofFailed
+        expr: rustcdc_reconciliation_recovery_proof_failed_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC reconciliation recovery proof failed
+
+      - alert: RUSTCDCAdminAuthAbuse
+        expr: increase(rustcdc_admin_auth_abuse_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin auth abuse detected
+
+      - alert: RUSTCDCAdminRateLimiterContentionHigh
+        expr: rustcdc_admin_rate_limiter_contention_ratio > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC admin rate limiter contention is high
+
+      - alert: RUSTCDCDataCorrectnessDegradation
+        expr: rustcdc_data_correctness_degradation_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC data correctness degradation detected
+
+      - alert: RUSTCDCHttpBatchOldestEventAgeHigh
+        expr: rustcdc_http_batch_oldest_event_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC HTTP batch oldest event age is too high
+
+      - alert: RUSTCDCRuntimeRecoverableBreakerOpen
+        expr: rustcdc_runtime_recoverable_breaker_open == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC runtime recoverable circuit breaker is open
+
+      - alert: RUSTCDCRuntimeRecoverableBreakerEscalationRisk
+        expr: rustcdc_runtime_recoverable_breaker_escalation_risk > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC runtime recoverable breaker escalation risk detected
+
+      - alert: CDCIcebergOrphanedFiles
+        expr: rustcdc_iceberg_orphaned_data_files_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Iceberg orphaned data files detected — storage cleanup required.
+            Files were written to the object store but never committed to a
+            snapshot (due to a terminal commit failure).  Run a compaction or
+            manual cleanup pass before they accumulate and inflate storage costs.
+
+      - alert: CDCEventDeliveryLatencyHigh
+        expr: histogram_quantile(0.99, rate(rustcdc_event_delivery_latency_ms_bucket[5m])) > 30000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            CDC event delivery P99 latency exceeds 30 s — sink back-pressure,
+            slow catalog commits, or network congestion suspected.
+
+      - alert: RUSTCDCAuditLogDropDetected
+        expr: increase(rustcdc_audit_log_drop_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Audit log entries are being dropped because the write channel is
+            full.  This means the filesystem is too slow to keep up with the
+            audit write rate.  Check disk I/O and consider reducing audit
+            write volume or increasing the audit log channel capacity.
+
+      - alert: RUSTCDCSourceDegradedLiveness
+        expr: >
+          rustcdc_source_consecutive_poll_errors >= 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Source consecutive errors have been at-or-above threshold for 5
+            minutes.  The pipeline may be stuck in indefinite circuit-breaker
+            backoff.  Check /livez and consider restarting the pod.
+
+      - alert: RUSTCDCRuntimeStalled
+        expr: rustcdc_runtime_health{verdict="stalled"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            The rustcdc runtime reports a Stalled health verdict — running,
+            but progress has stopped or is degrading.  The gauge is one-hot
+            (verdict="idle" is deliberately NOT alertable: a quiet database is
+            not an incident).  The stall reason is logged by the server at
+            WARN level ("runtime health degraded to stalled") — check the
+            logs for whether poll recency, polled-vs-committed divergence, or
+            source-side lag growth fired.
+
+      - alert: RUSTCDCEventsSkippedDataLoss
+        expr: increase(rustcdc_runtime_events_skipped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Events were permanently dropped by TransformErrorPolicy::Skip.
+            A skipped event is dropped AND the checkpoint advances past it,
+            so it will never be replayed — any increase of this counter is
+            confirmed data loss.  Identify the failing transform from the
+            server logs and decide whether to replay from an earlier
+            checkpoint after fixing it.
+
+      - alert: RUSTCDCReplicationSlotLagHigh
+        expr: rustcdc_runtime_replication_slot_lag_bytes > 1073741824
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            The PostgreSQL replication slot is retaining more than 1 GiB of
+            WAL.  Sustained growth risks hitting max_slot_wal_keep_size (slot
+            invalidation = unrecoverable data loss) or filling the WAL
+            volume.  Check sink throughput and the RUSTCDCRuntimeStalled
+            alert.

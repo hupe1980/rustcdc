@@ -1,0 +1,87 @@
+[package]
+name = "rustcdc-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+publish = false
+description = "Change-data-capture server powered by rustcdc"
+repository = "https://github.com/hupe1980/rustcdc-server"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "rustcdc"
+path = "src/main.rs"
+
+
+[workspace]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+rustcdc = { version = "0.7.0", features = ["postgres", "mysql", "mariadb", "sqlserver", "metrics", "avro", "schemreg", "wasm", "cloudevents"] }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "process"] }
+futures = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Layered configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Web / admin API
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+url = "2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.27" }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "metrics"] }
+tracing-opentelemetry = "0.28"
+
+# Error handling
+thiserror = "2"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+ed25519-dalek = "2"
+zip = "2"
+async-trait = "0.1"
+dashmap = "6"
+bytes = "1"
+tokio-postgres = "0.7"
+krafka = { version = "0.12.0" }
+
+iceberg = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
+iceberg-storage-opendal = { version = "0.9.1", features = ["opendal-fs", "opendal-s3", "opendal-gcs", "opendal-azdls"] }
+arrow-array = "57.1"
+arrow-schema = "57.1"
+parquet = "57.1"
+
+# Storage abstraction (E02-S03)
+opendal = { version = "0.51", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
+rustcdc = { version = "0.7.0", features = ["postgres", "mysql", "mariadb", "sqlserver", "metrics"] }
+wat = "1"
