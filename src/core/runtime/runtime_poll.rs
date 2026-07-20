@@ -14,6 +14,15 @@ impl CdcRuntime {
 
         let metrics = Arc::clone(&self.observability().metrics);
 
+        // Retry a source confirmation that failed after a durable commit, BEFORE any
+        // new events are polled and passed through the idempotency guard.
+        //
+        // Ordering is the whole point: the source is still replaying events the runtime
+        // already committed, and the guard would suppress all of them, producing an
+        // empty batch and a silent no-progress loop. Confirming first stops the replay
+        // at the source, so there is nothing to suppress.
+        self.retry_pending_confirmation().await?;
+
         if !self.buffered_events.is_empty() {
             return Ok(self.deliver_buffered_batch());
         }
@@ -32,6 +41,7 @@ impl CdcRuntime {
             }
 
             // Deduplicate source events before transform stages mutate payloads.
+            self.record_schema_change_events(&chunk).await?;
             let deduplicated = self.filter_idempotent_events(chunk)?;
             let transformed = self.apply_transforms(deduplicated).await?;
             self.enqueue_pending_source_events(transformed);
@@ -45,6 +55,7 @@ impl CdcRuntime {
                 .inspect_err(|error| metrics.record_error(error, "runtime.poll.snapshot_chunk"))?;
             if !chunk.is_empty() {
                 // Deduplicate source events before transform stages mutate payloads.
+                self.record_schema_change_events(&chunk).await?;
                 let deduplicated = self.filter_idempotent_events(chunk)?;
                 let transformed = self.apply_transforms(deduplicated).await?;
                 self.enqueue_pending_source_events(transformed);
@@ -107,7 +118,23 @@ impl CdcRuntime {
                             attempt = attempt.saturating_add(1);
                             continue;
                         }
-                        let resume_offset = self.config.checkpoint.load().await.ok().flatten();
+                        // A checkpoint-load *failure* must never be collapsed into
+                        // "no checkpoint exists".  `start_stream(None)` resumes from the
+                        // live head of the log (MySQL `SHOW MASTER STATUS`, SQL Server
+                        // `fn_cdc_get_max_lsn`), so treating a transient checkpoint-store
+                        // error as `None` silently skips every change written since the
+                        // last durable checkpoint.  Fail loud instead: the checkpoint
+                        // store being unreachable is exactly the condition under which we
+                        // must not guess a resume position.
+                        let resume_offset =
+                            self.config.checkpoint.load().await.map_err(|error| {
+                                crate::core::Error::CheckpointError(format!(
+                                    "failed loading checkpoint while resuming the stream after \
+                                 reconnect: {error}; refusing to restart the stream from the \
+                                 live log head because that would silently skip all changes \
+                                 since the last durable checkpoint"
+                                ))
+                            })?;
                         match self.source.start_stream(resume_offset.as_deref()).await {
                             Ok(new_stream) => {
                                 self.stream = Some(new_stream);
@@ -196,8 +223,21 @@ impl CdcRuntime {
                                 metrics
                                     .record_error(&connect_error, "runtime.poll.stream_reconnect");
                             } else {
+                                // See the equivalent guard above: a checkpoint-load failure
+                                // must never be collapsed into "no checkpoint exists",
+                                // because `start_stream(None)` resumes from the live log
+                                // head and silently skips everything since the last
+                                // durable checkpoint.
                                 let resume_offset =
-                                    self.config.checkpoint.load().await.ok().flatten();
+                                    self.config.checkpoint.load().await.map_err(|error| {
+                                        crate::core::Error::CheckpointError(format!(
+                                            "failed loading checkpoint while resuming the stream \
+                                             after a recoverable source error: {error}; refusing \
+                                             to restart the stream from the live log head because \
+                                             that would silently skip all changes since the last \
+                                             durable checkpoint"
+                                        ))
+                                    })?;
                                 match self.source.start_stream(resume_offset.as_deref()).await {
                                     Ok(new_stream) => {
                                         self.stream = Some(new_stream);
@@ -245,6 +285,9 @@ impl CdcRuntime {
                 return Ok(EventBatch::empty());
             }
             // Deduplicate source events before transform stages mutate payloads.
+            // Record any schema changes durably BEFORE the events announcing them are
+            // enqueued, so a consumer can never see a schema change the history lacks.
+            self.record_schema_change_events(&events).await?;
             let deduplicated = self.filter_idempotent_events(events)?;
             let transformed = self.apply_transforms(deduplicated).await?;
             self.enqueue_pending_source_events(transformed);
@@ -268,7 +311,7 @@ impl CdcRuntime {
         .boxed()
     }
 
-    pub(super) async fn apply_transforms(&self, events: Vec<Event>) -> Result<Vec<Event>> {
+    pub(super) async fn apply_transforms(&mut self, events: Vec<Event>) -> Result<Vec<Event>> {
         let has_dlq = self.config.options.dead_letter_handler.is_some();
         let mut out = Vec::with_capacity(events.len());
         for event in events {
@@ -286,6 +329,10 @@ impl CdcRuntime {
                         return Err(error);
                     }
                     TransformErrorPolicy::Skip => {
+                        // The checkpoint will advance past this event, so it is
+                        // unrecoverable. Count it — this is the metric the docs
+                        // promised and the crate never emitted.
+                        self.total_events_skipped = self.total_events_skipped.saturating_add(1);
                         self.record_runtime_error("runtime.transform.skip", &error);
                         tracing::warn!(
                             target: "rustcdc::core::runtime",
@@ -311,18 +358,87 @@ impl CdcRuntime {
         Ok(out)
     }
 
+    /// Retry a source confirmation that failed after a durable checkpoint commit.
+    ///
+    /// Succeeds silently when there is nothing pending. When the retry itself fails
+    /// the LSN is retained and the caller continues — a single transient failure must
+    /// not take the pipeline down. Escalation to a hard error happens in
+    /// [`Self::filter_idempotent_events`], once the failure has demonstrably produced
+    /// a no-progress loop.
+    async fn retry_pending_confirmation(&mut self) -> Result<()> {
+        let Some(lsn) = self.pending_confirmation_lsn else {
+            return Ok(());
+        };
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(());
+        };
+
+        match stream.confirm_lsn(lsn).await {
+            Ok(()) => {
+                tracing::info!(
+                    target: "rustcdc::core::runtime",
+                    lsn,
+                    "runtime confirmed a previously failed source position; \
+                     replay of already-committed events will stop",
+                );
+                self.pending_confirmation_lsn = None;
+                self.unconfirmed_stall_polls = 0;
+            }
+            Err(error) => {
+                self.record_runtime_error("runtime.poll.confirm_lsn_retry", &error);
+                tracing::warn!(
+                    target: "rustcdc::core::runtime",
+                    lsn,
+                    error = %error,
+                    "runtime could not confirm a durably committed source position; \
+                     the source will keep replaying committed events",
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn filter_idempotent_events(&mut self, events: Vec<Event>) -> Result<Vec<Event>> {
         let Some(guard) = self.idempotency_guard.as_mut() else {
             return Ok(events);
         };
 
-        let mut out = Vec::with_capacity(events.len());
+        let input_len = events.len();
+        let mut out = Vec::with_capacity(input_len);
         for event in events {
             if guard.should_process(&event)? {
                 out.push(event);
             } else {
                 self.total_events_deduplicated = self.total_events_deduplicated.saturating_add(1);
             }
+        }
+
+        // Detect the no-progress loop: the source delivered events, the guard
+        // suppressed every one of them, and a durably committed position remains
+        // unconfirmed. Left alone this returns empty batches forever while every
+        // health signal reports green, and on PostgreSQL the slot pins WAL on the
+        // primary until the disk fills.
+        if input_len > 0 && out.is_empty() && self.pending_confirmation_lsn.is_some() {
+            self.unconfirmed_stall_polls = self.unconfirmed_stall_polls.saturating_add(1);
+            if self.unconfirmed_stall_polls >= UNCONFIRMED_STALL_POLL_LIMIT {
+                let lsn = self.pending_confirmation_lsn.unwrap_or_default();
+                let error = Error::Unrecoverable(format!(
+                    "runtime is not making progress: source position {lsn} was durably \
+                     checkpointed but could not be confirmed to the source, so the source \
+                     keeps replaying already-committed events and the idempotency guard \
+                     suppresses all of them. {} consecutive polls produced no deliverable \
+                     events. Operator action required: restore connectivity to the source \
+                     so the position can be confirmed (for PostgreSQL this is \
+                     pg_replication_slot_advance — check the slot still exists and the \
+                     role retains REPLICATION). Until then the source retains its log \
+                     (on PostgreSQL, WAL on the primary).",
+                    self.unconfirmed_stall_polls
+                ));
+                self.record_runtime_error("runtime.poll.unconfirmed_stall", &error);
+                return Err(error);
+            }
+        } else if !out.is_empty() {
+            self.unconfirmed_stall_polls = 0;
         }
 
         Ok(out)
@@ -344,19 +460,47 @@ impl CdcRuntime {
             .saturating_sub(self.commit_barrier.pending_count());
 
         if available == 0 {
-            let error = Error::StateError(
-                "runtime commit barrier is full; commit acknowledgements before polling more events"
+            // Backpressure is flow control, not a failure. Classifying it as
+            // `StateError` made it `ErrorKind::Terminal` — documented as "a permanent
+            // problem that retrying will not resolve" — so an embedder following the
+            // crate's own retry guidance would shut down on routine buffer pressure.
+            let error = Error::Backpressure(
+                "runtime commit barrier is full; acknowledge the outstanding batch with \
+                 commit_ack() before polling again. This is normal flow control: the same \
+                 poll succeeds once in-flight events are committed."
                     .into(),
             );
             self.record_runtime_error("runtime.poll.buffer_full", &error);
             return Err(error);
         }
 
+        // Cut the batch on the byte budget as well as the event count.
+        //
+        // `max_event_bytes` was previously declared, defaulted, settable and documented
+        // as a flush limit — and never read. An operator setting it to protect a
+        // downstream with a hard message-size limit got no protection and no warning.
+        let max_bytes = self.config.options.max_event_bytes;
         let mut chunk = Vec::with_capacity(available.min(self.pending_source_events.len()));
+        let mut chunk_bytes = 0usize;
+
         while chunk.len() < available {
             let Some(event) = self.pending_source_events.pop_front() else {
                 break;
             };
+
+            if let Some(limit) = max_bytes {
+                let event_bytes = estimate_event_bytes(&event);
+                // Always deliver at least one event, even if it alone exceeds the
+                // budget. Refusing would stall the pipeline permanently on a single
+                // oversized row with no way for the caller to make progress; the batch
+                // simply ends up over budget and the caller can see why.
+                if !chunk.is_empty() && chunk_bytes.saturating_add(event_bytes) > limit {
+                    self.pending_source_events.push_front(event);
+                    break;
+                }
+                chunk_bytes = chunk_bytes.saturating_add(event_bytes);
+            }
+
             chunk.push(event);
         }
 
@@ -414,11 +558,16 @@ impl CdcRuntime {
         #[cfg(feature = "mysql")]
         if mysql_family {
             let (binlog_file, binlog_pos, gtid) = parse_mysql_stream_offset(&event.source.offset)?;
-            let offset = MysqlOffset {
-                gtid,
-                binlog_file,
-                binlog_pos,
-            };
+            // Carry the flavor so the checkpoint lands in the right file — a MariaDB
+            // stream writing checkpoint_mysql.json finds nothing on restart and
+            // silently resumes from the current binlog position.
+            let flavor = self
+                .config
+                .source
+                .source_type()
+                .unwrap_or("mysql")
+                .to_string();
+            let offset = MysqlOffset::new(flavor, binlog_file, binlog_pos, gtid);
             return Ok(GenericOffset::new(
                 source_type.to_string(),
                 offset
@@ -436,12 +585,15 @@ impl CdcRuntime {
 
     fn current_pending_batch(&self) -> Option<EventBatch> {
         let pending = self.pending_delivery.as_ref()?;
-        let uncommitted = &pending.events[pending.committed_prefix..];
+        let uncommitted_len = pending.events.len() - pending.committed_prefix;
+        // Share the buffer and carry an offset rather than copying the suffix — a
+        // redelivered batch is re-derived on every poll until it is acknowledged.
         Some(EventBatch {
-            events: Arc::new(uncommitted.to_vec()),
+            events: Arc::clone(&pending.events),
+            offset: pending.committed_prefix,
             ack_token: Some(AckToken {
                 delivery_id: pending.delivery_id,
-                event_count: uncommitted.len(),
+                event_count: uncommitted_len,
             }),
         })
     }
@@ -462,10 +614,15 @@ impl CdcRuntime {
         let now_ms = now_millis();
         self.total_events_polled = self.total_events_polled.saturating_add(events.len() as u64);
         self.last_poll_at_ms = Some(now_ms);
+        // `event_trace_id` costs two String allocations per event; skip it entirely
+        // when the tracer discards what it is given (the default).
+        let tracing_enabled = self.observability().tracer.is_enabled();
         for event in &events {
-            self.observability()
-                .tracer
-                .trace_event_start(&Self::event_trace_id(event));
+            if tracing_enabled {
+                self.observability()
+                    .tracer
+                    .trace_event_start(&Self::event_trace_id(event));
+            }
             let source_ts = normalize_source_timestamp_ms(event.source.timestamp).min(now_ms);
             let latency_ms = now_ms.saturating_sub(source_ts);
             self.observability()
@@ -511,6 +668,8 @@ impl CdcRuntime {
 
         EventBatch {
             events,
+            // A fresh delivery starts at the head of its own buffer.
+            offset: 0,
             ack_token: Some(AckToken {
                 delivery_id,
                 event_count,
@@ -522,7 +681,13 @@ impl CdcRuntime {
     pub fn enqueue_event(&mut self, event: Event) -> Result<()> {
         let queued_events = self.buffered_events.len() + self.injected_events.len();
         if queued_events >= self.config.options.max_buffer_size {
-            return Err(Error::StateError("runtime buffer is full".into()));
+            // Flow control, not a failure — same reasoning as the commit-barrier
+            // guard in `flush_pending_source_events`.
+            return Err(Error::Backpressure(
+                "runtime buffer is full; poll and acknowledge the buffered events before \
+                 enqueuing more"
+                    .into(),
+            ));
         }
 
         self.injected_events.push_back(event);
@@ -572,6 +737,47 @@ impl CdcRuntime {
         Ok(Some(event))
     }
 
+    /// Record connector-emitted schema-change events into the durable schema history.
+    ///
+    /// The connectors synthesize `Operation::SchemaChange` events directly (PostgreSQL
+    /// from a changed RELATION message, MySQL from a binlog QUERY event, SQL Server
+    /// from a capture-instance metadata refresh) and hand them to the runtime like any
+    /// other event. Before this hook existed, `record_ddl` had exactly one caller —
+    /// `capture_ddl_statement` — which itself had no non-test callers, so the schema
+    /// history was **never populated in any production path** while `start()`
+    /// nonetheless hard-required a retention policy for it.
+    ///
+    /// This is the one place every connector's events converge, so recording here
+    /// makes the history real for all of them at a single site. Ordering matters and
+    /// is preserved: the DDL is durably recorded *before* the event that announces it
+    /// is enqueued for delivery, so a consumer can never observe a schema change the
+    /// history does not already contain.
+    async fn record_schema_change_events(&mut self, events: &[Event]) -> Result<()> {
+        for event in events.iter().filter(|event| event.op.is_schema_change()) {
+            let Some(after) = event.after.as_ref() else {
+                continue;
+            };
+            let Some(captured) = crate::ddl_capture::CapturedDdl::from_event_payload(after) else {
+                // Not a shape we can turn into a schema-history entry (for example a
+                // synthetic relation-change event with no parseable statement). The
+                // event still reaches the consumer; only the history entry is skipped.
+                continue;
+            };
+            let Some(schema_event) = captured.to_schema_event() else {
+                continue;
+            };
+
+            self.config.schema_history.record_ddl(schema_event).await?;
+            if let Some(retention) = self.config.options.schema_history_retention {
+                self.config
+                    .schema_history
+                    .apply_retention(retention)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns an async stream of [`EventBatch`] values that stops when `token` is cancelled.
     ///
     /// Each item yielded from the stream must be acknowledged via [`CdcRuntime::commit_ack`]
@@ -592,4 +798,37 @@ impl CdcRuntime {
             }
         })
     }
+}
+
+/// Approximate serialized size of an event, for `max_event_bytes` accounting.
+///
+/// Uses the JSON payload sizes plus the fixed-ish envelope overhead rather than
+/// serializing the whole event: this runs per event on the poll path, and an exact
+/// figure would mean paying a full `serde_json::to_vec` for a number used only to
+/// decide where to cut the batch. Overestimating slightly is the safe direction for a
+/// downstream size limit.
+fn estimate_event_bytes(event: &Event) -> usize {
+    fn payload_len(value: Option<&serde_json::Value>) -> usize {
+        value.map_or(0, |value| match value {
+            serde_json::Value::Null => 4,
+            serde_json::Value::Bool(_) => 5,
+            serde_json::Value::Number(n) => n.to_string().len(),
+            serde_json::Value::String(s) => s.len() + 2,
+            // Objects and arrays dominate real payloads; serialize only these.
+            other => serde_json::to_string(other).map_or(0, |s| s.len()),
+        })
+    }
+
+    payload_len(event.before.as_ref())
+        + payload_len(event.after.as_ref())
+        + event.table.len()
+        + event.schema.as_deref().map_or(0, str::len)
+        + event.source.source_name.len()
+        + event.source.offset.len()
+        + event
+            .primary_key
+            .as_deref()
+            .map_or(0, |keys| keys.iter().map(String::len).sum::<usize>())
+        // Envelope scaffolding: field names, quoting, separators, timestamps.
+        + 128
 }

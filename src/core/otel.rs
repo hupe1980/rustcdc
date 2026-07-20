@@ -220,14 +220,37 @@ impl OTelMetricsCollector {
             .fetch_add(count, Ordering::Relaxed);
 
         if let Ok(mut state) = self.state.lock() {
-            let op_name = op.to_string();
-            let metric_key = format!("rustcdc.events.processed[op={op_name}]");
-            let entry = state
-                .counters
-                .entry(metric_key)
-                .or_insert((0, HashMap::new()));
-            entry.0 = entry.0.saturating_add(count);
-            entry.1.insert("operation".to_string(), op_name.clone());
+            // `Operation` is a closed set, so the metric key is one of six `&'static
+            // str`s — no formatting, no allocation. This ran per event and previously
+            // cost an `op.to_string()`, a `format!` for the map key, and an
+            // `"operation".to_string()` plus a clone, all inside the mutex.
+            //
+            // Note `Operation::to_str()` returns `&'static str` and its own docs say
+            // "Prefer this over `to_string()` on hot paths" — which the hot path was
+            // not doing.
+            let op_name = op.to_str();
+            let metric_key = match op {
+                Operation::Insert => "rustcdc.events.processed[op=insert]",
+                Operation::Update => "rustcdc.events.processed[op=update]",
+                Operation::Delete => "rustcdc.events.processed[op=delete]",
+                Operation::Read => "rustcdc.events.processed[op=read]",
+                Operation::SchemaChange => "rustcdc.events.processed[op=schema_change]",
+                Operation::Truncate => "rustcdc.events.processed[op=truncate]",
+                // Deliberately exhaustive: `Operation` is `#[non_exhaustive]` only for
+                // downstream crates, so a new variant added here is a compile error
+                // until it gets a metric key — which is what we want.
+            };
+
+            match state.counters.get_mut(metric_key) {
+                Some(entry) => entry.0 = entry.0.saturating_add(count),
+                None => {
+                    let mut labels = HashMap::new();
+                    labels.insert("operation".to_string(), op_name.to_string());
+                    state
+                        .counters
+                        .insert(metric_key.to_string(), (count, labels));
+                }
+            }
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments
@@ -292,11 +315,13 @@ impl OTelMetricsCollector {
 
     pub fn record_event_processing_duration(&self, duration_ms: u64) {
         if let Ok(mut state) = self.state.lock() {
-            state
-                .histograms
-                .entry("rustcdc.event_processing_duration_ms".to_string())
-                .or_insert_with(Vec::new)
-                .push(duration_ms);
+            push_bounded(
+                state
+                    .histograms
+                    .entry("rustcdc.event_processing_duration_ms".to_string())
+                    .or_default(),
+                duration_ms,
+            );
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments
@@ -308,11 +333,13 @@ impl OTelMetricsCollector {
 
     pub fn record_checkpoint_commit_duration(&self, duration_ms: u64) {
         if let Ok(mut state) = self.state.lock() {
-            state
-                .histograms
-                .entry("rustcdc.checkpoint_commit_duration_ms".to_string())
-                .or_insert_with(Vec::new)
-                .push(duration_ms);
+            push_bounded(
+                state
+                    .histograms
+                    .entry("rustcdc.checkpoint_commit_duration_ms".to_string())
+                    .or_default(),
+                duration_ms,
+            );
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments
@@ -462,7 +489,30 @@ fn error_metric_class(error: &Error) -> &'static str {
         Error::TransformError(_) => "transform",
         Error::NotImplemented(_) => "not_implemented",
         Error::PostCommitConfirmFailed { .. } => "post_commit_confirm_failed",
+        Error::Backpressure(_) => "backpressure",
     }
+}
+
+/// Maximum samples retained per in-memory histogram.
+///
+/// The in-memory histograms exist to serve `export_metrics()` between scrapes; they
+/// are not a durable store. They previously appended one `u64` per event **forever**
+/// — only `reset()` cleared them — so a long-running pipeline leaked roughly 2.8 GB
+/// per hour at 100k events/s, on the event path. `export_metrics` also clones the
+/// whole vector per scrape, so unbounded growth made scraping progressively slower too.
+///
+/// Retaining a bounded window of the most recent samples keeps p50/p95/p99 meaningful
+/// (they describe recent behaviour, which is what an operator wants) at fixed cost.
+const MAX_HISTOGRAM_SAMPLES: usize = 8192;
+
+/// Append a sample, evicting the oldest when the window is full.
+fn push_bounded(samples: &mut Vec<u64>, value: u64) {
+    if samples.len() >= MAX_HISTOGRAM_SAMPLES {
+        // Drop the oldest quarter in one move rather than shifting on every push,
+        // which would make this O(n) per event.
+        samples.drain(..MAX_HISTOGRAM_SAMPLES / 4);
+    }
+    samples.push(value);
 }
 
 #[derive(Debug, Clone)]
@@ -994,6 +1044,8 @@ mod tests {
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
 
         let propagated = tracer.propagate_baggage_to_event("event-123", &mut event);
@@ -1129,6 +1181,8 @@ mod tests {
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
 
         assert!(tracer.propagate_baggage_to_event("event-before", &mut event));
@@ -1157,6 +1211,8 @@ mod tests {
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
 
         assert!(!tracer.propagate_baggage_to_event("missing-event", &mut event));

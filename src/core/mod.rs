@@ -15,8 +15,8 @@ mod transport;
 
 pub use error::{Error, ErrorKind, FingerprintError, Result, SourceErrorKind};
 pub use event::{
-    Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata, ValidationError,
-    ValidationErrors, EVENT_ENVELOPE_VERSION,
+    Event, NoRowWrite, Operation, RowWrite, SnapshotMetadata, SourceMetadata, TransactionMetadata,
+    ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
 pub use idempotency::{
     fingerprint_event_stable, fingerprint_event_transient, EventIdempotencyGuard,
@@ -26,7 +26,8 @@ pub use observability::{EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetr
 #[cfg(feature = "metrics")]
 pub use otel::{MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord};
 pub use runtime::{
-    AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, IdempotencyOptions,
+    AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, HealthVerdict,
+    IdempotencyOptions,
     PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability,
     RuntimeOptions, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
 };

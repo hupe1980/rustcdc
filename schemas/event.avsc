@@ -101,7 +101,19 @@
       "name": "before_is_key_only",
       "type": "boolean",
       "default": false,
-      "doc": "True when 'before' contains only primary-key columns (PostgreSQL DEFAULT REPLICA IDENTITY on UPDATE or DELETE). Always false for INSERT, READ, SCHEMA_CHANGE, TRUNCATE, and all non-PostgreSQL events."
+      "doc": "True when 'before' contains only primary-key columns (PostgreSQL DEFAULT REPLICA IDENTITY). Always false for non-UPDATE or non-PostgreSQL events."
+    },
+    {
+      "name": "unavailable_columns",
+      "type": {"type": "array", "items": "string"},
+      "default": [],
+      "doc": "Columns absent from 'after' because the source could not supply them (PostgreSQL unchanged-TOAST). Absent, not null: a consumer writing whole rows must exclude them rather than writing NULL over an unchanged value. REPLICA IDENTITY FULL does not avoid this."
+    },
+    {
+      "name": "before_unavailable_columns",
+      "type": {"type": "array", "items": "string"},
+      "default": [],
+      "doc": "The same, for 'before'. Never merged with unavailable_columns: the two sets differ, and merging them marks genuinely-changed columns as unwritable."
     }
   ]
 }

@@ -338,31 +338,49 @@ fn structured_logger_json_100_events_parse_and_redact() {
     assert!(saw_redacted_error);
 }
 
-/// C-04: Verify that starting a runtime with no `schema_history_retention` policy
-/// returns a `ConfigError` that mentions `schema_history_retention`. The runtime
-/// now hard-fails at startup rather than logging a warning and continuing, so
-/// operators cannot accidentally run without a retention policy.
+/// C-04: Starting without a `schema_history_retention` policy must warn, not refuse.
+///
+/// Schema history grows only in response to DDL on captured tables, which is rare in most
+/// deployments. Blocking startup over a risk that may never materialise forced every
+/// operator to configure a subsystem nothing populated. The warning must still name the
+/// setting, or the risk becomes invisible instead of merely tolerated.
 #[tokio::test]
-async fn runtime_startup_without_schema_history_retention_emits_error_log() {
+async fn runtime_startup_without_schema_history_retention_warns_but_starts() {
     use rustcdc::checkpoint::InMemoryCheckpoint;
     use rustcdc::core::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig};
     use rustcdc::schema_history::InMemorySchemaHistory;
 
+    let sink = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_max_level(Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let guard = tracing::dispatcher::set_default(&dispatch);
+
     let checkpoint = InMemoryCheckpoint::default();
     let schema_history = InMemorySchemaHistory::default();
     let mut config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
-    // Explicitly clear the default retention to trigger the ConfigError.
+    // Explicitly clear the default retention to exercise the unconfigured path.
     config.options.schema_history_retention = None;
     let mut runtime = CdcRuntime::new(config).expect("runtime construction should succeed");
 
-    let err = runtime
+    runtime
         .start()
         .await
-        .expect_err("start must fail when schema_history_retention is None");
+        .expect("missing retention must warn, not block startup");
+    drop(guard);
 
-    let msg = err.to_string();
+    let logs = String::from_utf8(sink.inner.lock().unwrap().clone()).unwrap();
     assert!(
-        msg.contains("schema_history_retention"),
-        "ConfigError must mention schema_history_retention; got: {msg}"
+        logs.contains("schema_history_retention"),
+        "the warning must name the setting an operator has to configure; got: {logs}"
+    );
+    assert!(
+        logs.contains("WARN"),
+        "the unbounded-growth risk must be logged at WARN, not swallowed; got: {logs}"
     );
 }

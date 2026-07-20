@@ -250,6 +250,25 @@ impl MysqlSourceConfig {
 
         #[cfg(feature = "tls")]
         let builder = if self.transport.is_tls() {
+            // `mysql_async` builds its own TLS stack from `SslOpts` and offers no way
+            // to inject a pre-built `rustls::ClientConfig`. Silently ignoring an
+            // injected one is the dangerous option: `is_tls()` still reports `true`,
+            // every health check passes, and an operator who supplied a
+            // certificate-pinning verifier (the documented use case) has silently been
+            // downgraded to system-root verification — which is exactly the check
+            // pinning exists to strengthen against a rogue or compromised CA.
+            if matches!(self.transport, TransportConfig::RustlsConfig { .. }) {
+                return Err(Error::ConfigError(
+                    "mysql transport was given a pre-built rustls ClientConfig \
+                     (TransportConfig::RustlsConfig), but the MySQL driver constructs its own \
+                     TLS stack and cannot consume one. Applying it is impossible, and ignoring \
+                     it would silently discard whatever the config carries — commonly a \
+                     certificate-pinning verifier or an HSM-backed client certificate — while \
+                     still reporting TLS as enabled. Use TransportConfig::tls(), \
+                     tls_with_ca_cert_path(...) or mtls(...) for MySQL instead."
+                        .into(),
+                ));
+            }
             let ssl_opts = self.build_ssl_opts()?;
             builder.ssl_opts(Some(ssl_opts))
         } else {

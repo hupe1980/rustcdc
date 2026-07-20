@@ -177,7 +177,14 @@ impl SnapshotValidator {
             }
         }
 
-        let is_valid = total_received == total_expected && duplicates == 0;
+        // Validity must be decided **per table**, never on the cross-table totals.
+        // Summing first lets a shortfall in one table cancel against an overage in
+        // another (e.g. `users` short by 5 while `orders` is over by 5), so a snapshot
+        // that silently lost rows would report `is_valid == true`. `missing_tables` /
+        // `extra_tables` are already accumulated per table above — including tables
+        // that produced rows without an expected count — so requiring both to be empty
+        // is exactly the per-table check.
+        let is_valid = missing_tables.is_empty() && extra_tables.is_empty() && duplicates == 0;
 
         Ok(SnapshotValidationResult {
             rows_expected: total_expected,
@@ -297,6 +304,8 @@ mod tests {
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

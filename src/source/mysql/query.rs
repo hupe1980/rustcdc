@@ -101,6 +101,113 @@ pub(super) fn format_gtid(sid: [u8; 16], gno: u64) -> String {
     format!("{sid}:{gno}")
 }
 
+/// Merge a single GTID into a GTID **set**, returning the union.
+///
+/// This is the difference between a resumable checkpoint and a catastrophic one.
+///
+/// The stream previously did `stream.gtid = <single gtid>` on every `GtidEvent`,
+/// **overwriting** the executed-set read at startup. So a connector that began at
+/// `uuid:1-500` and processed one more transaction checkpointed `uuid:501` — discarding
+/// all history. Resuming from that tells the server the replica has executed *only*
+/// transaction 501, and it replays 1–500: a mass duplication of everything before the
+/// restart point, silently.
+///
+/// Intervals are coalesced so the set stays compact over a long-running stream —
+/// consecutive transactions collapse into one range rather than accumulating one entry
+/// per transaction.
+///
+/// Renders in MySQL's canonical form: single values as `m`, ranges as `m-n`. MySQL
+/// requires `n > m` strictly in the range form, so a one-transaction interval must be
+/// written `11`, never `11-11`.
+pub(super) fn merge_gtid_into_set(set: &str, gtid: &str) -> String {
+    // `gtid` is parsed as a *set* rather than a single `uuid:gno`. A GtidEvent carries
+    // one GTID, but accepting a set costs nothing and avoids a silent-loss failure mode:
+    // a single-GTID parser handed `uuid:100-120` would fail to parse `100-120` as a
+    // number and drop the whole thing, leaving the checkpoint empty.
+    let mut parsed = parse_gtid_set_intervals(set);
+
+    for (uuid, intervals) in parse_gtid_set_intervals(gtid) {
+        parsed.entry(uuid).or_default().extend(intervals);
+    }
+
+    render_gtid_set(parsed)
+}
+
+/// Parse `uuid:m-n:p,uuid2:q` into `uuid -> [(start, end_inclusive)]`.
+///
+/// Unparseable fragments are skipped rather than failing: this runs on the hot path
+/// during streaming, and a checkpoint that loses one malformed fragment is recoverable
+/// (at worst a replay) whereas erroring here would stall the pipeline.
+fn parse_gtid_set_intervals(set: &str) -> std::collections::BTreeMap<String, Vec<(u64, u64)>> {
+    let mut parsed: std::collections::BTreeMap<String, Vec<(u64, u64)>> = Default::default();
+
+    for uuid_set in set.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut parts = uuid_set.split(':').map(str::trim);
+        let Some(uuid) = parts.next().filter(|uuid| !uuid.is_empty()) else {
+            continue;
+        };
+        let entry = parsed.entry(uuid.to_ascii_lowercase()).or_default();
+        for interval in parts.filter(|part| !part.is_empty()) {
+            match interval.split_once('-') {
+                Some((start, end)) => {
+                    if let (Ok(start), Ok(end)) =
+                        (start.trim().parse::<u64>(), end.trim().parse::<u64>())
+                    {
+                        entry.push((start, end.max(start)));
+                    }
+                }
+                None => {
+                    if let Ok(value) = interval.parse::<u64>() {
+                        entry.push((value, value));
+                    }
+                }
+            }
+        }
+    }
+
+    parsed
+}
+
+/// Coalesce and render back to MySQL's canonical GTID-set text form.
+fn render_gtid_set(parsed: std::collections::BTreeMap<String, Vec<(u64, u64)>>) -> String {
+    let mut uuid_sets = Vec::with_capacity(parsed.len());
+
+    for (uuid, mut intervals) in parsed {
+        if intervals.is_empty() {
+            continue;
+        }
+        intervals.sort_unstable();
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+        for (start, end) in intervals {
+            match merged.last_mut() {
+                // Overlapping *or adjacent* (`end + 1 == start`) — adjacency matters,
+                // otherwise sequential transactions never coalesce and the set grows
+                // one entry per transaction forever.
+                Some(last) if start <= last.1.saturating_add(1) => {
+                    last.1 = last.1.max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+
+        let rendered = merged
+            .into_iter()
+            .map(|(start, end)| {
+                if start == end {
+                    start.to_string()
+                } else {
+                    format!("{start}-{end}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(":");
+        uuid_sets.push(format!("{uuid}:{rendered}"));
+    }
+
+    uuid_sets.join(",")
+}
+
 pub(super) fn binlog_row_to_mysql_row(row: BinlogRow) -> Result<MysqlRow> {
     MysqlRow::try_from(row).map_err(|error| {
         Error::SourceError(format!(

@@ -55,6 +55,11 @@ impl Default for PostgresSourceConfig {
             table_include_list: Vec::new(),
             table_exclude_list: Vec::new(),
             slot_idle_advance_interval_ms: Self::default_slot_idle_advance_interval_ms(),
+            // Safe default: never auto-create. See the field docs — a slot that
+            // disappeared mid-life is a data-loss event, not a provisioning gap.
+            create_replication_slot_if_missing: false,
+            // Off by default so the connector works against PostgreSQL 16 and earlier.
+            failover_slot: false,
         }
     }
 }

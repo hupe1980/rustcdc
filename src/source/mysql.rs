@@ -11,6 +11,7 @@ use mysql_common::{
         events::{EventData, RowsEventData, TableMapEvent},
         row::BinlogRow,
     },
+    packets::Sid,
     value::Value as MysqlValue,
 };
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -197,12 +198,41 @@ struct LiveMysqlBinlogProvider {
     poll_interval_ms: u64,
 }
 
+/// Parse a MySQL GTID set into the `Sid` list `COM_BINLOG_DUMP_GTID` expects.
+///
+/// A GTID set is comma-separated `uuid_set`s, each `uuid:interval[:interval]...` with
+/// intervals written `m` or `m-n`. Per-UUID parsing is delegated to `mysql_common`'s
+/// `Sid: FromStr`, so the interval semantics (`m` means `[m, m+1)`, `m-n` means
+/// `[m, n+1)`) and the binary encoding come from the same crate that writes the packet —
+/// there is no place here for the two to disagree.
+///
+/// An empty or whitespace-only set yields an empty list, which the caller treats as
+/// "no GTID position known" and leaves `BINLOG_THROUGH_GTID` unset.
+fn parse_gtid_set(gtid_set: &str) -> std::result::Result<Vec<Sid<'static>>, String> {
+    use std::str::FromStr as _;
+
+    let trimmed = gtid_set.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            Sid::from_str(entry).map_err(|error| format!("invalid GTID '{entry}': {error}"))
+        })
+        .collect()
+}
+
 impl LiveMysqlBinlogProvider {
     async fn new(
         config: &MysqlSourceConfig,
         binlog_file: String,
         next_pos: u32,
         gtid_mode_enabled: bool,
+        resume_gtid_set: &str,
         poll_interval_ms: u64,
     ) -> Result<Self> {
         let connection = MySqlBinlogConn::new(config.build_pool_opts()?)
@@ -216,8 +246,32 @@ impl LiveMysqlBinlogProvider {
         let mut request = BinlogStreamRequest::new(config.server_id)
             .with_filename(binlog_file.as_bytes())
             .with_pos(u64::from(next_pos));
+
+        // Position by GTID set when the server supports it and we have one.
+        //
+        // Binlog file+position coordinates are **server-local**: `binlog.000042:88371`
+        // addresses an unrelated point on a promoted replica, so resuming by file+pos
+        // after a failover silently reads the wrong data. GTID coordinates are globally
+        // meaningful, which is the whole reason GTIDs exist.
+        //
+        // Previously `with_gtid()` was called but `with_gtid_set()` never was. An empty
+        // sid_block makes mysql_common clear `BINLOG_THROUGH_GTID`, so the server fell
+        // back to file+pos — GTID mode was effectively a validation flag that positioned
+        // nothing. Encoding is delegated to `mysql_common`, which owns the
+        // COM_BINLOG_DUMP_GTID wire format including the 8.4 tagged-GTID encoding.
         if gtid_mode_enabled {
             request = request.with_gtid();
+
+            let sids = parse_gtid_set(resume_gtid_set).map_err(|error| {
+                Error::CheckpointError(format!(
+                    "cannot resume mysql stream: checkpointed GTID set is malformed: {error}. \
+                     Expected a set such as \
+                     '3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5,8-10'."
+                ))
+            })?;
+            if !sids.is_empty() {
+                request = request.with_gtid_set(sids);
+            }
         }
 
         let stream = connection
@@ -819,11 +873,12 @@ impl MysqlConnection {
             handle = handle.resume_from_checkpoint_payload(&offset.encode()?)?;
         }
 
-        self.snapshot_watermark = Some(MysqlOffset {
-            binlog_file: handle.snapshot.binlog_file.clone(),
-            binlog_pos: handle.snapshot.binlog_pos,
-            gtid: handle.snapshot.gtid.clone(),
-        });
+        self.snapshot_watermark = Some(MysqlOffset::new(
+            self.config.server_flavor.source_name(),
+            handle.snapshot.binlog_file.clone(),
+            handle.snapshot.binlog_pos,
+            handle.snapshot.gtid.clone(),
+        ));
 
         Ok(Box::new(handle))
     }
@@ -862,6 +917,74 @@ impl MysqlConnection {
             return Err(Error::SourceError(
                 "mysql binary logging is disabled (log_bin=OFF)".into(),
             ));
+        }
+
+        // ── Row-image fidelity checks ─────────────────────────────────────────
+        //
+        // These three server variables determine whether the binlog carries enough
+        // information to produce a correct event. Each unsuitable value causes
+        // *silent* corruption rather than an error at decode time, so they must be
+        // rejected at connect() — before a single event is emitted.
+
+        // binlog_row_metadata: MySQL 8.0/8.4 default to MINIMAL, which omits column
+        // names and PK flags from TABLE_MAP. Without FULL, every streamed event gets
+        // synthetic `@N` column keys and `primary_key: None` — which also silently
+        // disables handoff dedup and incremental-snapshot override suppression, both
+        // of which key on the primary key.
+        // A `None` result means the server does not expose the variable at all (older
+        // MariaDB); skip rather than fail, since we cannot distinguish "unsupported"
+        // from "misconfigured" on such a server.
+        if let Some(row_metadata) = backend.binlog_row_metadata().await? {
+            if !row_metadata.eq_ignore_ascii_case("FULL") {
+                return Err(Error::SourceError(format!(
+                    "binlog_row_metadata is '{row_metadata}' but rustcdc requires 'FULL'. \
+                     Anything less omits column names and primary-key flags from the \
+                     binlog, so streamed events would carry positional placeholder keys \
+                     ('@0', '@1', …) instead of real column names, and no primary key — \
+                     which additionally disables snapshot/stream duplicate suppression and \
+                     incremental-snapshot override suppression. \
+                     Neither default is suitable: MySQL 8 defaults to MINIMAL, MariaDB to \
+                     NO_LOG. Fix: SET GLOBAL binlog_row_metadata = FULL (and add \
+                     binlog_row_metadata=FULL to my.cnf / server config so it survives a \
+                     restart). Note this only affects binlog events written after the \
+                     change, so existing binlog content keeps the old encoding."
+                )));
+            }
+        }
+
+        // binlog_row_image: MINIMAL emits only changed columns in the after-image and
+        // only key columns in the before-image; NOBLOB omits unchanged BLOB/TEXT.
+        // A consumer upserting from a partial after-image erases every column absent
+        // from it, and nothing in the envelope marks the row as partial.
+        if let Some(row_image) = backend.binlog_row_image().await? {
+            if !row_image.eq_ignore_ascii_case("FULL") {
+                return Err(Error::SourceError(format!(
+                    "mysql binlog_row_image is '{row_image}' but rustcdc requires 'FULL'. \
+                     With MINIMAL or NOBLOB the binlog records only a subset of columns, so \
+                     UPDATE after-images would be emitted as if complete while silently \
+                     missing columns — a consumer performing an upsert would erase them. \
+                     Fix: SET GLOBAL binlog_row_image = FULL (and persist it in my.cnf)."
+                )));
+            }
+        }
+
+        // binlog_row_value_options=PARTIAL_JSON makes the server emit JSON diffs
+        // (BinlogValue::JsonDiff) that the row decoder cannot convert to a value. The
+        // resulting error is raised before any checkpoint advance, so the connector
+        // re-reads the same event on restart and fails identically — a permanent stall
+        // that only an operator changing this variable can clear.
+        if let Some(row_value_options) = backend.binlog_row_value_options().await? {
+            if !row_value_options.trim().is_empty() {
+                return Err(Error::SourceError(format!(
+                    "mysql binlog_row_value_options is '{row_value_options}' but rustcdc \
+                     requires it to be empty. PARTIAL_JSON makes the server write JSON diffs \
+                     instead of complete JSON values; rustcdc cannot apply those diffs, and \
+                     the resulting decode failure recurs on every restart because it happens \
+                     before the checkpoint advances — stalling the pipeline permanently. \
+                     Fix: SET GLOBAL binlog_row_value_options = '' (and persist it in \
+                     my.cnf)."
+                )));
+            }
         }
 
         let _ = backend.master_position().await?;
@@ -957,11 +1080,12 @@ impl Source for MysqlConnection {
         stream.stream_state = StreamState::Streaming;
 
         // Store stream start watermark so perform_handoff can validate the gap-free invariant.
-        self.stream_start = Some(MysqlOffset {
-            binlog_file: start.binlog_file.clone(),
-            binlog_pos: start.binlog_pos,
-            gtid: start.gtid.clone(),
-        });
+        self.stream_start = Some(MysqlOffset::new(
+            self.config.server_flavor.source_name(),
+            start.binlog_file.clone(),
+            start.binlog_pos,
+            start.gtid.clone(),
+        ));
 
         Ok(Box::new(MysqlStreamHandle::new(
             self.source_type().to_string(),
@@ -972,6 +1096,7 @@ impl Source for MysqlConnection {
                     start.binlog_file,
                     start.binlog_pos,
                     self.config.gtid_mode_enabled,
+                    &start.gtid,
                     self.stream_poll_interval_ms,
                 )
                 .await?,
@@ -1148,11 +1273,16 @@ impl StreamHandle for MysqlStreamHandle {
         &self,
         checkpoint: &mut dyn crate::checkpoint::Checkpoint,
     ) -> Result<()> {
-        let offset = MysqlOffset {
-            gtid: self.stream.gtid.clone(),
-            binlog_file: self.stream.binlog_file.clone(),
-            binlog_pos: self.stream.binlog_pos,
-        };
+        // `source_name` is the flavor ("mysql" or "mariadb") and determines the
+        // checkpoint file name. Hardcoding "mysql" made a MariaDB stream write
+        // checkpoint_mysql.json, find nothing on restart, and silently resume from the
+        // current binlog position.
+        let offset = MysqlOffset::new(
+            self.source_name.clone(),
+            self.stream.binlog_file.clone(),
+            self.stream.binlog_pos,
+            self.stream.gtid.clone(),
+        );
         checkpoint.save(&offset, self.events_polled).await
     }
 
@@ -1179,6 +1309,48 @@ trait ValidationBackend: Send + Sync {
     async fn has_replication_privilege(&self) -> Result<bool>;
     async fn binlog_enabled(&self) -> Result<bool>;
     async fn master_position(&self) -> Result<(String, u64)>;
+    /// `@@GLOBAL.binlog_row_metadata` — `FULL` or `MINIMAL`.
+    ///
+    /// MySQL 8.0/8.4 default to `MINIMAL`, under which `TABLE_MAP` events carry no
+    /// column names and no primary-key flags. The binlog decoder then synthesizes
+    /// positional placeholders (`@0`, `@1`, …) and reports `primary_key: None`.
+    ///
+    /// Returns `None` when the server does not expose the variable (older MariaDB),
+    /// in which case the check is skipped rather than failing the connection.
+    async fn binlog_row_metadata(&self) -> Result<Option<String>>;
+    /// `@@GLOBAL.binlog_row_image` — `FULL`, `MINIMAL`, or `NOBLOB`.
+    ///
+    /// Anything other than `FULL` yields partial before/after images that this
+    /// connector cannot distinguish from complete ones. `None` when unsupported.
+    async fn binlog_row_image(&self) -> Result<Option<String>>;
+    /// `@@GLOBAL.binlog_row_value_options` — empty, or `PARTIAL_JSON`.
+    ///
+    /// `PARTIAL_JSON` emits JSON diffs the row decoder cannot convert. `None` when
+    /// the server does not expose the variable (MariaDB).
+    async fn binlog_row_value_options(&self) -> Result<Option<String>>;
+}
+
+/// Read a global server variable, returning `None` when the server does not define it.
+///
+/// MySQL raises `ERROR 1193 (Unknown system variable)` for variables it does not
+/// support — notably `binlog_row_metadata` and `binlog_row_value_options`, which do
+/// not exist on MariaDB. Treating that as "not applicable" lets the same validation
+/// run against both flavors without failing MariaDB outright.
+async fn query_optional_global_var(pool: &MySqlPool, expr: &str) -> Result<Option<String>> {
+    let mut conn = pool.get_conn().await.map_err(|error| {
+        Error::SourceError(format!("failed to open connection for {expr}: {error}"))
+    })?;
+    match conn
+        .query_first::<Option<String>, _>(format!("SELECT {expr}"))
+        .await
+    {
+        Ok(value) => Ok(value.flatten()),
+        // Unknown system variable — the server does not support this setting.
+        Err(error) if error.to_string().contains("1193") => Ok(None),
+        Err(error) => Err(Error::SourceError(format!(
+            "failed to query {expr}: {error}"
+        ))),
+    }
 }
 
 struct LiveValidationBackend<'a> {
@@ -1245,6 +1417,18 @@ impl ValidationBackend for LiveValidationBackend<'_> {
         Ok(value.unwrap_or_default() != 0)
     }
 
+    async fn binlog_row_metadata(&self) -> Result<Option<String>> {
+        query_optional_global_var(self.pool, "@@GLOBAL.BINLOG_ROW_METADATA").await
+    }
+
+    async fn binlog_row_image(&self) -> Result<Option<String>> {
+        query_optional_global_var(self.pool, "@@GLOBAL.BINLOG_ROW_IMAGE").await
+    }
+
+    async fn binlog_row_value_options(&self) -> Result<Option<String>> {
+        query_optional_global_var(self.pool, "@@GLOBAL.BINLOG_ROW_VALUE_OPTIONS").await
+    }
+
     async fn master_position(&self) -> Result<(String, u64)> {
         let mut conn = self.pool.get_conn().await.map_err(|error| {
             Error::SourceError(format!("failed to query master status: {error}"))
@@ -1301,17 +1485,48 @@ mod tests {
     use crate::ddl_capture::{extract_captured_ddl, DdlDialect};
     use crate::SecretString;
 
-    #[derive(Default)]
     struct MockValidationBackend {
         gtid_mode_enabled: bool,
         binlog_format_row: bool,
         has_replication_privilege: bool,
         binlog_enabled: bool,
         master_position_called: Arc<AtomicBool>,
+        binlog_row_metadata: Option<String>,
+        binlog_row_image: Option<String>,
+        binlog_row_value_options: Option<String>,
+    }
+
+    impl Default for MockValidationBackend {
+        fn default() -> Self {
+            // Default to a correctly configured server so existing tests exercise the
+            // checks they were written for, not the row-image guards.
+            Self {
+                gtid_mode_enabled: false,
+                binlog_format_row: false,
+                has_replication_privilege: false,
+                binlog_enabled: false,
+                master_position_called: Arc::new(AtomicBool::new(false)),
+                binlog_row_metadata: Some("FULL".into()),
+                binlog_row_image: Some("FULL".into()),
+                binlog_row_value_options: Some(String::new()),
+            }
+        }
     }
 
     #[async_trait]
     impl ValidationBackend for MockValidationBackend {
+        async fn binlog_row_metadata(&self) -> crate::core::Result<Option<String>> {
+            Ok(self.binlog_row_metadata.clone())
+        }
+
+        async fn binlog_row_image(&self) -> crate::core::Result<Option<String>> {
+            Ok(self.binlog_row_image.clone())
+        }
+
+        async fn binlog_row_value_options(&self) -> crate::core::Result<Option<String>> {
+            Ok(self.binlog_row_value_options.clone())
+        }
+
         async fn gtid_mode_enabled(&self) -> crate::core::Result<bool> {
             Ok(self.gtid_mode_enabled)
         }
@@ -1570,13 +1785,110 @@ mod tests {
             binlog_format_row: true,
             has_replication_privilege: true,
             binlog_enabled: true,
-            master_position_called: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
         };
 
         MysqlConnection::validate_with_backend(&config, &backend)
             .await
             .unwrap();
         assert!(backend.master_position_called.load(Ordering::Relaxed));
+    }
+
+    /// Base config for the row-image fidelity guards below.
+    fn row_image_guard_config() -> MysqlSourceConfig {
+        MysqlSourceConfig {
+            host: "localhost".into(),
+            port: 3306,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            server_id: 10,
+            gtid_mode_enabled: false,
+            binlog_format_check: true,
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        }
+    }
+
+    fn row_image_guard_backend() -> MockValidationBackend {
+        MockValidationBackend {
+            gtid_mode_enabled: false,
+            binlog_format_row: true,
+            has_replication_privilege: true,
+            binlog_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_minimal_binlog_row_metadata() {
+        // MySQL 8's default. Without FULL the binlog carries no column names and no
+        // PK flags, so events would be emitted with `@0`/`@1` keys and no primary key.
+        let backend = MockValidationBackend {
+            binlog_row_metadata: Some("MINIMAL".into()),
+            ..row_image_guard_backend()
+        };
+
+        let error = MysqlConnection::validate_with_backend(&row_image_guard_config(), &backend)
+            .await
+            .expect_err("MINIMAL binlog_row_metadata must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("binlog_row_metadata"), "{message}");
+        assert!(message.contains("FULL"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_non_full_binlog_row_image() {
+        for value in ["MINIMAL", "NOBLOB"] {
+            let backend = MockValidationBackend {
+                binlog_row_image: Some(value.into()),
+                ..row_image_guard_backend()
+            };
+
+            let error = MysqlConnection::validate_with_backend(&row_image_guard_config(), &backend)
+                .await
+                .expect_err("non-FULL binlog_row_image must be rejected");
+            let message = error.to_string();
+            assert!(message.contains("binlog_row_image"), "{message}");
+            assert!(message.contains(value), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_partial_json_row_value_options() {
+        // PARTIAL_JSON emits JSON diffs the row decoder cannot convert, and the failure
+        // recurs on every restart because it precedes any checkpoint advance.
+        let backend = MockValidationBackend {
+            binlog_row_value_options: Some("PARTIAL_JSON".into()),
+            ..row_image_guard_backend()
+        };
+
+        let error = MysqlConnection::validate_with_backend(&row_image_guard_config(), &backend)
+            .await
+            .expect_err("PARTIAL_JSON binlog_row_value_options must be rejected");
+        assert!(
+            error.to_string().contains("binlog_row_value_options"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_skips_row_image_guards_when_server_lacks_the_variables() {
+        // MariaDB does not define binlog_row_metadata / binlog_row_value_options.
+        // `None` means "unsupported", which must not fail the connection.
+        let backend = MockValidationBackend {
+            binlog_row_metadata: None,
+            binlog_row_image: None,
+            binlog_row_value_options: None,
+            ..row_image_guard_backend()
+        };
+
+        MysqlConnection::validate_with_backend(&row_image_guard_config(), &backend)
+            .await
+            .expect("absent variables must be treated as not-applicable, not as a failure");
     }
 
     #[tokio::test]
@@ -1864,6 +2176,7 @@ mod tests {
             gtid: "uuid:3-5".into(),
             binlog_file: "mysql-bin.000010".into(),
             binlog_pos: 777,
+            source_flavor: "mysql".into(),
         };
         let restored = super::parser::decode_stream_resume_position("mysql", &offset).unwrap();
         assert_eq!(restored.binlog_file, "mysql-bin.000010");
@@ -2219,6 +2532,8 @@ mod tests {
             }),
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -2227,6 +2542,7 @@ mod tests {
         let wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 1024,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let mut conn = make_connection_with_watermarks(wm.clone(), wm.clone());
@@ -2244,11 +2560,13 @@ mod tests {
         let snapshot_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 2048,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 512,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
@@ -2265,11 +2583,13 @@ mod tests {
         let snapshot_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 512,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 1024,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
@@ -2286,11 +2606,13 @@ mod tests {
         let snapshot_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 9999,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000002".into(),
             binlog_pos: 4,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
@@ -2322,6 +2644,7 @@ mod tests {
         conn.stream_start = Some(MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 4,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         });
         let err = conn
@@ -2336,11 +2659,13 @@ mod tests {
         let snapshot_wm = MysqlOffset {
             binlog_file: "mysql-bin.000002".into(),
             binlog_pos: 100,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 9999,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
@@ -2357,11 +2682,13 @@ mod tests {
         let snapshot_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 100,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 10,
+            source_flavor: "mysql".into(),
             gtid: String::new(),
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
@@ -2408,6 +2735,108 @@ mod tests {
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].after.as_ref().unwrap()["id"], json!(10));
         assert_eq!(deduped[1].after.as_ref().unwrap()["id"], json!(11));
+    }
+
+    /// A GTID checkpoint must accumulate a **set**, never collapse to one GTID.
+    ///
+    /// The stream previously assigned `stream.gtid = <single gtid>` on every GtidEvent,
+    /// overwriting the executed set read at startup. A connector that began at
+    /// `uuid:1-500` and processed one more transaction checkpointed `uuid:501` —
+    /// resuming from which tells the server the replica executed only transaction 501,
+    /// replaying 1–500 as a silent mass duplication.
+    #[test]
+    fn gtid_merge_accumulates_a_set_instead_of_overwriting() {
+        use super::query::merge_gtid_into_set;
+        const UUID: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+        // The catastrophic case: an existing range plus the next transaction. The
+        // range must EXTEND to 1-501. Overwriting to a bare `501` is what caused the
+        // replay of 1-500.
+        let merged = merge_gtid_into_set(&format!("{UUID}:1-500"), &format!("{UUID}:501"));
+        assert_eq!(
+            merged,
+            format!("{UUID}:1-501"),
+            "an adjacent transaction must extend the existing range, never replace it"
+        );
+        assert_ne!(
+            merged,
+            format!("{UUID}:501"),
+            "collapsing the set to a single GTID replays every earlier transaction"
+        );
+
+        // Consecutive transactions coalesce rather than accumulating one entry each —
+        // otherwise the set grows without bound over a long-running stream.
+        let mut set = format!("{UUID}:1");
+        for gno in 2..=50 {
+            set = merge_gtid_into_set(&set, &format!("{UUID}:{gno}"));
+        }
+        assert_eq!(set, format!("{UUID}:1-50"), "got {set}");
+
+        // A gap must be preserved, not silently bridged — bridging would claim
+        // transactions we never saw, so the server would skip them.
+        let gapped = merge_gtid_into_set(&format!("{UUID}:1-5"), &format!("{UUID}:9"));
+        assert_eq!(gapped, format!("{UUID}:1-5:9"), "got {gapped}");
+
+        // A single transaction renders as `m`, never `m-m`: MySQL's grammar requires
+        // n > m strictly in the range form and rejects `9-9`.
+        assert_eq!(
+            merge_gtid_into_set("", &format!("{UUID}:9")),
+            format!("{UUID}:9")
+        );
+
+        // Multiple source UUIDs (multi-primary) are preserved independently.
+        const UUID2: &str = "11111111-2222-3333-4444-555555555555";
+        let multi = merge_gtid_into_set(&format!("{UUID}:1-5,{UUID2}:1-2"), &format!("{UUID2}:3"));
+        assert!(multi.contains(&format!("{UUID}:1-5")), "got {multi}");
+        assert!(multi.contains(&format!("{UUID2}:1-3")), "got {multi}");
+
+        // Re-seeing an already-covered transaction is a no-op, not a duplicate entry.
+        let idempotent = merge_gtid_into_set(&format!("{UUID}:1-10"), &format!("{UUID}:5"));
+        assert_eq!(idempotent, format!("{UUID}:1-10"));
+    }
+
+    /// The parser that feeds `COM_BINLOG_DUMP_GTID` must accept what we checkpoint.
+    ///
+    /// Per-UUID parsing is delegated to `mysql_common`'s `Sid: FromStr`, which also owns
+    /// the binary encoding — so the text we write and the packet we send cannot drift
+    /// apart. This test guards the set-level splitting we do ourselves.
+    #[test]
+    fn gtid_set_parses_into_sids_for_the_dump_request() {
+        const UUID: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        const UUID2: &str = "11111111-2222-3333-4444-555555555555";
+
+        assert!(
+            super::parse_gtid_set("").unwrap().is_empty(),
+            "an empty set means 'no GTID position known'"
+        );
+        assert!(super::parse_gtid_set("   ").unwrap().is_empty());
+
+        assert_eq!(
+            super::parse_gtid_set(&format!("{UUID}:1-500"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::parse_gtid_set(&format!("{UUID}:1-5:9,{UUID2}:1-2"))
+                .unwrap()
+                .len(),
+            2,
+            "each comma-separated uuid_set becomes one Sid"
+        );
+
+        // Round-trip: whatever `merge_gtid_into_set` produces must parse back.
+        let merged =
+            super::query::merge_gtid_into_set(&format!("{UUID}:1-5"), &format!("{UUID}:9"));
+        assert!(
+            super::parse_gtid_set(&merged).is_ok(),
+            "checkpointed set must be parseable for resume: {merged}"
+        );
+
+        assert!(
+            super::parse_gtid_set("not-a-uuid:1").is_err(),
+            "a malformed set must fail loud rather than silently positioning nowhere"
+        );
     }
 
     #[test]

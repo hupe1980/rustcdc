@@ -350,9 +350,11 @@ WARNING snapshot progress stalled (no new chunks for 30s)
 
 5. **Check transform pipeline overhead:**
    ```bash
-   # From metrics
-   curl http://otel-collector:9090/metrics | grep "rustcdc_transform_duration"
-   # p95 should be < 1ms per event
+   # There is no `rustcdc_transform_duration` metric. Transform cost is not
+   # instrumented; measure it in your own transform wrapper, or compare
+   # events_polled_total against events_committed_total over time:
+   curl http://localhost:9090/metrics | \
+     grep -E "rustcdc_runtime_events_(polled|committed)_total"
    ```
 
 **Resolution:**
@@ -452,9 +454,13 @@ ERROR detected missing event (event_id=12346 skipped)
 
 4. **Check for transform filtering:**
    ```bash
-   # From metrics
-   curl http://otel-collector:9090/metrics | grep "rustcdc_events_filtered"
-   # Should be intentional drops; not unexpected
+   # There is no `rustcdc_events_filtered` metric. The closest available signal is
+   # the deduplication counter; transform-filtered events are not counted at all
+   # Transform-filtered events are counted separately: see
+   # `rustcdc_runtime_events_skipped_total`, which counts events dropped by
+   # TransformErrorPolicy::Skip. Any non-zero value means data was lost.
+   curl http://localhost:9090/metrics | \
+     grep "rustcdc_runtime_events_deduplicated_total"
    ```
 
 **Resolution:**

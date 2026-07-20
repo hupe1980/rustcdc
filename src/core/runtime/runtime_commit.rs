@@ -83,21 +83,45 @@ impl CdcRuntime {
 
         if let Some(lsn) = confirmation_lsn {
             if let Some(stream) = self.stream.as_mut() {
-                if let Err(error) = stream.confirm_lsn(lsn).await {
-                    self.record_runtime_error("runtime.commit.confirm_lsn", &error);
-                    post_commit_failures.push(("stream confirm_lsn", error));
+                match stream.confirm_lsn(lsn).await {
+                    Ok(()) => {
+                        // Confirmed: any earlier unconfirmed position is now superseded.
+                        self.pending_confirmation_lsn = None;
+                        self.unconfirmed_stall_polls = 0;
+                    }
+                    Err(error) => {
+                        // Retain the LSN so the next poll can retry *before* the
+                        // idempotency guard suppresses the replayed events. Without
+                        // this the runtime stalls silently and forever.
+                        self.pending_confirmation_lsn = Some(lsn);
+                        self.record_runtime_error("runtime.commit.confirm_lsn", &error);
+                        post_commit_failures.push(("stream confirm_lsn", error));
+                    }
                 }
             }
         }
 
-        let committed_events = self
-            .pending_delivery
-            .as_ref()
-            .map(|pending| {
-                let start = pending.committed_prefix;
-                pending.events[start..start + count].to_vec()
-            })
-            .unwrap_or_default();
+        // Build trace ids only when a tracer will actually consume them.
+        //
+        // This used to deep-clone every committed event — both `serde_json::Value`
+        // trees — solely to pass them to `trace_event_end`, whose default
+        // implementation has an empty body. In the default configuration that was a
+        // full copy of the entire batch, per commit, thrown away immediately.
+        let tracing_enabled = self.observability().tracer.is_enabled();
+        let committed_trace_ids: Vec<String> = if tracing_enabled {
+            self.pending_delivery
+                .as_ref()
+                .map(|pending| {
+                    let start = pending.committed_prefix;
+                    pending.events[start..start + count]
+                        .iter()
+                        .map(Self::event_trace_id)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         self.delivered_not_committed -= count;
         self.total_events_committed = self.total_events_committed.saturating_add(count as u64);
@@ -114,10 +138,10 @@ impl CdcRuntime {
         self.observability()
             .metrics
             .record_checkpoint_committed(count as u64, latency_ms);
-        for event in &committed_events {
+        for trace_id in &committed_trace_ids {
             self.observability()
                 .tracer
-                .trace_event_end(&Self::event_trace_id(event), "committed");
+                .trace_event_end(trace_id, "committed");
         }
         self.observability()
             .tracer

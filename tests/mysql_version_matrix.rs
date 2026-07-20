@@ -43,6 +43,18 @@ async fn run_mysql_connection_lifecycle(version: &str, server_id: u32) -> rustcd
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
         .with_env_var("MYSQL_DATABASE", "cdc")
+        // rustcdc requires FULL row metadata and row images. MySQL 8 defaults
+        // binlog_row_metadata to MINIMAL, under which the binlog carries no column
+        // names and no primary-key flags — events would be emitted with positional
+        // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
+        // the test server must be configured the way a production server must be.
+        .with_cmd(vec![
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
+            format!("--server-id={server_id}").as_str(),
+        ])
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
@@ -117,6 +129,18 @@ async fn mysql_capabilities_are_consistent_in_matrix_profile() -> rustcdc::Resul
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
         .with_env_var("MYSQL_DATABASE", "cdc")
+        // rustcdc requires FULL row metadata and row images. MySQL 8 defaults
+        // binlog_row_metadata to MINIMAL, under which the binlog carries no column
+        // names and no primary-key flags — events would be emitted with positional
+        // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
+        // the test server must be configured the way a production server must be.
+        .with_cmd(vec![
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
+            "--server-id=1",
+        ])
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;

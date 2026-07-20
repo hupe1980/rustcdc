@@ -240,6 +240,31 @@ pub struct PostgresSourceConfig {
     /// Example: "rustcdc_slot"
     pub replication_slot_name: String,
 
+    /// Whether `connect()` may create the replication slot when it does not exist.
+    /// Default: `false` — the safe setting for a running pipeline.
+    ///
+    /// A slot that vanishes mid-life — dropped by an operator, lost to a failover to a
+    /// replica that never had it, or invalidated by `max_slot_wal_keep_size` — is a
+    /// DATA-LOSS event: the WAL it was retaining is gone. Recreating it silently
+    /// restarts capture at the current WAL position and skips everything in between,
+    /// which looks exactly like healthy operation.
+    ///
+    /// Set to `true` only for first-time provisioning or ephemeral test databases.
+    /// In production, prefer creating the slot out of band:
+    ///   SELECT pg_create_logical_replication_slot('rustcdc_slot', 'pgoutput');
+    pub create_replication_slot_if_missing: bool,
+
+    /// Create the slot with `failover = true` (PostgreSQL 17+).
+    /// Default: `false`.
+    ///
+    /// A failover-enabled slot is synchronized to physical standbys, so logical
+    /// replication resumes from the new primary after a promotion. Without it the slot
+    /// exists only on the old primary and is LOST on failover — taking every change
+    /// since the last confirmed LSN with it, and forcing a re-snapshot.
+    ///
+    /// Only applies when this connector creates the slot.
+    pub failover_slot: bool,
+
     /// Publication name used by pgoutput
     /// Example: "rustcdc_publication"
     pub publication_name: String,
@@ -454,6 +479,63 @@ Operationally, all connectors remain at-least-once at the runtime boundary; down
 
 ## MySQL Source Configuration
 
+### Required server configuration
+
+`MysqlConnection::connect()` validates these and **fails loud** if they are unsuitable. Each
+unsuitable value would otherwise cause *silent* corruption rather than an error at decode time,
+so none of them can be downgraded to a warning.
+
+| Variable | Required | MySQL 8 default | Why |
+|---|---|---|---|
+| `log_bin` | `ON` | `ON` | No binlog, no CDC. |
+| `binlog_format` | `ROW` | `ROW` | Statement-based logging cannot identify which rows changed. |
+| `binlog_row_metadata` | **`FULL`** | ⚠️ **`MINIMAL`** | Under `MINIMAL` the binlog carries **no column names and no primary-key flags**. Events would be emitted with positional placeholder keys (`@0`, `@1`, …) instead of real column names, and `primary_key: None` — which additionally disables snapshot/stream duplicate suppression and incremental-snapshot override suppression. |
+| `binlog_row_image` | **`FULL`** | `FULL` | Under `MINIMAL`/`NOBLOB` the binlog records only a subset of columns, so UPDATE after-images are emitted as if complete while silently missing columns. A consumer performing an upsert would erase them. |
+| `binlog_row_value_options` | **empty** | empty | `PARTIAL_JSON` makes the server write JSON *diffs* instead of complete values. rustcdc cannot apply those diffs, and the failure recurs on every restart because it precedes the checkpoint advance — stalling the pipeline permanently. |
+
+```sql
+SET GLOBAL binlog_row_metadata     = FULL;
+SET GLOBAL binlog_row_image        = FULL;
+SET GLOBAL binlog_row_value_options = '';
+```
+
+Persist these in `my.cnf` so they survive a restart. Note `binlog_row_metadata` only affects binlog
+events written **after** the change — existing binlog content keeps the old encoding.
+
+> **MariaDB:** `binlog_row_metadata` and `binlog_row_value_options` do not exist. The connector
+> detects their absence and skips those two checks rather than failing.
+
+### GTID positioning
+
+When `gtid_mode_enabled` is set, the connector resumes by **GTID set** rather than by
+binlog file+position. This matters for failover: binlog coordinates are *server-local*, so
+`binlog.000042:88371` addresses an unrelated point on a promoted replica. GTIDs are globally
+meaningful, which is the reason they exist.
+
+The checkpoint accumulates a full executed set (`uuid:1-500,uuid2:1-7`), coalescing adjacent
+intervals so it stays compact over a long-running stream. Encoding of the
+`COM_BINLOG_DUMP_GTID` packet is delegated to `mysql_common`, so the text form written to the
+checkpoint and the bytes sent to the server cannot drift apart.
+
+> **The checkpoint must be a set, never a single GTID.** Resuming from a bare `uuid:501`
+> tells the server the replica has executed only transaction 501, and it replays 1–500.
+
+### Binlog retention and resume safety
+
+On resume, the connector verifies the server still retains everything the checkpointed
+position has not consumed, using `GTID_SUBSET(@@GLOBAL.gtid_purged, <checkpoint position>)`.
+If the check fails it stops with an `Unrecoverable` error naming the exact purged-but-unread
+transactions, rather than letting the server fail with a generic *"could not find first log
+file"* that says nothing about how much was lost.
+
+Set `binlog_expire_logs_seconds` so retention comfortably exceeds your maximum expected
+connector downtime. (Note `expire_logs_days` was **removed** in MySQL 8.4 — using it now
+raises an error at startup.)
+
+> The subset direction matters and is easy to invert. The correct test is "everything the
+> server purged, I already consumed". The intuitive inverse — "my position is a subset of
+> what the server executed" — **fails open**: it reports available in precisely the gap case.
+
 ```rust
 pub struct MysqlSourceConfig {
     /// MySQL host (FQDN or IP)
@@ -477,8 +559,14 @@ pub struct MysqlSourceConfig {
     /// Database name to replicate from
     pub database: String,
     
-    /// Replication server id used by binlog stream client
-    /// Default: 1
+    /// Replication server id used by the binlog stream client.
+    ///
+    /// Default: `0`, which is deliberately *not* a usable value — MySQL treats 0 as
+    /// "not assigned" and `validate()` rejects it. You MUST set a unique id per
+    /// connector instance. Auto-generation was removed because PID-hash collisions
+    /// caused silent event loss in multi-instance deployments with no recoverable
+    /// signal: two readers sharing a server_id cause the server to evict one, and the
+    /// eviction surfaces only as a generic disconnect.
     pub server_id: u32,
 
     /// Whether GTID mode is enabled in your deployment.
@@ -678,7 +766,8 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
   "offset": {
     "lsn": 281474976711680,
     "slot_name": "rustcdc_postgres_abc123"
-  }
+  },
+  "content_checksum": "9f2b...(SHA-256 over the four fields above)"
 }
 ```
 
@@ -687,6 +776,29 @@ checkpoint from unauthorized access. Do not set a mode wider than 0o600.
 - `checkpoint_format_version` is required for all file checkpoints.
 - Unknown or missing versions are rejected at load time.
 - rustcdc intentionally enforces fail-closed checkpoint decoding for format safety.
+
+**Integrity:**
+
+`content_checksum` is a SHA-256 over the other fields. It is verified on every load, and a
+mismatch is a hard error rather than a resume.
+
+This matters because checkpoint corruption is otherwise **silent**. A flipped bit in an LSN
+or binlog position does not fail to parse — it resumes capture from a *wrong* position,
+skipping events with no error raised anywhere.
+
+The practical consequence: **checkpoint files cannot be edited or generated by hand.** For
+disaster recovery use the bundled seeding tool, which computes the checksum, writes
+atomically, applies the required file mode and fsyncs the parent directory:
+
+```bash
+cargo run --example seed_checkpoint --features postgres -- \
+  --dir /var/rustcdc/checkpoints \
+  --source-type postgres \
+  --committed-event-count 0 \
+  --offset '{"lsn": 281474976711680, "slot_name": "rustcdc_postgres_new"}'
+```
+
+Programmatically, the same operation is `FileCheckpoint::restore_from_record`.
 
 ### Custom Durable Checkpoint Backend
 
@@ -720,7 +832,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.6.7",                         // Service version
+    "0.7.0",                         // Service version
     "production",                    // Environment
 );
 

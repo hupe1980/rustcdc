@@ -168,6 +168,8 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
         database: "cdc".to_string(),
         replication_slot_name: "rustcdc_runtime_crash_snapshot_slot".to_string(),
         publication_name: "rustcdc_runtime_crash_snapshot_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
@@ -365,6 +367,8 @@ async fn run_postgres_process_kill_replay_scenario(
         database: "cdc".to_string(),
         replication_slot_name: "rustcdc_runtime_crash_slot".to_string(),
         publication_name: "rustcdc_runtime_crash_pub".to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,

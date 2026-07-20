@@ -32,116 +32,11 @@ const CONTENT_TYPE: &str = "avro/binary";
 
 /// Avro schema (JSON) for the canonical CDC event envelope.
 ///
-/// Also available as `schemas/event.avsc` in the repository.
+/// Loaded from `schemas/event.avsc` at compile time, so the published schema file and
+/// the encoder can never drift apart.
 /// Register this schema with your schema registry to enable Confluent
 /// Schema Registry framing (see module docs).
-pub const AVRO_SCHEMA: &str = r#"{
-  "type": "record",
-  "name": "Event",
-  "namespace": "io.rustcdc",
-  "doc": "Canonical CDC event envelope — rustcdc envelope_version=1",
-  "fields": [
-    {
-      "name": "before",
-      "type": ["null", "bytes"],
-      "default": null,
-      "doc": "JSON-encoded before-image. null for INSERT events."
-    },
-    {
-      "name": "after",
-      "type": ["null", "bytes"],
-      "default": null,
-      "doc": "JSON-encoded after-image. null for DELETE events."
-    },
-    {
-      "name": "op",
-      "type": {
-        "type": "enum",
-        "name": "Operation",
-        "namespace": "io.rustcdc",
-        "symbols": ["INSERT", "UPDATE", "DELETE", "READ", "SCHEMA_CHANGE", "TRUNCATE"],
-        "doc": "CRUD operation that produced this event."
-      }
-    },
-    {
-      "name": "source",
-      "type": {
-        "type": "record",
-        "name": "SourceMetadata",
-        "namespace": "io.rustcdc",
-        "fields": [
-          {"name": "source_name", "type": "string", "doc": "Logical connector name"},
-          {"name": "offset",      "type": "string", "doc": "Source-specific durable position"},
-          {"name": "timestamp",   "type": "long",   "doc": "Source timestamp in ms since epoch"}
-        ]
-      }
-    },
-    {
-      "name": "ts",
-      "type": "long",
-      "doc": "Event timestamp in milliseconds since Unix epoch."
-    },
-    {
-      "name": "schema",
-      "type": ["null", "string"],
-      "default": null,
-      "doc": "Database schema name. null when unknown."
-    },
-    {
-      "name": "table",
-      "type": "string",
-      "doc": "Table name that produced the event."
-    },
-    {
-      "name": "primary_key",
-      "type": {"type": "array", "items": "string"},
-      "default": [],
-      "doc": "Ordered list of primary key column names."
-    },
-    {
-      "name": "snapshot",
-      "type": ["null", {
-        "type": "record",
-        "name": "SnapshotMetadata",
-        "namespace": "io.rustcdc",
-        "fields": [
-          {"name": "snapshot_id",   "type": "string"},
-          {"name": "chunk_index",   "type": "int"},
-          {"name": "is_last_chunk", "type": "boolean"}
-        ]
-      }],
-      "default": null,
-      "doc": "Snapshot phase metadata. null outside snapshot."
-    },
-    {
-      "name": "transaction",
-      "type": ["null", {
-        "type": "record",
-        "name": "TransactionMetadata",
-        "namespace": "io.rustcdc",
-        "fields": [
-          {"name": "tx_id",        "type": "long"},
-          {"name": "total_events", "type": "int"},
-          {"name": "event_index",  "type": "int"}
-        ]
-      }],
-      "default": null,
-      "doc": "Transaction metadata. null for single-event transactions."
-    },
-    {
-      "name": "envelope_version",
-      "type": "int",
-      "default": 1,
-      "doc": "Canonical envelope schema version. Currently always 1."
-    },
-    {
-      "name": "before_is_key_only",
-      "type": "boolean",
-      "default": false,
-      "doc": "True when 'before' contains only primary-key columns (PostgreSQL DEFAULT REPLICA IDENTITY). Always false for non-UPDATE or non-PostgreSQL events."
-    }
-  ]
-}"#;
+pub const AVRO_SCHEMA: &str = include_str!("../../schemas/event.avsc");
 
 // ─── Operation index mapping ──────────────────────────────────────────────────
 //
@@ -204,6 +99,8 @@ fn op_avro_symbol(op: Operation) -> &'static str {
 ///     transaction: None,
 ///     envelope_version: EVENT_ENVELOPE_VERSION,
 ///     before_is_key_only: false,
+///     unavailable_columns: Vec::new(),
+///     before_unavailable_columns: Vec::new(),
 /// };
 /// let out = encoder.encode(&event).unwrap();
 /// assert_eq!(out.content_type, "avro/binary");
@@ -339,6 +236,26 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
             "before_is_key_only".into(),
             AvroValue::Boolean(event.before_is_key_only),
         ),
+        (
+            "unavailable_columns".into(),
+            AvroValue::Array(
+                event
+                    .unavailable_columns
+                    .iter()
+                    .map(|column| AvroValue::String(column.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            "before_unavailable_columns".into(),
+            AvroValue::Array(
+                event
+                    .before_unavailable_columns
+                    .iter()
+                    .map(|column| AvroValue::String(column.clone()))
+                    .collect(),
+            ),
+        ),
     ]))
 }
 
@@ -373,6 +290,8 @@ mod tests {
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -398,6 +317,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -506,6 +427,43 @@ mod tests {
         // The schema name should be "Event"
         let json = enc.schema().canonical_form();
         assert!(json.contains("Event"), "schema should contain 'Event'");
+    }
+
+    #[test]
+    /// A partial payload that survives encoding as if it were complete is silent
+    /// corruption at the sink. Both availability lists must reach the wire, and they must
+    /// stay distinct — a merged list marks genuinely-changed columns as unwritable.
+    fn availability_lists_round_trip_separately() {
+        let enc = AvroEncoder::new().unwrap();
+        let mut event = update_event();
+        event.unavailable_columns = vec!["big_kept".into()];
+        event.before_unavailable_columns = vec!["big_changed".into()];
+        let out = enc.encode(&event).unwrap();
+
+        let mut reader = out.bytes.as_slice();
+        let decoded = from_avro_datum(enc.schema(), &mut reader, None).unwrap();
+
+        let AvroValue::Record(fields) = decoded else {
+            panic!("expected Record");
+        };
+        let list = |name: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(AvroValue::Null)
+        };
+        assert_eq!(
+            list("unavailable_columns"),
+            AvroValue::Array(vec![AvroValue::String("big_kept".into())]),
+            "the after-image holes must reach the wire, or an Avro sink cannot know the \
+             payload is partial"
+        );
+        assert_eq!(
+            list("before_unavailable_columns"),
+            AvroValue::Array(vec![AvroValue::String("big_changed".into())]),
+            "the before-image holes must stay separate from the after-image holes"
+        );
     }
 
     #[test]

@@ -1,5 +1,8 @@
 use crate::{
-    core::{Event, Operation, Result, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
+    core::{
+        Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
+        EVENT_ENVELOPE_VERSION,
+    },
     ddl_capture::CapturedDdl,
     schema_history::{ColumnDef, TableSchema},
     source::{helpers::now_millis, table_is_allowed},
@@ -82,15 +85,60 @@ fn pg_type_name(oid: u32) -> String {
 }
 
 impl PostgresStreamHandle {
-    fn tuple_to_json(&self, relation_oid: u32, values: &[PgValue]) -> Option<serde_json::Value> {
-        let relation = self.relation_map.get(&relation_oid)?;
+    /// Decode a pgoutput tuple into a JSON object.
+    ///
+    /// Returns `Err` rather than `None` for both failure modes. Both used to be
+    /// silent: an unknown relation OID made the caller discard the whole event with
+    /// no warning and no counter, and a column-count overflow collapsed every extra
+    /// column onto one key. A missing RELATION is a protocol violation, not a
+    /// filterable condition — pgoutput is required to send RELATION before any row
+    /// referencing it — so the only safe response to either is to stop.
+    /// Returns the decoded row plus the names of any columns the source could not
+    /// supply (PostgreSQL unchanged-TOAST). Those columns are absent from the row, and
+    /// the caller must surface them on the event so a consumer does not mistake
+    /// "unavailable" for NULL and overwrite a value that never changed.
+    fn tuple_to_json(
+        &self,
+        relation_oid: u32,
+        values: &[PgValue],
+    ) -> Result<(serde_json::Value, Vec<String>)> {
+        let relation = self.relation_map.get(&relation_oid).ok_or_else(|| {
+            Error::SourceError(format!(
+                "postgres row event references relation oid {relation_oid} for which no \
+                 RELATION message has been seen. pgoutput guarantees RELATION precedes \
+                 any row referencing it, so the decoder state is inconsistent and the row \
+                 cannot be attributed to a table. Dropping it would lose data silently. \
+                 Restart the connector to rebuild the relation cache."
+            ))
+        })?;
         let mut map = serde_json::Map::new();
+        let mut unavailable = Vec::new();
         for (i, value) in values.iter().enumerate() {
-            let col_name = relation
-                .columns
-                .get(i)
-                .map(|c| c.name.as_str())
-                .unwrap_or("?");
+            // A tuple with more columns than the cached RELATION means our schema view
+            // is stale — the table gained a column and we missed (or have not yet
+            // processed) the new RELATION message.
+            //
+            // This used to fall back to the literal name `"?"`. Because the row is
+            // assembled into a `serde_json::Map`, *every* overflow column collapsed
+            // onto that one key and overwrote the previous one — silent, unlogged data
+            // destruction. Failing is the only safe response: the alternative is
+            // emitting a row that claims to be complete while having quietly discarded
+            // columns.
+            let Some(column) = relation.columns.get(i) else {
+                return Err(Error::SourceError(format!(
+                    "postgres tuple for relation '{}.{}' (oid {}) has {} values but the \
+                     cached schema has only {} columns. The table's schema changed and \
+                     this connector's RELATION cache is stale. Emitting the row would \
+                     silently drop the extra columns. Restart the connector to re-read \
+                     the relation metadata.",
+                    relation.namespace,
+                    relation.name,
+                    relation.oid,
+                    values.len(),
+                    relation.columns.len()
+                )));
+            };
+            let col_name = column.name.as_str();
             match value {
                 PgValue::Null => {
                     map.insert(col_name.to_string(), serde_json::Value::Null);
@@ -102,23 +150,28 @@ impl PostgresStreamHandle {
                     );
                 }
                 PgValue::Unchanged => {
-                    // TOAST value unchanged from previous row version - omit from JSON.
+                    // Unchanged TOASTed value: PostgreSQL did not put it in the WAL, so
+                    // we do not have it and cannot get it. Omit the key and record the
+                    // column so the consumer can tell "absent because unavailable" from
+                    // "absent because NULL".
+                    unavailable.push(col_name.to_string());
                 }
             }
         }
-        Some(serde_json::Value::Object(map))
+        Ok((serde_json::Value::Object(map), unavailable))
     }
 
+    /// The **bare** table name, never schema-qualified.
+    ///
+    /// `Event::schema` carries the namespace separately and
+    /// `Event::qualified_table_name()` joins the two. Embedding the namespace here as
+    /// well produced `tenant2.tenant2.users` for any non-`public` schema — a name no
+    /// route pattern an operator would write can ever match, so every event from a
+    /// non-public schema fell through to the default sink or was dropped.
     fn relation_table_name(&self, relation_oid: u32) -> String {
         self.relation_map
             .get(&relation_oid)
-            .map(|r| {
-                if r.namespace.is_empty() || r.namespace == "public" {
-                    r.name.clone()
-                } else {
-                    format!("{}.{}", r.namespace, r.name)
-                }
-            })
+            .map(|r| r.name.clone())
             .unwrap_or_else(|| format!("unknown_{relation_oid}"))
     }
 
@@ -159,12 +212,14 @@ impl PostgresStreamHandle {
         }
     }
 
-    fn build_insert_event(&self, insert: &PgInsert, lsn: u64) -> Option<Event> {
-        let after = self.tuple_to_json(insert.relation_oid, &insert.new_tuple)?;
-        Some(Event {
+    fn build_insert_event(&self, insert: &PgInsert, lsn: u64) -> Result<Event> {
+        let (after, unavailable_columns) =
+            self.tuple_to_json(insert.relation_oid, &insert.new_tuple)?;
+        Ok(Event {
             before: None,
             after: Some(after),
             op: Operation::Insert,
+            before_unavailable_columns: Vec::new(),
             source: self.source_meta(lsn),
             ts: self.current_commit_ts,
             schema: self.relation_schema(insert.relation_oid),
@@ -174,35 +229,51 @@ impl PostgresStreamHandle {
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns,
         })
     }
 
-    fn build_update_event(&self, update: &PgUpdate, lsn: u64) -> Option<Event> {
-        let after = self.tuple_to_json(update.relation_oid, &update.new_tuple)?;
+    fn build_update_event(&self, update: &PgUpdate, lsn: u64) -> Result<Event> {
+        let (after, unavailable_columns) =
+            self.tuple_to_json(update.relation_oid, &update.new_tuple)?;
 
         // If `old_tuple` is present we have the full pre-image (REPLICA IDENTITY FULL).
         // Otherwise fall back to `key_tuple` which contains only PK columns
         // (REPLICA IDENTITY DEFAULT). In the fallback case we set `before_is_key_only`
         // so consumers know not to treat the before image as a complete row.
-        let (before, before_is_key_only) = if let Some(before) = update
-            .old_tuple
-            .as_deref()
-            .and_then(|t| self.tuple_to_json(update.relation_oid, t))
-        {
-            (Some(before), false)
-        } else {
-            let key_before = update
-                .key_tuple
-                .as_deref()
-                .and_then(|t| self.tuple_to_json(update.relation_oid, t));
-            let is_key_only = key_before.is_some();
-            (key_before, is_key_only)
-        };
+        let (before, before_is_key_only, mut before_unavailable_columns) =
+            match update.old_tuple.as_deref() {
+                Some(tuple) => {
+                    // With REPLICA IDENTITY FULL the before-image has TOAST holes of its
+                    // own, and they are NOT the same set as the after-image's. A TOASTed
+                    // column that *was* modified arrives present in `after` and `'u'` in
+                    // `before`. Merging the two lists would mark that column unavailable,
+                    // and a correct sink would then skip writing a value that genuinely
+                    // changed — silent data loss. Keep them separate.
+                    let (before, before_unavailable) =
+                        self.tuple_to_json(update.relation_oid, tuple)?;
+                    (Some(before), false, before_unavailable)
+                }
+                None => match update.key_tuple.as_deref() {
+                    // A key-only before-image omits non-key columns by design. Reporting
+                    // them as TOAST holes would conflate two different kinds of absence.
+                    Some(tuple) => (
+                        Some(self.tuple_to_json(update.relation_oid, tuple)?.0),
+                        true,
+                        Vec::new(),
+                    ),
+                    None => (None, false, Vec::new()),
+                },
+            };
+        before_unavailable_columns.sort_unstable();
+        before_unavailable_columns.dedup();
 
-        Some(Event {
+        Ok(Event {
             before,
             after: Some(after),
             op: Operation::Update,
+            unavailable_columns,
+            before_unavailable_columns,
             source: self.source_meta(lsn),
             ts: self.current_commit_ts,
             schema: self.relation_schema(update.relation_oid),
@@ -215,25 +286,31 @@ impl PostgresStreamHandle {
         })
     }
 
-    fn build_delete_event(&self, delete: &PgDelete, lsn: u64) -> Option<Event> {
-        let (before, before_is_key_only) = if let Some(before) = delete
-            .old_tuple
-            .as_deref()
-            .and_then(|t| self.tuple_to_json(delete.relation_oid, t))
-        {
-            (Some(before), false)
-        } else {
-            let key_before = delete
-                .key_tuple
-                .as_deref()
-                .and_then(|t| self.tuple_to_json(delete.relation_oid, t));
-            let is_key_only = key_before.is_some();
-            (key_before, is_key_only)
-        };
-        Some(Event {
+    fn build_delete_event(&self, delete: &PgDelete, lsn: u64) -> Result<Event> {
+        // A DELETE carries no after-image, so every TOAST hole here belongs to `before`.
+        // Reporting them in `unavailable_columns` would describe a payload that does not
+        // exist, and hide the gap from the consumers that actually read the pre-image.
+        let (before, before_is_key_only, before_unavailable_columns) =
+            match delete.old_tuple.as_deref() {
+                Some(tuple) => {
+                    let (before, unavailable) = self.tuple_to_json(delete.relation_oid, tuple)?;
+                    (Some(before), false, unavailable)
+                }
+                None => match delete.key_tuple.as_deref() {
+                    Some(tuple) => (
+                        Some(self.tuple_to_json(delete.relation_oid, tuple)?.0),
+                        true,
+                        Vec::new(),
+                    ),
+                    None => (None, false, Vec::new()),
+                },
+            };
+        Ok(Event {
             before,
             after: None,
             op: Operation::Delete,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns,
             source: self.source_meta(lsn),
             ts: self.current_commit_ts,
             schema: self.relation_schema(delete.relation_oid),
@@ -263,6 +340,8 @@ impl PostgresStreamHandle {
                 transaction: self.tx_meta(),
                 envelope_version: EVENT_ENVELOPE_VERSION,
                 before_is_key_only: false,
+                unavailable_columns: Vec::new(),
+                before_unavailable_columns: Vec::new(),
             })
             .collect()
     }
@@ -372,6 +451,48 @@ impl PostgresStreamHandle {
                         .map(|existing| existing != &rel)
                         .unwrap_or(false);
 
+                    // Warn once per relation about a REPLICA IDENTITY that cannot
+                    // identify a row.
+                    //
+                    // `replica_identity` was decoded and then read nowhere, so
+                    // `NOTHING` went entirely undetected: UPDATE and DELETE arrive with
+                    // no key and no old tuple, and the resulting event has
+                    // `before: None, after: None` — it names a table but identifies no
+                    // row, and a consumer cannot apply it to anything. PostgreSQL also
+                    // treats `DEFAULT` on a table with no primary key as `NOTHING`.
+                    if !self.warned_replica_identity.contains(&rel.oid) {
+                        // pgoutput encodes this as the pg_class.relreplident char.
+                        let has_key = rel.columns.iter().any(|column| column.is_key());
+                        match rel.replica_identity {
+                            b'n' => {
+                                tracing::warn!(
+                                    target: "rustcdc::source::postgres",
+                                    table = %format!("{}.{}", rel.namespace, rel.name),
+                                    "table has REPLICA IDENTITY NOTHING: UPDATE and DELETE \
+                                     events will carry neither a key nor a before-image, so \
+                                     they identify no row and cannot be applied downstream. \
+                                     Fix with: ALTER TABLE {}.{} REPLICA IDENTITY FULL \
+                                     (or DEFAULT with a primary key).",
+                                    rel.namespace, rel.name,
+                                );
+                                self.warned_replica_identity.insert(rel.oid);
+                            }
+                            b'd' if !has_key => {
+                                tracing::warn!(
+                                    target: "rustcdc::source::postgres",
+                                    table = %format!("{}.{}", rel.namespace, rel.name),
+                                    "table has REPLICA IDENTITY DEFAULT but no primary key, \
+                                     which PostgreSQL treats as NOTHING: UPDATE and DELETE \
+                                     events will identify no row. Fix with: ALTER TABLE \
+                                     {}.{} REPLICA IDENTITY FULL, or add a primary key.",
+                                    rel.namespace, rel.name,
+                                );
+                                self.warned_replica_identity.insert(rel.oid);
+                            }
+                            _ => {}
+                        }
+                    }
+
                     self.relation_map.insert(rel.oid, rel.clone());
 
                     if changed {
@@ -395,7 +516,8 @@ impl PostgresStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
-                        if let Some(event) = self.build_insert_event(&insert, item.lsn) {
+                        {
+                            let event = self.build_insert_event(&insert, item.lsn)?;
                             self.partial_tx_events.push(event);
                         }
                     }
@@ -409,7 +531,8 @@ impl PostgresStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
-                        if let Some(event) = self.build_update_event(&update, item.lsn) {
+                        {
+                            let event = self.build_update_event(&update, item.lsn)?;
                             self.partial_tx_events.push(event);
                         }
                     }
@@ -423,7 +546,8 @@ impl PostgresStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
-                        if let Some(event) = self.build_delete_event(&delete, item.lsn) {
+                        {
+                            let event = self.build_delete_event(&delete, item.lsn)?;
                             self.partial_tx_events.push(event);
                         }
                     }
@@ -441,7 +565,49 @@ impl PostgresStreamHandle {
                         }
                     }
                 }
-                PgOutputMessage::Unknown(_) => {}
+                PgOutputMessage::Unknown(tag) => {
+                    // Not every unhandled tag is equally safe to skip.
+                    //
+                    // The connector negotiates `proto_version '1'`, under which the
+                    // server must not send v2 streaming or v3 two-phase messages. If one
+                    // arrives anyway, our view of transaction boundaries is wrong, and
+                    // silently skipping is dangerous in a specific way: dropping a
+                    // Stream Abort ('A') means we commit data the source rolled back.
+                    // Treat those as protocol violations.
+                    match tag {
+                        // v2 streaming: Stream Start/Stop/Commit/Abort, Stream Prepare.
+                        // v3 two-phase: Begin Prepare, Prepare, Commit Prepared,
+                        // Rollback Prepared.
+                        b'S' | b'E' | b'c' | b'A' | b'p' | b'b' | b'P' | b'K' | b'r' => {
+                            return Err(Error::SourceError(format!(
+                                "postgres sent pgoutput message '{}' (0x{tag:02x}), which \
+                                 belongs to protocol version 2 or 3, but this connector \
+                                 negotiated proto_version 1 and cannot interpret it. \
+                                 Skipping it would misrepresent transaction boundaries — \
+                                 and skipping a Stream Abort would commit data the source \
+                                 rolled back. This indicates a server/plugin mismatch.",
+                                tag as char
+                            )));
+                        }
+                        // Informational tags that are genuinely safe to skip, but should
+                        // not be silent: Origin ('O') matters for loop detection in
+                        // bidirectional setups, Type ('Y') carries custom-type identity,
+                        // and Message ('M') is `pg_logical_emit_message` output.
+                        other => {
+                            if self.warned_unknown_messages.insert(other) {
+                                tracing::warn!(
+                                    target: "rustcdc::source::postgres",
+                                    tag = %(other as char),
+                                    "ignoring unhandled pgoutput message type; \
+                                     'O' = Origin (bidirectional loop detection), \
+                                     'Y' = Type (custom type identity), \
+                                     'M' = logical decoding message. These are not \
+                                     surfaced as events.",
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(committed)

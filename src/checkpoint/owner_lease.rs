@@ -337,7 +337,7 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
         // Use OpenProcess with SYNCHRONIZE (0x00100000) to probe existence.
         // Returns a non-null handle when the PID exists (even without full access).
         // Falls back to conservatively assuming alive on unexpected errors.
-        use std::os::windows::io::OwnedHandle;
+        #[allow(unsafe_code)]
         extern "system" {
             fn OpenProcess(
                 dwDesiredAccess: u32,
@@ -349,6 +349,11 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const STILL_ACTIVE: u32 = 259;
+        // SAFETY: `OpenProcess` returns either null or a valid process handle. We
+        // check for null before use, pass a valid `&mut u32` out-parameter to
+        // `GetExitCodeProcess`, and `CloseHandle` the handle exactly once on every
+        // path that obtained it. No pointer outlives this block.
+        #[allow(unsafe_code)]
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {

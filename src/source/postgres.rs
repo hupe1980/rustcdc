@@ -63,6 +63,14 @@ pub struct PostgresStreamHandle {
     stream: PostgresStream,
     provider: Box<dyn PgOutputMessageProvider>,
     relation_map: HashMap<u32, PgRelation>,
+    /// Relations already warned about for an unusable REPLICA IDENTITY.
+    ///
+    /// pgoutput re-sends RELATION on every poll, so without this the warning would
+    /// repeat for every poll cycle of every affected table.
+    warned_replica_identity: std::collections::HashSet<u32>,
+    /// pgoutput message tags already warned about, so the warning fires once per tag
+    /// rather than once per message.
+    warned_unknown_messages: std::collections::HashSet<u8>,
     current_xid: Option<u32>,
     current_commit_ts: u64,
     partial_tx_events: Vec<Event>,
@@ -100,6 +108,8 @@ impl PostgresStreamHandle {
             stream,
             provider,
             relation_map: HashMap::new(),
+            warned_replica_identity: std::collections::HashSet::new(),
+            warned_unknown_messages: std::collections::HashSet::new(),
             current_xid: None,
             current_commit_ts: 0,
             partial_tx_events: Vec::new(),
@@ -455,6 +465,42 @@ pub struct PostgresSourceConfig {
     /// - Default: 30 000 ms.
     #[serde(default = "PostgresSourceConfig::default_slot_idle_advance_interval_ms")]
     pub slot_idle_advance_interval_ms: u64,
+    /// Whether `connect()` may create the replication slot when it does not exist.
+    ///
+    /// **Defaults to `false`, which is the safe setting for a running pipeline.**
+    ///
+    /// A replication slot that vanishes mid-life — dropped by an operator, lost in a
+    /// failover to a replica that never had it, or invalidated by
+    /// `max_slot_wal_keep_size` — is a *data-loss* event: the WAL it was retaining is
+    /// gone. Recreating it silently restarts capture at the current WAL position and
+    /// skips everything in between, which looks exactly like healthy operation.
+    ///
+    /// Set this to `true` only for first-time provisioning, or in environments where
+    /// the slot is genuinely expected to be absent on startup (ephemeral test
+    /// databases). Prefer creating the slot out of band in production.
+    #[serde(default)]
+    pub create_replication_slot_if_missing: bool,
+    /// Create the replication slot with `failover = true` (PostgreSQL **17+**).
+    ///
+    /// A failover-enabled slot is synchronized to physical standbys, so logical
+    /// replication can resume from the new primary after a promotion. Without it the
+    /// slot exists only on the old primary and is **lost on failover** — taking with it
+    /// every change since the last confirmed LSN, and forcing a re-snapshot.
+    ///
+    /// Only applies when the slot is created by this connector (see
+    /// [`create_replication_slot_if_missing`](PostgresSourceConfig::create_replication_slot_if_missing)).
+    ///
+    /// Slot synchronization additionally requires cluster-side configuration that this
+    /// connector cannot set: on the standby `sync_replication_slots = on`,
+    /// `primary_slot_name`, `hot_standby_feedback = on`, and a `dbname` in
+    /// `primary_conninfo`; on the primary, `synchronized_standby_slots`. Sync is
+    /// **asynchronous**, so verify `confirmed_flush_lsn` on the standby's synced slot
+    /// before promoting, and disable subscriptions before promotion to avoid consuming
+    /// from both old and new primary.
+    ///
+    /// Default: `false` (compatible with PostgreSQL 16 and earlier).
+    #[serde(default)]
+    pub failover_slot: bool,
 }
 
 /// PostgreSQL connector lifecycle manager.
@@ -531,8 +577,32 @@ impl PostgresConnection {
                 ca_cert_path,
                 client_cert_path,
                 client_key_path,
-                ..
+                allow_invalid_certificates,
+                allow_invalid_hostnames,
             } => {
+                // The insecure flags are documented as working, and the PostgreSQL
+                // connector silently ignored them — always building a fully verifying
+                // config. That fails *secure*, but it is still a config lie: an
+                // operator who set `tls_insecure_skip_verify()` to get past a
+                // self-signed certificate in a test environment hit an opaque
+                // verification failure while every doc and the config object told them
+                // verification was disabled. Say so instead.
+                //
+                // Note the three connectors previously interpreted the same
+                // `TransportConfig` three different ways; this makes PostgreSQL explicit
+                // about what it does and does not honour.
+                if *allow_invalid_certificates || *allow_invalid_hostnames {
+                    return Err(Error::ConfigError(
+                        "postgres transport sets allow_invalid_certificates or \
+                         allow_invalid_hostnames, but this connector always verifies the \
+                         server certificate and cannot disable it. Rather than silently \
+                         ignoring the setting and failing verification with an opaque error, \
+                         it is rejected here. For a self-signed or private-CA server use \
+                         TransportConfig::tls_with_ca_cert_path(Some(path)) and trust the CA \
+                         explicitly; for a plaintext test setup use TransportConfig::Plaintext."
+                            .into(),
+                    ));
+                }
                 #[cfg(not(feature = "tls"))]
                 {
                     let _ = (ca_cert_path, client_cert_path, client_key_path);
@@ -814,10 +884,15 @@ impl StreamHandle for PostgresStreamHandle {
             // The outer timeout_ms contract is enforced by the elapsed-time check below.
             let poll_timeout = Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS);
 
-            let xlog_data = self
+            let poll_outcome = self
                 .provider
                 .poll_xlog_data(self.max_events_per_poll, poll_timeout)
                 .await?;
+            // Only a *completed* poll that returned nothing proves the slot is caught
+            // up. A timed-out poll means the opposite — there is more backlog than
+            // could be decoded in the budget — so it must never reach the idle branch.
+            let slot_is_caught_up = poll_outcome.is_caught_up();
+            let xlog_data = poll_outcome.into_rows();
             if !xlog_data.is_empty() {
                 // Got WAL data — reset the idle advance timer so the interval is
                 // measured from the last active period, not from the last call.
@@ -843,11 +918,20 @@ impl StreamHandle for PostgresStreamHandle {
                 if self.stream.lsn_position > lsn_before {
                     self.provider.confirm_lsn(self.stream.lsn_position).await?;
                 }
-            } else if self.slot_idle_advance_interval_ms > 0 {
-                // Empty batch: no committed events this poll cycle. Periodically
-                // advance the replication slot to the current WAL write position so
-                // PostgreSQL can reclaim WAL segments that would otherwise accumulate
-                // indefinitely during aborted-transaction storms or idle periods.
+            } else if slot_is_caught_up && self.slot_idle_advance_interval_ms > 0 {
+                // The slot is provably caught up: the poll completed and returned no
+                // rows. Periodically advance the replication slot to the current WAL
+                // write position so PostgreSQL can reclaim WAL segments that would
+                // otherwise accumulate indefinitely during aborted-transaction storms
+                // or idle periods.
+                //
+                // Guarded on `slot_is_caught_up` because `idle_advance` jumps the slot
+                // to `pg_current_wal_lsn()`, permanently discarding anything not yet
+                // consumed. Running it after a timed-out poll would discard exactly the
+                // backlog that caused the timeout — and because the peek re-decodes the
+                // whole backlog each cycle, a stalled consumer makes timeouts *more*
+                // likely, so the two defaults (30 s poll backstop, 30 s idle interval)
+                // would otherwise turn downstream backpressure into silent WAL loss.
                 let threshold =
                     std::time::Duration::from_millis(self.slot_idle_advance_interval_ms);
                 let should_advance = self
@@ -1014,7 +1098,9 @@ mod tests {
     use crate::checkpoint::{Checkpoint, InMemoryCheckpoint, PostgresOffset};
     use crate::source::{SnapshotHandle, Source, StreamHandle};
 
-    use super::decoder::{decode_pgoutput_message, PgOutputMessage, PgOutputXLogData, PgValue};
+    use super::decoder::{
+        decode_pgoutput_message, PgOutputMessage, PgOutputXLogData, PgValue, PollOutcome,
+    };
     use super::parser::map_pgoutput_poll_error;
     use super::validation::{validate_with_backend, ValidationBackend};
     use super::PostgresSourceConfig;
@@ -1034,6 +1120,8 @@ mod tests {
         publication_exists: bool,
         has_replication_privilege: bool,
         create_called: Arc<AtomicBool>,
+        /// Records the `failover` argument the connector passed to slot creation.
+        create_failover: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -1042,7 +1130,12 @@ mod tests {
             Ok(self.slot_exists)
         }
 
-        async fn create_replication_slot(&self, _slot_name: &str) -> crate::core::Result<()> {
+        async fn create_replication_slot(
+            &self,
+            _slot_name: &str,
+            failover: bool,
+        ) -> crate::core::Result<()> {
+            self.create_failover.store(failover, Ordering::Relaxed);
             self.create_called.store(true, Ordering::Relaxed);
             if let Some(error) = &self.create_slot_result {
                 return Err(crate::core::Error::SourceError(error.to_string()));
@@ -1081,8 +1174,10 @@ mod tests {
             &mut self,
             _max: usize,
             _poll_timeout: std::time::Duration,
-        ) -> crate::core::Result<Vec<PgOutputXLogData>> {
-            Ok(self.batches.pop_front().unwrap_or_default())
+        ) -> crate::core::Result<PollOutcome> {
+            Ok(PollOutcome::Data(
+                self.batches.pop_front().unwrap_or_default(),
+            ))
         }
 
         async fn confirm_lsn(&mut self, lsn: u64) -> crate::core::Result<()> {
@@ -1147,6 +1242,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Tuple builder that can emit the pgoutput `'u'` unchanged-TOAST placeholder.
+    ///
+    /// `None` → SQL NULL (`'n'`), `Some(None)` → unchanged TOAST (`'u'`),
+    /// `Some(Some(text))` → a value (`'t'`).
+    fn append_tuple_data_with_toast(buf: &mut Vec<u8>, values: &[Option<Option<&str>>]) {
+        buf.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        for val in values {
+            match val {
+                None => buf.push(b'n'),
+                Some(None) => buf.push(b'u'),
+                Some(Some(s)) => {
+                    buf.push(b't');
+                    buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+    }
+
+    fn build_update_with_toast(oid: u32, new: &[Option<Option<&str>>]) -> Vec<u8> {
+        let mut buf = vec![b'U'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.push(b'N');
+        append_tuple_data_with_toast(&mut buf, new);
+        buf
     }
 
     fn build_insert(oid: u32, values: &[Option<&str>]) -> Vec<u8> {
@@ -1589,8 +1711,87 @@ mod tests {
         ]]);
         let mut handle = make_stream_handle(0, provider);
         let events = handle.next_events(100).await.unwrap();
-        assert_eq!(events[0].table, "myschema.orders");
+
+        // `table` is the BARE name and `schema` carries the namespace; the envelope
+        // joins them via `qualified_table_name()`. Putting the namespace in both
+        // produced `myschema.myschema.orders`, which no route pattern can match — so
+        // every event from a non-public schema fell through to the default sink.
+        assert_eq!(events[0].table, "orders");
         assert_eq!(events[0].schema, Some("myschema".to_string()));
+        assert_eq!(events[0].qualified_table_name(), "myschema.orders");
+    }
+
+    #[tokio::test]
+    async fn unchanged_toast_columns_are_reported_not_silently_omitted() {
+        // An UPDATE that does not touch a large TOASTed column: PostgreSQL omits the
+        // value from the WAL entirely and pgoutput sends the 'u' placeholder. The value
+        // is unrecoverable, so the column must be reported as *unavailable* rather than
+        // silently dropped — otherwise a consumer doing a full-row upsert writes NULL
+        // over a multi-megabyte document that never changed.
+        const OID: u32 = 31;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(
+                    OID,
+                    "public",
+                    "docs",
+                    &[("id", true), ("title", false), ("body", false)],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(
+                150,
+                // id=1, title changed, body unchanged-TOAST.
+                build_update_with_toast(OID, &[Some(Some("1")), Some(Some("new")), Some(None)]),
+            ),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let events = handle.next_events(100).await.unwrap();
+        assert_eq!(events.len(), 1);
+
+        let after = events[0].after.as_ref().unwrap();
+        assert_eq!(after.get("title").unwrap(), "new");
+        assert!(
+            after.get("body").is_none(),
+            "an unchanged TOAST value is absent, never null"
+        );
+        assert_eq!(
+            events[0].unavailable_columns,
+            vec!["body".to_string()],
+            "the omitted column must be reported so a consumer can exclude it from writes"
+        );
+
+        // A column whose value IS present must never be reported unavailable.
+        assert!(!events[0].unavailable_columns.contains(&"title".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_row_with_unknown_relation_fails_loud() {
+        // pgoutput guarantees RELATION precedes any row referencing it. A row for an
+        // unknown OID means the decoder state is inconsistent; the row cannot be
+        // attributed to a table, and silently dropping it loses data.
+        const KNOWN: u32 = 11;
+        const UNKNOWN: u32 = 99;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(KNOWN, "public", "items", &[("id", true)]),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(150, build_insert(UNKNOWN, &[Some("1")])),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let error = handle
+            .next_events(100)
+            .await
+            .expect_err("an unknown relation oid must fail loud, not be silently dropped");
+        let message = error.to_string();
+        assert!(message.contains("relation oid 99"), "{message}");
+        assert!(message.contains("RELATION"), "{message}");
     }
 
     #[tokio::test]
@@ -1901,7 +2102,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_creates_replication_slot_when_missing() {
+    async fn validation_creates_replication_slot_when_explicitly_opted_in() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            create_replication_slot_if_missing: true,
+            ..Default::default()
+        };
+        let backend = MockValidationBackend {
+            slot_exists: false,
+            publication_exists: true,
+            has_replication_privilege: true,
+            create_called: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
+        };
+
+        validate_with_backend(&config, &backend).await.unwrap();
+        assert!(backend.create_called.load(Ordering::Relaxed));
+    }
+
+    /// `failover_slot` must reach slot creation, and must default to off.
+    ///
+    /// A failover-enabled slot (PostgreSQL 17+) is synchronized to standbys so logical
+    /// replication can resume from the new primary after a promotion. Without it the
+    /// slot lives only on the old primary and is lost on failover, taking every change
+    /// since the last confirmed LSN with it.
+    #[tokio::test]
+    async fn failover_slot_flag_reaches_slot_creation() {
+        let base = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            create_replication_slot_if_missing: true,
+            ..Default::default()
+        };
+        assert!(
+            !base.failover_slot,
+            "failover slots are PG17+, so they must be opt-in"
+        );
+
+        for failover in [false, true] {
+            let config = PostgresSourceConfig {
+                failover_slot: failover,
+                ..base.clone()
+            };
+            let backend = MockValidationBackend {
+                slot_exists: false,
+                publication_exists: true,
+                has_replication_privilege: true,
+                create_called: Arc::new(AtomicBool::new(false)),
+                create_failover: Arc::new(AtomicBool::new(false)),
+                ..Default::default()
+            };
+
+            validate_with_backend(&config, &backend).await.unwrap();
+            assert!(backend.create_called.load(Ordering::Relaxed));
+            assert_eq!(
+                backend.create_failover.load(Ordering::Relaxed),
+                failover,
+                "failover_slot={failover} must be passed through to slot creation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_refuses_to_recreate_a_missing_slot_by_default() {
+        // Auto-creating a slot that disappeared mid-life restarts capture at the
+        // current WAL position, silently discarding everything since the last
+        // confirmed_flush_lsn. The default must fail loud instead.
         let config = PostgresSourceConfig {
             host: "localhost".into(),
             port: 5432,
@@ -1916,6 +2201,10 @@ mod tests {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             ..Default::default()
         };
+        assert!(
+            !config.create_replication_slot_if_missing,
+            "auto-create must be off by default"
+        );
         let backend = MockValidationBackend {
             slot_exists: false,
             publication_exists: true,
@@ -1924,8 +2213,19 @@ mod tests {
             ..Default::default()
         };
 
-        validate_with_backend(&config, &backend).await.unwrap();
-        assert!(backend.create_called.load(Ordering::Relaxed));
+        let error = validate_with_backend(&config, &backend)
+            .await
+            .expect_err("a missing slot must fail loud unless explicitly opted in");
+        assert!(
+            !backend.create_called.load(Ordering::Relaxed),
+            "the slot must not be created"
+        );
+        let message = error.to_string();
+        assert!(message.contains("does not exist"), "{message}");
+        assert!(
+            message.contains("create_replication_slot_if_missing"),
+            "the error must name the opt-in: {message}"
+        );
     }
 
     #[tokio::test]

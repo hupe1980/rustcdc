@@ -87,6 +87,12 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
         .with_cmd(vec![
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
+            // MariaDB defaults binlog_row_metadata to NO_LOG, MySQL to MINIMAL —
+            // neither carries column names or primary-key flags, so events would be
+            // emitted with positional placeholder keys and no key. connect() rejects
+            // that, so the test server must match a valid production configuration.
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
             "--server-id=1",
         ])
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -225,6 +231,12 @@ async fn run_mariadb_stream_capture_insert_update_delete(
         .with_cmd(vec![
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
+            // MariaDB defaults binlog_row_metadata to NO_LOG, MySQL to MINIMAL —
+            // neither carries column names or primary-key flags, so events would be
+            // emitted with positional placeholder keys and no key. connect() rejects
+            // that, so the test server must match a valid production configuration.
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
             "--server-id=1",
         ])
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -357,6 +369,12 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
         .with_cmd(vec![
             "--log-bin=mysql-bin",
             "--binlog-format=ROW",
+            // MariaDB defaults binlog_row_metadata to NO_LOG, MySQL to MINIMAL —
+            // neither carries column names or primary-key flags, so events would be
+            // emitted with positional placeholder keys and no key. connect() rejects
+            // that, so the test server must match a valid production configuration.
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
             "--server-id=1",
         ])
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")

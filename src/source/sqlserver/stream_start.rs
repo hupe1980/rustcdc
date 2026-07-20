@@ -5,7 +5,7 @@ use crate::{
 
 use super::{
     compare_lsn, lsn_bytes_to_hex, lsn_hex_to_bytes, query, sqlserver_resume_lsn_from_offset_bytes,
-    SqlServerConnection, SqlServerStream, SqlServerStreamHandle,
+    SqlServerCdcCursor, SqlServerConnection, SqlServerStream, SqlServerStreamHandle,
 };
 
 pub(super) async fn start_sqlserver_stream(
@@ -34,6 +34,11 @@ pub(super) async fn start_sqlserver_stream(
     let max_lsn_hex = connection.query_max_lsn_hex().await?;
     let mut max_lsn = lsn_hex_to_bytes(&max_lsn_hex)?;
 
+    // A checkpoint offset is either a bare `"{lsn}"` (window boundary) or
+    // `"{lsn}:{seqval}:{op}"` (a resume point *inside* a window that a previous poll
+    // could not read in full). Recovering the cursor is what makes a truncated window
+    // resumable without either re-reading it whole or skipping its remainder.
+    let mut resume_cursor: Option<SqlServerCdcCursor> = None;
     let start_lsn = if let Some(offset) = resume_from {
         if offset.source_type() != connection.source_type() {
             return Err(Error::CheckpointError(format!(
@@ -43,6 +48,9 @@ pub(super) async fn start_sqlserver_stream(
         }
 
         let encoded = offset.encode()?;
+        if let Ok(text) = serde_json::from_slice::<String>(encoded.as_slice()) {
+            resume_cursor = SqlServerCdcCursor::decode(&text);
+        }
         let resume = sqlserver_resume_lsn_from_offset_bytes(encoded.as_slice())?;
         if compare_lsn(&resume, &min_lsn).is_lt() {
             return Err(Error::CheckpointError(format!(
@@ -78,6 +86,8 @@ pub(super) async fn start_sqlserver_stream(
             .map(|meta| meta.capture_instance.clone())
             .collect(),
         poll_interval_ms: connection.stream_poll_interval_ms,
+        // A resumed mid-window position, when the checkpoint recorded one.
+        cursor: resume_cursor,
     };
 
     Ok(Box::new(SqlServerStreamHandle {
@@ -87,7 +97,7 @@ pub(super) async fn start_sqlserver_stream(
         events_polled: 0,
         requeued_events: Vec::new(),
         max_events_per_poll: connection.max_events_per_poll,
-        pending_update_afters: ahash::AHashMap::new(),
+        pending_update_befores: ahash::AHashMap::new(),
         window_buffer: Vec::new(),
     }))
 }

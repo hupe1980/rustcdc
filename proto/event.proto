@@ -105,4 +105,19 @@ message Event {
   // pre-image row. Occurs on PostgreSQL UPDATE and DELETE events when the table's
   // REPLICA IDENTITY is DEFAULT. Always false for non-UPDATE/DELETE or non-PostgreSQL events.
   bool before_is_key_only = 12;
+
+  // Columns that exist on the table but whose value the source could not supply for
+  // the AFTER image. These are ABSENT from after, not null. The concrete case is
+  // PostgreSQL unchanged-TOAST: a large value not modified by an UPDATE is omitted
+  // from the WAL entirely and cannot be recovered. A consumer writing whole rows must
+  // exclude these columns from the write rather than writing NULL over an unchanged
+  // value. REPLICA IDENTITY FULL does not avoid this — it governs the old tuple only.
+  repeated string unavailable_columns = 13;
+
+  // The same, for the BEFORE image. Tracked separately and never merged with
+  // unavailable_columns: the two sets differ. A TOASTed column that WAS modified is
+  // present in after and absent from before, so a merged list would mark a column that
+  // genuinely changed as unwritable and silently drop the update.
+  // Always empty when before_is_key_only is true.
+  repeated string before_unavailable_columns = 14;
 }

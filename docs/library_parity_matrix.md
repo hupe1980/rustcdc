@@ -44,7 +44,7 @@ Status values:
 | Crash/restart correctness validation | Ensures resume and offset safety after failure | Implemented | tests/crash_simulation_integration.rs, tests/data_loss_detection.rs, tests/runtime_postgres_process_crash_integration.rs, tests/runtime_mysql_process_crash_integration.rs, tests/runtime_sqlserver_process_crash_integration.rs |
 | Deterministic replay and fault-injection coverage | Reproducible correctness verification under adverse paths | Implemented | src/deterministic_replay/, src/fault_injection/, tests/fault_injection_soak_matrix.rs |
 | Capability reporting matches connector behavior | Prevents control-plane and operational misconfiguration | Implemented | src/core/runtime.rs, src/source/postgres.rs, src/source/mysql.rs, src/source/sqlserver.rs |
-| Public docs/API contract aligned with implementation | Prevents integration failures caused by stale guidance | Implemented | docs/api.md, docs/schema_evolution.md, docs/config_reference.md |
+| Public docs/API contract aligned with implementation | Prevents integration failures caused by stale guidance | **Partial** — doc code samples are not compiled in CI (there is no `include_str!` in `src/`, so `docs/*.md` and README samples are never doctested and can rot silently). Rustdoc examples on public items *are* doctested. | docs/api.md, docs/schema_evolution.md, docs/config_reference.md |
 
 ## Should-Have Capabilities
 

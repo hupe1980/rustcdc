@@ -53,6 +53,8 @@ impl SqlServerStreamHandle {
 
         self.stream.lsn_start = next_start;
         self.stream.lsn_end = next_end;
+        // Advancing to a fresh window invalidates any within-window resume point.
+        self.stream.cursor = None;
         Ok(())
     }
 
@@ -73,6 +75,7 @@ impl SqlServerStreamHandle {
             max_events_per_poll,
             &start_lsn_hex,
             &end_lsn_hex,
+            self.stream.cursor.as_ref(),
         );
 
         let query_result = match client.query(&sql, &[]).await {
@@ -80,7 +83,14 @@ impl SqlServerStreamHandle {
             Err(error) => {
                 let text = error.to_string();
                 if is_sqlserver_cdc_window_error(&text) {
-                    return Ok(Vec::new());
+                    return self
+                        .classify_cdc_window_error(
+                            capture_instance,
+                            &start_lsn_hex,
+                            &end_lsn_hex,
+                            &text,
+                        )
+                        .await;
                 }
                 return Err(Error::SourceError(format!(
                     "sqlserver CDC poll failed for capture instance '{capture_instance}': {error}"
@@ -93,7 +103,14 @@ impl SqlServerStreamHandle {
             Err(error) => {
                 let text = error.to_string();
                 if is_sqlserver_cdc_window_error(&text) {
-                    return Ok(Vec::new());
+                    return self
+                        .classify_cdc_window_error(
+                            capture_instance,
+                            &start_lsn_hex,
+                            &end_lsn_hex,
+                            &text,
+                        )
+                        .await;
                 }
                 return Err(Error::SourceError(format!(
                     "sqlserver CDC poll decode failed for capture instance '{capture_instance}': {error}"
@@ -125,15 +142,31 @@ impl SqlServerStreamHandle {
                 ))
             })?;
 
-            let mut object = serde_json::Map::new();
-            for (index, column) in columns.iter().enumerate() {
-                object.insert(
-                    column.clone(),
-                    super::decode_sqlserver_cell_to_json(&row, 3 + index),
-                );
-            }
+            let ts_ms = row.get::<i64, _>(3).unwrap_or(0);
 
-            let ts_ms = row.get::<i64, _>(3 + columns.len()).unwrap_or(0);
+            // Column 4 is the server-side `FOR JSON PATH` rendering of the captured
+            // columns. SQL Server serializes every type correctly, so there is no
+            // client-side type ladder to fall through.
+            //
+            // `FOR JSON PATH` omits keys whose value is NULL, so re-materialize the
+            // full column set with explicit nulls. Without this, a NULL column would be
+            // *absent* rather than `null`, which downstream cannot distinguish from a
+            // column that was never captured.
+            let row_json = row.get::<&str, _>(4).unwrap_or("{}");
+            let parsed: serde_json::Value = serde_json::from_str(row_json).map_err(|error| {
+                Error::SourceError(format!(
+                    "sqlserver CDC row_json is not valid JSON for capture instance \
+                     '{capture_instance}': {error}"
+                ))
+            })?;
+            let mut object = serde_json::Map::new();
+            for column in columns {
+                let value = parsed
+                    .get(column.as_str())
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                object.insert(column.clone(), value);
+            }
             out.push(SqlServerRawChange {
                 start_lsn_hex,
                 seqval_hex,
@@ -146,19 +179,100 @@ impl SqlServerStreamHandle {
         Ok(out)
     }
 
+    /// Decide whether a SQL Server error 313 means data loss or "not yet captured".
+    ///
+    /// `cdc.fn_cdc_get_all_changes_*` raises 313 whenever the requested LSN range is
+    /// "not appropriate", and that covers **two opposite situations**:
+    ///
+    /// * `from_lsn` is **below** the capture instance's `min_lsn` — the CDC cleanup job
+    ///   purged rows we had not read. Unrecoverable: advancing past them loses data.
+    /// * `from_lsn` is **above** the highest captured LSN — the capture job simply has
+    ///   not populated this range yet, which is routine on a freshly enabled capture
+    ///   instance or an idle table. Entirely transient.
+    ///
+    /// The two are indistinguishable from the error text alone, so we ask the server for
+    /// `min_lsn` and compare. Getting this wrong is costly in both directions: treating
+    /// the purge as transient silently skips data (the original defect), while treating
+    /// the not-yet-captured case as fatal takes down a healthy pipeline on startup.
+    async fn classify_cdc_window_error(
+        &self,
+        capture_instance: &str,
+        start_lsn_hex: &str,
+        end_lsn_hex: &str,
+        server_message: &str,
+    ) -> Result<Vec<SqlServerRawChange>> {
+        let mut client = query::connect_client(&self.config).await?;
+        let min_lsn_hex: String = match client
+            .query(
+                "SELECT sys.fn_varbintohexstr(sys.fn_cdc_get_min_lsn(@P1))",
+                &[&capture_instance],
+            )
+            .await
+        {
+            Ok(result) => match result.into_first_result().await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .next()
+                    .and_then(|row| row.get::<&str, _>(0).map(ToOwned::to_owned))
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            },
+            Err(_) => String::new(),
+        };
+
+        // If min_lsn is unreadable we cannot prove the data is still there, and the
+        // safe assumption for a correctness-first connector is that it is not.
+        let (Ok(start), Ok(min)) = (
+            lsn_hex_to_bytes(start_lsn_hex),
+            lsn_hex_to_bytes(&min_lsn_hex),
+        ) else {
+            return Err(out_of_retention_error(
+                capture_instance,
+                start_lsn_hex,
+                end_lsn_hex,
+                server_message,
+            ));
+        };
+
+        if compare_lsn(&start, &min).is_lt() {
+            // Genuinely purged: our position predates the oldest retained change.
+            return Err(out_of_retention_error(
+                capture_instance,
+                start_lsn_hex,
+                end_lsn_hex,
+                server_message,
+            ));
+        }
+
+        // Ahead of what has been captured so far. Return no rows and let the window
+        // logic retry; the window is never advanced past unread data, so this is safe.
+        tracing::debug!(
+            target: "rustcdc::source::sqlserver",
+            capture_instance,
+            start_lsn = %start_lsn_hex,
+            min_lsn = %min_lsn_hex,
+            "sqlserver CDC window is ahead of captured data (capture job has not reached \
+             it yet); treating as empty and retrying",
+        );
+        Ok(Vec::new())
+    }
+
     pub(super) fn map_changes_to_events(
         &mut self,
         meta: &CaptureInstanceMeta,
         changes: Vec<SqlServerRawChange>,
     ) -> Result<Vec<Event>> {
-        // SQL Server CDC with `'all update old'` emits two rows per UPDATE:
-        //   op=3  UPDATE after-image  (new column values)  — ORDER BY emits this first (3 < 4)
-        //   op=4  UPDATE before-image (old column values)  — emitted second
+        // SQL Server CDC with `'all update old'` emits two rows per UPDATE.  Per the
+        // `cdc.fn_cdc_get_all_changes_<capture_instance>` contract:
+        //   op=3  UPDATE before-image (captured column values BEFORE the update)
+        //         — ORDER BY emits this first (3 < 4)
+        //   op=4  UPDATE after-image  (captured column values AFTER the update)
+        //         — emitted second
         //
-        // Both rows share the same (__$start_lsn, __$seqval).  We buffer the op=3 row
-        // in `self.pending_update_afters` and emit a single merged Event when op=4 arrives.
-        // The buffer persists across poll boundaries so pairs split by `max_events_per_poll`
-        // are handled correctly.
+        // Both rows share the same (__$start_lsn, __$seqval).  We buffer the op=3
+        // before-image in `self.pending_update_befores` and emit a single merged Event
+        // when the op=4 after-image arrives.  The buffer persists across poll boundaries
+        // so pairs split by `max_events_per_poll` are handled correctly.
         let mut out = Vec::with_capacity(changes.len());
 
         for change in changes {
@@ -201,17 +315,17 @@ impl SqlServerStreamHandle {
                         ));
                     }
                 }
-                // UPDATE after-image: buffer until op=4 (before-image) arrives.
+                // UPDATE before-image: buffer until the op=4 after-image arrives.
                 3 => {
                     let key = (change.start_lsn_hex, change.seqval_hex);
-                    self.pending_update_afters
+                    self.pending_update_befores
                         .insert(key, (change.row, change.ts_ms));
                 }
-                // UPDATE before-image: merge with buffered op=3 after-image.
+                // UPDATE after-image: merge with the buffered op=3 before-image.
                 4 => {
                     let key = (change.start_lsn_hex.clone(), change.seqval_hex.clone());
-                    let (after_row, ts_ms) = self
-                        .pending_update_afters
+                    let (before_row, ts_ms) = self
+                        .pending_update_befores
                         .remove(&key)
                         .map(|(row, ts)| (Some(row), ts))
                         .unwrap_or_else(|| (None, change.ts_ms));
@@ -227,8 +341,8 @@ impl SqlServerStreamHandle {
                             &change.seqval_hex,
                             ts_ms,
                             Operation::Update,
+                            before_row,
                             Some(change.row),
-                            after_row,
                         ));
                     }
                 }
@@ -242,6 +356,35 @@ impl SqlServerStreamHandle {
 
         Ok(out)
     }
+}
+
+/// Build the hard error raised when SQL Server rejects the requested LSN window.
+///
+/// SQL Server raises error 313 ("An insufficient number of arguments were supplied
+/// for the procedure or function") from `cdc.fn_cdc_get_all_changes_<capture_instance>`
+/// when `from_lsn` falls outside the capture instance's currently retained range —
+/// i.e. the CDC cleanup job has purged change rows we have not yet read.
+///
+/// This condition **must** fail loud.  Treating it as an empty result set would let
+/// the poll loop advance the window past the purged range, permanently and silently
+/// discarding every change the cleanup job removed.
+fn out_of_retention_error(
+    capture_instance: &str,
+    start_lsn_hex: &str,
+    end_lsn_hex: &str,
+    server_message: &str,
+) -> Error {
+    Error::Unrecoverable(format!(
+        "sqlserver CDC change data for capture instance '{capture_instance}' is no longer \
+         retained: the requested window [{start_lsn_hex}, {end_lsn_hex}] is outside the range \
+         currently available in the change tables, which means the CDC cleanup job has purged \
+         changes this connector had not yet read. Resuming would silently skip those changes, \
+         so the stream is stopped instead. Operator action required: re-snapshot the affected \
+         tables, then restart from a fresh checkpoint. To prevent recurrence, increase the CDC \
+         retention window (`sys.sp_cdc_change_job @job_type = 'cleanup', @retention = ...`) so \
+         it comfortably exceeds the maximum expected connector downtime. \
+         (server message: {server_message})"
+    ))
 }
 
 fn build_sqlserver_event(
@@ -278,6 +421,8 @@ fn build_sqlserver_event(
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 
@@ -376,5 +521,7 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }

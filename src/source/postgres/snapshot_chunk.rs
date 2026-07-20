@@ -7,6 +7,25 @@ use crate::{
 
 use super::{PostgresSnapshotHandle, DEFAULT_SNAPSHOT_CHUNK_SIZE};
 
+/// Split a configured table name into `(schema, bare_table)`.
+///
+/// Snapshot tables are configured as either `"users"` or `"public.users"`. The event
+/// envelope carries the two separately — `Event::qualified_table_name()` joins them —
+/// so the schema must be stripped from `table` or the name double-qualifies.
+///
+/// Unqualified names default to `public`, matching PostgreSQL's own default
+/// `search_path` and the identity the streaming path derives from pgoutput RELATION
+/// messages. Getting this consistent is what keeps a router pattern matching the same
+/// table across the snapshot→stream transition.
+fn split_qualified_table_name(configured: &str) -> (Option<String>, String) {
+    match configured.split_once('.') {
+        Some((schema, table)) if !schema.is_empty() && !table.is_empty() => {
+            (Some(schema.to_string()), table.to_string())
+        }
+        _ => (Some("public".to_string()), configured.to_string()),
+    }
+}
+
 pub(super) async fn next_postgres_snapshot_chunk(
     handle: &mut PostgresSnapshotHandle,
     chunk_size: usize,
@@ -39,6 +58,29 @@ pub(super) async fn next_postgres_snapshot_chunk(
         };
         let remaining = requested - events.len();
 
+        // Emit the same identity the streaming path emits.
+        //
+        // Snapshot events previously carried `schema: None` and `primary_key: None`
+        // while streaming populated both, so for one physical table the two phases
+        // disagreed on both the event key and the routing name:
+        //
+        //   * `Event::primary_key_values()` returned `None`, so `encode_key` produced
+        //     an unkeyed record for **every row of the initial load**. Log compaction
+        //     never collapses those rows, upsert consumers cannot correlate them with
+        //     later updates, and the pre-snapshot value resurfaces after compaction.
+        //   * `qualified_table_name()` yielded `"users"` during snapshot but
+        //     `"public.users"` during streaming, so a router configured for
+        //     `public.users` silently received zero snapshot rows.
+        //
+        // MySQL and SQL Server already set the primary key on snapshot rows;
+        // PostgreSQL was the outlier, and `postgres` is the default feature.
+        let (schema_name, bare_table) = split_qualified_table_name(&table_name);
+        let primary_key = if key_columns.is_empty() {
+            None
+        } else {
+            Some(key_columns.clone())
+        };
+
         if live_query {
             if handle.client.is_none() {
                 let table = &mut handle.tables[table_index];
@@ -60,9 +102,9 @@ pub(super) async fn next_postgres_snapshot_chunk(
                             timestamp: now_millis(),
                         },
                         ts: now_millis(),
-                        schema: None,
-                        table: table_name.clone(),
-                        primary_key: None,
+                        schema: schema_name.clone(),
+                        table: bare_table.clone(),
+                        primary_key: primary_key.clone(),
                         snapshot: Some(SnapshotMetadata {
                             snapshot_id: handle.snapshot.snapshot_id.clone(),
                             chunk_index: handle.next_chunk_index,
@@ -71,6 +113,8 @@ pub(super) async fn next_postgres_snapshot_chunk(
                         transaction: None,
                         envelope_version: EVENT_ENVELOPE_VERSION,
                         before_is_key_only: false,
+                        unavailable_columns: Vec::new(),
+                        before_unavailable_columns: Vec::new(),
                     });
                 }
 
@@ -121,9 +165,9 @@ pub(super) async fn next_postgres_snapshot_chunk(
                         timestamp: now_millis(),
                     },
                     ts: now_millis(),
-                    schema: None,
-                    table: table_name.clone(),
-                    primary_key: None,
+                    schema: schema_name.clone(),
+                    table: bare_table.clone(),
+                    primary_key: primary_key.clone(),
                     snapshot: Some(SnapshotMetadata {
                         snapshot_id: handle.snapshot.snapshot_id.clone(),
                         chunk_index: handle.next_chunk_index,
@@ -132,6 +176,8 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
                     before_is_key_only: false,
+                    unavailable_columns: Vec::new(),
+                    before_unavailable_columns: Vec::new(),
                 });
             }
         } else {
@@ -156,9 +202,9 @@ pub(super) async fn next_postgres_snapshot_chunk(
                         timestamp: now_millis(),
                     },
                     ts: now_millis(),
-                    schema: None,
+                    schema: schema_name.clone(),
                     table: table.snapshot.table.clone(),
-                    primary_key: None,
+                    primary_key: primary_key.clone(),
                     snapshot: Some(SnapshotMetadata {
                         snapshot_id: handle.snapshot.snapshot_id.clone(),
                         chunk_index: handle.next_chunk_index,
@@ -167,6 +213,8 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
                     before_is_key_only: false,
+                    unavailable_columns: Vec::new(),
+                    before_unavailable_columns: Vec::new(),
                 });
             }
 

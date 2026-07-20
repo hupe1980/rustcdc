@@ -115,7 +115,9 @@ impl<'a> ReplayRunner<'a> {
             loop {
                 match self.runtime.enqueue_event(event.clone()) {
                     Ok(()) => break,
-                    Err(Error::StateError(message)) if message == "runtime buffer is full" => {
+                    // Match the kind, not the message text: the wording is not a
+                    // contract, and matching on it silently stops working when it changes.
+                    Err(error) if error.kind() == crate::core::ErrorKind::Backpressure => {
                         let batch = self.runtime.poll_event_batch().await?;
                         if batch.is_empty() {
                             return Err(Error::StateError(
@@ -291,6 +293,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

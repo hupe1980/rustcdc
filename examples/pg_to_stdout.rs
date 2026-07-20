@@ -30,6 +30,12 @@ async fn main() -> rustcdc::Result<()> {
         replication_slot_name: args.replication_slot,
         publication_name: args.publication,
         conn_timeout_secs: args.conn_timeout_secs,
+        // This example provisions its own slot so a first run works against an empty
+        // database. Production deployments should leave this `false` and create the slot
+        // out of band: if a slot disappears mid-life, recreating it silently restarts
+        // capture at the current WAL position and skips everything written since the
+        // last confirmed position.
+        create_replication_slot_if_missing: args.create_slot,
         ..PostgresSourceConfig::default()
     };
 
@@ -99,6 +105,7 @@ struct ExampleArgs {
     password: String,
     database: String,
     replication_slot: String,
+    create_slot: bool,
     publication: String,
     snapshot_tables: Vec<String>,
     checkpoint_dir: PathBuf,
@@ -121,6 +128,7 @@ impl ExampleArgs {
             password: env_or_default("CDC_RS_PASSWORD", "postgres"),
             database: env_or_default("CDC_RS_DB", "postgres"),
             replication_slot: env_or_default("CDC_RS_SLOT", "rustcdc_example_slot"),
+            create_slot: env_or_default("CDC_RS_CREATE_SLOT", "true") != "false",
             publication: env_or_default("CDC_RS_PUBLICATION", "rustcdc_example_pub"),
             snapshot_tables: env_or_default("CDC_RS_SNAPSHOT_TABLES", "public.users")
                 .split(',')
@@ -166,6 +174,7 @@ impl ExampleArgs {
                 "--password" => out.password = next_value(&mut args, "--password")?,
                 "--db" | "--database" => out.database = next_value(&mut args, "--database")?,
                 "--slot" => out.replication_slot = next_value(&mut args, "--slot")?,
+                "--no-create-slot" => out.create_slot = false,
                 "--publication" => out.publication = next_value(&mut args, "--publication")?,
                 "--snapshot-tables" => {
                     out.snapshot_tables = next_value(&mut args, "--snapshot-tables")?
@@ -242,6 +251,7 @@ Options:\n\
   --password <password>          PostgreSQL password (default: postgres)\n\
   --database <db>                PostgreSQL database (default: postgres)\n\
   --slot <name>                  Replication slot (default: rustcdc_example_slot)\n\
+  --no-create-slot               Require the slot to already exist (production default)\n\
   --publication <name>           Publication name (default: rustcdc_example_pub)\n\
   --snapshot-tables <csv>        Snapshot table list (default: public.users)\n\
   --checkpoint-dir <path>        Checkpoint directory (default: ./target/rustcdc-checkpoints)\n\

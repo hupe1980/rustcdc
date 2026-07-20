@@ -22,6 +22,8 @@ fn build_event(table: &str) -> Event {
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 

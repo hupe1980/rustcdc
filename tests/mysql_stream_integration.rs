@@ -46,6 +46,18 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
         .with_env_var("MYSQL_DATABASE", "cdc")
+        // rustcdc requires FULL row metadata and row images. MySQL 8 defaults
+        // binlog_row_metadata to MINIMAL, under which the binlog carries no column
+        // names and no primary-key flags — events would be emitted with positional
+        // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
+        // the test server must be configured the way a production server must be.
+        .with_cmd(vec![
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
+            "--server-id=1",
+        ])
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
@@ -204,6 +216,18 @@ async fn mysql_stream_resume_from_checkpoint() -> rustcdc::Result<()> {
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
         .with_env_var("MYSQL_DATABASE", "cdc")
+        // rustcdc requires FULL row metadata and row images. MySQL 8 defaults
+        // binlog_row_metadata to MINIMAL, under which the binlog carries no column
+        // names and no primary-key flags — events would be emitted with positional
+        // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
+        // the test server must be configured the way a production server must be.
+        .with_cmd(vec![
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
+            "--server-id=1",
+        ])
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
@@ -317,6 +341,18 @@ async fn mysql_stream_binlog_rotation() -> rustcdc::Result<()> {
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
         .with_env_var("MYSQL_DATABASE", "cdc")
+        // rustcdc requires FULL row metadata and row images. MySQL 8 defaults
+        // binlog_row_metadata to MINIMAL, under which the binlog carries no column
+        // names and no primary-key flags — events would be emitted with positional
+        // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
+        // the test server must be configured the way a production server must be.
+        .with_cmd(vec![
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
+            "--server-id=1",
+        ])
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;

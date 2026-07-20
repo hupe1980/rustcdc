@@ -34,6 +34,8 @@ fn build_event(id: u64) -> Event {
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 
@@ -103,7 +105,7 @@ impl Transform for NormalizeNameTransform {
 
 fn bench_event_json_roundtrip(c: &mut Criterion) {
     let payload = build_event(1);
-    c.bench_function("event_json_roundtrip", |b| {
+    c.bench_function("quality_perf/event_json_roundtrip", |b| {
         b.iter(|| {
             let encoded = black_box(&payload).to_json().expect("serialize event");
             Event::from_json(&encoded).expect("deserialize event")
@@ -119,7 +121,7 @@ fn bench_transform_pipeline(c: &mut Criterion) {
 
     let pipeline = build_transform_pipeline();
 
-    c.bench_function("transform_pipeline_two_stages", |b| {
+    c.bench_function("quality_perf/transform_pipeline_two_stages", |b| {
         b.iter(|| {
             let event = build_event(black_box(100));
             runtime
@@ -130,7 +132,7 @@ fn bench_transform_pipeline(c: &mut Criterion) {
 }
 
 fn bench_snapshot_10k_rows(c: &mut Criterion) {
-    let mut group = c.benchmark_group("snapshot_validator");
+    let mut group = c.benchmark_group("quality_perf/snapshot_validator");
     let size = 10_000_u64;
     let events: Vec<Event> = (1..=size).map(build_event).collect();
     group.throughput(Throughput::Elements(size));
@@ -154,7 +156,7 @@ fn bench_stream_1k_events(c: &mut Criterion) {
         .expect("build tokio runtime");
     let mut pipeline = build_transform_pipeline();
 
-    let mut group = c.benchmark_group("stream_events");
+    let mut group = c.benchmark_group("quality_perf/stream_events");
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("stream_1k_events", |b| {
         b.iter(|| run_pipeline_batch(&runtime, &mut pipeline, black_box(1_000)))
@@ -172,7 +174,7 @@ fn bench_full_cycle_snapshot_stream_handoff(c: &mut Criterion) {
     let snapshot_events: Vec<Event> = (1..=10_000).map(build_event).collect();
     let overlap_prefetch: Vec<Event> = (9_500..=10_500).map(build_event).collect();
 
-    c.bench_function("full_cycle_snapshot_stream_handoff", |b| {
+    c.bench_function("quality_perf/full_cycle_snapshot_stream_handoff", |b| {
         b.iter(|| {
             let mut validator = SnapshotValidator::new();
             validator.set_expected_count("users", 10_000);
@@ -204,7 +206,7 @@ fn bench_parallel_snapshot_4x100k(c: &mut Criterion) {
         })
         .collect();
 
-    c.bench_function("parallel_snapshot_4_tables_100k", |b| {
+    c.bench_function("quality_perf/parallel_snapshot_4_tables_100k", |b| {
         b.iter(|| {
             for (table_name, events) in &table_events {
                 let mut validator = SnapshotValidator::new();
@@ -223,7 +225,7 @@ fn bench_parallel_snapshot_4x100k(c: &mut Criterion) {
 }
 
 fn bench_quality_gate_targets(c: &mut Criterion) {
-    let mut group = c.benchmark_group("quality_gates");
+    let mut group = c.benchmark_group("quality_perf/quality_gates");
     // Use the same sampling parameters as the main benchmark suite so that
     // per-measurement confidence intervals are tight enough to support the
     // ±5 % regression gate. The former values (20 samples / 5 s) produced

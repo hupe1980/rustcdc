@@ -37,7 +37,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # windows-latest is required, not optional: the Win32 PID-liveness probe in
+        # checkpoint::owner_lease is the crate's only `unsafe` block, and a
+        # `#![forbid(unsafe_code)]` at the crate root made it impossible to compile for
+        # any *-pc-windows-* target. That break was invisible for as long as the matrix
+        # was Linux + macOS only. Keep Windows here so it cannot regress silently.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, nightly]
         profile:
           - { name: no-default-features, args: "--no-default-features" }
@@ -203,6 +208,10 @@ jobs:
           - postgres_version_matrix
           - postgres_snapshot_integration
           - postgres_stream_integration
+          # Type fidelity + REPLICA IDENTITY DEFAULT. Every other integration schema is
+          # BIGINT + TEXT, and that gap is what let a silent null-decoding defect survive
+          # in the SQL Server connector.
+          - postgres_type_fidelity_integration
           - postgres_handoff_integration
           - checkpoint_file_integration
           - runtime_postgres_process_crash_integration
@@ -425,7 +434,7 @@ jobs:
       BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
       BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
       CRITERION_BASELINE: ci-baseline
-      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_gates wasm_transform"
+      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_perf/quality_gates cdc_perf/quality_gates cdc_perf/wasm_transform"
       LATENCY_GATE_DEFAULT_P95_MS: "500"
       LATENCY_GATE_DEFAULT_P99_MS: "1000"
     steps:

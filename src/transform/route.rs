@@ -160,6 +160,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -388,6 +390,8 @@ mod tests {
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).await.unwrap());
         assert!(

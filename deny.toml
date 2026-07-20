@@ -1,6 +1,17 @@
 # cargo-deny configuration for rustcdc.
 #
 # Enforced by `cargo deny check` in the `policy-gate` CI job on every PR.
+
+[graph]
+# Resolve the dependency graph with every feature enabled.
+#
+# Without this, cargo-deny builds the graph from `default = ["postgres", "tls"]`
+# only, so every optional dependency is invisible to the advisory, license, and
+# ban checks — including the two highest-risk subtrees in the project: the
+# wasmtime/cranelift JIT and the aes-gcm/hkdf/hmac crypto stack, plus mysql_async,
+# tiberius, opentelemetry, prost, apache-avro and schemreg. A RUSTSEC advisory
+# against any of them would not have failed the gate.
+all-features = true
 # All vulnerabilities and yanked crates are denied by default (cargo-deny 0.19
 # behaviour: advisory checks are always enabled, the ignore list is the only
 # override mechanism).

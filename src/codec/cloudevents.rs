@@ -83,6 +83,8 @@ const CE_SPEC_VERSION: &str = "1.0";
 ///     transaction: None,
 ///     envelope_version: rustcdc::EVENT_ENVELOPE_VERSION,
 ///     before_is_key_only: false,
+///     unavailable_columns: Vec::new(),
+///     before_unavailable_columns: Vec::new(),
 /// };
 ///
 /// let out = encoder.encode(&event).unwrap();
@@ -124,8 +126,33 @@ impl EventEncoder for CloudEventsEncoder {
         // CloudEvents `type` — reverse-DNS prefixed event type.
         let ce_type = format!("io.rustcdc.change.{}", event.op.to_str());
 
-        // CloudEvents `id` — unique per event; use source + offset as a stable key.
-        let id = format!("{}/{}", event.source.source_name, event.source.offset);
+        // CloudEvents `id` — MUST be unique per `source`.
+        //
+        // The offset alone is not: every row of a multi-row transaction shares one
+        // commit LSN, so `UPDATE users SET tier='gold' WHERE region='EU'` touching 500
+        // rows produced 500 CloudEvents with identical `(source, id)`. Spec-conformant
+        // consumers performing at-most-once dedup on that pair — Knative Eventing,
+        // Azure Event Grid — discard 499 of them, as silent data loss the producer
+        // cannot observe.
+        //
+        // Fold in the transaction sequence when present (the same tiebreaker the
+        // idempotency fingerprint uses, and for the same reason), then the stable
+        // content fingerprint as a last resort for sources that carry neither.
+        let id = match &event.transaction {
+            Some(tx) => format!(
+                "{}/{}/{}/{}",
+                event.source.source_name, event.source.offset, tx.tx_id, tx.event_index
+            ),
+            None => match crate::core::fingerprint_event_stable(event) {
+                Ok(fingerprint) => format!(
+                    "{}/{}/{}",
+                    event.source.source_name, event.source.offset, fingerprint
+                ),
+                // Fingerprinting only fails on an empty source_name/offset, which
+                // `validate()` already rejects. Fall back rather than fail the encode.
+                Err(_) => format!("{}/{}", event.source.source_name, event.source.offset),
+            },
+        };
 
         // CloudEvents `time` — RFC 3339 timestamp.
         let time = unix_ms_to_rfc3339(event.ts);
@@ -152,6 +179,14 @@ impl EventEncoder for CloudEventsEncoder {
         if event.before_is_key_only {
             data.insert("before_is_key_only".into(), json!(true));
         }
+        if !event.unavailable_columns.is_empty() {
+            data.insert(
+                "unavailable_columns".into(),
+                json!(event.unavailable_columns),
+            );
+        }
+        // Carry the envelope version so consumers can detect a version bump.
+        data.insert("envelope_version".into(), json!(event.envelope_version));
 
         // Assemble the CloudEvents envelope.
         let mut ce = Map::new();
@@ -250,6 +285,66 @@ mod tests {
         Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
     };
 
+    /// CloudEvents 1.0 requires `source` + `id` to be unique per distinct event.
+    ///
+    /// Every row of a multi-row transaction shares one commit LSN, so keying `id` on
+    /// the offset alone made a 500-row `UPDATE` emit 500 events with identical
+    /// `(source, id)`. Spec-conformant consumers dedup on that pair and would discard
+    /// 499 of them — silent data loss the producer cannot observe.
+    #[test]
+    fn cloudevents_id_is_unique_within_one_transaction() {
+        let encoder = CloudEventsEncoder::default();
+
+        let mut ids = std::collections::HashSet::new();
+        for index in 0..500u32 {
+            let mut event = insert_event();
+            // Same commit LSN for every row, as a real transaction produces.
+            event.source.offset = "0/16B6A70".into();
+            event.after = Some(serde_json::json!({"id": index, "tier": "gold"}));
+            event.transaction = Some(TransactionMetadata {
+                tx_id: 4242,
+                total_events: Some(500),
+                event_index: index,
+            });
+
+            let encoded = encoder.encode(&event).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&encoded.bytes).unwrap();
+            let id = value.get("id").unwrap().as_str().unwrap().to_string();
+            assert!(
+                ids.insert(id.clone()),
+                "duplicate CloudEvents id '{id}' at event_index {index}"
+            );
+        }
+        assert_eq!(ids.len(), 500);
+    }
+
+    /// Sources that carry no transaction metadata must still produce distinct ids for
+    /// distinct rows sharing an offset.
+    #[test]
+    fn cloudevents_id_is_unique_without_transaction_metadata() {
+        let encoder = CloudEventsEncoder::default();
+
+        let mut first = insert_event();
+        first.transaction = None;
+        first.after = Some(serde_json::json!({"id": 1, "name": "alice"}));
+
+        let mut second = insert_event();
+        second.transaction = None;
+        second.after = Some(serde_json::json!({"id": 2, "name": "bob"}));
+
+        let id_of = |event: &Event| -> String {
+            let encoded = encoder.encode(event).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&encoded.bytes).unwrap();
+            value.get("id").unwrap().as_str().unwrap().to_string()
+        };
+
+        assert_ne!(
+            id_of(&first),
+            id_of(&second),
+            "two distinct rows at the same offset must not share a CloudEvents id"
+        );
+    }
+
     fn insert_event() -> Event {
         Event {
             before: None,
@@ -272,6 +367,8 @@ mod tests {
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

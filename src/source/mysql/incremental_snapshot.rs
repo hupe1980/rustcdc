@@ -349,6 +349,8 @@ impl MysqlIncrementalSnapshotHandle {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -444,8 +446,16 @@ impl MysqlIncrementalSnapshotHandle {
         }
         if stream_events.is_empty() {
             // Quiet database: re-query SHOW MASTER STATUS to detect progress.
+            //
+            // Must be `is_ge`, not `is_gt`. `high_wm` was captured from this same
+            // query moments earlier, and the binlog position only advances on write
+            // traffic. On an idle database `current == high_wm` forever, so `is_gt`
+            // never returns true, the window never closes, and the incremental
+            // snapshot stalls permanently in ChunkCollect — precisely when it should
+            // finish fastest. Reaching the high watermark is what closes the window;
+            // exceeding it is not required.
             let current = query_master_status(&self.pool).await?;
-            return Ok(cmp_binlog(&current, high_wm).is_gt());
+            return Ok(cmp_binlog(&current, high_wm).is_ge());
         }
         Ok(false)
     }
@@ -675,6 +685,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 

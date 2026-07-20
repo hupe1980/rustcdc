@@ -1,6 +1,13 @@
 //! Core crate surface for rustcdc.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: the Windows PID-liveness probe in
+// `checkpoint::owner_lease` needs a single, tightly-scoped `unsafe` block for the
+// Win32 `OpenProcess`/`GetExitCodeProcess` FFI. `forbid` cannot be locally
+// overridden, so it made the crate impossible to compile for `*-pc-windows-*`
+// targets — invisibly, because CI only builds Linux and macOS. Every other module
+// remains unsafe-free, and each exception must carry an explicit
+// `#[allow(unsafe_code)]` with a safety comment.
+#![deny(unsafe_code)]
 
 pub mod checkpoint;
 pub mod codec;
@@ -26,8 +33,10 @@ pub use crate::core::RustlsClientConfig;
 pub use crate::core::{
     fingerprint_event_stable, fingerprint_event_transient, AckMode, AckToken, CdcRuntime,
     ConnectionRetryPolicy, Error, ErrorKind, Event, EventBatch, EventIdempotencyGuard, EventTracer,
-    FingerprintError, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
-    Offset, Operation, PostCommitSourceConfirmPolicy, Result, RuntimeAdminSnapshot, RuntimeConfig,
+    FingerprintError, HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer,
+    NoOpMetricsCollector,
+    NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite,
+    RuntimeAdminSnapshot, RuntimeConfig,
     RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider,
     SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata, StructuredLogger,
     TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError, ValidationErrors,

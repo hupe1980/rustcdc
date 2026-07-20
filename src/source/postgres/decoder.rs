@@ -423,19 +423,50 @@ pub(super) struct PgOutputXLogData {
     pub(super) data: Vec<u8>,
 }
 
+/// Result of a single WAL poll.
+///
+/// The distinction between [`PollOutcome::Data`] with an empty vector and
+/// [`PollOutcome::TimedOut`] is load-bearing: an empty batch means the slot is
+/// genuinely caught up and it is safe to advance it during idle periods, whereas a
+/// timed-out poll means there is *more* backlog than could be decoded. Collapsing
+/// the two lets an idle-advance discard un-consumed WAL.
+#[derive(Debug)]
+pub(super) enum PollOutcome {
+    /// The poll completed. The vector may be empty, which means the slot is caught up.
+    Data(Vec<PgOutputXLogData>),
+    /// The poll exceeded its time budget before the server finished decoding.
+    /// The slot must **not** be treated as idle.
+    TimedOut,
+}
+
+impl PollOutcome {
+    /// Whether the slot is provably caught up — i.e. a completed poll with no rows.
+    pub(super) fn is_caught_up(&self) -> bool {
+        matches!(self, Self::Data(rows) if rows.is_empty())
+    }
+
+    /// Consume into the decoded rows, discarding the timeout distinction.
+    pub(super) fn into_rows(self) -> Vec<PgOutputXLogData> {
+        match self {
+            Self::Data(rows) => rows,
+            Self::TimedOut => Vec::new(),
+        }
+    }
+}
+
 #[async_trait]
 pub(super) trait PgOutputMessageProvider: Send + Sync {
     /// Poll for up to `max_messages` decoded WAL rows.
     ///
     /// The implementation **must** return within `poll_timeout`. For the
-    /// SQL-polling backend this is enforced via [`tokio::time::timeout`] plus a
-    /// server-side query cancellation so the underlying connection is always
-    /// returned to a ready state before the next call.
+    /// SQL-polling backend this is enforced via a server-side `statement_timeout`
+    /// so the underlying connection is always returned to a ready state before the
+    /// next call; that cancellation surfaces as [`PollOutcome::TimedOut`].
     async fn poll_xlog_data(
         &mut self,
         max_messages: usize,
         poll_timeout: Duration,
-    ) -> Result<Vec<PgOutputXLogData>>;
+    ) -> Result<PollOutcome>;
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()>;
     /// Advance the replication slot to the current WAL LSN during idle periods.
     ///
@@ -466,7 +497,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         &mut self,
         max_messages: usize,
         poll_timeout: Duration,
-    ) -> Result<Vec<PgOutputXLogData>> {
+    ) -> Result<PollOutcome> {
         // pg_logical_slot_peek_binary_changes expects upto_nchanges as int4.
         let capped = i32::try_from(max_messages.max(1)).unwrap_or(i32::MAX);
 
@@ -502,13 +533,22 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         let rows = match result {
             Ok(rows) => rows,
             Err(ref e) if e.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) => {
-                tracing::debug!(
+                // A cancelled poll is NOT an empty backlog — it is the opposite. The
+                // peek is non-consuming, so it re-decodes the whole un-acked backlog on
+                // every call; a timeout means that backlog has grown large enough not to
+                // decode within the budget. Reporting this as "no data" would let the
+                // caller conclude the slot is idle and advance it to
+                // `pg_current_wal_lsn()`, permanently discarding exactly the backlog
+                // that caused the timeout. Surface it distinctly instead.
+                tracing::warn!(
                     target: "rustcdc::source::postgres",
                     slot = %self.slot_name,
                     timeout_ms,
-                    "postgres poll_xlog_data hit statement_timeout; returning empty batch",
+                    "postgres poll_xlog_data hit statement_timeout; the un-acked WAL \
+                     backlog could not be decoded within the poll budget. Treating this \
+                     as backlog pressure, not as an idle slot.",
                 );
-                return Ok(vec![]);
+                return Ok(PollOutcome::TimedOut);
             }
             Err(e) => {
                 return Err(parser::map_pgoutput_poll_error(
@@ -528,7 +568,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             });
         }
 
-        Ok(messages)
+        Ok(PollOutcome::Data(messages))
     }
 
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
@@ -721,8 +761,8 @@ mod tests {
                 &mut self,
                 _max: usize,
                 _timeout: std::time::Duration,
-            ) -> crate::core::Result<Vec<PgOutputXLogData>> {
-                Ok(vec![])
+            ) -> crate::core::Result<PollOutcome> {
+                Ok(PollOutcome::Data(vec![]))
             }
 
             async fn confirm_lsn(&mut self, lsn: u64) -> crate::core::Result<()> {

@@ -312,6 +312,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -451,6 +453,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).await.unwrap());
         assert!(e.before.is_none(), "before must remain None for Truncate");
@@ -483,6 +487,8 @@ mod tests {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             before_is_key_only: false,
+            unavailable_columns: Vec::new(),
+            before_unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).await.unwrap());
         assert!(e.after.is_none(), "after must remain None for Delete");

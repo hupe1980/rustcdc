@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use rustcdc::checkpoint::InMemoryCheckpoint;
 use rustcdc::core::{
-    CdcRuntime, Event, Operation, RuntimeConfig, RuntimeSourceConfig, SourceMetadata,
-    TransformErrorPolicy, EVENT_ENVELOPE_VERSION,
+    CdcRuntime, Event, Operation, RuntimeConfig, RuntimeOptions, RuntimeSourceConfig,
+    SourceMetadata, TransformErrorPolicy, EVENT_ENVELOPE_VERSION,
 };
 use rustcdc::schema_history::InMemorySchemaHistory;
 use rustcdc::transform::Transform;
@@ -34,6 +34,8 @@ fn make_event(table: &str, id: u64) -> Event {
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
         before_is_key_only: false,
+        unavailable_columns: Vec::new(),
+        before_unavailable_columns: Vec::new(),
     }
 }
 
@@ -52,7 +54,7 @@ fn compile_wat(name: &str) -> tempfile::NamedTempFile {
 async fn build_runtime_with_wasm(
     wasm_path: impl AsRef<Path>,
     transform_error_policy: TransformErrorPolicy,
-) -> CdcRuntime {
+) -> (CdcRuntime, std::sync::mpsc::Receiver<(Event, rustcdc::Error)>) {
     let transform = RuntimeWasmTransform::new(WasmConfig {
         module_path: wasm_path.as_ref().to_path_buf(),
         timeout_ms: 50,
@@ -63,17 +65,25 @@ async fn build_runtime_with_wasm(
     .await
     .expect("create wasm transform");
 
+    // `Skip` drops the event *and* advances the checkpoint past it, so a dead-letter
+    // handler is mandatory — the runtime refuses to build without one. Nothing is
+    // expected to reach it here; a non-empty channel at the end of a test means an
+    // event was silently discarded.
+    let (dead_letters, dead_letter_rx) = std::sync::mpsc::channel();
     let config = RuntimeConfig::new(
         RuntimeSourceConfig::Disabled,
         InMemoryCheckpoint::default(),
         InMemorySchemaHistory::default(),
     )
-    .with_transform_error_policy(transform_error_policy);
+    .with_transform_error_policy(transform_error_policy)
+    .with_options(RuntimeOptions::new().with_dead_letter_handler(move |event, error| {
+        let _ = dead_letters.send((event, error));
+    }));
 
     let mut runtime = CdcRuntime::new(config).expect("create runtime");
     runtime.add_transform(Box::new(transform));
     runtime.start().await.expect("start runtime");
-    runtime
+    (runtime, dead_letter_rx)
 }
 
 struct RuntimeWasmTransform {
@@ -119,7 +129,8 @@ impl Transform for RuntimeWasmTransform {
 #[tokio::test]
 async fn pass_through_wasm_forwards_events() {
     let wasm_file = compile_wat("pass_through.wat");
-    let mut runtime = build_runtime_with_wasm(wasm_file.path(), TransformErrorPolicy::Halt).await;
+    let (mut runtime, _dead_letters) =
+        build_runtime_with_wasm(wasm_file.path(), TransformErrorPolicy::Halt).await;
 
     let event = make_event("users", 1);
     runtime.enqueue_event(event.clone()).unwrap();
@@ -140,7 +151,8 @@ async fn pass_through_wasm_forwards_events() {
 #[tokio::test]
 async fn filter_all_wasm_drops_events() {
     let wasm_file = compile_wat("filter_out_all.wat");
-    let mut runtime = build_runtime_with_wasm(wasm_file.path(), TransformErrorPolicy::Halt).await;
+    let (mut runtime, _dead_letters) =
+        build_runtime_with_wasm(wasm_file.path(), TransformErrorPolicy::Halt).await;
 
     for id in 1u64..=3 {
         runtime.enqueue_event(make_event("orders", id)).unwrap();
@@ -160,10 +172,15 @@ async fn filter_all_wasm_drops_events() {
 async fn transform_skip_policy_does_not_halt() {
     // pass_through never errors, so we test the Skip policy still delivers events.
     let wasm_file = compile_wat("pass_through.wat");
-    let mut runtime = build_runtime_with_wasm(wasm_file.path(), TransformErrorPolicy::Skip).await;
+    let (mut runtime, dead_letters) =
+        build_runtime_with_wasm(wasm_file.path(), TransformErrorPolicy::Skip).await;
 
     runtime.enqueue_event(make_event("accounts", 42)).unwrap();
     let batch = runtime.poll_event_batch().await.unwrap();
     // With pass_through + Skip, events should be delivered normally.
     assert_eq!(batch.len(), 1);
+    assert!(
+        dead_letters.try_recv().is_err(),
+        "Skip must not dead-letter an event the transform handled successfully"
+    );
 }

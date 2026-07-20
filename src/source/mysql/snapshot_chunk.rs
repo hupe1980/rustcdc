@@ -78,6 +78,8 @@ pub(super) async fn next_snapshot_chunk(
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
                     before_is_key_only: false,
+                    unavailable_columns: Vec::new(),
+                    before_unavailable_columns: Vec::new(),
                 });
             }
         } else {
@@ -116,6 +118,8 @@ pub(super) async fn next_snapshot_chunk(
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
                     before_is_key_only: false,
+                    unavailable_columns: Vec::new(),
+                    before_unavailable_columns: Vec::new(),
                 });
             }
 

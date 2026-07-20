@@ -4,7 +4,18 @@
   "committed_event_count": 28,
   "offset": {
     "snapshot_id": "sqlserver-snapshot-compat-1",
-    "lsn_start": [0, 0, 0, 42, 0, 0, 1, 155, 0, 16],
+    "lsn_start": [
+      0,
+      0,
+      0,
+      42,
+      0,
+      0,
+      1,
+      155,
+      0,
+      16
+    ],
     "current_table": 0,
     "next_chunk_index": 3,
     "tables": [
@@ -23,5 +34,6 @@
         "is_complete": false
       }
     ]
-  }
+  },
+  "content_checksum": "e0c72c08e19b7e40669af1246fc6f4cb15c9328919edc544744aa2fa9754942f"
 }

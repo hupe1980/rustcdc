@@ -36,9 +36,17 @@ pub(super) fn lsn_hex_to_bytes_opt(lsn_hex: &str) -> Option<[u8; 10]> {
 }
 
 pub(super) fn lsn_bytes_to_hex(lsn: &[u8; 10]) -> String {
-    let mut out = String::from("0x");
+    use std::fmt::Write as _;
+    // Lowercase to match `sys.fn_varbintohexstr`, which is what every LSN read back
+    // from the server looks like. Mixing cases breaks two things: the server-side
+    // string comparison in the truncate query (meaningless under a case-sensitive or
+    // binary collation, where 'a' > 'F'), and the client-side sort of the window
+    // buffer by `source.offset` (where '0' < 'A' < 'a', so uppercase truncate offsets
+    // sort before every lowercase DML offset that differs at a letter position).
+    let mut out = String::with_capacity(2 + lsn.len() * 2);
+    out.push_str("0x");
     for byte in lsn {
-        out.push_str(&format!("{byte:02X}"));
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
@@ -332,15 +340,71 @@ pub(super) fn build_snapshot_fetch_sql(
     )
 }
 
-fn build_cdc_select_columns(columns: &[String]) -> String {
-    let mut select_columns = String::from(
-        "sys.fn_varbintohexstr(__$start_lsn) AS start_lsn_hex, sys.fn_varbintohexstr(__$seqval) AS seqval_hex, __$operation AS operation",
-    );
-    for column in columns {
-        select_columns.push_str(", ");
-        select_columns.push_str(&quoted_identifier(column));
+/// A resume point *within* a CDC window.
+///
+/// A window can contain more changes than `max_events_per_poll`, so a poll may stop
+/// part-way through it. The cursor records exactly where, using the same triple the
+/// `ORDER BY` sorts on, so the next poll resumes with no gap and no repeat.
+///
+/// `operation` is part of the key because `'all update old'` emits **two rows sharing
+/// one `(start_lsn, seqval)`** — op=3 (before-image) and op=4 (after-image). A cursor
+/// keyed only on `(lsn, seqval)` would skip the op=4 partner when a batch boundary
+/// falls between them, silently turning an UPDATE into a lost after-image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlServerCdcCursor {
+    pub(crate) lsn_hex: String,
+    pub(crate) seqval_hex: String,
+    pub(crate) operation: i32,
+}
+
+impl SqlServerCdcCursor {
+    /// Encode as `"{lsn}:{seqval}:{op}"` for the checkpoint offset.
+    pub(crate) fn encode(&self) -> String {
+        format!("{}:{}:{}", self.lsn_hex, self.seqval_hex, self.operation)
     }
-    select_columns
+
+    /// Parse `"{lsn}:{seqval}:{op}"`. Returns `None` for a bare `"{lsn}"` offset,
+    /// which means "start of window" and is the pre-cursor checkpoint format.
+    pub(crate) fn decode(offset: &str) -> Option<Self> {
+        let mut parts = offset.split(':');
+        let lsn_hex = parts.next()?.to_string();
+        let seqval_hex = parts.next()?.to_string();
+        let operation = parts.next()?.parse::<i32>().ok()?;
+        lsn_hex_to_bytes(&lsn_hex).ok()?;
+        lsn_hex_to_bytes(&seqval_hex).ok()?;
+        Some(Self {
+            lsn_hex,
+            seqval_hex,
+            operation,
+        })
+    }
+}
+
+fn build_cdc_select_columns(columns: &[String]) -> String {
+    // Project the captured columns through `FOR JSON PATH`, exactly as the snapshot
+    // path does, and let SQL Server serialize every type.
+    //
+    // The previous approach decoded each cell client-side through a `try_get` ladder
+    // over five Rust types (`&str`, `i64`, `i32`, `f64`, `bool`), discarding every
+    // type mismatch. Because `tiberius` is pinned with `default-features = false` and
+    // no `chrono`/`rust_decimal` features, that silently produced `null` for decimal,
+    // numeric, money, datetime2, datetime, date, time, datetimeoffset, uniqueidentifier,
+    // varbinary, rowversion, xml, smallint, tinyint and real — indistinguishable from a
+    // genuine SQL NULL. It also meant the *same physical row* decoded correctly during
+    // snapshot (which already used FOR JSON PATH) and as `null` during streaming.
+    let mut projection = String::new();
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            projection.push_str(", ");
+        }
+        // Alias back to the original name so the JSON keys are the column names.
+        projection.push_str(&format!(
+            "c.{} AS {}",
+            quoted_identifier(column),
+            quoted_identifier(column)
+        ));
+    }
+    projection
 }
 
 pub(super) fn build_cdc_poll_sql(
@@ -349,12 +413,40 @@ pub(super) fn build_cdc_poll_sql(
     max_events_per_poll: usize,
     start_lsn_hex: &str,
     end_lsn_hex: &str,
+    cursor: Option<&SqlServerCdcCursor>,
 ) -> String {
-    let select_columns = build_cdc_select_columns(columns);
+    let row_projection = build_cdc_select_columns(columns);
+
+    // Lexicographic strict-greater-than on the same triple as the ORDER BY, so a
+    // resumed poll starts immediately after the last delivered row.
+    let cursor_clause = match cursor {
+        Some(c) => format!(
+            " WHERE c.__$start_lsn > CONVERT(binary(10), '{lsn}', 1) \
+              OR (c.__$start_lsn = CONVERT(binary(10), '{lsn}', 1) \
+                  AND c.__$seqval > CONVERT(binary(10), '{seq}', 1)) \
+              OR (c.__$start_lsn = CONVERT(binary(10), '{lsn}', 1) \
+                  AND c.__$seqval = CONVERT(binary(10), '{seq}', 1) \
+                  AND c.__$operation > {op})",
+            lsn = c.lsn_hex,
+            seq = c.seqval_hex,
+            op = c.operation
+        ),
+        None => String::new(),
+    };
+
     format!(
-        "SELECT TOP ({max_events_per_poll}) {select_columns}, DATEDIFF_BIG(MILLISECOND, '1970-01-01T00:00:00', SYSUTCDATETIME()) AS ts_ms \
-         FROM cdc.fn_cdc_get_all_changes_{capture_instance}(CONVERT(binary(10), '{start_lsn_hex}', 1), CONVERT(binary(10), '{end_lsn_hex}', 1), 'all update old') \
-         ORDER BY __$start_lsn, __$seqval, __$operation"
+        "SELECT TOP ({max_events_per_poll}) \
+         sys.fn_varbintohexstr(c.__$start_lsn) AS start_lsn_hex, \
+         sys.fn_varbintohexstr(c.__$seqval) AS seqval_hex, \
+         c.__$operation AS operation, \
+         DATEDIFF_BIG(MILLISECOND, '1970-01-01T00:00:00', \
+             COALESCE(sys.fn_cdc_map_lsn_to_time(c.__$start_lsn), SYSUTCDATETIME())) AS ts_ms, \
+         (SELECT {row_projection} FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) AS row_json \
+         FROM cdc.fn_cdc_get_all_changes_{capture_instance}(\
+             CONVERT(binary(10), '{start_lsn_hex}', 1), \
+             CONVERT(binary(10), '{end_lsn_hex}', 1), 'all update old') AS c\
+         {cursor_clause} \
+         ORDER BY c.__$start_lsn, c.__$seqval, c.__$operation"
     )
 }
 

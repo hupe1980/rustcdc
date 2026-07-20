@@ -72,6 +72,8 @@ fn source_config(
         database: "cdc".to_string(),
         replication_slot_name: slot.to_string(),
         publication_name: publication.to_string(),
+        // Ephemeral test container: the slot legitimately does not exist yet.
+        create_replication_slot_if_missing: true,
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
