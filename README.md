@@ -330,6 +330,7 @@ See [docs/runbook.md](docs/runbook.md) for the full procedure.
 - [Configuration Reference](docs/config_reference.md) - Complete configuration options
 - [Troubleshooting Guide](docs/troubleshooting.md) - Diagnosis and resolution procedures
 - [Operations Runbook](docs/runbook.md) - Production procedures, disaster recovery, alerting
+- [Security Posture](docs/security.md) - Transport defaults, dependency policy, known exposure
 - [Documentation Index](docs/documentation.md) - Cross-referenced documentation map
 
 ### Developer Documentation
