@@ -1188,13 +1188,25 @@ impl AdminState {
                 actor_token_id,
             };
 
+            // Reserve the queue-depth slot BEFORE handing the action to the
+            // worker. The worker decrements on dequeue from a separate thread;
+            // incrementing after `try_send` races it — the worker's
+            // `saturating_sub(1)` can land on a still-zero counter, floor at 0,
+            // and the late increment then strands the gauge at 1 forever.
+            {
+                let mut data = self.data.write().await;
+                data.signal_action_queue_depth = data.signal_action_queue_depth.saturating_add(1);
+            }
+
             match self.signal_action_tx.try_send(queued_action) {
-                Ok(()) => {
-                    let mut data = self.data.write().await;
-                    data.signal_action_queue_depth =
-                        data.signal_action_queue_depth.saturating_add(1);
-                }
+                Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(queued_action)) => {
+                    // The action never entered the queue — release the slot.
+                    {
+                        let mut data = self.data.write().await;
+                        data.signal_action_queue_depth =
+                            data.signal_action_queue_depth.saturating_sub(1);
+                    }
                     self.handle_signal_action_queue_unavailable(queued_action)
                         .await;
                     return SignalActionExecutionResult::Aborted {
@@ -1207,6 +1219,12 @@ impl AdminState {
                     };
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(queued_action)) => {
+                    // The action never entered the queue — release the slot.
+                    {
+                        let mut data = self.data.write().await;
+                        data.signal_action_queue_depth =
+                            data.signal_action_queue_depth.saturating_sub(1);
+                    }
                     self.handle_signal_action_queue_unavailable(queued_action)
                         .await;
                     return SignalActionExecutionResult::Aborted {
@@ -4165,6 +4183,21 @@ notification_log_file = "{}"
         panic!("timed out waiting for {signal_id}/{action_type} state {expected_state}");
     }
 
+    /// Poll until the async signal-action queue has fully drained.
+    ///
+    /// The worker decrements `signal_action_queue_depth` *after* emitting the
+    /// terminal lifecycle notification, so observing COMPLETED does not imply
+    /// the depth has reached zero yet — a fixed sleep here is a CI flake.
+    async fn wait_for_signal_queue_drained(admin: &AdminState) {
+        for _ in 0..250 {
+            if admin.data.read().await.signal_action_queue_depth == 0 {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for signal action queue to drain");
+    }
+
     /// Poll a file until it contains at least `expected_lines` non-empty lines,
     /// returning them.  Needed because the AuditLogWriter is async (mpsc channel
     /// to a tokio task), so writes may lag a few milliseconds behind the API call.
@@ -5471,7 +5504,7 @@ notification_log_file = "{}"
         assert_eq!(response.status(), StatusCode::OK);
 
         wait_for_signal_state(&admin, "sig-exec-1", "execute_snapshot", "COMPLETED").await;
-        sleep(Duration::from_millis(500)).await;
+        wait_for_signal_queue_drained(&admin).await;
 
         let data = admin.data.read().await;
         assert_eq!(data.signal_action_queue_depth, 0);
