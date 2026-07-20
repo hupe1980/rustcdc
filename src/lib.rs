@@ -34,13 +34,11 @@ pub use crate::core::{
     fingerprint_event_stable, fingerprint_event_transient, AckMode, AckToken, CdcRuntime,
     ConnectionRetryPolicy, Error, ErrorKind, Event, EventBatch, EventIdempotencyGuard, EventTracer,
     FingerprintError, HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer,
-    NoOpMetricsCollector,
-    NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite,
-    RuntimeAdminSnapshot, RuntimeConfig,
-    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider,
-    SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata, StructuredLogger,
-    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError, ValidationErrors,
-    EVENT_ENVELOPE_VERSION,
+    NoOpMetricsCollector, NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result,
+    RowWrite, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability, RuntimeOptions,
+    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
+    SourceErrorKind, SourceMetadata, StructuredLogger, TransactionMetadata, TransformErrorPolicy,
+    TransportConfig, ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "metrics")]
 pub use crate::core::{

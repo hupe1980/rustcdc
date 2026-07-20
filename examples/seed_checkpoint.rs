@@ -57,7 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (Some(dir), Some(source_type), Some(offset)) = (dir, source_type, offset) else {
-        return Err(format!("--dir, --source-type and --offset are all required\n\n{USAGE}").into());
+        return Err(
+            format!("--dir, --source-type and --offset are all required\n\n{USAGE}").into(),
+        );
     };
 
     // Parse before writing so a malformed offset fails here rather than at connector

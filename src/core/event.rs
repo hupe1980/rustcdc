@@ -1211,7 +1211,9 @@ mod tests {
         event.before_is_key_only = true;
         event.after = Some(json!({"id": 1, "title": "new title"}));
         event.unavailable_columns = vec!["body".into()];
-        event.validate().expect("this is a well-formed partial payload");
+        event
+            .validate()
+            .expect("this is a well-formed partial payload");
 
         match event.row_write() {
             RowWrite::Merge {
@@ -1275,7 +1277,12 @@ mod tests {
         delete.primary_key = Some(vec!["id".into()]);
         delete.after = None;
         delete.before = Some(json!({"id": 7}));
-        assert_eq!(delete.row_write(), RowWrite::Delete { key: json!({"id": 7}) });
+        assert_eq!(
+            delete.row_write(),
+            RowWrite::Delete {
+                key: json!({"id": 7})
+            }
+        );
 
         let mut truncate = valid_event();
         truncate.op = Operation::Truncate;

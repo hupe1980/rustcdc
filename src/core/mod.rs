@@ -27,9 +27,8 @@ pub use observability::{EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetr
 pub use otel::{MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord};
 pub use runtime::{
     AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, HealthVerdict,
-    IdempotencyOptions,
-    PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability,
-    RuntimeOptions, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
+    IdempotencyOptions, PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig,
+    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
 #[cfg(feature = "tls")]

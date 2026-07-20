@@ -425,7 +425,9 @@ async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_ident
         let mut state = seed;
         (0..40_000)
             .map(|_| {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 (b'a' + ((state >> 33) % 26) as u8) as char
             })
             .collect()
@@ -442,12 +444,8 @@ async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_ident
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let mut connection = PostgresConnection::new(source_config(
-        &host,
-        port,
-        "toast_slot",
-        "toast_pub",
-    ));
+    let mut connection =
+        PostgresConnection::new(source_config(&host, port, "toast_slot", "toast_pub"));
     connection.connect().await?;
     let mut stream = connection.start_stream(None).await?;
 
@@ -473,9 +471,7 @@ async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_ident
 
     // The claim under test: FULL does not make the after-image complete.
     assert!(
-        update
-            .unavailable_columns
-            .contains(&"big_kept".to_string()),
+        update.unavailable_columns.contains(&"big_kept".to_string()),
         "an unmodified TOASTed column must be reported unavailable even under \
          REPLICA IDENTITY FULL; got {:?}",
         update.unavailable_columns
@@ -519,7 +515,9 @@ async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_ident
             unavailable_columns,
         } => {
             // pgoutput delivers values in their text form, so the key is "1", not 1.
-            let id = key.get("id").expect("the merge key must carry the primary key");
+            let id = key
+                .get("id")
+                .expect("the merge key must carry the primary key");
             assert!(
                 id.as_str() == Some("1") || id.as_i64() == Some(1),
                 "unexpected key encoding: {id}"

@@ -54,7 +54,10 @@ fn compile_wat(name: &str) -> tempfile::NamedTempFile {
 async fn build_runtime_with_wasm(
     wasm_path: impl AsRef<Path>,
     transform_error_policy: TransformErrorPolicy,
-) -> (CdcRuntime, std::sync::mpsc::Receiver<(Event, rustcdc::Error)>) {
+) -> (
+    CdcRuntime,
+    std::sync::mpsc::Receiver<(Event, rustcdc::Error)>,
+) {
     let transform = RuntimeWasmTransform::new(WasmConfig {
         module_path: wasm_path.as_ref().to_path_buf(),
         timeout_ms: 50,
@@ -76,9 +79,11 @@ async fn build_runtime_with_wasm(
         InMemorySchemaHistory::default(),
     )
     .with_transform_error_policy(transform_error_policy)
-    .with_options(RuntimeOptions::new().with_dead_letter_handler(move |event, error| {
-        let _ = dead_letters.send((event, error));
-    }));
+    .with_options(
+        RuntimeOptions::new().with_dead_letter_handler(move |event, error| {
+            let _ = dead_letters.send((event, error));
+        }),
+    );
 
     let mut runtime = CdcRuntime::new(config).expect("create runtime");
     runtime.add_transform(Box::new(transform));
