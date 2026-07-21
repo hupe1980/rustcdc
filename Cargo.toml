@@ -68,7 +68,11 @@ async-trait = "0.1"
 dashmap = "6"
 bytes = "1"
 tokio-postgres = "0.7"
-krafka = { version = "0.12.0" }
+# One crypto backend for the whole process (aws-lc-rs, matching the provider
+# installed in main.rs) and every compression codec the docs offer (zstd is not
+# in krafka's default set — without compression-all a `compression = "zstd"`
+# config would fail validation at startup).
+krafka = { version = "0.13.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs"] }
 
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
@@ -85,3 +89,6 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
 rustcdc = { version = "0.7.0", features = ["postgres", "mysql", "mariadb", "sqlserver", "metrics"] }
 wat = "1"
+# test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
+# in unit tests without Docker.
+krafka = { version = "0.13.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "test-broker"] }

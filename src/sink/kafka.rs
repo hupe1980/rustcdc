@@ -169,6 +169,9 @@ impl KafkaSink {
                     .retries(config.retry_max_attempts)
                     .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
                     .request_timeout(Duration::from_millis(config.ack_timeout_ms))
+                    .connect_timeout(kafka_connect_timeout(Duration::from_millis(
+                        config.ack_timeout_ms,
+                    )))
                     .delivery_timeout(Self::delivery_timeout(config))
                     .max_in_flight(5)
                     .auth(auth)
@@ -209,6 +212,9 @@ impl KafkaSink {
                     .transactional_id(transactional_id)
                     .transaction_timeout(Duration::from_millis(config.transaction_timeout_ms))
                     .request_timeout(Duration::from_millis(config.ack_timeout_ms))
+                    .connect_timeout(kafka_connect_timeout(Duration::from_millis(
+                        config.ack_timeout_ms,
+                    )))
                     .compression(
                         config
                             .compression
@@ -277,6 +283,7 @@ impl KafkaSink {
             .bootstrap_servers(self.preflight_brokers.clone())
             .client_id(self.preflight_client_id.clone())
             .request_timeout(self.preflight_timeout)
+            .connect_timeout(kafka_connect_timeout(self.preflight_timeout))
             .auth(auth)
             .build()
             .await
@@ -317,28 +324,20 @@ impl KafkaSink {
         key: &[u8],
         payload: &[u8],
     ) -> rustcdc::core::Result<()> {
-        match &mut self.producer {
-            KafkaProducerClient::Idempotent(producer) => {
-                let _ = producer
-                    .send(&self.topic, Some(key), payload)
-                    .await
-                    .map_err(|e| {
-                        RtError::SourceError(format!("Kafka sink delivery failed: {e}"))
-                    })?;
-            }
-            KafkaProducerClient::Transactional(producer) => {
-                let _ = producer
-                    .send(&self.topic, Some(key), payload)
-                    .await
-                    .map_err(|e| {
-                        RtError::SourceError(format!(
-                            "Kafka transactional sink delivery failed: {e}"
-                        ))
-                    })?;
-            }
-        }
+        let metadata = match &mut self.producer {
+            KafkaProducerClient::Idempotent(producer) => producer
+                .send(&self.topic, Some(key), payload)
+                .await
+                .map_err(|e| RtError::SourceError(format!("Kafka sink delivery failed: {e}")))?,
+            KafkaProducerClient::Transactional(producer) => producer
+                .send(&self.topic, Some(key), payload)
+                .await
+                .map_err(|e| {
+                    RtError::SourceError(format!("Kafka transactional sink delivery failed: {e}"))
+                })?,
+        };
 
-        Ok(())
+        enforce_durable_confirmation(&metadata, "sink")
     }
 
     pub async fn send_encoded(&mut self, key: Bytes, value: Bytes) -> rustcdc::core::Result<()> {
@@ -477,6 +476,45 @@ impl KafkaSink {
 
 // ── Schema registry helpers ───────────────────────────────────────────────────
 
+/// Cap the TCP connect timeout at the request timeout.
+///
+/// krafka ≥ 0.13 validates `request_timeout >= connect_timeout` at build time
+/// (default connect timeout: 10 s). This server deliberately runs short request
+/// budgets for local state and preflight operations; a connection that cannot
+/// be established within the request budget is useless to that request anyway,
+/// so the connect timeout follows the request timeout downward.
+pub(crate) fn kafka_connect_timeout(request_timeout: Duration) -> Duration {
+    request_timeout.min(Duration::from_secs(10))
+}
+
+/// Durability tripwire on the send acknowledgement (krafka ≥ 0.13).
+///
+/// `RecordMetadata::delivery` states what the broker actually confirmed —
+/// `offset == -1` alone cannot distinguish "idempotent-deduplicated (durable)"
+/// from "acks = 0 (no guarantee at all)". Every producer in this server is
+/// built with `acks = All`, so an `Unacknowledged` confirmation can only mean a
+/// misconfiguration slipped through — fail the send instead of silently
+/// downgrading the delivery contract.
+pub(crate) fn enforce_durable_confirmation(
+    metadata: &krafka::producer::RecordMetadata,
+    context: &str,
+) -> rustcdc::core::Result<()> {
+    if metadata.is_unacknowledged() {
+        return Err(RtError::StateError(format!(
+            "Kafka {context} send returned an unacknowledged delivery confirmation \
+             (acks = 0 semantics); refusing to treat it as durable"
+        )));
+    }
+    if metadata.is_deduplicated() {
+        tracing::debug!(
+            topic = %metadata.topic,
+            partition = metadata.partition,
+            "Kafka {context} send deduplicated by idempotent producer — data already durable"
+        );
+    }
+    Ok(())
+}
+
 impl rustcdc::sink::SinkAdapter for KafkaSink {
     fn name(&self) -> &str {
         "kafka"
@@ -530,7 +568,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    use super::{BarrierState, BarrierStateMachine, KafkaSink};
+    use super::{kafka_connect_timeout, BarrierState, BarrierStateMachine, KafkaSink};
     use crate::config::schema::{
         KafkaCompression, KafkaSecurityConfig, KafkaSecurityProtocol, KafkaSinkConfig,
     };
@@ -1044,6 +1082,9 @@ mod tests {
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .request_timeout(Duration::from_millis(cfg.ack_timeout_ms))
+            .connect_timeout(kafka_connect_timeout(Duration::from_millis(
+                cfg.ack_timeout_ms,
+            )))
             .auth(auth.clone())
             .build()
             .await
@@ -1070,6 +1111,9 @@ mod tests {
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .request_timeout(Duration::from_millis(cfg.ack_timeout_ms))
+            .connect_timeout(kafka_connect_timeout(Duration::from_millis(
+                cfg.ack_timeout_ms,
+            )))
             .auth(auth)
             .build()
             .await
@@ -1168,5 +1212,103 @@ mod tests {
             .await
             .expect("consumer B close should succeed");
         sink.close().await.expect("sink close should succeed");
+    }
+
+    // ── In-process fake-broker tests (krafka `test-broker`) ──────────────────
+    //
+    // These run the real Kafka wire protocol against krafka's in-process fake
+    // broker — no Docker, no env gating, always on in CI.
+
+    #[tokio::test]
+    async fn fake_broker_sink_delivers_all_records_durably() {
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        broker.create_topic("cdc.fake.delivery", 3);
+
+        let cfg = sample_kafka_config(&broker.bootstrap_servers(), "cdc.fake.delivery");
+        let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
+
+        for i in 0..5u32 {
+            sink.send_encoded(
+                bytes::Bytes::from(format!("key-{i}")),
+                bytes::Bytes::from(format!("value-{i}")),
+            )
+            .await
+            .expect("send must succeed and confirm durably");
+        }
+        sink.flush().await.expect("flush");
+
+        // Every record must be in the broker log — the sum of next_offset over
+        // all partitions is the total number of durably appended records.
+        let total: i64 = broker.with_state(|state| {
+            (0..3)
+                .filter_map(|partition| state.partition("cdc.fake.delivery", partition))
+                .map(|p| p.next_offset)
+                .sum()
+        });
+        assert_eq!(
+            total, 5,
+            "all sends must be appended to the fake broker log"
+        );
+
+        sink.close().await.expect("close");
+    }
+
+    /// End-to-end check of the message-key contract through `SinkBinding`:
+    /// events with a primary key are keyed by the PK JSON (per-row ordering);
+    /// keyless events fall back to the qualified table name instead of an
+    /// empty key (which Kafka would hash — pinning every keyless event of
+    /// every table to one partition).
+    #[tokio::test]
+    async fn fake_broker_message_keys_use_pk_json_with_table_name_fallback() {
+        use krafka::consumer::CompactedTopicConsumer;
+
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        broker.create_topic("cdc.fake.keys", 1);
+
+        let cfg = sample_kafka_config(&broker.bootstrap_servers(), "cdc.fake.keys");
+        let mut binding =
+            crate::sink::build_binding(&crate::config::schema::SinkConfig::Kafka(cfg))
+                .await
+                .expect("sink binding");
+
+        let keyed = sample_event(); // primary_key = ["id"], after.id = 42
+        let mut keyless = sample_event();
+        keyless.primary_key = None;
+
+        binding.send_event(&keyed).await.expect("send keyed");
+        binding.send_event(&keyless).await.expect("send keyless");
+        use rustcdc::sink::SinkAdapter as _;
+        binding.flush().await.expect("flush");
+
+        // No connect_timeout on this builder — use a request budget >= the
+        // 10 s connect default (see load_records for the same workaround).
+        let mut consumer = CompactedTopicConsumer::builder()
+            .bootstrap_servers(broker.bootstrap_servers())
+            .topic("cdc.fake.keys".to_string())
+            .client_id("fake-key-check".to_string())
+            .request_timeout(Duration::from_secs(10))
+            .build()
+            .await
+            .expect("compacted consumer");
+        consumer
+            .scan(Duration::from_millis(1_000))
+            .await
+            .expect("scan");
+        let table = consumer.table();
+
+        assert!(
+            table.contains_key(br#"{"id":42}"#.as_slice()),
+            "keyed event must use the primary-key JSON as message key"
+        );
+        assert!(
+            table.contains_key(b"public.users".as_slice()),
+            "keyless event must fall back to the qualified table name key"
+        );
+        consumer.close().await.expect("consumer close");
+        binding.close().await.expect("binding close");
     }
 }

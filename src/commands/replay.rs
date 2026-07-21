@@ -654,6 +654,9 @@ max_event_bytes = {}
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .request_timeout(Duration::from_millis(1_000))
+            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
+                1_000,
+            )))
             .auth(auth.clone())
             .build()
             .await
@@ -702,6 +705,9 @@ max_event_bytes = {}
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .request_timeout(Duration::from_millis(1_000))
+            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
+                1_000,
+            )))
             .auth(auth)
             .build()
             .await

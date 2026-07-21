@@ -9,6 +9,8 @@ use rustcdc::sink::BoxedSink;
 
 pub use http::HttpSink;
 pub use iceberg::IcebergSink;
+pub(crate) use kafka::enforce_durable_confirmation;
+pub(crate) use kafka::kafka_connect_timeout;
 pub use kafka::KafkaSink;
 pub use rustcdc::sink::{FanOutSinkAdapter as FanOutSink, FileJsonlSink, StdoutSink};
 
@@ -160,7 +162,15 @@ impl SinkBinding {
                 .map_err(AppError::Runtime)
         } else {
             let output = self.codec.encode(event).map_err(AppError::Runtime)?;
-            let key = Bytes::from(output.key.unwrap_or_default());
+            let key = match output.key {
+                Some(key) => Bytes::from(key),
+                // Keyless events (table without a primary key): partition by the
+                // qualified table name so per-table ordering survives. The previous
+                // `unwrap_or_default()` produced an *empty* key, which Kafka
+                // partitioners hash like any other key (Java semantics) — pinning
+                // every keyless event across all tables to one murmur2("") partition.
+                None => Bytes::from(event.qualified_table_name().into_bytes()),
+            };
             let value = Bytes::from(output.value);
             self.transport
                 .send_encoded(key, value)

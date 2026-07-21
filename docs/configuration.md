@@ -257,8 +257,22 @@ password_env = "SCHEMA_REGISTRY_SECRET"
 | `delivery_mode` | `"at_least_once_idempotent"` | `at_least_once_idempotent` \| `transactional` |
 | `transactional_id` | — | Required for `"transactional"` mode; must be unique per pipeline |
 | `compression` | `"none"` | `none` \| `gzip` \| `snappy` \| `lz4` \| `zstd` |
-| `ack_timeout_ms` / `retry_backoff_ms` / `retry_max_attempts` | — | Producer retry tuning |
+| `ack_timeout_ms` / `retry_backoff_ms` / `retry_max_attempts` | — | Producer retry tuning (the TCP connect timeout follows `ack_timeout_ms` down, capped at 10 s) |
 | `security.protocol` | `"plaintext"` | `plaintext` \| `tls` (no SASL support) |
+
+**Message keys and ordering.** Events with a primary key are keyed by the
+compact-JSON primary-key values (e.g. `{"id":42}`), so all changes to one row
+land on one partition in order. Events from tables **without** a primary key
+are keyed by the qualified table name (`schema.table`), preserving per-table
+ordering while spreading tables across partitions. Kafka guarantees ordering
+only within a partition — consumers that need cross-table ordering must use a
+single-partition topic.
+
+**Durability.** Every producer runs with `acks = all` and idempotence enabled,
+and the sink verifies the broker's per-record delivery confirmation — a send
+that the broker did not acknowledge durably fails the batch instead of being
+treated as delivered. All compression codecs listed above (including `zstd`)
+are compiled into the binary.
 
 ### Apache Iceberg
 

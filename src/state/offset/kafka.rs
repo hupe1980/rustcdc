@@ -93,6 +93,9 @@ impl KafkaTopicStateWriter {
             .acks(Acks::All)
             .idempotent(true)
             .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
+            .connect_timeout(crate::sink::kafka_connect_timeout(
+                std::time::Duration::from_millis(config.request_timeout_ms),
+            ))
             .auth(auth)
             .build()
             .await
@@ -111,7 +114,7 @@ impl KafkaTopicStateWriter {
 
     async fn publish_record(&self, key: &[u8], payload: &[u8]) -> Result<(), AppError> {
         let producer = self.producer.lock().await;
-        let _record_metadata = producer
+        let record_metadata = producer
             .send(&self.topic, Some(key), payload)
             .await
             .map_err(|e| {
@@ -120,6 +123,10 @@ impl KafkaTopicStateWriter {
                     self.topic
                 ))
             })?;
+        // State records are checkpoints — an unacknowledged write here would let
+        // the pipeline advance past a position Kafka never durably stored.
+        crate::sink::enforce_durable_confirmation(&record_metadata, "state")
+            .map_err(|e| AppError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -556,6 +563,9 @@ async fn validate_prerequisites(config: &KafkaTopicStateConfig) -> Result<(), Ap
         .bootstrap_servers(config.brokers.clone())
         .client_id(format!("{}-state-admin", config.client_id))
         .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
+        .connect_timeout(crate::sink::kafka_connect_timeout(
+            std::time::Duration::from_millis(config.request_timeout_ms),
+        ))
         .auth(auth)
         .build()
         .await
@@ -699,11 +709,18 @@ pub(crate) fn validate_topic_config_entries(
 async fn load_records(config: &KafkaTopicStateConfig) -> Result<LoadedKafkaRecords, AppError> {
     let auth = config.security.to_auth_config().map_err(AppError::Other)?;
 
+    // CompactedTopicConsumerBuilder does not expose `connect_timeout` (krafka
+    // 0.13), and krafka validates `request_timeout >= connect_timeout` (10 s
+    // default) at build time. Floor the readback request budget at the connect
+    // default — readback is a startup-time operation where a generous network
+    // budget is safe. TODO(upstream): expose connect_timeout on the builder.
+    let readback_request_timeout =
+        std::time::Duration::from_millis(config.request_timeout_ms.max(10_000));
     let mut consumer = CompactedTopicConsumer::builder()
         .bootstrap_servers(config.brokers.clone())
         .topic(config.topic.clone())
         .client_id(format!("{}-state-readback", config.client_id))
-        .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
+        .request_timeout(readback_request_timeout)
         .auth(auth)
         .build()
         .await
@@ -1061,5 +1078,59 @@ mod tests {
         ]
         .into();
         validate_topic_config_entries(&cfg, &entries).expect("valid durability settings must pass");
+    }
+
+    /// Full state round-trip against krafka's in-process fake broker: seed the
+    /// bootstrap sentinel, publish a real checkpoint record (durability
+    /// confirmation enforced by `publish_record`), then read everything back
+    /// through the same compacted-scan path the runtime uses at startup.
+    #[tokio::test]
+    async fn fake_broker_state_roundtrip_seeds_and_reloads_checkpoint() {
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        broker.create_topic("cdc.fake.state", 1);
+
+        let config = KafkaTopicStateConfig {
+            brokers: broker.bootstrap_servers(),
+            topic: "cdc.fake.state".to_string(),
+            client_id: "fake-state-test".to_string(),
+            request_timeout_ms: 2_000,
+            readback_poll_timeout_ms: 500,
+            min_replication_factor: 1,
+            min_insync_replicas: 1,
+            durability_profile: crate::config::schema::KafkaStateDurabilityProfile::Development,
+            security: crate::config::schema::KafkaSecurityConfig::default(),
+        };
+
+        let writer = KafkaTopicStateWriter::new(&config).await.expect("writer");
+        writer.seed_bootstrap().await.expect("seed bootstrap");
+
+        let checkpoint = KafkaTopicCheckpointRecord {
+            record_version: KAFKA_TOPIC_CHECKPOINT_VERSION,
+            source_type: "postgres".to_string(),
+            offset_hex: hex::encode(br#"{"lsn":281474976711680,"slot_name":"fake_slot"}"#),
+            committed_event_count: 7,
+            saved_at_unix_ms: now_unix_ms(),
+        };
+        writer
+            .update_checkpoint(checkpoint)
+            .await
+            .expect("checkpoint publish");
+
+        let loaded = load_records(&config).await.expect("readback scan");
+        assert!(!loaded.legacy_format_detected);
+        let record = loaded.checkpoint.expect("checkpoint record present");
+        assert_eq!(record.source_type, "postgres");
+        assert_eq!(record.committed_event_count, 7);
+        assert!(!is_bootstrap_checkpoint_record(&record));
+        assert_eq!(
+            hex::decode(&record.offset_hex).expect("offset hex decodes"),
+            br#"{"lsn":281474976711680,"slot_name":"fake_slot"}"#
+        );
+        assert!(
+            loaded.schema_history.is_some(),
+            "bootstrap schema history present"
+        );
     }
 }

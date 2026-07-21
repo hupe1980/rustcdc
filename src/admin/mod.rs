@@ -307,6 +307,9 @@ impl KafkaNotificationPublisher {
             .retries(config.retry_max_attempts)
             .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
             .request_timeout(Duration::from_millis(config.ack_timeout_ms))
+            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
+                config.ack_timeout_ms,
+            )))
             .delivery_timeout(Duration::from_millis(
                 config.ack_timeout_ms.saturating_add(
                     config
@@ -343,12 +346,14 @@ impl KafkaNotificationPublisher {
 
         let record = ProducerRecord::new(self.topic.clone(), payload).with_key(key);
         let producer = self.producer.lock().await;
-        let _metadata = producer.send_record(record).await.map_err(|err| {
+        let metadata = producer.send_record(record).await.map_err(|err| {
             AppError::Other(format!(
                 "failed to emit notification event to admin.notification_kafka topic {}: {err}",
                 self.topic
             ))
         })?;
+        crate::sink::enforce_durable_confirmation(&metadata, "notification")
+            .map_err(|e| AppError::Other(e.to_string()))?;
         producer.flush().await.map_err(|err| {
             AppError::Other(format!(
                 "failed to flush admin.notification_kafka topic {}: {err}",
@@ -810,6 +815,9 @@ impl AdminState {
                         .auto_offset_reset(AutoOffsetReset::Earliest)
                         .enable_auto_commit(false)
                         .request_timeout(Duration::from_millis(1_000))
+                        .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
+                            1_000,
+                        )))
                         .auth(auth)
                         .build()
                         .await
@@ -4650,6 +4658,9 @@ notification_log_file = "{}"
             .auto_offset_reset(AutoOffsetReset::Earliest)
             .enable_auto_commit(false)
             .request_timeout(Duration::from_millis(1_000))
+            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
+                1_000,
+            )))
             .auth(kafka_auth_from_env())
             .build()
             .await
@@ -4726,6 +4737,9 @@ notification_log_file = "{}"
             .client_id(format!("cdc-admin-signal-ingress-producer-{suffix}"))
             .acks(krafka::producer::Acks::All)
             .request_timeout(Duration::from_millis(1_000))
+            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
+                1_000,
+            )))
             .auth(kafka_auth_from_env())
             .build()
             .await

@@ -180,7 +180,7 @@ dir = "./state"
 | **stdout** | — | Development / debugging |
 | **file_jsonl** | at_least_once | Rotatable, append-only |
 | **HTTP** | at_least_once | Batched, configurable retry |
-| **Apache Kafka** | at_least_once · effectively_once | Transactional producer |
+| **Apache Kafka** | at_least_once · effectively_once | Pure-Rust client (krafka), idempotent + transactional producers, per-record delivery confirmation, PK-keyed partitioning with per-table fallback |
 | **Apache Iceberg** | at_least_once | REST catalog, S3/GCS/ABS storage |
 
 ---
