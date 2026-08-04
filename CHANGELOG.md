@@ -82,6 +82,20 @@ The full mapping is documented under the column type mapping section in the conf
 the SQL Server suite asserts non-null on every `NOT NULL` column specifically to catch a
 regression of the original null-substitution shape.
 
+### Latency evidence fails on a stall, not on a slow machine
+
+All three latency suites used a fixed total budget — "collect 2,000 events within 180 s". A
+CI runner hit that wall at **1,995 of 2,000**: the pipeline was still delivering, and the
+test reported a timeout. The same run takes 5.5 s locally, so the budget was calibrated for a
+machine roughly 30× faster than a loaded runner.
+
+A latency test that cannot distinguish *slow machine* from *stuck pipeline* provides no
+evidence either way. The deadline is now progress-based (`ProgressDeadline`): it fails when
+no new events arrive for a sustained window — the same signal the runtime's own
+`HealthVerdict` treats as alertable, and one that does not depend on machine speed. A
+generous absolute backstop remains so a pathological trickle cannot hang CI, and its message
+distinguishes the two cases. Three unit tests cover progress, stall and backstop.
+
 ### CI failures fixed
 
 Three unrelated CI failures, all real:

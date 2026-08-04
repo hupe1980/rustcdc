@@ -459,3 +459,72 @@ impl ProgressDeadline {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod progress_deadline_tests {
+    use super::ProgressDeadline;
+    use std::time::Duration;
+
+    #[test]
+    fn progress_resets_the_stall_window() {
+        // The failure this replaced: a run that was still delivering was reported as a
+        // timeout because the *total* budget expired. Progress must keep it alive.
+        let mut deadline = ProgressDeadline::new(
+            "test",
+            100,
+            Duration::from_millis(120),
+            Duration::from_secs(60),
+        );
+        for committed in 1..=5 {
+            std::thread::sleep(Duration::from_millis(40));
+            deadline
+                .check(committed)
+                .unwrap_or_else(|error| panic!("progress must not trip the stall: {error}"));
+        }
+    }
+
+    #[test]
+    fn no_progress_trips_the_stall_window() {
+        let mut deadline = ProgressDeadline::new(
+            "test",
+            100,
+            Duration::from_millis(60),
+            Duration::from_secs(60),
+        );
+        deadline
+            .check(10)
+            .expect("first check establishes a baseline");
+        std::thread::sleep(Duration::from_millis(90));
+        let error = deadline
+            .check(10)
+            .expect_err("no progress must be reported as a stall");
+        let message = error.to_string();
+        assert!(message.contains("stalled"), "got: {message}");
+        assert!(
+            message.contains("10/100"),
+            "the message must say how far it got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_absolute_backstop_still_applies_while_progressing() {
+        // A pathologically slow trickle must not hang CI forever.
+        let mut deadline = ProgressDeadline::new(
+            "test",
+            1_000_000,
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        );
+        deadline
+            .check(1)
+            .expect("first check is inside the backstop");
+        std::thread::sleep(Duration::from_millis(80));
+        let error = deadline
+            .check(2)
+            .expect_err("the backstop must fire even while progressing");
+        assert!(
+            error.to_string().contains("backstop"),
+            "the message must distinguish a backstop from a stall: {error}"
+        );
+    }
+}
