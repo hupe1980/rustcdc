@@ -82,6 +82,36 @@ The full mapping is documented under the column type mapping section in the conf
 the SQL Server suite asserts non-null on every `NOT NULL` column specifically to catch a
 regression of the original null-substitution shape.
 
+### CI failures fixed
+
+Three unrelated CI failures, all real:
+
+* **The four process-kill suites tripped the checkpoint owner lease.** Each opened a
+  `FileCheckpoint::new(dir)` purely to *read* the checkpoint after killing the worker, then
+  built a runtime against the same directory — two writer instances, one lease. The C4 fix
+  that added the lease was correct; only one of the seven call sites had been converted to
+  `FileCheckpoint::read_only`. All four suites (PostgreSQL, MySQL, MariaDB, SQL Server) now
+  use the read-only handle for inspection.
+* **Nightly renamed `AtomicUsize::fetch_update` to `try_update`.** CI lints nightly with
+  `-D warnings`, so the deprecation broke the build; naming either method directly breaks
+  one toolchain or the other. Replaced with an explicit `compare_exchange_weak` loop, which
+  is stable on both.
+* **MSRV raised from 1.92 to 1.94.** `sqlx` 0.9 (a dev-dependency) requires 1.94, and
+  Cargo's resolver considers dev-dependencies, so the MSRV job failed. The library itself
+  still compiles on 1.92, so this could have been papered over by excluding dev-deps from
+  the resolve — but that leaves two MSRV numbers to keep straight and a special tool in CI
+  to explain. One number, verified on exactly the toolchain it names, is worth the bump.
+
+  **Migration:** requires Rust 1.94 or newer.
+
+### `SqlServerOffset` accepts pre-0.8 checkpoints
+
+`SqlServerOffset::from_bytes` did a strict struct parse, so a checkpoint written by 0.7.x —
+where the cursor was a bare JSON string — failed to load with a serde type error, leaving an
+operator to guess whether capture had lost its position. It now accepts both forms, which
+also makes the checkpoint loader agree with `sqlserver_cursor_from_offset_bytes`, which
+already did.
+
 ### Errors an operator can actually read
 
 * **`Error::report()` and `Error::chain()`.** `Display` on a contextual error shows only the

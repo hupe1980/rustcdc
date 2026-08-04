@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/rustcdc.svg)](https://crates.io/crates/rustcdc)
 [![docs.rs](https://img.shields.io/docsrs/rustcdc)](https://docs.rs/rustcdc)
 [![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.92-blue)](https://blog.rust-lang.org/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue)](https://blog.rust-lang.org/)
 [![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
 **Change data capture you embed, not deploy.** PostgreSQL, MySQL, MariaDB and SQL Server
@@ -299,8 +299,8 @@ zola --root site serve
 
 ## MSRV
 
-Rust 1.92 or newer, matching the `rust-version` in `Cargo.toml`. Raising it is a minor-version
-change.
+Rust 1.94 or newer, matching the `rust-version` in `Cargo.toml`. Raising it is a
+minor-version change. CI verifies it on exactly that toolchain.
 
 ## License
 

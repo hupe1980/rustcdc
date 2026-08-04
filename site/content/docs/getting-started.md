@@ -14,7 +14,7 @@ SQL Server differ only in the source config and the server prerequisites — see
 
 ## Prerequisites
 
-- Rust 1.92 or newer
+- Rust 1.94 or newer
 - A PostgreSQL 10+ server you can configure, with `wal_level = logical`
 - Docker, if you want to run the connector-backed test suites
 
@@ -30,7 +30,7 @@ docker run --rm -d --name rustcdc-pg -p 5432:5432 \
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.8", features = ["postgres"] }
+rustcdc = { version = "0.7", features = ["postgres"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

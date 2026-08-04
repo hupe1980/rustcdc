@@ -195,7 +195,7 @@ SQL Server differ only in the source config and the server prerequisites — see
 <a href="https://hupe1980.github.io/rustcdc/docs/config-reference/">configuration reference</a>.</p>
 <h2 id="prerequisites"><a class="zola-anchor" href="#prerequisites" aria-label="Anchor link for: prerequisites">Prerequisites</a></h2>
 <ul>
-<li>Rust 1.92 or newer</li>
+<li>Rust 1.94 or newer</li>
 <li>A PostgreSQL 10+ server you can configure, with <code>wal_level = logical</code></li>
 <li>Docker, if you want to run the connector-backed test suites</li>
 </ul>
@@ -206,7 +206,7 @@ SQL Server differ only in the source config and the server prerequisites — see
 </code></pre>
 <h2 id="1-add-the-dependency"><a class="zola-anchor" href="#1-add-the-dependency" aria-label="Anchor link for: 1-add-the-dependency">1. Add the dependency</a></h2>
 <pre><code data-lang="toml">[dependencies]
-rustcdc = { version = &quot;0.8&quot;, features = [&quot;postgres&quot;] }
+rustcdc = { version = &quot;0.7&quot;, features = [&quot;postgres&quot;] }
 tokio = { version = &quot;1&quot;, features = [&quot;full&quot;] }
 </code></pre>
 <h2 id="2-prepare-the-source-database"><a class="zola-anchor" href="#2-prepare-the-source-database" aria-label="Anchor link for: 2-prepare-the-source-database">2. Prepare the source database</a></h2>
