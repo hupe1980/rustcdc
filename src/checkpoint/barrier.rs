@@ -429,14 +429,25 @@ mod tests {
             committed_event_count: u64,
         ) -> crate::core::Result<()> {
             use std::sync::atomic::Ordering;
-            if self
-                .failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    n.checked_sub(1).or(Some(0))
-                })
-                .unwrap_or(0)
-                > 0
-            {
+            // Saturating decrement, returning the previous value. Written as an explicit
+            // CAS loop rather than `fetch_update`, which nightly has renamed to
+            // `try_update` — using either name directly breaks one toolchain or the other,
+            // and CI lints nightly with `-D warnings`.
+            let remaining_before = {
+                let mut current = self.failures_remaining.load(Ordering::SeqCst);
+                loop {
+                    match self.failures_remaining.compare_exchange_weak(
+                        current,
+                        current.saturating_sub(1),
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(previous) => break previous,
+                        Err(actual) => current = actual,
+                    }
+                }
+            };
+            if remaining_before > 0 {
                 return Err(crate::core::Error::CheckpointError("disk full".into()));
             }
             self.inner.save(offset, committed_event_count).await

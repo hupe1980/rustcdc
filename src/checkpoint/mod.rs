@@ -267,8 +267,23 @@ impl SqlServerOffset {
     }
 
     /// Decode an offset from its [`Offset::encode`] representation.
+    ///
+    /// Accepts both the current object form and the **bare JSON string** written before
+    /// this offset became a struct — `"0x0000002A00000B58003A"`. A checkpoint written by
+    /// 0.7.x is in that older form, and refusing it would fail the load on upgrade with a
+    /// serde type error, leaving an operator to guess whether capture had lost its
+    /// position. `sqlserver_cursor_from_offset_bytes` already accepts both forms; this
+    /// keeps the checkpoint loader from disagreeing with the cursor parser about the very
+    /// same bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(serde_json::from_slice(bytes)?)
+        match serde_json::from_slice::<Self>(bytes) {
+            Ok(offset) => Ok(offset),
+            Err(struct_error) => match serde_json::from_slice::<String>(bytes) {
+                Ok(cursor) => Ok(Self::new(cursor)),
+                // Report the struct error: it describes the form we actually expect.
+                Err(_) => Err(struct_error.into()),
+            },
+        }
     }
 
     /// Attach incremental-snapshot progress to this offset.
@@ -1514,5 +1529,56 @@ mod tests {
         drop(writer);
         let reopened = FileCheckpoint::new(dir.path());
         assert_eq!(reopened.get_committed_count().await.unwrap(), 5);
+    }
+}
+
+#[cfg(test)]
+mod sqlserver_offset_compat_tests {
+    use super::SqlServerOffset;
+    use crate::core::Offset;
+
+    #[test]
+    fn the_current_object_form_round_trips() {
+        let offset = SqlServerOffset::new("0x0000002A00000B58003A");
+        let decoded =
+            SqlServerOffset::from_bytes(&offset.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded.cursor, "0x0000002A00000B58003A");
+        assert!(decoded.incremental_snapshot.is_none());
+    }
+
+    #[test]
+    fn a_pre_0_8_bare_string_checkpoint_still_loads() {
+        // 0.7.x wrote the cursor as a bare JSON string. Rejecting it would fail the load
+        // on upgrade with a serde type error and leave capture without a position.
+        let legacy = serde_json::to_vec("0x0000002A00000B58003A").expect("encode legacy");
+        let decoded = SqlServerOffset::from_bytes(&legacy).expect("legacy form must load");
+        assert_eq!(decoded.cursor, "0x0000002A00000B58003A");
+        assert!(decoded.incremental_snapshot.is_none());
+    }
+
+    #[test]
+    fn incremental_snapshot_state_survives_the_object_form() {
+        let offset = SqlServerOffset::new("0x01").with_incremental_snapshot(Some(
+            crate::source::IncrementalSnapshotState {
+                snapshot_id: "snap-1".into(),
+                tables: Vec::new(),
+            },
+        ));
+        let decoded =
+            SqlServerOffset::from_bytes(&offset.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            decoded
+                .incremental_snapshot
+                .as_ref()
+                .map(|state| state.snapshot_id.as_str()),
+            Some("snap-1"),
+        );
+    }
+
+    #[test]
+    fn genuinely_malformed_bytes_report_the_object_form_error() {
+        // The message must describe the form we expect, not the legacy fallback.
+        let error = SqlServerOffset::from_bytes(b"{not json").expect_err("must reject");
+        assert!(!error.to_string().is_empty());
     }
 }
