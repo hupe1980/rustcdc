@@ -37,6 +37,10 @@
 use std::{
     fs,
     path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering::SeqCst},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -371,6 +375,46 @@ pub fn write_latency_artifacts(prefix: &str, summary: &LatencySummary) -> rustcd
     Ok(())
 }
 
+/// Shared status a concurrent writer task publishes to the collection loop.
+///
+/// The writer's `Result` is only observable by awaiting its `JoinHandle`, which the loop
+/// does *after* it finishes — so a writer that dies mid-run leaves the loop waiting for
+/// events that will never be produced, and its error stays invisible until the loop gives
+/// up on its own. Publishing progress and the terminal error makes both visible while the
+/// loop is still running.
+#[derive(Debug, Default)]
+pub struct WriterStatus {
+    rows_written: AtomicU64,
+    failure: std::sync::Mutex<Option<String>>,
+}
+
+impl WriterStatus {
+    /// A fresh status, shared between the writer and the collection loop.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Record one successfully committed row.
+    pub fn record_row(&self) {
+        self.rows_written.fetch_add(1, SeqCst);
+    }
+
+    /// Record the writer's terminal failure.
+    pub fn record_failure(&self, error: &rustcdc::Error) {
+        *self.failure.lock().expect("writer failure lock") = Some(error.to_string());
+    }
+
+    /// Rows committed to the source so far.
+    pub fn rows_written(&self) -> u64 {
+        self.rows_written.load(SeqCst)
+    }
+
+    /// The writer's terminal failure, if it has one.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().expect("writer failure lock").clone()
+    }
+}
+
 /// Progress-based deadline for a latency collection loop.
 ///
 /// # Why not a wall-clock deadline
@@ -394,6 +438,12 @@ pub struct ProgressDeadline {
     hard_stop: Instant,
     last_progress_at: Instant,
     last_count: u64,
+    /// Rows the writer task reports having committed to the source, if it publishes them.
+    ///
+    /// Without this a stall message cannot distinguish "the pipeline stopped delivering"
+    /// from "the writer never wrote the rows" — and the writer's own error is invisible
+    /// until after the loop, which a stalled loop never reaches.
+    writer: Option<Arc<WriterStatus>>,
 }
 
 impl ProgressDeadline {
@@ -412,7 +462,16 @@ impl ProgressDeadline {
             hard_stop: now + hard_stop_after,
             last_progress_at: now,
             last_count: 0,
+            writer: None,
         }
+    }
+
+    /// Observe the writer so a stall can name which side stopped — and so a writer that
+    /// died is reported immediately with its own error rather than as a timeout.
+    #[must_use]
+    pub fn watching_writer(mut self, writer: Arc<WriterStatus>) -> Self {
+        self.writer = Some(writer);
+        self
     }
 
     /// Sensible defaults: fail after 90 s with no new events, 15 min overall.
@@ -430,6 +489,19 @@ impl ProgressDeadline {
     /// Call once per loop iteration, including iterations that delivered nothing — an
     /// empty poll is exactly what a stall looks like.
     pub fn check(&mut self, committed: u64) -> rustcdc::Result<()> {
+        // A dead writer is reported with its own error, immediately. Waiting out the stall
+        // window would turn a clear "insert failed" into an ambiguous timeout.
+        if let Some(failure) = self.writer.as_ref().and_then(|writer| writer.failure()) {
+            return Err(rustcdc::Error::SourceError(format!(
+                "{}: the writer task failed after {} rows, so the remaining events were \
+                 never produced: {failure}",
+                self.label,
+                self.writer
+                    .as_ref()
+                    .map_or(0, |writer| writer.rows_written()),
+            )));
+        }
+
         if committed > self.last_count {
             self.last_count = committed;
             self.last_progress_at = Instant::now();
@@ -437,9 +509,25 @@ impl ProgressDeadline {
 
         let stalled_for = self.last_progress_at.elapsed();
         if stalled_for >= self.stall_after {
+            // Name which side stopped. A writer that died mid-run produces exactly the
+            // same shape as a stalled pipeline, and blaming the pipeline for it sends the
+            // reader looking in the wrong place.
+            let attribution = match self.writer.as_ref().map(|writer| writer.rows_written()) {
+                Some(written) if written < self.expected => format!(
+                    " The writer had only committed {written}/{} rows to the source, so \
+                     the missing events were never produced — look at the writer, not the \
+                     pipeline.",
+                    self.expected
+                ),
+                Some(written) => format!(
+                    " The writer committed all {written} rows to the source, so the events \
+                     exist and the pipeline stopped delivering them."
+                ),
+                None => " The pipeline stopped delivering.".to_string(),
+            };
             return Err(rustcdc::Error::TimeoutError(format!(
-                "{} stalled: no new events for {:.0}s at {}/{} committed. The pipeline \
-                 stopped delivering — this is a stall, not a slow machine.",
+                "{} stalled: no new events for {:.0}s at {}/{} committed.{attribution} \
+                 This is a stall, not a slow machine.",
                 self.label,
                 stalled_for.as_secs_f64(),
                 committed,
@@ -503,6 +591,79 @@ mod progress_deadline_tests {
         assert!(
             message.contains("10/100"),
             "the message must say how far it got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_writer_failure_is_reported_immediately_with_its_own_error() {
+        // Without this the loop waits out the whole stall window and then blames the
+        // pipeline for events the writer never produced.
+        let writer = super::WriterStatus::new();
+        writer.record_row();
+        writer.record_failure(&rustcdc::Error::SourceError("connection reset".into()));
+
+        let mut deadline = ProgressDeadline::new(
+            "test",
+            100,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+        )
+        .watching_writer(std::sync::Arc::clone(&writer));
+
+        let error = deadline
+            .check(1)
+            .expect_err("a dead writer must fail the run at once");
+        let message = error.to_string();
+        assert!(message.contains("connection reset"), "got: {message}");
+        assert!(
+            message.contains("writer task failed after 1 rows"),
+            "the message must say how far the writer got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_stall_names_the_writer_when_the_rows_were_never_written() {
+        let writer = super::WriterStatus::new();
+        writer.record_row();
+
+        let mut deadline = ProgressDeadline::new(
+            "test",
+            100,
+            Duration::from_millis(50),
+            Duration::from_secs(600),
+        )
+        .watching_writer(std::sync::Arc::clone(&writer));
+        deadline.check(1).expect("baseline");
+        std::thread::sleep(Duration::from_millis(80));
+
+        let message = deadline.check(1).expect_err("must stall").to_string();
+        assert!(
+            message.contains("look at the writer, not the pipeline"),
+            "a short writer must not be blamed on the pipeline: {message}"
+        );
+    }
+
+    #[test]
+    fn a_stall_names_the_pipeline_when_every_row_was_written() {
+        let writer = super::WriterStatus::new();
+        for _ in 0..100 {
+            writer.record_row();
+        }
+
+        let mut deadline = ProgressDeadline::new(
+            "test",
+            100,
+            Duration::from_millis(50),
+            Duration::from_secs(600),
+        )
+        .watching_writer(std::sync::Arc::clone(&writer));
+        deadline.check(40).expect("baseline");
+        std::thread::sleep(Duration::from_millis(80));
+
+        let message = deadline.check(40).expect_err("must stall").to_string();
+        assert!(
+            message.contains("the pipeline stopped delivering them"),
+            "with every row written, the pipeline is the right place to look: {message}"
         );
     }
 

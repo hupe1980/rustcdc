@@ -14,7 +14,7 @@ mod latency_evidence_common;
 
 use latency_evidence_common::{
     assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder, ProgressDeadline,
+    LatencyRecorder, ProgressDeadline, WriterStatus,
 };
 
 async fn sql_exec(client: &mut sqlserver_testkit::SqlClient, sql: &str) -> rustcdc::Result<()> {
@@ -85,6 +85,10 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
 
     // Write concurrently with polling, on a dedicated connection: `admin` stays with the
     // reader loop, which drives `sp_cdc_scan` to keep the capture job moving.
+    // Published so a stall can name which side stopped, and so a writer failure is
+    // reported with its own error instead of as an ambiguous timeout.
+    let writer_status = WriterStatus::new();
+    let writer_progress = std::sync::Arc::clone(&writer_status);
     let writer = tokio::spawn(async move {
         let mut writer_client = sqlserver_testkit::connect_admin_with_retry(
             &writer_host,
@@ -101,7 +105,11 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
                 "USE rustcdc_latency; INSERT INTO dbo.latency_users (id, payload) \
                  VALUES ({id}, '{payload}')"
             );
-            sql_exec(&mut writer_client, &sql).await?;
+            if let Err(error) = sql_exec(&mut writer_client, &sql).await {
+                writer_progress.record_failure(&error);
+                return Err(error);
+            }
+            writer_progress.record_row();
         }
         Ok::<_, rustcdc::Error>(())
     });
@@ -119,7 +127,8 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
         rows_inserted,
         std::time::Duration::from_secs(120),
         std::time::Duration::from_secs(900),
-    );
+    )
+    .watching_writer(std::sync::Arc::clone(&writer_status));
     while events_committed < rows_inserted {
         deadline.check(events_committed)?;
 

@@ -18,7 +18,7 @@ mod latency_evidence_common;
 
 use latency_evidence_common::{
     assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder, ProgressDeadline,
+    LatencyRecorder, ProgressDeadline, WriterStatus,
 };
 
 #[tokio::test]
@@ -137,18 +137,28 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
     // the measurement loop started, so it timed draining an already-full in-process
     // buffer — a microbenchmark of the runtime's own bookkeeping against a pipeline that
     // was never under load. Capture latency only means something under live writes.
+    // Published so the collection loop can tell "the pipeline stopped delivering" from
+    // "the writer never wrote the rows". The writer's own `Result` is not observable until
+    // after the loop, and a stalled loop never gets there.
+    let writer_status = WriterStatus::new();
+    let writer_progress = std::sync::Arc::clone(&writer_status);
     let writer = tokio::spawn(async move {
         for id in 1_i64..=rows_inserted as i64 {
             // The payload carries this process's wall clock, so capture latency is
             // measured against a single clock and container/host drift cannot skew it.
             let payload = stamped_payload(&format!("row-{id}"));
-            admin_client
+            if let Err(error) = admin_client
                 .execute(
                     "INSERT INTO public.latency_evidence_users (id, payload) VALUES ($1, $2)",
                     &[&id, &payload],
                 )
                 .await
-                .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+                .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
+            {
+                writer_progress.record_failure(&error);
+                return Err(error);
+            }
+            writer_progress.record_row();
         }
         Ok::<_, rustcdc::Error>(admin_client)
     });
@@ -156,7 +166,8 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
     let mut recorder = LatencyRecorder::new();
     let mut events_committed = 0_u64;
     let started = Instant::now();
-    let mut deadline = ProgressDeadline::with_defaults("postgres capture latency", rows_inserted);
+    let mut deadline = ProgressDeadline::with_defaults("postgres capture latency", rows_inserted)
+        .watching_writer(std::sync::Arc::clone(&writer_status));
 
     while events_committed < rows_inserted {
         deadline.check(events_committed)?;

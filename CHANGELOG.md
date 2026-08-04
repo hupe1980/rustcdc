@@ -94,7 +94,18 @@ evidence either way. The deadline is now progress-based (`ProgressDeadline`): it
 no new events arrive for a sustained window — the same signal the runtime's own
 `HealthVerdict` treats as alertable, and one that does not depend on machine speed. A
 generous absolute backstop remains so a pathological trickle cannot hang CI, and its message
-distinguishes the two cases. Three unit tests cover progress, stall and backstop.
+distinguishes the two cases.
+
+**That immediately paid off, and corrected the first diagnosis.** The next run reported *"no
+new events for 90s at 1996/2000"* — 90 seconds of zero progress is not a slow machine, so the
+initial reading ("healthy, just slow") was wrong. The suites now also publish writer progress
+(`WriterStatus`), because the writer task's `Result` is only observable *after* the loop, and
+a stalled loop never gets there: a writer that dies at row 1996 is indistinguishable from a
+stalled pipeline. A dead writer now fails the run at once with its own error, and a stall
+names which side stopped — *"the writer had only committed 1996/2000 rows, so the missing
+events were never produced"* versus *"the writer committed all 2000 rows, so the pipeline
+stopped delivering them"*. Six unit tests cover progress, stall, backstop, writer failure and
+both attributions.
 
 ### CI failures fixed
 

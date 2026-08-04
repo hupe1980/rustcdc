@@ -18,7 +18,7 @@ mod latency_evidence_common;
 
 use latency_evidence_common::{
     assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder, ProgressDeadline,
+    LatencyRecorder, ProgressDeadline, WriterStatus,
 };
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
@@ -133,17 +133,27 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc
 
     // Write concurrently with polling — see `latency_evidence_common` for why measuring a
     // pre-filled buffer measures nothing an operator can use.
+    // Published so a stall can name which side stopped, and so a writer failure is
+    // reported with its own error instead of as an ambiguous timeout.
+    let writer_status = WriterStatus::new();
+    let writer_progress = std::sync::Arc::clone(&writer_status);
     let writer = tokio::spawn(async move {
         for id in 1_i64..=rows_inserted as i64 {
             // Payload carries this process's wall clock, so capture latency is measured
             // against a single clock and container/host drift cannot skew it.
             let payload = stamped_payload(&format!("row-{id}"));
-            sqlx::query("INSERT INTO latency_evidence_users (id, payload) VALUES (?, ?)")
-                .bind(id)
-                .bind(payload)
-                .execute(&admin_pool)
-                .await
-                .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            if let Err(error) =
+                sqlx::query("INSERT INTO latency_evidence_users (id, payload) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(payload)
+                    .execute(&admin_pool)
+                    .await
+                    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
+            {
+                writer_progress.record_failure(&error);
+                return Err(error);
+            }
+            writer_progress.record_row();
         }
         Ok::<_, rustcdc::Error>(admin_pool)
     });
@@ -151,7 +161,8 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc
     let mut recorder = LatencyRecorder::new();
     let mut events_committed = 0_u64;
     let started = Instant::now();
-    let mut deadline = ProgressDeadline::with_defaults("mysql capture latency", rows_inserted);
+    let mut deadline = ProgressDeadline::with_defaults("mysql capture latency", rows_inserted)
+        .watching_writer(std::sync::Arc::clone(&writer_status));
 
     while events_committed < rows_inserted {
         deadline.check(events_committed)?;
