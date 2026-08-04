@@ -14,7 +14,7 @@ mod latency_evidence_common;
 
 use latency_evidence_common::{
     assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder,
+    LatencyRecorder, ProgressDeadline,
 };
 
 async fn sql_exec(client: &mut sqlserver_testkit::SqlClient, sql: &str) -> rustcdc::Result<()> {
@@ -111,14 +111,17 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
     let started = Instant::now();
 
     let cdc_scan_sql = "USE rustcdc_latency; EXEC sys.sp_cdc_scan";
-    let deadline = Instant::now() + Duration::from_secs(300);
+    // SQL Server CDC is polling-based and its capture job runs on the server's schedule,
+    // so a longer stall window is legitimate here — but it is still a stall window, not a
+    // total-time budget.
+    let mut deadline = ProgressDeadline::new(
+        "sqlserver capture latency",
+        rows_inserted,
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(900),
+    );
     while events_committed < rows_inserted {
-        if Instant::now() > deadline {
-            return Err(rustcdc::Error::TimeoutError(format!(
-                "timed out collecting sqlserver latency evidence \
-                 (committed={events_committed}, expected={rows_inserted})"
-            )));
-        }
+        deadline.check(events_committed)?;
 
         let poll_start = Instant::now();
         let batch = runtime.poll_event_batch().await?;

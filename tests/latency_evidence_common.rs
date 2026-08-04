@@ -37,7 +37,7 @@
 use std::{
     fs,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -369,4 +369,93 @@ pub fn write_latency_artifacts(prefix: &str, summary: &LatencySummary) -> rustcd
     fs::write(&markdown_path, markdown).map_err(rustcdc::Error::IoError)?;
 
     Ok(())
+}
+
+/// Progress-based deadline for a latency collection loop.
+///
+/// # Why not a wall-clock deadline
+///
+/// These suites used a fixed total budget — "collect 2,000 events within 180 s". On a
+/// loaded CI runner the same run that takes 5 s locally takes ~180 s, so the budget was
+/// hit at 1,995 of 2,000 events: the pipeline was still delivering, and the test reported
+/// a timeout. That failure says nothing about the pipeline, and a latency test that cannot
+/// distinguish *slow machine* from *stuck pipeline* provides no evidence either way.
+///
+/// What is actually worth failing on is **a stall**: no new events for a sustained period
+/// while the run is unfinished. That is the same signal the runtime's own `HealthVerdict`
+/// treats as alertable, and it is machine-speed independent.
+///
+/// A generous absolute backstop remains, so a pathologically slow trickle cannot hang CI
+/// forever.
+pub struct ProgressDeadline {
+    label: &'static str,
+    expected: u64,
+    stall_after: Duration,
+    hard_stop: Instant,
+    last_progress_at: Instant,
+    last_count: u64,
+}
+
+impl ProgressDeadline {
+    /// Fail after `stall_after` without progress, or after `hard_stop_after` overall.
+    pub fn new(
+        label: &'static str,
+        expected: u64,
+        stall_after: Duration,
+        hard_stop_after: Duration,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            label,
+            expected,
+            stall_after,
+            hard_stop: now + hard_stop_after,
+            last_progress_at: now,
+            last_count: 0,
+        }
+    }
+
+    /// Sensible defaults: fail after 90 s with no new events, 15 min overall.
+    pub fn with_defaults(label: &'static str, expected: u64) -> Self {
+        Self::new(
+            label,
+            expected,
+            Duration::from_secs(90),
+            Duration::from_secs(900),
+        )
+    }
+
+    /// Record the current committed count and check both limits.
+    ///
+    /// Call once per loop iteration, including iterations that delivered nothing — an
+    /// empty poll is exactly what a stall looks like.
+    pub fn check(&mut self, committed: u64) -> rustcdc::Result<()> {
+        if committed > self.last_count {
+            self.last_count = committed;
+            self.last_progress_at = Instant::now();
+        }
+
+        let stalled_for = self.last_progress_at.elapsed();
+        if stalled_for >= self.stall_after {
+            return Err(rustcdc::Error::TimeoutError(format!(
+                "{} stalled: no new events for {:.0}s at {}/{} committed. The pipeline \
+                 stopped delivering — this is a stall, not a slow machine.",
+                self.label,
+                stalled_for.as_secs_f64(),
+                committed,
+                self.expected,
+            )));
+        }
+
+        if Instant::now() > self.hard_stop {
+            return Err(rustcdc::Error::TimeoutError(format!(
+                "{} exceeded its absolute backstop at {}/{} committed while still making \
+                 progress. Either the runner is far slower than this budget assumes, or \
+                 throughput has regressed by orders of magnitude.",
+                self.label, committed, self.expected,
+            )));
+        }
+
+        Ok(())
+    }
 }

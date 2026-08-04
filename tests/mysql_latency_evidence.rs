@@ -18,7 +18,7 @@ mod latency_evidence_common;
 
 use latency_evidence_common::{
     assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder,
+    LatencyRecorder, ProgressDeadline,
 };
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
@@ -151,15 +151,10 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc
     let mut recorder = LatencyRecorder::new();
     let mut events_committed = 0_u64;
     let started = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut deadline = ProgressDeadline::with_defaults("mysql capture latency", rows_inserted);
 
     while events_committed < rows_inserted {
-        if Instant::now() > deadline {
-            return Err(rustcdc::Error::TimeoutError(format!(
-                "timed out collecting mysql latency evidence (committed={events_committed}, \
-                 expected={rows_inserted})"
-            )));
-        }
+        deadline.check(events_committed)?;
 
         let poll_start = Instant::now();
         let batch = runtime.poll_event_batch().await?;
