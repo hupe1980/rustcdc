@@ -66,15 +66,28 @@ type SqlClient = tiberius::Client<tokio_util::compat::Compat<TcpStream>>;
 /// Configuration for a SQL Server CDC connection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SqlServerSourceConfig {
+    /// SQL Server host, as an FQDN or IP address.
     pub host: String,
+    /// SQL Server port. Defaults to 1433.
     pub port: u16,
+    /// Login name. Requires the `CDC_ADMIN` role to read the capture tables.
     pub user: String,
+    /// Password material for `user`.
     pub password: SecretString,
+    /// Database to capture from. CDC must be enabled on it.
     pub database: String,
+    /// Named instance to connect to, or `None` for the default instance.
     pub instance_name: Option<String>,
+    /// Transport mode. TLS by default when the `tls` feature is enabled.
     pub transport: TransportConfig,
+    /// Connection timeout in seconds. Valid range 1-300.
     pub conn_timeout_secs: u64,
+    /// Require CDC to be enabled on the database, failing `connect()` if it is not.
+    ///
+    /// Disabling this check does not make capture work against a non-CDC database; it
+    /// only removes the diagnosis, so the failure surfaces later as missing tables.
     pub cdc_enabled: bool,
+    /// Schema holding the CDC capture tables. Conventionally `"cdc"`.
     pub cdc_schema: String,
     /// Maximum concurrent SQL Server connections used by prerequisite checks.
     ///
@@ -152,28 +165,51 @@ struct CaptureInstanceMeta {
     captured_columns: Vec<String>,
 }
 
+/// Snapshot progress for a single captured table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSnapshot {
+    /// Fully qualified `"schema.table"` name being snapshotted.
     pub table: String,
+    /// Row count estimated when the snapshot started.
+    ///
+    /// An estimate, not a guarantee: rows may be inserted or deleted while the
+    /// snapshot runs. Use it for progress reporting, not for completeness checks.
     pub total_rows: u64,
+    /// Rows emitted for this table so far.
     pub rows_processed: u64,
+    /// Keyset cursor marking the last row read, or `None` before the first chunk.
     pub cursor_position: Option<String>,
+    /// Whether every row of this table has been emitted.
     pub is_complete: bool,
 }
 
+/// State of an in-progress or completed SQL Server snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqlServerSnapshot {
+    /// CDC LSN at which the snapshot read is consistent.
+    ///
+    /// Streaming resumes from this position so that changes committed during the
+    /// snapshot are not lost; the overlap is deduplicated at handoff.
     pub lsn_start: [u8; 10],
+    /// Identifier for this snapshot run, carried in event metadata.
     pub snapshot_id: String,
+    /// Per-table progress, in the order the tables are snapshotted.
     pub tables: Vec<TableSnapshot>,
 }
 
 /// SQL Server CDC stream state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlServerStream {
+    /// Inclusive lower bound of the LSN window currently being read.
     pub lsn_start: [u8; 10],
+    /// Inclusive upper bound of the LSN window currently being read.
     pub lsn_end: [u8; 10],
+    /// Capture instances polled for this stream.
     pub change_tables: Vec<String>,
+    /// Delay between polls, in milliseconds.
+    ///
+    /// SQL Server CDC is polling-based, so this is the dominant term in capture
+    /// latency: p99 is roughly this value plus the capture agent's own delay.
     pub poll_interval_ms: u64,
     /// Resume point *within* the current window, set when a poll could not read the
     /// whole window because `max_events_per_poll` truncated the result set.
@@ -225,6 +261,7 @@ impl SqlServerHandoff {
     }
 }
 
+/// Live CDC stream handle for SQL Server.
 pub struct SqlServerStreamHandle {
     config: SqlServerSourceConfig,
     stream: SqlServerStream,
@@ -256,6 +293,7 @@ pub struct SqlServerStreamHandle {
     window_buffer: Vec<Event>,
 }
 
+/// Snapshot handle that reads captured tables in keyset-paginated chunks.
 pub struct SqlServerSnapshotHandle {
     snapshot: SqlServerSnapshot,
     tables: Vec<TableSnapshotState>,
@@ -384,6 +422,10 @@ fn tx_id_from_seqval(seqval_hex: &str) -> u64 {
 
 fn lsn_from_source_offset(offset: &str) -> Option<[u8; 10]> {
     parser::lsn_from_source_offset(offset)
+}
+
+fn sqlserver_cursor_from_offset_bytes(encoded: &[u8]) -> Result<String> {
+    parser::sqlserver_cursor_from_offset_bytes(encoded)
 }
 
 fn sqlserver_resume_lsn_from_offset_bytes(encoded: &[u8]) -> Result<[u8; 10]> {
@@ -929,6 +971,10 @@ pub struct SqlServerConnection {
 }
 
 impl SqlServerConnection {
+    /// Build a connection from the given configuration.
+    ///
+    /// Nothing is dialled here; call [`connect`](Self::connect) to establish the
+    /// session and run the CDC prerequisite probes.
     pub fn new(config: SqlServerSourceConfig) -> Self {
         let prereq_pool_size = config.prereq_pool_size.max(1);
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
@@ -957,10 +1003,18 @@ impl SqlServerConnection {
         }
     }
 
+    /// Establish the session and verify the CDC prerequisites.
+    ///
+    /// Fails if CDC is not enabled on the database (unless `cdc_enabled` is `false`) or
+    /// the login cannot read the capture tables — both are configuration errors that
+    /// otherwise surface much later as an empty stream.
     pub async fn connect(&self) -> Result<()> {
         connect_sqlserver_with_probe(self).await
     }
 
+    /// Close the session and stop the heartbeat task.
+    ///
+    /// Idempotent: closing an already-closed connection is a no-op.
     pub async fn close(&self) {
         let mut state = self.state.lock().await;
         if let Some(task) = state.heartbeat_task.take() {
@@ -974,6 +1028,11 @@ impl SqlServerConnection {
         state.stream_lsn_start = None;
     }
 
+    /// Whether the session is currently established.
+    ///
+    /// This reports the connector's own view, not liveness of the server. A socket that
+    /// died without a FIN still reads as connected — use the runtime's `HealthVerdict`
+    /// to distinguish "quiet" from "stalled".
     pub async fn is_connected(&self) -> bool {
         self.state.lock().await.connected
     }
@@ -1153,6 +1212,10 @@ impl SqlServerConnection {
         start_sqlserver_snapshot_internal(self, tables, resume_from).await
     }
 
+    /// Resume a snapshot from a persisted checkpoint offset.
+    ///
+    /// Tables already marked complete in the offset are skipped, and a partially read
+    /// table continues from its keyset cursor rather than from row zero.
     pub async fn start_snapshot_from_checkpoint(
         &mut self,
         tables: &[&str],
@@ -1167,15 +1230,16 @@ impl SqlServerConnection {
         config: IncrementalSnapshotConfig,
         resume_from: Option<&dyn Offset>,
     ) -> Result<Box<dyn StreamHandle>> {
-        use crate::source::sqlserver::incremental_snapshot::SqlServerIncrementalSnapshotHandle;
         self.ensure_connected().await?;
+        let resume_state = crate::source::incremental_snapshot_state_from_offset(resume_from);
         let inner = self.start_stream(resume_from).await?;
         let source_name = self.source_type().to_string();
-        let handle = SqlServerIncrementalSnapshotHandle::new(
+        let handle = incremental_snapshot::start(
             inner,
             self.config.clone(),
             config,
             source_name,
+            resume_state,
         )
         .await?;
         Ok(Box::new(handle))

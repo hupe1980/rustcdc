@@ -174,12 +174,24 @@ impl CrashSimulationValidator {
 /// Report from crash simulation validation.
 #[derive(Debug, Clone)]
 pub struct ValidationReport {
+    /// Events collected across every cycle, including duplicates.
     pub total_events_collected: u64,
+    /// Distinct events the run was expected to produce.
     pub expected_total_events: u64,
+    /// Events delivered more than once. Expected after a crash — not a failure.
     pub duplicate_count: u64,
+    /// Duplicates as a fraction of expected events.
+    ///
+    /// A quality signal, not a correctness one: at-least-once permits any rate, but a
+    /// high one means the checkpoint is committing far behind delivery.
     pub duplicate_rate: f64,
+    /// Simulation cycles executed.
     pub total_cycles: u64,
+    /// Cycles in which a crash was injected.
     pub cycles_with_crashes: u64,
+    /// Whether every expected event was delivered at least once.
+    ///
+    /// **This is the correctness assertion.** Duplicates do not fail it; a gap does.
     pub passed: bool,
 }
 

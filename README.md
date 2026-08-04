@@ -1,25 +1,99 @@
 # rustcdc
 
-rustcdc is an embeddable CDC library for Rust with a correctness-first design.
-The repository includes canonical event contracts, checkpoint safety primitives, schema history abstractions, an embedded runtime, and PostgreSQL/MySQL/MariaDB/SQL Server source connectors.
+[![crates.io](https://img.shields.io/crates/v/rustcdc.svg)](https://crates.io/crates/rustcdc)
+[![docs.rs](https://img.shields.io/docsrs/rustcdc)](https://docs.rs/rustcdc)
+[![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.92-blue)](https://blog.rust-lang.org/)
+[![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
-## Status 🚀
+**Change data capture you embed, not deploy.** PostgreSQL, MySQL, MariaDB and SQL Server
+behind one `Source` trait, one event envelope and one checkpoint model — as an ordinary Rust
+crate that links into your binary and runs on your Tokio runtime.
 
-**Pre-1.0.** Core connector and runtime paths are implemented and validated by 765 unit tests
-plus 16 integration suites running against real PostgreSQL 16, MySQL 8.0/8.1, MariaDB 10.5/10.6
-and SQL Server 2022 containers.
+📖 **[Documentation](https://hupe1980.github.io/rustcdc/docs/)** ·
+🚀 **[Getting started](https://hupe1980.github.io/rustcdc/docs/getting-started/)** ·
+🔧 **[API reference](https://docs.rs/rustcdc)**
 
-Current crate release: 0.7.0.
+## Why this exists
 
-### Handling partial payloads
+Embedding multi-database CDC today means embedding a JVM: Debezium's engine is a Java library,
+and Materialize and RisingWave are platforms rather than crates. The Rust alternatives are
+single-database primitives, and the most complete of them cannot be published to crates.io at
+all because it depends on a fork of a fork of `rust-postgres`.
 
-Not every event carries a complete row. Applying one as if it were complete writes `NULL`
-over a column that never changed — the classic CDC corruption. Rather than asking you to
-remember that, the API will not express the bad write:
+rustcdc writes its own pgoutput parser against stock `tokio-postgres`. That is why it ships as
+a normal dependency with no sidecar to supervise and no control plane to operate.
+
+## Status
+
+**Pre-1.0.** Latest published release is 0.7.0; 0.8.0 is in development and is a breaking
+release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are implemented
+and validated by 871 unit tests, 102 documentation samples compiled as doctests, and 27
+container-backed integration suites running against real PostgreSQL 16, MySQL 8.0/8.1,
+MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
+
+The public API may still change. Delivery is **at-least-once**; see
+[Delivery guarantees](#delivery-guarantees).
+
+## Install
+
+```toml
+[dependencies]
+rustcdc = { version = "0.7", features = ["postgres"] }
+```
+
+The default profile is `postgres` + `tls`. WASM transforms and every non-PostgreSQL connector
+are opt-in — see [Feature flags](#feature-flags).
+
+## Quick start
+
+```rust
+use rustcdc::{
+    checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory,
+    PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+};
+
+let source = PostgresSourceConfig {
+    host: "localhost".into(),
+    port: 5432,
+    user: "postgres".into(),
+    password: "postgres".into(),
+    database: "app".into(),
+    replication_slot_name: "rustcdc_slot".into(),
+    publication_name: "rustcdc_publication".into(),
+    ..PostgresSourceConfig::default()
+};
+
+let config = RuntimeConfig::new(
+    RuntimeSourceConfig::Postgres(source),
+    InMemoryCheckpoint::default(),   // use FileCheckpoint in production
+    InMemorySchemaHistory::default(),
+);
+# let _ = config;
+```
+
+Then drive the runtime: consume a batch, apply it, and acknowledge. The full loop — including
+why the acknowledgement is a separate step — is in the
+**[getting started guide](https://hupe1980.github.io/rustcdc/docs/getting-started/)**.
+
+## Read this before writing a sink
+
+Not every event carries a complete row. Applying one as if it were complete writes `NULL` over
+a column that never changed — the classic CDC corruption. Rather than asking you to remember
+that, the API will not express the bad write:
 
 ```rust
 use rustcdc::RowWrite;
-
+# use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+# struct Sink;
+# impl Sink {
+#     fn replace(&self, _key: Option<serde_json::Value>, _row: &serde_json::Value) {}
+#     fn update_only(&self, _key: serde_json::Value, _columns: &serde_json::Value) {}
+#     fn delete(&self, _key: serde_json::Value) {}
+#     fn truncate(&self) {}
+# }
+# fn log_unwritable(_reason: rustcdc::NoRowWrite) {}
+# fn example(event: &Event, sink: &Sink) {
 match event.row_write() {
     RowWrite::Replace { key, row } => sink.replace(key, row),  // complete row
     RowWrite::Merge { key, columns, .. } => sink.update_only(key, columns), // partial: SET only these
@@ -28,6 +102,7 @@ match event.row_write() {
     RowWrite::None { reason } => log_unwritable(reason),       // DDL, or no addressable row
     _ => {}
 }
+# }
 ```
 
 `Merge` hands you only the columns the source actually supplied, so there is no placeholder
@@ -35,311 +110,203 @@ left to write by accident. It arises from PostgreSQL unchanged-TOAST: a large va
 modified by an `UPDATE` is omitted from the WAL and is unrecoverable. `REPLICA IDENTITY FULL`
 does **not** fix it — replica identity governs the before-image only.
 
-See [docs/api.md](docs/api.md#partial-payloads--read-this-before-writing-a-sink) for the
-underlying fields (`unavailable_columns`, `before_unavailable_columns`, `before_is_key_only`).
+The underlying fields (`unavailable_columns`, `before_unavailable_columns`,
+`before_is_key_only`) are documented in the
+[API guide](https://hupe1980.github.io/rustcdc/docs/api/#partial-payloads-read-this-before-writing-a-sink).
 
-### Required source-database configuration
+## Required source-database configuration
 
 Some server settings cause **silent** corruption rather than an error, so `connect()` validates
 them and fails loud. Check these before your first run:
 
-- **MySQL:** `binlog_row_metadata=FULL` (⚠️ MySQL 8 defaults to `MINIMAL`, under which the binlog
-  carries no column names or primary-key flags), `binlog_row_image=FULL`,
+- **MySQL / MariaDB:** `binlog_row_metadata=FULL` (⚠️ MySQL 8 defaults to `MINIMAL`, under which
+  the binlog carries no column names or primary-key flags), `binlog_row_image=FULL`,
   `binlog_row_value_options=''`, `binlog_format=ROW`, and a unique non-zero `server_id`.
-  See [docs/config_reference.md](docs/config_reference.md#mysql-source-configuration).
 - **PostgreSQL:** the replication slot must exist. rustcdc will **not** create it automatically —
   a slot that disappeared mid-life is a data-loss event, and recreating it silently restarts
   capture at the current WAL position. Provision it out of band, or set
   `create_replication_slot_if_missing = true` for first-time setup.
+- **SQL Server:** CDC enabled on the database and on each captured table.
 
-### Knowing whether it is actually running
+Full matrix: [configuration reference](https://hupe1980.github.io/rustcdc/docs/config-reference/).
 
-`RuntimeState` cannot tell you: a connector streaming from a quiet database and one hung on a dead
-socket both report `Running`. `runtime.admin_snapshot().health` gives a `HealthVerdict` —
-`Healthy`, `Idle`, `Stalled { reason }` or `NotRunning` — where `reason` names both the condition
-and the remedy. `HealthVerdict::is_alertable()` is true for exactly `Stalled`, and the same verdict
-is on the Prometheus surface as `rustcdc_runtime_health{verdict="stalled"} == 1`.
+## Delivery guarantees
 
-See [docs/runbook.md](docs/runbook.md#health-verdict--idle-vs-stalled).
+- The runtime delivery contract is **at-least-once**. There is no exactly-once claim anywhere
+  in this crate.
+- Duplicates are possible after crashes, restarts, and partial ack/commit windows.
+- Ordering is preserved within committed ack prefixes.
+- Deduplicate sink-side on a stable key — source + table + primary key + source offset — and
+  validate that dedup in staging before production rollout.
 
-## MSRV 🛠️
+By default a delivered batch may end mid-transaction, because batches are cut on
+`max_buffer_size`, `max_event_bytes` and commit-barrier capacity, none of which know anything
+about transactions. For a sink that must apply each source transaction atomically — a ledger,
+a materialized view with cross-row invariants — set
+`TransactionBoundaryPolicy::PreserveTransactions` and every delivered batch ends on a
+transaction boundary — including when the rest of a transaction is still in flight from the
+source, which for a streaming connector is the normal case. A transaction larger than
+`max_buffer_size` is still delivered split, with a WARN naming the transaction id, because a
+permanent silent stall would be worse.
 
-This crate targets Rust 1.92 or newer, matching the `rust-version` declared in `Cargo.toml`.
+## What's in the box
 
-## Build 📦
+| | |
+|---|---|
+| **Connectors** | PostgreSQL (logical replication / pgoutput), MySQL and MariaDB (binlog, GTID), SQL Server (CDC capture tables) |
+| **Snapshots** | DBLog-style resumable incremental snapshot, implemented once and shared by every connector — including yours; chunk cursors persist inside the checkpoint offset, so a restart resumes at the chunk boundary |
+| **Checkpoints** | In-memory and file-backed; file writes are atomic, fsynced and SHA-256 checksummed, with a single-writer lease |
+| **Transforms** | Masking, filtering, projection, field mapping, routing, unwrapping, outbox — plus a sandboxed WASM stage |
+| **Codecs** | JSON, Avro, Protobuf; Confluent, Apicurio and AWS Glue schema registries |
+| **Observability** | Prometheus text exposition, OpenTelemetry metrics and tracing, structured logs, `HealthVerdict` |
+| **Testing** | Deterministic replay, fault injection, adapter conformance harness |
+
+Three details worth knowing up front:
+
+**Bring your own source.** `CdcRuntime::register_source` drives the runtime from any
+`impl Source`, including one this crate does not ship. The commit barrier, checkpointing,
+transforms, idempotency guard, health verdicts and metrics all apply unchanged — and
+implementing `IncrementalSnapshotBackend` gets you non-blocking DBLog snapshots too, since the
+watermark algorithm lives in one shared driver rather than once per connector. See
+[custom sources](https://hupe1980.github.io/rustcdc/docs/api/#custom-sources).
+
+**Transforms don't pay for async they don't use.** Every shipped transform is pure CPU work
+over an in-memory event, so `Transform::apply` is a plain `fn`. A stage that genuinely must
+await implements `AsyncTransform` and is registered with `add_async_transform`. The pipeline
+runs a whole delivery through each stage in turn rather than each event through the whole
+pipeline, so a stage can amortise per-batch setup — the WASM stage takes its instance lock
+once per batch instead of once per event.
+
+**Knowing whether it is actually running.** `RuntimeState` cannot tell you: a connector
+streaming from a quiet database and one hung on a dead socket both report `Running`.
+`runtime.admin_snapshot().health` returns a `HealthVerdict` — `Healthy`, `Idle`,
+`Stalled { reason }` or `NotRunning` — where `reason` names both the condition and the remedy.
+`HealthVerdict::is_alertable()` is true for exactly `Stalled`, and the same verdict is exported
+as `rustcdc_runtime_health{verdict="stalled"} == 1`. See the
+[runbook](https://hupe1980.github.io/rustcdc/docs/runbook/#health-verdict-idle-vs-stalled).
+
+## Feature flags
+
+| Flag | Enables |
+|---|---|
+| `postgres` *(default)* | PostgreSQL connector (pulls in `tls`) |
+| `tls` *(default)* | TLS transport surface |
+| `mysql` / `mariadb` | MySQL and MariaDB connectors (shared transport stack, distinct source identity) |
+| `sqlserver` | SQL Server connector |
+| `wasm` | WASM transform sandbox via wasmtime (~15 MB release overhead; opt-in by design) |
+| `outbox` | Outbox pattern helpers and transforms |
+| `encryption` | Encryption-oriented transforms and helpers |
+| `metrics` | OpenTelemetry metrics and tracing |
+| `schemreg` | Confluent Schema Registry — Avro, JSON Schema, Protobuf |
+| `apicurio` | Apicurio Registry v3 native REST API |
+| `glue` | AWS Glue Schema Registry (18-byte wire header, UUID schema identity) |
+| `test-harnesses` | Replay, fault injection and conformance harnesses (dev/test only) |
+
+`--no-default-features` builds the foundation without any connector; `--all-features` validates
+the full additive surface.
+
+TLS is the default for every connector and needs no feature flag for private-CA or mutual-TLS
+deployments — configure `TransportConfig::tls_with_ca_cert_path(...)` or
+`TransportConfig::mtls(...)` directly.
+
+## Examples
 
 ```bash
-cargo build
-cargo build --features postgres
+# PostgreSQL → stdout
+cargo run --example pg_to_stdout --features postgres -- \
+  --host localhost --port 5432 --database testdb --snapshot-tables public.users
+
+# MariaDB → stdout (same runtime loop, MariaDB source identity)
+cargo run --example mariadb_to_stdout --features mariadb -- \
+  --host localhost --port 3306 --database testdb --snapshot-tables app.users
+
+# Full local stack: PostgreSQL + pg_to_stdout
+docker compose up --build
+docker compose down -v
 ```
 
-Default profile enables `postgres` + `tls`. WASM transforms are **opt-in** (`--features wasm`).
+The examples also read `CDC_RS_HOST`, `CDC_RS_PORT`, `CDC_RS_DB`, `CDC_RS_SNAPSHOT_TABLES` and
+related variables, and commit every 100 events by default.
 
-## Feature Profiles ⚙️
+## How this is verified
 
-- default profile: `postgres` + `tls` (lean, no JIT runtime in the default binary)
-- `--features wasm`: WASM transform sandbox via wasmtime (~15 MB release binary overhead; opt-in by design)
-- `--features postgres`: PostgreSQL connector profile (TLS transport is required and enabled transitively)
-- `--features mysql`: MySQL connector profile (TLS transport is required and enabled transitively)
-- `--features mariadb`: MariaDB connector profile (reuses the MySQL transport stack with MariaDB source identity)
-- `--features sqlserver`: SQL Server connector profile (TLS transport is required and enabled transitively)
-- `--features tls`: explicit TLS transport surface (already included by relational connector features)
-- `--features outbox`: enables outbox helpers and transforms
-- `--features encryption`: enables encryption-oriented transforms and helpers
-- `--features metrics`: enables OpenTelemetry metrics/tracing integrations
-- `--no-default-features`: foundation-only validation without source connectors
-- `--all-features`: validates the full additive feature surface
+**Every public item is documented.** `#![deny(missing_docs)]` is enforced at the crate root and
+gated in CI. For a library whose public surface *is* the product, an undocumented `pub fn` on a
+checkpoint or connector type is a reader guessing at a correctness contract.
 
-For self-signed or private-CA deployments, configure TLS directly with `TransportConfig::tls_with_ca_cert_path(...)` or `TransportConfig::mtls(...)`. No Cargo feature is required for those production-safe paths.
+**The documentation compiles.** Every Rust block in this README and under `site/content/docs/`
+is compiled and run by `cargo test --doc --all-features`, gated in CI. Wiring the Markdown into
+the doctest run immediately surfaced 36 broken samples out of 96, including wrong field names
+and methods that had moved between types. Blocks that cannot run in a doctest — they need a
+live database, or they document the shape of a type — are marked `ignore` with a one-line
+reason; an unmarked block that fails to compile is a defect.
 
-## License
+**Failure paths are exercised, not assumed.** Deterministic replay, fault injection and
+process-kill crash tests are part of the suite, and are available to *your* tests too via the
+`test-harnesses` feature. See
+[reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/).
 
-Licensed under either of:
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-
-Run local quality checks:
+## Development
 
 ```bash
 cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 bash scripts/ci-policy-gate.sh
 ```
 
-Run full connector-backed evidence locally (requires Docker daemon):
-
-```bash
-bash scripts/ci-benchmark-gate.sh
-bash scripts/run_full_integration_matrix_evidence.sh
-```
-
-To validate the foundation profile without source-specific features:
+Foundation-only profile, without any connector:
 
 ```bash
 cargo test --lib --no-default-features
 ```
 
-## Benchmark Evidence Policy
-
-Benchmark evidence is produced via `scripts/ci-benchmark-gate.sh`.
-Local runs are allowed, but are classified as non-release evidence unless strict release-policy inputs are satisfied.
-
-Example local run (non-release classification expected):
+Connector-backed evidence (requires a running Docker daemon):
 
 ```bash
+bash scripts/run_full_integration_matrix_evidence.sh
 bash scripts/ci-benchmark-gate.sh
 ```
 
-Release-grade benchmark classification requires commit-pinned metadata plus a named Criterion baseline:
+Benchmarks are in-process microbenchmarks with no connector I/O — a regression signal for the
+transform and codec paths, not a throughput claim. The evidence policy, including release-grade
+classification, is documented under
+[benchmark evidence](https://hupe1980.github.io/rustcdc/docs/reliability-testing/#benchmark-evidence).
+
+The documentation site lives in [`site/`](site/) and is built with [Zola](https://www.getzola.org/):
 
 ```bash
-BENCHMARK_STRICT=1 \
-BENCHMARK_MAX_REGRESSION_PERCENT=5 \
-BENCHMARK_BASELINE_COMMIT="$(git rev-parse HEAD)" \
-BENCHMARK_BASELINE_ARTIFACT="commit:$(git rev-parse HEAD)" \
-CRITERION_BASELINE="ci-baseline" \
-bash scripts/ci-benchmark-gate.sh
+zola --root site serve
 ```
 
-Use the same `CRITERION_BASELINE=ci-baseline` value in CI so release evidence and local reports compare against the same named baseline.
+## Documentation
 
-> **⚠️ Benchmarks measure in-process work only.** Both bench targets are microbenchmarks with no
-> connector I/O — they do not measure end-to-end CDC throughput or latency. Treat a local run as
-> a regression signal for the transform/codec paths, not as a performance claim.
->
-> Regenerate `BENCHMARK_REPORT.md` on a clean tree before citing any number from it, and pin
-> `BENCHMARK_BASELINE_COMMIT` to a known-good SHA so comparisons are like-for-like.
+| | |
+|---|---|
+| [Getting started](https://hupe1980.github.io/rustcdc/docs/getting-started/) | First pipeline, from an empty project to committed events |
+| [Architecture](https://hupe1980.github.io/rustcdc/docs/architecture/) | Capture, commit barrier and checkpointing — how they fit and why |
+| [API guide](https://hupe1980.github.io/rustcdc/docs/api/) | The embedding model: lifecycle, acknowledgement, transforms, codecs |
+| [Configuration reference](https://hupe1980.github.io/rustcdc/docs/config-reference/) | Every option, with the failure it prevents |
+| [Schema evolution](https://hupe1980.github.io/rustcdc/docs/schema-evolution/) | DDL handling, schema history, registry compatibility |
+| [Adapter SDK](https://hupe1980.github.io/rustcdc/docs/adapter-sdk/) | Writing a connector the runtime treats as first-class |
+| [WASM transform SDK](https://hupe1980.github.io/rustcdc/docs/wasm-transform-sdk/) | Sandboxed transforms, ABI and limits |
+| [Deployment](https://hupe1980.github.io/rustcdc/docs/deployment/) | Running it in production |
+| [Runbook](https://hupe1980.github.io/rustcdc/docs/runbook/) | Alert thresholds, recovery procedures, disaster recovery |
+| [Troubleshooting](https://hupe1980.github.io/rustcdc/docs/troubleshooting/) | Symptom → diagnosis → resolution |
+| [Security](https://hupe1980.github.io/rustcdc/docs/security/) | Transport defaults, secret handling, known exposure |
+| [Reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/) | Replay, fault injection, conformance |
+| [Library parity matrix](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) | Scope-aware comparison against alternatives |
 
-## Quick Start ✅
+## MSRV
 
-```rust
-use rustcdc::{checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory, RuntimeConfig, RuntimeSourceConfig};
+Rust 1.92 or newer, matching the `rust-version` in `Cargo.toml`. Raising it is a minor-version
+change.
 
-let checkpoint = InMemoryCheckpoint::default();
-let schema_history = InMemorySchemaHistory::default();
-let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+## License
 
-let _config = config;
-```
+Licensed under either of:
 
-## Delivery Guarantees 🔁
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
-- Runtime delivery contract is at-least-once.
-- Duplicate event delivery is possible after crashes, restart boundaries, and partial ack/commit windows.
-- Ordering is preserved within committed ack prefixes, but consumers must still tolerate duplicates.
-- Downstream systems should apply idempotency using stable keys (for example: source + table + primary key + source offset/transaction metadata).
-
-Operational expectation:
-- Treat rustcdc as correctness-first at-least-once transport, not exactly-once.
-- Validate sink-side deduplication in staging before production rollout.
-
-## Runtime Transform Error Policy 🧯
-
-`RuntimeConfig` defaults to halting on transform failures via `TransformErrorPolicy::Halt`.
-For best-effort pipelines, switch to `TransformErrorPolicy::Skip`:
-
-```rust
-use rustcdc::{
-	checkpoint::InMemoryCheckpoint,
-	schema_history::InMemorySchemaHistory,
-	PostgresSourceConfig,
-	RuntimeConfig,
-	RuntimeSourceConfig,
-	TransformErrorPolicy,
-};
-let checkpoint = InMemoryCheckpoint::default();
-let schema_history = InMemorySchemaHistory::default();
-let source = PostgresSourceConfig {
-	host: "localhost".into(),
-	port: 5432,
-	user: "postgres".into(),
-	password: "postgres".into(),
-	database: "app".into(),
-	replication_slot_name: "rustcdc_slot".into(),
-	publication_name: "rustcdc_publication".into(),
-	conn_timeout_secs: 30,
-	..PostgresSourceConfig::default()
-};
-
-let config = RuntimeConfig::new(RuntimeSourceConfig::Postgres(source), checkpoint, schema_history)
-	.with_transform_error_policy(TransformErrorPolicy::Skip);
-```
-
-`Halt` is the safe default because it preserves strict failure visibility.
-
-## Post-Commit Confirmation Policy
-
-`RuntimeConfig` now defaults to `PostCommitSourceConfirmPolicy::FailFast`.
-If source confirmation fails after durable checkpoint commit, runtime returns an error by default to surface confirmation divergence immediately.
-
-For availability-biased pipelines, opt into continue behavior explicitly:
-
-```rust
-use rustcdc::PostCommitSourceConfirmPolicy;
-
-let config = config.with_post_commit_source_confirm_policy(
-	PostCommitSourceConfirmPolicy::Continue,
-);
-```
-
-## TRUNCATE Event Support
-
-`TRUNCATE` statements are surfaced as `Operation::Truncate` events on PostgreSQL, MySQL and
-MariaDB, and on SQL Server when `capture_truncate_events` is enabled. `before` and `after` are both
-`None` for truncate events. Connectors that support them advertise `ConnectorCapabilities::truncate`.
-
-## Connection Retry 🔄
-
-Automatic reconnection on transient source failures is **enabled by default**
-(`RuntimeOptions::connection_retry` defaults to `Some(ConnectionRetryPolicy::default())`). To tune it:
-
-```rust
-use rustcdc::{ConnectionRetryPolicy, RuntimeOptions};
-
-// ConnectionRetryPolicy is #[non_exhaustive], so use the builder rather than a
-// struct literal — struct-literal syntax is not available outside the crate.
-let options = RuntimeOptions::new().with_connection_retry(Some(
-    ConnectionRetryPolicy::new()
-        .with_max_retries(Some(5)) // None = retry indefinitely
-        .with_initial_delay_ms(300)
-        .with_max_delay_ms(10_000),
-));
-```
-
-Only recoverable errors (`SourceError`, `TimeoutError`) trigger retry. Fatal errors propagate immediately.
-
-> **Note:** `with_connection_retry` lives on `RuntimeOptions`, not on `RuntimeConfig`. Pass the
-> options via `RuntimeConfig::with_options(...)`.
-
-## Transport Configuration 🔒
-
-All connectors default to TLS. For trusted private networks or local testing only, use the explicit plaintext escape hatch:
-
-```rust
-use rustcdc::TransportConfig;
-
-let transport = TransportConfig::plaintext(); // ⚠️ never use in production
-```
-
-## PostgreSQL Example 🐘
-
-Build and run the PostgreSQL example:
-
-```bash
-cargo build --example pg_to_stdout --features postgres
-./target/debug/examples/pg_to_stdout --host localhost --port 5432 --database testdb --snapshot-tables public.users
-```
-
-The example also accepts environment variables (`CDC_RS_HOST`, `CDC_RS_PORT`, `CDC_RS_DB`, `CDC_RS_SNAPSHOT_TABLES`, and related settings) and commits every 100 events by default.
-
-## MariaDB Example 🐬
-
-Build and run the MariaDB example:
-
-```bash
-cargo build --example mariadb_to_stdout --features mariadb
-./target/debug/examples/mariadb_to_stdout --host localhost --port 3306 --database testdb --snapshot-tables public.users
-```
-
-The MariaDB example uses the same runtime loop as the PostgreSQL example, but it starts from `MariaDbSourceConfig` and a MariaDB-specific source identity.
-
-## Docker Compose Example 🐳
-
-Bring up the local PostgreSQL + `pg_to_stdout` demo stack:
-
-```bash
-docker compose up --build
-```
-
-The compose setup initializes `public.users` and publication `rustcdc_example_pub` automatically.
-
-Stop and clean up:
-
-```bash
-docker compose down -v
-```
-
-## Disaster Recovery: seeding a checkpoint 🩹
-
-Checkpoint files carry a SHA-256 integrity checksum that is verified on every load, so they
-cannot be written by hand. Silent checkpoint corruption is otherwise unrecoverable — a
-flipped bit in an LSN still parses, and capture resumes from a *wrong* position with no
-error raised anywhere.
-
-To seed one during recovery (connector stopped):
-
-```bash
-cargo run --example seed_checkpoint --features postgres -- \
-  --dir /var/rustcdc/checkpoints \
-  --source-type postgres \
-  --committed-event-count 0 \
-  --offset '{"lsn": 281474976711680, "slot_name": "rustcdc_postgres_new"}'
-```
-
-Programmatically this is `FileCheckpoint::restore_from_record`. Seeding a position *ahead*
-of what was actually delivered skips everything in between, permanently — when in doubt,
-seed behind and rely on at-least-once tolerance downstream.
-
-See [docs/runbook.md](docs/runbook.md) for the full procedure.
-
-## Documentation Map 📚
-
-### Operational Documentation
-
-- [Getting Started Guide](docs/getting_started.md) - Setup and quick start
-- [Configuration Reference](docs/config_reference.md) - Complete configuration options
-- [Troubleshooting Guide](docs/troubleshooting.md) - Diagnosis and resolution procedures
-- [Operations Runbook](docs/runbook.md) - Production procedures, disaster recovery, alerting
-- [Security Posture](docs/security.md) - Transport defaults, dependency policy, known exposure
-- [Documentation Index](docs/documentation.md) - Cross-referenced documentation map
-
-### Developer Documentation
-
-- [API Documentation](docs/api.md) - Rust SDK documentation
-- [Adapter SDK](docs/adapter_sdk.md) - Building custom adapters
-- [WASM Transform SDK](docs/wasm_transform_sdk.md) - WASM transform runtime
-
-### Project Documentation
-
-- Architecture: [docs/architecture.md](docs/architecture.md)
-- Library parity matrix (scope-aware release gating): [docs/library_parity_matrix.md](docs/library_parity_matrix.md)
+at your option.

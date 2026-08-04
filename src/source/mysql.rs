@@ -44,7 +44,8 @@ use self::{
     },
     query::{
         binlog_row_to_mysql_row, format_gtid, mysql_json_value_to_param, mysql_row_to_json,
-        mysql_value_to_json, primary_key_columns_from_row,
+        mysql_row_to_json_with_labels, mysql_value_to_json, primary_key_columns_from_row,
+        EnumSetLabels,
     },
     state::{
         ConnectionState, MysqlBinlogMessage, MysqlRowChange, MysqlStream, SnapshotCheckpointState,
@@ -71,8 +72,11 @@ const MAX_EVENTS_PER_POLL: usize = 1_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerFlavor {
+    /// Oracle MySQL. GTIDs are `uuid:interval`.
     #[default]
     Mysql,
+    /// MariaDB. GTIDs are `domain-server-sequence` and are **not** interchangeable with
+    /// MySQL's format; the flavor also selects the checkpoint file namespace.
     MariaDb,
 }
 
@@ -97,9 +101,15 @@ impl ServerFlavor {
 /// Configuration for a MySQL CDC connection.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MysqlSourceConfig {
+    /// Server hostname or IP.
     pub host: String,
+    /// Server port.
     pub port: u16,
+    /// Login user. Needs the connector's replication/CDC privileges.
     pub user: String,
+    /// Password material. Redacted in `Debug` and `Display`; prefer
+    /// [`SecretString::from_provider`](crate::core::SecretString::from_provider) or
+    /// `from_callback` so it is resolved at connect time rather than held in config.
     pub password: SecretString,
     /// Connector authentication mode.
     ///
@@ -107,11 +117,24 @@ pub struct MysqlSourceConfig {
     /// IAM auth tokens (typically via `SecretString::from_callback`).
     #[serde(default)]
     pub auth_mode: DatabaseAuthMode,
+    /// Default database for unqualified table references.
     pub database: String,
+    /// Replication server id, unique across every replica of this server.
+    ///
+    /// Defaults to `0`, which the server rejects — deliberately, as a tripwire. Two
+    /// connectors sharing an id silently steal each other's binlog stream.
     pub server_id: u32,
+    /// Position by GTID set rather than by binlog file and position.
+    ///
+    /// Binlog coordinates are server-local, so a file+position resume after a failover
+    /// reads an unrelated point in an unrelated file. Enable this wherever failover is
+    /// possible.
     pub gtid_mode_enabled: bool,
+    /// Verify `binlog_format = ROW` at connect time.
     pub binlog_format_check: bool,
+    /// Transport mode. TLS by default; plaintext is an explicit, loudly-logged opt-in.
     pub transport: TransportConfig,
+    /// Connection timeout in seconds.
     pub conn_timeout_secs: u64,
     /// Stream poll interval in milliseconds.
     pub stream_poll_interval_ms: u64,
@@ -154,24 +177,45 @@ pub struct MysqlSourceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Per-table progress within a bulk snapshot.
 pub struct TableSnapshot {
+    /// Table in `"schema.table"` form.
     pub table: String,
+    /// Row count observed when the snapshot began.
+    ///
+    /// A planner estimate on some connectors, so treat it as a progress denominator, not
+    /// as a correctness check.
     pub total_rows: u64,
+    /// Rows emitted so far.
     pub rows_processed: u64,
+    /// Keyset cursor for resuming this table, encoded per connector. `None` before the
+    /// first chunk.
     pub cursor_position: Option<String>,
+    /// Whether this table has been read to exhaustion.
     pub is_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Durable state of a MySQL bulk snapshot, including the binlog position it was taken at.
 pub struct MysqlSnapshot {
+    /// Per-table progress.
     pub tables: Vec<TableSnapshot>,
+    /// Stable identifier carried on every emitted row's `SnapshotMetadata`.
     pub snapshot_id: String,
+    /// Unix epoch milliseconds when the snapshot started.
     pub snapshot_start_ts: u64,
+    /// Binlog file the snapshot's consistent view corresponds to.
     pub binlog_file: String,
+    /// Binlog position the snapshot's consistent view corresponds to.
     pub binlog_pos: u32,
+    /// Executed GTID set at the snapshot's consistent view.
+    ///
+    /// This is what the stream resumes from at handoff. Losing it forces a resume by
+    /// file+position, which is server-local.
     pub gtid: String,
 }
 
+/// A MySQL bulk snapshot in progress.
 pub struct MysqlSnapshotHandle {
     source_name: String,
     snapshot: MysqlSnapshot,
@@ -185,7 +229,22 @@ pub struct MysqlSnapshotHandle {
 
 #[async_trait]
 trait MysqlBinlogProvider: Send + Sync {
-    async fn poll_events(&mut self, max_events: usize) -> Result<Vec<MysqlBinlogMessage>>;
+    /// Read up to `max_events` binlog messages, returning by `deadline` at the latest.
+    ///
+    /// `deadline` is not advisory. Batch assembly used to be bounded only by
+    /// `max_events`, with a per-event read timeout and no wall-clock limit — so under a
+    /// writer that kept producing, the loop never broke early and kept accumulating until
+    /// it hit the cap. The first event of a 1,000-event batch therefore waited for the
+    /// other 999 to arrive, adding hundreds of milliseconds of capture latency that the
+    /// caller's `max_poll_wait_ms` was supposed to bound and did not.
+    ///
+    /// Returning fewer events than `max_events` is always correct: the remainder stays in
+    /// the stream and arrives on the next poll.
+    async fn poll_events(
+        &mut self,
+        max_events: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<MysqlBinlogMessage>>;
 }
 
 struct LiveMysqlBinlogProvider {
@@ -196,6 +255,9 @@ struct LiveMysqlBinlogProvider {
     active_tx_id: Option<u64>,
     next_tx_id: u64,
     poll_interval_ms: u64,
+    /// Binlog event types already warned about, so an unrecognised type produces one
+    /// log line rather than one per event.
+    warned_event_types: std::collections::HashSet<u8>,
 }
 
 /// Parse a MySQL GTID set into the `Sid` list `COM_BINLOG_DUMP_GTID` expects.
@@ -208,6 +270,66 @@ struct LiveMysqlBinlogProvider {
 ///
 /// An empty or whitespace-only set yields an empty list, which the caller treats as
 /// "no GTID position known" and leaves `BINLOG_THROUGH_GTID` unset.
+/// How long the binlog read loop may block for its next event, or `None` to stop.
+///
+/// Batch assembly used to be bounded only by `max_events_per_poll`, with a per-event read
+/// timeout and no wall-clock limit. Under a writer that kept producing, every
+/// `stream.next()` returned inside the per-event timeout, so the loop never broke early
+/// and kept accumulating until it hit the cap — and the *first* event of a 1,000-event
+/// batch waited for the other 999 to arrive. Measured against MySQL 8 that cost
+/// p50 431 ms / p95 1,559 ms of capture latency; bounding the loop brought it to
+/// p50 55 ms / p95 99 ms and raised sustained throughput 2.8×.
+///
+/// Rules:
+///
+/// * **Batch still empty** — wait a full poll interval regardless of the deadline. An idle
+///   stream must not become a busy loop, and returning nothing early helps no one.
+/// * **Batch has data, deadline passed** — `None`: return what we have. The remainder
+///   stays in the stream and arrives on the next poll.
+/// * **Batch has data, time remaining** — wait the shorter of the remaining budget and
+///   one poll interval.
+fn binlog_read_timeout(
+    collected: usize,
+    remaining: Duration,
+    poll_interval_ms: u64,
+) -> Option<Duration> {
+    let poll_interval = Duration::from_millis(poll_interval_ms);
+    if collected == 0 {
+        return Some(poll_interval);
+    }
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.min(poll_interval))
+}
+
+/// Decode a MariaDB `GTID_EVENT` (type 162) body into `domain-server-sequence` form.
+///
+/// Body layout, per the MariaDB binlog documentation:
+///
+/// | Offset | Size | Field |
+/// |---|---|---|
+/// | 0 | 8 | sequence number (little-endian `u64`) |
+/// | 8 | 4 | domain id (little-endian `u32`) |
+/// | 12 | 1 | flags |
+///
+/// Further optional fields follow depending on `flags` and are not needed here. The
+/// server id comes from the common event header, not the body.
+///
+/// Returns `None` when the body is too short to hold the fixed prefix — the caller
+/// turns that into an error rather than a silent skip, because a missing GTID
+/// downgrades the checkpoint to a server-local binlog coordinate.
+fn parse_mariadb_gtid_event(server_id: u32, data: &[u8]) -> Option<String> {
+    const MIN_BODY_LEN: usize = 13;
+    if data.len() < MIN_BODY_LEN {
+        return None;
+    }
+
+    let sequence = u64::from_le_bytes(data[0..8].try_into().ok()?);
+    let domain_id = u32::from_le_bytes(data[8..12].try_into().ok()?);
+    Some(format!("{domain_id}-{server_id}-{sequence}"))
+}
+
 fn parse_gtid_set(gtid_set: &str) -> std::result::Result<Vec<Sid<'static>>, String> {
     use std::str::FromStr as _;
 
@@ -292,6 +414,7 @@ impl LiveMysqlBinlogProvider {
             active_tx_id: None,
             next_tx_id: 1,
             poll_interval_ms: poll_interval_ms.max(1),
+            warned_event_types: std::collections::HashSet::new(),
         })
     }
 
@@ -308,12 +431,20 @@ impl LiveMysqlBinlogProvider {
             .and_then(primary_key_columns_from_row)
             .or_else(|| after.as_ref().and_then(primary_key_columns_from_row));
 
+        // ENUM and SET arrive as an ordinal and a bitmask; the labels live in the
+        // table-map's optional metadata, which `binlog_row_metadata=FULL` supplies.
+        let labels = EnumSetLabels::from_table_map(table_map);
+
         Ok(MysqlRowChange {
             schema: Some(table_map.database_name().into_owned()),
             table: table_map.table_name().into_owned(),
             primary_key,
-            before: before.as_ref().map(mysql_row_to_json),
-            after: after.as_ref().map(mysql_row_to_json),
+            before: before
+                .as_ref()
+                .map(|row| mysql_row_to_json_with_labels(row, &labels)),
+            after: after
+                .as_ref()
+                .map(|row| mysql_row_to_json_with_labels(row, &labels)),
         })
     }
 
@@ -325,6 +456,77 @@ impl LiveMysqlBinlogProvider {
             self.next_tx_id = self.next_tx_id.saturating_add(1);
             self.active_tx_id = Some(tx_id);
             (tx_id, true)
+        }
+    }
+
+    /// Decode a MariaDB-specific binlog event that `mysql_common` cannot classify.
+    ///
+    /// MariaDB defines its own event types above the MySQL range. `mysql_common`'s
+    /// `EventType` enum stops before them, so `Event::read_data()` returns
+    /// `Ok(None)` and the event vanishes. For most of these that is harmless; for two
+    /// of them it is not, which is why this exists rather than a blanket skip.
+    ///
+    /// Types, per the MariaDB binlog event documentation:
+    ///
+    /// | Type | Name | Handling |
+    /// |---|---|---|
+    /// | 160 | `ANNOTATE_ROWS_EVENT` | Skip — carries the originating SQL text for humans |
+    /// | 161 | `BINLOG_CHECKPOINT_EVENT` | Skip — names the oldest binlog still needed by an in-flight transaction |
+    /// | 162 | `GTID_EVENT` | **Decoded** — this is the replication position |
+    /// | 163 | `GTID_LIST_EVENT` | Skip — the state at the start of a binlog file |
+    /// | 164 | `START_ENCRYPTION_EVENT` | **Hard error** — every following event is ciphertext |
+    fn decode_mariadb_event(
+        &mut self,
+        raw_event_type: u8,
+        server_id: u32,
+        data: &[u8],
+    ) -> Result<Vec<MysqlBinlogMessage>> {
+        const MARIA_ANNOTATE_ROWS_EVENT: u8 = 160;
+        const MARIA_BINLOG_CHECKPOINT_EVENT: u8 = 161;
+        const MARIA_GTID_EVENT: u8 = 162;
+        const MARIA_GTID_LIST_EVENT: u8 = 163;
+        const MARIA_START_ENCRYPTION_EVENT: u8 = 164;
+
+        match raw_event_type {
+            MARIA_GTID_EVENT => {
+                let Some(gtid) = parse_mariadb_gtid_event(server_id, data) else {
+                    return Err(Error::SourceError(format!(
+                        "mariadb GTID event payload is {} bytes, which is shorter than the \
+                         13-byte minimum (8-byte sequence number, 4-byte domain id, 1-byte \
+                         flags). Refusing to continue: without the GTID the checkpoint falls \
+                         back to a binlog file and position, which is server-local and \
+                         resumes at an unrelated point after a failover.",
+                        data.len()
+                    )));
+                };
+                self.active_gtid = Some(gtid.clone());
+                Ok(vec![MysqlBinlogMessage::Gtid { gtid }])
+            }
+            MARIA_START_ENCRYPTION_EVENT => Err(Error::Unrecoverable(
+                "mariadb binlog encryption is enabled (START_ENCRYPTION_EVENT). Every \
+                 subsequent event is ciphertext that this connector cannot decode, so \
+                 continuing would silently drop all changes from this point on. Disable \
+                 encrypt_binlog on the source, or capture from an unencrypted replica."
+                    .into(),
+            )),
+            MARIA_ANNOTATE_ROWS_EVENT | MARIA_BINLOG_CHECKPOINT_EVENT | MARIA_GTID_LIST_EVENT => {
+                Ok(Vec::new())
+            }
+            other => {
+                // Warn once per type rather than per event: an unrecognised type is
+                // usually informational, but a silent skip is how the GTID gap above
+                // went unnoticed, so it must at least be visible.
+                if self.warned_event_types.insert(other) {
+                    tracing::warn!(
+                        target: "rustcdc::source::mysql",
+                        event_type = other,
+                        "skipping binlog event of an unrecognised type; if this server \
+                         produces change data in this event type, those changes are not \
+                         being captured",
+                    );
+                }
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -461,7 +663,11 @@ impl LiveMysqlBinlogProvider {
 
 #[async_trait]
 impl MysqlBinlogProvider for LiveMysqlBinlogProvider {
-    async fn poll_events(&mut self, max_events: usize) -> Result<Vec<MysqlBinlogMessage>> {
+    async fn poll_events(
+        &mut self,
+        max_events: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<MysqlBinlogMessage>> {
         if max_events == 0 {
             return Ok(Vec::new());
         }
@@ -469,11 +675,15 @@ impl MysqlBinlogProvider for LiveMysqlBinlogProvider {
         let mut out = Vec::new();
 
         while out.len() < max_events {
-            let next_event = tokio::time::timeout(
-                Duration::from_millis(self.poll_interval_ms),
-                self.stream.next(),
-            )
-            .await;
+            let Some(read_timeout) = binlog_read_timeout(
+                out.len(),
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                self.poll_interval_ms,
+            ) else {
+                break;
+            };
+
+            let next_event = tokio::time::timeout(read_timeout, self.stream.next()).await;
 
             let Some(event) = (match next_event {
                 Ok(value) => value,
@@ -490,7 +700,30 @@ impl MysqlBinlogProvider for LiveMysqlBinlogProvider {
 
             let header = event.header();
             self.next_pos = header.log_pos();
+            // The binlog common header stores the timestamp in **whole seconds**, so this
+            // is truncated down to the second — an event committed at T+0.999s reports
+            // T+0.000s. Any lag figure derived from it is therefore over-reported by up
+            // to 1,000 ms. Measured against MySQL 8 the median over-report is ~480 ms,
+            // which is the expected half-second for uniformly distributed sub-second
+            // commits. Documented on `SourceMetadata::timestamp`; PostgreSQL and SQL
+            // Server both carry microsecond-resolution commit timestamps and are exact.
             let timestamp_ms = u64::from(header.timestamp()) * 1_000;
+
+            // `read_data()` returns `Ok(None)` for any event type `mysql_common`'s
+            // `EventType` enum does not know — which is every MariaDB-specific type
+            // (160-164). Those were silently discarded, so MariaDB GTIDs never reached
+            // the checkpoint (leaving file+position, which is server-local and
+            // meaningless after a failover) and an encrypted binlog looked like an
+            // empty one. Handle the raw type before falling through.
+            let raw_event_type = event.header().event_type().err().map(u8::from);
+            if let Some(raw_event_type) = raw_event_type {
+                out.extend(self.decode_mariadb_event(
+                    raw_event_type,
+                    event.header().server_id(),
+                    event.data(),
+                )?);
+                continue;
+            }
 
             if let Some(data) = event.read_data().map_err(|error| {
                 Error::SourceError(format!(
@@ -505,6 +738,7 @@ impl MysqlBinlogProvider for LiveMysqlBinlogProvider {
     }
 }
 
+/// Live binlog stream. Obtain via `MysqlConnection::start_stream`.
 pub struct MysqlStreamHandle {
     source_name: String,
     stream: MysqlStream,
@@ -751,6 +985,7 @@ pub struct MysqlConnection {
 }
 
 impl MysqlConnection {
+    /// Build a connection from configuration. Does not connect; call `connect()`.
     pub fn new(config: MysqlSourceConfig) -> Self {
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
         let max_events_per_poll = config.max_events_per_poll.max(1);
@@ -766,6 +1001,17 @@ impl MysqlConnection {
         }
     }
 
+    /// Establish the connection and validate the server-side prerequisites.
+    ///
+    /// Validation is the point: `binlog_row_metadata` and `binlog_row_image` both default
+    /// to values under which capture produces **silently wrong** data — column names
+    /// become `@0`, `@1`, primary keys vanish, and UPDATE after-images arrive partial but
+    /// look complete. Both are rejected here with a remedy in the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SourceError`] for connection or
+    /// validation failures.
     pub async fn connect(&self) -> Result<()> {
         self.config.validate()?;
         {
@@ -789,7 +1035,12 @@ impl MysqlConnection {
             )
             .await
             .map_err(|_| Error::SourceError("mysql connection timed out".into()))?
-            .map_err(|error| Error::SourceError(format!("mysql connection failed: {error}")))?;
+            .map_err(|error| {
+                Error::SourceError(format!(
+                    "mysql connection failed: {}",
+                    crate::core::render_error_chain(&error)
+                ))
+            })?;
 
             let backend = LiveValidationBackend { pool: &pool };
             Self::validate_with_backend(&self.config, &backend).await?;
@@ -804,6 +1055,7 @@ impl MysqlConnection {
         }
     }
 
+    /// Close the connection. Safe to call when already closed.
     pub async fn close(&self) {
         let mut state = self.state.lock().await;
         if let Some(handle) = state.heartbeat_task.take() {
@@ -815,6 +1067,7 @@ impl MysqlConnection {
         self.logger.source_disconnected();
     }
 
+    /// Whether a connection is currently established.
     pub async fn is_connected(&self) -> bool {
         self.state.lock().await.pool.is_some()
     }
@@ -883,6 +1136,7 @@ impl MysqlConnection {
         Ok(Box::new(handle))
     }
 
+    /// Resume a bulk snapshot from a persisted snapshot checkpoint.
     pub async fn start_snapshot_from_checkpoint(
         &mut self,
         tables: &[&str],
@@ -1033,7 +1287,6 @@ impl MysqlConnection {
         config: IncrementalSnapshotConfig,
         resume_from: Option<&dyn Offset>,
     ) -> Result<Box<dyn StreamHandle>> {
-        use crate::source::mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
         let pool = {
             let state = self.state.lock().await;
             state.pool.clone().ok_or_else(|| {
@@ -1042,12 +1295,19 @@ impl MysqlConnection {
                 )
             })?
         };
+        let resume_state = crate::source::incremental_snapshot_state_from_offset(resume_from);
         let inner = self.start_stream(resume_from).await?;
         let source_name = self.source_type().to_string();
         let default_database = self.config.database.clone();
-        let handle =
-            MysqlIncrementalSnapshotHandle::new(inner, pool, config, source_name, default_database)
-                .await?;
+        let handle = incremental_snapshot::start(
+            inner,
+            pool,
+            config,
+            source_name,
+            default_database,
+            resume_state,
+        )
+        .await?;
         Ok(Box::new(handle))
     }
 }
@@ -1239,9 +1499,20 @@ impl StreamHandle for MysqlStreamHandle {
 
         let started = std::time::Instant::now();
         let timeout = Duration::from_millis(timeout_ms);
+        // The caller's budget bounds batch assembly too, not only the wait for the first
+        // event. A `timeout_ms` of 0 means "take what is immediately available", so give
+        // the provider one poll interval to read what has already arrived.
+        let deadline = if timeout_ms == 0 {
+            started + Duration::from_millis(self.stream_poll_interval_ms)
+        } else {
+            started + timeout
+        };
 
         loop {
-            let messages = self.provider.poll_events(self.max_events_per_poll).await?;
+            let messages = self
+                .provider
+                .poll_events(self.max_events_per_poll, deadline)
+                .await?;
             if !messages.is_empty() {
                 let events = self.process_messages(messages);
                 if !events.is_empty() {
@@ -1284,6 +1555,15 @@ impl StreamHandle for MysqlStreamHandle {
             self.stream.gtid.clone(),
         );
         checkpoint.save(&offset, self.events_polled).await
+    }
+
+    fn position_offset(&self) -> Option<Box<dyn crate::core::Offset>> {
+        Some(Box::new(MysqlOffset::new(
+            self.source_name.clone(),
+            self.stream.binlog_file.clone(),
+            self.stream.binlog_pos,
+            self.stream.gtid.clone(),
+        )))
     }
 
     async fn requeue_events(&mut self, events: Vec<Event>) -> Result<()> {
@@ -1475,6 +1755,7 @@ mod tests {
         source::{SnapshotHandle, Source, StreamHandle},
     };
 
+    use super::parse_mariadb_gtid_event;
     use super::MysqlSourceConfig;
     use super::{
         ConnectionState, MysqlBinlogMessage, MysqlBinlogProvider, MysqlConnection, MysqlRowChange,
@@ -1982,6 +2263,7 @@ mod tests {
         async fn poll_events(
             &mut self,
             _max_events: usize,
+            _deadline: std::time::Instant,
         ) -> crate::core::Result<Vec<MysqlBinlogMessage>> {
             Ok(self.batches.pop_front().unwrap_or_default())
         }
@@ -2177,6 +2459,7 @@ mod tests {
             binlog_file: "mysql-bin.000010".into(),
             binlog_pos: 777,
             source_flavor: "mysql".into(),
+            incremental_snapshot: None,
         };
         let restored = super::parser::decode_stream_resume_position("mysql", &offset).unwrap();
         assert_eq!(restored.binlog_file, "mysql-bin.000010");
@@ -2544,6 +2827,7 @@ mod tests {
             binlog_pos: 1024,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let mut conn = make_connection_with_watermarks(wm.clone(), wm.clone());
         let result = conn
@@ -2562,12 +2846,14 @@ mod tests {
             binlog_pos: 2048,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 512,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
         let result = conn
@@ -2585,12 +2871,14 @@ mod tests {
             binlog_pos: 512,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 1024,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
         let err = conn
@@ -2608,12 +2896,14 @@ mod tests {
             binlog_pos: 9999,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000002".into(),
             binlog_pos: 4,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
         let err = conn
@@ -2646,6 +2936,7 @@ mod tests {
             binlog_pos: 4,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         });
         let err = conn
             .perform_handoff(&mut AlreadyDoneSnapshotHandle, &mut NoOpStreamHandle)
@@ -2661,12 +2952,14 @@ mod tests {
             binlog_pos: 100,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 9999,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
         let result = conn
@@ -2684,12 +2977,14 @@ mod tests {
             binlog_pos: 100,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let stream_wm = MysqlOffset {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 10,
             source_flavor: "mysql".into(),
             gtid: String::new(),
+            incremental_snapshot: None,
         };
         let mut conn = make_connection_with_watermarks(snapshot_wm, stream_wm);
 
@@ -2919,5 +3214,101 @@ mod tests {
             assert_eq!(tx.tx_id, 42);
         }
         assert_eq!(handle.events_polled, TX_EVENTS as u64);
+    }
+
+    // ─── MariaDB-specific binlog events ──────────────────────────────────────
+
+    /// Build a MariaDB `GTID_EVENT` body: seq (u64 LE), domain (u32 LE), flags (u8).
+    fn mariadb_gtid_body(sequence: u64, domain_id: u32, flags: u8) -> Vec<u8> {
+        let mut body = Vec::with_capacity(13);
+        body.extend_from_slice(&sequence.to_le_bytes());
+        body.extend_from_slice(&domain_id.to_le_bytes());
+        body.push(flags);
+        body
+    }
+
+    #[test]
+    fn mariadb_gtid_event_decodes_to_domain_server_sequence() {
+        // `mysql_common`'s EventType enum stops below MariaDB's 160-164 range, so
+        // `read_data()` returns Ok(None) and these events used to vanish entirely —
+        // leaving the MariaDB checkpoint with no GTID at all, i.e. a binlog file and
+        // position, which is server-local and resumes somewhere unrelated after a
+        // failover.
+        let body = mariadb_gtid_body(100, 0, 0);
+        assert_eq!(
+            parse_mariadb_gtid_event(1, &body).as_deref(),
+            Some("0-1-100"),
+            "MariaDB GTIDs are written domain-server-sequence"
+        );
+    }
+
+    #[test]
+    fn mariadb_gtid_event_uses_the_header_server_id_and_a_non_zero_domain() {
+        let body = mariadb_gtid_body(4_294_967_296, 7, 0);
+        assert_eq!(
+            parse_mariadb_gtid_event(42, &body).as_deref(),
+            Some("7-42-4294967296"),
+            "the sequence number is a u64 and must not be truncated to u32"
+        );
+    }
+
+    #[test]
+    fn mariadb_gtid_event_body_shorter_than_the_fixed_prefix_is_rejected() {
+        // Returning a partial GTID would be worse than none: it would be checkpointed
+        // and resumed from.
+        assert!(parse_mariadb_gtid_event(1, &[0u8; 12]).is_none());
+        assert!(parse_mariadb_gtid_event(1, &[]).is_none());
+    }
+
+    #[test]
+    fn mariadb_gtid_event_ignores_trailing_optional_fields() {
+        // `flags & FL_GROUP_COMMIT_ID` appends a commit id; the fixed prefix is
+        // unaffected and must still decode.
+        let mut body = mariadb_gtid_body(5, 1, 0x02);
+        body.extend_from_slice(&99u64.to_le_bytes());
+        assert_eq!(parse_mariadb_gtid_event(3, &body).as_deref(), Some("1-3-5"));
+    }
+
+    // ─── Binlog batch-assembly deadline ──────────────────────────────────────
+
+    use super::binlog_read_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn an_empty_batch_always_waits_a_full_poll_interval() {
+        // Returning nothing early because the caller's budget is thin helps no one, and
+        // a zero timeout on an idle stream is a busy loop.
+        assert_eq!(
+            binlog_read_timeout(0, Duration::ZERO, 50),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            binlog_read_timeout(0, Duration::from_millis(5), 50),
+            Some(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn a_non_empty_batch_stops_once_the_caller_budget_is_spent() {
+        // This is the fix: batch assembly used to be bounded only by max_events_per_poll,
+        // so under a continuous writer the first event of a 1,000-event batch waited for
+        // the other 999 — hundreds of milliseconds the caller's max_poll_wait_ms was
+        // supposed to bound.
+        assert_eq!(binlog_read_timeout(1, Duration::ZERO, 50), None);
+        assert_eq!(binlog_read_timeout(999, Duration::ZERO, 50), None);
+    }
+
+    #[test]
+    fn a_non_empty_batch_never_waits_past_the_deadline() {
+        assert_eq!(
+            binlog_read_timeout(1, Duration::from_millis(12), 50),
+            Some(Duration::from_millis(12)),
+            "the remaining budget is shorter than the poll interval and must win"
+        );
+        assert_eq!(
+            binlog_read_timeout(1, Duration::from_millis(500), 50),
+            Some(Duration::from_millis(50)),
+            "with budget to spare, one poll interval is the read granularity"
+        );
     }
 }

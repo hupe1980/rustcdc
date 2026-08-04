@@ -42,26 +42,11 @@ const CONTENT_TYPE: &str = "application/x-protobuf";
 /// # use rustcdc::codec::{EventEncoder, ProtobufEncoder};
 /// # use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// let encoder = ProtobufEncoder;
-/// let event = Event {
-///     before: None,
-///     after: Some(serde_json::json!({"id": 1})),
-///     op: Operation::Insert,
-///     source: SourceMetadata {
-///         source_name: "postgres".into(),
-///         offset: "0/16B6A70".into(),
-///         timestamp: 1,
-///     },
-///     ts: 1,
-///     schema: None,
-///     table: "users".into(),
-///     primary_key: None,
-///     snapshot: None,
-///     transaction: None,
-///     envelope_version: EVENT_ENVELOPE_VERSION,
-///     before_is_key_only: false,
-///     unavailable_columns: Vec::new(),
-///     before_unavailable_columns: Vec::new(),
-/// };
+/// let event = Event::builder("users", Operation::Insert)
+///     .after(serde_json::json!({"id": 1}))
+///     .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+///     .ts(1)
+///     .build();
 /// let out = encoder.encode(&event).unwrap();
 /// assert_eq!(out.content_type, "application/x-protobuf");
 /// ```
@@ -92,11 +77,17 @@ impl EventEncoder for ProtobufEncoder {
 pub enum ProtoOperation {
     /// Default/unspecified — never emitted by a well-formed encoder.
     Unspecified = 0,
+    /// Row created.
     Insert = 1,
+    /// Row modified.
     Update = 2,
+    /// Row removed.
     Delete = 3,
+    /// Snapshot row, not a live change.
     Read = 4,
+    /// Schema change (DDL).
     SchemaChange = 5,
+    /// Table truncated.
     Truncate = 6,
 }
 
@@ -109,6 +100,28 @@ impl ProtoOperation {
             Operation::Read => Self::Read,
             Operation::SchemaChange => Self::SchemaChange,
             Operation::Truncate => Self::Truncate,
+        }
+    }
+
+    /// Convert back to the canonical [`Operation`].
+    ///
+    /// `Unspecified` is an error rather than a silent default: protobuf's zero value is
+    /// indistinguishable from an absent field, so mapping it to `Insert` would turn a
+    /// truncated or foreign message into a fabricated row creation.
+    fn to_op(self) -> Result<Operation> {
+        match self {
+            Self::Insert => Ok(Operation::Insert),
+            Self::Update => Ok(Operation::Update),
+            Self::Delete => Ok(Operation::Delete),
+            Self::Read => Ok(Operation::Read),
+            Self::SchemaChange => Ok(Operation::SchemaChange),
+            Self::Truncate => Ok(Operation::Truncate),
+            Self::Unspecified => Err(Error::SerializationError(
+                "protobuf event carries OPERATION_UNSPECIFIED (the protobuf zero value), \
+                 which means the `op` field was absent or the message was not produced by \
+                 a rustcdc encoder. Refusing to guess an operation."
+                    .into(),
+            )),
         }
     }
 }
@@ -278,6 +291,82 @@ impl ProtoEvent {
     /// Decode a `ProtoEvent` from raw protobuf bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Self::decode(bytes).map_err(|e| Error::SerializationError(format!("protobuf decode: {e}")))
+    }
+
+    /// Convert back into the canonical [`crate::core::Event`].
+    ///
+    /// The inverse of [`ProtoEvent::from_event`]. Round-tripping is exact except for
+    /// `TransactionMetadata::total_events`, where protobuf cannot distinguish "absent"
+    /// from zero — `0` decodes back to `None`, matching the sentinel documented in
+    /// `proto/event.proto`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SerializationError`] if `op` is unset, `source` is missing, or a
+    /// row image is not valid JSON. All are permanent: the same bytes will never decode.
+    pub fn into_event(self) -> Result<Event> {
+        use crate::core::{SnapshotMetadata, SourceMetadata, TransactionMetadata};
+
+        let decode_payload =
+            |bytes: Option<Vec<u8>>, which: &str| -> Result<Option<serde_json::Value>> {
+                bytes
+                    .map(|raw| {
+                        serde_json::from_slice(&raw).map_err(|error| {
+                            Error::SerializationError(format!(
+                                "protobuf {which}-image is not valid JSON: {error}"
+                            ))
+                        })
+                    })
+                    .transpose()
+            };
+
+        let op = ProtoOperation::try_from(self.op)
+            .map_err(|_| {
+                Error::SerializationError(format!(
+                    "protobuf event carries unknown operation discriminant {}",
+                    self.op
+                ))
+            })?
+            .to_op()?;
+
+        let source = self.source.ok_or_else(|| {
+            Error::SerializationError(
+                "protobuf event has no `source` metadata, so it carries no durable position \
+                 and cannot be checkpointed"
+                    .into(),
+            )
+        })?;
+
+        Ok(Event {
+            before: decode_payload(self.before, "before")?,
+            after: decode_payload(self.after, "after")?,
+            op,
+            source: SourceMetadata {
+                source_name: source.source_name,
+                offset: source.offset,
+                timestamp: source.timestamp,
+            },
+            ts: self.ts,
+            schema: self.schema,
+            table: self.table,
+            primary_key: (!self.primary_key.is_empty()).then_some(self.primary_key),
+            snapshot: self.snapshot.map(|s| SnapshotMetadata {
+                snapshot_id: s.snapshot_id,
+                chunk_index: s.chunk_index,
+                is_last_chunk: s.is_last_chunk,
+            }),
+            transaction: self.transaction.map(|t| TransactionMetadata {
+                tx_id: t.tx_id,
+                // `0` is protobuf's zero value and the documented "unknown" sentinel —
+                // it is not an empty transaction.
+                total_events: (t.total_events != 0).then_some(t.total_events),
+                event_index: t.event_index,
+            }),
+            envelope_version: self.envelope_version as u16,
+            before_is_key_only: self.before_is_key_only,
+            unavailable_columns: self.unavailable_columns,
+            before_unavailable_columns: self.before_unavailable_columns,
+        })
     }
 }
 

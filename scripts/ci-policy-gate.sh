@@ -45,6 +45,12 @@ run_markdown_link_check() {
         http://*|https://*|mailto:*|\#*)
           continue
           ;;
+        @/*)
+          # Zola internal link. `zola build` resolves and validates these against
+          # the content tree and fails on a miss, so re-checking them here as file
+          # paths would only produce false positives.
+          continue
+          ;;
       esac
 
       local resolved
@@ -62,10 +68,12 @@ run_markdown_link_check() {
     done < <(rg --no-line-number --no-filename --pcre2 -o '\[[^][]+\]\(([^)]+)\)' "$markdown_file")
   }
 
-  check_markdown_file "README.md"
   while IFS= read -r file; do
     check_markdown_file "$file"
-  done < <(find docs -type f -name '*.md' | sort)
+  done < <(find . -maxdepth 1 -type f -name '*.md' | sort)
+  while IFS= read -r file; do
+    check_markdown_file "$file"
+  done < <(find site/content -type f -name '*.md' | sort)
 
   if [[ "$failed" -gt 0 ]]; then
     echo "markdown link check failed: $failed broken links out of $checked checked" >&2
@@ -73,6 +81,19 @@ run_markdown_link_check() {
   fi
 
   echo "markdown link check passed: $checked links checked"
+
+  # Zola owns the internal `@/...` links, the template/shortcode surface and the
+  # taxonomy of the content tree. If it is installed, build the site so a broken
+  # cross-reference fails the gate rather than the deploy.
+  if command -v zola >/dev/null 2>&1; then
+    if ! zola --root site check >/dev/null; then
+      echo "zola check failed: the documentation site does not build" >&2
+      exit 1
+    fi
+    echo "zola check passed"
+  else
+    echo "zola not installed: skipping documentation site check"
+  fi
 }
 
 check_equal_sets() {
@@ -147,7 +168,7 @@ run_schema_contract_check() {
 run_deprecated_usage_check() {
   local pattern='\#\[\s*deprecated|deprecated\('
   local matches
-  matches="$(rg -n --hidden --glob '!.git' --glob '!target' "$pattern" src tests docs scripts .github xtask Cargo.toml README.md || true)"
+  matches="$(rg -n --hidden --glob '!.git' --glob '!target' "$pattern" src tests site/content scripts .github xtask Cargo.toml README.md || true)"
 
   if [[ -n "$matches" ]]; then
     echo "Deprecated marker/usage gate failed. Remove deprecated APIs/usages before merging." >&2
@@ -323,7 +344,106 @@ run_workflow_drift_check() {
   echo "Workflow drift guard passed."
 }
 
+# Every public field of a user-facing config struct must appear in the configuration
+# reference. These tables used to be hand-copied `pub struct` dumps in the docs, which
+# drifted silently: eleven fields existed in code and were documented nowhere. A field
+# nobody can find is a field nobody sets, and the defaults here are load-bearing.
+run_config_docs_coverage_check() {
+  local doc="site/content/docs/config-reference.md"
+  local failed=0
+
+  check_struct_fields_documented() {
+    local file="$1"
+    local struct_name="$2"
+    local bt='`'
+
+    # Public field names inside the struct body, up to its closing brace at column 0.
+    local fields
+    fields="$(awk -v s="pub struct $struct_name" '
+      index($0, s) == 1 { inside = 1; next }
+      inside && /^}/ { exit }
+      inside && match($0, /^[ \t]+pub [a-z_0-9]+:/) {
+        line = $0
+        sub(/^[ \t]+pub /, "", line)
+        sub(/:.*$/, "", line)
+        print line
+      }
+    ' "$file")"
+
+    if [[ -z "$fields" ]]; then
+      echo "config docs coverage: struct $struct_name not found in $file" >&2
+      failed=$((failed + 1))
+      return
+    fi
+
+    local field
+    while IFS= read -r field; do
+      [[ -z "$field" ]] && continue
+      # The reference documents fields in table rows: | `field` | type | ... |
+      if ! rg -q "^[|] ${bt}${field}${bt}" "$doc"; then
+        echo "config docs coverage: $struct_name::$field is not documented in $doc" >&2
+        failed=$((failed + 1))
+      fi
+    done <<< "$fields"
+  }
+
+  check_struct_fields_documented "src/core/runtime.rs" "RuntimeConfig"
+  check_struct_fields_documented "src/core/runtime.rs" "RuntimeOptions"
+  check_struct_fields_documented "src/source/postgres.rs" "PostgresSourceConfig"
+  check_struct_fields_documented "src/source/mysql.rs" "MysqlSourceConfig"
+  check_struct_fields_documented "src/source/sqlserver.rs" "SqlServerSourceConfig"
+
+  if [[ "$failed" -gt 0 ]]; then
+    echo "config docs coverage check failed: $failed undocumented field(s)" >&2
+    exit 1
+  fi
+
+  echo "Config docs coverage check passed."
+}
+
 run_markdown_link_check
+# A public type inside a submodule that its parent never re-exports is unreachable in
+# practice: `codec::schema_registry` is `pub`, but every doc example and every downstream
+# import names `codec::…`. `ConfluentProtobufEncoder` and `ConfluentProtobufDecoder` sat
+# unexported for an entire release cycle — the codec with no live test coverage was also
+# the one nobody could import.
+run_reexport_coverage_check() {
+  local failed=0
+
+  check_module_reexports() {
+    local child="$1"
+    local parent="$2"
+
+    local items
+    items="$(rg --no-line-number --no-filename -o \
+      '^pub (?:struct|enum|trait|const|type|fn|async fn) ([A-Za-z_][A-Za-z0-9_]*)' \
+      --replace '$1' "$child" || true)"
+
+    local item
+    while IFS= read -r item; do
+      [[ -z "$item" ]] && continue
+      if ! rg -q "\\b$item\\b" "$parent"; then
+        echo "re-export coverage: $child defines public \`$item\` but $parent never names it" >&2
+        failed=$((failed + 1))
+      fi
+    done <<< "$items"
+  }
+
+  check_module_reexports "src/codec/schema_registry.rs" "src/codec/mod.rs"
+  check_module_reexports "src/codec/avro.rs" "src/codec/mod.rs"
+  check_module_reexports "src/codec/json.rs" "src/codec/mod.rs"
+  check_module_reexports "src/source/incremental_snapshot/driver.rs" "src/source/mod.rs"
+
+  if [[ "$failed" -gt 0 ]]; then
+    echo "re-export coverage check failed: $failed unreachable public item(s)" >&2
+    exit 1
+  fi
+
+  echo "Re-export coverage check passed."
+}
+
+run_config_docs_coverage_check
+run_reexport_coverage_check
 run_schema_contract_check
 run_deprecated_usage_check
 run_async_trait_policy_check

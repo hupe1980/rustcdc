@@ -7,7 +7,6 @@
 //! 4. `Err(TransformError)` — no route found.
 
 use ahash::AHashMap as HashMap;
-use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
@@ -16,6 +15,7 @@ use crate::core::{Error, Event, Result};
 use super::Transform;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Routes events to named destinations by table pattern.
 pub struct RouteConfig {
     /// Exact source table name → destination label (highest priority).
     pub routing_table: HashMap<String, String>,
@@ -25,6 +25,9 @@ pub struct RouteConfig {
     /// compiled once at [`RouteTransform::new`] time — use [`RouteConfig::validate`]
     /// to surface compile errors before calling `new`.
     pub route_patterns_raw: Vec<(String, String)>,
+    /// Destination for events matching no route.
+    ///
+    /// There is always one, so an unrouted table cannot silently vanish.
     pub default_destination: String,
     /// Inject the resolved destination into `event.after["_destination"]`.
     pub add_destination_field: bool,
@@ -57,6 +60,7 @@ impl RouteConfig {
 /// Routing priority: exact-table → regex-pattern → default.
 #[derive(Debug, Clone)]
 pub struct RouteTransform {
+    /// Routing configuration.
     pub config: RouteConfig,
     /// Pre-compiled regex patterns derived from `config.route_patterns_raw`.
     patterns: Vec<(Regex, String)>,
@@ -104,9 +108,8 @@ impl RouteTransform {
     }
 }
 
-#[async_trait]
 impl Transform for RouteTransform {
-    async fn apply(&self, event: &mut Event) -> Result<bool> {
+    fn apply(&self, event: &mut Event) -> Result<bool> {
         let destination = self.destination_for(&event.table)?;
 
         if self.config.update_table {
@@ -182,7 +185,7 @@ mod tests {
     async fn routes_event_to_mapped_destination() {
         let transform = simple_transform("users", "topic-users");
         let mut e = event("users");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.after.unwrap()["_destination"], "topic-users");
     }
 
@@ -198,7 +201,7 @@ mod tests {
         .unwrap();
 
         let mut e = event("orders");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.after.unwrap()["_destination"], "topic-default");
     }
 
@@ -206,7 +209,7 @@ mod tests {
     async fn missing_mapping_without_default_errors() {
         let transform = RouteTransform::new(RouteConfig::default()).unwrap();
         let mut e = event("orders");
-        assert!(transform.apply(&mut e).await.is_err());
+        assert!(transform.apply(&mut e).is_err());
     }
 
     #[tokio::test]
@@ -214,8 +217,8 @@ mod tests {
         let transform = simple_transform("users", "topic-users");
         let mut first = event("users");
         let mut second = event("users");
-        assert!(transform.apply(&mut first).await.unwrap());
-        assert!(transform.apply(&mut second).await.unwrap());
+        assert!(transform.apply(&mut first).unwrap());
+        assert!(transform.apply(&mut second).unwrap());
         assert_eq!(first.after, second.after);
     }
 
@@ -233,7 +236,7 @@ mod tests {
         .unwrap();
 
         let mut e = event("users");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(
             e.table, "topic-users",
             "event.table must be updated to destination"
@@ -254,7 +257,7 @@ mod tests {
         .unwrap();
 
         let mut e = event("orders");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.table, "topic-orders");
         assert_eq!(e.after.as_ref().unwrap()["_destination"], "topic-orders");
     }
@@ -273,7 +276,7 @@ mod tests {
         .unwrap();
 
         let mut e = event("orders_2024");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.after.unwrap()["_destination"], "topic-orders");
     }
 
@@ -291,7 +294,7 @@ mod tests {
         .unwrap();
 
         let mut e = event("orders_vip");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         // Exact match wins over the regex pattern.
         assert_eq!(e.after.unwrap()["_destination"], "topic-vip");
     }
@@ -312,7 +315,7 @@ mod tests {
 
         // Matches both patterns; first one wins.
         let mut e = event("orders_archive");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.after.unwrap()["_destination"], "topic-orders");
     }
 
@@ -328,7 +331,7 @@ mod tests {
         .unwrap();
 
         let mut e = event("payments");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.after.unwrap()["_destination"], "topic-catch-all");
     }
 
@@ -393,7 +396,7 @@ mod tests {
             unavailable_columns: Vec::new(),
             before_unavailable_columns: Vec::new(),
         };
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert!(
             e.after.is_none(),
             "after must remain None for Truncate events — no phantom payload"
@@ -414,7 +417,7 @@ mod tests {
         .unwrap();
 
         let mut e = event("public.users");
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.table, "topic-public");
     }
 }

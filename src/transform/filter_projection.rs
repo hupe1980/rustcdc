@@ -16,7 +16,6 @@
 
 use std::collections::HashSet;
 
-use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 
@@ -37,6 +36,7 @@ pub enum FilterMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Row filtering and column projection.
 pub struct FilterProjectionConfig {
     /// Rules applied to decide whether to keep (`true`) or drop (`false`) an event.
     ///
@@ -119,6 +119,7 @@ pub enum FilterOperator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One predicate: a field, an operator, and a value to compare against.
 pub struct FilterRule {
     field: FilterField,
     operator: FilterOperator,
@@ -126,6 +127,8 @@ pub struct FilterRule {
 }
 
 impl FilterRule {
+    /// Build a rule. Validation happens at
+    /// [`FilterProjectionTransform::new`](super::FilterProjectionTransform::new).
     pub fn new(field: FilterField, operator: FilterOperator, value: impl Into<String>) -> Self {
         Self {
             field,
@@ -136,6 +139,13 @@ impl FilterRule {
 }
 
 impl FilterProjectionConfig {
+    /// Check the rule is well-formed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] for an empty value
+    /// or an invalid regex — caught at construction rather than silently at apply time,
+    /// where the failure would arrive as dropped events.
     pub fn validate(&self) -> Result<()> {
         // include_columns and exclude_columns are mutually exclusive — allowing both
         // produces confusing behavior (exclude is a no-op against an already-reduced set).
@@ -171,6 +181,7 @@ impl FilterProjectionConfig {
 /// done against the pre-parsed state, eliminating allocations on the hot path.
 #[derive(Debug, Clone)]
 pub struct FilterProjectionTransform {
+    /// Filter and projection configuration.
     pub config: FilterProjectionConfig,
     /// Pre-built include set; `None` when `include_columns` is absent.
     include_set: Option<HashSet<String>>,
@@ -353,9 +364,8 @@ fn extract_json_field<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-#[async_trait]
 impl Transform for FilterProjectionTransform {
-    async fn apply(&self, event: &mut Event) -> Result<bool> {
+    fn apply(&self, event: &mut Event) -> Result<bool> {
         if !self.evaluate_filter(event) {
             return Ok(false);
         }
@@ -420,7 +430,7 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Delete);
-        assert!(!transform.apply(&mut e).await.unwrap());
+        assert!(!transform.apply(&mut e).unwrap());
     }
 
     #[tokio::test]
@@ -433,7 +443,7 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         let after = e.after.unwrap();
         assert_eq!(after["id"], 1);
         assert_eq!(after["name"], "alice");
@@ -450,7 +460,7 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert!(e.after.unwrap().get("secret").is_none());
     }
 
@@ -491,7 +501,7 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(transform.apply(&mut e).await.is_err());
+        assert!(transform.apply(&mut e).is_err());
     }
 
     #[tokio::test]
@@ -510,8 +520,8 @@ mod tests {
         let mut first = event(Operation::Insert);
         let mut second = event(Operation::Insert);
 
-        assert!(transform.apply(&mut first).await.unwrap());
-        assert!(transform.apply(&mut second).await.unwrap());
+        assert!(transform.apply(&mut first).unwrap());
+        assert!(transform.apply(&mut second).unwrap());
         assert_eq!(first.after, second.after);
     }
 
@@ -531,7 +541,7 @@ mod tests {
 
         let mut e = event(Operation::Insert);
         assert!(
-            transform.apply(&mut e).await.unwrap(),
+            transform.apply(&mut e).unwrap(),
             "event with name=alice must pass"
         );
     }
@@ -550,7 +560,7 @@ mod tests {
 
         let mut e = event(Operation::Insert);
         assert!(
-            !transform.apply(&mut e).await.unwrap(),
+            !transform.apply(&mut e).unwrap(),
             "event with name=alice must be dropped"
         );
     }
@@ -569,7 +579,7 @@ mod tests {
 
         let mut e = event(Operation::Insert);
         assert!(
-            transform.apply(&mut e).await.unwrap(),
+            transform.apply(&mut e).unwrap(),
             "\"alice\" contains \"lic\""
         );
     }
@@ -587,10 +597,7 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert);
-        assert!(
-            transform.apply(&mut e).await.unwrap(),
-            "\"alice\" matches ^ali"
-        );
+        assert!(transform.apply(&mut e).unwrap(), "\"alice\" matches ^ali");
     }
 
     #[test]
@@ -622,7 +629,7 @@ mod tests {
         .unwrap();
 
         let mut e = event(Operation::Insert); // after["id"] = 1
-        assert!(transform.apply(&mut e).await.unwrap(), "id=1 > 0");
+        assert!(transform.apply(&mut e).unwrap(), "id=1 > 0");
     }
 
     #[tokio::test]
@@ -639,7 +646,7 @@ mod tests {
 
         let mut e = event(Operation::Update);
         assert!(
-            transform.apply(&mut e).await.unwrap(),
+            transform.apply(&mut e).unwrap(),
             "before.secret=x must match"
         );
     }
@@ -660,11 +667,11 @@ mod tests {
 
         // Both match → keep.
         let mut insert_users = event(Operation::Insert);
-        assert!(transform.apply(&mut insert_users).await.unwrap());
+        assert!(transform.apply(&mut insert_users).unwrap());
 
         // Only table matches, op doesn't → drop.
         let mut update_users = event(Operation::Update);
-        assert!(!transform.apply(&mut update_users).await.unwrap());
+        assert!(!transform.apply(&mut update_users).unwrap());
     }
 
     #[tokio::test]
@@ -681,7 +688,7 @@ mod tests {
 
         // table=users, op=insert → second rule matches.
         let mut e = event(Operation::Insert); // table = "users"
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
     }
 
     #[tokio::test]
@@ -698,7 +705,7 @@ mod tests {
 
         // table=users (≠orders), op=insert (≠delete) → neither rule matches.
         let mut e = event(Operation::Insert);
-        assert!(!transform.apply(&mut e).await.unwrap());
+        assert!(!transform.apply(&mut e).unwrap());
     }
 
     #[tokio::test]
@@ -719,10 +726,10 @@ mod tests {
         .unwrap();
 
         let mut matching = event(Operation::Insert);
-        assert!(transform.apply(&mut matching).await.unwrap());
+        assert!(transform.apply(&mut matching).unwrap());
 
         let mut non_matching = event(Operation::Update); // op differs
-        assert!(!transform.apply(&mut non_matching).await.unwrap());
+        assert!(!transform.apply(&mut non_matching).unwrap());
     }
 
     #[tokio::test]
@@ -761,7 +768,7 @@ mod tests {
             before_unavailable_columns: Vec::new(),
         };
         assert!(
-            transform.apply(&mut e).await.unwrap(),
+            transform.apply(&mut e).unwrap(),
             "Truncate must pass through even when content-field filter rules are present"
         );
     }
@@ -803,7 +810,7 @@ mod tests {
             before_unavailable_columns: Vec::new(),
         };
         assert!(
-            !transform.apply(&mut e).await.unwrap(),
+            !transform.apply(&mut e).unwrap(),
             "Truncate must be dropped when pass_through_truncate=false and rule does not match"
         );
     }

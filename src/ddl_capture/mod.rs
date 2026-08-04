@@ -31,8 +31,11 @@ mod tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DdlDialect {
+    /// PostgreSQL DDL grammar.
     Postgres,
+    /// MySQL and MariaDB DDL grammar.
     Mysql,
+    /// SQL Server (T-SQL) DDL grammar.
     SqlServer,
 }
 
@@ -50,8 +53,11 @@ impl DdlDialect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DdlOperation {
+    /// `CREATE TABLE`.
     CreateTable,
+    /// `ALTER TABLE`.
     AlterTable,
+    /// `DROP TABLE`.
     DropTable,
 }
 
@@ -59,15 +65,40 @@ pub enum DdlOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SchemaDiffOperation {
-    AddColumn { column: ColumnDef },
-    DropColumn { name: String },
-    RenameColumn { from: String, to: String },
-    Unsupported { clause: String },
+    /// A column was added.
+    AddColumn {
+        /// The new column's definition.
+        column: ColumnDef,
+    },
+    /// A column was removed.
+    DropColumn {
+        /// Name of the removed column.
+        name: String,
+    },
+    /// A column was renamed.
+    ///
+    /// Renames matter downstream well beyond the schema: a mask rule, a field mapping, or
+    /// a filter that names the old path silently stops matching.
+    RenameColumn {
+        /// Previous column name.
+        from: String,
+        /// New column name.
+        to: String,
+    },
+    /// A clause this parser does not model.
+    ///
+    /// Surfaced rather than dropped, so a consumer can decide whether the unparsed change
+    /// is one it must react to.
+    Unsupported {
+        /// The clause text as written.
+        clause: String,
+    },
 }
 
 /// Canonical schema diff extracted from a DDL statement when available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaDiff {
+    /// Ordered operations taking the previous schema to the new one.
     pub operations: Vec<SchemaDiffOperation>,
 }
 
@@ -84,12 +115,19 @@ impl DdlOperation {
 /// Dialect-aware normalized DDL parse result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedDdlStatement {
+    /// Grammar the statement was parsed with.
     pub dialect: DdlDialect,
+    /// Top-level DDL operation.
     pub operation: DdlOperation,
+    /// Schema the statement targets.
     pub schema: String,
+    /// Table the statement targets.
     pub table: String,
+    /// The DDL statement as written.
     pub statement: String,
+    /// Table schema after the statement, when the parser could derive it.
     pub result_schema: Option<TableSchema>,
+    /// Column-level diff, when the parser could derive one.
     pub schema_diff: Option<SchemaDiff>,
 }
 

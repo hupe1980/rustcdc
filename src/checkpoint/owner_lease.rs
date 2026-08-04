@@ -40,6 +40,56 @@ use crate::core::{Error, Result};
 #[derive(Debug)]
 pub(crate) struct OwnerLease {
     pub(crate) lock_path: PathBuf,
+    /// The exact token written when this lease was acquired.
+    ///
+    /// Held so [`OwnerLease::verify_still_held`] can fence writes: a lease that was
+    /// acquired successfully is not thereby held *forever*.
+    token: String,
+}
+
+impl OwnerLease {
+    /// Confirm this process still owns the lease, before a durable write.
+    ///
+    /// Acquiring a lease once is not the same as holding it. An operator can delete
+    /// the sentinel file to clear what looks like a stuck lease; a peer that saw this
+    /// process as dead can take it over; a shared-filesystem mount can be swapped
+    /// underneath. In every one of those cases the original owner previously carried
+    /// on writing, and two writers rewriting the same whole-file store silently
+    /// destroy each other's records.
+    ///
+    /// Checking costs one small read per durable write — the write itself is an
+    /// fsync plus a rename, so the read is not measurable — and converts silent
+    /// mutual corruption into a loud, named error.
+    pub(crate) fn verify_still_held(&self, store_label: &str) -> Result<()> {
+        let raw = match fs::read_to_string(&self.lock_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::StateError(format!(
+                    "{store_label} owner lease file '{}' has disappeared; this process no \
+                     longer holds exclusive write access. Another instance may have taken \
+                     over, or the file was removed manually. Refusing to write, because two \
+                     writers against one store destroy each other's records. Restart this \
+                     runtime after confirming no other instance is running.",
+                    self.lock_path.display()
+                )));
+            }
+            Err(error) => return Err(Error::from(error)),
+        };
+
+        if raw.trim() == self.token {
+            return Ok(());
+        }
+
+        Err(Error::StateError(format!(
+            "{store_label} owner lease at '{}' is no longer held by this process \
+             (expected '{}', found '{}'). Another instance has taken ownership. Refusing \
+             to write, because two writers against one store destroy each other's records. \
+             Use a dedicated {store_label} directory per runtime instance.",
+            self.lock_path.display(),
+            self.token,
+            raw.trim()
+        )))
+    }
 }
 
 impl Drop for OwnerLease {
@@ -57,13 +107,6 @@ static LEASE_REFS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> = 
 
 fn lease_ref_counts() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
     LEASE_REFS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-pub(crate) fn increment_lease_ref(lock_path: &Path) {
-    if let Ok(mut refs) = lease_ref_counts().lock() {
-        let entry = refs.entry(lock_path.to_path_buf()).or_insert(0);
-        *entry = entry.saturating_add(1);
-    }
 }
 
 pub(crate) fn decrement_lease_ref(lock_path: &Path) -> usize {
@@ -198,7 +241,54 @@ pub(crate) fn atomic_write_lease(lock_path: &Path, content: &str) -> std::io::Re
     Ok(())
 }
 
+/// Reject a second in-process holder of the same lease path.
+///
+/// The on-disk check cannot catch this: a second `FileCheckpoint` or
+/// `FileSchemaHistory` constructed against the same directory in the same process
+/// writes the same `HOSTNAME:PID`, so the file-based decision table classifies it as
+/// a **re-entrant** acquire and lets it through. Both instances then hold independent
+/// in-memory state and rewrite the whole file, silently destroying each other's
+/// records — reproducibly, with no error anywhere.
+///
+/// Instances are sequential-safe: `Drop` decrements the count, so constructing one
+/// after another has been dropped is fine. Clones share a single `OwnerLease` and
+/// never re-acquire.
+fn reserve_in_process(lock_path: &Path, store_label: &str) -> Result<()> {
+    let mut refs = lease_ref_counts().lock().map_err(|_| {
+        Error::StateError(format!("{store_label} owner lease registry lock poisoned"))
+    })?;
+
+    if refs.get(lock_path).copied().unwrap_or(0) > 0 {
+        return Err(Error::StateError(format!(
+            "{store_label} owner lease for '{}' is already held by another instance in \
+             this process. Two instances against one store hold independent in-memory \
+             state and rewrite the whole file, silently destroying each other's records. \
+             Share one instance (it is cheap to clone), or use a dedicated \
+             {store_label} directory per instance.",
+            lock_path.display()
+        )));
+    }
+
+    refs.insert(lock_path.to_path_buf(), 1);
+    Ok(())
+}
+
 pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease> {
+    // Claim in-process ownership first, so the on-disk work is skipped entirely when
+    // a sibling instance already holds this path. Release the reservation if the
+    // on-disk acquire then fails, otherwise a rejected attempt would poison the path
+    // for the rest of the process lifetime.
+    reserve_in_process(lock_path, store_label)?;
+    match acquire_on_disk(lock_path, store_label) {
+        Ok(lease) => Ok(lease),
+        Err(error) => {
+            decrement_lease_ref(lock_path);
+            Err(error)
+        }
+    }
+}
+
+fn acquire_on_disk(lock_path: &Path, store_label: &str) -> Result<OwnerLease> {
     let owner_pid = std::process::id();
     let hostname = current_hostname();
 
@@ -301,9 +391,9 @@ pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease>
         Err(error) => return Err(Error::from(error)),
     }
 
-    increment_lease_ref(lock_path);
     Ok(OwnerLease {
         lock_path: lock_path.to_path_buf(),
+        token: lease_content,
     })
 }
 
@@ -439,16 +529,16 @@ mod tests {
 
     /// Same process acquiring the same path twice must succeed (re-entrant).
     #[test]
-    fn acquire_is_reentrant_within_same_process() {
+    fn dropping_the_lease_removes_the_sentinel_file() {
+        // This test previously asserted that a second in-process `acquire` succeeded
+        // ("re-entrant"), which was the mechanism by which two store instances
+        // silently destroyed each other's records. A second acquire is now refused —
+        // see `a_second_instance_in_this_process_is_refused`.
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("test.owner");
-        let lease1 = acquire(&lock_path, "test").unwrap();
-        let lease2 = acquire(&lock_path, "test").unwrap();
-        drop(lease1);
-        // After first drop the ref-count is 1; file should still exist.
+        let lease = acquire(&lock_path, "test").unwrap();
         assert!(lock_path.exists());
-        drop(lease2);
-        // After second drop the ref-count hits 0; file is removed.
+        drop(lease);
         assert!(!lock_path.exists());
     }
 
@@ -555,18 +645,69 @@ mod tests {
         );
     }
 
-    /// Ref-count increments and decrements are balanced; file is removed at zero.
     #[test]
-    fn ref_count_increment_decrement_balanced() {
+    fn decrementing_past_zero_is_a_no_op() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("refcount.owner");
-        std::fs::write(&lock_path, b"dummy").unwrap();
+        assert_eq!(decrement_lease_ref(&lock_path), 0);
+    }
 
-        increment_lease_ref(&lock_path);
-        increment_lease_ref(&lock_path);
-        assert_eq!(decrement_lease_ref(&lock_path), 1);
-        assert_eq!(decrement_lease_ref(&lock_path), 0);
-        // Decrementing past zero should return 0 and not panic.
-        assert_eq!(decrement_lease_ref(&lock_path), 0);
+    #[test]
+    fn a_second_instance_in_this_process_is_refused() {
+        // Regression: the on-disk decision table classifies a second instance in the
+        // same process as a *re-entrant* acquire (same HOSTNAME:PID), so both used to
+        // succeed. Each then rewrote the whole store file from its own in-memory
+        // state, silently destroying the other's records.
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("second.owner");
+
+        let first = acquire(&lock_path, "checkpoint").expect("first acquire must succeed");
+        let error = acquire(&lock_path, "checkpoint")
+            .expect_err("a second in-process instance must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("already held by another instance in this process"),
+            "message must name the real cause; got: {message}"
+        );
+
+        // Sequential use is still fine.
+        drop(first);
+        acquire(&lock_path, "checkpoint").expect("acquire after release must succeed");
+    }
+
+    #[test]
+    fn a_rejected_acquire_does_not_poison_the_path() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("poison.owner");
+        // A foreign live-host lease makes the on-disk acquire fail.
+        std::fs::write(&lock_path, format_lease("some-other-host", 4242)).unwrap();
+
+        assert!(acquire(&lock_path, "checkpoint").is_err());
+
+        // The in-process reservation must have been released, so a later attempt is
+        // judged on its own merits rather than inheriting the failed one.
+        std::fs::remove_file(&lock_path).unwrap();
+        acquire(&lock_path, "checkpoint").expect("path must not be poisoned by the failure");
+    }
+
+    #[test]
+    fn verify_still_held_detects_a_stolen_or_deleted_lease() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("fence.owner");
+        let lease = acquire(&lock_path, "checkpoint").unwrap();
+
+        lease
+            .verify_still_held("checkpoint")
+            .expect("freshly acquired lease must verify");
+
+        // Someone else takes ownership.
+        std::fs::write(&lock_path, format_lease("other-host", 999)).unwrap();
+        let error = lease.verify_still_held("checkpoint").unwrap_err();
+        assert!(error.to_string().contains("no longer held by this process"));
+
+        // Or the file is removed entirely.
+        std::fs::remove_file(&lock_path).unwrap();
+        let error = lease.verify_still_held("checkpoint").unwrap_err();
+        assert!(error.to_string().contains("disappeared"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.92"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -33,7 +33,7 @@ mariadb = ["mysql"]
 # Enable SQL Server-specific source implementations.
 sqlserver = ["dep:tiberius", "tls"]
 # Enable TLS-related transport support for source connectors.
-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "dep:tokio-rustls"]
+tls = ["dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
 # Enable WASM-based transform execution (wasmtime + wasmparser). Required for
 # loading `.wasm` modules as event transforms. Safe to disable when WASM
 # transforms are not used to reduce the binary size significantly.
@@ -55,7 +55,19 @@ protobuf = ["dep:prost"]
 avro = ["dep:apache-avro"]
 # Enable Confluent Schema Registry integration (Avro, JSON Schema wire framing, schema registration/lookup,
 # subject naming strategies). Delegates HTTP, caching, and wire format to the `schemreg` crate.
-schemreg = ["dep:schemreg", "dep:apache-avro", "dep:bytes", "avro"]
+schemreg = ["dep:schemreg", "schemreg/confluent", "schemreg/json", "schemreg/protobuf", "dep:apache-avro", "dep:bytes", "dep:prost-reflect", "avro", "protobuf", "dep:protox", "dep:prost"]
+# Enable the Apicurio Registry v3 native REST API as a schema-registry backend.
+#
+# Apicurio also exposes a Confluent-compatible endpoint that the `schemreg` feature can
+# already talk to; this uses the native v3 API instead, which exposes artifact groups and
+# richer metadata that the compatibility shim flattens away.
+apicurio = ["schemreg", "schemreg/apicurio"]
+# Enable the AWS Glue Schema Registry as a backend.
+#
+# Glue uses its own 18-byte wire header (not the Confluent 5-byte one) and identifies
+# schemas by UUID rather than by integer id, so it is a distinct encode/decode path
+# rather than a drop-in registry swap. Pulls in the AWS SDK.
+glue = ["schemreg", "schemreg/glue"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -63,41 +75,51 @@ ahash = { version = "0.8.11", features = ["serde"] }
 futures-util = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-sha2 = "0.10.9"
+sha2 = "0.11"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "rt", "signal", "sync", "time", "fs", "io-util"] }
 tracing = "0.1.41"
 regex = "1.11.1"
-wasmparser = { version = "0.246", optional = true }
-wasmtime = { version = "44", optional = true }
-aes-gcm = { version = "0.10.3", optional = true }
-base64 = { version = "0.22.1", optional = true }
-hkdf = { version = "0.12", optional = true }
-hmac = { version = "0.12", optional = true }
-opentelemetry = { version = "0.27", features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["trace", "metrics", "rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["trace", "metrics", "grpc-tonic"], optional = true }
+wasmparser = { version = "0.255", optional = true }
+wasmtime = { version = "47", optional = true }
+aes-gcm = { version = "0.11", optional = true }
+base64 = { version = "0.23", optional = true }
+hkdf = { version = "0.13", optional = true }
+hmac = { version = "0.13", optional = true }
+opentelemetry = { version = "0.32", features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["trace", "metrics", "grpc-tonic"], optional = true }
 tokio-postgres = { version = "0.7.15", optional = true }
-tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 zeroize = { version = "1", features = ["alloc"] }
-mysql_async = { version = "0.36.2", default-features = false, features = ["minimal", "binlog"], optional = true }
-mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal", "binlog"], optional = true }
+mysql_common = { version = "0.37", default-features = false, features = ["binlog"], optional = true }
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "tokio", "rustls"], optional = true }
 tokio-util = { version = "0.7.16", features = ["compat"] }
 rustls = { version = "0.23.19", default-features = false, features = ["std", "ring"], optional = true }
-rustls-pemfile = { version = "2.0", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
-prost = { version = "0.13", optional = true }
-apache-avro = { version = "0.17", optional = true }
+prost = { version = "0.14", optional = true }
+prost-reflect = { version = "0.16", optional = true }
+apache-avro = { version = "0.21", optional = true }
 bytes = { version = "1", optional = true }
-schemreg = { version = "0.3", default-features = false, features = ["confluent", "json"], optional = true }
+schemreg = { version = "0.4", default-features = false, features = ["confluent", "json"], optional = true }
+
+[build-dependencies]
+# Pure-Rust protobuf compiler: builds the descriptor set for Confluent Protobuf framing
+# without requiring `protoc` on the building machine.
+protox = { version = "0.9", optional = true }
+prost = { version = "0.14", optional = true }
 
 [dev-dependencies]
-criterion = "0.7.0"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "json"] }
+criterion = "0.8"
+# Validates real events against the published `EVENT_JSON_SCHEMA`. Pinned to the same
+# version `schemreg` validates with, so the test agrees with the encoder rather than with
+# a second implementation's reading of the spec.
+jsonschema = { version = "0.46", default-features = false }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "json"] }
 tempfile = "3.23.0"
-testcontainers = "0.25"
+testcontainers = "0.27"
 tokio-test = "0.4.4"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "std", "json"] }
 reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls"] }
@@ -126,7 +148,7 @@ name = "fault_injection_soak_matrix"
 required-features = ["test-harnesses"]
 
 [[test]]
-name = "crash_simulation_integration"
+name = "crash_recovery_model"
 required-features = ["test-harnesses"]
 
 [[test]]

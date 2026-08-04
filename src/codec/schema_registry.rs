@@ -33,10 +33,17 @@ use apache_avro::Schema;
 
 pub use ::schemreg::confluent::ConfluentSchemaRegistry;
 pub use ::schemreg::wire::{decode_wire_format, encode_wire_format};
+pub use ::schemreg::{detect_wire_format, SchemaRegError};
 pub use ::schemreg::{
-    CachedSchemaRegistry, CompatibilityLevel, EncodeTarget, SchemaId, SchemaRegistryClient,
-    SchemaType, SubjectNameStrategy,
+    AnySchemaCache, DynSchemaRegistryClient, SchemaDecoder, SchemaEncoder, SchemaReference,
+    SchemaVersion,
 };
+pub use ::schemreg::{
+    CachedSchemaRegistry, CompatibilityLevel, EncodeTarget, RetryPolicy, SchemaId,
+    SchemaRegistryClient, SchemaType, SubjectNameStrategy, DEFAULT_BASE_BACKOFF,
+    DEFAULT_MAX_BACKOFF, DEFAULT_MAX_RETRIES,
+};
+pub use ::schemreg::{DecodedMessage, DetectedWireFormat, SchemaFormat, WireFormatDecoder};
 
 use crate::codec::avro::AvroEncoder;
 use crate::codec::{EncodedOutput, EventEncoder};
@@ -72,7 +79,13 @@ pub const KEY_AVRO_SCHEMA: &str = r#"{
 #[non_exhaustive]
 pub enum SchemaRegistryAuth {
     /// HTTP Basic authentication (username + password).
-    Basic { username: String, password: String },
+    /// HTTP Basic authentication.
+    Basic {
+        /// Registry username.
+        username: String,
+        /// Registry password.
+        password: String,
+    },
     /// OAuth / IAM bearer token stored as a [`SecretString`] to prevent accidental logging.
     BearerToken(SecretString),
 }
@@ -86,7 +99,14 @@ pub enum SchemaRegistryAuth {
 /// [`ConfluentAvroEncoder`] and [`ConfluentAvroDecoder`].
 #[derive(Clone, Debug)]
 pub struct SchemaRegistryConfig {
-    /// Schema Registry base URL (trailing slash is trimmed automatically).
+    /// Schema Registry API root — the URL that serves `/subjects`, with any trailing
+    /// slash trimmed.
+    ///
+    /// For Confluent Schema Registry this is the server root
+    /// (`http://schema-registry:8081`). For a Confluent-compatible endpoint on another
+    /// product it is the compatibility path itself — Apicurio, for example, serves it at
+    /// `http://apicurio:8080/apis/ccompat/v7`. Paths are used as given; nothing is
+    /// appended.
     pub url: String,
     /// Kafka topic name used to derive value and key subject names via
     /// [`SubjectNameStrategy`].
@@ -118,6 +138,31 @@ pub struct SchemaRegistryConfig {
     /// Tune this when all producers share a single Schema Registry host to cap
     /// idle connection overhead under bursty traffic.
     pub pool_max_idle_per_host: Option<usize>,
+    /// Schemas this one depends on, registered as Confluent **schema references**.
+    ///
+    /// A reference lets a schema `import` a type that lives under a different subject,
+    /// rather than inlining it. The registry then resolves the dependency at read time and
+    /// enforces compatibility on it independently.
+    ///
+    /// rustcdc's own envelope has no dependencies, so this is empty by default. It exists
+    /// for a deployment that has extended the envelope, or that registers rustcdc's schema
+    /// alongside its own types in a shared subject namespace — without it, registration
+    /// against such a subject fails because the referenced types cannot be resolved.
+    pub references: Vec<SchemaReference>,
+    /// Retry policy for transient registry failures.
+    ///
+    /// Without one, a single HTTP 503 or a dropped connection while resolving a schema
+    /// fails the event — and on the encode path that takes the pipeline down for a
+    /// condition that resolves on its own in seconds. The default retries with jittered
+    /// exponential back-off and honours `Retry-After`.
+    ///
+    /// Only *transient* conditions are retried (transport failures, HTTP 429, HTTP 5xx).
+    /// Not-found, auth, and invalid-schema are permanent and fail immediately, so an
+    /// outer retry loop cannot spin on them.
+    ///
+    /// Set [`RetryPolicy::none`] if you retry at a higher layer and do not want the two
+    /// to multiply.
+    pub retry_policy: RetryPolicy,
 }
 
 impl SchemaRegistryConfig {
@@ -134,7 +179,49 @@ impl SchemaRegistryConfig {
             connect_timeout_ms: None,
             normalize_schemas: false,
             pool_max_idle_per_host: None,
+            references: Vec::new(),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Declare the schema references this schema depends on.
+    ///
+    /// ```
+    /// use rustcdc::codec::{SchemaReference, SchemaRegistryConfig};
+    ///
+    /// let config = SchemaRegistryConfig::new("http://localhost:8081", "cdc-events")
+    ///     .with_references(vec![SchemaReference::new(
+    ///         "com.example.Address",
+    ///         "com.example.Address",
+    ///         1,
+    ///     )]);
+    /// # let _ = config;
+    /// ```
+    #[must_use]
+    pub fn with_references(mut self, references: Vec<SchemaReference>) -> Self {
+        self.references = references;
+        self
+    }
+
+    /// Replace the retry policy for transient registry failures.
+    ///
+    /// ```
+    /// use rustcdc::codec::{RetryPolicy, SchemaRegistryConfig};
+    /// use std::time::Duration;
+    ///
+    /// let config = SchemaRegistryConfig::new("http://localhost:8081", "cdc-events")
+    ///     .with_retry_policy(
+    ///         RetryPolicy::new()
+    ///             .max_retries(5)
+    ///             .base_backoff(Duration::from_millis(100))
+    ///             .max_backoff(Duration::from_secs(5)),
+    ///     );
+    /// # let _ = config;
+    /// ```
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Set the subject name strategy.
@@ -279,6 +366,7 @@ impl SchemaRegistryConfig {
         }
 
         builder = builder.normalize_schemas(self.normalize_schemas);
+        builder = builder.retry_policy(self.retry_policy.clone());
 
         let registry = builder
             .build()
@@ -291,6 +379,230 @@ impl SchemaRegistryConfig {
 
         Ok(cached)
     }
+}
+
+// ─── Registry error classification ────────────────────────────────────────────
+
+/// Translate a registry error into a rustcdc error with the **right retryability**.
+///
+/// This matters because the schema registry sits on the encode and decode paths, and
+/// rustcdc's `ErrorKind` drives the embedder's retry loop. Mapping everything to
+/// [`Error::SourceError`] — which classifies as `Transient`, "safe to retry with backoff"
+/// — means an embedder retries a 404 forever, and never retries the 503 any differently.
+///
+/// `schemreg` already classifies its own errors, so this defers to it rather than
+/// re-deriving the rules from status codes:
+///
+/// | Registry condition | rustcdc kind | Why |
+/// |---|---|---|
+/// | transport failure, HTTP 429, HTTP 5xx | `Transient` | resolves on its own |
+/// | subject / version / schema not found | `Terminal` | needs the schema registered |
+/// | auth failure | `Terminal` | needs a credential change |
+/// | everything else | `Terminal` | retrying reproduces it |
+fn map_registry_error(context: &str, error: ::schemreg::SchemaRegError) -> Error {
+    use crate::core::SourceErrorKind;
+
+    if error.is_retryable() {
+        return Error::source_error(
+            SourceErrorKind::NetworkTransient,
+            format!("{context}: {error}"),
+        );
+    }
+    if error.is_not_found() {
+        return Error::source_error(
+            SourceErrorKind::SchemaMismatch,
+            format!(
+                "{context}: {error}. The schema this message was written with is not in the \
+                 registry, so the payload cannot be interpreted. Retrying will not help."
+            ),
+        );
+    }
+    if matches!(error, ::schemreg::SchemaRegError::Auth { .. }) {
+        return Error::source_error(SourceErrorKind::AuthFailed, format!("{context}: {error}"));
+    }
+
+    Error::SchemaError(format!("{context}: {error}"))
+}
+
+// ─── Preflight ────────────────────────────────────────────────────────────────
+
+/// Verify the registry is reachable and its schemas are usable, before capture starts.
+///
+/// Schema resolution sits on the **encode path**, so a registry problem does not surface
+/// as a startup failure — it surfaces as a failed event, mid-pipeline, once traffic is
+/// already flowing. This turns that into a startup check, which is where an operator can
+/// still act on it.
+///
+/// Checks, in order of how early they fail:
+///
+/// 1. **Reachability** — a `health_check` round-trip.
+/// 2. **Subject readiness** — with `auto_register = false`, that both the value and key
+///    subjects exist *and* carry the schema rustcdc encodes with. That second half is the
+///    important one: an id that resolves to a different schema produces silently wrong
+///    field values downstream, not an error.
+/// 3. **Compatibility** — with `auto_register = true`, that rustcdc's schema is compatible
+///    with what is already registered, so the failure arrives here rather than as an
+///    opaque HTTP 409 on the first event.
+///
+/// A registry that does not implement an optional endpoint (`health_check`,
+/// `check_compatibility`) reports `NotSupported`; that is skipped rather than treated as a
+/// failure, because a registry legitimately need not offer them.
+///
+/// Wire this into a readiness probe alongside
+/// [`CdcRuntime::admin_snapshot`](crate::CdcRuntime::admin_snapshot).
+///
+/// # Errors
+///
+/// Returns [`Error::ConfigError`] naming the subject and the remedy.
+pub async fn preflight_schema_registry(
+    registry: &impl SchemaRegistryClient,
+    config: &SchemaRegistryConfig,
+) -> Result<()> {
+    match registry.health_check().await {
+        Ok(()) => {}
+        Err(error) if is_not_supported(&error) => {
+            tracing::debug!(
+                target: "rustcdc::codec::schema_registry",
+                "registry does not implement a health endpoint; skipping reachability check",
+            );
+        }
+        Err(error) => {
+            return Err(Error::ConfigError(format!(
+                "schema registry at '{}' is not reachable: {error}. Schema resolution is on \
+                 the encode path, so starting anyway would fail the first event instead of \
+                 failing here.",
+                config.url
+            )));
+        }
+    }
+
+    let value_subject = config
+        .strategy
+        .subject_name(&config.topic, Some("io.rustcdc.Event"), EncodeTarget::Value)
+        .map_err(|error| Error::ConfigError(format!("value subject name: {error}")))?;
+    let key_subject = config
+        .strategy
+        .subject_name(
+            &config.topic,
+            Some("io.rustcdc.EventKey"),
+            EncodeTarget::Key,
+        )
+        .map_err(|error| Error::ConfigError(format!("key subject name: {error}")))?;
+
+    for (subject, expected) in [
+        (&value_subject, crate::codec::avro::AVRO_SCHEMA),
+        (&key_subject, KEY_AVRO_SCHEMA),
+    ] {
+        if config.auto_register {
+            match registry
+                .check_compatible(subject, expected, SchemaType::Avro)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Error::ConfigError(format!(
+                        "rustcdc's Avro schema is INCOMPATIBLE with the schema already \
+                         registered under subject '{subject}', per that subject's \
+                         compatibility level. Registering it would be rejected by the \
+                         registry, and forcing it past the check would break every existing \
+                         consumer. Resolve the schema conflict, or use a different subject."
+                    )));
+                }
+                // A subject that does not exist yet is the normal first-run case.
+                Err(error) if is_not_supported(&error) || is_not_found(&error) => {}
+                Err(error) => {
+                    return Err(Error::ConfigError(format!(
+                        "compatibility check failed for subject '{subject}': {error}"
+                    )));
+                }
+            }
+        } else {
+            let registered = registry.get_latest_schema(subject).await.map_err(|error| {
+                Error::ConfigError(format!(
+                    "subject '{subject}' is not registered and `auto_register` is off: \
+                     {error}. Register rustcdc's schema out of band, or enable \
+                     `auto_register` for first-time setup."
+                ))
+            })?;
+            assert_registry_schema_matches(subject, &registered.schema, expected)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether an error means the registry does not implement an optional endpoint.
+///
+/// A registry legitimately need not offer `health_check` or `check_compatibility`, so
+/// this is skipped rather than treated as a failure.
+fn is_not_supported(error: &::schemreg::SchemaRegError) -> bool {
+    matches!(error, ::schemreg::SchemaRegError::NotSupported(_))
+}
+
+/// Whether an error means the subject or schema does not exist yet.
+///
+/// Delegates to `schemreg`, which maps the Confluent error codes 40401–40403
+/// (subject / version / schema not found). Not-found on a compatibility check is the
+/// ordinary first-run case, not a problem.
+fn is_not_found(error: &::schemreg::SchemaRegError) -> bool {
+    error.is_not_found()
+}
+
+// ─── Schema identity ──────────────────────────────────────────────────────────
+
+/// Reject a registry schema that is not the one the encoder will write with.
+///
+/// # Why this is not optional
+///
+/// The Confluent wire format stamps a *schema id*; the payload bytes are whatever the
+/// producer actually encoded. If the two disagree, a consumer resolves the id to the
+/// registry's schema and decodes the producer's bytes with it.
+///
+/// **Avro binary carries no field names or types** — it is positional and untagged. A
+/// mismatch therefore does not fail to decode. It silently yields shifted fields and
+/// values that look entirely plausible, which is the worst possible outcome and one that
+/// surfaces arbitrarily far downstream.
+///
+/// Comparison is on Avro's **parsing canonical form** (RFC-style: strips docs, aliases
+/// and default values, normalises ordering), so a registry copy that differs only in
+/// formatting or in field ordering *within the JSON* is accepted, while a genuine
+/// structural difference is rejected.
+fn assert_registry_schema_matches(
+    subject: &str,
+    registry_schema: &str,
+    expected_schema: &str,
+) -> Result<()> {
+    let registry_parsed = Schema::parse_str(registry_schema).map_err(|error| {
+        Error::ConfigError(format!(
+            "schema registered under subject '{subject}' is not valid Avro: {error}"
+        ))
+    })?;
+    let expected_parsed = Schema::parse_str(expected_schema).map_err(|error| {
+        Error::ConfigError(format!(
+            "rustcdc's own Avro schema failed to parse: {error}"
+        ))
+    })?;
+
+    if registry_parsed.canonical_form() == expected_parsed.canonical_form() {
+        return Ok(());
+    }
+
+    Err(Error::ConfigError(format!(
+        "the schema registered under subject '{subject}' is not the schema rustcdc \
+         encodes with, so every message would be stamped with an id that resolves to a \
+         different schema. Avro binary is positional and untagged, so consumers would not \
+         see an error — they would silently decode shifted fields and plausible-looking \
+         wrong values.\n\
+         \n\
+         Registry canonical form: {}\n\
+         Expected canonical form: {}\n\
+         \n\
+         Remedy: register rustcdc's schema under this subject (set `auto_register = true` \
+         for first-time setup, or register it out of band), or point `topic`/`strategy` at \
+         a subject that carries it.",
+        registry_parsed.canonical_form(),
+        expected_parsed.canonical_form(),
+    )))
 }
 
 // ─── ConfluentAvroEncoder ─────────────────────────────────────────────────────
@@ -346,14 +658,19 @@ impl ConfluentAvroEncoder {
                     &value_subject,
                     crate::codec::avro::AVRO_SCHEMA,
                     SchemaType::Avro,
-                    &[],
+                    &config.references,
                 )
                 .await
                 .map_err(|e| {
                     Error::ConfigError(format!("register value schema '{}': {e}", value_subject))
                 })?;
             let kid = registry
-                .register_schema(&key_subject, KEY_AVRO_SCHEMA, SchemaType::Avro, &[])
+                .register_schema(
+                    &key_subject,
+                    KEY_AVRO_SCHEMA,
+                    SchemaType::Avro,
+                    &config.references,
+                )
                 .await
                 .map_err(|e| {
                     Error::ConfigError(format!("register key schema '{}': {e}", key_subject))
@@ -372,6 +689,22 @@ impl ConfluentAvroEncoder {
                 .map_err(|e| {
                     Error::ConfigError(format!("lookup key schema '{}': {e}", key_subject))
                 })?;
+
+            // Verify the registry's schema is the one this encoder will actually write
+            // with. Taking the id without checking is a silent-corruption path, and it is
+            // the *safer-looking* configuration that triggers it: `auto_register = false`
+            // is what a careful operator sets in a managed Kafka environment.
+            //
+            // Avro binary is positional and untagged, so a consumer resolving the stamped
+            // id to a different schema does not get an error — it gets shifted fields and
+            // plausible-looking wrong values.
+            assert_registry_schema_matches(
+                &value_subject,
+                &vs.schema,
+                crate::codec::avro::AVRO_SCHEMA,
+            )?;
+            assert_registry_schema_matches(&key_subject, &ks.schema, KEY_AVRO_SCHEMA)?;
+
             (vs.id, ks.id)
         };
 
@@ -506,21 +839,24 @@ impl<R: SchemaRegistryClient> ConfluentAvroDecoder<R> {
     /// `async` because schema fetching from the registry is required for schema
     /// IDs not yet in the local cache.
     pub async fn decode(&self, bytes: &[u8]) -> Result<Event> {
-        let (schema_id, avro_bytes) = decode_wire_format(bytes)
-            .map_err(|e| Error::SourceError(format!("confluent wire format decode: {e}")))?;
+        // Malformed framing is permanent — these exact bytes will never decode. It was
+        // previously a `SourceError`, which classifies as `Transient` ("safe to retry with
+        // backoff"), so an embedder following the crate's own guidance retried a message
+        // that cannot succeed, forever.
+        let (schema_id, avro_bytes) = decode_wire_format(bytes).map_err(|e| {
+            Error::SerializationError(format!(
+                "confluent wire format decode: {e}. The payload does not carry a valid \
+                 5-byte Confluent header, so it was not produced by a Confluent-framed \
+                 serialiser. Retrying will not change the bytes."
+            ))
+        })?;
 
-        let schemreg_schema = self
-            .registry
-            .get_schema_by_id(schema_id)
+        let schemreg_schema = SchemaRegistryClient::get_schema_by_id(&*self.registry, schema_id)
             .await
-            .map_err(|e| {
-                Error::SourceError(format!(
-                    "schema registry get_schema_by_id({schema_id}): {e}"
-                ))
-            })?;
+            .map_err(|e| map_registry_error(&format!("get_schema_by_id({schema_id})"), e))?;
 
         let writer_schema = Schema::parse_str(&schemreg_schema.schema).map_err(|e| {
-            Error::SourceError(format!("avro schema parse (schema_id={schema_id}): {e}"))
+            Error::SchemaError(format!("avro schema parse (schema_id={schema_id}): {e}"))
         })?;
 
         let value = apache_avro::from_avro_datum(
@@ -528,10 +864,16 @@ impl<R: SchemaRegistryClient> ConfluentAvroDecoder<R> {
             &mut std::io::Cursor::new(avro_bytes),
             Some(&self.reader_schema),
         )
-        .map_err(|e| Error::SourceError(format!("avro decode (schema_id={schema_id}): {e}")))?;
+        .map_err(|e| {
+            Error::SerializationError(format!("avro decode (schema_id={schema_id}): {e}"))
+        })?;
 
-        apache_avro::from_value::<Event>(&value).map_err(|e| {
-            Error::SourceError(format!(
+        // Not `apache_avro::from_value::<Event>`: `before`/`after` are Avro `bytes`
+        // holding UTF-8 JSON, which a blanket serde mapping cannot reverse. That mismatch
+        // meant this decoder had never successfully decoded an event — a live round trip
+        // against a real registry is what exposed it.
+        crate::codec::avro::avro_value_to_event(&value).map_err(|e| {
+            Error::SerializationError(format!(
                 "avro → Event deserialize (schema_id={schema_id}): {e}"
             ))
         })
@@ -568,11 +910,11 @@ pub const EVENT_JSON_SCHEMA: &str = r#"{
   "properties": {
     "before": {
       "description": "Row state before the operation, when available. null for INSERT events.",
-      "oneOf": [{"type": "null"}, {}]
+      "type": ["null", "object", "array", "string", "number", "boolean"]
     },
     "after": {
       "description": "Row state after the operation, when available. null for DELETE events.",
-      "oneOf": [{"type": "null"}, {}]
+      "type": ["null", "object", "array", "string", "number", "boolean"]
     },
     "op": {
       "description": "CRUD operation that produced this event.",
@@ -650,6 +992,16 @@ pub const EVENT_JSON_SCHEMA: &str = r#"{
     "before_is_key_only": {
       "description": "True when `before` contains only primary-key columns (REPLICA IDENTITY DEFAULT).",
       "type": "boolean"
+    },
+    "unavailable_columns": {
+      "description": "Columns absent from `after` because the source could not supply them. Omitted when empty.",
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "before_unavailable_columns": {
+      "description": "Columns absent from `before`. Tracked separately from `unavailable_columns` — the two sets are not the same.",
+      "type": "array",
+      "items": {"type": "string"}
     }
   },
   "required": ["before", "after", "op", "source", "ts", "table", "envelope_version", "before_is_key_only"],
@@ -781,13 +1133,15 @@ where
     ///
     /// - `Error::ConfigError` on the first call for a subject if the registry
     ///   is unreachable or schema registration fails.
-    /// - `Error::SourceError` if JSON serialisation or Schema validation fails.
+    /// - A classified source error when the registry is unreachable (`Transient`) or the
+    ///   schema is missing (`Terminal`) — see [`Error::kind`](crate::core::Error::kind).
+    /// - [`Error::SerializationError`] if JSON serialisation or schema validation fails.
     pub async fn encode_event(&self, event: &Event) -> Result<EncodedOutput> {
         let bytes = self
             .value_encoder
             .encode_ser(event, &self.topic, EncodeTarget::Value)
             .await
-            .map_err(|e| Error::SourceError(format!("json schema encode event: {e}")))?;
+            .map_err(|e| map_registry_error("json schema encode event", e))?;
         Ok(EncodedOutput::new(
             bytes.to_vec(),
             CONFLUENT_JSON_CONTENT_TYPE,
@@ -815,7 +1169,7 @@ where
         self.key_encoder
             .encode(&key_value, &self.topic, EncodeTarget::Key)
             .await
-            .map_err(|e| Error::SourceError(format!("json schema encode event key: {e}")))
+            .map_err(|e| map_registry_error("json schema encode event key", e))
     }
 
     /// Cached schema ID for the value subject, or `None` if not yet resolved.
@@ -872,16 +1226,20 @@ impl<C: SchemaRegistryClient> ConfluentJsonSchemaDecoder<C> {
     ///
     /// # Errors
     ///
-    /// - `Error::SourceError` if the Confluent framing header is malformed.
-    /// - `Error::SourceError` if JSON deserialisation or `Event` conversion fails.
+    /// - [`Error::SerializationError`] if the Confluent framing header is malformed or the
+    ///   payload does not deserialise. Both are permanent: the same bytes will never
+    ///   decode, so they classify as `Terminal` rather than inviting a retry loop.
+    /// - A classified source error when the registry is unreachable (`Transient`) or the
+    ///   schema id is not registered (`Terminal`).
     pub async fn decode(&self, bytes: &[u8]) -> Result<Event> {
         let value = self
             .inner
             .decode(bytes::Bytes::copy_from_slice(bytes))
             .await
-            .map_err(|e| Error::SourceError(format!("json schema decode: {e}")))?;
+            .map_err(|e| map_registry_error("json schema decode", e))?;
+        // Deserialisation of an already-fetched schema is permanent, not transient.
         serde_json::from_value::<Event>(value)
-            .map_err(|e| Error::SourceError(format!("json schema → Event deserialize: {e}")))
+            .map_err(|e| Error::SerializationError(format!("json schema → Event deserialize: {e}")))
     }
 }
 
@@ -896,6 +1254,414 @@ impl<C: SchemaRegistryClient> ConfluentJsonSchemaDecoder<C> {
 pub type ConfluentJsonSchemaCodec<C> = ConfluentJsonSchemaEncoder<C>;
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+// ─── Cache warming ────────────────────────────────────────────────────────────
+
+/// Pre-resolve a set of schema ids so the first events do not pay a registry round-trip.
+///
+/// Schema resolution is on the decode path, so a cold cache turns the first message for
+/// each distinct schema id into a synchronous registry call. On a consumer restarting
+/// against a backlog that is a burst of round-trips exactly when throughput matters most,
+/// and it is also when the registry is most likely to rate-limit.
+///
+/// Schema ids are **immutable** — a registry never reassigns one — so a warmed entry is
+/// valid for the process lifetime. Warming is therefore free of staleness risk, unlike
+/// caching `get_latest_schema`, which the cache deliberately never does.
+///
+/// Fetches run concurrently. A failure for one id does not abort the rest: the error names
+/// every id that could not be warmed, and warming is best-effort by nature — a failed warm
+/// costs a round-trip later, not correctness.
+///
+/// # Errors
+///
+/// Returns [`Error::SourceError`] listing the ids that could not be fetched.
+pub async fn warm_schema_cache<C>(
+    registry: &CachedSchemaRegistry<C>,
+    schema_ids: impl IntoIterator<Item = SchemaId>,
+) -> Result<()>
+where
+    C: SchemaRegistryClient,
+{
+    registry.warm_cache(schema_ids).await.map_err(|error| {
+        Error::SourceError(format!(
+            "warming the schema cache failed: {error}. This is best-effort — the affected \
+             ids will simply be fetched on first use — but a persistent failure usually \
+             means the ids do not exist in this registry."
+        ))
+    })
+}
+
+// ─── Confluent Protobuf ───────────────────────────────────────────────────────
+
+/// The compiled descriptor set for `proto/event.proto`.
+///
+/// Built at compile time by `build.rs` using [`protox`], a pure-Rust protobuf compiler, so
+/// building rustcdc never requires `protoc` on the machine.
+const EVENT_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/event_descriptor.bin"));
+
+/// Fully-qualified name of the CDC event message in `proto/event.proto`.
+const EVENT_PROTO_FULL_NAME: &str = "rustcdc.Event";
+
+/// The `.proto` source registered as the schema, so the registry stores the real IDL.
+const EVENT_PROTO_SOURCE: &str = include_str!("../../proto/event.proto");
+
+/// Load the `rustcdc.Event` message descriptor from the compiled descriptor set.
+///
+/// The descriptor is what makes Confluent Protobuf framing correct. That wire format
+/// carries a **message-index path** — the position of the message inside its `.proto` file
+/// — and a hand-written index that happens to be wrong produces a header a Confluent
+/// deserialiser misreads without erroring. Deriving it from the descriptor makes it correct
+/// by construction, which is why `schemreg` requires one rather than accepting raw indexes.
+fn event_message_descriptor() -> Result<prost_reflect::MessageDescriptor> {
+    let pool =
+        prost_reflect::DescriptorPool::decode(EVENT_FILE_DESCRIPTOR_SET).map_err(|error| {
+            Error::ConfigError(format!(
+                "the compiled protobuf descriptor set is not decodable: {error}. This is a build \
+             problem, not a configuration one — `build.rs` produced it from proto/event.proto."
+            ))
+        })?;
+
+    pool.get_message_by_name(EVENT_PROTO_FULL_NAME)
+        .ok_or_else(|| {
+            Error::ConfigError(format!(
+                "message '{EVENT_PROTO_FULL_NAME}' is missing from the compiled descriptor \
+                 set; proto/event.proto and src/codec/protobuf.rs have diverged"
+            ))
+        })
+}
+
+/// CDC [`Event`] → Confluent Schema Registry-framed Protobuf encoder.
+///
+/// Completes the three-format Confluent story alongside [`ConfluentAvroEncoder`] and
+/// [`ConfluentJsonSchemaEncoder`].
+///
+/// # Framing
+///
+/// Confluent Protobuf does **not** use the plain 5-byte header. It is:
+///
+/// ```text
+/// [0x00 magic][4-byte BE schema_id][message-index path][protobuf payload]
+/// ```
+///
+/// The message-index path locates the message within its `.proto` file. rustcdc derives it
+/// from the compiled descriptor rather than hardcoding it, so it stays correct if the file
+/// gains a message ahead of `Event`.
+///
+/// # Payload shape
+///
+/// Same as [`crate::codec::ProtobufEncoder`]: `before` and `after` carry UTF-8 JSON as
+/// protobuf `bytes`, which keeps the row payload schemaless while the envelope is typed.
+/// A consumer decodes the message, then parses those two fields as JSON.
+///
+/// Requires the `schemreg` feature.
+pub struct ConfluentProtobufEncoder<C> {
+    inner: Arc<::schemreg::ProtobufSchemaEncoder<C>>,
+    topic: String,
+}
+
+impl<C> std::fmt::Debug for ConfluentProtobufEncoder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfluentProtobufEncoder")
+            .field("topic", &self.topic)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C> ConfluentProtobufEncoder<C>
+where
+    C: SchemaRegistryClient + 'static,
+{
+    /// Build an encoder against `registry`.
+    ///
+    /// Subject resolution is **lazy and cached per subject**, unlike
+    /// [`ConfluentAvroEncoder`] which resolves once at construction. That is the right
+    /// shape for Protobuf: the `RecordName` and `TopicRecordName` strategies exist to give
+    /// each message type its own subject, and resolving eagerly would defeat them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] if the descriptor set cannot be loaded or the
+    /// encoder cannot be built.
+    pub fn new(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
+        let descriptor = event_message_descriptor()?;
+
+        let inner = ::schemreg::ProtobufSchemaEncoder::builder()
+            .registry(registry)
+            .schema(EVENT_PROTO_SOURCE)
+            .descriptor(descriptor)
+            .strategy(config.strategy.clone())
+            .references(config.references.clone())
+            .max_subject_cache_entries(config.max_cache_entries.unwrap_or(1_000))
+            .build()
+            .map_err(|error| {
+                Error::ConfigError(format!("confluent protobuf encoder build: {error}"))
+            })?;
+
+        Ok(Self {
+            inner: Arc::new(inner),
+            topic: config.topic.clone(),
+        })
+    }
+
+    /// The message-index path this encoder writes into every header.
+    pub fn message_indexes(&self) -> &[i32] {
+        self.inner.message_indexes()
+    }
+
+    /// Number of subjects currently resolved in the encoder's cache.
+    pub fn cached_subject_count(&self) -> usize {
+        self.inner.cached_subject_count()
+    }
+
+    /// Drop a subject's cached schema id, forcing re-resolution on the next encode.
+    ///
+    /// Use after a deliberate schema change so the encoder picks up the new id without a
+    /// restart.
+    pub fn invalidate_subject(&self, subject: &str) {
+        self.inner.invalidate_subject(subject);
+    }
+
+    /// Encode an event as Confluent-framed Protobuf.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified source error when the registry is unreachable (`Transient`) or
+    /// the subject cannot be resolved (`Terminal`).
+    pub async fn encode(&self, event: &Event) -> Result<Vec<u8>> {
+        let message = crate::codec::protobuf::ProtoEvent::from_event(event)?;
+        let framed = self
+            .inner
+            .encode(&message, &self.topic, EncodeTarget::Value)
+            .await
+            .map_err(|error| map_registry_error("confluent protobuf encode", error))?;
+        Ok(framed.to_vec())
+    }
+}
+
+/// Confluent-framed Protobuf → CDC [`Event`] decoder.
+///
+/// Requires the `schemreg` feature.
+pub struct ConfluentProtobufDecoder<C> {
+    inner: ::schemreg::ProtobufSchemaDecoder<C>,
+}
+
+impl<C> std::fmt::Debug for ConfluentProtobufDecoder<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfluentProtobufDecoder").finish()
+    }
+}
+
+impl<C> ConfluentProtobufDecoder<C>
+where
+    C: SchemaRegistryClient + 'static,
+{
+    /// Build a decoder against `registry`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] if the expected descriptor cannot be loaded.
+    pub fn new(registry: C) -> Result<Self> {
+        let descriptor = event_message_descriptor()?;
+        let inner = ::schemreg::ProtobufSchemaDecoder::new(registry)
+            .with_expected_descriptor(&descriptor)
+            .map_err(|error| {
+                Error::ConfigError(format!("confluent protobuf decoder build: {error}"))
+            })?;
+        Ok(Self { inner })
+    }
+
+    /// Decode a Confluent-framed Protobuf message to a CDC [`Event`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::SerializationError`] if the framing or payload is malformed. Permanent:
+    ///   the same bytes will never decode, so it classifies `Terminal` rather than inviting
+    ///   a retry loop.
+    /// - A classified source error when the registry is unreachable (`Transient`) or the
+    ///   schema id is not registered (`Terminal`).
+    pub async fn decode(&self, bytes: &[u8]) -> Result<Event> {
+        let message: crate::codec::protobuf::ProtoEvent = self
+            .inner
+            .decode(bytes::Bytes::copy_from_slice(bytes))
+            .await
+            .map_err(|error| map_registry_error("confluent protobuf decode", error))?;
+        message.into_event()
+    }
+}
+
+// ─── Apicurio Registry (native v3 API) ────────────────────────────────────────
+
+/// Configuration for the Apicurio Registry v3 native REST API.
+///
+/// Apicurio also exposes a Confluent-compatible endpoint, which
+/// [`SchemaRegistryConfig`] can already talk to. Prefer this when you want the native
+/// API: the compatibility shim flattens Apicurio's artifact groups and richer metadata
+/// into the Confluent subject model, so group-scoped artifacts are not addressable
+/// through it.
+///
+/// The resulting client implements [`SchemaRegistryClient`], so it drops straight into
+/// [`ConfluentAvroEncoder`] and [`ConfluentJsonSchemaEncoder`] — the **wire format is
+/// still the Confluent 5-byte framing**, which is what Apicurio emits in this mode.
+///
+/// Requires the `apicurio` feature.
+#[cfg(feature = "apicurio")]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ApicurioRegistryConfig {
+    /// Apicurio server **root**, e.g. `http://apicurio:8080` — with any trailing slash
+    /// trimmed.
+    ///
+    /// The client appends `/apis/registry/v3` itself, so passing that path here produces
+    /// a doubled URL and a 404 from the server. To drive Apicurio through its
+    /// Confluent-compatible API instead, use [`SchemaRegistryConfig`] with
+    /// `http://apicurio:8080/apis/ccompat/v7`.
+    pub url: String,
+    /// Kafka topic used to derive subject names via [`SubjectNameStrategy`].
+    pub topic: String,
+    /// Subject name strategy. Defaults to [`SubjectNameStrategy::TopicName`].
+    pub strategy: SubjectNameStrategy,
+    /// Optional authentication credentials.
+    pub auth: Option<SchemaRegistryAuth>,
+    /// Register schemas automatically on first use. Default `true`.
+    pub auto_register: bool,
+    /// HTTP request timeout in milliseconds.
+    pub request_timeout_ms: Option<u64>,
+    /// TCP connect timeout in milliseconds.
+    pub connect_timeout_ms: Option<u64>,
+    /// Maximum schema entries retained in the in-memory cache.
+    pub max_cache_entries: Option<usize>,
+    /// Retry policy for transient registry failures. See
+    /// [`SchemaRegistryConfig::retry_policy`].
+    pub retry_policy: RetryPolicy,
+}
+
+#[cfg(feature = "apicurio")]
+impl ApicurioRegistryConfig {
+    /// Create a config with the given registry URL and Kafka topic.
+    pub fn new(url: impl Into<String>, topic: impl Into<String>) -> Self {
+        Self {
+            url: url.into().trim_end_matches('/').to_owned(),
+            topic: topic.into(),
+            strategy: SubjectNameStrategy::TopicName,
+            auth: None,
+            auto_register: true,
+            request_timeout_ms: None,
+            connect_timeout_ms: None,
+            max_cache_entries: None,
+            retry_policy: RetryPolicy::default(),
+        }
+    }
+
+    /// Set the subject name strategy.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: SubjectNameStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Set authentication credentials.
+    #[must_use]
+    pub fn with_auth(mut self, auth: SchemaRegistryAuth) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Require schemas to exist rather than registering them on first use.
+    #[must_use]
+    pub fn with_auto_register(mut self, auto_register: bool) -> Self {
+        self.auto_register = auto_register;
+        self
+    }
+
+    /// Replace the retry policy for transient registry failures.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// Build a cached Apicurio registry client.
+    ///
+    /// Constructs the HTTP client and wraps it in an in-memory LRU cache. Makes **no**
+    /// network connections — a wrong URL or an unreachable registry surfaces on first use,
+    /// not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] if the URL is malformed or a credential cannot be
+    /// resolved.
+    pub fn build(&self) -> Result<CachedSchemaRegistry<::schemreg::ApicurioSchemaRegistry>> {
+        let mut builder = ::schemreg::ApicurioSchemaRegistry::builder().url(&self.url);
+
+        if let Some(ref auth) = self.auth {
+            builder = match auth {
+                SchemaRegistryAuth::Basic { username, password } => {
+                    builder.basic_auth(username, password)
+                }
+                SchemaRegistryAuth::BearerToken(token) => {
+                    let token = token
+                        .expose_secret()
+                        .map_err(|error| Error::ConfigError(format!("bearer token: {error}")))?;
+                    builder.bearer_token(token)
+                }
+            };
+        }
+
+        if let Some(ms) = self.request_timeout_ms {
+            builder = builder.request_timeout(Duration::from_millis(ms));
+        }
+        if let Some(ms) = self.connect_timeout_ms {
+            builder = builder.connect_timeout(Duration::from_millis(ms));
+        }
+        builder = builder.retry_policy(self.retry_policy.clone());
+
+        let registry = builder
+            .build()
+            .map_err(|error| Error::ConfigError(format!("apicurio registry build: {error}")))?;
+
+        Ok(match self.max_cache_entries {
+            Some(n) => CachedSchemaRegistry::with_max_entries(registry, n),
+            None => CachedSchemaRegistry::new(registry),
+        })
+    }
+
+    /// The equivalent [`SchemaRegistryConfig`], for the encoder constructors.
+    ///
+    /// The encoders take a `SchemaRegistryConfig` for subject naming and registration
+    /// policy; the transport comes from the client passed alongside it. This keeps the two
+    /// consistent rather than asking a caller to restate the topic and strategy.
+    pub fn as_schema_registry_config(&self) -> SchemaRegistryConfig {
+        SchemaRegistryConfig::new(&self.url, &self.topic)
+            .with_strategy(self.strategy.clone())
+            .with_auto_register(self.auto_register)
+    }
+}
+
+// ─── AWS Glue Schema Registry ─────────────────────────────────────────────────
+
+/// AWS Glue Schema Registry re-exports.
+///
+/// Glue is **not** a drop-in swap for a Confluent-compatible registry:
+///
+/// | | Confluent / Apicurio | AWS Glue |
+/// |---|---|---|
+/// | Wire header | 5 bytes (`0x00` + 4-byte BE id) | 18 bytes (`0x03` + compression + 16-byte UUID) |
+/// | Schema identity | monotonic integer id | schema-version UUID |
+/// | Compression | none | optional ZLIB |
+///
+/// So a consumer must know which framing to expect, or use
+/// [`detect_wire_format`] to decide per message.
+///
+/// Requires the `glue` feature.
+#[cfg(feature = "glue")]
+pub mod glue {
+    pub use ::schemreg::glue::{
+        decode_glue_wire_format, decode_glue_wire_format_borrowed, encode_glue_wire_format,
+        AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder, CachedGlueSchemaRegistry,
+        GlueCompression, GlueDataFormat, GlueSchema, GlueSchemaRegistryClient, GlueSchemaVersionId,
+    };
+}
 
 #[cfg(test)]
 mod tests {
@@ -1346,5 +2112,369 @@ mod tests {
         let registry = Arc::new(cfg.build().unwrap());
         let encoder = ConfluentJsonSchemaEncoder::new(registry, &cfg).unwrap();
         let _cloned = encoder.clone();
+    }
+
+    // ─── Schema-identity verification ────────────────────────────────────────
+
+    #[test]
+    fn a_registry_schema_matching_ours_is_accepted_despite_formatting_differences() {
+        // Comparison is on Avro's parsing canonical form, so whitespace, docs and field
+        // ordering *within the JSON* must not cause a spurious rejection — otherwise
+        // every registry that normalises schemas on write would fail startup.
+        let reformatted = crate::codec::avro::AVRO_SCHEMA
+            .replace('\n', " ")
+            .replace("  ", " ");
+        assert_ne!(
+            reformatted,
+            crate::codec::avro::AVRO_SCHEMA,
+            "the test input must actually differ textually"
+        );
+
+        assert_registry_schema_matches(
+            "cdc-events-value",
+            &reformatted,
+            crate::codec::avro::AVRO_SCHEMA,
+        )
+        .expect("a formatting-only difference must be accepted");
+    }
+
+    #[test]
+    fn a_structurally_different_registry_schema_is_rejected() {
+        // The bug this prevents: with `auto_register = false` the encoder took the
+        // registry's schema *id* but encoded with its own schema. Avro binary is
+        // positional and untagged, so a consumer resolving that id to a different schema
+        // does not get an error — it gets shifted fields and plausible wrong values.
+        let foreign = r#"{
+          "type": "record",
+          "name": "Event",
+          "namespace": "io.rustcdc",
+          "fields": [{"name": "totally_different", "type": "string"}]
+        }"#;
+
+        let error = assert_registry_schema_matches(
+            "cdc-events-value",
+            foreign,
+            crate::codec::avro::AVRO_SCHEMA,
+        )
+        .expect_err("a structurally different schema must be rejected, not silently used");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("positional and untagged"),
+            "the error must explain why this is silent corruption; got: {message}"
+        );
+        assert!(
+            message.contains("auto_register"),
+            "the error must name the remedy; got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_registry_schema_that_is_not_valid_avro_is_rejected() {
+        let error =
+            assert_registry_schema_matches("cdc-events-value", "{not avro", KEY_AVRO_SCHEMA)
+                .expect_err("invalid Avro must be rejected");
+        assert!(error.to_string().contains("not valid Avro"));
+    }
+
+    // ─── Registry error classification ───────────────────────────────────────
+
+    #[test]
+    fn a_transient_registry_failure_is_retryable() {
+        use crate::core::{ErrorKind, SourceErrorKind};
+
+        let error = map_registry_error(
+            "get_schema_by_id(7)",
+            ::schemreg::SchemaRegError::Http {
+                status: 503,
+                message: "service unavailable".into(),
+            },
+        );
+        assert_eq!(error.kind(), ErrorKind::Transient);
+        assert_eq!(error.source_kind(), Some(SourceErrorKind::NetworkTransient));
+    }
+
+    #[test]
+    fn a_missing_schema_is_terminal_not_retryable() {
+        use crate::core::{ErrorKind, SourceErrorKind};
+
+        // Confluent error code 40403 = schema not found. Retrying cannot register it, so
+        // classifying it `Transient` would spin an embedder's retry loop forever.
+        let error = map_registry_error(
+            "get_schema_by_id(7)",
+            ::schemreg::SchemaRegError::Api {
+                error_code: 40403,
+                message: "Schema not found".into(),
+            },
+        );
+        assert_eq!(error.kind(), ErrorKind::Terminal);
+        assert_eq!(error.source_kind(), Some(SourceErrorKind::SchemaMismatch));
+    }
+
+    #[test]
+    fn an_auth_failure_is_terminal() {
+        use crate::core::{ErrorKind, SourceErrorKind};
+
+        let error = map_registry_error(
+            "register_schema",
+            ::schemreg::SchemaRegError::Auth {
+                status: 401,
+                message: "unauthorized".into(),
+            },
+        );
+        assert_eq!(error.kind(), ErrorKind::Terminal);
+        assert_eq!(error.source_kind(), Some(SourceErrorKind::AuthFailed));
+    }
+
+    #[test]
+    fn malformed_confluent_framing_is_not_classified_as_retryable() {
+        use crate::core::ErrorKind;
+
+        // These exact bytes will never decode. Reporting them as `Transient` — which the
+        // decoder used to do, via `SourceError` — invites a retry loop that cannot end.
+        let error = decode_wire_format(&[0xFF, 0x00])
+            .map_err(|e| {
+                crate::core::Error::SerializationError(format!("confluent wire format: {e}"))
+            })
+            .expect_err("a wrong magic byte must not decode");
+        assert_eq!(error.kind(), ErrorKind::Terminal);
+    }
+
+    // ─── Confluent Protobuf ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_event_message_descriptor_loads_from_the_compiled_descriptor_set() {
+        // The descriptor is what makes the Confluent Protobuf message-index path correct.
+        // If `proto/event.proto` and the prost structs drift apart, this is where it
+        // surfaces — at build time rather than as a header a consumer misreads.
+        let descriptor =
+            event_message_descriptor().expect("build.rs must produce a loadable descriptor set");
+        assert_eq!(descriptor.full_name(), EVENT_PROTO_FULL_NAME);
+    }
+
+    #[test]
+    fn the_message_index_path_is_derived_not_guessed() {
+        use ::schemreg::message_index_path;
+
+        let descriptor = event_message_descriptor().unwrap();
+        let indexes = message_index_path(&descriptor).expect("index path must be derivable");
+
+        // `Event` is the 4th message in proto/event.proto (SourceMetadata,
+        // SnapshotMetadata, TransactionMetadata, Event), so a hardcoded `[0]` — the
+        // obvious guess, and what a single-message schema would use — would be wrong.
+        // Confluent deserialisers do not error on a wrong index; they misread the header.
+        assert_eq!(
+            indexes,
+            vec![3],
+            "the index path must match Event's position in the .proto file"
+        );
+    }
+
+    #[test]
+    fn proto_event_round_trips_through_the_wire_representation() {
+        use crate::codec::protobuf::ProtoEvent;
+        use crate::core::{Operation, SourceMetadata, TransactionMetadata};
+
+        let original = Event {
+            after: Some(serde_json::json!({"id": 7, "name": "alice"})),
+            op: Operation::Update,
+            before: Some(serde_json::json!({"id": 7, "name": "bob"})),
+            source: SourceMetadata {
+                source_name: "postgres".into(),
+                offset: "0/16B6A70".into(),
+                timestamp: 1_700_000_000_000,
+            },
+            ts: 1_700_000_000_001,
+            schema: Some("public".into()),
+            table: "users".into(),
+            primary_key: Some(vec!["id".into()]),
+            transaction: Some(TransactionMetadata {
+                tx_id: 42,
+                total_events: Some(2),
+                event_index: 1,
+            }),
+            unavailable_columns: vec!["big_doc".into()],
+            ..Event::default()
+        };
+
+        let recovered = ProtoEvent::from_event(&original)
+            .unwrap()
+            .into_event()
+            .expect("a well-formed ProtoEvent must convert back");
+
+        assert_eq!(recovered, original, "protobuf must round-trip exactly");
+    }
+
+    #[test]
+    fn an_unknown_total_events_round_trips_as_none_not_zero() {
+        use crate::codec::protobuf::ProtoEvent;
+        use crate::core::{Operation, SourceMetadata, TransactionMetadata};
+
+        // protobuf cannot distinguish an absent scalar from zero, so `None` encodes as 0.
+        // Decoding 0 back to `Some(0)` would tell a consumer the transaction is empty,
+        // when in fact the source did not know its size at begin time.
+        let mut event = Event {
+            op: Operation::Insert,
+            after: Some(serde_json::json!({"id": 1})),
+            source: SourceMetadata {
+                source_name: "mysql".into(),
+                offset: "bin.000001:4".into(),
+                timestamp: 1,
+            },
+            table: "t".into(),
+            ..Event::default()
+        };
+        event.transaction = Some(TransactionMetadata {
+            tx_id: 9,
+            total_events: None,
+            event_index: 0,
+        });
+
+        let recovered = ProtoEvent::from_event(&event)
+            .unwrap()
+            .into_event()
+            .unwrap();
+        assert_eq!(
+            recovered.transaction.unwrap().total_events,
+            None,
+            "0 is the documented 'unknown' sentinel, not an empty transaction"
+        );
+    }
+
+    #[test]
+    fn an_unspecified_operation_is_rejected_rather_than_defaulted() {
+        use crate::codec::protobuf::ProtoEvent;
+
+        // protobuf's zero value is indistinguishable from an absent field. Defaulting it
+        // to Insert would turn a truncated or foreign message into a fabricated row
+        // creation, which a sink would apply.
+        let proto = ProtoEvent {
+            op: 0,
+            ..Default::default()
+        };
+        let error = proto
+            .into_event()
+            .expect_err("OPERATION_UNSPECIFIED must not decode");
+        assert!(error.to_string().contains("Refusing to guess"));
+    }
+}
+
+#[cfg(test)]
+mod event_json_schema_tests {
+    use super::EVENT_JSON_SCHEMA;
+    use crate::core::{Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata};
+    use serde_json::json;
+
+    fn validate(event: &Event) -> Result<(), String> {
+        let schema: serde_json::Value =
+            serde_json::from_str(EVENT_JSON_SCHEMA).expect("the published schema must parse");
+        let compiled = jsonschema::validator_for(&schema).expect("the schema must compile");
+        let instance = serde_json::to_value(event).expect("event serialises");
+        compiled
+            .validate(&instance)
+            .map_err(|error| format!("{error} (instance: {instance})"))
+    }
+
+    #[test]
+    fn an_insert_validates_against_the_published_schema() {
+        // `before` is null for an INSERT. The schema previously expressed the row payload
+        // as `oneOf: [null, {}]`, and the empty schema matches null too — so null was
+        // valid under *both* branches and `oneOf` rejected it. That made every INSERT and
+        // every DELETE fail validation: the JSON Schema codec could not encode a normal
+        // event at all.
+        let event = Event::builder("users", Operation::Insert)
+            .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
+            .after(json!({ "id": 1, "email": "a@example.com" }))
+            .ts(1)
+            .build();
+        validate(&event).expect("an insert must validate");
+    }
+
+    #[test]
+    fn a_delete_validates_against_the_published_schema() {
+        let event = Event::builder("users", Operation::Delete)
+            .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
+            .before(json!({ "id": 1 }))
+            .ts(1)
+            .build();
+        validate(&event).expect("a delete must validate");
+    }
+
+    #[test]
+    fn an_event_carrying_unavailable_columns_validates() {
+        // These fields are `skip_serializing_if = "Vec::is_empty"`, so they appear only on
+        // partial payloads — and the schema declared `additionalProperties: false` without
+        // listing them. Every event describing a partial row would have been rejected:
+        // exactly the events whose correct handling this crate emphasises most.
+        let event = Event::builder("users", Operation::Update)
+            .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
+            .before(json!({ "id": 1 }))
+            .after(json!({ "id": 1, "name": "x" }))
+            .unavailable_columns(["big_kept"])
+            .before_unavailable_columns(["big_changed"])
+            .ts(1)
+            .build();
+        validate(&event).expect("a partial-payload event must validate");
+    }
+
+    #[test]
+    fn a_fully_populated_event_validates() {
+        let event = Event::builder("users", Operation::Read)
+            .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
+            .schema("public")
+            .before(json!({ "id": 1 }))
+            .after(json!({ "id": 1 }))
+            .primary_key(["id"])
+            .snapshot(SnapshotMetadata::new("snap-1", 0, false))
+            .transaction(TransactionMetadata::new(7, 1, Some(3)))
+            .before_is_key_only(true)
+            .ts(1)
+            .build();
+        validate(&event).expect("a fully populated event must validate");
+    }
+
+    #[test]
+    fn every_operation_symbol_is_accepted_by_the_schema() {
+        // The schema pins an enum; an operation the encoder can produce but the schema
+        // rejects would fail only for that one operation, in production.
+        for op in [
+            Operation::Insert,
+            Operation::Update,
+            Operation::Delete,
+            Operation::Read,
+            Operation::SchemaChange,
+            Operation::Truncate,
+        ] {
+            let event = Event::builder("t", op)
+                .source(SourceMetadata::new("s", "1", 1))
+                .after(json!({ "id": 1 }))
+                .ts(1)
+                .build();
+            validate(&event).unwrap_or_else(|error| panic!("operation {op:?} rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn an_event_with_an_unknown_field_is_still_rejected() {
+        // `additionalProperties: false` is load-bearing: it is what makes a consumer's
+        // schema check catch a producer that added a field the consumer cannot interpret.
+        // Widening the schema to fix the two defects above must not have disabled it.
+        let mut instance = serde_json::to_value(
+            Event::builder("t", Operation::Insert)
+                .source(SourceMetadata::new("s", "1", 1))
+                .after(json!({ "id": 1 }))
+                .ts(1)
+                .build(),
+        )
+        .expect("serialise");
+        instance["surprise"] = json!("value");
+
+        let schema: serde_json::Value =
+            serde_json::from_str(EVENT_JSON_SCHEMA).expect("schema parses");
+        let compiled = jsonschema::validator_for(&schema).expect("schema compiles");
+        assert!(
+            compiled.validate(&instance).is_err(),
+            "an unknown field must still be rejected"
+        );
     }
 }

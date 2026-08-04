@@ -55,6 +55,7 @@ use crate::core::{Error, Event, Result};
 ///
 /// `AtLeastOnce` < `AtLeastOnceIdempotent` < `EffectivelyOnce`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum SinkDeliveryGuarantee {
     /// Events are delivered at least once; duplicate delivery is possible.
     ///
@@ -657,11 +658,14 @@ impl SinkAdapter for MemorySinkAdapter {
 /// A set of events used as input for a single conformance scenario.
 #[derive(Debug, Clone)]
 pub struct AdapterGoldenFixture {
+    /// Scenario name, reported in conformance failures.
     pub name: String,
+    /// Events fed to the adapter under test.
     pub events: Vec<Event>,
 }
 
 impl AdapterGoldenFixture {
+    /// Build a named fixture from an event list.
     pub fn new(name: impl Into<String>, events: Vec<Event>) -> Self {
         Self {
             name: name.into(),
@@ -669,18 +673,22 @@ impl AdapterGoldenFixture {
         }
     }
 
+    /// One event — the smallest useful smoke scenario.
     pub fn single_event(event: Event) -> Self {
         Self::new("single_event", vec![event])
     }
 
+    /// A multi-event batch, exercising batch handling.
     pub fn batch(events: Vec<Event>) -> Self {
         Self::new("batch", events)
     }
 
+    /// Events whose relative order the adapter must preserve.
     pub fn ordering(events: Vec<Event>) -> Self {
         Self::new("ordering", events)
     }
 
+    /// Events replayed after a simulated crash, exercising duplicate tolerance.
     pub fn crash_recovery(events: Vec<Event>) -> Self {
         Self::new("crash_recovery", events)
     }
@@ -689,8 +697,11 @@ impl AdapterGoldenFixture {
 /// Result of a single conformance scenario.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestResult {
+    /// Whether the scenario passed.
     pub passed: bool,
+    /// Every failure observed, not just the first.
     pub errors: Vec<String>,
+    /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
 }
 
@@ -877,6 +888,7 @@ pub struct AdapterConformanceSuite {
 }
 
 impl AdapterConformanceSuite {
+    /// Build a suite with the default conformance harness.
     pub fn new() -> Self {
         Self::default()
     }

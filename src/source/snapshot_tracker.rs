@@ -191,11 +191,21 @@ impl SnapshotProgressTracker {
 /// Report on parallel snapshot execution.
 #[derive(Debug, Clone)]
 pub struct SnapshotTrackerReport {
+    /// Stable identifier for the snapshot run being reported.
     pub snapshot_id: String,
+    /// Tables in the snapshot.
     pub total_tables: usize,
+    /// Tables read to exhaustion.
     pub completed_tables: usize,
+    /// Rows emitted across all tables.
     pub total_rows_processed: u64,
+    /// Tables not yet complete.
     pub pending_tables: Vec<String>,
+    /// Completion percentage, 0â€“100.
+    ///
+    /// Table-weighted, not row-weighted, so it moves in steps rather than smoothly —
+    /// a snapshot at 50% has finished half its *tables*, which may be far from half its
+    /// rows.
     pub progress_percent: u8,
 }
 

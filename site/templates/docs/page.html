@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block structured_data %}
+{#- TechArticle tells a search engine this is documentation rather than a blog post,
+    which is what surfaces it for "how do I …" queries. -#}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": {{ page.title | json_encode | safe }},
+  "description": {{ page.description | default(value=config.description) | json_encode | safe }},
+  "url": {{ page.permalink | json_encode | safe }},
+  "inLanguage": "en",
+  "isPartOf": {
+    "@type": "WebSite",
+    "name": {{ config.title | json_encode | safe }},
+    "url": {{ config.base_url | json_encode | safe }}
+  },
+  "author": { "@type": "Person", "name": {{ config.extra.author | json_encode | safe }} }
+}
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="wrap docs-layout">
+  {% include "docs/_sidebar.html" %}
+  <article class="prose">
+    <h1>{{ page.title }}</h1>
+    {% if page.description %}<p class="page-meta">{{ page.description }}</p>{% endif %}
+    {{ page.content | safe }}
+
+    <nav class="page-nav" aria-label="Documentation">
+      {% if page.lower %}<a href="{{ page.lower.permalink }}">← {{ page.lower.title }}</a>{% else %}<span></span>{% endif %}
+      {% if page.higher %}<a href="{{ page.higher.permalink }}">{{ page.higher.title }} →</a>{% endif %}
+    </nav>
+  </article>
+</div>
+{% endblock %}

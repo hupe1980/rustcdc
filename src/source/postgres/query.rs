@@ -2,6 +2,9 @@ use std::time::Duration;
 
 use tokio_postgres::Client;
 
+#[cfg(feature = "tls")]
+use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
+
 use crate::core::{Error, Result};
 
 use super::parser::{format_pg_lsn, parse_pg_lsn};
@@ -188,8 +191,10 @@ pub(super) fn build_tls_root_store(ca_cert_path: Option<&str>) -> Result<rustls:
                 "failed to read TLS CA certificate file '{path}': {error}"
             ))
         })?;
-        let mut cursor = std::io::Cursor::new(&pem_bytes);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
+        // `rustls_pki_types::pem`, not the archived `rustls-pemfile`: the latter has
+        // been unmaintained since August 2025 (RUSTSEC-2025-0134) and its last release is
+        // a thin wrapper over exactly this code.
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem_bytes)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| {
                 Error::ConfigError(format!(
@@ -256,8 +261,6 @@ pub(super) fn build_tls_client_config(
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
 ) -> Result<rustls::ClientConfig> {
-    use std::io::Cursor;
-
     let root_store = build_tls_root_store(ca_cert_path)?;
 
     match (client_cert_path, client_key_path) {
@@ -273,14 +276,13 @@ pub(super) fn build_tls_client_config(
                 ))
             })?;
 
-            let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut Cursor::new(&cert_pem))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        Error::ConfigError(format!(
-                            "failed to parse mTLS client certificate PEM '{cert_path}': {error}"
-                        ))
-                    })?;
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    Error::ConfigError(format!(
+                        "failed to parse mTLS client certificate PEM '{cert_path}': {error}"
+                    ))
+                })?;
 
             if certs.is_empty() {
                 return Err(Error::ConfigError(format!(
@@ -288,17 +290,12 @@ pub(super) fn build_tls_client_config(
                 )));
             }
 
-            let key = rustls_pemfile::private_key(&mut Cursor::new(&key_pem))
-                .map_err(|error| {
-                    Error::ConfigError(format!(
-                        "failed to parse mTLS private key PEM '{key_path}': {error}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    Error::ConfigError(format!(
-                        "mTLS private key file '{key_path}' contains no private key"
-                    ))
-                })?;
+            let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|error| {
+                Error::ConfigError(format!(
+                    "failed to parse mTLS private key PEM '{key_path}': {error}. The file \
+                     must contain exactly one PKCS#8, PKCS#1 or SEC1 private key."
+                ))
+            })?;
 
             rustls::ClientConfig::builder_with_provider(resolve_crypto_provider())
                 .with_safe_default_protocol_versions()

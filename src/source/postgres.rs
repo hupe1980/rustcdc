@@ -58,6 +58,9 @@ const MAX_EVENTS_PER_POLL: usize = 1_000;
 /// Maximum time a single `poll_xlog_data` SQL query may run when `timeout_ms == 0`.
 /// Prevents indefinite blocking on the "single-shot, return immediately" code-path.
 const DEFAULT_POLL_BACKSTOP_MS: u64 = 30_000;
+/// Live pgoutput stream over a logical replication slot.
+///
+/// Obtain via `PostgresConnection::start_stream`.
 pub struct PostgresStreamHandle {
     source_name: String,
     stream: PostgresStream,
@@ -126,22 +129,38 @@ impl PostgresStreamHandle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Per-table progress within a bulk snapshot.
 pub struct TableSnapshot {
+    /// Table in `"schema.table"` form.
     pub table: String,
+    /// Row count observed when the snapshot began.
+    ///
+    /// A planner estimate on some connectors, so treat it as a progress denominator, not
+    /// as a correctness check.
     pub total_rows: u64,
+    /// Rows emitted so far.
     pub rows_processed: u64,
+    /// Keyset cursor for resuming this table, encoded per connector. `None` before the
+    /// first chunk.
     pub cursor_position: Option<String>,
+    /// Whether this table has been read to exhaustion.
     pub is_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Durable state of a PostgreSQL bulk snapshot.
 pub struct PostgresSnapshot {
+    /// Per-table progress.
     pub tables: Vec<TableSnapshot>,
+    /// Stable identifier carried on every emitted row's `SnapshotMetadata`.
     pub snapshot_id: String,
+    /// Unix epoch milliseconds when the snapshot started.
     pub snapshot_start_ts: u64,
+    /// Unix epoch milliseconds when the snapshot finished; `0` while in progress.
     pub snapshot_end_ts: u64,
 }
 
+/// A PostgreSQL bulk snapshot in progress.
 pub struct PostgresSnapshotHandle {
     source_name: String,
     snapshot: PostgresSnapshot,
@@ -421,10 +440,17 @@ impl PostgresSnapshotHandle {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Configuration for a PostgreSQL CDC connection.
 pub struct PostgresSourceConfig {
+    /// Server hostname or IP.
     pub host: String,
+    /// Server port.
     pub port: u16,
+    /// Login user. Needs the connector's replication/CDC privileges.
     pub user: String,
+    /// Password material. Redacted in `Debug` and `Display`; prefer
+    /// [`SecretString::from_provider`](crate::core::SecretString::from_provider) or
+    /// `from_callback` so it is resolved at connect time rather than held in config.
     pub password: SecretString,
     /// Connector authentication mode.
     ///
@@ -432,10 +458,19 @@ pub struct PostgresSourceConfig {
     /// IAM auth tokens (typically via `SecretString::from_callback`).
     #[serde(default)]
     pub auth_mode: DatabaseAuthMode,
+    /// Database to replicate from.
     pub database: String,
+    /// Logical replication slot name.
+    ///
+    /// The slot is the durable retention anchor: PostgreSQL holds WAL for it until the
+    /// connector confirms progress. Provision it out of band in production — see
+    /// `create_replication_slot_if_missing` for why auto-creation is off by default.
     pub replication_slot_name: String,
+    /// Publication the slot reads through. Must include every captured table.
     pub publication_name: String,
+    /// Transport mode. TLS by default; plaintext is an explicit, loudly-logged opt-in.
     pub transport: TransportConfig,
+    /// Connection timeout in seconds.
     pub conn_timeout_secs: u64,
     /// Stream poll interval in milliseconds.
     pub stream_poll_interval_ms: u64,
@@ -514,6 +549,7 @@ pub struct PostgresConnection {
 }
 
 impl PostgresConnection {
+    /// Build a connection from configuration. Does not connect; call `connect()`.
     pub fn new(config: PostgresSourceConfig) -> Self {
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
         let max_events_per_poll = config.max_events_per_poll.max(1);
@@ -528,6 +564,7 @@ impl PostgresConnection {
         }
     }
 
+    /// Build a connection with a caller-supplied structured logger.
     pub fn with_logger(config: PostgresSourceConfig, logger: StructuredLogger) -> Self {
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
         let max_events_per_poll = config.max_events_per_poll.max(1);
@@ -542,6 +579,17 @@ impl PostgresConnection {
         }
     }
 
+    /// Establish the connection and validate the server-side prerequisites.
+    ///
+    /// Validation is the point: several PostgreSQL misconfigurations cause **silent**
+    /// wrong results rather than errors, so they are rejected here with a remedy in the
+    /// message. Idempotent — connecting an already-connected source succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SourceError`] for connection
+    /// failures, or [`Error::Unrecoverable`] when the
+    /// replication slot is missing and auto-creation is not enabled.
     pub async fn connect(&self) -> Result<()> {
         self.config.validate()?;
         {
@@ -561,7 +609,10 @@ impl PostgresConnection {
                     .connect(tokio_postgres::NoTls)
                     .await
                     .map_err(|error| {
-                        Error::SourceError(format!("postgres plaintext connection failed: {error}"))
+                        Error::SourceError(format!(
+                            "postgres plaintext connection failed: {}",
+                            crate::core::render_error_chain(&error)
+                        ))
                     })?;
                 let connection_task = tokio::spawn(run_connection_task(connection));
                 self.validate_connected_client(&client).await?;
@@ -627,7 +678,10 @@ impl PostgresConnection {
                         .connect(tls_connector)
                         .await
                         .map_err(|error| {
-                            Error::SourceError(format!("postgres tls connection failed: {error}"))
+                            Error::SourceError(format!(
+                                "postgres tls connection failed: {}",
+                                crate::core::render_error_chain(&error)
+                            ))
                         })?;
 
                     let connection_task = tokio::spawn(run_connection_task(connection));
@@ -671,6 +725,7 @@ impl PostgresConnection {
         Ok(())
     }
 
+    /// Close the connection. Safe to call when already closed.
     pub async fn close(&self) {
         let mut state = self.state.lock().await;
         if let Some(handle) = state.heartbeat_task.take() {
@@ -683,6 +738,7 @@ impl PostgresConnection {
         self.logger.source_disconnected();
     }
 
+    /// Whether a connection is currently established.
     pub async fn is_connected(&self) -> bool {
         self.state.lock().await.client.is_some()
     }
@@ -691,6 +747,7 @@ impl PostgresConnection {
         start_postgres_snapshot_internal(self, tables).await
     }
 
+    /// Resume a bulk snapshot from a persisted snapshot checkpoint.
     pub async fn start_snapshot_from_checkpoint(
         &mut self,
         tables: &[&str],
@@ -727,9 +784,11 @@ impl PostgresConnection {
                 )
             })?
         };
+        let resume_state = crate::source::incremental_snapshot_state_from_offset(resume_from);
         let inner = start_postgres_stream(self, resume_from).await?;
         let source_name = self.source_type().to_string();
-        let handle = IncrementalSnapshotHandle::new(inner, client, config, source_name).await?;
+        let handle =
+            incremental_snapshot::start(inner, client, config, source_name, resume_state).await?;
         Ok(Box::new(handle))
     }
 
@@ -962,11 +1021,15 @@ impl StreamHandle for PostgresStreamHandle {
         &self,
         checkpoint: &mut dyn crate::checkpoint::Checkpoint,
     ) -> Result<()> {
-        let offset = PostgresOffset {
-            lsn: self.stream.lsn_position,
-            slot_name: self.stream.slot_name.clone(),
-        };
+        let offset = PostgresOffset::new(self.stream.lsn_position, self.stream.slot_name.clone());
         checkpoint.save(&offset, self.events_polled).await
+    }
+
+    fn position_offset(&self) -> Option<Box<dyn crate::core::Offset>> {
+        Some(Box::new(PostgresOffset::new(
+            self.stream.lsn_position,
+            self.stream.slot_name.clone(),
+        )))
     }
 
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
@@ -1908,6 +1971,7 @@ mod tests {
         let offset = PostgresOffset {
             lsn: 4242,
             slot_name: "slot".into(),
+            incremental_snapshot: None,
         };
         let lsn = super::decode_stream_resume_lsn("postgres", "slot", &offset).unwrap();
         assert_eq!(lsn, 4242);

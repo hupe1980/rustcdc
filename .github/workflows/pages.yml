@@ -1,0 +1,58 @@
+# Publishes the documentation site to GitHub Pages.
+#
+# Deploys only from main. Pull requests are covered by the `docs-site` job in ci.yml,
+# which builds and link-checks the same content without publishing it.
+name: pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it: a cancelled deploy can leave
+# the published site on a half-uploaded artifact.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ZOLA_VERSION: 0.22.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zola
+        run: |
+          curl -sSfL "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin zola
+          zola --version
+      - uses: actions/configure-pages@v5
+        id: pages
+      # base_url is committed in site/config.toml, but taking it from the Pages API
+      # keeps the build correct if the site is ever served from a different origin.
+      - name: build
+        run: zola --root site build --base-url "${{ steps.pages.outputs.base_url }}"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

@@ -13,10 +13,21 @@ use crate::{
 /// Faults that can be injected into checkpoint save/load operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointFault {
+    /// Return a checkpoint whose payload has been tampered with.
+    ///
+    /// Should be rejected by the record's integrity checksum rather than resumed from.
     CorruptCheckpoint,
+    /// Fail `load`.
+    ///
+    /// The critical case: a load failure must **not** be collapsed into "no checkpoint",
+    /// which would resume from the live head of the log and skip everything since the
+    /// last durable position.
     FailLoad,
+    /// Fail `save`, exercising the commit barrier's rollback path.
     FailSave,
+    /// Delay `save` by this much, exercising commit-latency handling.
     SlowSave(Duration),
+    /// Silently discard a saved checkpoint, modelling a lost durable write.
     LoseCheckpoint,
 }
 
@@ -28,6 +39,7 @@ pub struct FaultInjectingCheckpoint<C> {
 }
 
 impl<C> FaultInjectingCheckpoint<C> {
+    /// Wrap a checkpoint store, injecting no faults until one is configured.
     pub fn new(inner: C) -> Self {
         Self {
             inner,
@@ -35,12 +47,14 @@ impl<C> FaultInjectingCheckpoint<C> {
         }
     }
 
+    /// Arm a fault for subsequent operations.
     pub fn inject(&mut self, fault: CheckpointFault) {
         if let Ok(mut faults) = self.faults.lock() {
             faults.push(fault);
         }
     }
 
+    /// Clear the armed fault.
     pub fn reset(&mut self) {
         if let Ok(mut faults) = self.faults.lock() {
             faults.clear();

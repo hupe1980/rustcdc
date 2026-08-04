@@ -132,15 +132,27 @@ impl MariaDbSourceConfig {
 
     /// Override the user name.
     #[must_use]
-    pub fn with_user(mut self, user: String) -> Self {
-        self.0.user = user;
+    pub fn with_user(mut self, user: impl Into<String>) -> Self {
+        self.0.user = user.into();
+        self
+    }
+
+    /// Override the password material.
+    ///
+    /// Accepts anything convertible into a [`SecretString`](crate::core::SecretString),
+    /// including a plain `&str` or `String` for development. Prefer
+    /// `SecretString::from_provider` or `SecretString::from_callback` in production, so
+    /// the secret is resolved at connect time rather than held in the config.
+    #[must_use]
+    pub fn with_password(mut self, password: impl Into<crate::core::SecretString>) -> Self {
+        self.0.password = password.into();
         self
     }
 
     /// Override the target database.
     #[must_use]
-    pub fn with_database(mut self, database: String) -> Self {
-        self.0.database = database;
+    pub fn with_database(mut self, database: impl Into<String>) -> Self {
+        self.0.database = database.into();
         self
     }
 }

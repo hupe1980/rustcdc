@@ -4,8 +4,9 @@ use crate::{
 };
 
 use super::{
-    compare_lsn, lsn_bytes_to_hex, lsn_hex_to_bytes, query, sqlserver_resume_lsn_from_offset_bytes,
-    SqlServerCdcCursor, SqlServerConnection, SqlServerStream, SqlServerStreamHandle,
+    compare_lsn, lsn_bytes_to_hex, lsn_hex_to_bytes, query, sqlserver_cursor_from_offset_bytes,
+    sqlserver_resume_lsn_from_offset_bytes, SqlServerCdcCursor, SqlServerConnection,
+    SqlServerStream, SqlServerStreamHandle,
 };
 
 pub(super) async fn start_sqlserver_stream(
@@ -48,9 +49,8 @@ pub(super) async fn start_sqlserver_stream(
         }
 
         let encoded = offset.encode()?;
-        if let Ok(text) = serde_json::from_slice::<String>(encoded.as_slice()) {
-            resume_cursor = SqlServerCdcCursor::decode(&text);
-        }
+        let cursor_text = sqlserver_cursor_from_offset_bytes(encoded.as_slice())?;
+        resume_cursor = SqlServerCdcCursor::decode(&cursor_text);
         let resume = sqlserver_resume_lsn_from_offset_bytes(encoded.as_slice())?;
         if compare_lsn(&resume, &min_lsn).is_lt() {
             return Err(Error::CheckpointError(format!(

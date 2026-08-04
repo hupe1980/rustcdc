@@ -3,42 +3,27 @@
 //! `enqueue_event` to inject synthetic events, then verify they pass through
 //! (or are filtered by) a WASM module loaded from `fixtures/wasm/`.
 
-use async_trait::async_trait;
 use rustcdc::checkpoint::InMemoryCheckpoint;
 use rustcdc::core::{
     CdcRuntime, Event, Operation, RuntimeConfig, RuntimeOptions, RuntimeSourceConfig,
-    SourceMetadata, TransformErrorPolicy, EVENT_ENVELOPE_VERSION,
+    SourceMetadata, TransformErrorPolicy,
 };
 use rustcdc::schema_history::InMemorySchemaHistory;
-use rustcdc::transform::Transform;
+use rustcdc::transform::AsyncTransform;
 use rustcdc::wasm::{TransformResult, WasmConfig, WasmRuntime};
 use serde_json::json;
 use std::path::Path;
 use tokio::sync::Mutex;
 
 fn make_event(table: &str, id: u64) -> Event {
-    Event {
-        before: None,
-        after: Some(json!({"id": id, "name": "alice"})),
-        op: Operation::Insert,
-        source: SourceMetadata {
-            source_name: "wasm-e2e".into(),
-            offset: id.to_string(),
-            timestamp: id,
-        },
-        ts: id,
-        schema: Some("public".into()),
-        table: table.into(),
-        primary_key: Some(vec!["id".into()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    Event::builder(table, Operation::Insert)
+        .after(json!({"id": id, "name": "alice"}))
+        .source(SourceMetadata::new("wasm-e2e", id.to_string(), id))
+        .ts(id)
+        .schema("public")
+        .primary_key(["id"])
+        .build()
 }
-
 fn compile_wat(name: &str) -> tempfile::NamedTempFile {
     let wat_path = Path::new("fixtures/wasm").join(name);
     let wat_src = std::fs::read_to_string(&wat_path).expect("read wat fixture");
@@ -86,7 +71,7 @@ async fn build_runtime_with_wasm(
     );
 
     let mut runtime = CdcRuntime::new(config).expect("create runtime");
-    runtime.add_transform(Box::new(transform));
+    runtime.add_async_transform(Box::new(transform));
     runtime.start().await.expect("start runtime");
     (runtime, dead_letter_rx)
 }
@@ -112,8 +97,9 @@ impl RuntimeWasmTransform {
     }
 }
 
-#[async_trait]
-impl Transform for RuntimeWasmTransform {
+// WASM must await, so it implements the async variant of the trait.
+#[async_trait::async_trait]
+impl AsyncTransform for RuntimeWasmTransform {
     async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         let mut runtime = self.runtime.lock().await;
         match runtime.transform(event).await? {

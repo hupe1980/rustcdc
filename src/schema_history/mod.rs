@@ -54,12 +54,20 @@ pub enum DDLEvent {
     AlterTable(TableSchema),
     /// A schema evolution event represented as an ordered diff over the previous version.
     AlterTableDiff {
+        /// Schema containing the table.
         schema: String,
+        /// Table that changed.
         table: String,
+        /// Ordered operations taking the previous version to this one.
         diff: SchemaDiff,
     },
     /// Table removal.
-    DropTable { schema: String, table: String },
+    DropTable {
+        /// Schema containing the table.
+        schema: String,
+        /// Table that was dropped.
+        table: String,
+    },
 }
 
 /// Abstraction for recording and querying table schema history.
@@ -304,6 +312,20 @@ impl FileSchemaHistory {
         })
     }
 
+    /// Confirm this process still owns the store file before rewriting it.
+    fn verify_lease_still_held(&self) -> Result<()> {
+        let lease = self._lease.lock().map_err(|_| {
+            Error::StateError("schema_history owner lease lock poisoned during verification".into())
+        })?;
+
+        match lease.as_ref() {
+            Some(lease) => lease.verify_still_held("schema_history"),
+            None => Err(Error::StateError(
+                "schema_history owner lease is not held; refusing to write".into(),
+            )),
+        }
+    }
+
     fn load_store(path: &Path) -> Result<SchemaStore> {
         let bytes = fs::read(path)?;
         if bytes.is_empty() {
@@ -321,6 +343,11 @@ impl FileSchemaHistory {
     }
 
     fn persist_store(&self, store: &SchemaStore) -> Result<()> {
+        // Fence the write: ownership acquired at construction is not ownership now.
+        // `persist_store` rewrites the *whole* file from this instance's in-memory
+        // state, so a second writer does not merge with it — it erases it.
+        self.verify_lease_still_held()?;
+
         let state = FileSchemaHistoryState {
             schemas: store.clone(),
         };
@@ -546,6 +573,11 @@ fn apply_schema_diff(schema: &mut TableSchema, diff: &SchemaDiff) -> Result<()> 
     Ok(())
 }
 
+/// Checks events against the recorded schema history.
+///
+/// Catches the case where a consumer would observe a row shape the history has no entry
+/// for — which means either the DDL was missed or the history was written after the event
+/// it describes, and either way a downstream schema-aware consumer will fail on it.
 pub struct SchemaValidator<H> {
     history: Arc<H>,
 }
@@ -554,10 +586,20 @@ impl<H> SchemaValidator<H>
 where
     H: SchemaHistory + 'static,
 {
+    /// Build a validator over a shared schema history.
     pub fn new(history: Arc<H>) -> Self {
         Self { history }
     }
 
+    /// Check an event against the recorded history for its table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SchemaError`] when the event's
+    /// shape has no corresponding history entry — meaning either the DDL was never
+    /// captured or the history was written after the event that describes it. A
+    /// schema-aware downstream consumer would fail on such an event later and further
+    /// from the cause.
     pub async fn validate_event(
         &self,
         event: &Event,
@@ -974,6 +1016,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Release the writer before reopening: one instance per store file is the
+        // enforced contract, and this is simulating a restart.
+        drop(history);
         let reloaded = FileSchemaHistory::new(&path).await.unwrap();
         let latest = reloaded
             .latest_schema("public.users")
@@ -1091,6 +1136,7 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 2);
 
+        drop(history);
         let reloaded = FileSchemaHistory::new(&path).await.unwrap();
         assert!(reloaded
             .get_schema_at_version("public.users", 1)

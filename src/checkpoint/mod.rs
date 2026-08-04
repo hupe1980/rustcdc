@@ -114,11 +114,39 @@ pub struct PostgresOffset {
     pub lsn: u64,
     /// Replication slot used to resume from this offset.
     pub slot_name: String,
+    /// Progress of an in-flight incremental (DBLog) snapshot, when one is running.
+    ///
+    /// Stored with the stream position rather than in a file of its own: a chunk
+    /// cursor is only meaningful relative to the stream position it was captured
+    /// against, so the two must become durable in the same atomic write. Without
+    /// this the snapshot restarts from row zero on every process restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_snapshot: Option<crate::source::IncrementalSnapshotState>,
 }
 
 impl PostgresOffset {
+    /// Decode an offset from its [`Offset::encode`] representation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(serde_json::from_slice(bytes)?)
+    }
+
+    /// Construct a stream offset with no incremental-snapshot state attached.
+    pub fn new(lsn: u64, slot_name: impl Into<String>) -> Self {
+        Self {
+            lsn,
+            slot_name: slot_name.into(),
+            incremental_snapshot: None,
+        }
+    }
+
+    /// Attach incremental-snapshot progress to this offset.
+    #[must_use]
+    pub fn with_incremental_snapshot(
+        mut self,
+        state: Option<crate::source::IncrementalSnapshotState>,
+    ) -> Self {
+        self.incremental_snapshot = state;
+        self
     }
 }
 
@@ -155,9 +183,16 @@ pub struct MysqlOffset {
     /// MySQL server or vice versa, where the GTID formats are mutually unintelligible.
     #[serde(default = "MysqlOffset::default_flavor")]
     pub source_flavor: String,
+    /// Progress of an in-flight incremental (DBLog) snapshot, when one is running.
+    ///
+    /// See [`PostgresOffset::incremental_snapshot`] for why this travels with the
+    /// stream position instead of in a separate record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_snapshot: Option<crate::source::IncrementalSnapshotState>,
 }
 
 impl MysqlOffset {
+    /// Decode an offset from its [`Offset::encode`] representation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(serde_json::from_slice(bytes)?)
     }
@@ -178,13 +213,78 @@ impl MysqlOffset {
             binlog_file: binlog_file.into(),
             binlog_pos,
             source_flavor: source_flavor.into(),
+            incremental_snapshot: None,
         }
+    }
+
+    /// Attach incremental-snapshot progress to this offset.
+    #[must_use]
+    pub fn with_incremental_snapshot(
+        mut self,
+        state: Option<crate::source::IncrementalSnapshotState>,
+    ) -> Self {
+        self.incremental_snapshot = state;
+        self
     }
 }
 
 impl Offset for MysqlOffset {
     fn source_type(&self) -> &str {
         &self.source_flavor
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
+/// Concrete SQL Server checkpoint offset.
+///
+/// `cursor` is either a bare `"{lsn}"` window boundary or `"{lsn}:{seqval}:{op}"`,
+/// a resume point *inside* a window that a previous poll truncated. The three-part
+/// form is what makes a mid-LSN resume representable at all: a single commit can
+/// produce more rows than `max_events_per_poll`, and `__$operation` is part of the
+/// key because `'all update old'` emits op=3 and op=4 sharing one `(lsn, seqval)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqlServerOffset {
+    /// Encoded CDC cursor — `"{lsn}"` or `"{lsn}:{seqval}:{op}"`.
+    pub cursor: String,
+    /// Progress of an in-flight incremental (DBLog) snapshot, when one is running.
+    ///
+    /// See [`PostgresOffset::incremental_snapshot`] for why this travels with the
+    /// stream position instead of in a separate record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_snapshot: Option<crate::source::IncrementalSnapshotState>,
+}
+
+impl SqlServerOffset {
+    /// Construct a stream offset with no incremental-snapshot state attached.
+    pub fn new(cursor: impl Into<String>) -> Self {
+        Self {
+            cursor: cursor.into(),
+            incremental_snapshot: None,
+        }
+    }
+
+    /// Decode an offset from its [`Offset::encode`] representation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    /// Attach incremental-snapshot progress to this offset.
+    #[must_use]
+    pub fn with_incremental_snapshot(
+        mut self,
+        state: Option<crate::source::IncrementalSnapshotState>,
+    ) -> Self {
+        self.incremental_snapshot = state;
+        self
+    }
+}
+
+impl Offset for SqlServerOffset {
+    fn source_type(&self) -> &str {
+        "sqlserver"
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
@@ -202,6 +302,7 @@ pub struct GenericOffset {
 }
 
 impl GenericOffset {
+    /// Wrap already-encoded offset bytes under a source-type namespace.
     pub fn new(source: impl Into<String>, bytes: Vec<u8>) -> Self {
         Self {
             source: source.into(),
@@ -241,8 +342,25 @@ impl std::fmt::Debug for StoredCheckpoint {
 /// Checkpoint abstraction for durable source progress.
 #[async_trait]
 pub trait Checkpoint: Send + Sync {
+    /// Durably persist `offset` and the running committed-event count.
+    ///
+    /// **Must be durable on return**, not merely buffered: the runtime treats a
+    /// successful save as the point past which events will not be replayed. An
+    /// implementation that returns before the write reaches stable storage converts a
+    /// crash into silent data loss.
+    ///
+    /// Must also be **monotonic** per source: refusing a write that would move progress
+    /// backwards is what stops a stale in-flight write from rewinding the position.
     async fn save(&mut self, offset: &dyn Offset, committed_event_count: u64) -> Result<()>;
+
+    /// Load the furthest durable offset, or `None` when none exists.
+    ///
+    /// A store error **must** surface as `Err`, never as `Ok(None)`. Collapsing the two
+    /// makes the runtime resume from the live head of the log, silently skipping
+    /// everything since the last durable position.
     async fn load(&self) -> Result<Option<Box<dyn Offset>>>;
+
+    /// Number of events durably committed, or `0` when no checkpoint exists.
     async fn get_committed_count(&self) -> Result<u64>;
 }
 
@@ -269,6 +387,7 @@ pub struct InMemoryCheckpoint {
 
 #[cfg(any(test, feature = "test-harnesses"))]
 impl InMemoryCheckpoint {
+    /// Number of retained checkpoint entries. Test-only introspection.
     pub fn history_len(&self) -> usize {
         self.entries
             .lock()
@@ -278,6 +397,20 @@ impl InMemoryCheckpoint {
 }
 
 /// File-backed checkpoint store for local durability.
+///
+/// # One writer per directory
+///
+/// [`FileCheckpoint::new`] takes an exclusive owner lease on the directory, and a second
+/// writable instance against the same directory is **refused**. That is not
+/// over-caution: each instance holds its own view of progress and rewrites the whole
+/// record, so two of them silently overwrite each other — the checkpoint ends up wherever
+/// the last writer happened to be, which is how a resume position regresses or jumps
+/// forward with no error anywhere.
+///
+/// Reading is not dangerous, so it is not restricted. Use
+/// [`FileCheckpoint::read_only`] for inspection — a health endpoint, an operator tool, a
+/// test assertion — while a runtime owns the directory. A read-only handle takes no lease
+/// and refuses to write.
 #[derive(Debug)]
 pub struct FileCheckpoint {
     /// Directory containing checkpoint files.
@@ -285,6 +418,8 @@ pub struct FileCheckpoint {
     /// Unix file mode used when creating checkpoint files.
     pub file_mode: u32,
     lease: Mutex<Option<owner_lease::OwnerLease>>,
+    /// When set, this handle never acquires the owner lease and refuses to write.
+    read_only: bool,
 }
 
 impl FileCheckpoint {
@@ -294,13 +429,53 @@ impl FileCheckpoint {
         source_type.strip_suffix("_snapshot").unwrap_or(source_type)
     }
 
-    /// Create a new file checkpoint store.
+    /// Create a writable checkpoint store, taking the directory's owner lease.
+    ///
+    /// The lease is acquired lazily on first use, and a second writable instance against
+    /// the same directory is refused — see the type docs. For inspection alongside a
+    /// running instance, use [`FileCheckpoint::read_only`].
     pub fn new(checkpoint_dir: impl Into<PathBuf>) -> Self {
         Self {
             checkpoint_dir: checkpoint_dir.into(),
             file_mode: FILE_CHECKPOINT_DEFAULT_FILE_MODE,
             lease: Mutex::new(None),
+            read_only: false,
         }
+    }
+
+    /// Create a **read-only** handle for inspecting a checkpoint directory.
+    ///
+    /// Takes no owner lease, so it can be used freely alongside the runtime that owns the
+    /// directory — a readiness endpoint reporting the committed count, an operator tool
+    /// dumping the resume position, a test asserting progress. Concurrent readers cannot
+    /// corrupt anything; only concurrent *writers* can, and this handle cannot write.
+    ///
+    /// [`Checkpoint::save`] returns a [`crate::core::Error::CheckpointError`] naming the
+    /// remedy rather than silently doing nothing.
+    ///
+    /// ```no_run
+    /// use rustcdc::checkpoint::{Checkpoint, FileCheckpoint};
+    ///
+    /// # async fn example() -> rustcdc::Result<()> {
+    /// // The runtime owns this directory; this handle just looks.
+    /// let inspector = FileCheckpoint::read_only("/var/rustcdc/checkpoints");
+    /// let committed = inspector.get_committed_count().await?;
+    /// println!("durably committed: {committed}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_only(checkpoint_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            checkpoint_dir: checkpoint_dir.into(),
+            file_mode: FILE_CHECKPOINT_DEFAULT_FILE_MODE,
+            lease: Mutex::new(None),
+            read_only: true,
+        }
+    }
+
+    /// Whether this handle refuses to write.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     fn lease_path(&self) -> PathBuf {
@@ -308,6 +483,12 @@ impl FileCheckpoint {
     }
 
     fn ensure_owner_lease(&self) -> Result<()> {
+        // A read-only handle takes no lease: it cannot corrupt anything, and requiring one
+        // would make inspecting a directory a runtime owns impossible.
+        if self.read_only {
+            return Ok(());
+        }
+
         let mut lease = self.lease.lock().map_err(|_| {
             crate::core::Error::CheckpointError(
                 "checkpoint owner lease lock poisoned during acquisition".into(),
@@ -349,6 +530,40 @@ impl FileCheckpoint {
 
         *lease = Some(acquired);
         Ok(())
+    }
+
+    /// Confirm this process still owns the checkpoint directory before writing to it.
+    ///
+    /// Acquiring the lease once is not the same as holding it: an operator can delete
+    /// the sentinel file to clear what looks like a stuck lease, and a peer that saw
+    /// this process as dead can take it over. Both cases used to leave two writers
+    /// against one directory, each advancing the checkpoint from its own view of
+    /// progress — which is how a checkpoint silently regresses or jumps forward.
+    fn verify_lease_still_held(&self) -> Result<()> {
+        if self.read_only {
+            return Err(crate::core::Error::CheckpointError(format!(
+                "this FileCheckpoint handle for '{}' is read-only and cannot write. It was \
+                 created with FileCheckpoint::read_only(), which takes no owner lease so it \
+                 can safely inspect a directory another instance owns. Use \
+                 FileCheckpoint::new() for the owning instance.",
+                self.checkpoint_dir.display()
+            )));
+        }
+
+        let lease = self.lease.lock().map_err(|_| {
+            crate::core::Error::CheckpointError(
+                "checkpoint owner lease lock poisoned during verification".into(),
+            )
+        })?;
+
+        match lease.as_ref() {
+            Some(lease) => lease
+                .verify_still_held("checkpoint")
+                .map_err(|error| crate::core::Error::CheckpointError(error.to_string())),
+            None => Err(crate::core::Error::CheckpointError(
+                "checkpoint owner lease is not held; refusing to write".into(),
+            )),
+        }
     }
 
     fn checkpoint_path(&self, source_type: &str) -> PathBuf {
@@ -665,6 +880,9 @@ fn set_checkpoint_file_mode(file: &File, mode: u32) -> Result<()> {
 impl Checkpoint for FileCheckpoint {
     async fn save(&mut self, offset: &dyn Offset, committed_event_count: u64) -> Result<()> {
         self.ensure_owner_lease()?;
+        // Fence the write: ownership acquired at startup is not ownership now. This also
+        // rejects a read-only handle, which by construction never took the lease.
+        self.verify_lease_still_held()?;
         self.ensure_directory()?;
 
         let source_type = offset.source_type().to_string();
@@ -710,6 +928,7 @@ impl Checkpoint for FileCheckpoint {
                 let _validated = MysqlOffset::from_bytes(&encoded)?;
                 Box::new(GenericOffset::new("mariadb", encoded))
             }
+            "sqlserver" => Box::new(SqlServerOffset::from_bytes(&encoded)?),
             other => Box::new(GenericOffset::new(other, encoded)),
         };
         Ok(Some(offset))
@@ -799,6 +1018,7 @@ mod tests {
         let offset = PostgresOffset {
             lsn: 42,
             slot_name: "slot-a".into(),
+            incremental_snapshot: None,
         };
 
         checkpoint.save(&offset, 7).await.unwrap();
@@ -814,6 +1034,7 @@ mod tests {
             binlog_file: "mysql-bin.000001".into(),
             binlog_pos: 8,
             source_flavor: "mysql".into(),
+            incremental_snapshot: None,
         };
         let encoded = crate::core::Offset::encode(&offset).unwrap();
         let decoded = MysqlOffset::from_bytes(&encoded).unwrap();
@@ -827,6 +1048,7 @@ mod tests {
         let offset = PostgresOffset {
             lsn: 99,
             slot_name: "slot-a".into(),
+            incremental_snapshot: None,
         };
 
         checkpoint.save(&offset, 11).await.unwrap();
@@ -878,6 +1100,7 @@ mod tests {
             binlog_file: "binlog.000001".into(),
             binlog_pos: 4,
             source_flavor: "mysql".into(),
+            incremental_snapshot: None,
         };
 
         let error = checkpoint.save(&offset, 1).await.unwrap_err();
@@ -908,6 +1131,7 @@ mod tests {
                 &PostgresOffset {
                     lsn: 1,
                     slot_name: "slot-a".into(),
+                    incremental_snapshot: None,
                 },
                 1,
             )
@@ -921,6 +1145,7 @@ mod tests {
                     binlog_file: "mysql-bin.000001".into(),
                     binlog_pos: 4,
                     source_flavor: "mysql".into(),
+                    incremental_snapshot: None,
                 },
                 2,
             )
@@ -947,6 +1172,7 @@ mod tests {
                 &PostgresOffset {
                     lsn: 4_294_967_296,
                     slot_name: "slot-a".into(),
+                    incremental_snapshot: None,
                 },
                 7,
             )
@@ -1020,6 +1246,7 @@ mod tests {
                 &PostgresOffset {
                     lsn: 99,
                     slot_name: "slot-a".into(),
+                    incremental_snapshot: None,
                 },
                 3,
             )
@@ -1091,6 +1318,7 @@ mod tests {
         let offset = PostgresOffset {
             lsn: 123,
             slot_name: "slot-a".into(),
+            incremental_snapshot: None,
         };
 
         checkpoint.save(&offset, 3).await.unwrap();
@@ -1158,6 +1386,7 @@ mod tests {
                 &PostgresOffset {
                     lsn: 200,
                     slot_name: "slot-a".into(),
+                    incremental_snapshot: None,
                 },
                 10,
             )
@@ -1169,6 +1398,7 @@ mod tests {
                 &PostgresOffset {
                     lsn: 150,
                     slot_name: "slot-a".into(),
+                    incremental_snapshot: None,
                 },
                 9,
             )
@@ -1187,6 +1417,7 @@ mod tests {
                 &PostgresOffset {
                     lsn: 300,
                     slot_name: "slot-a".into(),
+                    incremental_snapshot: None,
                 },
                 21,
             )
@@ -1198,6 +1429,7 @@ mod tests {
                 &PostgresOffset {
                     lsn: 301,
                     slot_name: "slot-a".into(),
+                    incremental_snapshot: None,
                 },
                 21,
             )
@@ -1252,24 +1484,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_checkpoint_allows_reentrant_owner_lease_within_process() {
+    async fn a_second_file_checkpoint_on_the_same_directory_is_refused() {
+        // This test previously asserted that a second `FileCheckpoint` on the same
+        // directory worked ("re-entrant lease"). It did — and that is exactly how two
+        // instances silently overwrote each other's records, because each holds its
+        // own lease state and rewrites the whole file. One instance per directory.
         let dir = tempdir().unwrap();
         let mut writer = FileCheckpoint::new(dir.path());
-        let reader = FileCheckpoint::new(dir.path());
 
         writer
-            .save(
-                &PostgresOffset {
-                    lsn: 77,
-                    slot_name: "slot-a".into(),
-                },
-                5,
-            )
+            .save(&PostgresOffset::new(77, "slot-a"), 5)
             .await
             .unwrap();
 
-        let loaded = reader.load().await.unwrap();
-        assert!(loaded.is_some());
-        assert_eq!(reader.get_committed_count().await.unwrap(), 5);
+        let second = FileCheckpoint::new(dir.path());
+        let error = second
+            .load()
+            .await
+            .expect_err("a second instance must be refused, not silently allowed");
+        assert!(
+            error
+                .to_string()
+                .contains("already held by another instance in this process"),
+            "error must name the real cause; got: {error}"
+        );
+
+        // The single owning instance keeps working, and sequential reuse is fine.
+        assert_eq!(writer.get_committed_count().await.unwrap(), 5);
+        drop(writer);
+        let reopened = FileCheckpoint::new(dir.path());
+        assert_eq!(reopened.get_committed_count().await.unwrap(), 5);
     }
 }

@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Configuration reference · rustcdc</title><meta name="description" content="Every rustcdc runtime and connector option, with the failure each one prevents."><link rel="canonical" href="https://hupe1980.github.io/rustcdc/docs/config-reference/">
+
+<meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large">
+<meta name="author" content="hupe1980">
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta property="og:type" content="article">
+<meta property="og:site_name" content="rustcdc">
+<meta property="og:title" content="Configuration reference">
+<meta property="og:description" content="Every rustcdc runtime and connector option, with the failure each one prevents.">
+<meta property="og:url" content="https://hupe1980.github.io/rustcdc/docs/config-reference/">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Configuration reference">
+<meta name="twitter:description" content="Every rustcdc runtime and connector option, with the failure each one prevents.">
+<meta name="twitter:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+
+<link rel="icon" href="https://hupe1980.github.io/rustcdc/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="rustcdc" href="https://hupe1980.github.io/rustcdc/atom.xml">
+<link rel="stylesheet" href="https://hupe1980.github.io/rustcdc/main.css"><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "rustcdc",
+  "description": "Embeddable change data capture for Rust. PostgreSQL, MySQL, MariaDB and SQL Server in one crate — no JVM, no sidecar.",
+  "url": "https://hupe1980.github.io/rustcdc",
+  "codeRepository": "https://github.com/hupe1980/rustcdc",
+  "programmingLanguage": { "@type": "ComputerLanguage", "name": "Rust" },
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": { "@type": "Person", "name": "hupe1980" },
+  "keywords": "change data capture, CDC, Rust, PostgreSQL, MySQL, MariaDB, SQL Server, logical replication, binlog, Debezium alternative"
+}
+</script><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Configuration reference",
+  "description": "Every rustcdc runtime and connector option, with the failure each one prevents.",
+  "url": "https://hupe1980.github.io/rustcdc/docs/config-reference/",
+  "inLanguage": "en",
+  "isPartOf": {
+    "@type": "WebSite",
+    "name": "rustcdc",
+    "url": "https://hupe1980.github.io/rustcdc"
+  },
+  "author": { "@type": "Person", "name": "hupe1980" }
+}
+</script>
+
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="https://hupe1980.github.io/rustcdc/">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">rustcdc</span>
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="https://hupe1980.github.io/rustcdc/docs/">Docs</a>
+      <a href="https://hupe1980.github.io/rustcdc/docs/getting-started/">Get started</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">API</a>
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+    </nav>
+    <button class="theme-toggle" type="button" aria-label="Toggle colour theme" data-theme-toggle>
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="wrap docs-layout">
+  <nav class="docs-sidebar" aria-label="Documentation">
+  <h2>Start</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;getting-started&#x2F;"
+         >
+        Getting started
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;architecture&#x2F;"
+         >
+        Architecture
+      </a>
+    </li>
+  </ul>
+  <h2>Build</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;api&#x2F;"
+         >
+        API guide
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;config-reference&#x2F;"
+         class="active" aria-current="page">
+        Configuration reference
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;schema-evolution&#x2F;"
+         >
+        Schema evolution
+      </a>
+    </li>
+  </ul>
+  <h2>Extend</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;adapter-sdk&#x2F;"
+         >
+        Sink adapter SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-transform-sdk&#x2F;"
+         >
+        WASM transform SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-conformance-contract&#x2F;"
+         >
+        WASM conformance contract
+      </a>
+    </li>
+  </ul>
+  <h2>Operate</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;deployment&#x2F;"
+         >
+        Deployment
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;runbook&#x2F;"
+         >
+        Operations runbook
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;troubleshooting&#x2F;"
+         >
+        Troubleshooting
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;security&#x2F;"
+         >
+        Security
+      </a>
+    </li>
+  </ul>
+  <h2>Verify</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;reliability-testing&#x2F;"
+         >
+        Reliability testing
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;feature-policy&#x2F;"
+         >
+        Feature policy
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;library-parity-matrix&#x2F;"
+         >
+        Comparison &amp; scope
+      </a>
+    </li>
+  </ul>
+</nav>
+
+  <article class="prose">
+    <h1>Configuration reference</h1>
+    <p class="page-meta">Every rustcdc runtime and connector option, with the failure each one prevents.</p>
+    <p><strong>Version:</strong> v0.1+<br />
+<strong>Audience:</strong> Platform engineers and application developers embedding rustcdc</p>
+<hr />
+<h2 id="table-of-contents"><a class="zola-anchor" href="#table-of-contents" aria-label="Anchor link for: table-of-contents">Table of Contents</a></h2>
+<ol>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#runtimeconfig">RuntimeConfig</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#runtime-consumption-model">Runtime Consumption Model</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#transaction-boundaries">Transaction boundaries</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#connector-capabilities">Connector Capabilities</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#column-type-mapping">Column type mapping</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#postgresql-source-configuration">PostgreSQL Source Configuration</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#mysql-source-configuration">MySQL Source Configuration</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#mariadb-source-configuration">MariaDB Source Configuration</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#sql-server-source-configuration">SQL Server Source Configuration</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#checkpoint-configuration">Checkpoint Configuration</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#observability-configuration">Observability Configuration</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#production-recommendations">Production Recommendations</a></li>
+</ol>
+<hr />
+<h2 id="runtimeconfig"><a class="zola-anchor" href="#runtimeconfig" aria-label="Anchor link for: runtimeconfig">RuntimeConfig</a></h2>
+<p>Core runtime configuration for CDC operations.</p>
+<h3 id="fields"><a class="zola-anchor" href="#fields" aria-label="Anchor link for: fields">Fields</a></h3>
+<table><thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>source</code></td><td><code>RuntimeSourceConfig</code></td><td>Typed source connector configuration; see <a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#postgresql-source-configuration">Source selection</a> below.</td></tr>
+<tr><td><code>snapshot_tables</code></td><td><code>Vec&lt;String&gt;</code></td><td>Tables for the <strong>classic blocking snapshot</strong>, applied on first run when no checkpoint exists. <code>"schema.table"</code> format. Empty means stream-only.</td></tr>
+<tr><td><code>incremental_snapshot</code></td><td><code>Option&lt;IncrementalSnapshotConfig&gt;</code></td><td>Tables for the <strong>non-blocking DBLog snapshot</strong>. Supersedes <code>snapshot_tables</code>; set one or the other, never both.</td></tr>
+<tr><td><code>checkpoint</code></td><td><code>C: Checkpoint</code></td><td>Durable position store. <code>InMemoryCheckpoint</code> for tests, <code>FileCheckpoint</code> or your own backend otherwise.</td></tr>
+<tr><td><code>schema_history</code></td><td><code>H: SchemaHistory</code></td><td>Schema/DDL history store, with the same in-memory-vs-durable choice.</td></tr>
+<tr><td><code>options</code></td><td><code>RuntimeOptions</code></td><td>Operational knobs; see the table below.</td></tr>
+</tbody></table>
+<h3 id="runtimeoptions"><a class="zola-anchor" href="#runtimeoptions" aria-label="Anchor link for: runtimeoptions">RuntimeOptions</a></h3>
+<p><code>RuntimeOptions</code> carries the operational knobs. Every default below is chosen to make a
+failure visible rather than to keep the pipeline running through one.</p>
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>observability</code></td><td><code>RuntimeObservability</code></td><td>no-op</td><td>Metrics collector and event tracer. Nothing is exported until you set these.</td></tr>
+<tr><td><code>max_buffer_size</code></td><td><code>usize</code></td><td>10 000</td><td>Maximum events per delivered batch.</td></tr>
+<tr><td><code>max_poll_wait_ms</code></td><td><code>u64</code></td><td>5 000</td><td>How long <code>poll_event_batch</code> waits before returning an empty batch.</td></tr>
+<tr><td><code>max_event_bytes</code></td><td><code>Option&lt;usize&gt;</code></td><td><code>None</code></td><td>Upper bound on serialized bytes per batch. <code>None</code> relies on <code>max_buffer_size</code> alone — which is a poor proxy when row sizes vary by orders of magnitude.</td></tr>
+<tr><td><code>transform_error_policy</code></td><td><code>TransformErrorPolicy</code></td><td><code>Halt</code></td><td>What a failing transform does. <code>Halt</code> preserves failure visibility; <code>Skip</code> requires a <code>dead_letter_handler</code>.</td></tr>
+<tr><td><code>dead_letter_handler</code></td><td><code>Option&lt;Arc&lt;dyn Fn(Event, Error)&gt;&gt;</code></td><td><code>None</code></td><td>Invoked for events discarded under <code>Skip</code>. Mandatory with that policy — a skipped event is otherwise unrecoverable.</td></tr>
+<tr><td><code>post_commit_source_confirm_policy</code></td><td><code>PostCommitSourceConfirmPolicy</code></td><td><code>FailFast</code></td><td>Behaviour when source confirmation fails <em>after</em> the durable checkpoint commit. <code>FailFast</code> surfaces the divergence; <code>Continue</code> is the availability-biased opt-in.</td></tr>
+<tr><td><code>idempotency</code></td><td><code>Option&lt;IdempotencyOptions&gt;</code></td><td>on, 100 000 keys</td><td>Runtime duplicate suppression. Disable with <code>with_idempotency_disabled()</code>.</td></tr>
+<tr><td><code>validate_events</code></td><td><code>bool</code></td><td><code>true</code></td><td>Enforce the event envelope contract on every event.</td></tr>
+<tr><td><code>schema_history_retention</code></td><td><code>Option&lt;SchemaHistoryRetention&gt;</code></td><td><code>keep_last(256)</code></td><td>Bounds unbounded schema-history growth.</td></tr>
+<tr><td><code>connection_retry</code></td><td><code>Option&lt;ConnectionRetryPolicy&gt;</code></td><td>enabled</td><td>Jittered exponential back-off for recoverable source connection errors. <code>None</code> propagates immediately.</td></tr>
+<tr><td><code>sink_close_timeout_ms</code></td><td><code>Option&lt;u64&gt;</code></td><td><code>None</code></td><td>Timeout applied to a registered sink's <code>close</code> during orderly shutdown.</td></tr>
+<tr><td><code>transaction_boundary</code></td><td><code>TransactionBoundaryPolicy</code></td><td><code>Split</code></td><td>Whether a delivered batch may end mid-transaction. See <a href="https://hupe1980.github.io/rustcdc/docs/config-reference/#transaction-boundaries">Transaction boundaries</a>.</td></tr>
+</tbody></table>
+<h3 id="runtimeconfig-builder-example"><a class="zola-anchor" href="#runtimeconfig-builder-example" aria-label="Anchor link for: runtimeconfig-builder-example">RuntimeConfig Builder Example</a></h3>
+<pre><code data-lang="rust">use rustcdc::{
+  checkpoint::InMemoryCheckpoint,
+  schema_history::InMemorySchemaHistory,
+  PostgresSourceConfig,
+  RuntimeConfig,
+  RuntimeSourceConfig,
+  SecretString,
+};
+
+let checkpoint = InMemoryCheckpoint::default();
+let schema_history = InMemorySchemaHistory::default();
+let source = PostgresSourceConfig {
+  host: &quot;localhost&quot;.into(),
+  port: 5432,
+  user: &quot;postgres&quot;.into(),
+  password: SecretString::from_callback(&quot;postgres-password&quot;, || {
+    std::env::var(&quot;CDC_RS_POSTGRES_PASSWORD&quot;)
+      .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
+  }),
+  database: &quot;mydb&quot;.into(),
+  replication_slot_name: &quot;rustcdc_slot&quot;.into(),
+  publication_name: &quot;rustcdc_publication&quot;.into(),
+  conn_timeout_secs: 30,
+  ..PostgresSourceConfig::default()
+};
+
+let config = RuntimeConfig::new(RuntimeSourceConfig::postgres(source), checkpoint, schema_history)
+    .with_snapshot_tables(vec![&quot;public.users&quot;.to_string(), &quot;public.orders&quot;.to_string()])
+    .with_max_buffer_size(50_000)
+    .with_max_poll_wait_ms(2_000)
+    .with_transform_error_policy(rustcdc::TransformErrorPolicy::Halt);
+</code></pre>
+<p>For env-driven bootstrapping, use explicit argument parsing in your host
+application and map values into typed source configs.</p>
+<p>Prefer the associated constructors when selecting a source in embedder code:</p>
+<ul>
+<li><code>RuntimeSourceConfig::postgres(...)</code></li>
+<li><code>RuntimeSourceConfig::mysql(...)</code></li>
+<li><code>RuntimeSourceConfig::mariadb(...)</code></li>
+<li><code>RuntimeSourceConfig::sqlserver(...)</code></li>
+<li><code>RuntimeSourceConfig::disabled()</code></li>
+</ul>
+<h2 id="runtime-consumption-model"><a class="zola-anchor" href="#runtime-consumption-model" aria-label="Anchor link for: runtime-consumption-model">Runtime Consumption Model</a></h2>
+<p>The preferred embedder surface is now batch-oriented rather than count-oriented.</p>
+<p><code>poll_event_batch()</code> returns an <code>EventBatch</code> containing the delivered events plus an <code>AckMode</code>. Re-polling before acknowledgement redelivers the same in-flight batch, which keeps retry behavior loss-safe.</p>
+<pre><code data-lang="rust">use rustcdc::{CdcRuntime, Result};
+
+async fn consume_once(runtime: &amp;mut CdcRuntime) -&gt; Result&lt;()&gt; {
+  let batch = runtime.poll_event_batch().await?;
+  if batch.is_empty() {
+    return Ok(());
+  }
+
+  runtime.commit_ack(batch.ack_mode()).await?;
+
+  Ok(())
+}
+</code></pre>
+<p>For partial acknowledgement, split the token and commit only the accepted prefix. The remaining suffix will be re-delivered on the next poll.</p>
+<pre><code data-lang="rust">use rustcdc::AckMode;
+# use rustcdc::{CdcRuntime, Result};
+# async fn example(runtime: &amp;mut CdcRuntime) -&gt; Result&lt;()&gt; {
+let batch = runtime.poll_event_batch().await?;
+if let AckMode::Required(token) = batch.ack_mode() {
+  let (accepted, _retry_later) = token.split_at(10)?;
+  runtime.commit_ack(accepted).await?;
+}
+# Ok(())
+# }
+</code></pre>
+<p><code>event_batches()</code> exposes the same model as a stream of non-empty <code>EventBatch</code> values.</p>
+<pre><code data-lang="rust">use futures_util::StreamExt;
+# use rustcdc::{CdcRuntime, Result};
+# async fn example(runtime: &amp;mut CdcRuntime) -&gt; Result&lt;()&gt; {
+let mut batches = runtime.event_batches();
+while let Some(batch) = batches.next().await {
+  let batch = batch?;
+  let _ = batch;
+}
+# Ok(())
+# }
+</code></pre>
+<p><code>poll_event_batch()</code> + <code>commit_ack(batch.ack_mode())</code> is now the canonical runtime acknowledgement API.</p>
+<h2 id="transaction-boundaries"><a class="zola-anchor" href="#transaction-boundaries" aria-label="Anchor link for: transaction-boundaries">Transaction boundaries</a></h2>
+<p>By default a delivered batch may end in the middle of a source transaction. Batches are cut on
+<code>max_buffer_size</code>, <code>max_event_bytes</code> and free commit-barrier capacity — none of which know
+anything about transactions. That is <code>TransactionBoundaryPolicy::Split</code>, and for most sinks it
+is the right trade: lowest latency, strictly bounded memory, and a transaction of any size is
+delivered across as many batches as needed.</p>
+<p>It is the wrong trade when your sink must apply each source transaction atomically — a ledger,
+a materialized view with cross-row invariants, anything where a half-applied transaction is a
+state that never existed upstream:</p>
+<pre><code data-lang="rust">use rustcdc::{RuntimeOptions, TransactionBoundaryPolicy};
+
+let options = RuntimeOptions::new()
+    .with_transaction_boundary(TransactionBoundaryPolicy::PreserveTransactions);
+# let _ = options;
+</code></pre>
+<p>Under <code>PreserveTransactions</code> the runtime withholds the trailing partial transaction from each
+batch and delivers it with the next one, so every batch ends on a transaction boundary.</p>
+<p><strong>How the runtime knows a transaction ended.</strong> Two signals count, and nothing else does:
+the event declares its own position (<code>event_index + 1 == total_events</code>), or a later event
+belongs to a different transaction. Absence of a signal is not proof of an ending, so a
+transaction whose remaining events have not arrived yet is <strong>withheld</strong> rather than
+delivered partially — including when the rest is simply still in flight from the source,
+which for a streaming connector is the normal case rather than the exception.</p>
+<p><strong>The one case it cannot honour.</strong> A single transaction larger than <code>max_buffer_size</code> does not
+fit in any batch. Trimming it would produce an empty batch forever — a silent, permanent stall,
+strictly worse than the split it is trying to avoid. The runtime therefore delivers such a
+transaction split and logs a <code>WARN</code> naming the transaction id and <code>max_buffer_size</code>. If the
+guarantee has to hold absolutely, raise <code>max_buffer_size</code> above the largest transaction the
+source produces.</p>
+<p>Events with no transaction metadata — snapshot rows, and connectors that do not report
+transaction boundaries — are treated as their own boundary and are never trimmed.</p>
+<h2 id="connector-capabilities"><a class="zola-anchor" href="#connector-capabilities" aria-label="Anchor link for: connector-capabilities">Connector Capabilities</a></h2>
+<p>Runtime source selection now exposes explicit connector capabilities through <code>ConnectorCapabilities</code>.</p>
+<pre><code data-lang="rust">use rustcdc::{ConnectorCapabilities, RuntimeSourceConfig};
+
+let source = RuntimeSourceConfig::Disabled;
+let caps: ConnectorCapabilities = source.capabilities();
+assert!(!caps.snapshot);
+assert!(!caps.handoff);
+assert!(!caps.ddl_capture);
+</code></pre>
+<p>When running a runtime instance, the same view is available from <code>source_capabilities()</code>:</p>
+<pre><code data-lang="rust"># use rustcdc::CdcRuntime;
+# fn example(runtime: &amp;CdcRuntime) {
+let caps = runtime.source_capabilities();
+if !caps.snapshot {
+  // Guard feature wiring in embedders before attempting snapshot mode.
+}
+# }
+</code></pre>
+<p>For configured PostgreSQL/MySQL/MariaDB/SQL Server sources, the runtime advertises
+<code>snapshot=true</code>, <code>handoff=true</code>, <code>ddl_capture=true</code>, <code>heartbeat=true</code>, and
+<code>schema_introspection=true</code>.</p>
+<p>The runtime now also provides an embeddable admin/introspection surface that includes
+capabilities, readiness/liveness, buffer depth, and delivery counters.</p>
+<pre><code data-lang="rust"># use rustcdc::{CdcRuntime, Result};
+# fn example(runtime: &amp;CdcRuntime) -&gt; Result&lt;()&gt; {
+let admin = runtime.admin_snapshot();
+assert_eq!(admin.state, &quot;running&quot;);
+
+let json = runtime.admin_snapshot_json()?;
+let prometheus = runtime.admin_metrics_prometheus();
+# let _ = (json, prometheus);
+# Ok(())
+# }
+</code></pre>
+<p><code>admin_snapshot_json()</code> is intended for control-plane APIs, and
+<code>admin_metrics_prometheus()</code> emits Prometheus-friendly text for embedding in
+lightweight health endpoints.</p>
+<p>The runtime constructor enforces capability guards. For example, configuring <code>snapshot_tables</code> with a source that does not support snapshots is rejected at construction time.</p>
+<hr />
+<h2 id="postgresql-source-configuration"><a class="zola-anchor" href="#postgresql-source-configuration" aria-label="Anchor link for: postgresql-source-configuration">PostgreSQL Source Configuration</a></h2>
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>host</code></td><td><code>String</code></td><td>—</td><td>Host FQDN or IP.</td></tr>
+<tr><td><code>port</code></td><td><code>u16</code></td><td>5432</td><td></td></tr>
+<tr><td><code>user</code></td><td><code>String</code></td><td>—</td><td>Needs the <code>REPLICATION</code> role.</td></tr>
+<tr><td><code>password</code></td><td><code>SecretString</code></td><td>—</td><td>Build with <code>SecretString::new</code>, <code>from_provider</code>, or <code>from_callback</code>.</td></tr>
+<tr><td><code>auth_mode</code></td><td><code>DatabaseAuthMode</code></td><td><code>Password</code></td><td><code>AwsIamToken</code> switches to short-lived IAM token semantics and requires TLS.</td></tr>
+<tr><td><code>database</code></td><td><code>String</code></td><td>—</td><td>Database to replicate from.</td></tr>
+<tr><td><code>replication_slot_name</code></td><td><code>String</code></td><td>—</td><td>e.g. <code>"rustcdc_slot"</code>.</td></tr>
+<tr><td><code>publication_name</code></td><td><code>String</code></td><td>—</td><td>Publication used by pgoutput.</td></tr>
+<tr><td><code>create_replication_slot_if_missing</code></td><td><code>bool</code></td><td><code>false</code></td><td><strong>Read the note below before setting this.</strong></td></tr>
+<tr><td><code>failover_slot</code></td><td><code>bool</code></td><td><code>false</code></td><td>Create the slot with <code>failover = true</code> (PostgreSQL 17+) so it survives a promotion. Only applies when this connector creates the slot.</td></tr>
+<tr><td><code>table_include_list</code></td><td><code>Vec&lt;String&gt;</code></td><td><code>[]</code></td><td>Allowlist in <code>"schema.table"</code> form. Non-empty means <em>only</em> these tables; takes precedence over the exclude list. Empty means all tables the publication carries.</td></tr>
+<tr><td><code>table_exclude_list</code></td><td><code>Vec&lt;String&gt;</code></td><td><code>[]</code></td><td>Blocklist in <code>"schema.table"</code> form. Ignored when the include list is non-empty.</td></tr>
+<tr><td><code>transport</code></td><td><code>TransportConfig</code></td><td>TLS</td><td>TLS by default when the <code>tls</code> feature is on.</td></tr>
+<tr><td><code>conn_timeout_secs</code></td><td><code>u64</code></td><td>30</td><td>Range 1–300.</td></tr>
+<tr><td><code>stream_poll_interval_ms</code></td><td><code>u64</code></td><td>50</td><td>Range 1–60 000.</td></tr>
+<tr><td><code>max_events_per_poll</code></td><td><code>usize</code></td><td>1 000</td><td>Range 1–100 000.</td></tr>
+<tr><td><code>slot_idle_advance_interval_ms</code></td><td><code>u64</code></td><td>30 000</td><td>See "Idle slots retain WAL" below. <code>0</code> disables.</td></tr>
+</tbody></table>
+<p><strong><code>create_replication_slot_if_missing</code> is not a convenience flag.</strong> A slot that vanishes
+mid-life — dropped by an operator, lost to a failover onto a replica that never had it, or
+invalidated by <code>max_slot_wal_keep_size</code> — is a <em>data-loss event</em>: the WAL it was retaining is
+gone. Recreating it silently restarts capture at the current WAL position and skips everything
+in between, which looks exactly like healthy operation. Set it <code>true</code> only for first-time
+provisioning or ephemeral test databases; otherwise create the slot out of band:</p>
+<pre><code data-lang="sql">SELECT pg_create_logical_replication_slot(&#39;rustcdc_slot&#39;, &#39;pgoutput&#39;);
+</code></pre>
+<p><strong>Idle slots retain WAL.</strong> When no committed events are delivered — an idle database, or a
+burst of rolled-back transactions — the slot's <code>confirmed_flush_lsn</code> stays pinned and
+PostgreSQL cannot recycle WAL segments. <code>slot_idle_advance_interval_ms</code> makes the connector
+periodically call <code>pg_replication_slot_advance(pg_current_wal_lsn())</code> after that much time
+without events. Disabling it on a long-lived stream is how a disk fills up.</p>
+<h3 id="secret-loading-patterns"><a class="zola-anchor" href="#secret-loading-patterns" aria-label="Anchor link for: secret-loading-patterns">Secret Loading Patterns</a></h3>
+<p>Connector passwords are now modeled as <code>SecretString</code>, not raw <code>String</code> values.</p>
+<pre><code data-lang="rust">use rustcdc::{SecretProvider, SecretString};
+use std::sync::Arc;
+
+struct VaultProvider;
+
+impl SecretProvider for VaultProvider {
+  fn resolve_secret(&amp;self, reference: &amp;str) -&gt; rustcdc::Result&lt;String&gt; {
+    Ok(format!(&quot;vault://{reference}&quot;))
+  }
+}
+
+let inline_secret = SecretString::new(&quot;postgres&quot;);
+let provider_secret = SecretString::from_provider(
+  &quot;vault&quot;,
+  &quot;database/postgres/password&quot;,
+  Arc::new(VaultProvider),
+);
+let callback_secret = SecretString::from_callback(&quot;runtime-refresh&quot;, || {
+  std::env::var(&quot;CDC_RS_ROTATED_PASSWORD&quot;)
+    .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
+});
+</code></pre>
+<p>Deferred secrets are resolved at validation/connect time and remain redacted in <code>Debug</code>/<code>Display</code> output.</p>
+<h3 id="feature-gated-encryption-transforms"><a class="zola-anchor" href="#feature-gated-encryption-transforms" aria-label="Anchor link for: feature-gated-encryption-transforms">Feature-Gated Encryption Transforms</a></h3>
+<p>Enable the <code>encryption</code> feature to use field-level AES-GCM encryption and decryption through the existing <code>MaskHashTransform</code> surface.</p>
+<pre><code data-lang="rust">use rustcdc::{MaskHashConfig, MaskHashTransform, MaskRule, SecretString};
+// `MaskHashConfig::mask_rules` is an `ahash::AHashMap`, re-exported by the crate&#39;s
+// dependency — `std::collections::HashMap` will not coerce.
+use ahash::AHashMap;
+
+let mut encrypt_rules = AHashMap::new();
+encrypt_rules.insert(
+  &quot;profile.phone&quot;.to_string(),
+  MaskRule::Encrypt(SecretString::from_callback(&quot;field-key&quot;, || {
+    std::env::var(&quot;CDC_RS_FIELD_KEY&quot;)
+      .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
+  })),
+);
+
+let encrypt_transform = MaskHashTransform::new(MaskHashConfig {
+  mask_rules: encrypt_rules,
+  default_rule: MaskRule::Null,
+});
+
+let mut decrypt_rules = AHashMap::new();
+decrypt_rules.insert(
+  &quot;profile.phone&quot;.to_string(),
+  MaskRule::Decrypt(SecretString::from_callback(&quot;field-key&quot;, || {
+    std::env::var(&quot;CDC_RS_FIELD_KEY&quot;)
+      .map_err(|error| rustcdc::Error::ConfigError(error.to_string()))
+  })),
+);
+
+let decrypt_transform = MaskHashTransform::new(MaskHashConfig {
+  mask_rules: decrypt_rules,
+  default_rule: MaskRule::Null,
+});
+</code></pre>
+<p>Encrypted fields are emitted as <code>enc:&lt;nonce_b64&gt;:&lt;ciphertext_b64&gt;</code> strings and decrypted back into their original JSON values with the matching key.</p>
+<p>Format/KDF contract for current unversioned payloads:</p>
+<ul>
+<li>AEAD: AES-256-GCM</li>
+<li>Nonce: 12 random bytes (base64 encoded)</li>
+<li>KDF: HKDF-SHA-256, 32-byte output, no salt</li>
+<li>HKDF info label: <code>b"rustcdc-field-encryption"</code></li>
+</ul>
+<p>Future backward-compatibility rollout plan (when versioning becomes necessary):</p>
+<ul>
+<li>phase 1: decrypt supports both legacy unversioned and new versioned payloads</li>
+<li>phase 2: encrypt emits only the new versioned payload format</li>
+<li>phase 3: after migration window, remove legacy decrypt support with release-note callout</li>
+</ul>
+<h3 id="field-mapping-transform"><a class="zola-anchor" href="#field-mapping-transform" aria-label="Anchor link for: field-mapping-transform">Field Mapping Transform</a></h3>
+<p>Use <code>FieldMappingTransform</code> for high-value schema-alignment operations without
+custom code:</p>
+<ul>
+<li>copy fields (<code>copy</code>)</li>
+<li>rename/move fields (<code>rename</code>)</li>
+<li>inject static literals (<code>set_literals</code>)</li>
+<li>remove fields (<code>remove</code>)</li>
+</ul>
+<p>Paths use dot notation (<code>profile.email</code>, <code>meta.source</code>).</p>
+<pre><code data-lang="rust">use rustcdc::{FieldMappingConfig, FieldMappingTransform};
+use serde_json::json;
+
+# fn example() -&gt; rustcdc::Result&lt;()&gt; {
+let transform = FieldMappingTransform::new(FieldMappingConfig {
+  copy: vec![(&quot;user.email&quot;.into(), &quot;email&quot;.into())],
+  rename: vec![(&quot;user.name&quot;.into(), &quot;user.full_name&quot;.into())],
+  set_literals: vec![(&quot;meta.pipeline&quot;.into(), json!(&quot;orders&quot;))],
+  remove: vec![&quot;legacy_flag&quot;.into()],
+  strict: true,
+})?;
+# Ok(())
+# }
+</code></pre>
+<p><code>strict = true</code> fails fast when copy/rename/remove source paths are missing,
+which helps catch drift during schema evolution and replay.</p>
+<p><strong>Replay determinism caveat (important):</strong></p>
+<ul>
+<li><code>MaskRule::Encrypt</code> is intentionally nonce-based and therefore non-deterministic.</li>
+<li>Replaying the same logical event will produce different ciphertext bytes.</li>
+<li>Use encryption rules only when your downstream dedup/idempotency logic does not depend on byte-identical payload replay.</li>
+<li>For replay-sensitive pipelines, prefer deterministic masking rules — <code>UnsaltedSha256</code>,
+<code>HmacSha256</code> (keyed, and the GDPR-appropriate choice), <code>Redact</code>, <code>Truncate</code>, <code>Null</code> — on
+fields that participate in replay comparisons. (There is no <code>MaskRule::Hash</code>.)</li>
+</ul>
+<p><strong>Transport Selection:</strong></p>
+<ul>
+<li><code>TransportConfig::tls()</code> (default with <code>tls</code> feature): TLS with system trust store</li>
+<li><code>TransportConfig::tls_with_ca_cert_path(path)</code>: TLS with explicit CA bundle</li>
+<li><code>TransportConfig::tls_insecure_skip_verify()</code>: TLS with certificate/hostname verification disabled (testing or tightly controlled air-gapped environments only)</li>
+<li><code>TransportConfig::plaintext()</code>: unencrypted transport — credentials and data transmitted in the clear</li>
+</ul>
+<p>Use TLS transport for all production connector configurations.
+<code>TransportConfig::plaintext()</code> is provided as an explicit escape hatch for trusted
+private networks and local integration testing only — never use it in production.</p>
+<p><strong>Connection Retry Policy:</strong></p>
+<p>Set <code>RuntimeOptions.connection_retry</code> to automatically retry recoverable source
+connection failures with truncated exponential backoff:</p>
+<pre><code data-lang="rust">use rustcdc::{ConnectionRetryPolicy, RuntimeOptions};
+# use rustcdc::{checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory,
+#     RuntimeConfig, RuntimeSourceConfig};
+# let (source, checkpoint, schema_history) = (
+#     RuntimeSourceConfig::Disabled,
+#     InMemoryCheckpoint::default(),
+#     InMemorySchemaHistory::default(),
+# );
+// `with_connection_retry` lives on `RuntimeOptions`, not on `RuntimeConfig`.
+let config = RuntimeConfig::new(source, checkpoint, schema_history)
+    .with_options(RuntimeOptions::new().with_connection_retry(
+        ConnectionRetryPolicy::new()
+            .with_max_retries(Some(5))    // None retries indefinitely
+            .with_initial_delay_ms(300)   // first retry after 300 ms
+            .with_max_delay_ms(10_000),   // backoff capped at 10 s
+    ));
+# let _ = config;
+</code></pre>
+<p>Retry applies to recoverable errors only: an unclassified <code>SourceError</code>, a <code>TimeoutError</code>,
+or a classified source error whose <code>SourceErrorKind</code> is recoverable
+(<code>NetworkTransient</code>, <code>QuotaExceeded</code>, <code>Unknown</code>). <code>AuthFailed</code>, <code>SchemaMismatch</code> and
+<code>SlotNotFound</code> are <strong>not</strong> retried — they need an operator, and retrying only delays the page.
+Fatal errors (<code>ConfigError</code>, <code>ValidationError</code>, <code>Unrecoverable</code>) propagate immediately.</p>
+<blockquote>
+<p><strong>Operational warning — <code>max_retries: None</code> (indefinite retry):</strong>
+Setting <code>max_retries: None</code> causes the runtime to retry failed source
+connections forever. This is appropriate for highly-available deployments
+where the source database is expected to recover (e.g., failover, transient
+network blips), but it <strong>masks dead source connections indefinitely</strong>.
+If your monitoring relies on <code>poll_event_batch</code> returning an error to
+trigger alerts or circuit-breaking logic, indefinite retry will prevent
+that signal from surfacing.</p>
+<p><strong>Recommendations for <code>max_retries: None</code>:</strong></p>
+<ul>
+<li>Set a <code>replication_lag_ms</code> alert threshold in your observability stack;
+rising lag indicates the source is unreachable even when the runtime
+does not surface an error.</li>
+<li>Emit a dead-man's-switch metric: if <code>total_events_polled</code> stops growing
+for an unexpectedly long window, treat the pipeline as stalled.</li>
+<li>Consider bounded retry (<code>max_retries: Some(N)</code>) with external restart
+orchestration (e.g., Kubernetes pod restart policy) so stalled pipelines
+surface cleanly rather than silently burning CPU in a backoff loop.</li>
+</ul>
+</blockquote>
+<h3 id="connector-specific-post-commit-confirmation-semantics"><a class="zola-anchor" href="#connector-specific-post-commit-confirmation-semantics" aria-label="Anchor link for: connector-specific-post-commit-confirmation-semantics">Connector-Specific Post-Commit Confirmation Semantics</a></h3>
+<p><code>commit_ack()</code> has a uniform API but connector confirmation semantics are intentionally connector-specific:</p>
+<ul>
+<li>PostgreSQL:
+<ul>
+<li>Runtime confirms durable progress via replication-slot LSN confirmation.</li>
+<li>Post-commit confirmation failures are governed by <code>PostCommitSourceConfirmPolicy</code>.</li>
+</ul>
+</li>
+<li>MySQL:
+<ul>
+<li>Runtime durability is checkpoint-first.</li>
+<li><code>confirm_lsn</code> is a connector compatibility hook and does not provide PostgreSQL-style slot advancement semantics.</li>
+</ul>
+</li>
+<li>SQL Server:
+<ul>
+<li>Runtime durability is checkpoint-first.</li>
+<li><code>confirm_lsn</code> is a connector compatibility hook and does not provide PostgreSQL-style slot advancement semantics.</li>
+</ul>
+</li>
+</ul>
+<p>Operationally, all connectors remain at-least-once at the runtime boundary; downstream idempotency remains mandatory.</p>
+<p><strong>Resumable Snapshot Cursoring:</strong></p>
+<ul>
+<li>Snapshot resume uses primary-key keyset cursoring (not <code>ctid</code>).</li>
+<li>Tables configured for resumable snapshots must expose a primary key.</li>
+<li>Tables without a primary key are rejected for resumable snapshots.</li>
+<li>This prevents physical tuple cursor instability during long-running snapshots with concurrent writes.</li>
+</ul>
+<hr />
+<h2 id="column-type-mapping"><a class="zola-anchor" href="#column-type-mapping" aria-label="Anchor link for: column-type-mapping">Column type mapping</a></h2>
+<p>Every event payload is JSON, so each source type is rendered into a JSON value. Where the
+mapping is not obvious — or where getting it wrong produces a <em>plausible</em> wrong value rather
+than an error — it is pinned by the type-fidelity integration suites
+(<code>tests/{postgres,mysql,sqlserver}_type_fidelity_integration.rs</code>), which assert exact decoded
+values against real databases.</p>
+<h3 id="the-general-rules"><a class="zola-anchor" href="#the-general-rules" aria-label="Anchor link for: the-general-rules">The general rules</a></h3>
+<table><thead><tr><th>Source shape</th><th>JSON</th><th>Note</th></tr></thead><tbody>
+<tr><td>Integers within <code>i64</code>/<code>u64</code></td><td>number</td><td></td></tr>
+<tr><td>Exact numerics (<code>DECIMAL</code>, <code>NUMERIC</code>, <code>MONEY</code>)</td><td>string</td><td>Rendering as a JSON number would round-trip through a float and lose the low digits.</td></tr>
+<tr><td>Floating point</td><td>number</td><td></td></tr>
+<tr><td>Booleans</td><td>boolean or number</td><td>PostgreSQL sends <code>t</code>/<code>f</code>; MySQL <code>TINYINT(1)</code> is a number.</td></tr>
+<tr><td>Text</td><td>string</td><td></td></tr>
+<tr><td>Binary (<code>BYTEA</code>, <code>VARBINARY</code>, <code>BLOB</code>)</td><td>string</td><td>Hex-encoded. Lossy UTF-8 transcoding would deliver a replacement character as though it were the stored value.</td></tr>
+<tr><td>JSON / JSONB</td><td>string</td><td>The source's own serialization, preserved verbatim.</td></tr>
+<tr><td><code>NULL</code></td><td><code>null</code></td><td>Present as a key with a null value — <strong>not</strong> an absent key.</td></tr>
+<tr><td>Value the source could not supply</td><td><em>key absent</em></td><td>Listed in <code>unavailable_columns</code>; see <a href="https://hupe1980.github.io/rustcdc/docs/api/#partial-payloads-read-this-before-writing-a-sink">partial payloads</a>.</td></tr>
+</tbody></table>
+<p>The last two rows are the distinction that matters most: a missing key means "no information",
+a <code>null</code> means "the value is NULL". Collapsing them is the classic CDC corruption.</p>
+<h3 id="mysql-and-mariadb-temporal-and-enumerated-types"><a class="zola-anchor" href="#mysql-and-mariadb-temporal-and-enumerated-types" aria-label="Anchor link for: mysql-and-mariadb-temporal-and-enumerated-types">MySQL and MariaDB temporal and enumerated types</a></h3>
+<p>The binlog stores these in encodings that do not survive a naive read, so the connector
+consults the table-map metadata rather than the value alone.</p>
+<table><thead><tr><th>Column type</th><th>JSON</th><th>Why it needs the metadata</th></tr></thead><tbody>
+<tr><td><code>DATE</code></td><td><code>"2026-07-20"</code></td><td>The binlog value is a full timestamp tuple shared with <code>DATETIME</code>. Rendering by value alone reports a midnight time the source never carried; truncating whenever the time is zero would instead strip the time from a <code>DATETIME</code> that genuinely falls at midnight. Only the column type separates them.</td></tr>
+<tr><td><code>DATETIME</code>, <code>TIMESTAMP</code></td><td><code>"2026-07-20T12:34:56"</code> or <code>...T12:34:56.789012</code></td><td>Fractional seconds appear only when the column declares them; a fixed width would fabricate or truncate precision.</td></tr>
+<tr><td><code>TIME</code></td><td><code>"d:hh:mm:ss.uuuuuu"</code></td><td>MySQL <code>TIME</code> can exceed 24 hours, so it is not a clock time.</td></tr>
+<tr><td><code>ENUM</code></td><td>the <strong>label</strong>, e.g. <code>"happy"</code></td><td>The binlog carries the 1-based ordinal. Forwarding it delivers <code>1</code> where the row holds <code>'happy'</code> — a plausible integer that silently means something different as soon as the enum's declaration order changes. The labels come from the table-map optional metadata.</td></tr>
+<tr><td><code>SET</code></td><td>comma-joined labels, e.g. <code>"read,write"</code></td><td>The binlog carries a little-endian bitmask in raw bytes. Reading those bytes as text yields control characters that are valid UTF-8, so the wrong reading fails <em>silently</em>.</td></tr>
+</tbody></table>
+<p>Both <code>ENUM</code> and <code>SET</code> labels require <code>binlog_row_metadata=FULL</code>, which rustcdc already demands
+for column names and key flags. Without it the values fall back to the raw ordinal and mask.</p>
+<blockquote>
+<p><strong>ENUM ordinal <code>0</code></strong> is MySQL's "invalid value" slot, produced by a non-strict-mode insert of
+an unlisted value. It maps to the empty string, as MySQL itself displays it — not to the
+first variant.</p>
+</blockquote>
+<h3 id="sql-server"><a class="zola-anchor" href="#sql-server" aria-label="Anchor link for: sql-server">SQL Server</a></h3>
+<p><code>DECIMAL</code>, <code>NUMERIC</code>, <code>MONEY</code>, <code>DATETIME2</code>, <code>DATETIMEOFFSET</code>, <code>TIME</code>, <code>UNIQUEIDENTIFIER</code>,
+<code>VARBINARY</code> and <code>XML</code> all decode to their exact values. This is called out explicitly because
+an earlier version of the connector returned <code>null</code> for five of them — indistinguishable from a
+genuine SQL NULL, delivered as an authentic value, with no error anywhere. The fidelity suite
+now asserts non-null on every <code>NOT NULL</code> column precisely to catch a regression of that shape.</p>
+<h2 id="mysql-source-configuration"><a class="zola-anchor" href="#mysql-source-configuration" aria-label="Anchor link for: mysql-source-configuration">MySQL Source Configuration</a></h2>
+<h3 id="required-server-configuration"><a class="zola-anchor" href="#required-server-configuration" aria-label="Anchor link for: required-server-configuration">Required server configuration</a></h3>
+<p><code>MysqlConnection::connect()</code> validates these and <strong>fails loud</strong> if they are unsuitable. Each
+unsuitable value would otherwise cause <em>silent</em> corruption rather than an error at decode time,
+so none of them can be downgraded to a warning.</p>
+<table><thead><tr><th>Variable</th><th>Required</th><th>MySQL 8 default</th><th>Why</th></tr></thead><tbody>
+<tr><td><code>log_bin</code></td><td><code>ON</code></td><td><code>ON</code></td><td>No binlog, no CDC.</td></tr>
+<tr><td><code>binlog_format</code></td><td><code>ROW</code></td><td><code>ROW</code></td><td>Statement-based logging cannot identify which rows changed.</td></tr>
+<tr><td><code>binlog_row_metadata</code></td><td><strong><code>FULL</code></strong></td><td>⚠️ <strong><code>MINIMAL</code></strong></td><td>Under <code>MINIMAL</code> the binlog carries <strong>no column names and no primary-key flags</strong>. Events would be emitted with positional placeholder keys (<code>@0</code>, <code>@1</code>, …) instead of real column names, and <code>primary_key: None</code> — which additionally disables snapshot/stream duplicate suppression and incremental-snapshot override suppression.</td></tr>
+<tr><td><code>binlog_row_image</code></td><td><strong><code>FULL</code></strong></td><td><code>FULL</code></td><td>Under <code>MINIMAL</code>/<code>NOBLOB</code> the binlog records only a subset of columns, so UPDATE after-images are emitted as if complete while silently missing columns. A consumer performing an upsert would erase them.</td></tr>
+<tr><td><code>binlog_row_value_options</code></td><td><strong>empty</strong></td><td>empty</td><td><code>PARTIAL_JSON</code> makes the server write JSON <em>diffs</em> instead of complete values. rustcdc cannot apply those diffs, and the failure recurs on every restart because it precedes the checkpoint advance — stalling the pipeline permanently.</td></tr>
+</tbody></table>
+<pre><code data-lang="sql">SET GLOBAL binlog_row_metadata     = FULL;
+SET GLOBAL binlog_row_image        = FULL;
+SET GLOBAL binlog_row_value_options = &#39;&#39;;
+</code></pre>
+<p>Persist these in <code>my.cnf</code> so they survive a restart. Note <code>binlog_row_metadata</code> only affects binlog
+events written <strong>after</strong> the change — existing binlog content keeps the old encoding.</p>
+<blockquote>
+<p><strong>MariaDB:</strong> <code>binlog_row_metadata</code> and <code>binlog_row_value_options</code> do not exist. The connector
+detects their absence and skips those two checks rather than failing.</p>
+</blockquote>
+<h3 id="gtid-positioning"><a class="zola-anchor" href="#gtid-positioning" aria-label="Anchor link for: gtid-positioning">GTID positioning</a></h3>
+<p>When <code>gtid_mode_enabled</code> is set, the connector resumes by <strong>GTID set</strong> rather than by
+binlog file+position. This matters for failover: binlog coordinates are <em>server-local</em>, so
+<code>binlog.000042:88371</code> addresses an unrelated point on a promoted replica. GTIDs are globally
+meaningful, which is the reason they exist.</p>
+<p>The checkpoint accumulates a full executed set (<code>uuid:1-500,uuid2:1-7</code>), coalescing adjacent
+intervals so it stays compact over a long-running stream. Encoding of the
+<code>COM_BINLOG_DUMP_GTID</code> packet is delegated to <code>mysql_common</code>, so the text form written to the
+checkpoint and the bytes sent to the server cannot drift apart.</p>
+<blockquote>
+<p><strong>The checkpoint must be a set, never a single GTID.</strong> Resuming from a bare <code>uuid:501</code>
+tells the server the replica has executed only transaction 501, and it replays 1–500.</p>
+</blockquote>
+<h3 id="binlog-retention-and-resume-safety"><a class="zola-anchor" href="#binlog-retention-and-resume-safety" aria-label="Anchor link for: binlog-retention-and-resume-safety">Binlog retention and resume safety</a></h3>
+<p>On resume, the connector verifies the server still retains everything the checkpointed
+position has not consumed, using <code>GTID_SUBSET(@@GLOBAL.gtid_purged, &lt;checkpoint position&gt;)</code>.
+If the check fails it stops with an <code>Unrecoverable</code> error naming the exact purged-but-unread
+transactions, rather than letting the server fail with a generic <em>"could not find first log
+file"</em> that says nothing about how much was lost.</p>
+<p>Set <code>binlog_expire_logs_seconds</code> so retention comfortably exceeds your maximum expected
+connector downtime. (Note <code>expire_logs_days</code> was <strong>removed</strong> in MySQL 8.4 — using it now
+raises an error at startup.)</p>
+<blockquote>
+<p>The subset direction matters and is easy to invert. The correct test is "everything the
+server purged, I already consumed". The intuitive inverse — "my position is a subset of
+what the server executed" — <strong>fails open</strong>: it reports available in precisely the gap case.</p>
+</blockquote>
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>host</code></td><td><code>String</code></td><td>—</td><td>Host FQDN or IP.</td></tr>
+<tr><td><code>port</code></td><td><code>u16</code></td><td>3306</td><td></td></tr>
+<tr><td><code>user</code></td><td><code>String</code></td><td>—</td><td>Needs <code>REPLICATION CLIENT</code> and <code>SELECT</code>.</td></tr>
+<tr><td><code>password</code></td><td><code>SecretString</code></td><td>—</td><td></td></tr>
+<tr><td><code>auth_mode</code></td><td><code>DatabaseAuthMode</code></td><td><code>Password</code></td><td><code>AwsIamToken</code> requires TLS.</td></tr>
+<tr><td><code>database</code></td><td><code>String</code></td><td>—</td><td>Database to replicate from.</td></tr>
+<tr><td><code>server_id</code></td><td><code>u32</code></td><td><code>0</code> — <strong>invalid on purpose</strong></td><td>Replication server id for the binlog client. MySQL treats <code>0</code> as unassigned and <code>validate()</code> rejects it, so you must set a unique id per connector instance.</td></tr>
+<tr><td><code>server_flavor</code></td><td><code>ServerFlavor</code></td><td><code>Mysql</code></td><td>Set <code>MariaDb</code> when connecting to MariaDB: <code>source_type()</code> then returns <code>"mariadb"</code> and checkpoints use a separate <code>checkpoint_mariadb.json</code>.</td></tr>
+<tr><td><code>gtid_mode_enabled</code></td><td><code>bool</code></td><td><code>false</code></td><td>Whether GTID mode is enabled on the server.</td></tr>
+<tr><td><code>binlog_format_check</code></td><td><code>bool</code></td><td><code>true</code></td><td>Validate <code>binlog_format = ROW</code> before streaming.</td></tr>
+<tr><td><code>table_include_list</code></td><td><code>Vec&lt;String&gt;</code></td><td><code>[]</code></td><td>Allowlist in <code>"schema.table"</code> form; takes precedence over the exclude list.</td></tr>
+<tr><td><code>table_exclude_list</code></td><td><code>Vec&lt;String&gt;</code></td><td><code>[]</code></td><td>Blocklist in <code>"schema.table"</code> form.</td></tr>
+<tr><td><code>transport</code></td><td><code>TransportConfig</code></td><td>TLS</td><td></td></tr>
+<tr><td><code>conn_timeout_secs</code></td><td><code>u64</code></td><td>30</td><td>Range 1–300.</td></tr>
+<tr><td><code>stream_poll_interval_ms</code></td><td><code>u64</code></td><td>50</td><td>Range 1–60 000.</td></tr>
+<tr><td><code>max_events_per_poll</code></td><td><code>usize</code></td><td>1 000</td><td>Range 1–100 000.</td></tr>
+<tr><td><code>handoff_overlap_drain_budget_ms</code></td><td><code>u64</code></td><td><code>stream_poll_interval_ms * 8</code></td><td>Wall-clock budget for draining overlap events during snapshot-to-stream handoff. <code>0</code> disables the budget (unlimited drain).</td></tr>
+</tbody></table>
+<p><strong>Why <code>server_id</code> has no auto-generated default.</strong> Auto-generation was removed because
+PID-hash collisions caused silent event loss in multi-instance deployments: two readers
+sharing a <code>server_id</code> cause the server to evict one, and the eviction surfaces only as a
+generic disconnect. A deliberately invalid default forces the decision to be made once,
+explicitly.</p>
+<p><strong>Why the handoff drain has a time budget.</strong> The previous implementation capped overlap
+draining at a hard-coded eight polls. On a high-traffic table with large batches that cap was
+exhausted before the overlap was drained, and the connector silently delivered duplicate rows.
+The budget is wall-clock instead, and exhausting it emits a <code>WARN</code> naming the residual count
+rather than passing the duplicates off as normal.</p>
+<h3 id="mysql-gtid-string-format"><a class="zola-anchor" href="#mysql-gtid-string-format" aria-label="Anchor link for: mysql-gtid-string-format">MySQL GTID String Format</a></h3>
+<pre><code data-lang="text">GTID Set Format: &quot;source_id:interval[, ...]&quot;
+Example: &quot;3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5&quot;
+</code></pre>
+<hr />
+<h2 id="mariadb-source-configuration"><a class="zola-anchor" href="#mariadb-source-configuration" aria-label="Anchor link for: mariadb-source-configuration">MariaDB Source Configuration</a></h2>
+<p>MariaDB uses the same MySQL-protocol transport stack, but rustcdc exposes it as a first-class source identity through [<code>MariaDbSourceConfig</code>] and <code>RuntimeSourceConfig::mariadb(...)</code>.</p>
+<p>Use MariaDB when you need distinct checkpoint naming, source labeling, or runtime routing while keeping the same underlying binlog transport semantics as MySQL.</p>
+<pre><code data-lang="rust">use rustcdc::{MariaDbSourceConfig, RuntimeSourceConfig};
+
+// `MariaDbSourceConfig` is a newtype over `MysqlSourceConfig` that forces
+// `server_flavor = MariaDb`, so it is built with the `with_*` builders rather than
+// struct-literal syntax.
+let source = MariaDbSourceConfig::default()
+    .with_host(&quot;localhost&quot;)
+    .with_port(3306)
+    .with_user(&quot;cdc_user&quot;)
+    .with_password(&quot;cdc_password&quot;) // prefer SecretString::from_callback in production
+    .with_database(&quot;events&quot;);
+
+let runtime_source = RuntimeSourceConfig::mariadb(source);
+# let _ = runtime_source;
+</code></pre>
+<p>MariaDB supports the same startup, snapshot, and streaming modes as MySQL, but emits <code>source_type() == "mariadb"</code> and uses MariaDB-specific checkpoint identifiers.</p>
+<blockquote>
+<p><strong>GTID Format Warning:</strong> MariaDB uses a distinct GTID format — <code>domain_id-server_id-sequence_no</code>
+(e.g. <code>0-1-12345</code>) — that is <strong>incompatible</strong> with MySQL's <code>uuid:interval</code> format
+(e.g. <code>3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5</code>). Never mix checkpoint files between
+MySQL and MariaDB instances, even if the schemas are identical. Doing so will produce
+invalid GTID resume positions and cause the connector to silently restart replication
+from the beginning or raise a fatal position error. Always use
+<code>RuntimeSourceConfig::mariadb(...)</code> (not <code>RuntimeSourceConfig::mysql(...)</code>) when
+connecting to a MariaDB server to ensure correct checkpoint namespace isolation.</p>
+</blockquote>
+<hr />
+<h2 id="sql-server-source-configuration"><a class="zola-anchor" href="#sql-server-source-configuration" aria-label="Anchor link for: sql-server-source-configuration">SQL Server Source Configuration</a></h2>
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>host</code></td><td><code>String</code></td><td>—</td><td>Host FQDN or IP.</td></tr>
+<tr><td><code>port</code></td><td><code>u16</code></td><td>1433</td><td></td></tr>
+<tr><td><code>user</code></td><td><code>String</code></td><td>—</td><td>Needs the <code>CDC_ADMIN</code> role.</td></tr>
+<tr><td><code>password</code></td><td><code>SecretString</code></td><td>—</td><td></td></tr>
+<tr><td><code>database</code></td><td><code>String</code></td><td>—</td><td>CDC must be enabled on this database.</td></tr>
+<tr><td><code>instance_name</code></td><td><code>Option&lt;String&gt;</code></td><td><code>None</code></td><td>Named instance; <code>None</code> uses the default instance.</td></tr>
+<tr><td><code>cdc_enabled</code></td><td><code>bool</code></td><td><code>true</code></td><td>Require CDC to be enabled on the database, and fail connect if it is not.</td></tr>
+<tr><td><code>cdc_schema</code></td><td><code>String</code></td><td><code>"cdc"</code></td><td>Schema holding the CDC capture tables.</td></tr>
+<tr><td><code>capture_truncate_events</code></td><td><code>bool</code></td><td><code>false</code></td><td>Capture <code>TRUNCATE TABLE</code> via a DDL trigger; see below.</td></tr>
+<tr><td><code>table_include_list</code></td><td><code>Vec&lt;String&gt;</code></td><td><code>[]</code></td><td>Allowlist in <code>"schema.table"</code> form; takes precedence over the exclude list.</td></tr>
+<tr><td><code>table_exclude_list</code></td><td><code>Vec&lt;String&gt;</code></td><td><code>[]</code></td><td>Blocklist in <code>"schema.table"</code> form.</td></tr>
+<tr><td><code>transport</code></td><td><code>TransportConfig</code></td><td>TLS</td><td></td></tr>
+<tr><td><code>conn_timeout_secs</code></td><td><code>u64</code></td><td>30</td><td>Range 1–300.</td></tr>
+<tr><td><code>prereq_pool_size</code></td><td><code>usize</code></td><td>4</td><td>Concurrent connections used by prerequisite checks. Range 1–64.</td></tr>
+<tr><td><code>stream_poll_interval_ms</code></td><td><code>u64</code></td><td>5 000</td><td>Range 1–60 000. <strong>See the latency note below.</strong></td></tr>
+<tr><td><code>max_events_per_poll</code></td><td><code>usize</code></td><td>10 000</td><td>Range 1–100 000.</td></tr>
+</tbody></table>
+<blockquote>
+<p><strong>⚠️ SQL Server CDC is polling-based, not event-driven.</strong> p99 latency is approximately
+<code>stream_poll_interval_ms</code> plus the CDC capture agent's own delay. Reduce the interval to
+500–1 000 ms for latency-sensitive workloads, and do not compare SQL Server latency numbers
+against the log-based connectors as though they measured the same thing.</p>
+</blockquote>
+<p><strong>Capturing TRUNCATE.</strong> SQL Server's <code>cdc.fn_cdc_get_all_changes_*</code> cannot see <code>TRUNCATE TABLE</code>, because TRUNCATE bypasses row-level logging. With <code>capture_truncate_events = true</code>,
+rustcdc creates a shadow table (<code>[&lt;cdc_schema&gt;].[rustcdc_truncate_events]</code>) and a
+database-level DDL trigger (<code>rustcdc_truncate_capture</code>) on first connect. The trigger records
+the affected schema and table along with the current CDC maximum LSN from
+<code>sys.fn_cdc_get_max_lsn()</code>; rustcdc polls that shadow table alongside the change tables and
+emits <code>Operation::Truncate</code> positioned after all DML at or before that LSN.</p>
+<p>The connected user needs <code>db_owner</code>, <code>db_ddladmin</code> or <code>sysadmin</code> to create those objects —
+already required for CDC administration. They are created idempotently and survive restarts.
+Ordering is <strong>best-effort</strong>: the truncate lands after every DML change whose commit LSN is at
+or before the LSN captured when the trigger fired, which is as precise as SQL Server allows
+for an operation that bypasses row-level logging.</p>
+<h3 id="aws-iam-auth-mode-mysql-postgresql"><a class="zola-anchor" href="#aws-iam-auth-mode-mysql-postgresql" aria-label="Anchor link for: aws-iam-auth-mode-mysql-postgresql">AWS IAM Auth Mode (MySQL/PostgreSQL)</a></h3>
+<p>For RDS-style IAM database auth, use connector <code>auth_mode = AwsIamToken</code> and
+resolve the token through <code>SecretString::from_callback</code> (or provider) so each
+new connection can fetch a fresh short-lived token.</p>
+<p>TLS is mandatory when <code>auth_mode = AwsIamToken</code>.</p>
+<h3 id="sql-server-connection-string-format"><a class="zola-anchor" href="#sql-server-connection-string-format" aria-label="Anchor link for: sql-server-connection-string-format">SQL Server Connection String Format</a></h3>
+<pre><code data-lang="text">sqlserver://user:password@host:port;database=dbname;TrustServerCertificate=no;Encrypt=yes
+</code></pre>
+<hr />
+<h2 id="checkpoint-configuration"><a class="zola-anchor" href="#checkpoint-configuration" aria-label="Anchor link for: checkpoint-configuration">Checkpoint Configuration</a></h2>
+<h3 id="inmemorycheckpoint"><a class="zola-anchor" href="#inmemorycheckpoint" aria-label="Anchor link for: inmemorycheckpoint">InMemoryCheckpoint</a></h3>
+<p><strong>Use Case:</strong> Development, testing, single-machine deployments (volatile)</p>
+<pre><code data-lang="rust">use rustcdc::checkpoint::InMemoryCheckpoint;
+
+let checkpoint = InMemoryCheckpoint::default();
+// Keeps checkpoint in memory; lost on process restart
+</code></pre>
+<h3 id="filecheckpoint"><a class="zola-anchor" href="#filecheckpoint" aria-label="Anchor link for: filecheckpoint">FileCheckpoint</a></h3>
+<p><strong>Use Case:</strong> Local machine deployments; single-machine production (persistent but not HA)</p>
+<pre><code data-lang="rust">use rustcdc::checkpoint::FileCheckpoint;
+
+// Default: 0o600 (owner read/write only — enforced at load time).
+let checkpoint = FileCheckpoint::new(&quot;/var/rustcdc/checkpoints&quot;);
+// Stores checkpoint in JSON file; atomically updated via write-rename.
+</code></pre>
+<p>File permissions are enforced at load time: if the checkpoint file on disk has
+mode bits accessible to group or other (e.g. 0o644), the load is rejected with
+a <code>CheckpointError</code>. This protects connection credentials embedded in the
+checkpoint from unauthorized access. Do not set a mode wider than 0o600.</p>
+<p><strong>File Location Format:</strong></p>
+<pre><code data-lang="text">/var/rustcdc/checkpoints/checkpoint_postgres.json
+/var/rustcdc/checkpoints/checkpoint_mysql.json
+/var/rustcdc/checkpoints/checkpoint_sqlserver.json
+</code></pre>
+<p><strong>File Content Example:</strong></p>
+<pre><code data-lang="json">{
+  &quot;checkpoint_format_version&quot;: 1,
+  &quot;source_type&quot;: &quot;postgres&quot;,
+  &quot;committed_event_count&quot;: 12345,
+  &quot;offset&quot;: {
+    &quot;lsn&quot;: 281474976711680,
+    &quot;slot_name&quot;: &quot;rustcdc_postgres_abc123&quot;
+  },
+  &quot;content_checksum&quot;: &quot;9f2b...(SHA-256 over the four fields above)&quot;
+}
+</code></pre>
+<p><strong>Checkpoint Format Version Policy:</strong></p>
+<ul>
+<li><code>checkpoint_format_version = 1</code> is the current write format.</li>
+<li><code>checkpoint_format_version</code> is required for all file checkpoints.</li>
+<li>Unknown or missing versions are rejected at load time.</li>
+<li>rustcdc intentionally enforces fail-closed checkpoint decoding for format safety.</li>
+</ul>
+<p><strong>Integrity:</strong></p>
+<p><code>content_checksum</code> is a SHA-256 over the other fields. It is verified on every load, and a
+mismatch is a hard error rather than a resume.</p>
+<p>This matters because checkpoint corruption is otherwise <strong>silent</strong>. A flipped bit in an LSN
+or binlog position does not fail to parse — it resumes capture from a <em>wrong</em> position,
+skipping events with no error raised anywhere.</p>
+<p>The practical consequence: <strong>checkpoint files cannot be edited or generated by hand.</strong> For
+disaster recovery use the bundled seeding tool, which computes the checksum, writes
+atomically, applies the required file mode and fsyncs the parent directory:</p>
+<pre><code data-lang="bash">cargo run --example seed_checkpoint --features postgres -- \
+  --dir /var/rustcdc/checkpoints \
+  --source-type postgres \
+  --committed-event-count 0 \
+  --offset &#39;{&quot;lsn&quot;: 281474976711680, &quot;slot_name&quot;: &quot;rustcdc_postgres_new&quot;}&#39;
+</code></pre>
+<p>Programmatically, the same operation is <code>FileCheckpoint::restore_from_record</code>.</p>
+<h3 id="custom-durable-checkpoint-backend"><a class="zola-anchor" href="#custom-durable-checkpoint-backend" aria-label="Anchor link for: custom-durable-checkpoint-backend">Custom Durable Checkpoint Backend</a></h3>
+<p><strong>Use Case:</strong> High-availability or centralized checkpoint management</p>
+<p>rustcdc currently ships with <code>FileCheckpoint</code> and <code>InMemoryCheckpoint</code>.
+For HA or centralized state, implement the <code>Checkpoint</code> trait against your
+own storage backend (for example PostgreSQL, Redis, object storage, or a
+platform metadata service).</p>
+<hr />
+<h2 id="observability-configuration"><a class="zola-anchor" href="#observability-configuration" aria-label="Anchor link for: observability-configuration">Observability Configuration</a></h2>
+<h3 id="noop-observability-default"><a class="zola-anchor" href="#noop-observability-default" aria-label="Anchor link for: noop-observability-default">NoOp Observability (Default)</a></h3>
+<pre><code data-lang="rust">use rustcdc::{RuntimeConfig, RuntimeObservability};
+
+// Metrics and tracing are disabled by default via explicit runtime observability options.
+let config = RuntimeConfig::new(...)
+  .with_observability(RuntimeObservability::default());
+</code></pre>
+<h3 id="opentelemetry-observability"><a class="zola-anchor" href="#opentelemetry-observability" aria-label="Anchor link for: opentelemetry-observability">OpenTelemetry Observability</a></h3>
+<pre><code data-lang="rust">// Requires --features metrics. `RuntimeConfig::new(...)` stands in for your own
+// source/checkpoint/schema-history arguments.
+use rustcdc::{OTelConfig, OTelEventTracer, OTelMetricsCollector, RuntimeConfig, RuntimeObservability};
+use std::sync::Arc;
+
+let otel_config = OTelConfig::new(
+    &quot;http://otel-collector:4317&quot;,  // OTLP gRPC endpoint
+    &quot;rustcdc&quot;,                        // Service name
+    &quot;0.8.0&quot;,                         // Service version
+    &quot;production&quot;,                    // Environment
+);
+
+let metrics = Arc::new(OTelMetricsCollector::with_otlp_exporter(otel_config.clone())?);
+let tracer = Arc::new(OTelEventTracer::with_otlp_exporter(otel_config)?);
+
+let config = RuntimeConfig::new(...)
+  .with_observability(
+    RuntimeObservability::default()
+      .with_metrics(metrics)
+      .with_tracer(tracer)
+  );
+</code></pre>
+<h3 id="runtime-admin-metrics-cdcruntime-admin-metrics-prometheus"><a class="zola-anchor" href="#runtime-admin-metrics-cdcruntime-admin-metrics-prometheus" aria-label="Anchor link for: runtime-admin-metrics-cdcruntime-admin-metrics-prometheus">Runtime Admin Metrics (<code>CdcRuntime::admin_metrics_prometheus()</code>)</a></h3>
+<table><thead><tr><th>Metric</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>rustcdc_runtime_readiness</code></td><td>Gauge</td><td>Runtime readiness (1 ready, 0 not ready)</td></tr>
+<tr><td><code>rustcdc_runtime_liveness</code></td><td>Gauge</td><td>Runtime liveness (1 alive, 0 stopped)</td></tr>
+<tr><td><code>rustcdc_runtime_buffer_depth</code></td><td>Gauge</td><td>Buffered events waiting for delivery</td></tr>
+<tr><td><code>rustcdc_runtime_in_flight_events</code></td><td>Gauge</td><td>Delivered but uncommitted events</td></tr>
+<tr><td><code>rustcdc_runtime_events_polled_total</code></td><td>Counter</td><td>Total events delivered by runtime batches</td></tr>
+<tr><td><code>rustcdc_runtime_events_committed_total</code></td><td>Counter</td><td>Total acknowledged and checkpointed events</td></tr>
+<tr><td><code>rustcdc_runtime_events_deduplicated_total</code></td><td>Counter</td><td>Total events suppressed by idempotency guard</td></tr>
+<tr><td><code>rustcdc_runtime_events_skipped_total</code></td><td>Counter</td><td>Events permanently dropped by <code>TransformErrorPolicy::Skip</code>. <strong>Any non-zero value means data was lost</strong> — the checkpoint advances past skipped events, so they are never replayed. Alert on any increase.</td></tr>
+<tr><td><code>rustcdc_runtime_idempotency_evictions_total</code></td><td>Counter</td><td>Fingerprints evicted because the idempotency window filled. Growing steadily means the window is too small for this deployment's replay distance; raise <code>IdempotencyOptions::capacity</code>.</td></tr>
+<tr><td><code>rustcdc_runtime_idempotency_unidentifiable_total</code></td><td>Counter</td><td>Events passed through undeduplicated because they carry neither transaction metadata nor a resolvable primary key. Expected for keyless tables.</td></tr>
+<tr><td><code>rustcdc_runtime_health</code></td><td>Gauge</td><td>Derived health verdict, one series per <code>verdict</code> label. <strong><code>rustcdc_runtime_health{verdict="stalled"} == 1</code> is the alert rule</strong> — <code>state</code> alone cannot distinguish healthy-idle from stalled.</td></tr>
+<tr><td><code>rustcdc_runtime_checkpoint_age_ms</code></td><td>Gauge</td><td>Age of last durable checkpoint</td></tr>
+<tr><td><code>rustcdc_runtime_replication_lag_ms</code></td><td>Gauge</td><td>Estimated source lag in milliseconds</td></tr>
+<tr><td><code>rustcdc_replication_slot_lag_bytes</code></td><td>Gauge</td><td>PostgreSQL replication slot WAL lag (<code>pg_current_wal_lsn - confirmed_flush_lsn</code>). <strong>The single most operationally critical PostgreSQL signal</strong>: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth.</td></tr>
+<tr><td><code>rustcdc_runtime_source_capability</code></td><td>Gauge</td><td>Connector capability flags, one series per <code>capability</code> label</td></tr>
+</tbody></table>
+<h3 id="opentelemetry-exported-metrics-otelmetricscollector"><a class="zola-anchor" href="#opentelemetry-exported-metrics-otelmetricscollector" aria-label="Anchor link for: opentelemetry-exported-metrics-otelmetricscollector">OpenTelemetry Exported Metrics (<code>OTelMetricsCollector</code>)</a></h3>
+<table><thead><tr><th>Metric</th><th>Type</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>rustcdc.events.processed</code></td><td>Counter</td><td>Total events successfully processed</td></tr>
+<tr><td><code>rustcdc.events.filtered</code></td><td>Counter</td><td>Events dropped by transform pipeline</td></tr>
+<tr><td><code>rustcdc.errors</code></td><td>Counter</td><td>Total errors encountered</td></tr>
+<tr><td><code>rustcdc.checkpoint.committed_count</code></td><td>Counter</td><td>Total events committed to checkpoint</td></tr>
+<tr><td><code>rustcdc.replication_lag_ms</code></td><td>Gauge</td><td>Estimated replication lag in milliseconds</td></tr>
+<tr><td><code>rustcdc.replication_lag_events</code></td><td>Gauge</td><td>Estimated events not yet consumed</td></tr>
+<tr><td><code>rustcdc.checkpoint_offset</code></td><td>Gauge</td><td>Current checkpoint offset (source-specific encoding)</td></tr>
+<tr><td><code>rustcdc.buffer_size</code></td><td>Gauge</td><td>Current buffered event count</td></tr>
+<tr><td><code>rustcdc.snapshot_progress</code></td><td>Gauge</td><td>Current snapshot completion percentage</td></tr>
+<tr><td><code>rustcdc.event_processing_duration</code></td><td>Histogram</td><td>Event processing latency (ms)</td></tr>
+<tr><td><code>rustcdc.checkpoint_commit_duration</code></td><td>Histogram</td><td>Checkpoint commit latency (ms)</td></tr>
+</tbody></table>
+<h3 id="structured-log-fields"><a class="zola-anchor" href="#structured-log-fields" aria-label="Anchor link for: structured-log-fields">Structured Log Fields</a></h3>
+<p>All logs include:</p>
+<ul>
+<li><code>source_type</code>: Connector type (postgres, mysql, sqlserver)</li>
+<li><code>timestamp</code>: ISO 8601 timestamp</li>
+<li><code>level</code>: ERROR, WARN, INFO, DEBUG, TRACE</li>
+<li><code>message</code>: Human-readable description</li>
+<li>Context fields (when applicable):
+<ul>
+<li><code>table</code>: Table name</li>
+<li><code>event_count</code>: Number of events</li>
+<li><code>offset</code>: Source-specific position</li>
+<li><code>error</code>: Error details (sanitized)</li>
+</ul>
+</li>
+</ul>
+<p><strong>Enable Logging:</strong></p>
+<pre><code data-lang="bash"># Set environment variable
+export RUST_LOG=rustcdc=info,rustcdc::source=debug
+
+# Run with structured JSON output
+export RUST_LOG_FORMAT=json
+</code></pre>
+<hr />
+<h2 id="production-recommendations"><a class="zola-anchor" href="#production-recommendations" aria-label="Anchor link for: production-recommendations">Production Recommendations</a></h2>
+<h3 id="checkpoint-store-selection"><a class="zola-anchor" href="#checkpoint-store-selection" aria-label="Anchor link for: checkpoint-store-selection">Checkpoint Store Selection</a></h3>
+<table><thead><tr><th>Scenario</th><th>Recommendation</th><th>Rationale</th></tr></thead><tbody>
+<tr><td>Single machine, restarts acceptable</td><td>FileCheckpoint</td><td>Simple, no external dependencies</td></tr>
+<tr><td>HA cluster, centralized state</td><td>Custom <code>Checkpoint</code> backend</td><td>Integrates with your existing HA metadata store</td></tr>
+<tr><td>Development/testing</td><td>InMemoryCheckpoint</td><td>Fast iteration; ephemeral OK</td></tr>
+</tbody></table>
+<h3 id="buffer-size-tuning"><a class="zola-anchor" href="#buffer-size-tuning" aria-label="Anchor link for: buffer-size-tuning">Buffer Size Tuning</a></h3>
+<pre><code data-lang="text">Throughput-Focused (High Latency Acceptable):
+  max_buffer_size = 100_000
+  max_poll_wait_ms = 5_000
+  → Batches large groups; fewer commits
+
+Latency-Focused (Lower Throughput):
+  max_buffer_size = 10_000
+  max_poll_wait_ms = 1_000
+  → Frequent commits; sub-second latency
+
+Balanced (Recommended):
+  max_buffer_size = 50_000
+  max_poll_wait_ms = 2_000
+  → ~50-100ms latency; 1K-2K commits/sec
+</code></pre>
+<h3 id="connector-scaling-envelopes"><a class="zola-anchor" href="#connector-scaling-envelopes" aria-label="Anchor link for: connector-scaling-envelopes">Connector Scaling Envelopes</a></h3>
+<p>Use these as baseline production profiles, then tune with real workload evidence.</p>
+<p><strong>SQL Server connector tuning (<code>SqlServerSourceConfig</code>):</strong></p>
+<table><thead><tr><th>Profile</th><th style="text-align: right"><code>prereq_pool_size</code></th><th style="text-align: right"><code>stream_poll_interval_ms</code></th><th style="text-align: right"><code>max_events_per_poll</code></th><th>Suggested Use</th></tr></thead><tbody>
+<tr><td>Low-latency</td><td style="text-align: right">4</td><td style="text-align: right">250</td><td style="text-align: right">5000</td><td>Near-real-time dashboards, lower throughput</td></tr>
+<tr><td>Balanced (default-ish)</td><td style="text-align: right">4-8</td><td style="text-align: right">1000</td><td style="text-align: right">10000-20000</td><td>General production workloads</td></tr>
+<tr><td>Throughput-heavy</td><td style="text-align: right">8-16</td><td style="text-align: right">2000-5000</td><td style="text-align: right">20000-50000</td><td>Backfills, bursty write workloads</td></tr>
+</tbody></table>
+<p><strong>PostgreSQL connector tuning (<code>PostgresSourceConfig</code>):</strong></p>
+<table><thead><tr><th>Profile</th><th style="text-align: right"><code>stream_poll_interval_ms</code></th><th style="text-align: right"><code>max_events_per_poll</code></th><th>Suggested Use</th></tr></thead><tbody>
+<tr><td>Low-latency</td><td style="text-align: right">10-25</td><td style="text-align: right">250-500</td><td>Interactive workloads where update freshness is prioritized</td></tr>
+<tr><td>Balanced (default-ish)</td><td style="text-align: right">50-250</td><td style="text-align: right">1000-5000</td><td>General production workloads</td></tr>
+<tr><td>Throughput-heavy</td><td style="text-align: right">250-1000</td><td style="text-align: right">5000-20000</td><td>Backfills, high sustained ingest</td></tr>
+</tbody></table>
+<p><strong>MySQL connector tuning (<code>MysqlSourceConfig</code>):</strong></p>
+<table><thead><tr><th>Profile</th><th style="text-align: right"><code>stream_poll_interval_ms</code></th><th style="text-align: right"><code>max_events_per_poll</code></th><th>Suggested Use</th></tr></thead><tbody>
+<tr><td>Low-latency</td><td style="text-align: right">10-25</td><td style="text-align: right">250-500</td><td>Interactive workloads where update freshness is prioritized</td></tr>
+<tr><td>Balanced (default-ish)</td><td style="text-align: right">50-250</td><td style="text-align: right">1000-5000</td><td>General production workloads</td></tr>
+<tr><td>Throughput-heavy</td><td style="text-align: right">250-1000</td><td style="text-align: right">5000-20000</td><td>Backfills, high sustained ingest</td></tr>
+</tbody></table>
+<p>For sustained saturation, combine connector tuning with runtime delivery controls (<code>RuntimeOptions.max_buffer_size</code>, <code>RuntimeOptions.max_poll_wait_ms</code>) and horizontal partitioning.</p>
+<h3 id="tls-best-practices"><a class="zola-anchor" href="#tls-best-practices" aria-label="Anchor link for: tls-best-practices">TLS Best Practices</a></h3>
+<pre><code data-lang="rust">use rustcdc::TransportConfig;
+
+// Recommended: explicit CA bundle in production.
+let transport =
+    TransportConfig::tls_with_ca_cert_path(Some(&quot;/etc/ssl/certs/company-ca.pem&quot;.to_string()));
+
+// Also valid: rely on system trust store.
+let transport = TransportConfig::tls();
+
+// Testing/air-gapped fallback only: disable certificate + hostname verification.
+let transport = TransportConfig::tls_insecure_skip_verify();
+
+// Plaintext: only for trusted private networks or local integration testing.
+// Credentials and event data are transmitted unencrypted.
+let transport = TransportConfig::plaintext();
+</code></pre>
+<p>Connector config helpers now provide explicit transport selection APIs:</p>
+<pre><code data-lang="rust">// Requires the mysql, postgres and sqlserver features together.
+let mysql_cfg = MysqlSourceConfig::default().with_plaintext_transport();
+let pg_cfg = PostgresSourceConfig::default().with_plaintext_transport();
+let mssql_cfg = SqlServerSourceConfig::default().with_plaintext_transport();
+
+let mysql_tls = mysql_cfg.with_tls_transport();
+</code></pre>
+<h3 id="monitoring-checklist"><a class="zola-anchor" href="#monitoring-checklist" aria-label="Anchor link for: monitoring-checklist">Monitoring Checklist</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"/>
+Alert on <code>rustcdc_runtime_replication_lag_ms &gt; 30000</code> (30s)</li>
+<li><input disabled="" type="checkbox"/>
+Alert on <code>rustcdc_runtime_liveness == 0</code></li>
+<li><input disabled="" type="checkbox"/>
+Alert on <code>rustcdc_runtime_checkpoint_age_ms &gt; 10000</code></li>
+<li><input disabled="" type="checkbox"/>
+Alert on <code>rustcdc_runtime_events_polled_total</code> trend deviation &gt; 20%</li>
+<li><input disabled="" type="checkbox"/>
+Dashboard: Replication lag trend over 24h</li>
+<li><input disabled="" type="checkbox"/>
+Dashboard: Event processing rate (events/sec)</li>
+<li><input disabled="" type="checkbox"/>
+Dashboard: Checkpoint commit latency distribution</li>
+</ul>
+<hr />
+<p><strong>Last Updated:</strong> May 25, 2026<br />
+<strong>Version:</strong> Configuration Reference v0.1+</p>
+
+
+    <nav class="page-nav" aria-label="Documentation">
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;api&#x2F;">← API guide</a>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;schema-evolution&#x2F;">Schema evolution →</a>
+    </nav>
+  </article>
+</div>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>rustcdc</strong> — embeddable change data capture for Rust.
+      Licensed MIT OR Apache-2.0.
+    </p>
+    <nav aria-label="Footer">
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+      <a href="https:&#x2F;&#x2F;crates.io&#x2F;crates&#x2F;rustcdc" rel="noopener">crates.io</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">docs.rs</a>
+      <a href="https://hupe1980.github.io/rustcdc/atom.xml">Feed</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+// Theme: honour the stored choice, else the OS preference. Inline and tiny so it
+// runs before paint and the page does not flash the wrong theme.
+(function () {
+  var key = "rustcdc-theme";
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem(key); } catch (e) { /* private mode */ }
+  if (stored) root.setAttribute("data-theme", stored);
+
+  var button = document.querySelector("[data-theme-toggle]");
+  if (!button) return;
+  button.addEventListener("click", function () {
+    var current = root.getAttribute("data-theme");
+    var next = current === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) { /* ignore */ }
+  });
+})();
+</script>
+</body>
+</html>

@@ -322,6 +322,7 @@ async fn run_postgres_process_kill_replay_scenario(
             &PostgresOffset {
                 lsn: baseline_lsn,
                 slot_name: "rustcdc_runtime_crash_slot".to_string(),
+                incremental_snapshot: None,
             },
             0,
         )
@@ -427,7 +428,7 @@ async fn run_postgres_process_kill_replay_scenario(
 
     runtime.commit_ack(replay_batch.ack_mode()).await?;
 
-    let reader_after = FileCheckpoint::new(checkpoint_dir.path());
+    let reader_after = FileCheckpoint::read_only(checkpoint_dir.path());
     assert_eq!(
         reader_after.get_committed_count().await?,
         worker_batch_len as u64

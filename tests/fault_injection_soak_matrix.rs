@@ -12,7 +12,7 @@ use rustcdc::{
         SourceFault,
     },
     source::{HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle},
-    Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    Event, Operation, SourceMetadata,
 };
 
 const SOAK_TOTAL_EVENTS: usize = 5_000;
@@ -33,26 +33,17 @@ impl rustcdc::Offset for TestOffset {
 
 fn make_event(source_name: &str, id: usize) -> Event {
     let ts = id as u64 + 1;
-    Event {
-        before: None,
-        after: Some(serde_json::json!({"id": id, "payload": format!("evt-{id}")})),
-        op: Operation::Insert,
-        source: SourceMetadata {
-            source_name: source_name.to_string(),
-            offset: id.to_string(),
-            timestamp: ts,
-        },
-        ts,
-        schema: Some("public".to_string()),
-        table: "soak_table".to_string(),
-        primary_key: Some(vec!["id".to_string()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    Event::builder("soak_table".to_string(), Operation::Insert)
+        .after(serde_json::json!({"id": id, "payload": format!("evt-{id}")}))
+        .source(SourceMetadata::new(
+            source_name.to_string(),
+            id.to_string(),
+            ts,
+        ))
+        .ts(ts)
+        .schema("public".to_string())
+        .primary_key(["id"])
+        .build()
 }
 
 fn make_batches(source_name: &str, total: usize, batch_size: usize) -> VecDeque<Vec<Event>> {

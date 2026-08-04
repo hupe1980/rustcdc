@@ -311,6 +311,7 @@ async fn run_mariadb_process_kill_replay_scenario(
         binlog_file: baseline_file,
         binlog_pos: baseline_pos,
         source_flavor: "mysql".into(),
+        incremental_snapshot: None,
     };
     let baseline_bytes = serde_json::to_vec(&baseline_offset)
         .map_err(|error| rustcdc::Error::CheckpointError(error.to_string()))?;
@@ -411,7 +412,7 @@ async fn run_mariadb_process_kill_replay_scenario(
 
     runtime.commit_ack(replay_batch.ack_mode()).await?;
 
-    let reader_after = FileCheckpoint::new(checkpoint_dir.path());
+    let reader_after = FileCheckpoint::read_only(checkpoint_dir.path());
     assert_eq!(
         reader_after.get_committed_count().await?,
         worker_batch_len as u64

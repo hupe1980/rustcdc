@@ -1,6 +1,5 @@
 //! Field mapping transform for copy/rename/set/remove operations.
 
-use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use crate::core::{Error, Event, Result};
@@ -8,6 +7,7 @@ use crate::core::{Error, Event, Result};
 use super::Transform;
 
 #[derive(Debug, Clone, Default, PartialEq)]
+/// Copy, rename, inject, and remove fields by dotted path.
 pub struct FieldMappingConfig {
     /// Copy value from source path to destination path.
     pub copy: Vec<(String, String)>,
@@ -43,7 +43,9 @@ struct SetRule {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Applies [`FieldMappingConfig`] to event payloads.
 pub struct FieldMappingTransform {
+    /// Mapping configuration.
     pub config: FieldMappingConfig,
     copy_rules: Vec<MoveRule>,
     rename_rules: Vec<MoveRule>,
@@ -52,6 +54,12 @@ pub struct FieldMappingTransform {
 }
 
 impl FieldMappingTransform {
+    /// Build a transform, validating the mapping up front.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] for a malformed
+    /// path or a mapping that would collide.
     pub fn new(config: FieldMappingConfig) -> Result<Self> {
         let copy_rules = config
             .copy
@@ -176,9 +184,8 @@ impl FieldMappingTransform {
     }
 }
 
-#[async_trait]
 impl Transform for FieldMappingTransform {
-    async fn apply(&self, event: &mut Event) -> Result<bool> {
+    fn apply(&self, event: &mut Event) -> Result<bool> {
         self.apply_payload(&mut event.before)?;
         self.apply_payload(&mut event.after)?;
         Ok(true)
@@ -326,7 +333,7 @@ mod tests {
         .unwrap();
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         assert_eq!(event.after.unwrap()["email"], "alice@example.com");
     }
 
@@ -339,7 +346,7 @@ mod tests {
         .unwrap();
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         let after = event.after.unwrap();
         assert_eq!(after["user"]["full_name"], "alice");
         assert!(after["user"].get("name").is_none());
@@ -354,7 +361,7 @@ mod tests {
         .unwrap();
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         assert_eq!(event.after.unwrap()["meta"]["source"], "mysql");
     }
 
@@ -367,7 +374,7 @@ mod tests {
         .unwrap();
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         assert!(event.after.unwrap().get("legacy").is_none());
     }
 
@@ -381,7 +388,7 @@ mod tests {
         .unwrap();
 
         let mut first_event = event();
-        assert!(transform.apply(&mut first_event).await.is_err());
+        assert!(transform.apply(&mut first_event).is_err());
 
         let transform = FieldMappingTransform::new(FieldMappingConfig {
             remove: vec!["missing".into()],
@@ -391,7 +398,7 @@ mod tests {
         .unwrap();
 
         let mut second_event = event();
-        assert!(transform.apply(&mut second_event).await.is_err());
+        assert!(transform.apply(&mut second_event).is_err());
     }
 
     #[tokio::test]
@@ -407,8 +414,8 @@ mod tests {
 
         let mut first = event();
         let mut second = event();
-        assert!(transform.apply(&mut first).await.unwrap());
-        assert!(transform.apply(&mut second).await.unwrap());
+        assert!(transform.apply(&mut first).unwrap());
+        assert!(transform.apply(&mut second).unwrap());
 
         assert_eq!(first.after, second.after);
         assert_eq!(first.before, second.before);
@@ -456,7 +463,7 @@ mod tests {
             unavailable_columns: Vec::new(),
             before_unavailable_columns: Vec::new(),
         };
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert!(e.before.is_none(), "before must remain None for Truncate");
         assert!(e.after.is_none(), "after must remain None for Truncate");
     }
@@ -490,7 +497,7 @@ mod tests {
             unavailable_columns: Vec::new(),
             before_unavailable_columns: Vec::new(),
         };
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         assert!(e.after.is_none(), "after must remain None for Delete");
         // set_literal IS applied to the before payload (it's present).
         assert_eq!(e.before.as_ref().unwrap()["_source"], "cdc");

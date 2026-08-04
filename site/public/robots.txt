@@ -1,0 +1,5 @@
+# rustcdc documentation site.
+User-agent: *
+Allow: /
+
+Sitemap: https://hupe1980.github.io/rustcdc/sitemap.xml

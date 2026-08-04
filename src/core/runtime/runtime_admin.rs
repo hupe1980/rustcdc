@@ -57,6 +57,14 @@ impl CdcRuntime {
             total_events_committed: self.total_events_committed,
             total_events_deduplicated: self.total_events_deduplicated,
             total_events_skipped: self.total_events_skipped,
+            idempotency_evictions: self
+                .idempotency_guard
+                .as_ref()
+                .map(|guard| guard.eviction_count()),
+            idempotency_unidentifiable_passthrough: self
+                .idempotency_guard
+                .as_ref()
+                .map(|guard| guard.unidentifiable_passthrough_count()),
             health: self.derive_health(now_ms),
             started_at_ms: self.started_at_ms,
             last_poll_at_ms: self.last_poll_at_ms,
@@ -237,6 +245,24 @@ impl CdcRuntime {
              rustcdc_runtime_events_deduplicated_total{{source_type=\"{source_type}\"}} {}",
             admin.total_events_deduplicated
         )?;
+
+        if let Some(evictions) = admin.idempotency_evictions {
+            writeln!(
+                w,
+                "# HELP rustcdc_runtime_idempotency_evictions_total Fingerprints evicted because the idempotency window filled. Growing steadily means the window is too small for this deployment's replay distance, so older duplicates stop being suppressed; raise IdempotencyOptions::capacity.\n\
+                 # TYPE rustcdc_runtime_idempotency_evictions_total counter\n\
+                 rustcdc_runtime_idempotency_evictions_total{{source_type=\"{source_type}\"}} {evictions}"
+            )?;
+        }
+
+        if let Some(passthrough) = admin.idempotency_unidentifiable_passthrough {
+            writeln!(
+                w,
+                "# HELP rustcdc_runtime_idempotency_unidentifiable_total Events passed through undeduplicated because they carry neither transaction metadata nor a resolvable primary key. Expected for keyless tables; deduplicating them could drop distinct rows.\n\
+                 # TYPE rustcdc_runtime_idempotency_unidentifiable_total counter\n\
+                 rustcdc_runtime_idempotency_unidentifiable_total{{source_type=\"{source_type}\"}} {passthrough}"
+            )?;
+        }
 
         writeln!(
             w,

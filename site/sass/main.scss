@@ -1,0 +1,501 @@
+// rustcdc site styles.
+//
+// Constraints that shaped this: no webfonts (a docs page should not block paint on a
+// third-party request), no JS framework, and both colour themes first-class — people
+// read API docs at night. System font stacks render natively on every platform and
+// cost nothing.
+
+// ─── Tokens ─────────────────────────────────────────────────────────────────
+
+:root {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --measure: 74ch;
+  --wrap: 1200px;
+  --radius: 10px;
+  --radius-sm: 6px;
+
+  --step--1: clamp(0.82rem, 0.79rem + 0.14vw, 0.89rem);
+  --step-0: clamp(1rem, 0.96rem + 0.2vw, 1.08rem);
+  --step-1: clamp(1.2rem, 1.12rem + 0.4vw, 1.4rem);
+  --step-2: clamp(1.5rem, 1.35rem + 0.75vw, 1.95rem);
+  --step-3: clamp(1.95rem, 1.65rem + 1.5vw, 2.9rem);
+  --step-4: clamp(2.4rem, 1.85rem + 2.7vw, 4rem);
+}
+
+// Light is the default; dark applies when the OS asks for it or the reader picks it.
+:root,
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-subtle: #f6f7f9;
+  --bg-raised: #ffffff;
+  --border: #e3e6ea;
+  --border-strong: #cbd1d9;
+  --text: #14171f;
+  --text-muted: #5b6472;
+  --accent: #b3441a;
+  --accent-soft: #fdf1ec;
+  --link: #a63d16;
+  --code-bg: #f6f7f9;
+  --shadow: 0 1px 2px rgb(16 24 40 / 6%), 0 8px 24px rgb(16 24 40 / 6%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    --bg: #0b1020;
+    --bg-subtle: #121829;
+    --bg-raised: #141b2e;
+    --border: #232c44;
+    --border-strong: #35415e;
+    --text: #e8ecf4;
+    --text-muted: #99a3b8;
+    --accent: #ff9b6a;
+    --accent-soft: #24192099;
+    --link: #ffb08a;
+    --code-bg: #0e1526;
+    --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 28px rgb(0 0 0 / 35%);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0b1020;
+  --bg-subtle: #121829;
+  --bg-raised: #141b2e;
+  --border: #232c44;
+  --border-strong: #35415e;
+  --text: #e8ecf4;
+  --text-muted: #99a3b8;
+  --accent: #ff9b6a;
+  --accent-soft: #24192099;
+  --link: #ffb08a;
+  --code-bg: #0e1526;
+  --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 28px rgb(0 0 0 / 35%);
+}
+
+// ─── Base ───────────────────────────────────────────────────────────────────
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.wrap {
+  width: 100%;
+  max-width: var(--wrap);
+  margin-inline: auto;
+  padding-inline: 1.25rem;
+}
+
+a { color: var(--link); text-underline-offset: 0.18em; }
+a:hover { text-decoration-thickness: 2px; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  background: var(--accent);
+  color: #fff;
+  padding: 0.6rem 1rem;
+  z-index: 100;
+
+  &:focus { left: 0; }
+}
+
+h1, h2, h3, h4 {
+  line-height: 1.2;
+  letter-spacing: -0.018em;
+  margin: 2.2rem 0 0.75rem;
+  scroll-margin-top: 5rem;
+}
+h1 { font-size: var(--step-3); margin-top: 0; }
+h2 { font-size: var(--step-2); }
+h3 { font-size: var(--step-1); }
+
+// ─── Header ─────────────────────────────────────────────────────────────────
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(140%) blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+
+.header-inner {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  min-height: 3.75rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--text);
+  text-decoration: none;
+  letter-spacing: -0.02em;
+}
+
+.brand-mark {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 3px;
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 45%, #6f7bff));
+}
+
+.site-nav {
+  margin-left: auto;
+  display: flex;
+  gap: 1.1rem;
+  font-size: var(--step--1);
+  flex-wrap: wrap;
+
+  a {
+    color: var(--text-muted);
+    text-decoration: none;
+    font-weight: 500;
+
+    &:hover { color: var(--text); }
+  }
+}
+
+.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  width: 2rem;
+  height: 2rem;
+  cursor: pointer;
+  line-height: 1;
+
+  &:hover { color: var(--text); border-color: var(--border-strong); }
+}
+
+// ─── Landing ────────────────────────────────────────────────────────────────
+
+.hero {
+  padding: clamp(3rem, 8vw, 6.5rem) 0 clamp(2rem, 5vw, 4rem);
+  border-bottom: 1px solid var(--border);
+  background:
+    radial-gradient(60rem 30rem at 70% -10%, var(--accent-soft), transparent 60%);
+}
+
+.hero h1 {
+  font-size: var(--step-4);
+  max-width: 20ch;
+  margin-bottom: 1rem;
+}
+
+.hero .lede {
+  font-size: var(--step-1);
+  color: var(--text-muted);
+  max-width: 58ch;
+  margin: 0 0 2rem;
+}
+
+.eyebrow {
+  display: inline-block;
+  font-size: var(--step--1);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.7rem 1.15rem;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  font-size: var(--step--1);
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: transform 0.12s ease;
+
+  &:hover { transform: translateY(-1px); }
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.btn-secondary {
+  background: var(--bg-raised);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.install {
+  margin-top: 2rem;
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.9rem;
+  color: var(--text);
+}
+
+.section {
+  padding: clamp(2.5rem, 6vw, 4.5rem) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-title {
+  font-size: var(--step-2);
+  margin: 0 0 0.5rem;
+}
+
+.section-lede {
+  color: var(--text-muted);
+  max-width: var(--measure);
+  margin: 0 0 2rem;
+}
+
+.grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr));
+}
+
+.card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.35rem;
+
+  h3 { margin: 0 0 0.5rem; font-size: 1.05rem; }
+  p { margin: 0; color: var(--text-muted); font-size: var(--step--1); }
+  code { font-size: 0.85em; }
+}
+
+.card-link {
+  text-decoration: none;
+  color: inherit;
+  display: block;
+  transition: border-color 0.12s ease, transform 0.12s ease;
+
+  &:hover {
+    border-color: var(--accent);
+    transform: translateY(-2px);
+  }
+}
+
+// ─── Content ────────────────────────────────────────────────────────────────
+
+.docs-layout {
+  display: grid;
+  grid-template-columns: 16rem minmax(0, 1fr);
+  gap: 2.5rem;
+  padding: 2.5rem 0 4rem;
+  align-items: start;
+}
+
+@media (max-width: 60rem) {
+  .docs-layout { grid-template-columns: 1fr; gap: 1.5rem; }
+  .docs-sidebar { position: static !important; max-height: none !important; }
+}
+
+.docs-sidebar {
+  position: sticky;
+  top: 4.75rem;
+  max-height: calc(100vh - 6rem);
+  overflow-y: auto;
+  font-size: var(--step--1);
+
+  h2 {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--text-muted);
+    margin: 1.4rem 0 0.5rem;
+  }
+
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { margin: 0.1rem 0; }
+
+  a {
+    display: block;
+    padding: 0.32rem 0.6rem;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    text-decoration: none;
+
+    &:hover { background: var(--bg-subtle); color: var(--text); }
+    &.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  }
+}
+
+.prose {
+  max-width: var(--measure);
+
+  > * + * { margin-top: 1.05rem; }
+
+  p, li { overflow-wrap: break-word; }
+
+  ul, ol { padding-left: 1.35rem; }
+  li + li { margin-top: 0.3rem; }
+
+  blockquote {
+    margin-inline: 0;
+    padding: 0.85rem 1.1rem;
+    border-left: 3px solid var(--accent);
+    background: var(--bg-subtle);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    color: var(--text);
+
+    > :first-child { margin-top: 0; }
+    > :last-child { margin-bottom: 0; }
+  }
+
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+
+  img { max-width: 100%; height: auto; }
+
+  // Anchor links appear on hover; always reachable by keyboard.
+  a.zola-anchor {
+    opacity: 0;
+    margin-left: 0.4rem;
+    text-decoration: none;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+
+  h2:hover a.zola-anchor,
+  h3:hover a.zola-anchor,
+  h4:hover a.zola-anchor,
+  a.zola-anchor:focus { opacity: 1; }
+}
+
+// Code. Wide blocks scroll inside their own box so the page never scrolls sideways.
+code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.6;
+
+  code {
+    background: none;
+    border: 0;
+    padding: 0;
+    font-size: inherit;
+  }
+}
+
+// Tables carry most of the reference material here, so they get real attention.
+.table-scroll,
+.prose table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.prose table {
+  border-collapse: collapse;
+  font-size: var(--step--1);
+  white-space: normal;
+
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.55rem 0.75rem;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th { background: var(--bg-subtle); font-weight: 600; }
+  tr:nth-child(even) td { background: color-mix(in srgb, var(--bg-subtle) 45%, transparent); }
+}
+
+.page-meta {
+  color: var(--text-muted);
+  font-size: var(--step--1);
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: var(--step--1);
+}
+
+// ─── Footer ─────────────────────────────────────────────────────────────────
+
+.site-footer {
+  border-top: 1px solid var(--border);
+  padding: 2rem 0;
+  color: var(--text-muted);
+  font-size: var(--step--1);
+}
+
+.footer-inner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: space-between;
+  align-items: center;
+
+  p { margin: 0; }
+  nav { display: flex; gap: 1rem; }
+}

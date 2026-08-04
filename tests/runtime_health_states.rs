@@ -25,32 +25,17 @@ fn make_event_with_id(id: u64) -> Event {
         .expect("system clock before unix epoch")
         .as_millis() as u64;
 
-    Event {
-        before: None,
-        after: Some(json!({"id": id, "name": format!("Alice-{id}")})),
-        op: Operation::Insert,
-        source: SourceMetadata {
-            source_name: "mock".into(),
-            offset: id.to_string(),
-            timestamp: now_ms,
-        },
-        ts: now_ms,
-        schema: Some("public".to_string()),
-        table: "users".to_string(),
-        primary_key: Some(vec!["id".to_string()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: rustcdc::core::EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    Event::builder("users".to_string(), Operation::Insert)
+        .after(json!({"id": id, "name": format!("Alice-{id}")}))
+        .source(SourceMetadata::new("mock", id.to_string(), now_ms))
+        .ts(now_ms)
+        .schema("public".to_string())
+        .primary_key(["id"])
+        .build()
 }
-
 fn make_event() -> Event {
     make_event_with_id(1)
 }
-
 #[tokio::test]
 async fn healthy_state_shows_zero_lag_after_recent_commit() {
     let mut runtime = make_test_runtime();

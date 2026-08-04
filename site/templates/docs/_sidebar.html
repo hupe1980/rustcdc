@@ -1,0 +1,19 @@
+{#- Documentation navigation. Grouped by what the reader is trying to do, not by
+    how the files happen to be named. -#}
+{%- set docs = get_section(path="docs/_index.md") -%}
+<nav class="docs-sidebar" aria-label="Documentation">
+  {%- for group in docs.extra.nav %}
+  <h2>{{ group.title }}</h2>
+  <ul>
+    {%- for item in group.items %}
+    {%- set item_page = get_page(path=item) %}
+    <li>
+      <a href="{{ item_page.permalink }}"
+         {% if page and page.permalink == item_page.permalink %}class="active" aria-current="page"{% endif %}>
+        {{ item_page.title }}
+      </a>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endfor %}
+</nav>

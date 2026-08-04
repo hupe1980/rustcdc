@@ -23,26 +23,13 @@
 //! use rustcdc::codec::{EventEncoder, JsonEncoder};
 //! use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 //!
-//! let event = Event {
-//!     before: None,
-//!     after: Some(serde_json::json!({"id": 1, "name": "alice"})),
-//!     op: Operation::Insert,
-//!     source: SourceMetadata {
-//!         source_name: "postgres".into(),
-//!         offset: "0/16B6A70".into(),
-//!         timestamp: 1,
-//!     },
-//!     ts: 1,
-//!     schema: Some("public".into()),
-//!     table: "users".into(),
-//!     primary_key: Some(vec!["id".into()]),
-//!     snapshot: None,
-//!     transaction: None,
-//!     envelope_version: EVENT_ENVELOPE_VERSION,
-//!     before_is_key_only: false,
-//!     unavailable_columns: Vec::new(),
-//!     before_unavailable_columns: Vec::new(),
-//! };
+//! let event = Event::builder("users", Operation::Insert)
+//!     .after(serde_json::json!({"id": 1, "name": "alice"}))
+//!     .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+//!     .ts(1)
+//!     .schema("public")
+//!     .primary_key(["id"])
+//!     .build();
 //!
 //! let encoder = JsonEncoder;
 //! let output = encoder.encode(&event).unwrap();
@@ -57,12 +44,10 @@
 //! use rustcdc::{Event, Operation, EVENT_ENVELOPE_VERSION};
 //! use serde_json::json;
 //!
-//! let event = Event {
-//!     after: Some(json!({"id": 5, "name": "alice"})),
-//!     op: Operation::Insert,
-//!     primary_key: Some(vec!["id".into()]),
-//!     ..Event::default()
-//! };
+//! let event = Event::builder("", Operation::Insert)
+//!     .after(json!({"id": 5, "name": "alice"}))
+//!     .primary_key(["id"])
+//!     .build();
 //!
 //! let codec = JsonCodec::default();
 //! let output = codec.encode(&event).unwrap();
@@ -81,19 +66,28 @@ pub mod protobuf;
 pub mod schema_registry;
 
 #[cfg(feature = "avro")]
-pub use avro::AvroEncoder;
+pub use avro::{avro_value_to_event, AvroDecoder, AvroEncoder, AVRO_SCHEMA};
 #[cfg(feature = "cloudevents")]
 pub use cloudevents::CloudEventsEncoder;
 pub use json::{JsonCodec, JsonEncoder, JsonPrettyEncoder};
 #[cfg(feature = "protobuf")]
 pub use protobuf::ProtobufEncoder;
+#[cfg(feature = "glue")]
+pub use schema_registry::glue;
+#[cfg(feature = "apicurio")]
+pub use schema_registry::ApicurioRegistryConfig;
 #[cfg(feature = "schemreg")]
 pub use schema_registry::{
-    decode_wire_format, encode_wire_format, CachedSchemaRegistry, CompatibilityLevel,
+    decode_wire_format, detect_wire_format, encode_wire_format, preflight_schema_registry,
+    warm_schema_cache, AnySchemaCache, CachedSchemaRegistry, CompatibilityLevel,
     ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
-    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentSchemaRegistry, EncodeTarget,
-    SchemaId, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType,
-    SubjectNameStrategy, EVENT_JSON_SCHEMA, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
+    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentProtobufDecoder,
+    ConfluentProtobufEncoder, ConfluentSchemaRegistry, DecodedMessage, DetectedWireFormat,
+    DynSchemaRegistryClient, EncodeTarget, RetryPolicy, SchemaDecoder, SchemaEncoder, SchemaFormat,
+    SchemaId, SchemaReference, SchemaRegError, SchemaRegistryAuth, SchemaRegistryClient,
+    SchemaRegistryConfig, SchemaType, SchemaVersion, SubjectNameStrategy, WireFormatDecoder,
+    DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_RETRIES, EVENT_JSON_SCHEMA,
+    KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
 };
 
 use crate::core::{Event, Result};
@@ -177,12 +171,10 @@ pub trait EventEncoder: Send + Sync {
     /// use rustcdc::{Event, Operation, EVENT_ENVELOPE_VERSION};
     /// use serde_json::json;
     ///
-    /// let event = Event {
-    ///     after: Some(json!({"id": 5, "name": "alice"})),
-    ///     op: Operation::Insert,
-    ///     primary_key: Some(vec!["id".into()]),
-    ///     ..Event::default()
-    /// };
+    /// let event = Event::builder("", Operation::Insert)
+    ///     .after(json!({"id": 5, "name": "alice"}))
+    ///     .primary_key(["id"])
+    ///     .build();
     ///
     /// let encoder = JsonEncoder;
     /// let key = encoder.encode_key(&event).unwrap();
@@ -286,12 +278,10 @@ pub trait Codec: Send + Sync {
 /// use serde_json::json;
 ///
 /// let codec = EncoderCodec::new(JsonEncoder);
-/// let event = Event {
-///     after: Some(json!({"id": 1})),
-///     op: Operation::Insert,
-///     primary_key: Some(vec!["id".into()]),
-///     ..Event::default()
-/// };
+/// let event = Event::builder("", Operation::Insert)
+///     .after(json!({"id": 1}))
+///     .primary_key(["id"])
+///     .build();
 /// let out = codec.encode(&event).unwrap();
 /// assert_eq!(out.content_type, "application/json");
 /// assert!(out.key.is_some());

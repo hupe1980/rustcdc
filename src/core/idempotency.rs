@@ -13,12 +13,31 @@ use crate::core::{Error, Event, FingerprintError, Result};
 ///
 /// This helper is intended for sink-side consumers that need to absorb replay
 /// without requiring exactly-once source semantics.
+///
+/// # Safety property: it never suppresses what it cannot prove is a duplicate
+///
+/// The fingerprint is content-derived, so two genuinely distinct rows that happen
+/// to be byte-identical also hash identically. That is not hypothetical: an audit
+/// or event-log table with no primary key can legitimately contain
+/// `INSERT INTO pings VALUES ('ok'), ('ok')`, and on a connector that does not
+/// supply intra-transaction sequencing both rows share one source offset. A naive
+/// guard drops the second row and the checkpoint advances past it — permanent,
+/// silent, unlogged data loss, in the component whose job is to *protect* delivery.
+///
+/// The guard therefore suppresses only events it can identify: those carrying
+/// transaction metadata (`tx_id` + `event_index`) or a resolvable primary-key
+/// value. Everything else passes through and is counted in
+/// [`EventIdempotencyGuard::unidentifiable_passthrough_count`]. Passing a duplicate
+/// through is at-least-once — the guarantee the pipeline already documents — while
+/// dropping a distinct row is not recoverable by any downstream consumer.
 #[derive(Debug, Clone)]
 pub struct EventIdempotencyGuard {
     capacity: usize,
     ttl_ms: Option<u64>,
     seen: HashMap<u64, u64>,
     order: VecDeque<(u64, u64)>,
+    evictions: u64,
+    unidentifiable_passthrough: u64,
 }
 
 impl EventIdempotencyGuard {
@@ -35,6 +54,8 @@ impl EventIdempotencyGuard {
             ttl_ms: None,
             seen: HashMap::with_capacity(capacity),
             order: VecDeque::with_capacity(capacity),
+            evictions: 0,
+            unidentifiable_passthrough: 0,
         })
     }
 
@@ -52,10 +73,35 @@ impl EventIdempotencyGuard {
         Ok(self)
     }
 
+    /// Number of fingerprints evicted because the window filled.
+    ///
+    /// A non-zero and growing value means the window is too small for the replay
+    /// distance in this deployment: duplicates older than the window are no longer
+    /// suppressed. Delivery stays correct (at-least-once), but a downstream that
+    /// relies on the guard for deduplication will start seeing repeats. Raise
+    /// `IdempotencyOptions::capacity`.
+    pub fn eviction_count(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Number of events passed through because they could not be identified.
+    ///
+    /// These are events with neither transaction metadata nor a resolvable
+    /// primary-key value — typically rows from a table with no primary key. The
+    /// guard deliberately does not deduplicate them; see the type-level docs.
+    pub fn unidentifiable_passthrough_count(&self) -> u64 {
+        self.unidentifiable_passthrough
+    }
+
     /// Return true when the event should be processed, false when duplicate.
     pub fn should_process(&mut self, event: &Event) -> Result<bool> {
         let now = now_millis();
         self.prune_expired(now);
+
+        if !event_is_identifiable(event) {
+            self.unidentifiable_passthrough = self.unidentifiable_passthrough.saturating_add(1);
+            return Ok(true);
+        }
 
         let fingerprint = fingerprint_event_transient(event)?;
         if self.seen.contains_key(&fingerprint) {
@@ -73,6 +119,7 @@ impl EventIdempotencyGuard {
         while self.seen.len() > self.capacity {
             if let Some((expired_key, _)) = self.order.pop_front() {
                 self.seen.remove(&expired_key);
+                self.evictions = self.evictions.saturating_add(1);
             }
         }
     }
@@ -90,6 +137,51 @@ impl EventIdempotencyGuard {
             self.seen.remove(&fingerprint);
         }
     }
+}
+
+/// Whether an event carries enough identity for duplicate detection to be safe.
+///
+/// Two conditions qualify:
+///
+/// * **Transaction metadata.** `tx_id` + `event_index` uniquely order the event
+///   within its transaction, so two identical rows in one transaction hash apart.
+/// * **A resolvable primary key.** Every declared key column is present in the
+///   before- or after-image, so two rows that differ only in identity still hash
+///   apart, and a genuine replay of the same row hashes the same.
+///
+/// A `Truncate` event has no row image at all but is idempotent by nature and
+/// carries a distinct source offset, so it qualifies too.
+///
+/// Anything else — a keyless table on a connector without intra-transaction
+/// sequencing — is *not* identifiable, and [`EventIdempotencyGuard`] passes it
+/// through rather than risk dropping a distinct row.
+fn event_is_identifiable(event: &Event) -> bool {
+    if event.transaction.is_some() {
+        return true;
+    }
+    if matches!(
+        event.op,
+        crate::core::Operation::Truncate | crate::core::Operation::SchemaChange
+    ) {
+        return true;
+    }
+
+    let Some(key_columns) = event.primary_key.as_deref() else {
+        return false;
+    };
+    if key_columns.is_empty() {
+        return false;
+    }
+    let Some(row) = event
+        .after
+        .as_ref()
+        .or(event.before.as_ref())
+        .and_then(|value| value.as_object())
+    else {
+        return false;
+    };
+
+    key_columns.iter().all(|column| row.contains_key(column))
 }
 
 /// Build a **transient** in-process fingerprint for the runtime idempotency guard.
@@ -211,7 +303,15 @@ pub fn fingerprint_event_stable(event: &Event) -> std::result::Result<String, Fi
         digest.update(0u8.to_le_bytes());
     }
 
-    Ok(format!("{:x}", digest.finalize()))
+    // RustCrypto 0.11 returns a `hybrid-array::Array`, which no longer implements
+    // `LowerHex`. Format the bytes explicitly so the digest encoding stays exactly what it
+    // was — a stable fingerprint that changed shape would silently invalidate every
+    // persisted dedup record on the consumer side.
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Hash a serde_json Value into the hasher without allocating an intermediate String.
@@ -348,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_evicts_oldest_fingerprint() {
+    fn capacity_evicts_oldest_fingerprint_and_counts_the_eviction() {
         let mut guard = EventIdempotencyGuard::new(1).unwrap();
         let first = make_event("off-1", None);
         let second = make_event("off-2", None);
@@ -358,6 +458,68 @@ mod tests {
 
         // first was evicted due to capacity=1
         assert!(guard.should_process(&first).unwrap());
+        assert!(
+            guard.eviction_count() > 0,
+            "evictions must be observable — a silently undersized window stops \
+             deduplicating with no signal"
+        );
+    }
+
+    /// Two byte-identical rows from a keyless table, sharing one source offset.
+    fn keyless_event(offset: &str) -> Event {
+        let mut event = make_event(offset, None);
+        event.primary_key = None;
+        event.after = Some(json!({"payload": "ping"}));
+        event
+    }
+
+    #[test]
+    fn identical_rows_from_a_keyless_table_are_never_suppressed() {
+        // `INSERT INTO pings VALUES ('ok'), ('ok')` on a table with no primary key
+        // produces two distinct rows that fingerprint identically. Suppressing the
+        // second is permanent data loss: the checkpoint advances past it and nothing
+        // downstream can recover it.
+        let mut guard = EventIdempotencyGuard::new(8).unwrap();
+        let event = keyless_event("same-offset");
+
+        assert!(guard.should_process(&event).unwrap());
+        assert!(
+            guard.should_process(&event).unwrap(),
+            "an unidentifiable event must pass through, not be dropped"
+        );
+        assert_eq!(guard.unidentifiable_passthrough_count(), 2);
+    }
+
+    #[test]
+    fn an_event_whose_key_column_is_absent_from_the_row_is_not_identifiable() {
+        // A declared primary key that the row image does not actually carry cannot
+        // distinguish two rows, so it must not be treated as identity.
+        let mut event = make_event("off", None);
+        event.primary_key = Some(vec!["id".into()]);
+        event.after = Some(json!({"name": "alice"}));
+
+        let mut guard = EventIdempotencyGuard::new(8).unwrap();
+        assert!(guard.should_process(&event).unwrap());
+        assert!(guard.should_process(&event).unwrap());
+        assert_eq!(guard.unidentifiable_passthrough_count(), 2);
+    }
+
+    #[test]
+    fn transaction_metadata_alone_makes_a_keyless_event_identifiable() {
+        let mut guard = EventIdempotencyGuard::new(8).unwrap();
+        let mut event = keyless_event("same-offset");
+        event.transaction = Some(TransactionMetadata {
+            tx_id: 7,
+            total_events: Some(2),
+            event_index: 0,
+        });
+
+        assert!(guard.should_process(&event).unwrap());
+        assert!(
+            !guard.should_process(&event).unwrap(),
+            "with tx sequencing a true replay is still suppressed"
+        );
+        assert_eq!(guard.unidentifiable_passthrough_count(), 0);
     }
 
     #[test]

@@ -144,6 +144,54 @@ pub struct RuntimeOptions {
     ///
     /// Set to `None` (default) to leave close duration unbounded.
     pub sink_close_timeout_ms: Option<u64>,
+    /// Whether a delivered batch may end in the middle of a source transaction.
+    ///
+    /// Defaults to [`TransactionBoundaryPolicy::Split`], which matches the behaviour
+    /// of every comparable CDC library. See the enum docs for when to change it.
+    pub transaction_boundary: TransactionBoundaryPolicy,
+}
+
+/// Whether a delivered batch may end in the middle of a source transaction.
+///
+/// The runtime cuts batches on `max_buffer_size`, `max_event_bytes` and the commit
+/// barrier's free capacity — none of which know anything about transactions. A cut
+/// that lands inside one means the sink sees rows 1–3 of a five-row transaction,
+/// commits them, and only later receives rows 4–5. Between those two commits the
+/// sink holds a state that never existed in the source database.
+///
+/// For most sinks that is fine and is the reason the default is [`Split`]: it keeps
+/// latency low and memory bounded. It is *not* fine for a sink that must apply each
+/// source transaction atomically — a ledger, a materialized view with cross-row
+/// invariants, or any consumer that publishes "the database as of transaction N".
+///
+/// [`Split`]: TransactionBoundaryPolicy::Split
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TransactionBoundaryPolicy {
+    /// Cut batches wherever the buffer limits fall (default).
+    ///
+    /// Lowest latency and strictly bounded memory. A transaction of any size is
+    /// delivered across as many batches as needed.
+    #[default]
+    Split,
+    /// Never end a delivered batch in the middle of a source transaction.
+    ///
+    /// The runtime trims the trailing partial transaction off each batch and delivers
+    /// it with the next one, so every batch ends on a transaction boundary.
+    ///
+    /// # The one case this cannot honour
+    ///
+    /// A single transaction larger than `max_buffer_size` does not fit in any batch.
+    /// Trimming it would produce an empty batch forever — a silent, permanent stall,
+    /// which is strictly worse than the split it is trying to avoid. The runtime
+    /// therefore delivers such a transaction split, and logs a WARN naming the
+    /// transaction id and `max_buffer_size`. Raise `max_buffer_size` above the
+    /// largest transaction the source produces if the guarantee must hold absolutely.
+    ///
+    /// Events with no transaction metadata (snapshot rows, and connectors that do not
+    /// report transaction boundaries) are treated as their own boundary and are never
+    /// trimmed.
+    PreserveTransactions,
 }
 
 impl Default for RuntimeOptions {
@@ -171,6 +219,7 @@ impl Default for RuntimeOptions {
             dead_letter_handler: None,
             max_event_bytes: None,
             sink_close_timeout_ms: None,
+            transaction_boundary: TransactionBoundaryPolicy::Split,
         }
     }
 }
@@ -353,17 +402,46 @@ impl RuntimeOptions {
         self.sink_close_timeout_ms = timeout_ms.into();
         self
     }
+
+    /// Choose whether a delivered batch may end mid-transaction.
+    ///
+    /// ```
+    /// use rustcdc::{RuntimeOptions, TransactionBoundaryPolicy};
+    ///
+    /// // A sink that must apply each source transaction atomically.
+    /// let options = RuntimeOptions::new()
+    ///     .with_transaction_boundary(TransactionBoundaryPolicy::PreserveTransactions);
+    /// ```
+    #[must_use]
+    pub fn with_transaction_boundary(mut self, policy: TransactionBoundaryPolicy) -> Self {
+        self.transaction_boundary = policy;
+        self
+    }
 }
 
 /// Runtime-level idempotency guard configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct IdempotencyOptions {
+    /// Maximum fingerprints retained in the sliding window.
+    ///
+    /// Sized for the replay distance of the deployment, not for the event rate: once the
+    /// window fills, duplicates older than it stop being suppressed. Evictions are
+    /// counted in `RuntimeAdminSnapshot::idempotency_evictions`.
     pub capacity: usize,
+    /// Optional fingerprint lifetime in milliseconds.
+    ///
+    /// `None` keeps a fingerprint until capacity evicts it. A TTL admits an expected
+    /// long-tail replay after a retention window while still suppressing immediate
+    /// duplicates.
     pub ttl_ms: Option<u64>,
 }
 
 impl IdempotencyOptions {
+    /// Build options with the given window capacity and no TTL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] if `capacity` is zero.
     pub fn new(capacity: usize) -> Result<Self> {
         if capacity == 0 {
             return Err(Error::ConfigError(
@@ -376,6 +454,11 @@ impl IdempotencyOptions {
         })
     }
 
+    /// Set a fingerprint lifetime in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] if `ttl_ms` is zero.
     pub fn with_ttl_ms(mut self, ttl_ms: u64) -> Result<Self> {
         if ttl_ms == 0 {
             return Err(Error::ConfigError(
@@ -404,7 +487,6 @@ impl IdempotencyOptions {
 ///     .with_max_delay_ms(10_000);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ConnectionRetryPolicy {
     /// Maximum number of consecutive retries before the error is surfaced.
     /// `None` means retry indefinitely.
@@ -484,16 +566,28 @@ impl ConnectionRetryPolicy {
 }
 
 /// Source configuration for runtime construction.
+///
+/// `#[non_exhaustive]`: this enum gains a variant with every connector the crate
+/// adds, which makes it the single most certain future source of breakage for an
+/// embedder that matches on it exhaustively. Add a `_` arm.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum RuntimeSourceConfig {
     #[cfg(feature = "postgres")]
+    /// PostgreSQL logical replication via pgoutput.
     Postgres(PostgresSourceConfig),
     #[cfg(feature = "mysql")]
+    /// MySQL binlog replication.
     Mysql(MysqlSourceConfig),
     #[cfg(feature = "mariadb")]
+    /// MariaDB binlog replication. Shares the MySQL transport with MariaDB source
+    /// identity, so checkpoints land in their own namespace and GTID formats do not mix.
     MariaDb(crate::source::MariaDbSourceConfig),
     #[cfg(feature = "sqlserver")]
+    /// SQL Server CDC capture tables.
     SqlServer(SqlServerSourceConfig),
+    /// No source. The runtime accepts injected events and exercises the full
+    /// buffer/commit path, which is what the tests and examples use.
     Disabled,
 }
 
@@ -625,9 +719,18 @@ impl RuntimeSourceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RuntimeState {
+    /// Constructed but never started.
+    ///
+    /// Note this does **not** mean "running with nothing to do" — for that, and for the
+    /// distinction from a stalled connector, read
+    /// [`RuntimeAdminSnapshot::health`] instead. `RuntimeState` alone cannot tell a quiet
+    /// database from a hung socket: both report `Running`.
     Idle,
+    /// Started and polling.
     Running,
+    /// A shutdown is in progress.
     Stopping,
+    /// Stopped. May be started again.
     Stopped,
 }
 
@@ -729,6 +832,20 @@ pub struct RuntimeAdminSnapshot {
     pub total_events_committed: u64,
     /// Cumulative count of events suppressed by the idempotency guard since `start()`. Never resets.
     pub total_events_deduplicated: u64,
+    /// Fingerprints the idempotency guard evicted because its window filled.
+    ///
+    /// Growing steadily means the window is too small for this deployment's replay
+    /// distance: older duplicates stop being suppressed. Delivery stays at-least-once,
+    /// but a sink relying on the guard will begin seeing repeats. Raise
+    /// `IdempotencyOptions::capacity`. `None` when the guard is disabled.
+    pub idempotency_evictions: Option<u64>,
+    /// Events the idempotency guard passed through because it could not identify them.
+    ///
+    /// These come from tables with no primary key on connectors that supply no
+    /// intra-transaction sequencing. The guard deliberately does not deduplicate them
+    /// — dropping a distinct row is unrecoverable, whereas a duplicate is the
+    /// documented at-least-once contract. `None` when the guard is disabled.
+    pub idempotency_unidentifiable_passthrough: Option<u64>,
     /// Events permanently dropped by [`TransformErrorPolicy::Skip`].
     ///
     /// **Any non-zero value means data was lost.** A skipped event is dropped *and* the
@@ -833,6 +950,7 @@ impl AckToken {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "AckMode::Required must be passed to CdcRuntime::commit_ack(); ignoring it stalls the commit barrier"]
+#[non_exhaustive]
 pub enum AckMode {
     /// The batch must be acknowledged; `token` carries the delivery reference.
     Required(AckToken),
@@ -1105,7 +1223,17 @@ struct PendingDelivery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransformErrorPolicy {
+    /// Surface the error to the caller and stop. The default, and the safe choice.
     Halt,
+    /// Drop the failing event and continue.
+    ///
+    /// **This loses data.** A skipped event never reaches the commit barrier, so it gets
+    /// no offset — but the events after it do, and the checkpoint persists the last
+    /// accepted offset, which is *past* the skipped one. It is therefore never replayed.
+    ///
+    /// Selecting this requires a `dead_letter_handler`, so the loss is a deliberate,
+    /// captured routing decision rather than a `warn!` line, and every skip increments
+    /// `RuntimeAdminSnapshot::total_events_skipped`. Alert on any increase.
     Skip,
 }
 
@@ -1301,8 +1429,8 @@ enum RuntimeSource {
     #[cfg(feature = "sqlserver")]
     SqlServer(SqlServerConnection),
     Disabled,
-    #[cfg(test)]
-    Mock(Box<dyn crate::source::Source>),
+    /// A source supplied by the embedder via [`CdcRuntime::register_source`].
+    Custom(Box<dyn crate::source::Source>),
 }
 
 impl RuntimeSource {
@@ -1317,8 +1445,7 @@ impl RuntimeSource {
             Self::Disabled => Err(Error::ConfigError(
                 "runtime source is disabled in this build".into(),
             )),
-            #[cfg(test)]
-            Self::Mock(_) => Ok(()),
+            Self::Custom(source) => source.connect().await,
         }
     }
 
@@ -1331,8 +1458,7 @@ impl RuntimeSource {
             #[cfg(feature = "sqlserver")]
             Self::SqlServer(source) => source.close().await,
             Self::Disabled => {}
-            #[cfg(test)]
-            Self::Mock(_) => {}
+            Self::Custom(source) => source.close().await,
         }
     }
 
@@ -1349,8 +1475,7 @@ impl RuntimeSource {
             Self::Disabled => Err(Error::ConfigError(
                 "runtime source is disabled in this build".into(),
             )),
-            #[cfg(test)]
-            Self::Mock(source) => source.start_snapshot(&refs).await,
+            Self::Custom(source) => source.start_snapshot(&refs).await,
         }
     }
 
@@ -1383,8 +1508,7 @@ impl RuntimeSource {
             Self::Disabled => Err(Error::ConfigError(
                 "runtime source is disabled in this build".into(),
             )),
-            #[cfg(test)]
-            Self::Mock(source) => {
+            Self::Custom(source) => {
                 source
                     .start_snapshot_from_checkpoint(&refs, Some(resume_from))
                     .await
@@ -1407,8 +1531,7 @@ impl RuntimeSource {
             Self::Disabled => Err(Error::ConfigError(
                 "runtime source is disabled in this build".into(),
             )),
-            #[cfg(test)]
-            Self::Mock(source) => source.start_stream(resume_from).await,
+            Self::Custom(source) => source.start_stream(resume_from).await,
         }
     }
 
@@ -1428,9 +1551,12 @@ impl RuntimeSource {
             Self::Disabled => Err(Error::ConfigError(
                 "runtime source is disabled in this build".into(),
             )),
-            #[cfg(test)]
-            Self::Mock(_) => Err(Error::ConfigError(
-                "incremental snapshot startup is unsupported for mock runtime source".into(),
+            Self::Custom(_) => Err(Error::ConfigError(
+                "incremental snapshot startup is not available for a custom source. \
+                 The DBLog watermark algorithm needs connector-native watermark queries \
+                 that the Source trait does not expose; use snapshot_tables for a \
+                 blocking initial snapshot instead."
+                    .into(),
             )),
         }
     }
@@ -1451,8 +1577,7 @@ impl RuntimeSource {
             Self::Disabled => Err(Error::ConfigError(
                 "runtime source is disabled in this build".into(),
             )),
-            #[cfg(test)]
-            Self::Mock(source) => source.perform_handoff(snapshot, stream).await,
+            Self::Custom(source) => source.perform_handoff(snapshot, stream).await,
         }
     }
 }
@@ -1701,9 +1826,20 @@ impl CdcRuntime {
         }
     }
 
-    /// Add a transform stage applied to polled events.
+    /// Add a **synchronous** transform stage applied to polled events.
+    ///
+    /// Prefer this. Every transform this crate ships is synchronous, and the sync path
+    /// avoids a boxed future per event on the hottest path in the library.
     pub fn add_transform(&mut self, transform: Box<dyn crate::transform::Transform>) {
         self.transform_pipeline.add_transform(transform);
+    }
+
+    /// Add an **async** transform stage applied to polled events.
+    ///
+    /// For a stage that genuinely must `await` — a WASM sandbox, a network enrichment
+    /// lookup. See [`crate::transform::AsyncTransform`].
+    pub fn add_async_transform(&mut self, transform: Box<dyn crate::transform::AsyncTransform>) {
+        self.transform_pipeline.add_async_transform(transform);
     }
 
     /// Register a sink to be closed (with the configured timeout) during
@@ -1730,10 +1866,32 @@ impl CdcRuntime {
         self.registered_sink = Some(std::sync::Mutex::new(BoxedSink::new(sink)));
     }
 
+    /// Drive the runtime from a source this crate does not ship.
+    ///
+    /// Replaces whatever source the [`RuntimeConfig`] selected. Everything the runtime
+    /// provides — the commit barrier, checkpointing, transforms, the idempotency
+    /// guard, health verdicts, metrics — applies unchanged to a third-party
+    /// [`Source`](crate::source::Source).
+    ///
+    /// Call this **before** [`CdcRuntime::start`]; the source is connected during
+    /// `start()`.
+    ///
+    /// # Checkpoint offsets
+    ///
+    /// The runtime derives the checkpoint offset from the delivered event for the
+    /// connectors it knows. For a custom source it falls back to persisting
+    /// `Event::source.offset` verbatim, so that field must be a complete, resumable
+    /// position — the same string your `start_stream(resume_from)` is able to resume
+    /// from. Implement [`StreamHandle::position_offset`](crate::source::StreamHandle::position_offset)
+    /// if you need richer state.
+    pub fn register_source(&mut self, source: Box<dyn crate::source::Source>) {
+        self.source = RuntimeSource::Custom(source);
+    }
+
     /// Replace the runtime source with a mock for testing.
     #[cfg(test)]
     pub(crate) fn inject_mock_source(&mut self, source: Box<dyn crate::source::Source>) {
-        self.source = RuntimeSource::Mock(source);
+        self.register_source(source);
     }
 }
 
@@ -2196,6 +2354,233 @@ mod tests {
         assert_eq!(checkpoint.get_committed_count().await.unwrap(), 3);
     }
 
+    // ─── Transaction-boundary policy ─────────────────────────────────────────
+
+    use super::{RuntimeOptions, TransactionBoundaryPolicy};
+    use crate::core::TransactionMetadata;
+
+    fn tx_event(tx_id: u64, event_index: u32, offset: &str) -> Event {
+        let mut event = event();
+        event.op = Operation::Insert;
+        event.source.offset = offset.to_string();
+        event.transaction = Some(TransactionMetadata {
+            tx_id,
+            total_events: None,
+            event_index,
+        });
+        event
+    }
+
+    fn transaction_boundary_runtime(
+        policy: TransactionBoundaryPolicy,
+        max_buffer_size: usize,
+    ) -> CdcRuntime {
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::Disabled,
+            InMemoryCheckpoint::default(),
+            crate::schema_history::InMemorySchemaHistory::default(),
+        )
+        .with_idempotency_disabled()
+        .with_options(
+            RuntimeOptions::new()
+                .with_max_buffer_size(max_buffer_size)
+                .with_transaction_boundary(policy),
+        );
+        CdcRuntime::new(config).unwrap()
+    }
+
+    /// Simulate the cut `flush_pending_source_events` makes: take `cut` events off
+    /// the queue, leave the rest, then apply the boundary policy.
+    fn cut_and_trim(
+        runtime: &mut CdcRuntime,
+        queued: Vec<Event>,
+        cut: usize,
+    ) -> (Vec<String>, Vec<String>) {
+        runtime.pending_source_events.extend(queued);
+        let mut chunk: Vec<Event> = (0..cut)
+            .filter_map(|_| runtime.pending_source_events.pop_front())
+            .collect();
+        runtime.trim_to_transaction_boundary(&mut chunk);
+
+        let delivered = chunk
+            .iter()
+            .map(|event| event.source.offset.clone())
+            .collect();
+        let requeued = runtime
+            .pending_source_events
+            .iter()
+            .map(|event| event.source.offset.clone())
+            .collect();
+        (delivered, requeued)
+    }
+
+    #[test]
+    fn split_is_the_default_policy() {
+        assert_eq!(
+            RuntimeOptions::default().transaction_boundary,
+            TransactionBoundaryPolicy::Split,
+            "changing the default would silently alter batch shapes for every embedder"
+        );
+    }
+
+    #[test]
+    fn split_policy_cuts_batches_mid_transaction() {
+        // Baseline: the default deliberately splits, so the guarantee added by
+        // `PreserveTransactions` is measured against a real difference, not a no-op.
+        let mut runtime = transaction_boundary_runtime(TransactionBoundaryPolicy::Split, 16);
+        let queued = vec![
+            tx_event(7, 0, "o0"),
+            tx_event(7, 1, "o1"),
+            tx_event(8, 0, "o2"),
+            tx_event(8, 1, "o3"),
+        ];
+
+        let (delivered, requeued) = cut_and_trim(&mut runtime, queued, 3);
+        assert_eq!(delivered, vec!["o0", "o1", "o2"], "the cut is not adjusted");
+        assert_eq!(requeued, vec!["o3"]);
+    }
+
+    #[test]
+    fn preserve_transactions_trims_a_trailing_partial_transaction() {
+        // The cut at 3 lands inside tx 8, so the batch must be trimmed back to the
+        // tx 7 / tx 8 boundary and the partial transaction returned to the queue.
+        let mut runtime =
+            transaction_boundary_runtime(TransactionBoundaryPolicy::PreserveTransactions, 16);
+        let queued = vec![
+            tx_event(7, 0, "o0"),
+            tx_event(7, 1, "o1"),
+            tx_event(8, 0, "o2"),
+            tx_event(8, 1, "o3"),
+        ];
+
+        let (delivered, requeued) = cut_and_trim(&mut runtime, queued, 3);
+        assert_eq!(
+            delivered,
+            vec!["o0", "o1"],
+            "batch must end on the boundary"
+        );
+        assert_eq!(
+            requeued,
+            vec!["o2", "o3"],
+            "trimmed events must be requeued in their original order, none dropped"
+        );
+    }
+
+    #[test]
+    fn preserve_transactions_leaves_a_batch_that_already_ends_on_a_boundary() {
+        let mut runtime =
+            transaction_boundary_runtime(TransactionBoundaryPolicy::PreserveTransactions, 16);
+        let queued = vec![
+            tx_event(7, 0, "o0"),
+            tx_event(7, 1, "o1"),
+            tx_event(8, 0, "o2"),
+        ];
+
+        let (delivered, requeued) = cut_and_trim(&mut runtime, queued, 2);
+        assert_eq!(delivered, vec!["o0", "o1"]);
+        assert_eq!(requeued, vec!["o2"]);
+    }
+
+    #[test]
+    fn a_transaction_larger_than_the_buffer_is_delivered_split_rather_than_stalling() {
+        // Holding this back would produce an empty batch forever — a silent permanent
+        // stall, strictly worse than the split the policy exists to avoid. The escape
+        // hatch is `max_buffer_size`: once one unfinished transaction fills the batch,
+        // it ships split with a WARN.
+        let mut runtime =
+            transaction_boundary_runtime(TransactionBoundaryPolicy::PreserveTransactions, 2);
+        let queued = (0..4)
+            .map(|index| tx_event(9, index, &format!("o{index}")))
+            .collect();
+
+        let (delivered, _) = cut_and_trim(&mut runtime, queued, 2);
+        assert_eq!(
+            delivered,
+            vec!["o0", "o1"],
+            "a transaction that cannot fit in one batch must still make progress"
+        );
+    }
+
+    #[test]
+    fn a_transaction_whose_rest_has_not_arrived_yet_is_held_back() {
+        // The load-bearing case, and the one the previous implementation got wrong: the
+        // queue behind the cut is *empty*, which means "I have not seen the rest yet" —
+        // not "there is no rest". Treating the two as the same delivered a partial
+        // transaction whenever one spanned two polls, which for a streaming source is
+        // the common case rather than the exception.
+        let mut runtime =
+            transaction_boundary_runtime(TransactionBoundaryPolicy::PreserveTransactions, 16);
+        let queued = vec![tx_event(11, 0, "o0"), tx_event(11, 1, "o1")];
+
+        let (delivered, requeued) = cut_and_trim(&mut runtime, queued, 2);
+        assert!(
+            delivered.is_empty(),
+            "a transaction with no observed end must not be delivered, got {delivered:?}"
+        );
+        assert_eq!(
+            requeued,
+            vec!["o0", "o1"],
+            "the withheld events must stay queued, in order, for the next batch"
+        );
+    }
+
+    #[test]
+    fn a_transaction_that_declares_its_size_is_delivered_once_complete() {
+        // `total_events` is the only end-of-transaction signal available when nothing is
+        // queued behind the cut. A source that fills it in must not be made to wait.
+        let mut runtime =
+            transaction_boundary_runtime(TransactionBoundaryPolicy::PreserveTransactions, 16);
+        let mut first = tx_event(12, 0, "o0");
+        let mut second = tx_event(12, 1, "o1");
+        if let Some(tx) = first.transaction.as_mut() {
+            tx.total_events = Some(2);
+        }
+        if let Some(tx) = second.transaction.as_mut() {
+            tx.total_events = Some(2);
+        }
+
+        let (delivered, requeued) = cut_and_trim(&mut runtime, vec![first, second], 2);
+        assert_eq!(
+            delivered,
+            vec!["o0", "o1"],
+            "a declared-complete transaction must ship immediately"
+        );
+        assert!(requeued.is_empty());
+    }
+
+    #[test]
+    fn an_event_without_transaction_metadata_is_its_own_boundary() {
+        // Snapshot rows and connectors that do not report transactions must never be
+        // withheld — waiting for an end that will never be signalled is a wedge.
+        let mut runtime =
+            transaction_boundary_runtime(TransactionBoundaryPolicy::PreserveTransactions, 16);
+        let mut plain = tx_event(13, 0, "o0");
+        plain.transaction = None;
+
+        let (delivered, _) = cut_and_trim(&mut runtime, vec![plain], 1);
+        assert_eq!(delivered, vec!["o0"]);
+    }
+
+    #[test]
+    fn preserve_transactions_leaves_events_without_transaction_metadata_alone() {
+        // Snapshot rows and connectors that report no transaction boundaries must not
+        // be trimmed — otherwise every event looks like "the same (absent) transaction"
+        // and the batch would be trimmed to nothing.
+        let mut runtime =
+            transaction_boundary_runtime(TransactionBoundaryPolicy::PreserveTransactions, 16);
+        let queued = (0..4)
+            .map(|index| {
+                let mut e = event();
+                e.source.offset = format!("o{index}");
+                e
+            })
+            .collect();
+
+        let (delivered, requeued) = cut_and_trim(&mut runtime, queued, 2);
+        assert_eq!(delivered, vec!["o0", "o1"]);
+        assert_eq!(requeued, vec!["o2", "o3"]);
+    }
+
     #[tokio::test]
     async fn runtime_observability_emits_delivery_commit_and_barrier_signals() {
         let metrics_state = Arc::new(Mutex::new(RecordingMetricsState::default()));
@@ -2294,9 +2679,8 @@ mod tests {
     #[derive(Debug)]
     struct NonDeterministicTransform;
 
-    #[async_trait]
     impl Transform for FailTransform {
-        async fn apply(&self, _event: &mut Event) -> crate::core::Result<bool> {
+        fn apply(&self, _event: &mut Event) -> crate::core::Result<bool> {
             Err(crate::core::Error::TransformError("boom".into()))
         }
 
@@ -2305,9 +2689,8 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Transform for NonDeterministicTransform {
-        async fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
+        fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
             static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
             let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
 
@@ -2333,7 +2716,11 @@ mod tests {
         runtime.add_transform(Box::new(FailTransform));
 
         let error = runtime.apply_transforms(vec![event()]).await.unwrap_err();
-        assert!(matches!(error, crate::core::Error::TransformError(_)));
+        assert!(
+            matches!(error.root_cause(), crate::core::Error::TransformError(_)),
+            "the transform failure must reach the caller with its cause intact; got: {error:?}"
+        );
+        assert!(error.to_string().contains("fail_transform"));
     }
 
     /// `Skip` without a dead-letter handler is silent data loss, and is rejected.
@@ -3238,6 +3625,9 @@ mod tests {
             serde_json::from_slice(&expected_payload).unwrap();
         assert_eq!(persisted_payload, expected_payload_json);
         assert_eq!(checkpoint.get_committed_count().await.unwrap(), 1);
+        // Release the inspection handle before the "restarted" runtime opens its own:
+        // one instance per checkpoint directory is the enforced contract.
+        drop(checkpoint);
 
         let source_resume = MockSource::with_snapshot(vec![], vec![]);
         let snapshot_resume_source = source_resume.last_snapshot_resume_source();
@@ -3453,7 +3843,7 @@ mod tests {
         let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
             .with_post_commit_source_confirm_policy(PostCommitSourceConfirmPolicy::Continue);
         let mut runtime = CdcRuntime::new(config).unwrap();
-        runtime.source = RuntimeSource::Mock(Box::new(
+        runtime.source = RuntimeSource::Custom(Box::new(
             MockSource::stream_only(vec![vec![event]])
                 .with_confirm_lsn_error("simulated confirm_lsn failure"),
         ));
@@ -3512,7 +3902,7 @@ mod tests {
         let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
             .with_idempotency_disabled();
         let mut runtime = CdcRuntime::new(config).unwrap();
-        runtime.source = RuntimeSource::Mock(Box::new(
+        runtime.source = RuntimeSource::Custom(Box::new(
             MockSource::stream_only(vec![])
                 .with_replay_stream(vec![evt.clone()])
                 .with_confirm_lsn_error("simulated slot advance failure"),
@@ -3594,7 +3984,7 @@ mod tests {
         // Default options: FailFast + idempotency guard enabled.
         let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
         let mut runtime = CdcRuntime::new(config).unwrap();
-        runtime.source = RuntimeSource::Mock(Box::new(
+        runtime.source = RuntimeSource::Custom(Box::new(
             MockSource::stream_only(vec![])
                 .with_replay_stream(vec![evt.clone()])
                 .with_confirm_lsn_error("simulated slot advance failure"),
@@ -4001,7 +4391,7 @@ mod tests {
         let schema_history = InMemorySchemaHistory::default();
         let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
         let mut runtime = CdcRuntime::new(config).unwrap();
-        runtime.source = RuntimeSource::Mock(Box::new(
+        runtime.source = RuntimeSource::Custom(Box::new(
             MockSource::stream_only(vec![])
                 .with_replay_stream(vec![evt])
                 .with_confirm_lsn_error("simulated slot advance failure"),
@@ -4086,7 +4476,7 @@ mod tests {
             .with_replay_stream(vec![evt.clone()])
             .with_confirm_lsn_error("simulated slot advance failure");
         let failure_handle = source.confirm_lsn_error_handle();
-        runtime.source = RuntimeSource::Mock(Box::new(source));
+        runtime.source = RuntimeSource::Custom(Box::new(source));
 
         runtime
             .config

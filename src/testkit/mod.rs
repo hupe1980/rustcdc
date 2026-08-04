@@ -36,8 +36,11 @@ use crate::core::{CdcRuntime, Error, Event, Result};
 
 /// Trait for fixture types that expose a named, ordered event sequence.
 pub trait Fixture {
+    /// Fixture name, used in failure messages.
     fn name(&self) -> &str;
+    /// The events this fixture replays.
     fn events(&self) -> &[Event];
+    /// Mutable access, for tests that perturb a fixture before replaying it.
     fn events_mut(&mut self) -> &mut [Event];
 }
 
@@ -49,6 +52,11 @@ pub struct JsonFixture {
 }
 
 impl JsonFixture {
+    /// Load a fixture from a JSON file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or does not parse as a fixture.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
@@ -91,8 +99,11 @@ impl Fixture for JsonFixture {
 /// Diff result produced by [`ReplayRunner::verify_output`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixtureDiff {
+    /// Events the fixture declared.
     pub expected_count: usize,
+    /// Events the run actually produced.
     pub actual_count: usize,
+    /// Human-readable description of each difference.
     pub mismatches: Vec<String>,
 }
 
@@ -103,10 +114,16 @@ pub struct ReplayRunner<'a> {
 }
 
 impl<'a> ReplayRunner<'a> {
+    /// Bind a fixture to the runtime that will replay it.
     pub fn new(fixture: Box<dyn Fixture>, runtime: &'a mut CdcRuntime) -> Self {
         Self { fixture, runtime }
     }
 
+    /// Replay the fixture through the runtime and collect what came out.
+    ///
+    /// # Errors
+    ///
+    /// Propagates runtime errors from enqueue, poll, or commit.
     pub async fn run(&mut self) -> Result<Vec<Event>> {
         let expected = self.fixture.events().len();
         let mut output = Vec::with_capacity(expected);
@@ -146,6 +163,14 @@ impl<'a> ReplayRunner<'a> {
         Ok(output)
     }
 
+    /// Compare produced events against expectations.
+    ///
+    /// Returns a [`FixtureDiff`] describing every difference rather than failing on the
+    /// first — a single assertion tells you nothing about the shape of a regression.
+    ///
+    /// # Errors
+    ///
+    /// Propagates serialization errors while rendering mismatches.
     pub fn verify_output(&self, expected: &[Event], actual: &[Event]) -> Result<FixtureDiff> {
         let mut mismatches = Vec::new();
         for (index, (left, right)) in expected.iter().zip(actual.iter()).enumerate() {
@@ -172,16 +197,22 @@ impl<'a> ReplayRunner<'a> {
 
 /// A single runtime-level conformance test scenario.
 pub trait ConformanceTest {
+    /// Test name, reported in the suite result.
     fn name(&self) -> &str;
+    /// Execute the test against `runtime`.
     fn run(&self, runtime: &mut CdcRuntime) -> Result<TestResult>;
 }
 
 /// Aggregate result for a full [`ConformanceSuite`] run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuiteResult {
+    /// Tests that passed.
     pub passed: usize,
+    /// Tests that failed.
     pub failed: usize,
+    /// Tests executed.
     pub total: usize,
+    /// Per-test outcomes.
     pub tests: Vec<TestResult>,
 }
 
@@ -197,14 +228,17 @@ impl Default for ConformanceSuite {
 }
 
 impl ConformanceSuite {
+    /// Build an empty suite.
     pub fn new() -> Self {
         Self { tests: Vec::new() }
     }
 
+    /// Append a test to the suite.
     pub fn add_test(&mut self, test: Box<dyn ConformanceTest>) {
         self.tests.push(test);
     }
 
+    /// Run every test, continuing past failures, and aggregate the results.
     pub fn run_all(&mut self, runtime: &mut CdcRuntime) -> SuiteResult {
         let mut results = Vec::new();
         for test in &self.tests {
@@ -234,12 +268,14 @@ pub struct NotImplementedConformanceTest {
 }
 
 impl NotImplementedConformanceTest {
+    /// The checkpoint never advances past what the consumer acknowledged.
     pub fn checkpoint_barrier_enforced() -> Self {
         Self {
             name: "checkpoint_barrier_enforced",
         }
     }
 
+    /// A crash replays from the last durable checkpoint without losing events.
     pub fn no_event_loss_on_crash() -> Self {
         Self {
             name: "no_event_loss_on_crash",

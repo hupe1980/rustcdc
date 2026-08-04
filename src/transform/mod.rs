@@ -23,21 +23,116 @@ pub use outbox::{OutboxResult, OutboxTransform};
 pub use route::{RouteConfig, RouteTransform};
 pub use unwrap::{UnwrapConfig, UnwrapTransform};
 
-#[async_trait]
+/// A **synchronous** stage in the event pipeline.
+///
+/// Stages run in order, per event, and may mutate the event in place or drop it.
+///
+/// # Why this is not `async`
+///
+/// Every transform this crate ships — masking, filtering, projection, field mapping,
+/// routing, unwrapping, outbox — is pure CPU work over an in-memory event. When the trait
+/// was `async`, `#[async_trait]` boxed a future for each of them on **every event**:
+/// O(events × stages) heap allocations on the hottest path in the library, all to await
+/// something that never yields.
+///
+/// A stage that genuinely must await — a WASM sandbox, a network enrichment lookup —
+/// implements [`AsyncTransform`] instead. [`TransformPipeline`] holds both and pays the
+/// boxing cost only for the stages that need it.
+///
+/// # What a transform must not do
+///
+/// **Destroy the message key.** `Event::primary_key` names the key *columns*; the values
+/// live in the row payload. Projecting away, renaming, or re-encrypting a key column
+/// detaches the two, and the event is emitted unkeyed — log compaction stops collapsing
+/// it and upsert consumers start inserting duplicates. The pipeline rejects this rather
+/// than letting it through silently, but a transform should not attempt it.
 pub trait Transform: Send + Sync + std::fmt::Debug {
     /// Apply transform in-place; return true to keep event, false to drop it.
-    async fn apply(&self, event: &mut Event) -> Result<bool>;
+    fn apply(&self, event: &mut Event) -> Result<bool>;
+
+    /// Stage name, used in error messages and metrics.
     fn name(&self) -> &str;
+
+    /// Apply to a whole batch, dropping events the stage filters out.
+    ///
+    /// The default runs [`Transform::apply`] over the batch in place. Override when a
+    /// stage can amortise per-batch setup — compiling a pattern once, resolving a lookup
+    /// table once — rather than repeating it per event.
+    fn apply_batch(&self, events: &mut Vec<Event>) -> Result<()> {
+        let mut error = None;
+        events.retain_mut(|event| {
+            if error.is_some() {
+                return true;
+            }
+            match self.apply(event) {
+                Ok(keep) => keep,
+                Err(failure) => {
+                    error = Some(failure);
+                    true
+                }
+            }
+        });
+        match error {
+            Some(failure) => Err(failure),
+            None => Ok(()),
+        }
+    }
 }
 
+/// A stage that must `await` — a WASM sandbox, a network lookup.
+///
+/// Prefer [`Transform`] wherever the work is pure CPU: this variant boxes a future per
+/// event, which is exactly the cost the split exists to avoid paying for stages that do
+/// not need it.
+#[async_trait]
+pub trait AsyncTransform: Send + Sync + std::fmt::Debug {
+    /// Apply transform in-place; return true to keep event, false to drop it.
+    async fn apply(&self, event: &mut Event) -> Result<bool>;
+
+    /// Stage name, used in error messages and metrics.
+    fn name(&self) -> &str;
+
+    /// Apply to a whole batch.
+    ///
+    /// The default awaits [`AsyncTransform::apply`] per event. Override to amortise a
+    /// per-batch cost — a WASM stage, for instance, can acquire its instance lock once for
+    /// the batch instead of once per event.
+    async fn apply_batch(&self, events: &mut Vec<Event>) -> Result<()> {
+        let mut kept = Vec::with_capacity(events.len());
+        for mut event in std::mem::take(events) {
+            if self.apply(&mut event).await? {
+                kept.push(event);
+            }
+        }
+        *events = kept;
+        Ok(())
+    }
+}
+
+/// One stage of a [`TransformPipeline`], sync or async.
+enum Stage {
+    Sync(Box<dyn Transform>),
+    Async(Box<dyn AsyncTransform>),
+}
+
+impl Stage {
+    fn name(&self) -> &str {
+        match self {
+            Self::Sync(transform) => transform.name(),
+            Self::Async(transform) => transform.name(),
+        }
+    }
+}
+
+/// An ordered chain of [`Transform`] and [`AsyncTransform`] stages.
 #[derive(Default)]
 pub struct TransformPipeline {
-    transforms: Vec<Box<dyn Transform>>,
+    transforms: Vec<Stage>,
 }
 
 impl std::fmt::Debug for TransformPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&str> = self.transforms.iter().map(|t| t.name()).collect();
+        let names: Vec<&str> = self.transforms.iter().map(Stage::name).collect();
         f.debug_struct("TransformPipeline")
             .field("transforms", &names)
             .finish()
@@ -45,9 +140,14 @@ impl std::fmt::Debug for TransformPipeline {
 }
 
 impl TransformPipeline {
-    /// Add a transform to the end of the pipeline (mutating form).
+    /// Add a synchronous transform to the end of the pipeline (mutating form).
     pub fn add_transform(&mut self, transform: Box<dyn Transform>) {
-        self.transforms.push(transform);
+        self.transforms.push(Stage::Sync(transform));
+    }
+
+    /// Add an async transform to the end of the pipeline (mutating form).
+    pub fn add_async_transform(&mut self, transform: Box<dyn AsyncTransform>) {
+        self.transforms.push(Stage::Async(transform));
     }
 
     /// Add a transform to the end of the pipeline (fluent builder form).
@@ -59,7 +159,7 @@ impl TransformPipeline {
     /// ```
     #[must_use]
     pub fn with<T: Transform + 'static>(mut self, transform: T) -> Self {
-        self.transforms.push(Box::new(transform));
+        self.transforms.push(Stage::Sync(Box::new(transform)));
         self
     }
 
@@ -73,6 +173,85 @@ impl TransformPipeline {
         self.transforms.is_empty()
     }
 
+    /// Run a whole batch through every stage, in order, stage by stage.
+    ///
+    /// Prefer this over calling [`TransformPipeline::apply`] per event. It runs stage 1
+    /// over the whole batch, then stage 2, and so on — so a stage that overrides
+    /// `apply_batch` amortises its per-batch cost once instead of once per event, and an
+    /// async stage acquires its lock once instead of `batch.len()` times.
+    ///
+    /// Events a stage drops are removed from the batch; the caller sees only survivors.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a stage failure with the stage name as context, preserving the original
+    /// error kind. Also fails if a stage left an event without resolvable primary-key
+    /// values — see [`TransformPipeline::apply`] for why that is fatal rather than a
+    /// warning.
+    pub async fn apply_batch(&self, events: &mut Vec<Event>) -> Result<()> {
+        if self.transforms.is_empty() || events.is_empty() {
+            return Ok(());
+        }
+
+        // Which events arrived with a resolvable message key. Captured before any stage
+        // runs, because the guard below asks whether a stage *destroyed* one — an event
+        // that never had a key is not a regression.
+        let had_key: Vec<bool> = events
+            .iter()
+            .map(|event| event.op.is_data_change() && event.primary_key_values().is_some())
+            .collect();
+        let keyed_tables: Vec<String> = events
+            .iter()
+            .zip(&had_key)
+            .filter(|(_, keyed)| **keyed)
+            .map(|(event, _)| event.qualified_table_name())
+            .collect();
+
+        for stage in &self.transforms {
+            match stage {
+                Stage::Sync(transform) => transform.apply_batch(events),
+                Stage::Async(transform) => transform.apply_batch(events).await,
+            }
+            .map_err(|error| error.context(format!("transform '{}' failed", stage.name())))?;
+
+            // Key destruction is checked per stage, so the error names the stage that did
+            // it rather than the last one to run.
+            if !keyed_tables.is_empty() {
+                if let Some(event) = events
+                    .iter()
+                    .find(|event| event.op.is_data_change() && event.primary_key_values().is_none())
+                {
+                    return Err(Error::TransformError(format!(
+                        "{}: transform removed the event's primary-key values for table \
+                         '{}'. The event had a resolvable key before this transform and does \
+                         not after it, so it would be emitted unkeyed — breaking log \
+                         compaction and upsert consumers downstream. Primary key columns \
+                         are {:?}. Check whether this transform projects away, renames, or \
+                         rewrites a key column; exclude the key columns from it, or clear \
+                         `Event::primary_key` deliberately if the events are genuinely \
+                         keyless.",
+                        stage.name(),
+                        event.qualified_table_name(),
+                        event.primary_key.as_deref().unwrap_or(&[]),
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run an event through every stage in order.
+    ///
+    /// Returns `Ok(None)` if a stage dropped the event — an ordinary filtering outcome,
+    /// not an error.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a stage failure with the stage name as context, **preserving the
+    /// original error kind** so a `ConfigError` raised inside a transform still routes as
+    /// a configuration problem rather than a terminal one. Also fails if a stage left the
+    /// event without resolvable primary-key values.
     pub async fn apply(&self, mut event: Event) -> Result<Option<Event>> {
         // Whether the event had a resolvable message key before any transform ran.
         // Only meaningful for data-change events; READ/SCHEMA_CHANGE/TRUNCATE carry no
@@ -80,10 +259,21 @@ impl TransformPipeline {
         let key_before = event.op.is_data_change() && event.primary_key_values().is_some();
 
         for transform in &self.transforms {
-            let keep = transform
-                .apply(&mut event)
-                .await
-                .map_err(|error| Error::TransformError(format!("{}: {error}", transform.name())))?;
+            // Wrap with context rather than re-wrapping as `TransformError`.
+            //
+            // Re-wrapping laundered the variant: a `ConfigError` raised inside a
+            // transform (a mask rule naming a column that does not exist, say) came
+            // out as `TransformError`, whose `ErrorKind` is `Terminal` rather than
+            // `Configuration`. An embedder routing configuration problems to "fix the
+            // config and restart" and terminal ones to "page someone" got the wrong
+            // one, and `TransformErrorPolicy::Skip` would quietly discard events over
+            // a typo. `Error::context` keeps the cause — and therefore the kind —
+            // while still naming the transform that failed.
+            let keep = match transform {
+                Stage::Sync(transform) => transform.apply(&mut event),
+                Stage::Async(transform) => transform.apply(&mut event).await,
+            }
+            .map_err(|error| error.context(format!("transform '{}' failed", transform.name())))?;
             if !keep {
                 return Ok(None);
             }
@@ -126,7 +316,6 @@ impl TransformPipeline {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use serde_json::json;
 
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -142,9 +331,8 @@ mod tests {
     #[derive(Debug)]
     struct FailTransform;
 
-    #[async_trait]
     impl Transform for AppendSuffix {
-        async fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
+        fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
             if let Some(serde_json::Value::Object(after)) = &mut event.after {
                 after.insert("suffix".into(), json!("ok"));
             }
@@ -156,9 +344,8 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Transform for DropEvent {
-        async fn apply(&self, _event: &mut Event) -> crate::core::Result<bool> {
+        fn apply(&self, _event: &mut Event) -> crate::core::Result<bool> {
             Ok(false)
         }
 
@@ -167,9 +354,8 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Transform for FailTransform {
-        async fn apply(&self, _event: &mut Event) -> crate::core::Result<bool> {
+        fn apply(&self, _event: &mut Event) -> crate::core::Result<bool> {
             Err(crate::core::Error::ConfigError("boom".into()))
         }
 
@@ -219,14 +405,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_wraps_transform_errors_with_context() {
+    async fn pipeline_names_the_failing_transform_without_laundering_the_cause() {
+        // This test previously asserted that the pipeline re-wrapped every failure as
+        // `TransformError`. It did — and that flipped a `ConfigError` raised inside a
+        // transform from `ErrorKind::Configuration` to `ErrorKind::Terminal`, sending
+        // an embedder's error routing to the wrong branch. The transform name is still
+        // reported; the cause is now preserved alongside it.
         let mut pipeline = TransformPipeline::default();
         pipeline.add_transform(Box::new(FailTransform));
 
         let error = pipeline.apply(event()).await.unwrap_err();
         assert!(
-            matches!(error, crate::core::Error::TransformError(message) if message.contains("fail_transform"))
+            error.to_string().contains("fail_transform"),
+            "the failing transform must still be named; got: {error}"
         );
+        // `FailTransform` raises a `ConfigError` — a mask rule naming a column that
+        // does not exist is exactly this shape. The kind must survive the pipeline so
+        // an embedder routes it to "fix the config and restart" rather than to a page.
+        assert!(
+            matches!(error.root_cause(), crate::core::Error::ConfigError(_)),
+            "the original cause must survive; got: {:?}",
+            error.root_cause()
+        );
+        assert_eq!(error.kind(), crate::core::ErrorKind::Configuration);
     }
 
     #[tokio::test]

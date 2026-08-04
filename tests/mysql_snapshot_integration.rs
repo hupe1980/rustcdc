@@ -143,7 +143,7 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
             query.push_str(&format!("('row-{}')", i));
             first = false;
         }
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .execute(&admin_pool)
             .await
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
@@ -295,7 +295,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> rustcdc::Result<()> {
             query.push_str(&format!("('row-{}')", i));
             first = false;
         }
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .execute(&admin_pool)
             .await
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;

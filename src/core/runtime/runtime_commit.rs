@@ -66,14 +66,17 @@ impl CdcRuntime {
         self.observability()
             .tracer
             .trace_checkpoint_barrier("accepting");
-        self.commit_barrier
-            .notify_consumer_accepted(count as u64)
-            .inspect_err(|error| self.record_runtime_error("runtime.commit.accept", error))?;
         self.observability()
             .tracer
             .trace_checkpoint_barrier("flushing");
+        // Acceptance and the durable write are one operation. Splitting them meant a
+        // checkpoint-store failure left the acceptance marks applied, so the natural
+        // retry failed with "acceptance notification exceeds pending records" forever
+        // and `stop()` refused to run — only `force_stop()`, which discards the
+        // events, could exit. `accept_and_commit` restores the pre-call state on
+        // failure, so retrying the identical `commit_ack` is correct.
         self.commit_barrier
-            .commit(&mut *self.config.checkpoint)
+            .accept_and_commit(count as u64, &mut *self.config.checkpoint)
             .await
             .inspect_err(|error| self.record_runtime_error("runtime.commit.checkpoint", error))?;
 
