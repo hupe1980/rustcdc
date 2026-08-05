@@ -420,6 +420,44 @@ impl RuntimeOptions {
 }
 
 /// Runtime-level idempotency guard configuration.
+///
+/// # Both constructors return `Result`, so the chain needs a `?` per step
+///
+/// `capacity` and `ttl_ms` are validated where they are set rather than at
+/// `CdcRuntime::new`, because a zero for either silently disables the guard rather than
+/// configuring it — a window of zero suppresses nothing, and a TTL of zero expires every
+/// fingerprint before the next event. That makes both methods fallible, which means the
+/// natural-looking chain does **not** compile:
+///
+/// ```compile_fail
+/// use rustcdc::IdempotencyOptions;
+/// # fn main() -> rustcdc::Result<()> {
+/// // error[E0599]: no method named `with_ttl_ms` found for enum `Result`
+/// let options = IdempotencyOptions::new(100_000).with_ttl_ms(60_000);
+/// # Ok(()) }
+/// ```
+///
+/// Write it with a `?` after each step:
+///
+/// ```
+/// use rustcdc::IdempotencyOptions;
+/// # fn main() -> rustcdc::Result<()> {
+/// let options = IdempotencyOptions::new(100_000)?.with_ttl_ms(60_000)?;
+/// assert_eq!(options.capacity, 100_000);
+/// assert_eq!(options.ttl_ms, Some(60_000));
+/// # Ok(()) }
+/// ```
+///
+/// Outside a `Result`-returning function, unwrap the constant once:
+///
+/// ```
+/// use rustcdc::IdempotencyOptions;
+///
+/// let options = IdempotencyOptions::new(100_000)
+///     .and_then(|options| options.with_ttl_ms(60_000))
+///     .expect("literal capacity and TTL are both non-zero");
+/// # let _ = options;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdempotencyOptions {
     /// Maximum fingerprints retained in the sliding window.
@@ -439,9 +477,22 @@ pub struct IdempotencyOptions {
 impl IdempotencyOptions {
     /// Build options with the given window capacity and no TTL.
     ///
+    /// Returns a `Result`, so chaining [`with_ttl_ms`](Self::with_ttl_ms) onto it needs a
+    /// `?` in between — see the type-level docs.
+    ///
+    /// ```
+    /// use rustcdc::IdempotencyOptions;
+    /// # fn main() -> rustcdc::Result<()> {
+    /// let options = IdempotencyOptions::new(100_000)?.with_ttl_ms(60_000)?;
+    /// # let _ = options;
+    /// # Ok(()) }
+    /// ```
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::ConfigError`] if `capacity` is zero.
+    /// Returns [`Error::ConfigError`] if `capacity` is zero. A zero-capacity window
+    /// suppresses nothing, so accepting it would present a disabled guard as an enabled
+    /// one.
     pub fn new(capacity: usize) -> Result<Self> {
         if capacity == 0 {
             return Err(Error::ConfigError(
@@ -456,9 +507,13 @@ impl IdempotencyOptions {
 
     /// Set a fingerprint lifetime in milliseconds.
     ///
+    /// Takes and returns `Self`, but is called on the `Ok` value of
+    /// [`new`](Self::new) — `IdempotencyOptions::new(n)?.with_ttl_ms(ms)?`.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::ConfigError`] if `ttl_ms` is zero.
+    /// Returns [`Error::ConfigError`] if `ttl_ms` is zero. A zero TTL expires every
+    /// fingerprint before the next event, disabling the guard rather than tuning it.
     pub fn with_ttl_ms(mut self, ttl_ms: u64) -> Result<Self> {
         if ttl_ms == 0 {
             return Err(Error::ConfigError(
@@ -851,6 +906,15 @@ pub struct RuntimeAdminSnapshot {
     /// **Any non-zero value means data was lost.** A skipped event is dropped *and* the
     /// checkpoint advances past it, so it is never replayed. Alert on any increase.
     pub total_events_skipped: u64,
+    /// Transform rules that have never matched anything since `start()`.
+    ///
+    /// A masking rule that never fires means a column is shipping in clear text; a
+    /// routing rule that never fires means events are going to the default destination.
+    /// Neither errors, so this is the only signal. **Non-empty is only meaningful after
+    /// real traffic** — every rule is unmatched before the first event.
+    ///
+    /// See [`UnmatchedRule`](crate::transform::UnmatchedRule).
+    pub unmatched_transform_rules: Vec<crate::transform::UnmatchedRule>,
     /// Derived health verdict.
     ///
     /// Use this for alerting rather than composing `state`, counters and timestamps by
@@ -3360,10 +3424,13 @@ mod tests {
             "id".to_string(),
             MaskRule::Encrypt(crate::core::SecretString::new("state-of-the-art-test-key")),
         );
-        runtime.add_transform(Box::new(MaskHashTransform::new(MaskHashConfig {
-            mask_rules: rules,
-            default_rule: MaskRule::UnsaltedSha256,
-        })));
+        runtime.add_transform(Box::new(
+            MaskHashTransform::new(MaskHashConfig {
+                mask_rules: rules,
+                default_rule: MaskRule::UnsaltedSha256,
+            })
+            .unwrap(),
+        ));
 
         runtime.start().await.unwrap();
         runtime.enqueue_event(event()).unwrap();
@@ -4914,6 +4981,120 @@ mod tests {
         let prometheus = runtime.admin_metrics_prometheus();
         assert!(prometheus.contains("rustcdc_runtime_checkpoint_age_ms"));
         assert!(prometheus.contains("rustcdc_runtime_replication_lag_ms"));
+    }
+
+    /// A masking rule that never fires must reach the metrics endpoint, not just a log.
+    ///
+    /// A rule with zero hits means a column is shipping in clear text. Before this, the
+    /// only way to see it was to call an accessor at shutdown — something an operator has
+    /// to go looking for rather than something that pages them.
+    #[tokio::test]
+    async fn unmatched_transform_rules_reach_the_admin_surface() {
+        use crate::transform::{MaskHashConfig, MaskHashTransform, MaskRule};
+
+        let mut rules: ahash::AHashMap<String, MaskRule> = ahash::AHashMap::new();
+        rules.insert("payload".into(), MaskRule::Redact("***".into()));
+        rules.insert("paylaod".into(), MaskRule::Redact("***".into())); // typo
+
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::Disabled,
+            InMemoryCheckpoint::default(),
+            InMemorySchemaHistory::default(),
+        );
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.add_transform(Box::new(
+            MaskHashTransform::new(MaskHashConfig {
+                mask_rules: rules,
+                default_rule: MaskRule::Passthrough,
+            })
+            .unwrap(),
+        ));
+        runtime.start().await.unwrap();
+
+        // Before traffic every rule is unmatched, which says nothing — but it must not be
+        // reported as if it did, or the metric fires on every cold start.
+        let mut event = event();
+        event.after = Some(serde_json::json!({"payload": "secret"}));
+        runtime.enqueue_event(event).unwrap();
+        let _ = runtime.poll_event_batch().await.unwrap();
+
+        let admin = runtime.admin_snapshot();
+        let reported: Vec<&str> = admin
+            .unmatched_transform_rules
+            .iter()
+            .map(|rule| rule.rule.as_str())
+            .collect();
+        assert_eq!(
+            reported,
+            vec!["paylaod"],
+            "only the rule that never matched must be reported"
+        );
+
+        let prometheus = runtime.admin_metrics_prometheus();
+        assert!(
+            prometheus.contains(
+                "rustcdc_transform_rules_unmatched{source_type=\"unknown\",\
+                 transform=\"mask_hash\",kind=\"mask\",rule=\"paylaod\"} 1"
+            ),
+            "the unmatched rule must be a labelled series an alert can match on:\n{prometheus}"
+        );
+    }
+
+    /// A rule identifier containing a quote must not break the whole scrape.
+    #[tokio::test]
+    async fn prometheus_label_values_are_escaped() {
+        use crate::transform::{
+            FilterField, FilterOperator, FilterProjectionConfig, FilterProjectionTransform,
+            FilterRule,
+        };
+
+        // `FilterRule::describe` renders the value with `{:?}`, so the label value
+        // contains double quotes. Unescaped, they terminate the label early and the
+        // exposition body becomes unparseable — taking every metric on the endpoint down,
+        // not just this one.
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::Disabled,
+            InMemoryCheckpoint::default(),
+            InMemorySchemaHistory::default(),
+        );
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.add_transform(Box::new(
+            FilterProjectionTransform::new(FilterProjectionConfig {
+                filters: vec![FilterRule::new(
+                    FilterField::Table,
+                    FilterOperator::Eq,
+                    "never\\matches",
+                )],
+                ..FilterProjectionConfig::default()
+            })
+            .unwrap(),
+        ));
+        runtime.start().await.unwrap();
+        runtime.enqueue_event(event()).unwrap();
+        let _ = runtime.poll_event_batch().await.unwrap();
+
+        let prometheus = runtime.admin_metrics_prometheus();
+        let line = prometheus
+            .lines()
+            .find(|line| line.starts_with("rustcdc_transform_rules_unmatched{"))
+            .expect("the unmatched filter rule must be reported");
+        assert!(
+            line.ends_with("} 1"),
+            "the series must be well-formed: {line}"
+        );
+        assert_eq!(
+            line,
+            concat!(
+                r#"rustcdc_transform_rules_unmatched{source_type="unknown","#,
+                r#"transform="filter_projection",kind="filter","#,
+                // `describe` renders the value with `{:?}`, so the rule text is
+                // `table eq "never\\matches"`. Prometheus escaping then doubles each
+                // backslash and backslash-escapes each quote.
+                r#"rule="table eq \"never\\\\matches\""} 1"#
+            ),
+            "quotes and backslashes inside a rule must be escaped so the exposition body \
+             stays parseable"
+        );
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::core::{Error, SecretString};
 use crate::core::{Event, Result};
 
-use super::Transform;
+use super::{Transform, UnmatchedRule};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -25,7 +25,7 @@ use super::Transform;
 ///
 /// Rules match by **exact dotted JSON path** against a `default_rule`, so a typo or an
 /// upstream rename silently disables one. Every rule carries a hit counter for exactly
-/// that reason — see [`MaskHashTransform::unmatched_rules`].
+/// that reason — see [`Transform::unmatched_rules`].
 pub enum MaskRule {
     /// Deterministic SHA-256 hash (no salt).
     ///
@@ -118,6 +118,67 @@ impl MaskHashConfig {
             default_rule: MaskRule::UnsaltedSha256,
         }
     }
+
+    /// Reject a configuration whose rules cannot do what they appear to.
+    ///
+    /// Called by [`MaskHashTransform::new`], so a bad rule fails at construction rather
+    /// than producing plausible-looking output forever. Matches the validation
+    /// [`FilterProjectionConfig::validate`](crate::transform::FilterProjectionConfig::validate)
+    /// and [`RouteConfig::validate`](crate::transform::RouteConfig::validate) already do.
+    ///
+    /// # What is rejected, and why
+    ///
+    /// - **`Truncate(0)`** produces an empty string, which is indistinguishable
+    ///   downstream from a genuinely empty column. It is almost always a typo for
+    ///   [`MaskRule::Redact`] or [`MaskRule::Null`], and unlike those two it leaves a
+    ///   consumer no way to tell that masking happened at all.
+    /// - **`Redact("")`** has the same defect for the same reason.
+    /// - **An empty rule path** can never match a field, so the rule silently does
+    ///   nothing — the failure mode the hit counters exist to surface, caught earlier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`](crate::core::Error::ConfigError) naming the offending
+    /// path and the rule to use instead.
+    pub fn validate(&self) -> Result<()> {
+        let rules = self
+            .mask_rules
+            .iter()
+            .map(|(path, rule)| (path.as_str(), rule))
+            // The default rule reaches every unlisted field, so a bad one is worse, not
+            // exempt.
+            .chain([("<default_rule>", &self.default_rule)]);
+
+        for (path, rule) in rules {
+            if path.trim().is_empty() {
+                return Err(crate::core::Error::ConfigError(
+                    "mask rule path must not be empty: an empty path matches no field, so \
+                     the rule would silently do nothing"
+                        .into(),
+                ));
+            }
+            match rule {
+                MaskRule::Truncate(0) => {
+                    return Err(crate::core::Error::ConfigError(format!(
+                        "mask rule for '{path}' is Truncate(0), which produces an empty \
+                         string — indistinguishable downstream from a genuinely empty \
+                         column. Use MaskRule::Redact with a marker a consumer can \
+                         recognise, or MaskRule::Null, both of which say masking happened."
+                    )));
+                }
+                MaskRule::Redact(placeholder) if placeholder.is_empty() => {
+                    return Err(crate::core::Error::ConfigError(format!(
+                        "mask rule for '{path}' redacts to an empty string, which is \
+                         indistinguishable downstream from a genuinely empty column. Give \
+                         Redact a marker a consumer can recognise (\"***\"), or use \
+                         MaskRule::Null."
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Applies masking, hashing and field encryption to event payloads.
@@ -134,10 +195,11 @@ impl MaskHashConfig {
 /// Fail-closed is not the right answer either: it would refuse to start a pipeline
 /// over a rule for an optional column, and operators would work around it by removing
 /// rules. Instead every rule carries a hit counter.
-/// [`MaskHashTransform::unmatched_rules`] names the rules that have never fired, and
-/// [`MaskHashTransform::warn_on_unmatched_rules`] logs them. Call it after the first
-/// batches have flowed, or wire `unmatched_rules()` into a health check — a rule with
-/// zero hits after real traffic means the field is not being masked.
+/// [`Transform::unmatched_rules`] names the rules that have never fired, the runtime
+/// exposes them as `rustcdc_transform_rules_unmatched`, and
+/// [`Transform::warn_on_unmatched_rules`] logs them. Alert on the metric, or wire
+/// [`MaskHashTransform::unmatched_rule_paths`] into a health check — a rule with zero hits
+/// after real traffic means the field is not being masked.
 #[derive(Debug, Default)]
 pub struct MaskHashTransform {
     /// Rule configuration.
@@ -153,13 +215,28 @@ pub struct MaskHashTransform {
 impl Clone for MaskHashTransform {
     /// Clones the configuration; hit counters start fresh in the clone.
     fn clone(&self) -> Self {
-        Self::new(self.config.clone())
+        // The original's config was validated at construction, so this cannot fail.
+        Self::new_unchecked(self.config.clone())
     }
 }
 
 impl MaskHashTransform {
     /// Build a transform from rule configuration, with all hit counters at zero.
-    pub fn new(config: MaskHashConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`](crate::core::Error::ConfigError) when a rule cannot
+    /// do what it appears to — see [`MaskHashConfig::validate`].
+    pub fn new(config: MaskHashConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self::new_unchecked(config))
+    }
+
+    /// Build a transform without validating the configuration.
+    ///
+    /// Only for [`Clone`], which rebuilds from a config that was validated when the
+    /// original was constructed.
+    fn new_unchecked(config: MaskHashConfig) -> Self {
         let mut rule_paths: Vec<String> = config.mask_rules.keys().cloned().collect();
         // Deterministic order so `unmatched_rules()` output is stable across runs.
         rule_paths.sort();
@@ -186,7 +263,12 @@ impl MaskHashTransform {
     /// **A non-empty result after real traffic means those fields are not being
     /// masked.** Empty before any events have flowed, so evaluate it against a
     /// meaningful sample rather than at startup.
-    pub fn unmatched_rules(&self) -> Vec<&str> {
+    ///
+    /// The same information reaches the runtime through
+    /// [`Transform::unmatched_rules`], which is what feeds the
+    /// `rustcdc_transform_rules_unmatched` metric. Prefer the metric for alerting;
+    /// this accessor is for a caller that wants just the paths.
+    pub fn unmatched_rule_paths(&self) -> Vec<&str> {
         use std::sync::atomic::Ordering;
         self.rule_paths
             .iter()
@@ -202,28 +284,6 @@ impl MaskHashTransform {
         self.rule_slots
             .get(path)
             .map(|index| self.rule_hits[*index].load(Ordering::Relaxed))
-    }
-
-    /// Log a WARN naming every rule that has never matched, if any.
-    ///
-    /// Returns the number of unmatched rules so a caller can fail a readiness check
-    /// on it if the deployment requires masking to be provably active.
-    pub fn warn_on_unmatched_rules(&self) -> usize {
-        let unmatched = self.unmatched_rules();
-        if unmatched.is_empty() {
-            return 0;
-        }
-        tracing::warn!(
-            target: "rustcdc::transform::mask_hash",
-            unmatched_rules = ?unmatched,
-            configured_rules = self.rule_paths.len(),
-            "{} of {} masking rules have never matched a field. Those fields are NOT \
-             being masked — check for a typo in the path, a column renamed upstream, or \
-             an earlier transform that moved the field.",
-            unmatched.len(),
-            self.rule_paths.len(),
-        );
-        unmatched.len()
     }
 
     /// Record that the rule registered at `path` fired.
@@ -361,6 +421,22 @@ impl Transform for MaskHashTransform {
 
     fn name(&self) -> &str {
         "mask_hash"
+    }
+
+    fn unmatched_rules(&self) -> Vec<UnmatchedRule> {
+        self.unmatched_rule_paths()
+            .into_iter()
+            .map(|path| {
+                UnmatchedRule::new(
+                    self.name(),
+                    "mask",
+                    path,
+                    "Those fields are NOT being masked and are shipping in clear text — \
+                     check for a typo in the path, a column renamed upstream, or an earlier \
+                     transform that moved the field.",
+                )
+            })
+            .collect()
     }
 }
 
@@ -584,6 +660,13 @@ mod tests {
 
     use super::{MaskHashConfig, MaskHashTransform, MaskRule};
 
+    /// Every configuration in this module is deliberately valid; a construction failure
+    /// is a test bug, not the behaviour under test. The validation itself is covered by
+    /// its own tests below.
+    fn mask_transform(config: MaskHashConfig) -> MaskHashTransform {
+        MaskHashTransform::new(config).expect("test mask configuration must be valid")
+    }
+
     /// A rule on an object- or array-valued field must actually apply.
     ///
     /// Previously only the scalar arm consulted `mask_rules`, so such a rule was
@@ -596,7 +679,7 @@ mod tests {
         config
             .mask_rules
             .insert("profile".into(), MaskRule::Redact("***".into()));
-        let transform = MaskHashTransform::new(config);
+        let transform = mask_transform(config);
 
         let mut event = event();
         transform.apply(&mut event).unwrap();
@@ -620,7 +703,7 @@ mod tests {
         config
             .mask_rules
             .insert("emails.*".into(), MaskRule::Redact("***".into()));
-        let transform = MaskHashTransform::new(config);
+        let transform = mask_transform(config);
 
         let mut event = event();
         event.after = Some(json!({
@@ -676,7 +759,7 @@ mod tests {
     async fn hash_rule_is_applied() {
         let mut rules = HashMap::new();
         rules.insert("email".into(), MaskRule::UnsaltedSha256);
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Null,
         });
@@ -690,7 +773,7 @@ mod tests {
     async fn redact_and_null_rules_are_applied() {
         let mut rules = HashMap::new();
         rules.insert("email".into(), MaskRule::Redact("***".into()));
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Null,
         });
@@ -706,7 +789,7 @@ mod tests {
     async fn truncate_rule_is_applied() {
         let mut rules = HashMap::new();
         rules.insert("email".into(), MaskRule::Truncate(5));
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::UnsaltedSha256,
         });
@@ -720,7 +803,7 @@ mod tests {
     async fn nested_columns_can_be_masked() {
         let mut rules = HashMap::new();
         rules.insert("profile.phone".into(), MaskRule::Redact("hidden".into()));
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::UnsaltedSha256,
         });
@@ -734,7 +817,7 @@ mod tests {
     async fn mask_hash_is_deterministic() {
         let mut rules = HashMap::new();
         rules.insert("email".into(), MaskRule::UnsaltedSha256);
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Null,
         });
@@ -754,7 +837,7 @@ mod tests {
             "profile.phone".into(),
             MaskRule::Encrypt(SecretString::new("field-key")),
         );
-        let encrypt = MaskHashTransform::new(MaskHashConfig {
+        let encrypt = mask_transform(MaskHashConfig {
             mask_rules: encrypt_rules,
             default_rule: MaskRule::Null,
         });
@@ -774,7 +857,7 @@ mod tests {
             "profile.phone".into(),
             MaskRule::Decrypt(SecretString::new("field-key")),
         );
-        let decrypt = MaskHashTransform::new(MaskHashConfig {
+        let decrypt = mask_transform(MaskHashConfig {
             mask_rules: decrypt_rules,
             default_rule: MaskRule::Null,
         });
@@ -792,7 +875,7 @@ mod tests {
             "email".into(),
             MaskRule::Encrypt(SecretString::new("field-key")),
         );
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Null,
         });
@@ -812,7 +895,7 @@ mod tests {
             "email".into(),
             MaskRule::Encrypt(SecretString::new("field-key")),
         );
-        let encrypt = MaskHashTransform::new(MaskHashConfig {
+        let encrypt = mask_transform(MaskHashConfig {
             mask_rules: encrypt_rules,
             default_rule: MaskRule::Null,
         });
@@ -825,7 +908,7 @@ mod tests {
             "email".into(),
             MaskRule::Decrypt(SecretString::new("wrong-key")),
         );
-        let decrypt = MaskHashTransform::new(MaskHashConfig {
+        let decrypt = mask_transform(MaskHashConfig {
             mask_rules: decrypt_rules,
             default_rule: MaskRule::Null,
         });
@@ -842,7 +925,7 @@ mod tests {
             "email".into(),
             MaskRule::Decrypt(SecretString::new("field-key")),
         );
-        let decrypt = MaskHashTransform::new(MaskHashConfig {
+        let decrypt = mask_transform(MaskHashConfig {
             mask_rules: decrypt_rules,
             default_rule: MaskRule::Null,
         });
@@ -873,7 +956,7 @@ mod tests {
 
         let mut encrypt_rules = HashMap::new();
         encrypt_rules.insert("email".into(), MaskRule::Encrypt(secret()));
-        let encrypt = MaskHashTransform::new(MaskHashConfig {
+        let encrypt = mask_transform(MaskHashConfig {
             mask_rules: encrypt_rules,
             default_rule: MaskRule::Passthrough,
         });
@@ -892,7 +975,7 @@ mod tests {
         let mut decrypt_rules = HashMap::new();
         decrypt_rules.insert("email".into(), MaskRule::Decrypt(secret()));
         decrypt_rules.insert("phone".into(), MaskRule::Decrypt(secret()));
-        let decrypt = MaskHashTransform::new(MaskHashConfig {
+        let decrypt = mask_transform(MaskHashConfig {
             mask_rules: decrypt_rules,
             default_rule: MaskRule::Passthrough,
         });
@@ -932,7 +1015,7 @@ mod tests {
         let secret = SecretString::new("my-secret-key");
         let mut rules = HashMap::new();
         rules.insert("email".into(), MaskRule::HmacSha256(secret.clone()));
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Null,
         });
@@ -956,7 +1039,7 @@ mod tests {
         let make_transform = |key: &str| {
             let mut rules = HashMap::new();
             rules.insert("email".into(), MaskRule::HmacSha256(SecretString::new(key)));
-            MaskHashTransform::new(MaskHashConfig {
+            mask_transform(MaskHashConfig {
                 mask_rules: rules,
                 default_rule: MaskRule::Null,
             })
@@ -981,7 +1064,7 @@ mod tests {
         let unsalted = {
             let mut rules = HashMap::new();
             rules.insert("email".into(), MaskRule::UnsaltedSha256);
-            MaskHashTransform::new(MaskHashConfig {
+            mask_transform(MaskHashConfig {
                 mask_rules: rules,
                 default_rule: MaskRule::Null,
             })
@@ -992,7 +1075,7 @@ mod tests {
                 "email".into(),
                 MaskRule::HmacSha256(SecretString::new("key")),
             );
-            MaskHashTransform::new(MaskHashConfig {
+            mask_transform(MaskHashConfig {
                 mask_rules: rules,
                 default_rule: MaskRule::Null,
             })
@@ -1018,7 +1101,7 @@ mod tests {
         let mut rules: HashMap<String, MaskRule> = HashMap::new();
         rules.insert("email".into(), MaskRule::Redact("***".into()));
         rules.insert("emial".into(), MaskRule::Redact("***".into())); // typo
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Passthrough,
         });
@@ -1027,19 +1110,32 @@ mod tests {
         transform.apply(&mut event).unwrap();
 
         assert_eq!(
-            transform.unmatched_rules(),
+            transform.unmatched_rule_paths(),
             vec!["emial"],
             "the typo'd rule must be reported as never having matched"
         );
         assert_eq!(transform.rule_hit_count("email"), Some(1));
         assert_eq!(transform.warn_on_unmatched_rules(), 1);
+
+        // And the same rule reaches the runtime through the trait, carrying the
+        // consequence an operator needs to act on it.
+        let reported = Transform::unmatched_rules(&transform);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].transform, "mask_hash");
+        assert_eq!(reported[0].kind, "mask");
+        assert_eq!(reported[0].rule, "emial");
+        assert!(
+            reported[0].consequence.contains("clear text"),
+            "the consequence must name what is actually happening: {}",
+            reported[0].consequence
+        );
     }
 
     #[tokio::test]
     async fn a_wildcard_rule_counts_every_element_it_covered() {
         let mut rules: HashMap<String, MaskRule> = HashMap::new();
         rules.insert("emails.*".into(), MaskRule::Redact("***".into()));
-        let transform = MaskHashTransform::new(MaskHashConfig {
+        let transform = mask_transform(MaskHashConfig {
             mask_rules: rules,
             default_rule: MaskRule::Passthrough,
         });
@@ -1048,6 +1144,89 @@ mod tests {
         transform.apply(&mut event).unwrap();
 
         assert_eq!(transform.rule_hit_count("emails.*"), Some(3));
-        assert!(transform.unmatched_rules().is_empty());
+        assert!(transform.unmatched_rule_paths().is_empty());
+        assert!(Transform::unmatched_rules(&transform).is_empty());
+    }
+
+    // ─── Configuration validation ────────────────────────────────────────────
+
+    #[test]
+    fn truncate_zero_is_rejected_at_construction() {
+        // `Truncate(0)` yields "", which downstream cannot tell apart from a genuinely
+        // empty column — so the masking is invisible, not just useless. It is almost
+        // always a typo for Redact or Null.
+        let mut rules: HashMap<String, MaskRule> = HashMap::new();
+        rules.insert("ssn".into(), MaskRule::Truncate(0));
+
+        let error = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: rules,
+            default_rule: MaskRule::Passthrough,
+        })
+        .expect_err("Truncate(0) must be rejected");
+
+        let message = error.to_string();
+        assert!(message.contains("ssn"), "must name the rule: {message}");
+        assert!(
+            message.contains("Redact") && message.contains("Null"),
+            "must name the remedy: {message}"
+        );
+    }
+
+    #[test]
+    fn truncate_zero_is_rejected_as_the_default_rule_too() {
+        // The default rule reaches every unlisted field, so a bad one is worse than a
+        // bad named rule, not exempt from the check.
+        let error = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: HashMap::new(),
+            default_rule: MaskRule::Truncate(0),
+        })
+        .expect_err("Truncate(0) as the default must be rejected");
+        assert!(error.to_string().contains("<default_rule>"));
+    }
+
+    #[test]
+    fn truncate_of_at_least_one_is_accepted() {
+        let mut rules: HashMap<String, MaskRule> = HashMap::new();
+        rules.insert("ssn".into(), MaskRule::Truncate(1));
+        MaskHashTransform::new(MaskHashConfig {
+            mask_rules: rules,
+            default_rule: MaskRule::Passthrough,
+        })
+        .expect("Truncate(1) keeps a character and is a legitimate rule");
+    }
+
+    #[test]
+    fn redacting_to_an_empty_string_is_rejected() {
+        // Same defect as Truncate(0), reached a different way.
+        let mut rules: HashMap<String, MaskRule> = HashMap::new();
+        rules.insert("ssn".into(), MaskRule::Redact(String::new()));
+        let error = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: rules,
+            default_rule: MaskRule::Passthrough,
+        })
+        .expect_err("an empty redaction marker must be rejected");
+        assert!(error.to_string().contains("empty column"));
+    }
+
+    #[test]
+    fn an_empty_rule_path_is_rejected() {
+        let mut rules: HashMap<String, MaskRule> = HashMap::new();
+        rules.insert(String::new(), MaskRule::Redact("***".into()));
+        let error = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: rules,
+            default_rule: MaskRule::Passthrough,
+        })
+        .expect_err("a rule that can never match must be rejected");
+        assert!(error.to_string().contains("matches no field"));
+    }
+
+    #[test]
+    fn the_shipped_constructors_produce_valid_configurations() {
+        MaskHashConfig::default()
+            .validate()
+            .expect("the default configuration must be valid");
+        MaskHashConfig::hash_all()
+            .validate()
+            .expect("hash_all must be valid");
     }
 }

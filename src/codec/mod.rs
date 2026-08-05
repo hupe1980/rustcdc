@@ -71,9 +71,11 @@ pub use avro::{avro_value_to_event, AvroDecoder, AvroEncoder, AVRO_SCHEMA};
 pub use cloudevents::CloudEventsEncoder;
 pub use json::{JsonCodec, JsonEncoder, JsonPrettyEncoder};
 #[cfg(feature = "protobuf")]
-pub use protobuf::ProtobufEncoder;
+pub use protobuf::{ProtoEventKey, ProtobufEncoder};
 #[cfg(feature = "glue")]
 pub use schema_registry::glue;
+#[cfg(feature = "glue")]
+pub use schema_registry::glue::{GlueAvroConfig, GlueAvroDecoder, GlueAvroEncoder};
 #[cfg(feature = "apicurio")]
 pub use schema_registry::ApicurioRegistryConfig;
 #[cfg(feature = "schemreg")]
@@ -87,7 +89,7 @@ pub use schema_registry::{
     SchemaId, SchemaReference, SchemaRegError, SchemaRegistryAuth, SchemaRegistryClient,
     SchemaRegistryConfig, SchemaType, SchemaVersion, SubjectNameStrategy, WireFormatDecoder,
     DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_RETRIES, EVENT_JSON_SCHEMA,
-    KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
+    KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA, KEY_PROTO_SCHEMA,
 };
 
 use crate::core::{Event, Result};
@@ -364,6 +366,141 @@ impl Codec for BoxedCodec {
     }
 }
 
+// ─── AsyncCodec ───────────────────────────────────────────────────────────────
+
+/// The `async` counterpart of [`Codec`], for encoders that must await.
+///
+/// # Why this exists
+///
+/// Two of the three Confluent encoders resolve their subject **lazily**, on first
+/// encode, because [`SubjectNameStrategy::RecordName`] and
+/// [`TopicRecordName`](SubjectNameStrategy::TopicRecordName) exist precisely to give each
+/// record type its own subject — resolving eagerly at construction would defeat them.
+/// Their `encode` is therefore `async`, which fits neither [`Codec`] nor [`EventEncoder`].
+///
+/// Before this trait, a sink that wanted to hold "some codec" could not hold all three
+/// Confluent formats behind one type: [`ConfluentAvroEncoder`] reached [`BoxedCodec`] via
+/// [`EncoderCodec`], while [`ConfluentJsonSchemaEncoder`] and [`ConfluentProtobufEncoder`]
+/// sat outside the type system entirely, and every embedder hand-rolled the same
+/// three-variant dispatch enum. `AsyncCodec` is that enum, once, in the library.
+///
+/// # Relationship to [`Codec`]
+///
+/// There is a blanket `impl<T: Codec> AsyncCodec for T`, so **every synchronous codec is
+/// already an `AsyncCodec`** and a sink only ever needs to accept this one trait. Generic
+/// code bounded on `AsyncCodec` therefore takes [`JsonCodec`] and
+/// [`ConfluentProtobufEncoder`] alike.
+///
+/// Two consequences of the blanket impl are worth knowing:
+///
+/// - A type cannot implement both traits by hand. Implement [`Codec`] when encoding never
+///   awaits, and `AsyncCodec` only when it must.
+/// - The encode method is [`encode_async`](Self::encode_async), *not* `encode`. A trait
+///   that is blanket-implemented over another must not reuse its method names: with both
+///   traits in scope, `codec.encode(..)` would be an `E0034` ambiguity on every synchronous
+///   codec — an error the library would be handing to its users on the hottest call in the
+///   API. [`content_type`](Self::content_type) does share a name, because the blanket impl
+///   forwards it and both traits return the same value, so the worst case there is a
+///   compiler-suggested disambiguation that cannot change behaviour.
+///
+/// # Example
+///
+/// ```rust
+/// use rustcdc::codec::{AsyncCodec, BoxedAsyncCodec, JsonCodec};
+///
+/// # async fn example() -> rustcdc::core::Result<()> {
+/// // A synchronous codec crosses over for free via the blanket impl.
+/// let codec: BoxedAsyncCodec = JsonCodec::default().boxed_async();
+///
+/// # let event = rustcdc::Event::builder("t", rustcdc::Operation::Insert).build();
+/// let out = codec.encode_async(&event).await?;
+/// assert_eq!(out.content_type, "application/json");
+/// # Ok(()) }
+/// ```
+///
+/// [`SubjectNameStrategy::RecordName`]: crate::codec::SubjectNameStrategy
+/// [`ConfluentAvroEncoder`]: crate::codec::ConfluentAvroEncoder
+/// [`ConfluentJsonSchemaEncoder`]: crate::codec::ConfluentJsonSchemaEncoder
+/// [`ConfluentProtobufEncoder`]: crate::codec::ConfluentProtobufEncoder
+#[async_trait::async_trait]
+pub trait AsyncCodec: Send + Sync {
+    /// Encode the event into a key + value pair, awaiting whatever the encoder needs.
+    ///
+    /// Named `encode_async` rather than `encode` so that it never collides with
+    /// [`Codec::encode`] on the types the blanket impl covers — see the trait docs.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying encoder reports — for the registry-backed codecs, a
+    /// classified source error when the registry is unreachable (`Transient`) or the
+    /// subject cannot be resolved (`Terminal`).
+    async fn encode_async(&self, event: &Event) -> Result<CodecOutput>;
+
+    /// The MIME content type for every successful `value` byte sequence.
+    fn content_type(&self) -> &'static str;
+
+    /// Wrap `self` in a [`BoxedAsyncCodec`], erasing the concrete type.
+    fn boxed_async(self) -> BoxedAsyncCodec
+    where
+        Self: Sized + 'static,
+    {
+        BoxedAsyncCodec::new(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: Codec> AsyncCodec for T {
+    async fn encode_async(&self, event: &Event) -> Result<CodecOutput> {
+        Codec::encode(self, event)
+    }
+
+    fn content_type(&self) -> &'static str {
+        Codec::content_type(self)
+    }
+}
+
+/// A type-erased [`AsyncCodec`].
+///
+/// The async counterpart of [`BoxedCodec`]. Because of the blanket
+/// `impl<T: Codec> AsyncCodec for T`, this holds synchronous and asynchronous codecs
+/// alike — which is the point: a sink stores one type regardless of format.
+///
+/// ```rust
+/// use rustcdc::codec::{AsyncCodec, BoxedAsyncCodec, JsonCodec};
+///
+/// let codec: BoxedAsyncCodec = JsonCodec::default().boxed_async();
+/// assert_eq!(AsyncCodec::content_type(&codec), "application/json");
+/// ```
+pub struct BoxedAsyncCodec(Box<dyn AsyncCodec>);
+
+impl std::fmt::Debug for BoxedAsyncCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoxedAsyncCodec")
+            .field("content_type", &self.0.content_type())
+            .finish()
+    }
+}
+
+impl BoxedAsyncCodec {
+    /// Wrap any [`AsyncCodec`] implementation in a type-erased `BoxedAsyncCodec`.
+    ///
+    /// Prefer [`AsyncCodec::boxed_async`] for ergonomic construction.
+    pub fn new<C: AsyncCodec + 'static>(codec: C) -> Self {
+        Self(Box::new(codec))
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncCodec for BoxedAsyncCodec {
+    async fn encode_async(&self, event: &Event) -> Result<CodecOutput> {
+        self.0.encode_async(event).await
+    }
+
+    fn content_type(&self) -> &'static str {
+        self.0.content_type()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,7 +571,7 @@ mod tests {
         let codec = EncoderCodec::new(JsonEncoder);
         let event = sample_event();
         let out = codec.encode(&event).unwrap();
-        assert_eq!(out.content_type, codec.content_type());
+        assert_eq!(out.content_type, Codec::content_type(&codec));
     }
 
     #[test]
@@ -476,5 +613,46 @@ mod tests {
         let event = sample_event();
         let out = codec.encode(&event).unwrap();
         assert!(!out.value.is_empty());
+    }
+
+    // ─── AsyncCodec ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_sync_codec_is_an_async_codec_via_the_blanket_impl() {
+        use crate::codec::json::JsonCodec;
+        let codec = JsonCodec::default();
+        let mut event = sample_event();
+        event.primary_key = Some(vec!["id".into()]);
+
+        let out = codec.encode_async(&event).await.unwrap();
+        assert_eq!(out.content_type, "application/json");
+        assert!(out.key.is_some());
+    }
+
+    #[tokio::test]
+    async fn boxed_async_codec_erases_the_concrete_type() {
+        use crate::codec::json::JsonCodec;
+        // The point of the trait: one type holds sync and async codecs alike, so a sink
+        // does not need a hand-rolled dispatch enum per registry format.
+        let codecs: Vec<BoxedAsyncCodec> = vec![
+            JsonCodec::default().boxed_async(),
+            EncoderCodec::new(JsonEncoder).boxed_async(),
+        ];
+
+        let mut event = sample_event();
+        event.primary_key = Some(vec!["id".into()]);
+        for codec in &codecs {
+            let out = codec.encode_async(&event).await.unwrap();
+            assert_eq!(AsyncCodec::content_type(codec), "application/json");
+            assert!(out.key.is_some());
+        }
+    }
+
+    #[test]
+    fn boxed_async_codec_is_send_and_sync() {
+        // A sink shares one across tasks; if this ever stops holding, every caller has to
+        // reach for a mutex.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BoxedAsyncCodec>();
     }
 }

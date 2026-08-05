@@ -429,10 +429,78 @@ run_reexport_coverage_check() {
     done <<< "$items"
   }
 
+  # Crate-root parity, one level further up than module→parent.
+  #
+  # Module→parent alone left items reachable only as `rustcdc::codec::X` while their
+  # direct counterparts were `rustcdc::X`: `ConfluentProtobufEncoder`/`Decoder` next to
+  # the Avro and JSON Schema pairs, `AvroDecoder` next to `AvroEncoder`,
+  # `OutboxTransform`/`OutboxResult` next to every other shipped transform, the three
+  # concrete `DdlExtractor` implementations next to the trait, and
+  # `IncrementalSnapshotBackend` — the custom-source extension point the audit calls a
+  # differentiator — next to the `IncrementalSnapshotConfig` and handles already there.
+  # Nothing was broken; it cost a docs search per item and made the surface look
+  # arbitrary.
+  #
+  # The rule is **all-or-nothing per module**, and it configures itself: if `src/lib.rs`
+  # re-exports anything from a module, it must re-export everything that module
+  # re-exports. Modules `lib.rs` deliberately keeps namespaced — `checkpoint`,
+  # `testkit`, `fault_injection`, `deterministic_replay`, `schema_history` — have no
+  # crate-root surface to be inconsistent with and are skipped. Adding a single item
+  # from one of them to `lib.rs` opts it in, which is the intended tripwire.
+  #
+  # Every public *item* (`pub struct|enum|trait|const|type|fn`) declared anywhere in the
+  # crate. Used to tell items apart from the module path segments that also appear inside
+  # a `pub use` statement — `avro` in `pub use avro::{…}` is a `pub mod`, not an item, and
+  # crate-root parity for modules is a separate question this gate deliberately leaves to
+  # `pub mod` declarations in lib.rs.
+  local public_items
+  # Anchored at column 0 so an inherent method (`    pub fn route(..)` inside an `impl`)
+  # is not mistaken for a module-level item.
+  public_items="$(rg --no-line-number --no-filename -o \
+    '^pub (?:struct|enum|trait|const|type|fn|async fn) ([A-Za-z_][A-Za-z0-9_]*)' \
+    --replace '$1' src | sort -u)"
+
+  # Names re-exported by `<module>/mod.rs` must also be named by `src/lib.rs`.
+  check_crate_root_reexports() {
+    local module_mod="$1"
+    local module_name
+    module_name="$(basename "$(dirname "$module_mod")")"
+
+    # Skip modules with no crate-root surface at all — they are namespaced by design.
+    if ! rg -q "^pub use crate::${module_name}::" src/lib.rs; then
+      return
+    fi
+
+    # Take the name after `as` when a re-export is aliased: that is the name `lib.rs`
+    # would have to use, and matching the pre-alias name reports a false positive.
+    local names
+    names="$(rg --no-line-number --no-filename --multiline -o \
+      'pub use [^;]+;' "$module_mod" \
+      | sed -E 's/[A-Za-z_][A-Za-z0-9_]* +as +([A-Za-z_][A-Za-z0-9_]*)/\1/g' \
+      | rg -o '\b[A-Za-z_][A-Za-z0-9_]*\b' \
+      | sort -u || true)"
+
+    local item
+    while IFS= read -r item; do
+      [[ -z "$item" ]] && continue
+      # Keep only real items; skip `pub`/`use`/`crate` and module path segments.
+      grep -qx -- "$item" <<< "$public_items" || continue
+      if ! rg -q "\\b$item\\b" src/lib.rs; then
+        echo "crate-root parity: $module_mod re-exports \`$item\` but src/lib.rs never names it" >&2
+        failed=$((failed + 1))
+      fi
+    done <<< "$names"
+  }
+
   check_module_reexports "src/codec/schema_registry.rs" "src/codec/mod.rs"
   check_module_reexports "src/codec/avro.rs" "src/codec/mod.rs"
   check_module_reexports "src/codec/json.rs" "src/codec/mod.rs"
   check_module_reexports "src/source/incremental_snapshot/driver.rs" "src/source/mod.rs"
+
+  # Every module directory; the function itself skips those with no crate-root surface.
+  for module_mod in src/*/mod.rs; do
+    check_crate_root_reexports "$module_mod"
+  done
 
   if [[ "$failed" -gt 0 ]]; then
     echo "re-export coverage check failed: $failed unreachable public item(s)" >&2

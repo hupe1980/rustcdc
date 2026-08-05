@@ -23,6 +23,85 @@ pub use outbox::{OutboxResult, OutboxTransform};
 pub use route::{RouteConfig, RouteTransform};
 pub use unwrap::{UnwrapConfig, UnwrapTransform};
 
+// ─── Rule coverage ────────────────────────────────────────────────────────────
+
+/// A configured rule that has never matched anything.
+///
+/// # Why every pattern-matching transform reports this
+///
+/// Masking, filtering and routing all match by **pattern against a permissive default**,
+/// so a typo, an upstream column rename, or an earlier stage that moved a field disables
+/// a rule *silently*. Nothing errors; the pipeline keeps running and produces plausible
+/// output. What it does instead is the specific harm each transform exists to prevent:
+///
+/// | Transform | A rule that never fires means |
+/// |---|---|
+/// | [`MaskHashTransform`] | a column is shipping in **clear text** |
+/// | [`FilterProjectionTransform`] | rows meant to be excluded are being delivered |
+/// | [`RouteTransform`] | events are going to the **default destination**, not the one configured |
+///
+/// Failing closed is not the answer — it would refuse to start over a rule for an
+/// optional column, and operators would respond by deleting rules. So each rule carries a
+/// hit counter, the runtime exposes the never-fired ones as
+/// `rustcdc_transform_rules_unmatched`, and the condition becomes an alert rule rather
+/// than a log line someone has to grep for at shutdown.
+///
+/// Zero hits is only meaningful **after real traffic**. Evaluate against a representative
+/// sample, not at startup.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct UnmatchedRule {
+    /// The stage the rule belongs to, from [`Transform::name`].
+    pub transform: String,
+    /// What kind of rule it is — `"mask"`, `"filter"`, `"route"`.
+    ///
+    /// A string rather than an enum: it is a metric label, and a stage outside this crate
+    /// must be able to name its own rule kinds without a breaking change here.
+    pub kind: String,
+    /// The configured pattern that never fired — a JSON path, a filter predicate, a
+    /// routing table key or regex.
+    pub rule: String,
+    /// What is silently happening because the rule never fired.
+    ///
+    /// Carried on the value rather than left to the reader: the consequence is what makes
+    /// the alert actionable, and it differs per transform.
+    pub consequence: String,
+}
+
+impl UnmatchedRule {
+    /// Build a report entry.
+    pub fn new(
+        transform: impl Into<String>,
+        kind: impl Into<String>,
+        rule: impl Into<String>,
+        consequence: impl Into<String>,
+    ) -> Self {
+        Self {
+            transform: transform.into(),
+            kind: kind.into(),
+            rule: rule.into(),
+            consequence: consequence.into(),
+        }
+    }
+}
+
+/// Shared body of [`Transform::warn_on_unmatched_rules`] and its async twin.
+fn warn_on_unmatched_rules(name: &str, unmatched: Vec<UnmatchedRule>) -> usize {
+    if unmatched.is_empty() {
+        return 0;
+    }
+    let rules: Vec<&str> = unmatched.iter().map(|rule| rule.rule.as_str()).collect();
+    tracing::warn!(
+        target: "rustcdc::transform",
+        transform = name,
+        unmatched_rules = ?rules,
+        "{} rule(s) on '{name}' have never matched. {}",
+        unmatched.len(),
+        unmatched[0].consequence,
+    );
+    unmatched.len()
+}
+
 /// A **synchronous** stage in the event pipeline.
 ///
 /// Stages run in order, per event, and may mutate the event in place or drop it.
@@ -52,6 +131,28 @@ pub trait Transform: Send + Sync + std::fmt::Debug {
 
     /// Stage name, used in error messages and metrics.
     fn name(&self) -> &str;
+
+    /// Configured rules that have never matched anything.
+    ///
+    /// See [`UnmatchedRule`] for why this is a first-class part of the trait rather than
+    /// a per-transform accessor. The default is empty: a stage whose behaviour does not
+    /// depend on patterns matching has nothing to report.
+    ///
+    /// Implementations must count *matches*, not invocations, and must return an empty
+    /// vector before any events have flowed — a rule cannot be judged unmatched until
+    /// there has been traffic for it to miss.
+    fn unmatched_rules(&self) -> Vec<UnmatchedRule> {
+        Vec::new()
+    }
+
+    /// Log a WARN naming every rule of this stage that has never matched, if any.
+    ///
+    /// Returns the number of unmatched rules, so a caller can fail a readiness check on
+    /// it. Prefer the `rustcdc_transform_rules_unmatched` metric for alerting — a log
+    /// line at shutdown is something an operator has to go looking for.
+    fn warn_on_unmatched_rules(&self) -> usize {
+        warn_on_unmatched_rules(self.name(), self.unmatched_rules())
+    }
 
     /// Apply to a whole batch, dropping events the stage filters out.
     ///
@@ -91,6 +192,18 @@ pub trait AsyncTransform: Send + Sync + std::fmt::Debug {
 
     /// Stage name, used in error messages and metrics.
     fn name(&self) -> &str;
+
+    /// Configured rules that have never matched anything. See [`Transform::unmatched_rules`].
+    fn unmatched_rules(&self) -> Vec<UnmatchedRule> {
+        Vec::new()
+    }
+
+    /// Log a WARN naming every rule of this stage that has never matched, if any.
+    ///
+    /// See [`Transform::warn_on_unmatched_rules`].
+    fn warn_on_unmatched_rules(&self) -> usize {
+        warn_on_unmatched_rules(self.name(), self.unmatched_rules())
+    }
 
     /// Apply to a whole batch.
     ///
@@ -171,6 +284,34 @@ impl TransformPipeline {
     /// Returns `true` when the pipeline contains no transforms.
     pub fn is_empty(&self) -> bool {
         self.transforms.is_empty()
+    }
+
+    /// Every rule across every stage that has never matched anything.
+    ///
+    /// This is what [`CdcRuntime::admin_snapshot`](crate::CdcRuntime::admin_snapshot)
+    /// surfaces and what the `rustcdc_transform_rules_unmatched` metric is built from.
+    /// **Meaningful only after real traffic** — see [`UnmatchedRule`].
+    pub fn unmatched_rules(&self) -> Vec<UnmatchedRule> {
+        self.transforms
+            .iter()
+            .flat_map(|stage| match stage {
+                Stage::Sync(transform) => transform.unmatched_rules(),
+                Stage::Async(transform) => transform.unmatched_rules(),
+            })
+            .collect()
+    }
+
+    /// Log a WARN for every stage that has rules which never matched.
+    ///
+    /// Returns the total number of unmatched rules across the pipeline.
+    pub fn warn_on_unmatched_rules(&self) -> usize {
+        self.transforms
+            .iter()
+            .map(|stage| match stage {
+                Stage::Sync(transform) => transform.warn_on_unmatched_rules(),
+                Stage::Async(transform) => transform.warn_on_unmatched_rules(),
+            })
+            .sum()
     }
 
     /// Run a whole batch through every stage, in order, stage by stage.

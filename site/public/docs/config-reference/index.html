@@ -905,7 +905,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     &quot;http://otel-collector:4317&quot;,  // OTLP gRPC endpoint
     &quot;rustcdc&quot;,                        // Service name
-    &quot;0.8.0&quot;,                         // Service version
+    &quot;0.9.0&quot;,                         // Service version
     &quot;production&quot;,                    // Environment
 );
 
@@ -931,6 +931,7 @@ let config = RuntimeConfig::new(...)
 <tr><td><code>rustcdc_runtime_events_skipped_total</code></td><td>Counter</td><td>Events permanently dropped by <code>TransformErrorPolicy::Skip</code>. <strong>Any non-zero value means data was lost</strong> — the checkpoint advances past skipped events, so they are never replayed. Alert on any increase.</td></tr>
 <tr><td><code>rustcdc_runtime_idempotency_evictions_total</code></td><td>Counter</td><td>Fingerprints evicted because the idempotency window filled. Growing steadily means the window is too small for this deployment's replay distance; raise <code>IdempotencyOptions::capacity</code>.</td></tr>
 <tr><td><code>rustcdc_runtime_idempotency_unidentifiable_total</code></td><td>Counter</td><td>Events passed through undeduplicated because they carry neither transaction metadata nor a resolvable primary key. Expected for keyless tables.</td></tr>
+<tr><td><code>rustcdc_transform_rules_unmatched</code></td><td>Gauge</td><td>Configured transform rules that have never matched an event, one series per rule (<code>transform</code>, <code>kind</code>, <code>rule</code> labels). <strong>Emitted only when a rule is unmatched</strong>, so its absence is the healthy state and <code>rustcdc_transform_rules_unmatched &gt; 0</code> is a complete alert rule. A masking rule that never fires means a column is shipping in clear text; a routing rule that never fires means events are going to the default destination. Only meaningful after real traffic — every rule is unmatched before the first event.</td></tr>
 <tr><td><code>rustcdc_runtime_health</code></td><td>Gauge</td><td>Derived health verdict, one series per <code>verdict</code> label. <strong><code>rustcdc_runtime_health{verdict="stalled"} == 1</code> is the alert rule</strong> — <code>state</code> alone cannot distinguish healthy-idle from stalled.</td></tr>
 <tr><td><code>rustcdc_runtime_checkpoint_age_ms</code></td><td>Gauge</td><td>Age of last durable checkpoint</td></tr>
 <tr><td><code>rustcdc_runtime_replication_lag_ms</code></td><td>Gauge</td><td>Estimated source lag in milliseconds</td></tr>

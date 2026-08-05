@@ -46,7 +46,7 @@ pub use ::schemreg::{
 pub use ::schemreg::{DecodedMessage, DetectedWireFormat, SchemaFormat, WireFormatDecoder};
 
 use crate::codec::avro::AvroEncoder;
-use crate::codec::{EncodedOutput, EventEncoder};
+use crate::codec::{AsyncCodec, CodecOutput, EncodedOutput, EventEncoder};
 use crate::core::{Error, Event, Result, SecretString};
 
 // ─── Wire format content type ─────────────────────────────────────────────────
@@ -337,9 +337,30 @@ impl SchemaRegistryConfig {
     /// Constructs the underlying HTTP client and wraps it with an in-memory LRU
     /// cache. Does **not** make any network connections.
     pub fn build(&self) -> Result<CachedSchemaRegistry<ConfluentSchemaRegistry>> {
-        let mut builder = ConfluentSchemaRegistry::builder().url(&self.url);
+        // Exhaustive destructuring — no `..` rest pattern. Adding a field to
+        // `SchemaRegistryConfig` breaks the build here until it is either wired into the
+        // client or explicitly bound to `_` with a reason. A transport option that silently
+        // stops taking effect is the same defect `as_schema_registry_config` shipped with.
+        let Self {
+            url,
+            // Encoder-side, not transport: subject naming and registration policy are read
+            // by the encoders, which take this config alongside the client built here.
+            topic: _,
+            strategy: _,
+            references: _,
+            auto_register: _,
+            auth,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_cache_entries,
+            normalize_schemas,
+            pool_max_idle_per_host,
+            retry_policy,
+        } = self;
 
-        if let Some(ref auth) = self.auth {
+        let mut builder = ConfluentSchemaRegistry::builder().url(url);
+
+        if let Some(auth) = auth {
             builder = match auth {
                 SchemaRegistryAuth::Basic { username, password } => {
                     builder.basic_auth(username, password)
@@ -353,27 +374,27 @@ impl SchemaRegistryConfig {
             };
         }
 
-        if let Some(ms) = self.request_timeout_ms {
-            builder = builder.request_timeout(Duration::from_millis(ms));
+        if let Some(ms) = request_timeout_ms {
+            builder = builder.request_timeout(Duration::from_millis(*ms));
         }
 
-        if let Some(ms) = self.connect_timeout_ms {
-            builder = builder.connect_timeout(Duration::from_millis(ms));
+        if let Some(ms) = connect_timeout_ms {
+            builder = builder.connect_timeout(Duration::from_millis(*ms));
         }
 
-        if let Some(n) = self.pool_max_idle_per_host {
-            builder = builder.pool_max_idle_per_host(n);
+        if let Some(n) = pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(*n);
         }
 
-        builder = builder.normalize_schemas(self.normalize_schemas);
-        builder = builder.retry_policy(self.retry_policy.clone());
+        builder = builder.normalize_schemas(*normalize_schemas);
+        builder = builder.retry_policy(retry_policy.clone());
 
         let registry = builder
             .build()
             .map_err(|e| Error::ConfigError(format!("schema registry build: {e}")))?;
 
-        let cached = match self.max_cache_entries {
-            Some(n) => CachedSchemaRegistry::with_max_entries(registry, n),
+        let cached = match max_cache_entries {
+            Some(n) => CachedSchemaRegistry::with_max_entries(registry, *n),
             None => CachedSchemaRegistry::new(registry),
         };
 
@@ -426,6 +447,112 @@ fn map_registry_error(context: &str, error: ::schemreg::SchemaRegError) -> Error
 
 // ─── Preflight ────────────────────────────────────────────────────────────────
 
+/// The record names and schema texts rustcdc writes for one wire format.
+///
+/// Both halves vary by format, and getting either wrong points the check at subjects
+/// nothing writes to: Avro and JSON Schema derive subjects from the Avro-style record
+/// name, Protobuf from the message's fully-qualified name (which is what `schemreg` takes
+/// from the descriptor).
+struct SchemaSet {
+    value_record: &'static str,
+    key_record: &'static str,
+    value_schema: &'static str,
+    key_schema: &'static str,
+}
+
+/// Resolve the schemas rustcdc encodes with for `schema_type`.
+///
+/// # Errors
+///
+/// [`Error::ConfigError`] for a format rustcdc has no schemas for. `SchemaType` is
+/// `#[non_exhaustive]` in `schemreg`, and quietly falling back to the Avro schemas is
+/// precisely the defect this indirection exists to prevent.
+fn schema_set_for(schema_type: SchemaType) -> Result<SchemaSet> {
+    Ok(match schema_type {
+        SchemaType::Avro => SchemaSet {
+            value_record: "io.rustcdc.Event",
+            key_record: "io.rustcdc.EventKey",
+            value_schema: crate::codec::avro::AVRO_SCHEMA,
+            key_schema: KEY_AVRO_SCHEMA,
+        },
+        SchemaType::Json => SchemaSet {
+            value_record: "io.rustcdc.Event",
+            key_record: "io.rustcdc.EventKey",
+            value_schema: EVENT_JSON_SCHEMA,
+            key_schema: KEY_JSON_SCHEMA,
+        },
+        SchemaType::Protobuf => SchemaSet {
+            value_record: EVENT_PROTO_FULL_NAME,
+            key_record: EVENT_KEY_PROTO_FULL_NAME,
+            value_schema: EVENT_PROTO_SOURCE,
+            key_schema: KEY_PROTO_SCHEMA,
+        },
+        other => {
+            return Err(Error::ConfigError(format!(
+                "rustcdc has no schemas for schema type {other:?}: it encodes Avro, JSON \
+                 Schema and Protobuf only."
+            )))
+        }
+    })
+}
+
+/// Enforce `auto_register = false` for an encoder whose subject resolution registers.
+///
+/// # Why this exists
+///
+/// `SchemaRegistryConfig::auto_register = false` means *"require the schemas to already
+/// exist"*. [`ConfluentAvroEncoder`] has always honoured it, because it resolves both
+/// subjects itself at construction. The JSON Schema and Protobuf encoders delegate subject
+/// resolution to `schemreg`, whose resolution path is `register_schema` — with no
+/// lookup-only mode — so through 0.8 the setting was **silently ignored** by both. An
+/// operator who set it got schemas registered anyway, and none of the schema-identity
+/// checking that setting exists to buy.
+///
+/// This closes it as far as the dependency allows: at construction, both subjects must
+/// already exist *and* carry exactly the schema rustcdc will write. That converts a
+/// missing-subject or a permissions problem into a startup failure, and restores the
+/// identity check.
+///
+/// **The one thing it cannot do** is prevent the later `register_schema` call. Because the
+/// content is verified identical first, that call is a content-identical re-registration,
+/// which a Confluent-compatible registry answers with the existing id rather than a new
+/// version. A registry that rejects registration outright for this principal will still
+/// fail — but now at startup, with this error, rather than on the first event.
+async fn assert_subjects_preregistered<C>(
+    registry: &C,
+    config: &SchemaRegistryConfig,
+    schema_type: SchemaType,
+) -> Result<()>
+where
+    C: SchemaRegistryClient + ?Sized,
+{
+    let set = schema_set_for(schema_type)?;
+
+    for (record, expected, target) in [
+        (set.value_record, set.value_schema, EncodeTarget::Value),
+        (set.key_record, set.key_schema, EncodeTarget::Key),
+    ] {
+        let subject = config
+            .strategy
+            .subject_name(&config.topic, Some(record), target)
+            .map_err(|error| Error::ConfigError(format!("{target} subject name: {error}")))?;
+
+        let registered = registry
+            .get_latest_schema(&subject)
+            .await
+            .map_err(|error| {
+                Error::ConfigError(format!(
+                    "subject '{subject}' is not registered and `auto_register` is off: {error}. \
+                 Register rustcdc's schema out of band, or enable `auto_register` for \
+                 first-time setup."
+                ))
+            })?;
+        assert_registry_schema_matches(&subject, &registered.schema, expected, schema_type)?;
+    }
+
+    Ok(())
+}
+
 /// Verify the registry is reachable and its schemas are usable, before capture starts.
 ///
 /// Schema resolution sits on the **encode path**, so a registry problem does not surface
@@ -454,10 +581,29 @@ fn map_registry_error(context: &str, error: ::schemreg::SchemaRegError) -> Error
 /// # Errors
 ///
 /// Returns [`Error::ConfigError`] naming the subject and the remedy.
-pub async fn preflight_schema_registry(
-    registry: &impl SchemaRegistryClient,
+pub async fn preflight_schema_registry<C>(
+    registry: &C,
     config: &SchemaRegistryConfig,
-) -> Result<()> {
+    schema_type: SchemaType,
+) -> Result<()>
+where
+    C: SchemaRegistryClient + ?Sized,
+{
+    // `schema_type` selects which schemas to check, and it is not optional. Through 0.8
+    // this function always checked the **Avro** schemas under Avro record names, whatever
+    // codec the pipeline actually used — so a JSON Schema or Protobuf deployment with
+    // `auto_register = false` failed preflight against a perfectly correct registry, and
+    // with `auto_register = true` ran an Avro compatibility check against a JSON subject.
+    //
+    // Generic over the client, and `?Sized`, so an `ApicurioSchemaRegistry` or an erased
+    // `&dyn DynSchemaRegistryClient` preflights exactly like the Confluent client.
+    let SchemaSet {
+        value_record,
+        key_record,
+        value_schema,
+        key_schema,
+    } = schema_set_for(schema_type)?;
+
     match registry.health_check().await {
         Ok(()) => {}
         Err(error) if is_not_supported(&error) => {
@@ -478,34 +624,28 @@ pub async fn preflight_schema_registry(
 
     let value_subject = config
         .strategy
-        .subject_name(&config.topic, Some("io.rustcdc.Event"), EncodeTarget::Value)
+        .subject_name(&config.topic, Some(value_record), EncodeTarget::Value)
         .map_err(|error| Error::ConfigError(format!("value subject name: {error}")))?;
     let key_subject = config
         .strategy
-        .subject_name(
-            &config.topic,
-            Some("io.rustcdc.EventKey"),
-            EncodeTarget::Key,
-        )
+        .subject_name(&config.topic, Some(key_record), EncodeTarget::Key)
         .map_err(|error| Error::ConfigError(format!("key subject name: {error}")))?;
 
-    for (subject, expected) in [
-        (&value_subject, crate::codec::avro::AVRO_SCHEMA),
-        (&key_subject, KEY_AVRO_SCHEMA),
-    ] {
+    for (subject, expected) in [(&value_subject, value_schema), (&key_subject, key_schema)] {
         if config.auto_register {
             match registry
-                .check_compatible(subject, expected, SchemaType::Avro)
+                .check_compatible(subject, expected, schema_type)
                 .await
             {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(Error::ConfigError(format!(
-                        "rustcdc's Avro schema is INCOMPATIBLE with the schema already \
+                        "rustcdc's {} schema is INCOMPATIBLE with the schema already \
                          registered under subject '{subject}', per that subject's \
                          compatibility level. Registering it would be rejected by the \
                          registry, and forcing it past the check would break every existing \
-                         consumer. Resolve the schema conflict, or use a different subject."
+                         consumer. Resolve the schema conflict, or use a different subject.",
+                        schema_type.as_str()
                     )));
                 }
                 // A subject that does not exist yet is the normal first-run case.
@@ -524,7 +664,7 @@ pub async fn preflight_schema_registry(
                      `auto_register` for first-time setup."
                 ))
             })?;
-            assert_registry_schema_matches(subject, &registered.schema, expected)?;
+            assert_registry_schema_matches(subject, &registered.schema, expected, schema_type)?;
         }
     }
 
@@ -563,46 +703,129 @@ fn is_not_found(error: &::schemreg::SchemaRegError) -> bool {
 /// values that look entirely plausible, which is the worst possible outcome and one that
 /// surfaces arbitrarily far downstream.
 ///
-/// Comparison is on Avro's **parsing canonical form** (RFC-style: strips docs, aliases
-/// and default values, normalises ordering), so a registry copy that differs only in
-/// formatting or in field ordering *within the JSON* is accepted, while a genuine
-/// structural difference is rejected.
+/// Comparison is per format, and in each case tolerant of representation but not of
+/// structure:
+///
+/// - **Avro** — the **parsing canonical form** (RFC-style: strips docs, aliases and
+///   default values, normalises ordering), so a registry copy differing only in formatting
+///   or in field ordering within the JSON is accepted.
+/// - **JSON Schema** — parsed to `serde_json::Value` and compared structurally, so
+///   whitespace and key ordering do not matter.
+/// - **Protobuf** — the registry stores `.proto` source, so comparison is on the source
+///   with comments and redundant whitespace stripped.
 fn assert_registry_schema_matches(
     subject: &str,
     registry_schema: &str,
     expected_schema: &str,
+    schema_type: SchemaType,
 ) -> Result<()> {
-    let registry_parsed = Schema::parse_str(registry_schema).map_err(|error| {
-        Error::ConfigError(format!(
-            "schema registered under subject '{subject}' is not valid Avro: {error}"
-        ))
-    })?;
-    let expected_parsed = Schema::parse_str(expected_schema).map_err(|error| {
-        Error::ConfigError(format!(
-            "rustcdc's own Avro schema failed to parse: {error}"
-        ))
-    })?;
+    let (registry_form, expected_form) = match schema_type {
+        SchemaType::Avro => {
+            let registry_parsed = Schema::parse_str(registry_schema).map_err(|error| {
+                Error::ConfigError(format!(
+                    "schema registered under subject '{subject}' is not valid Avro: {error}"
+                ))
+            })?;
+            let expected_parsed = Schema::parse_str(expected_schema).map_err(|error| {
+                Error::ConfigError(format!(
+                    "rustcdc's own Avro schema failed to parse: {error}"
+                ))
+            })?;
+            (
+                registry_parsed.canonical_form(),
+                expected_parsed.canonical_form(),
+            )
+        }
+        SchemaType::Json => {
+            let registry_parsed: serde_json::Value = serde_json::from_str(registry_schema)
+                .map_err(|error| {
+                    Error::ConfigError(format!(
+                        "schema registered under subject '{subject}' is not valid JSON: {error}"
+                    ))
+                })?;
+            let expected_parsed: serde_json::Value = serde_json::from_str(expected_schema)
+                .map_err(|error| {
+                    Error::ConfigError(format!(
+                        "rustcdc's own JSON schema failed to parse: {error}"
+                    ))
+                })?;
+            // Compared as `Value`, not as re-serialised text. Map equality is
+            // order-independent for both of serde_json's map backends, so this holds
+            // whether or not something in the dependency graph turns on `preserve_order` —
+            // and a registry that stores the schema with its keys in a different order is
+            // not a schema change. `to_string` is used only to render the mismatch.
+            if registry_parsed == expected_parsed {
+                return Ok(());
+            }
+            (registry_parsed.to_string(), expected_parsed.to_string())
+        }
+        SchemaType::Protobuf => (
+            normalize_proto_source(registry_schema),
+            normalize_proto_source(expected_schema),
+        ),
+        other => {
+            return Err(Error::ConfigError(format!(
+                "cannot compare schemas of type {other:?}: rustcdc encodes Avro, JSON \
+                 Schema and Protobuf only."
+            )))
+        }
+    };
 
-    if registry_parsed.canonical_form() == expected_parsed.canonical_form() {
+    if registry_form == expected_form {
         return Ok(());
     }
 
+    // The Avro wording is the sharpest case and the one that motivated this check, but the
+    // failure mode generalises: the id in the header resolves to the registry's schema
+    // while the bytes are whatever rustcdc encoded.
+    let consequence = match schema_type {
+        SchemaType::Avro => {
+            "Avro binary is positional and untagged, so consumers would not see an error — \
+             they would silently decode shifted fields and plausible-looking wrong values."
+        }
+        SchemaType::Json => {
+            "Consumers validating against the registry's schema would reject rustcdc's \
+             payloads, or accept fields the registry's schema does not describe."
+        }
+        SchemaType::Protobuf => {
+            "Protobuf is tagged, so most mismatches surface as decode errors — but a field \
+             whose number was reused with a compatible wire type decodes silently as the \
+             wrong field."
+        }
+        // Unreachable: the comparison above already rejected any other type.
+        _ => "Consumers would resolve the id to a schema the payload was not written with.",
+    };
+
     Err(Error::ConfigError(format!(
-        "the schema registered under subject '{subject}' is not the schema rustcdc \
+        "the schema registered under subject '{subject}' is not the {} schema rustcdc \
          encodes with, so every message would be stamped with an id that resolves to a \
-         different schema. Avro binary is positional and untagged, so consumers would not \
-         see an error — they would silently decode shifted fields and plausible-looking \
-         wrong values.\n\
+         different schema. {consequence}\n\
          \n\
-         Registry canonical form: {}\n\
-         Expected canonical form: {}\n\
+         Registry canonical form: {registry_form}\n\
+         Expected canonical form: {expected_form}\n\
          \n\
          Remedy: register rustcdc's schema under this subject (set `auto_register = true` \
          for first-time setup, or register it out of band), or point `topic`/`strategy` at \
          a subject that carries it.",
-        registry_parsed.canonical_form(),
-        expected_parsed.canonical_form(),
+        schema_type.as_str()
     )))
+}
+
+/// Strip `//` comments and collapse whitespace in `.proto` source.
+///
+/// The registry stores Protobuf schemas as source text, so a byte comparison would reject
+/// a registry copy that differs only in a reflowed comment. Comments carry no wire
+/// semantics; token sequence does.
+fn normalize_proto_source(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(index) => &line[..index],
+            None => line,
+        })
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ─── ConfluentAvroEncoder ─────────────────────────────────────────────────────
@@ -702,8 +925,14 @@ impl ConfluentAvroEncoder {
                 &value_subject,
                 &vs.schema,
                 crate::codec::avro::AVRO_SCHEMA,
+                SchemaType::Avro,
             )?;
-            assert_registry_schema_matches(&key_subject, &ks.schema, KEY_AVRO_SCHEMA)?;
+            assert_registry_schema_matches(
+                &key_subject,
+                &ks.schema,
+                KEY_AVRO_SCHEMA,
+                SchemaType::Avro,
+            )?;
 
             (vs.id, ks.id)
         };
@@ -892,6 +1121,9 @@ pub type ConfluentAvroCodec = crate::codec::EncoderCodec<ConfluentAvroEncoder>;
 
 const CONFLUENT_JSON_CONTENT_TYPE: &str = "application/vnd.kafka+json";
 
+/// Content type for Confluent-framed Protobuf, alongside the Avro and JSON constants.
+const CONFLUENT_PROTOBUF_CONTENT_TYPE: &str = "application/vnd.kafka+protobuf";
+
 // ─── Event JSON Schema ────────────────────────────────────────────────────────
 
 /// JSON Schema (draft 2020-12) for the canonical CDC event envelope.
@@ -1054,7 +1286,7 @@ pub const KEY_JSON_SCHEMA: &str = r#"{
 /// # async fn example() -> rustcdc::core::Result<()> {
 /// let config = SchemaRegistryConfig::new("http://localhost:8081", "cdc-events");
 /// let registry = std::sync::Arc::new(config.build()?);
-/// let encoder = ConfluentJsonSchemaEncoder::new(registry, &config)?;
+/// let encoder = ConfluentJsonSchemaEncoder::new(registry, &config).await?;
 /// # Ok(()) }
 /// ```
 ///
@@ -1086,8 +1318,8 @@ where
     /// Both value and key schemas are registered (or looked up) lazily on the
     /// first encode call for each subject. The schemas used are
     /// [`EVENT_JSON_SCHEMA`] and [`KEY_JSON_SCHEMA`].
-    pub fn new(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
-        Self::new_inner(registry, config, true)
+    pub async fn new(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
+        Self::new_inner(registry, config, true).await
     }
 
     /// Construct a JSON Schema encoder that skips JSON Schema validation on encode.
@@ -1095,22 +1327,48 @@ where
     /// Use this only when producers are trusted and throughput is the priority.
     /// Invalid events will be accepted by the encoder but may be rejected by
     /// consumers that validate on decode.
-    pub fn without_validation(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
-        Self::new_inner(registry, config, false)
+    ///
+    /// # Errors
+    ///
+    /// As [`ConfluentJsonSchemaEncoder::new`].
+    pub async fn without_validation(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
+        Self::new_inner(registry, config, false).await
     }
 
-    fn new_inner(registry: C, config: &SchemaRegistryConfig, validate: bool) -> Result<Self> {
+    async fn new_inner(registry: C, config: &SchemaRegistryConfig, validate: bool) -> Result<Self> {
+        // `auto_register = false` was silently ignored here through 0.8: `schemreg`'s JSON
+        // encoder resolves subjects by registering them, with no lookup-only mode, so the
+        // setting bought nothing. Verifying up front is what it can be made to mean — see
+        // `assert_subjects_preregistered` for exactly what that does and does not enforce.
+        if !config.auto_register {
+            assert_subjects_preregistered(&registry, config, SchemaType::Json).await?;
+        }
+
+        // `record_name` is what the `RecordName` and `TopicRecordName` strategies derive
+        // the subject from. Without it those two strategies failed at *encode* time with
+        // "RecordName strategy requires a record name" — a config error that only surfaced
+        // once traffic was flowing, and only for the strategies that exist to give each
+        // record type its own subject. The names match the `$id` of each JSON Schema and
+        // the record names the Avro encoder uses, so the two codecs agree on subjects.
         let value_encoder = ::schemreg::json::JsonSchemaEncoder::builder()
             .registry(registry.clone())
             .schema(EVENT_JSON_SCHEMA)
+            .record_name("io.rustcdc.Event")
             .strategy(config.strategy.clone())
+            // Carried through, like the Avro and Protobuf encoders already did. Dropping
+            // them made registration fail against a subject namespace whose referenced
+            // types cannot be resolved — the failure `references` exists to prevent.
+            .references(config.references.clone())
             .validate_on_encode(validate)
             .build()
             .map_err(|e| Error::ConfigError(format!("json schema value encoder build: {e}")))?;
 
+        // The key subject's schema is `KEY_JSON_SCHEMA`, which imports nothing, so the
+        // envelope's references deliberately do not apply to it.
         let key_encoder = ::schemreg::json::JsonSchemaEncoder::builder()
             .registry(registry)
             .schema(KEY_JSON_SCHEMA)
+            .record_name("io.rustcdc.EventKey")
             .strategy(config.strategy.clone())
             .validate_on_encode(validate)
             .build()
@@ -1247,11 +1505,37 @@ impl<C: SchemaRegistryClient> ConfluentJsonSchemaDecoder<C> {
 
 /// Async key + value codec backed by Confluent JSON Schema framing.
 ///
-/// Unlike the synchronous [`crate::codec::Codec`] trait, JSON Schema encoding
-/// is inherently async (lazy subject/schema resolution). Use the methods on
-/// [`ConfluentJsonSchemaEncoder`] directly instead of the `Codec` trait when
-/// building Kafka producers with JSON Schema.
+/// JSON Schema encoding is inherently async (lazy subject/schema resolution), so this
+/// implements [`crate::codec::AsyncCodec`] rather than the synchronous
+/// [`crate::codec::Codec`]. A sink that accepts `AsyncCodec` — or stores a
+/// [`BoxedAsyncCodec`](crate::codec::BoxedAsyncCodec) — takes this and every synchronous
+/// codec through the same type.
 pub type ConfluentJsonSchemaCodec<C> = ConfluentJsonSchemaEncoder<C>;
+
+/// Async key + value codec: registry-framed JSON Schema on both channels.
+///
+/// The key is `None` for keyless events rather than a framed `{"key": null}`, so a Kafka
+/// producer round-robins them instead of collapsing every keyless event onto one
+/// partition. Call [`encode_event_key`](ConfluentJsonSchemaEncoder::encode_event_key)
+/// directly when the framed-always form (matching Debezium) is what you want.
+#[async_trait::async_trait]
+impl<C> AsyncCodec for ConfluentJsonSchemaEncoder<C>
+where
+    C: SchemaRegistryClient + Clone + Send + Sync + 'static,
+{
+    async fn encode_async(&self, event: &Event) -> Result<CodecOutput> {
+        let key = match event.primary_key_values() {
+            Some(_) => Some(self.encode_event_key(event).await?.to_vec()),
+            None => None,
+        };
+        let value = self.encode_event(event).await?;
+        Ok(CodecOutput::new(key, value.bytes, value.content_type))
+    }
+
+    fn content_type(&self) -> &'static str {
+        CONFLUENT_JSON_CONTENT_TYPE
+    }
+}
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -1276,19 +1560,62 @@ pub type ConfluentJsonSchemaCodec<C> = ConfluentJsonSchemaEncoder<C>;
 ///
 /// Returns [`Error::SourceError`] listing the ids that could not be fetched.
 pub async fn warm_schema_cache<C>(
-    registry: &CachedSchemaRegistry<C>,
+    registry: &C,
     schema_ids: impl IntoIterator<Item = SchemaId>,
 ) -> Result<()>
 where
-    C: SchemaRegistryClient,
+    C: SchemaRegistryClient + ?Sized,
 {
-    registry.warm_cache(schema_ids).await.map_err(|error| {
-        Error::SourceError(format!(
-            "warming the schema cache failed: {error}. This is best-effort — the affected \
-             ids will simply be fetched on first use — but a persistent failure usually \
-             means the ids do not exist in this registry."
-        ))
-    })
+    use futures_util::StreamExt as _;
+
+    // Any `SchemaRegistryClient`, not `CachedSchemaRegistry<C>` specifically. Requiring the
+    // concrete cache type made this unusable behind `Arc<dyn DynSchemaRegistryClient>` —
+    // and erasure is exactly what a deployment with several registry backends needs, since
+    // the encoders are generic over the client and every variant would otherwise exist
+    // twice. Warming matters most in precisely those multi-registry, many-subject
+    // deployments, so the two features could not be used together.
+    //
+    // `?Sized` so `&dyn DynSchemaRegistryClient` passes directly.
+    //
+    // Fetching through the trait warms the same cache: `CachedSchemaRegistry`'s
+    // `get_schema_by_id` is the cache-populating path, which is what `warm_cache` calls
+    // internally. Against a client with **no** cache this issues the round-trips and
+    // retains nothing — a wasted warm rather than a wrong one.
+    let unique: std::collections::BTreeSet<SchemaId> = schema_ids.into_iter().collect();
+    if unique.is_empty() {
+        return Ok(());
+    }
+
+    // Bounded so that pre-warming several thousand ids on startup cannot exhaust the HTTP
+    // connection pool or trip the registry's rate limiter. Matches `schemreg`'s own bound.
+    const WARM_CACHE_CONCURRENCY: usize = 16;
+
+    let failures: Vec<String> = futures_util::stream::iter(unique)
+        .map(|id| async move {
+            registry
+                .get_schema_by_id(id)
+                .await
+                .err()
+                .map(|error| format!("id {id}: {error}"))
+        })
+        .buffer_unordered(WARM_CACHE_CONCURRENCY)
+        .filter_map(|failure| async move { failure })
+        .collect()
+        .await;
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    // One id failing does not abort the rest — the successful fetches are warmed, and the
+    // error names every id that was not.
+    Err(Error::SourceError(format!(
+        "warming the schema cache failed for {} schema id(s): {}. This is best-effort — the \
+         affected ids will simply be fetched on first use — but a persistent failure usually \
+         means the ids do not exist in this registry.",
+        failures.len(),
+        failures.join("; ")
+    )))
 }
 
 // ─── Confluent Protobuf ───────────────────────────────────────────────────────
@@ -1300,11 +1627,31 @@ where
 const EVENT_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/event_descriptor.bin"));
 
+/// The compiled descriptor set for `proto/event_key.proto`.
+const EVENT_KEY_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/event_key_descriptor.bin"));
+
 /// Fully-qualified name of the CDC event message in `proto/event.proto`.
 const EVENT_PROTO_FULL_NAME: &str = "rustcdc.Event";
 
+/// Fully-qualified name of the primary-key message in `proto/event_key.proto`.
+const EVENT_KEY_PROTO_FULL_NAME: &str = "rustcdc.EventKey";
+
 /// The `.proto` source registered as the schema, so the registry stores the real IDL.
 const EVENT_PROTO_SOURCE: &str = include_str!("../../proto/event.proto");
+
+/// The `.proto` source registered under the **key** subject by
+/// [`ConfluentProtobufEncoder::encode_event_key`].
+///
+/// The Protobuf counterpart of [`KEY_AVRO_SCHEMA`] and [`KEY_JSON_SCHEMA`], and the third
+/// leg of a three-format key story that was missing one: through 0.8, `ConfluentAvroEncoder`
+/// had `encode_key` and `ConfluentJsonSchemaEncoder` had `encode_event_key`, but the
+/// Protobuf encoder had no key path at all, so a fan-out mixing codecs silently paired a
+/// registry-framed value with an unframed compact-JSON key and nothing in the API said so.
+///
+/// Carries the same payload as the other two: the primary key as a JSON object encoded in
+/// a string, absent for keyless events.
+pub const KEY_PROTO_SCHEMA: &str = include_str!("../../proto/event_key.proto");
 
 /// Load the `rustcdc.Event` message descriptor from the compiled descriptor set.
 ///
@@ -1314,21 +1661,40 @@ const EVENT_PROTO_SOURCE: &str = include_str!("../../proto/event.proto");
 /// deserialiser misreads without erroring. Deriving it from the descriptor makes it correct
 /// by construction, which is why `schemreg` requires one rather than accepting raw indexes.
 fn event_message_descriptor() -> Result<prost_reflect::MessageDescriptor> {
-    let pool =
-        prost_reflect::DescriptorPool::decode(EVENT_FILE_DESCRIPTOR_SET).map_err(|error| {
-            Error::ConfigError(format!(
-                "the compiled protobuf descriptor set is not decodable: {error}. This is a build \
-             problem, not a configuration one — `build.rs` produced it from proto/event.proto."
-            ))
-        })?;
+    message_descriptor(
+        EVENT_FILE_DESCRIPTOR_SET,
+        EVENT_PROTO_FULL_NAME,
+        "proto/event.proto",
+    )
+}
 
-    pool.get_message_by_name(EVENT_PROTO_FULL_NAME)
-        .ok_or_else(|| {
-            Error::ConfigError(format!(
-                "message '{EVENT_PROTO_FULL_NAME}' is missing from the compiled descriptor \
-                 set; proto/event.proto and src/codec/protobuf.rs have diverged"
-            ))
-        })
+/// Load the `rustcdc.EventKey` message descriptor. See [`event_message_descriptor`].
+fn event_key_message_descriptor() -> Result<prost_reflect::MessageDescriptor> {
+    message_descriptor(
+        EVENT_KEY_FILE_DESCRIPTOR_SET,
+        EVENT_KEY_PROTO_FULL_NAME,
+        "proto/event_key.proto",
+    )
+}
+
+fn message_descriptor(
+    descriptor_set: &[u8],
+    full_name: &str,
+    proto_path: &str,
+) -> Result<prost_reflect::MessageDescriptor> {
+    let pool = prost_reflect::DescriptorPool::decode(descriptor_set).map_err(|error| {
+        Error::ConfigError(format!(
+            "the compiled protobuf descriptor set for {proto_path} is not decodable: {error}. \
+             This is a build problem, not a configuration one — `build.rs` produced it."
+        ))
+    })?;
+
+    pool.get_message_by_name(full_name).ok_or_else(|| {
+        Error::ConfigError(format!(
+            "message '{full_name}' is missing from the compiled descriptor set; \
+             {proto_path} and src/codec/protobuf.rs have diverged"
+        ))
+    })
 }
 
 /// CDC [`Event`] → Confluent Schema Registry-framed Protobuf encoder.
@@ -1355,8 +1721,18 @@ fn event_message_descriptor() -> Result<prost_reflect::MessageDescriptor> {
 /// A consumer decodes the message, then parses those two fields as JSON.
 ///
 /// Requires the `schemreg` feature.
+///
+/// # Keys
+///
+/// [`encode_event_key`](Self::encode_event_key) frames the primary key against
+/// [`KEY_PROTO_SCHEMA`] under the key subject, mirroring
+/// [`ConfluentAvroEncoder::encode_key`] and
+/// [`ConfluentJsonSchemaEncoder::encode_event_key`]. Use it rather than
+/// [`crate::codec::ProtobufEncoder`]'s default compact-JSON key, which produces a key
+/// framed differently from the value it accompanies.
 pub struct ConfluentProtobufEncoder<C> {
     inner: Arc<::schemreg::ProtobufSchemaEncoder<C>>,
+    key_encoder: Arc<::schemreg::ProtobufSchemaEncoder<C>>,
     topic: String,
 }
 
@@ -1383,13 +1759,21 @@ where
     ///
     /// Returns [`Error::ConfigError`] if the descriptor set cannot be loaded or the
     /// encoder cannot be built.
-    pub fn new(registry: C, config: &SchemaRegistryConfig) -> Result<Self> {
-        let descriptor = event_message_descriptor()?;
+    pub async fn new(registry: C, config: &SchemaRegistryConfig) -> Result<Self>
+    where
+        C: Clone,
+    {
+        // See `ConfluentJsonSchemaEncoder::new_inner`: `schemreg`'s Protobuf encoder also
+        // resolves subjects by registering them, so `auto_register = false` was silently
+        // ignored here too.
+        if !config.auto_register {
+            assert_subjects_preregistered(&registry, config, SchemaType::Protobuf).await?;
+        }
 
         let inner = ::schemreg::ProtobufSchemaEncoder::builder()
-            .registry(registry)
+            .registry(registry.clone())
             .schema(EVENT_PROTO_SOURCE)
-            .descriptor(descriptor)
+            .descriptor(event_message_descriptor()?)
             .strategy(config.strategy.clone())
             .references(config.references.clone())
             .max_subject_cache_entries(config.max_cache_entries.unwrap_or(1_000))
@@ -1398,8 +1782,24 @@ where
                 Error::ConfigError(format!("confluent protobuf encoder build: {error}"))
             })?;
 
+        // The key subject gets its own schema — `proto/event_key.proto`, not the event
+        // file — so the registered IDL contains exactly the message the key subject uses.
+        // References are deliberately *not* carried over: they belong to the event
+        // envelope, and `EventKey` imports nothing.
+        let key_encoder = ::schemreg::ProtobufSchemaEncoder::builder()
+            .registry(registry)
+            .schema(KEY_PROTO_SCHEMA)
+            .descriptor(event_key_message_descriptor()?)
+            .strategy(config.strategy.clone())
+            .max_subject_cache_entries(config.max_cache_entries.unwrap_or(1_000))
+            .build()
+            .map_err(|error| {
+                Error::ConfigError(format!("confluent protobuf key encoder build: {error}"))
+            })?;
+
         Ok(Self {
             inner: Arc::new(inner),
+            key_encoder: Arc::new(key_encoder),
             topic: config.topic.clone(),
         })
     }
@@ -1436,6 +1836,57 @@ where
             .await
             .map_err(|error| map_registry_error("confluent protobuf encode", error))?;
         Ok(framed.to_vec())
+    }
+
+    /// Encode the primary key of an event as Confluent-framed Protobuf (key channel).
+    ///
+    /// Produces a `rustcdc.EventKey` message registered under the key subject against
+    /// [`KEY_PROTO_SCHEMA`], so key and value share the same framing. Keyless events —
+    /// TRUNCATE, SCHEMA_CHANGE, tables with no declared primary key — produce a message
+    /// with the `key` field absent, matching the `{"key": null}` that
+    /// [`ConfluentJsonSchemaEncoder::encode_event_key`] emits and Debezium's behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified source error when the registry is unreachable (`Transient`) or
+    /// the key subject cannot be resolved (`Terminal`).
+    pub async fn encode_event_key(&self, event: &Event) -> Result<Vec<u8>> {
+        let message = crate::codec::protobuf::ProtoEventKey::from_event(event)?;
+        let framed = self
+            .key_encoder
+            .encode(&message, &self.topic, EncodeTarget::Key)
+            .await
+            .map_err(|error| map_registry_error("confluent protobuf encode key", error))?;
+        Ok(framed.to_vec())
+    }
+}
+
+/// Async key + value codec: registry-framed Protobuf on both channels.
+///
+/// The key is `None` for keyless events rather than a framed `EventKey` with an absent
+/// `key` field, so a Kafka producer round-robins them instead of collapsing every keyless
+/// event onto one partition. Call [`encode_event_key`](ConfluentProtobufEncoder::encode_event_key)
+/// directly when the framed-always form is what you want.
+#[async_trait::async_trait]
+impl<C> AsyncCodec for ConfluentProtobufEncoder<C>
+where
+    C: SchemaRegistryClient + Send + Sync + 'static,
+{
+    async fn encode_async(&self, event: &Event) -> Result<CodecOutput> {
+        let key = match event.primary_key_values() {
+            Some(_) => Some(self.encode_event_key(event).await?),
+            None => None,
+        };
+        let value = ConfluentProtobufEncoder::encode(self, event).await?;
+        Ok(CodecOutput::new(
+            key,
+            value,
+            CONFLUENT_PROTOBUF_CONTENT_TYPE,
+        ))
+    }
+
+    fn content_type(&self) -> &'static str {
+        CONFLUENT_PROTOBUF_CONTENT_TYPE
     }
 }
 
@@ -1531,6 +1982,15 @@ pub struct ApicurioRegistryConfig {
     pub connect_timeout_ms: Option<u64>,
     /// Maximum schema entries retained in the in-memory cache.
     pub max_cache_entries: Option<usize>,
+    /// Maximum number of idle keep-alive connections per host. See
+    /// [`SchemaRegistryConfig::pool_max_idle_per_host`].
+    pub pool_max_idle_per_host: Option<usize>,
+    /// Schemas this one depends on, registered as artifact references. See
+    /// [`SchemaRegistryConfig::references`].
+    ///
+    /// Apicurio calls these *artifact references* and models them with the same
+    /// `(name, subject, version)` triple, so [`SchemaReference`] carries over unchanged.
+    pub references: Vec<SchemaReference>,
     /// Retry policy for transient registry failures. See
     /// [`SchemaRegistryConfig::retry_policy`].
     pub retry_policy: RetryPolicy,
@@ -1549,6 +2009,8 @@ impl ApicurioRegistryConfig {
             request_timeout_ms: None,
             connect_timeout_ms: None,
             max_cache_entries: None,
+            pool_max_idle_per_host: None,
+            references: Vec::new(),
             retry_policy: RetryPolicy::default(),
         }
     }
@@ -1557,6 +2019,41 @@ impl ApicurioRegistryConfig {
     #[must_use]
     pub fn with_strategy(mut self, strategy: SubjectNameStrategy) -> Self {
         self.strategy = strategy;
+        self
+    }
+
+    /// Set the HTTP request timeout, in milliseconds.
+    #[must_use]
+    pub fn with_request_timeout_ms(mut self, ms: u64) -> Self {
+        self.request_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Set the TCP connect timeout, in milliseconds.
+    #[must_use]
+    pub fn with_connect_timeout_ms(mut self, ms: u64) -> Self {
+        self.connect_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Cap the in-memory schema cache at `n` entries.
+    #[must_use]
+    pub fn with_max_cache_entries(mut self, n: usize) -> Self {
+        self.max_cache_entries = Some(n);
+        self
+    }
+
+    /// Cap idle keep-alive connections per host.
+    #[must_use]
+    pub fn with_pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.pool_max_idle_per_host = Some(n);
+        self
+    }
+
+    /// Declare the artifact references this schema depends on.
+    #[must_use]
+    pub fn with_references(mut self, references: Vec<SchemaReference>) -> Self {
+        self.references = references;
         self
     }
 
@@ -1592,9 +2089,25 @@ impl ApicurioRegistryConfig {
     /// Returns [`Error::ConfigError`] if the URL is malformed or a credential cannot be
     /// resolved.
     pub fn build(&self) -> Result<CachedSchemaRegistry<::schemreg::ApicurioSchemaRegistry>> {
-        let mut builder = ::schemreg::ApicurioSchemaRegistry::builder().url(&self.url);
+        // Exhaustive destructuring — see `SchemaRegistryConfig::build`.
+        let Self {
+            url,
+            // Encoder-side, not transport.
+            topic: _,
+            strategy: _,
+            references: _,
+            auto_register: _,
+            auth,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_cache_entries,
+            pool_max_idle_per_host,
+            retry_policy,
+        } = self;
 
-        if let Some(ref auth) = self.auth {
+        let mut builder = ::schemreg::ApicurioSchemaRegistry::builder().url(url);
+
+        if let Some(auth) = auth {
             builder = match auth {
                 SchemaRegistryAuth::Basic { username, password } => {
                     builder.basic_auth(username, password)
@@ -1608,20 +2121,23 @@ impl ApicurioRegistryConfig {
             };
         }
 
-        if let Some(ms) = self.request_timeout_ms {
-            builder = builder.request_timeout(Duration::from_millis(ms));
+        if let Some(ms) = request_timeout_ms {
+            builder = builder.request_timeout(Duration::from_millis(*ms));
         }
-        if let Some(ms) = self.connect_timeout_ms {
-            builder = builder.connect_timeout(Duration::from_millis(ms));
+        if let Some(ms) = connect_timeout_ms {
+            builder = builder.connect_timeout(Duration::from_millis(*ms));
         }
-        builder = builder.retry_policy(self.retry_policy.clone());
+        if let Some(n) = pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(*n);
+        }
+        builder = builder.retry_policy(retry_policy.clone());
 
         let registry = builder
             .build()
             .map_err(|error| Error::ConfigError(format!("apicurio registry build: {error}")))?;
 
-        Ok(match self.max_cache_entries {
-            Some(n) => CachedSchemaRegistry::with_max_entries(registry, n),
+        Ok(match max_cache_entries {
+            Some(n) => CachedSchemaRegistry::with_max_entries(registry, *n),
             None => CachedSchemaRegistry::new(registry),
         })
     }
@@ -1631,10 +2147,88 @@ impl ApicurioRegistryConfig {
     /// The encoders take a `SchemaRegistryConfig` for subject naming and registration
     /// policy; the transport comes from the client passed alongside it. This keeps the two
     /// consistent rather than asking a caller to restate the topic and strategy.
+    ///
+    /// **Every field this type has is carried over.** The body destructures `self`
+    /// exhaustively, so adding a field to [`ApicurioRegistryConfig`] without deciding how
+    /// it maps is a compile error rather than a setting that quietly stops taking effect —
+    /// which is how `auth`, both timeouts, `max_cache_entries` and `retry_policy` were
+    /// silently dropped before 0.9.
+    ///
+    /// Two things do *not* carry over, because they have no Apicurio counterpart:
+    ///
+    /// - [`SchemaRegistryConfig::normalize_schemas`] is a Confluent query parameter
+    ///   (`?normalize=true`) on `POST /subjects/{subject}/versions`. Apicurio's native v3
+    ///   API has no equivalent, so this stays `false`. Apicurio canonicalises content for
+    ///   its own `IfExists` de-duplication instead.
+    /// - `url` is copied verbatim, and for this type that is the Apicurio **server root**,
+    ///   not a Confluent API root. Do not call [`SchemaRegistryConfig::build`] on the
+    ///   result — it would target `/subjects` under the v3 root and 404. Use
+    ///   [`ApicurioRegistryConfig::build`] for the client, and this config only for the
+    ///   policy half of an encoder constructor. (Apicurio's Confluent-compatible endpoint
+    ///   lives at `{root}/apis/ccompat/v7`; point a `SchemaRegistryConfig` there directly
+    ///   if that is what you want.)
     pub fn as_schema_registry_config(&self) -> SchemaRegistryConfig {
-        SchemaRegistryConfig::new(&self.url, &self.topic)
-            .with_strategy(self.strategy.clone())
-            .with_auto_register(self.auto_register)
+        // Exhaustive destructuring — no `..` rest pattern. This is the gate: a new field on
+        // `ApicurioRegistryConfig` breaks the build here until it is mapped or explicitly
+        // ignored with a reason.
+        let Self {
+            url,
+            topic,
+            strategy,
+            auth,
+            auto_register,
+            request_timeout_ms,
+            connect_timeout_ms,
+            max_cache_entries,
+            pool_max_idle_per_host,
+            references,
+            retry_policy,
+        } = self;
+
+        let mut config = SchemaRegistryConfig::new(url, topic)
+            .with_strategy(strategy.clone())
+            .with_auto_register(*auto_register)
+            .with_references(references.clone())
+            .with_retry_policy(retry_policy.clone());
+        if let Some(auth) = auth {
+            config = config.with_auth(auth.clone());
+        }
+        if let Some(ms) = request_timeout_ms {
+            config = config.with_request_timeout_ms(*ms);
+        }
+        if let Some(ms) = connect_timeout_ms {
+            config = config.with_connect_timeout_ms(*ms);
+        }
+        if let Some(n) = max_cache_entries {
+            config = config.with_max_cache_entries(*n);
+        }
+        if let Some(n) = pool_max_idle_per_host {
+            config = config.with_pool_max_idle_per_host(*n);
+        }
+        config
+    }
+
+    /// Run [`preflight_schema_registry`] against an Apicurio client using this config.
+    ///
+    /// Preflight was Confluent-only in practice through 0.8 — not because the check needed
+    /// a Confluent client (it has always been generic over [`SchemaRegistryClient`], and
+    /// `ApicurioSchemaRegistry` implements it) but because it took a
+    /// [`SchemaRegistryConfig`] and there was no obvious way to get one from here. An
+    /// Apicurio deployment therefore silently got no startup check while a Confluent one
+    /// did.
+    ///
+    /// Subject names come from [`ApicurioRegistryConfig::strategy`], including
+    /// [`SubjectNameStrategy::ApicurioGroupRecordName`], so a group-scoped artifact is
+    /// checked at the address the encoder will actually write to.
+    ///
+    /// # Errors
+    ///
+    /// As [`preflight_schema_registry`].
+    pub async fn preflight<C>(&self, registry: &C, schema_type: SchemaType) -> Result<()>
+    where
+        C: SchemaRegistryClient + ?Sized,
+    {
+        preflight_schema_registry(registry, &self.as_schema_registry_config(), schema_type).await
     }
 }
 
@@ -1656,11 +2250,586 @@ impl ApicurioRegistryConfig {
 /// Requires the `glue` feature.
 #[cfg(feature = "glue")]
 pub mod glue {
+    use std::sync::Arc;
+
+    use apache_avro::Schema;
+
+    use crate::codec::{EncodedOutput, EventEncoder};
+    use crate::core::{Error, Event, Result};
+
     pub use ::schemreg::glue::{
         decode_glue_wire_format, decode_glue_wire_format_borrowed, encode_glue_wire_format,
         AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder, CachedGlueSchemaRegistry,
         GlueCompression, GlueDataFormat, GlueSchema, GlueSchemaRegistryClient, GlueSchemaVersionId,
     };
+
+    /// Content type for Glue-framed Avro, distinct from the Confluent one because the
+    /// framing is not the same and a consumer must not treat them interchangeably.
+    const GLUE_AVRO_CONTENT_TYPE: &str = "application/vnd.aws-glue+avro";
+
+    /// Configuration for the Glue Avro encoder.
+    ///
+    /// Glue identifies schemas by **name**, not by the topic/subject pair Confluent uses,
+    /// so there is no [`SubjectNameStrategy`](super::SubjectNameStrategy) here — the
+    /// schema name is given directly.
+    #[derive(Debug, Clone)]
+    #[non_exhaustive]
+    pub struct GlueAvroConfig {
+        /// Glue schema name for the event envelope, e.g. `"cdc-events"`.
+        pub schema_name: String,
+        /// Glue schema name for the primary-key envelope.
+        ///
+        /// Defaults to `{schema_name}-key`, mirroring the Confluent `-key` suffix.
+        pub key_schema_name: String,
+        /// Payload compression. Glue's header carries a compression byte; Confluent's
+        /// does not.
+        pub compression: GlueCompression,
+        /// Register the schemas on first use rather than requiring them to exist.
+        ///
+        /// Glue's `register_schema` is idempotent for identical content, so `true` is safe
+        /// to leave on. Unlike the Confluent path there is no lookup-by-name API in
+        /// `schemreg`'s Glue client, so `false` is **not** offered rather than being
+        /// offered and silently ignored.
+        pub auto_register: bool,
+    }
+
+    impl GlueAvroConfig {
+        /// Configure the encoder for a schema name, defaulting the key schema to
+        /// `{schema_name}-key`.
+        pub fn new(schema_name: impl Into<String>) -> Self {
+            let schema_name = schema_name.into();
+            Self {
+                key_schema_name: format!("{schema_name}-key"),
+                schema_name,
+                compression: GlueCompression::None,
+                auto_register: true,
+            }
+        }
+
+        /// Override the key schema name.
+        #[must_use]
+        pub fn with_key_schema_name(mut self, name: impl Into<String>) -> Self {
+            self.key_schema_name = name.into();
+            self
+        }
+
+        /// Compress payloads with ZLIB.
+        #[must_use]
+        pub fn with_compression(mut self, compression: GlueCompression) -> Self {
+            self.compression = compression;
+            self
+        }
+    }
+
+    /// CDC [`Event`] → AWS Glue-framed Avro encoder.
+    ///
+    /// # Why this exists
+    ///
+    /// Through 0.8 the `glue` feature re-exported `schemreg`'s Glue types and nothing else,
+    /// while the feature description promised "the AWS Glue Schema Registry as a backend".
+    /// An embedder got no `Event` encoder at all and had to write the Avro conversion, the
+    /// registration and the framing by hand — the work every other registry backend does
+    /// for them.
+    ///
+    /// # Framing
+    ///
+    /// Glue does **not** use the Confluent 5-byte header:
+    ///
+    /// ```text
+    /// [0x03 version][compression byte][16-byte schema-version UUID][avro payload]
+    /// ```
+    ///
+    /// 18 bytes, a UUID rather than an integer id, and an optional ZLIB payload. A consumer
+    /// must know which framing to expect, or call
+    /// [`detect_wire_format`](super::detect_wire_format) per message.
+    ///
+    /// # Schema identity
+    ///
+    /// The payload is the same [`AVRO_SCHEMA`](crate::codec::avro::AVRO_SCHEMA) the
+    /// Confluent Avro encoder writes, so a consumer that already decodes rustcdc's Avro
+    /// envelope needs only the framing changed.
+    pub struct GlueAvroEncoder<C> {
+        registry: Arc<C>,
+        avro: crate::codec::avro::AvroEncoder,
+        key_schema: Schema,
+        config: GlueAvroConfig,
+        /// Resolved once at construction, like [`super::ConfluentAvroEncoder`]: Glue has one
+        /// schema name per encoder, so there is nothing to resolve lazily.
+        value_version_id: GlueSchemaVersionId,
+        key_version_id: GlueSchemaVersionId,
+    }
+
+    impl<C> std::fmt::Debug for GlueAvroEncoder<C> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GlueAvroEncoder")
+                .field("schema_name", &self.config.schema_name)
+                .field("key_schema_name", &self.config.key_schema_name)
+                .field("compression", &self.config.compression)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<C: GlueSchemaRegistryClient> GlueAvroEncoder<C> {
+        /// Register (or resolve) both schemas and build the encoder.
+        ///
+        /// # Errors
+        ///
+        /// Returns a classified source error when Glue is unreachable (`Transient`) or
+        /// rejects the schema (`Terminal`).
+        pub async fn new(registry: Arc<C>, config: GlueAvroConfig) -> Result<Self> {
+            let avro = crate::codec::avro::AvroEncoder::new()?;
+            let key_schema = Schema::parse_str(super::KEY_AVRO_SCHEMA).map_err(|error| {
+                Error::ConfigError(format!(
+                    "rustcdc's key Avro schema failed to parse: {error}"
+                ))
+            })?;
+
+            let value_version_id = registry
+                .register_schema(
+                    &config.schema_name,
+                    crate::codec::avro::AVRO_SCHEMA,
+                    GlueDataFormat::Avro,
+                )
+                .await
+                .map_err(|error| super::map_registry_error("glue register value schema", error))?;
+            let key_version_id = registry
+                .register_schema(
+                    &config.key_schema_name,
+                    super::KEY_AVRO_SCHEMA,
+                    GlueDataFormat::Avro,
+                )
+                .await
+                .map_err(|error| super::map_registry_error("glue register key schema", error))?;
+
+            Ok(Self {
+                registry,
+                avro,
+                key_schema,
+                config,
+                value_version_id,
+                key_version_id,
+            })
+        }
+
+        /// The Glue schema-version UUID stamped into every value header.
+        pub fn value_schema_version_id(&self) -> GlueSchemaVersionId {
+            self.value_version_id
+        }
+
+        /// The Glue schema-version UUID stamped into every key header.
+        pub fn key_schema_version_id(&self) -> GlueSchemaVersionId {
+            self.key_version_id
+        }
+
+        /// Borrow the registry client.
+        pub fn registry(&self) -> &Arc<C> {
+            &self.registry
+        }
+
+        /// Encode an event as Glue-framed Avro.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::SerializationError`] if the event cannot be encoded, or a wire-format
+        /// error if framing fails.
+        pub fn encode_event(&self, event: &Event) -> Result<EncodedOutput> {
+            let payload = self.avro.encode(event)?;
+            let framed = encode_glue_wire_format(
+                self.value_version_id,
+                &payload.bytes,
+                self.config.compression,
+            )
+            .map_err(|error| super::map_registry_error("glue value framing", error))?;
+            Ok(EncodedOutput::new(framed.to_vec(), GLUE_AVRO_CONTENT_TYPE))
+        }
+
+        /// Encode the primary key as Glue-framed Avro against `KEY_AVRO_SCHEMA`.
+        ///
+        /// Returns `None` for a keyless event — TRUNCATE, SCHEMA_CHANGE, or a table with no
+        /// declared primary key — so a producer round-robins them rather than collapsing
+        /// every keyless event onto one partition.
+        ///
+        /// # Errors
+        ///
+        /// As [`encode_event`](Self::encode_event).
+        pub fn encode_event_key(&self, event: &Event) -> Result<Option<Vec<u8>>> {
+            let Some(key) = event.primary_key_values() else {
+                return Ok(None);
+            };
+            let key_json = serde_json::to_string(&key).map_err(|error| {
+                Error::SerializationError(format!("glue key serialise: {error}"))
+            })?;
+            let record = apache_avro::types::Value::Record(vec![(
+                "key".to_string(),
+                apache_avro::types::Value::Union(
+                    1,
+                    Box::new(apache_avro::types::Value::String(key_json)),
+                ),
+            )]);
+            let payload = apache_avro::to_avro_datum(&self.key_schema, record)
+                .map_err(|error| Error::SerializationError(format!("glue key encode: {error}")))?;
+            let framed =
+                encode_glue_wire_format(self.key_version_id, &payload, self.config.compression)
+                    .map_err(|error| super::map_registry_error("glue key framing", error))?;
+            Ok(Some(framed.to_vec()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<C> crate::codec::AsyncCodec for GlueAvroEncoder<C>
+    where
+        C: GlueSchemaRegistryClient + Send + Sync + 'static,
+    {
+        async fn encode_async(&self, event: &Event) -> Result<crate::codec::CodecOutput> {
+            let value = self.encode_event(event)?;
+            Ok(crate::codec::CodecOutput::new(
+                self.encode_event_key(event)?,
+                value.bytes,
+                value.content_type,
+            ))
+        }
+
+        fn content_type(&self) -> &'static str {
+            GLUE_AVRO_CONTENT_TYPE
+        }
+    }
+
+    /// Glue-framed Avro → CDC [`Event`] decoder.
+    ///
+    /// Strips the 18-byte header, resolves the writer schema by its version UUID, and
+    /// converts through the same [`avro_value_to_event`](crate::codec::avro_value_to_event)
+    /// used by the bare and Confluent Avro decoders.
+    pub struct GlueAvroDecoder<C> {
+        registry: Arc<C>,
+        reader_schema: Arc<Schema>,
+    }
+
+    impl<C> std::fmt::Debug for GlueAvroDecoder<C> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GlueAvroDecoder").finish_non_exhaustive()
+        }
+    }
+
+    impl<C> Clone for GlueAvroDecoder<C> {
+        fn clone(&self) -> Self {
+            Self {
+                registry: Arc::clone(&self.registry),
+                reader_schema: Arc::clone(&self.reader_schema),
+            }
+        }
+    }
+
+    impl<C: GlueSchemaRegistryClient> GlueAvroDecoder<C> {
+        /// Build a decoder against `registry`.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::ConfigError`] if the reader schema fails to parse.
+        pub fn new(registry: Arc<C>) -> Result<Self> {
+            let reader_schema = Schema::parse_str(crate::codec::avro::AVRO_SCHEMA)
+                .map_err(|error| Error::ConfigError(format!("reader schema parse: {error}")))?;
+            Ok(Self {
+                registry,
+                reader_schema: Arc::new(reader_schema),
+            })
+        }
+
+        /// Decode a Glue-framed Avro message to an [`Event`].
+        ///
+        /// The writer schema is fetched by the header's version UUID and used for
+        /// resolution, so a message written under an older compatible schema decodes
+        /// correctly rather than being read positionally against the current one.
+        ///
+        /// # Errors
+        ///
+        /// - A wire-format error for a malformed header. **Permanent** — the same bytes
+        ///   will never decode — so it classifies `Terminal` rather than inviting a retry
+        ///   loop.
+        /// - A classified source error when Glue is unreachable (`Transient`) or the
+        ///   schema version is unknown (`Terminal`).
+        pub async fn decode(&self, bytes: &[u8]) -> Result<Event> {
+            let (version_id, payload) = decode_glue_wire_format(bytes)
+                .map_err(|error| super::map_registry_error("glue wire format", error))?;
+
+            let schema = self
+                .registry
+                .get_schema_by_version_id(version_id)
+                .await
+                .map_err(|error| super::map_registry_error("glue schema lookup", error))?;
+
+            let writer_schema = Schema::parse_str(&schema.schema_definition).map_err(|error| {
+                Error::SerializationError(format!(
+                    "schema for Glue version id {version_id:?} is not valid Avro: {error}"
+                ))
+            })?;
+
+            let mut reader: &[u8] = payload.as_ref();
+            let value = apache_avro::from_avro_datum(
+                &writer_schema,
+                &mut reader,
+                Some(&self.reader_schema),
+            )
+            .map_err(|error| Error::SerializationError(format!("glue avro decode: {error}")))?;
+
+            crate::codec::avro::avro_value_to_event(&value)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::core::{Operation, SourceMetadata};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// In-memory stand-in for AWS Glue.
+        ///
+        /// Glue has no self-hostable implementation, so there is no container to point a
+        /// live suite at — the gap FINDINGS.md states explicitly. What *is* verifiable
+        /// without AWS is everything rustcdc owns: the Avro conversion, the 18-byte
+        /// framing, the compression byte, schema-version identity, and the round trip.
+        /// Only the AWS transport itself stays unexercised, and that belongs to `schemreg`.
+        #[derive(Default)]
+        struct FakeGlue {
+            by_id: Mutex<HashMap<[u8; 16], Arc<GlueSchema>>>,
+            by_name: Mutex<HashMap<String, GlueSchemaVersionId>>,
+            registrations: Mutex<Vec<String>>,
+        }
+
+        impl GlueSchemaRegistryClient for FakeGlue {
+            async fn get_schema_by_version_id(
+                &self,
+                id: GlueSchemaVersionId,
+            ) -> ::schemreg::Result<Arc<GlueSchema>> {
+                self.by_id
+                    .lock()
+                    .expect("lock")
+                    .get(id.as_bytes())
+                    .cloned()
+                    // 40403 is the Confluent "schema not found" code `is_not_found`
+                    // recognises, which is what makes this classify Terminal.
+                    .ok_or_else(|| {
+                        ::schemreg::SchemaRegError::api(40403, "unknown Glue schema version")
+                    })
+            }
+
+            async fn register_schema<'a>(
+                &'a self,
+                schema_name: &'a str,
+                schema: &'a str,
+                data_format: GlueDataFormat,
+            ) -> ::schemreg::Result<GlueSchemaVersionId> {
+                self.registrations
+                    .lock()
+                    .expect("lock")
+                    .push(schema_name.to_string());
+
+                // Idempotent for identical content, like the real service.
+                if let Some(existing) = self.by_name.lock().expect("lock").get(schema_name) {
+                    return Ok(*existing);
+                }
+
+                let mut uuid = [0u8; 16];
+                let index = self.by_id.lock().expect("lock").len() as u8;
+                uuid[15] = index + 1;
+                let id = GlueSchemaVersionId::from_bytes(uuid);
+
+                self.by_id
+                    .lock()
+                    .expect("lock")
+                    .insert(uuid, Arc::new(GlueSchema::new(id, data_format, schema)));
+                self.by_name
+                    .lock()
+                    .expect("lock")
+                    .insert(schema_name.to_string(), id);
+                Ok(id)
+            }
+        }
+
+        fn event() -> Event {
+            Event::builder("users", Operation::Insert)
+                .source(SourceMetadata::new("postgres", "0/1", 1_700_000_000))
+                .schema("public")
+                .after(serde_json::json!({ "id": 7, "email": "a@example.com" }))
+                .primary_key(["id"])
+                .ts(1_700_000_000)
+                .build()
+        }
+
+        #[tokio::test]
+        async fn a_glue_framed_event_round_trips() {
+            let registry = Arc::new(FakeGlue::default());
+            let encoder =
+                GlueAvroEncoder::new(Arc::clone(&registry), GlueAvroConfig::new("cdc-events"))
+                    .await
+                    .expect("encoder");
+
+            let input = event();
+            let framed = encoder.encode_event(&input).expect("encode");
+
+            // 18-byte header: version, compression, 16-byte UUID — not Confluent's 5.
+            assert_eq!(framed.bytes[0], 0x03, "Glue header version byte");
+            assert_eq!(framed.bytes[1], 0x00, "no compression");
+            assert_eq!(
+                &framed.bytes[2..18],
+                encoder.value_schema_version_id().as_bytes(),
+                "the header must carry the id the registry assigned"
+            );
+            assert_eq!(framed.content_type, "application/vnd.aws-glue+avro");
+
+            let decoded = GlueAvroDecoder::new(registry)
+                .expect("decoder")
+                .decode(&framed.bytes)
+                .await
+                .expect("decode");
+
+            // Avro is positional and untagged: "decode succeeded" is not the assertion
+            // that matters, "the payload came back unchanged" is.
+            assert_eq!(decoded.table, input.table);
+            assert_eq!(decoded.op, input.op);
+            assert_eq!(decoded.after, input.after);
+            assert_eq!(decoded.source.offset, input.source.offset);
+        }
+
+        #[tokio::test]
+        async fn zlib_compression_round_trips_and_sets_the_header_byte() {
+            let registry = Arc::new(FakeGlue::default());
+            let config = GlueAvroConfig::new("cdc-events").with_compression(GlueCompression::Zlib);
+            let encoder = GlueAvroEncoder::new(Arc::clone(&registry), config)
+                .await
+                .expect("encoder");
+
+            let framed = encoder.encode_event(&event()).expect("encode");
+            assert_eq!(framed.bytes[1], 0x05, "ZLIB compression byte");
+
+            let decoded = GlueAvroDecoder::new(registry)
+                .expect("decoder")
+                .decode(&framed.bytes)
+                .await
+                .expect("decode");
+            assert_eq!(decoded.after, event().after);
+        }
+
+        #[tokio::test]
+        async fn key_and_value_get_distinct_schema_versions() {
+            let registry = Arc::new(FakeGlue::default());
+            let encoder =
+                GlueAvroEncoder::new(Arc::clone(&registry), GlueAvroConfig::new("cdc-events"))
+                    .await
+                    .expect("encoder");
+
+            assert_ne!(
+                encoder.value_schema_version_id().as_bytes(),
+                encoder.key_schema_version_id().as_bytes(),
+                "key and value are different schemas under different names"
+            );
+            assert_eq!(
+                registry.registrations.lock().expect("lock").as_slice(),
+                ["cdc-events", "cdc-events-key"],
+                "the key schema name defaults to the `-key` suffix"
+            );
+
+            let key = encoder
+                .encode_event_key(&event())
+                .expect("encode key")
+                .expect("keyed event");
+            assert_eq!(&key[2..18], encoder.key_schema_version_id().as_bytes());
+
+            // And the payload itself decodes to the primary key. The union branch index
+            // is hand-written (1 = the `string` arm of `["null","string"]`); a wrong index
+            // produces bytes that frame correctly and decode to the wrong branch, so the
+            // header assertion above would not catch it.
+            let key_schema = Schema::parse_str(super::super::KEY_AVRO_SCHEMA).expect("schema");
+            let mut payload: &[u8] = &key[18..];
+            let decoded = apache_avro::from_avro_datum(&key_schema, &mut payload, None)
+                .expect("key payload decodes");
+            let apache_avro::types::Value::Record(fields) = decoded else {
+                panic!("key payload must be a record");
+            };
+            let (name, value) = &fields[0];
+            assert_eq!(name, "key");
+            let apache_avro::types::Value::Union(index, inner) = value else {
+                panic!("key field must be a union");
+            };
+            assert_eq!(*index, 1, "a keyed event takes the `string` branch");
+            assert_eq!(
+                **inner,
+                apache_avro::types::Value::String(r#"{"id":7}"#.to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn a_keyless_event_produces_no_key() {
+            // So a producer round-robins it rather than collapsing every keyless event
+            // onto one partition.
+            let registry = Arc::new(FakeGlue::default());
+            let encoder =
+                GlueAvroEncoder::new(Arc::clone(&registry), GlueAvroConfig::new("cdc-events"))
+                    .await
+                    .expect("encoder");
+
+            let keyless = Event::builder("users", Operation::Truncate)
+                .source(SourceMetadata::new("postgres", "0/9", 1))
+                .ts(1)
+                .build();
+            assert!(encoder
+                .encode_event_key(&keyless)
+                .expect("encode")
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn glue_framing_is_detected_as_glue_not_confluent() {
+            // The two framings must not be confused: a Confluent consumer reading Glue
+            // bytes would take the compression byte and the first three UUID bytes as a
+            // schema id.
+            let registry = Arc::new(FakeGlue::default());
+            let encoder = GlueAvroEncoder::new(registry, GlueAvroConfig::new("cdc-events"))
+                .await
+                .expect("encoder");
+            let framed = encoder.encode_event(&event()).expect("encode");
+
+            let detected = format!("{:?}", super::super::detect_wire_format(&framed.bytes));
+            assert!(
+                detected.to_lowercase().contains("glue"),
+                "Glue framing must be detected as Glue, got {detected}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_malformed_header_is_terminal_not_retryable() {
+            // These exact bytes will never decode, so classifying them retryable makes an
+            // embedder following the crate's own guidance spin forever.
+            use crate::core::ErrorKind;
+
+            let registry = Arc::new(FakeGlue::default());
+            let decoder = GlueAvroDecoder::new(registry).expect("decoder");
+            let error = decoder
+                .decode(&[0x00, 0x01, 0x02])
+                .await
+                .expect_err("a truncated header must be rejected");
+            assert_eq!(error.kind(), ErrorKind::Terminal);
+        }
+
+        #[tokio::test]
+        async fn an_unknown_schema_version_is_terminal() {
+            let registry = Arc::new(FakeGlue::default());
+            let encoder =
+                GlueAvroEncoder::new(Arc::clone(&registry), GlueAvroConfig::new("cdc-events"))
+                    .await
+                    .expect("encoder");
+            let mut framed = encoder.encode_event(&event()).expect("encode").bytes;
+            // Point the header at a version the registry has never issued.
+            framed[17] = 0xFF;
+
+            let error = GlueAvroDecoder::new(registry)
+                .expect("decoder")
+                .decode(&framed)
+                .await
+                .expect_err("an unknown schema version must fail");
+            assert_eq!(error.kind(), crate::core::ErrorKind::Terminal);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1830,6 +2999,82 @@ mod tests {
         // build() only constructs the reqwest client — no network connection.
         let cfg = SchemaRegistryConfig::new("http://localhost:8081", "t");
         assert!(cfg.build().is_ok());
+    }
+
+    // ─── Apicurio → SchemaRegistryConfig carry-through ───────────────────────
+
+    #[cfg(feature = "apicurio")]
+    #[test]
+    fn apicurio_config_carries_every_overlapping_field_over() {
+        // Set every field to a non-default value, then assert each one survives. The
+        // conversion silently dropped auth, both timeouts, max_cache_entries and
+        // retry_policy through 0.8 — a caller who set a retry policy got the
+        // `SchemaRegistryConfig::new` default with no indication it had been discarded.
+        let apicurio = ApicurioRegistryConfig::new("http://apicurio:8080/", "orders")
+            .with_strategy(SubjectNameStrategy::RecordName)
+            .with_auth(SchemaRegistryAuth::Basic {
+                username: "u".to_string(),
+                password: "p".to_string(),
+            })
+            .with_auto_register(false)
+            .with_request_timeout_ms(11_000)
+            .with_connect_timeout_ms(2_500)
+            .with_max_cache_entries(777)
+            .with_pool_max_idle_per_host(9)
+            .with_references(vec![SchemaReference::new(
+                "com.example.Address",
+                "com.example.Address",
+                3,
+            )])
+            .with_retry_policy(RetryPolicy::none());
+
+        let derived = apicurio.as_schema_registry_config();
+
+        assert_eq!(derived.url, "http://apicurio:8080");
+        assert_eq!(derived.topic, "orders");
+        assert_eq!(derived.strategy, SubjectNameStrategy::RecordName);
+        assert!(
+            matches!(derived.auth, Some(SchemaRegistryAuth::Basic { .. })),
+            "auth must carry over"
+        );
+        assert!(!derived.auto_register);
+        assert_eq!(derived.request_timeout_ms, Some(11_000));
+        assert_eq!(derived.connect_timeout_ms, Some(2_500));
+        assert_eq!(derived.max_cache_entries, Some(777));
+        assert_eq!(derived.pool_max_idle_per_host, Some(9));
+        assert_eq!(derived.references.len(), 1);
+        assert_eq!(derived.references[0].name, "com.example.Address");
+        assert_eq!(
+            derived.retry_policy.max_retries_value(),
+            RetryPolicy::none().max_retries_value(),
+            "retry policy must carry over, not reset to the default"
+        );
+        assert_ne!(
+            derived.retry_policy.max_retries_value(),
+            RetryPolicy::default().max_retries_value(),
+            "the assertion above is only meaningful if none() differs from the default"
+        );
+        // Not representable on Apicurio's native v3 API; documented on the method.
+        assert!(!derived.normalize_schemas);
+    }
+
+    #[cfg(feature = "apicurio")]
+    #[test]
+    fn apicurio_config_defaults_match_the_confluent_defaults() {
+        let derived =
+            ApicurioRegistryConfig::new("http://apicurio:8080", "t").as_schema_registry_config();
+        let baseline = SchemaRegistryConfig::new("http://apicurio:8080", "t");
+
+        assert_eq!(derived.strategy, baseline.strategy);
+        assert_eq!(derived.auto_register, baseline.auto_register);
+        assert_eq!(derived.request_timeout_ms, baseline.request_timeout_ms);
+        assert_eq!(derived.connect_timeout_ms, baseline.connect_timeout_ms);
+        assert_eq!(derived.max_cache_entries, baseline.max_cache_entries);
+        assert_eq!(
+            derived.pool_max_idle_per_host,
+            baseline.pool_max_idle_per_host
+        );
+        assert!(derived.references.is_empty());
     }
 
     // ─── Key schema ──────────────────────────────────────────────────────────
@@ -2074,26 +3319,60 @@ mod tests {
         assert!(types.contains(&"string"), "key must allow string");
     }
 
-    #[test]
-    fn json_schema_encoder_constructs_without_registry_call() {
-        // Verify ConfluentJsonSchemaEncoder::new() does not make network calls
-        // at construction time — registry is only contacted on first encode.
+    #[tokio::test]
+    async fn json_schema_encoder_constructs_without_registry_call() {
+        // With `auto_register` on (the default) construction must still make no network
+        // call — subject resolution stays lazy, and only `auto_register = false` trades
+        // that for a startup check. `http://localhost:8081` is not listening.
         let cfg = SchemaRegistryConfig::new("http://localhost:8081", "orders");
         let registry = Arc::new(cfg.build().unwrap());
-        let encoder = ConfluentJsonSchemaEncoder::new(registry, &cfg);
+        let encoder = ConfluentJsonSchemaEncoder::new(registry, &cfg).await;
         assert!(
             encoder.is_ok(),
-            "encoder construction must not require a live registry"
+            "encoder construction must not require a live registry when auto_register is on"
         );
         let encoder = encoder.unwrap();
         assert_eq!(encoder.topic(), "orders");
     }
 
-    #[test]
-    fn json_schema_encoder_without_validation_constructs() {
+    #[tokio::test]
+    async fn json_schema_encoder_with_auto_register_off_requires_a_reachable_registry() {
+        // `auto_register = false` means "require the schemas to already exist". Through
+        // 0.8 this encoder ignored it entirely and registered anyway; the setting now
+        // fails at construction against an unreachable registry rather than buying
+        // nothing.
+        let cfg = SchemaRegistryConfig::new("http://127.0.0.1:1", "orders")
+            .with_auto_register(false)
+            .with_connect_timeout_ms(500)
+            .with_request_timeout_ms(500);
+        let registry = Arc::new(cfg.build().unwrap());
+        let error = ConfluentJsonSchemaEncoder::new(registry, &cfg)
+            .await
+            .expect_err("auto_register = false must verify the subjects exist");
+        assert!(
+            error.to_string().contains("auto_register"),
+            "the error must name the setting that caused the check: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn protobuf_encoder_with_auto_register_off_requires_a_reachable_registry() {
+        let cfg = SchemaRegistryConfig::new("http://127.0.0.1:1", "orders")
+            .with_auto_register(false)
+            .with_connect_timeout_ms(500)
+            .with_request_timeout_ms(500);
+        let registry = Arc::new(cfg.build().unwrap());
+        let error = ConfluentProtobufEncoder::new(registry, &cfg)
+            .await
+            .expect_err("auto_register = false must verify the subjects exist");
+        assert!(error.to_string().contains("auto_register"));
+    }
+
+    #[tokio::test]
+    async fn json_schema_encoder_without_validation_constructs() {
         let cfg = SchemaRegistryConfig::new("http://localhost:8081", "orders");
         let registry = Arc::new(cfg.build().unwrap());
-        let encoder = ConfluentJsonSchemaEncoder::without_validation(registry, &cfg);
+        let encoder = ConfluentJsonSchemaEncoder::without_validation(registry, &cfg).await;
         assert!(encoder.is_ok());
     }
 
@@ -2106,11 +3385,13 @@ mod tests {
         assert!(dbg.contains("ConfluentJsonSchemaDecoder"));
     }
 
-    #[test]
-    fn json_schema_encoder_is_clone() {
+    #[tokio::test]
+    async fn json_schema_encoder_is_clone() {
         let cfg = SchemaRegistryConfig::new("http://localhost:8081", "t");
         let registry = Arc::new(cfg.build().unwrap());
-        let encoder = ConfluentJsonSchemaEncoder::new(registry, &cfg).unwrap();
+        let encoder = ConfluentJsonSchemaEncoder::new(registry, &cfg)
+            .await
+            .unwrap();
         let _cloned = encoder.clone();
     }
 
@@ -2134,6 +3415,7 @@ mod tests {
             "cdc-events-value",
             &reformatted,
             crate::codec::avro::AVRO_SCHEMA,
+            SchemaType::Avro,
         )
         .expect("a formatting-only difference must be accepted");
     }
@@ -2155,6 +3437,7 @@ mod tests {
             "cdc-events-value",
             foreign,
             crate::codec::avro::AVRO_SCHEMA,
+            SchemaType::Avro,
         )
         .expect_err("a structurally different schema must be rejected, not silently used");
 
@@ -2171,10 +3454,105 @@ mod tests {
 
     #[test]
     fn a_registry_schema_that_is_not_valid_avro_is_rejected() {
-        let error =
-            assert_registry_schema_matches("cdc-events-value", "{not avro", KEY_AVRO_SCHEMA)
-                .expect_err("invalid Avro must be rejected");
+        let error = assert_registry_schema_matches(
+            "cdc-events-value",
+            "{not avro",
+            KEY_AVRO_SCHEMA,
+            SchemaType::Avro,
+        )
+        .expect_err("invalid Avro must be rejected");
         assert!(error.to_string().contains("not valid Avro"));
+    }
+
+    #[test]
+    fn json_schema_identity_ignores_formatting_but_not_structure() {
+        let reformatted: String = serde_json::from_str::<serde_json::Value>(EVENT_JSON_SCHEMA)
+            .map(|value| serde_json::to_string_pretty(&value).expect("re-serialise"))
+            .expect("EVENT_JSON_SCHEMA parses");
+        assert_registry_schema_matches(
+            "cdc-json-value",
+            &reformatted,
+            EVENT_JSON_SCHEMA,
+            SchemaType::Json,
+        )
+        .expect("a formatting-only difference must be accepted");
+
+        // Key order specifically: a registry that stores the schema with its keys in a
+        // different order has not changed the schema, and rejecting that would fail
+        // startup against a perfectly correct registry.
+        let reordered = r#"{"required":["b","a"],"type":"object",
+                            "properties":{"b":{"type":"string"},"a":{"type":"integer"}}}"#;
+        let original = r#"{"type":"object",
+                           "properties":{"a":{"type":"integer"},"b":{"type":"string"}},
+                           "required":["b","a"]}"#;
+        assert_registry_schema_matches("cdc-json-value", reordered, original, SchemaType::Json)
+            .expect("reordered object keys are the same schema");
+
+        // Array order, by contrast, is significant in JSON Schema and must not be
+        // normalised away.
+        let reordered_array = r#"{"type":"object","required":["a","b"]}"#;
+        assert_registry_schema_matches(
+            "cdc-json-value",
+            reordered_array,
+            r#"{"type":"object","required":["b","a"]}"#,
+            SchemaType::Json,
+        )
+        .expect_err("array element order is part of the schema");
+
+        assert_registry_schema_matches(
+            "cdc-json-value",
+            KEY_JSON_SCHEMA,
+            EVENT_JSON_SCHEMA,
+            SchemaType::Json,
+        )
+        .expect_err("a different schema must be rejected");
+    }
+
+    #[test]
+    fn protobuf_schema_identity_ignores_comments_but_not_structure() {
+        // The registry stores `.proto` source, so a reflowed comment must not read as a
+        // schema change — but a changed field must.
+        let stripped: String = KEY_PROTO_SCHEMA
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(stripped, KEY_PROTO_SCHEMA, "the test input must differ");
+        assert_registry_schema_matches(
+            "cdc-proto-key",
+            &stripped,
+            KEY_PROTO_SCHEMA,
+            SchemaType::Protobuf,
+        )
+        .expect("comments carry no wire semantics");
+
+        assert_registry_schema_matches(
+            "cdc-proto-key",
+            EVENT_PROTO_SOURCE,
+            KEY_PROTO_SCHEMA,
+            SchemaType::Protobuf,
+        )
+        .expect_err("a different message must be rejected");
+    }
+
+    #[test]
+    fn preflight_derives_the_subject_names_each_format_actually_uses() {
+        // Protobuf subjects come from the message's fully-qualified name, Avro and JSON
+        // from the record name. Checking the Avro names for a Protobuf pipeline — which is
+        // what 0.8 did unconditionally — looks at subjects nothing writes to.
+        let strategy = SubjectNameStrategy::TopicRecordName;
+        assert_eq!(
+            strategy
+                .subject_name("cdc", Some(EVENT_PROTO_FULL_NAME), EncodeTarget::Value)
+                .unwrap(),
+            "cdc-rustcdc.Event"
+        );
+        assert_eq!(
+            strategy
+                .subject_name("cdc", Some("io.rustcdc.Event"), EncodeTarget::Value)
+                .unwrap(),
+            "cdc-io.rustcdc.Event"
+        );
     }
 
     // ─── Registry error classification ───────────────────────────────────────

@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::core::{Error, Event, Result};
 
-use super::Transform;
+use super::{Transform, UnmatchedRule};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// Routes events to named destinations by table pattern.
@@ -58,12 +58,35 @@ impl RouteConfig {
 /// A compiled routing transform.
 ///
 /// Routing priority: exact-table → regex-pattern → default.
-#[derive(Debug, Clone)]
+///
+/// # A route that never fires is silent
+///
+/// Every rule carries a hit counter, and [`Transform::unmatched_rules`] names the ones
+/// that never matched. A routing rule fails **open**, into `default_destination`, so a
+/// typo or a renamed table does not error — the events simply go somewhere else, and the
+/// only visible symptom is a destination that never receives anything. See
+/// [`UnmatchedRule`].
+#[derive(Debug)]
 pub struct RouteTransform {
     /// Routing configuration.
     pub config: RouteConfig,
     /// Pre-compiled regex patterns derived from `config.route_patterns_raw`.
     patterns: Vec<(Regex, String)>,
+    /// Hit counter per exact-table rule, parallel to `exact_rules`.
+    exact_hits: Vec<std::sync::atomic::AtomicU64>,
+    /// Exact-table rule keys in a stable order.
+    exact_rules: Vec<String>,
+    /// Key → index into `exact_hits`.
+    exact_slots: ahash::AHashMap<String, usize>,
+    /// Hit counter per regex pattern, parallel to `patterns`.
+    pattern_hits: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Clone for RouteTransform {
+    /// Clones the configuration; hit counters start fresh in the clone.
+    fn clone(&self) -> Self {
+        Self::new(self.config.clone()).expect("patterns already compiled once")
+    }
 }
 
 impl RouteTransform {
@@ -84,17 +107,64 @@ impl RouteTransform {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { config, patterns })
+
+        // Sorted so the unmatched-rule report is stable across runs; `routing_table` is a
+        // hash map with no inherent order.
+        let mut exact_rules: Vec<String> = config.routing_table.keys().cloned().collect();
+        exact_rules.sort();
+        let exact_slots = exact_rules
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), index))
+            .collect();
+        let exact_hits = exact_rules
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        let pattern_hits = patterns
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+
+        Ok(Self {
+            config,
+            patterns,
+            exact_hits,
+            exact_rules,
+            exact_slots,
+            pattern_hits,
+        })
+    }
+
+    /// Number of events this exact-table or regex rule has routed.
+    ///
+    /// `None` when the rule is not configured.
+    pub fn rule_hit_count(&self, rule: &str) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        if let Some(index) = self.exact_slots.get(rule) {
+            return Some(self.exact_hits[*index].load(Ordering::Relaxed));
+        }
+        self.config
+            .route_patterns_raw
+            .iter()
+            .position(|(pattern, _)| pattern == rule)
+            .map(|index| self.pattern_hits[index].load(Ordering::Relaxed))
     }
 
     fn destination_for(&self, table: &str) -> Result<String> {
+        use std::sync::atomic::Ordering;
+
         // 1. Exact match.
         if let Some(mapped) = self.config.routing_table.get(table) {
+            if let Some(index) = self.exact_slots.get(table) {
+                self.exact_hits[*index].fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(mapped.clone());
         }
         // 2. Regex patterns in declaration order.
-        for (re, dest) in &self.patterns {
+        for (index, (re, dest)) in self.patterns.iter().enumerate() {
             if re.is_match(table) {
+                self.pattern_hits[index].fetch_add(1, Ordering::Relaxed);
                 return Ok(dest.clone());
             }
         }
@@ -131,6 +201,34 @@ impl Transform for RouteTransform {
 
     fn name(&self) -> &str {
         "route"
+    }
+
+    fn unmatched_rules(&self) -> Vec<UnmatchedRule> {
+        use std::sync::atomic::Ordering;
+
+        const CONSEQUENCE: &str = "Events those rules were meant to route are going to \
+             `default_destination` instead — routing fails open, so a renamed table or a \
+             pattern that never matches produces no error, only a destination that stays \
+             empty.";
+
+        let exact = self
+            .exact_rules
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.exact_hits[*index].load(Ordering::Relaxed) == 0)
+            .map(|(_, key)| UnmatchedRule::new(self.name(), "route", key, CONSEQUENCE));
+
+        let patterns = self
+            .config
+            .route_patterns_raw
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.pattern_hits[*index].load(Ordering::Relaxed) == 0)
+            .map(|(_, (pattern, _))| {
+                UnmatchedRule::new(self.name(), "route", pattern, CONSEQUENCE)
+            });
+
+        exact.chain(patterns).collect()
     }
 }
 
@@ -419,5 +517,81 @@ mod tests {
         let mut e = event("public.users");
         assert!(transform.apply(&mut e).unwrap());
         assert_eq!(e.table, "topic-public");
+    }
+
+    // ─── Fail-open reporting ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_route_that_never_matches_is_reported_rather_than_silently_ignored() {
+        // Routing fails open into `default_destination`. A renamed table or a pattern
+        // that never matches produces no error — the events just go somewhere else, and
+        // the only symptom is a destination that stays empty.
+        let mut map = HashMap::new();
+        map.insert("public.users".to_string(), "users-topic".to_string());
+        map.insert("public.usres".to_string(), "users-topic".to_string()); // typo
+        let transform = RouteTransform::new(RouteConfig {
+            routing_table: map,
+            route_patterns_raw: vec![
+                ("^public\\.order".to_string(), "orders-topic".to_string()),
+                ("^public\\.nothing".to_string(), "dead-topic".to_string()),
+            ],
+            default_destination: "fallback".to_string(),
+            ..RouteConfig::default()
+        })
+        .expect("valid patterns");
+
+        transform.apply(&mut event("public.users")).unwrap();
+        transform.apply(&mut event("public.orders")).unwrap();
+
+        let reported = Transform::unmatched_rules(&transform);
+        let unmatched: Vec<&str> = reported.iter().map(|rule| rule.rule.as_str()).collect();
+        assert_eq!(
+            unmatched,
+            vec!["public.usres", "^public\\.nothing"],
+            "both the typo'd exact rule and the dead pattern must be reported"
+        );
+        assert!(reported.iter().all(|rule| rule.kind == "route"));
+        assert!(
+            reported[0].consequence.contains("default_destination"),
+            "the consequence must name where the events actually went: {}",
+            reported[0].consequence
+        );
+
+        assert_eq!(transform.rule_hit_count("public.users"), Some(1));
+        assert_eq!(transform.rule_hit_count("public.usres"), Some(0));
+        assert_eq!(transform.rule_hit_count("^public\\.order"), Some(1));
+        assert_eq!(transform.rule_hit_count("nonexistent"), None);
+        assert_eq!(transform.warn_on_unmatched_rules(), 2);
+    }
+
+    #[test]
+    fn every_route_that_fires_leaves_nothing_to_report() {
+        let mut map = HashMap::new();
+        map.insert("public.users".to_string(), "users-topic".to_string());
+        let transform = RouteTransform::new(RouteConfig {
+            routing_table: map,
+            default_destination: "fallback".to_string(),
+            ..RouteConfig::default()
+        })
+        .expect("valid config");
+
+        transform.apply(&mut event("public.users")).unwrap();
+        assert!(Transform::unmatched_rules(&transform).is_empty());
+    }
+
+    #[test]
+    fn a_clone_starts_its_hit_counters_fresh() {
+        let mut map = HashMap::new();
+        map.insert("public.users".to_string(), "users-topic".to_string());
+        let transform = RouteTransform::new(RouteConfig {
+            routing_table: map,
+            default_destination: "fallback".to_string(),
+            ..RouteConfig::default()
+        })
+        .expect("valid config");
+        transform.apply(&mut event("public.users")).unwrap();
+
+        let cloned = transform.clone();
+        assert_eq!(cloned.rule_hit_count("public.users"), Some(0));
     }
 }

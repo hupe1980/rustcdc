@@ -231,6 +231,37 @@ pub struct ProtoEvent {
     pub before_unavailable_columns: Vec<String>,
 }
 
+/// Protobuf representation of a CDC event's primary key.
+///
+/// Mirrors `message EventKey` in `proto/event_key.proto`, and carries the same payload
+/// as [`KEY_AVRO_SCHEMA`] and [`KEY_JSON_SCHEMA`]: the primary key as a JSON object
+/// encoded in a string, absent for keyless events.
+///
+/// [`KEY_AVRO_SCHEMA`]: crate::codec::KEY_AVRO_SCHEMA
+/// [`KEY_JSON_SCHEMA`]: crate::codec::KEY_JSON_SCHEMA
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoEventKey {
+    /// JSON object mapping primary-key column names to values; `None` for keyless events.
+    #[prost(string, optional, tag = "1")]
+    pub key: Option<String>,
+}
+
+impl ProtoEventKey {
+    /// Build the key message for an event.
+    ///
+    /// `key` is `None` — an absent protobuf field, not an empty string — when the event
+    /// declares no primary key, when none of the key columns appear in the row image, or
+    /// for the keyless operations (TRUNCATE, SCHEMA_CHANGE).
+    pub fn from_event(event: &Event) -> Result<Self> {
+        let key = event
+            .primary_key_values()
+            .map(|value| serde_json::to_string(&value))
+            .transpose()
+            .map_err(|e| Error::SerializationError(format!("protobuf key encode: {e}")))?;
+        Ok(Self { key })
+    }
+}
+
 impl ProtoEvent {
     /// Convert a [`crate::core::Event`] into its protobuf representation.
     pub fn from_event(event: &Event) -> Result<Self> {
@@ -521,5 +552,41 @@ mod tests {
     #[test]
     fn content_type_is_x_protobuf() {
         assert_eq!(ProtobufEncoder.content_type(), "application/x-protobuf");
+    }
+
+    // ─── ProtoEventKey ───────────────────────────────────────────────────────
+
+    #[test]
+    fn proto_event_key_carries_the_primary_key_as_json() {
+        let event = full_event();
+        let key = ProtoEventKey::from_event(&event).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(key.key.as_deref().expect("keyed event")).unwrap();
+        assert_eq!(json, event.primary_key_values().unwrap());
+    }
+
+    #[test]
+    fn proto_event_key_is_absent_not_empty_for_keyless_events() {
+        // Absent, not "": a consumer has to be able to tell "no key" from "a key that
+        // serialised to nothing", and protobuf's empty string is indistinguishable from
+        // an unset non-optional field.
+        let mut event = full_event();
+        event.primary_key = None;
+        let key = ProtoEventKey::from_event(&event).unwrap();
+        assert!(key.key.is_none());
+
+        let bytes = key.encode_to_vec();
+        assert!(
+            bytes.is_empty(),
+            "an absent optional field must occupy no bytes on the wire"
+        );
+    }
+
+    #[test]
+    fn proto_event_key_round_trips() {
+        let event = full_event();
+        let bytes = ProtoEventKey::from_event(&event).unwrap().encode_to_vec();
+        let decoded = <ProtoEventKey as prost::Message>::decode(&bytes[..]).unwrap();
+        assert_eq!(decoded.key.as_deref(), Some(r#"{"id":1}"#));
     }
 }

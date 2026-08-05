@@ -26,11 +26,11 @@ a normal dependency with no sidecar to supervise and no control plane to operate
 
 ## Status
 
-**Pre-1.0.** Latest published release is 0.7.0; 0.8.0 is in development and is a breaking
+**Pre-1.0.** Latest published release is 0.7.0; 0.9.0 is in development and is a breaking
 release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are implemented
-and validated by 871 unit tests, 102 documentation samples compiled as doctests, and 27
-container-backed integration suites running against real PostgreSQL 16, MySQL 8.0/8.1,
-MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
+and validated by 915 unit tests, 109 documentation samples compiled as doctests, and 52
+integration suites, the container-backed ones running against real PostgreSQL 16,
+MySQL 8.0/8.1, MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
 
 The public API may still change. Delivery is **at-least-once**; see
 [Delivery guarantees](#delivery-guarantees).
@@ -192,14 +192,14 @@ as `rustcdc_runtime_health{verdict="stalled"} == 1`. See the
 | `postgres` *(default)* | PostgreSQL connector (pulls in `tls`) |
 | `tls` *(default)* | TLS transport surface |
 | `mysql` / `mariadb` | MySQL and MariaDB connectors (shared transport stack, distinct source identity) |
-| `sqlserver` | SQL Server connector |
+| `sqlserver` | SQL Server connector. **Brings a second, older TLS stack** — see the note below |
 | `wasm` | WASM transform sandbox via wasmtime (~15 MB release overhead; opt-in by design) |
 | `outbox` | Outbox pattern helpers and transforms |
 | `encryption` | Encryption-oriented transforms and helpers |
 | `metrics` | OpenTelemetry metrics and tracing |
 | `schemreg` | Confluent Schema Registry — Avro, JSON Schema, Protobuf |
 | `apicurio` | Apicurio Registry v3 native REST API |
-| `glue` | AWS Glue Schema Registry (18-byte wire header, UUID schema identity) |
+| `glue` | AWS Glue Schema Registry — `GlueAvroEncoder`/`Decoder` (18-byte wire header, UUID schema identity) |
 | `test-harnesses` | Replay, fault injection and conformance harnesses (dev/test only) |
 
 `--no-default-features` builds the foundation without any connector; `--all-features` validates
@@ -208,6 +208,18 @@ the full additive surface.
 TLS is the default for every connector and needs no feature flag for private-CA or mutual-TLS
 deployments — configure `TransportConfig::tls_with_ca_cert_path(...)` or
 `TransportConfig::mtls(...)` directly.
+
+> **`sqlserver` negotiates TLS with a different stack than the rest of the crate.**
+> Everything else in rustcdc — every other connector, every sink — is on `rustls 0.23`.
+> `tiberius 0.12.3` hard-pins `tokio-rustls 0.24`, so enabling `sqlserver` adds a second,
+> older copy: `rustls 0.21` / `rustls-webpki 0.101.7`, carrying RUSTSEC-2026-0098, -0099
+> and -0104, plus the unmaintained `rustls-pemfile 1.0` via `rustls-native-certs 0.6`.
+> It is not deduplicable and not fixable from here — the fix needs a tiberius release
+> built against `rustls 0.23`. Two of the three advisories are unreachable on rustcdc's
+> code paths and the third needs CA misissuance to exploit; the per-advisory reachability
+> analysis, the `cargo deny` suppressions and the mitigations are in
+> [security](https://hupe1980.github.io/rustcdc/docs/security/#known-exposure-sqlserver-feature).
+> Deployments that cannot accept it should leave the feature off — it is not a default.
 
 ## Examples
 

@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.94"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -31,6 +31,14 @@ mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "mysql
 # capability flags) are handled transparently by the shared connector code.
 mariadb = ["mysql"]
 # Enable SQL Server-specific source implementations.
+#
+# SECURITY: this feature negotiates TLS with a *different, older* stack than the rest of
+# the crate. Everything else here is on rustls 0.23; tiberius 0.12.3 hard-pins
+# tokio-rustls 0.24, so enabling this adds rustls 0.21 / rustls-webpki 0.101.7 —
+# carrying RUSTSEC-2026-0098, -0099 and -0104, plus the unmaintained rustls-pemfile 1.0
+# via rustls-native-certs 0.6. Not deduplicable and not fixable from here: it needs a
+# tiberius release built against rustls 0.23. Per-advisory reachability analysis and
+# mitigations are in site/content/docs/security.md; the suppressions are in deny.toml.
 sqlserver = ["dep:tiberius", "tls"]
 # Enable TLS-related transport support for source connectors.
 tls = ["dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
@@ -65,8 +73,13 @@ apicurio = ["schemreg", "schemreg/apicurio"]
 # Enable the AWS Glue Schema Registry as a backend.
 #
 # Glue uses its own 18-byte wire header (not the Confluent 5-byte one) and identifies
-# schemas by UUID rather than by integer id, so it is a distinct encode/decode path
-# rather than a drop-in registry swap. Pulls in the AWS SDK.
+# schemas by UUID rather than by integer id, so it is a distinct encode/decode path rather
+# than a drop-in registry swap: `GlueAvroEncoder` / `GlueAvroDecoder`, not the Confluent
+# pair. Pulls in the AWS SDK.
+#
+# EVIDENCE: Glue has no self-hostable implementation, so this is the one registry backend
+# with no live-service test. Everything rustcdc owns is covered against an in-memory fake;
+# the AWS transport itself belongs to `schemreg`. See site/content/docs/api.md.
 glue = ["schemreg", "schemreg/glue"]
 
 [dependencies]

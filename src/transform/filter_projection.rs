@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::core::{Error, Event, Result};
 
-use super::Transform;
+use super::{Transform, UnmatchedRule};
 
 /// Logical combination mode for multiple [`FilterRule`]s in a
 /// [`FilterProjectionConfig`].
@@ -136,6 +136,30 @@ impl FilterRule {
             value: value.into(),
         }
     }
+
+    /// A stable one-line rendering of the predicate, e.g. `after.user.country eq "DE"`.
+    ///
+    /// Used as the rule identity in [`UnmatchedRule::rule`](crate::transform::UnmatchedRule)
+    /// and therefore as a Prometheus label value, so it must not vary run to run.
+    pub fn describe(&self) -> String {
+        let field = match &self.field {
+            FilterField::Op => "op".to_string(),
+            FilterField::Table => "table".to_string(),
+            FilterField::AfterField(path) => format!("after.{path}"),
+            FilterField::BeforeField(path) => format!("before.{path}"),
+        };
+        let operator = match self.operator {
+            FilterOperator::Eq => "eq",
+            FilterOperator::Ne => "ne",
+            FilterOperator::Contains => "contains",
+            FilterOperator::Regex => "regex",
+            FilterOperator::Lt => "lt",
+            FilterOperator::LtEq => "lteq",
+            FilterOperator::Gt => "gt",
+            FilterOperator::GtEq => "gteq",
+        };
+        format!("{field} {operator} {:?}", self.value)
+    }
 }
 
 impl FilterProjectionConfig {
@@ -179,7 +203,7 @@ impl FilterProjectionConfig {
 ///
 /// Constructed via [`FilterProjectionTransform::new`].  All per-event work is
 /// done against the pre-parsed state, eliminating allocations on the hot path.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FilterProjectionTransform {
     /// Filter and projection configuration.
     pub config: FilterProjectionConfig,
@@ -190,6 +214,21 @@ pub struct FilterProjectionTransform {
     /// Pre-compiled regexes, parallel to `config.filters`.
     /// `None` for rules whose operator is not [`FilterOperator::Regex`].
     compiled_regexes: Vec<Option<Regex>>,
+    /// Times each rule was evaluated, parallel to `config.filters`.
+    ///
+    /// Tracked separately from `rule_matches` because [`FilterMode::All`] short-circuits:
+    /// a rule that was never *reached* is not evidence of a typo, while one that was
+    /// evaluated repeatedly and never matched is.
+    rule_evaluations: Vec<std::sync::atomic::AtomicU64>,
+    /// Times each rule returned `true`, parallel to `config.filters`.
+    rule_matches: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Clone for FilterProjectionTransform {
+    /// Clones the configuration; hit counters start fresh in the clone.
+    fn clone(&self) -> Self {
+        Self::new(self.config.clone()).expect("configuration already validated once")
+    }
 }
 
 impl FilterProjectionTransform {
@@ -222,12 +261,37 @@ impl FilterProjectionTransform {
             .as_deref()
             .map(|cols| cols.iter().cloned().collect::<HashSet<String>>());
 
+        let rule_evaluations = config
+            .filters
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        let rule_matches = config
+            .filters
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+
         Ok(Self {
             config,
             include_set,
             exclude_set,
             compiled_regexes,
+            rule_evaluations,
+            rule_matches,
         })
+    }
+
+    /// How many events each filter rule has matched, by rule index.
+    ///
+    /// `None` when the index is out of range. A rule that has been evaluated many times
+    /// and matched zero is the silent-misconfiguration signal — see
+    /// [`Transform::unmatched_rules`].
+    pub fn rule_hit_count(&self, index: usize) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        self.rule_matches
+            .get(index)
+            .map(|count| count.load(Ordering::Relaxed))
     }
 
     #[inline]
@@ -249,7 +313,19 @@ impl FilterProjectionTransform {
             .filters
             .iter()
             .zip(self.compiled_regexes.iter())
-            .map(|(rule, re)| self.evaluate_rule(event, rule, re.as_ref()));
+            .enumerate()
+            .map(|(index, (rule, re))| {
+                use std::sync::atomic::Ordering;
+                // Two relaxed increments per rule per event. `all`/`any` below still
+                // short-circuit, so a rule that was never reached records neither — which
+                // is what makes the unmatched report trustworthy under `FilterMode::All`.
+                self.rule_evaluations[index].fetch_add(1, Ordering::Relaxed);
+                let matched = self.evaluate_rule(event, rule, re.as_ref());
+                if matched {
+                    self.rule_matches[index].fetch_add(1, Ordering::Relaxed);
+                }
+                matched
+            });
 
         match self.config.filter_mode {
             FilterMode::All => iter.all(|m| m),
@@ -377,6 +453,31 @@ impl Transform for FilterProjectionTransform {
 
     fn name(&self) -> &str {
         "filter_projection"
+    }
+
+    fn unmatched_rules(&self) -> Vec<UnmatchedRule> {
+        use std::sync::atomic::Ordering;
+
+        const CONSEQUENCE: &str = "Rows those rules were meant to select or exclude are \
+             being handled by whatever the remaining rules decide — a filter fails open \
+             into the surrounding `FilterMode`, so a typo in a field path or a value that \
+             never occurs produces no error, only a rule that silently contributes nothing.";
+
+        self.config
+            .filters
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                // Evaluated at least once and never matched. A rule that was never
+                // reached — because an earlier rule short-circuited every event under
+                // `FilterMode::All` — is not reported: it has had no chance to match.
+                self.rule_evaluations[*index].load(Ordering::Relaxed) > 0
+                    && self.rule_matches[*index].load(Ordering::Relaxed) == 0
+            })
+            .map(|(_, rule)| {
+                UnmatchedRule::new(self.name(), "filter", rule.describe(), CONSEQUENCE)
+            })
+            .collect()
     }
 }
 
@@ -813,5 +914,93 @@ mod tests {
             !transform.apply(&mut e).unwrap(),
             "Truncate must be dropped when pass_through_truncate=false and rule does not match"
         );
+    }
+
+    // ─── Fail-open reporting ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_filter_rule_that_never_matches_is_reported() {
+        // A filter rule fails open into the surrounding `FilterMode`: a typo in a field
+        // path makes the rule contribute nothing, with no error anywhere.
+        let transform = FilterProjectionTransform::new(FilterProjectionConfig {
+            // The typo'd rule goes first: `FilterMode::Any` short-circuits on the first
+            // `true`, so a rule placed after a matching one would never be evaluated.
+            filters: vec![
+                FilterRule::new(
+                    FilterField::AfterField("secrt".into()), // typo for "secret"
+                    FilterOperator::Eq,
+                    "x",
+                ),
+                FilterRule::new(FilterField::Table, FilterOperator::Contains, "users"),
+            ],
+            filter_mode: FilterMode::Any,
+            ..FilterProjectionConfig::default()
+        })
+        .expect("valid config");
+
+        let mut e = event(Operation::Insert);
+        e.table = "public.users".into();
+        assert!(transform.apply(&mut e).unwrap());
+
+        let reported = Transform::unmatched_rules(&transform);
+        assert_eq!(reported.len(), 1, "only the typo'd rule must be reported");
+        assert_eq!(reported[0].kind, "filter");
+        assert!(
+            reported[0].rule.contains("after.secrt"),
+            "the report must identify the rule: {}",
+            reported[0].rule
+        );
+        assert_eq!(
+            transform.rule_hit_count(0),
+            Some(0),
+            "the typo'd rule never matched"
+        );
+        assert_eq!(transform.rule_hit_count(1), Some(1));
+        assert_eq!(transform.rule_hit_count(2), None);
+    }
+
+    #[test]
+    fn a_rule_that_was_never_reached_is_not_reported_as_unmatched() {
+        // `FilterMode::All` short-circuits on the first false. A rule that never got a
+        // chance to run has not failed to match — reporting it would be a false positive
+        // that trains operators to ignore the signal.
+        let transform = FilterProjectionTransform::new(FilterProjectionConfig {
+            filters: vec![
+                FilterRule::new(FilterField::Table, FilterOperator::Eq, "never.matches"),
+                FilterRule::new(FilterField::Op, FilterOperator::Eq, "insert"),
+            ],
+            filter_mode: FilterMode::All,
+            ..FilterProjectionConfig::default()
+        })
+        .expect("valid config");
+
+        let mut e = event(Operation::Insert);
+        e.table = "public.users".into();
+        assert!(!transform.apply(&mut e).unwrap(), "the first rule drops it");
+
+        let reported = Transform::unmatched_rules(&transform);
+        assert_eq!(
+            reported.len(),
+            1,
+            "only the evaluated-and-never-matched rule is reported, not the unreached one"
+        );
+        assert!(reported[0].rule.contains("table"));
+        assert_eq!(
+            transform.rule_hit_count(1),
+            Some(0),
+            "the second rule was never evaluated"
+        );
+    }
+
+    #[test]
+    fn describe_is_stable_and_identifies_the_rule() {
+        // The rendering becomes a Prometheus label value, so it must not vary run to run.
+        let rule = FilterRule::new(
+            FilterField::AfterField("user.country".into()),
+            FilterOperator::Eq,
+            "DE",
+        );
+        assert_eq!(rule.describe(), r#"after.user.country eq "DE""#);
+        assert_eq!(rule.describe(), rule.clone().describe());
     }
 }

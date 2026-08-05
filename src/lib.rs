@@ -79,9 +79,9 @@ pub mod wasm;
 #[cfg(feature = "tls")]
 pub use crate::core::RustlsClientConfig;
 pub use crate::core::{
-    fingerprint_event_stable, fingerprint_event_transient, AckMode, AckToken, CdcRuntime,
-    ConnectionRetryPolicy, Error, ErrorChain, ErrorKind, ErrorReport, Event, EventBatch,
-    EventBuilder, EventIdempotencyGuard, EventTracer, FingerprintError, HealthVerdict,
+    fingerprint_event_stable, fingerprint_event_transient, render_error_chain, AckMode, AckToken,
+    CdcRuntime, ConnectionRetryPolicy, Error, ErrorChain, ErrorKind, ErrorReport, Event,
+    EventBatch, EventBuilder, EventIdempotencyGuard, EventTracer, FingerprintError, HealthVerdict,
     IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector, NoRowWrite,
     Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite, RuntimeAdminSnapshot,
     RuntimeConfig, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
@@ -94,8 +94,10 @@ pub use crate::core::{
     MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord,
 };
 pub use crate::ddl_capture::{
-    CapturedDdl, DdlDialect, DdlExtractor, DdlOperation, ParsedDdlStatement, SchemaDiff,
-    SchemaDiffOperation,
+    extract_columns_from_create, extract_primary_keys, extract_qualified_name,
+    extract_qualified_name_with_default, normalize_identifier, CapturedDdl, DdlDialect,
+    DdlExtractor, DdlOperation, MysqlDdlExtractor, ParsedDdlStatement, PostgresDdlExtractor,
+    SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor,
 };
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
 pub use crate::source::IncrementalSnapshotConfig;
@@ -106,8 +108,10 @@ pub use crate::source::MysqlIncrementalSnapshotHandle;
 #[cfg(feature = "sqlserver")]
 pub use crate::source::SqlServerIncrementalSnapshotHandle;
 pub use crate::source::{
-    ConnectorCapabilities, DatabaseAuthMode, HandoffResult, SnapshotCheckpointHelper, SnapshotEnd,
-    SnapshotProgress, SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport,
+    incremental_snapshot_state_from_offset, ChunkRow, ConnectorCapabilities, DatabaseAuthMode,
+    HandoffResult, IncrementalSnapshotBackend, IncrementalSnapshotDriver, IncrementalSnapshotState,
+    IncrementalSnapshotTableState, SnapshotCheckpointHelper, SnapshotEnd, SnapshotProgress,
+    SnapshotProgressTracker, SnapshotTable, SnapshotTrackerConfig, SnapshotTrackerReport,
     SnapshotValidationResult, SnapshotValidator, TableProgress,
 };
 #[cfg(feature = "mariadb")]
@@ -125,8 +129,10 @@ pub use crate::transform::{
     AsyncTransform, FieldMappingConfig, FieldMappingTransform, FilterField, FilterMode,
     FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule, MaskHashConfig,
     MaskHashTransform, MaskRule, RouteConfig, RouteTransform, Transform, TransformPipeline,
-    UnwrapConfig, UnwrapTransform,
+    UnmatchedRule, UnwrapConfig, UnwrapTransform,
 };
+#[cfg(feature = "outbox")]
+pub use crate::transform::{OutboxResult, OutboxTransform};
 #[cfg(feature = "wasm")]
 pub use crate::wasm::{
     TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,
@@ -135,28 +141,31 @@ pub use crate::wasm::{
 
 #[cfg(feature = "apicurio")]
 pub use crate::codec::ApicurioRegistryConfig;
-#[cfg(feature = "avro")]
-pub use crate::codec::AvroEncoder;
 #[cfg(feature = "cloudevents")]
 pub use crate::codec::CloudEventsEncoder;
-#[cfg(feature = "protobuf")]
-pub use crate::codec::ProtobufEncoder;
+#[cfg(feature = "avro")]
+pub use crate::codec::{avro_value_to_event, AvroDecoder, AvroEncoder, AVRO_SCHEMA};
 #[cfg(feature = "schemreg")]
 pub use crate::codec::{
     decode_wire_format, detect_wire_format, encode_wire_format, preflight_schema_registry,
     warm_schema_cache, AnySchemaCache, CachedSchemaRegistry, CompatibilityLevel,
     ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
-    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentSchemaRegistry,
-    DecodedMessage, DetectedWireFormat, DynSchemaRegistryClient, EncodeTarget, RetryPolicy,
-    SchemaDecoder, SchemaEncoder, SchemaFormat, SchemaId, SchemaReference, SchemaRegError,
-    SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType, SchemaVersion,
-    SubjectNameStrategy, WireFormatDecoder, DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF,
-    DEFAULT_MAX_RETRIES, EVENT_JSON_SCHEMA, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
+    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentProtobufDecoder,
+    ConfluentProtobufEncoder, ConfluentSchemaRegistry, DecodedMessage, DetectedWireFormat,
+    DynSchemaRegistryClient, EncodeTarget, RetryPolicy, SchemaDecoder, SchemaEncoder, SchemaFormat,
+    SchemaId, SchemaReference, SchemaRegError, SchemaRegistryAuth, SchemaRegistryClient,
+    SchemaRegistryConfig, SchemaType, SchemaVersion, SubjectNameStrategy, WireFormatDecoder,
+    DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_RETRIES, EVENT_JSON_SCHEMA,
+    KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA, KEY_PROTO_SCHEMA,
 };
 pub use crate::codec::{
-    BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec, EventEncoder, JsonCodec,
-    JsonEncoder, JsonPrettyEncoder,
+    AsyncCodec, BoxedAsyncCodec, BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec,
+    EventEncoder, JsonCodec, JsonEncoder, JsonPrettyEncoder,
 };
+#[cfg(feature = "glue")]
+pub use crate::codec::{GlueAvroConfig, GlueAvroDecoder, GlueAvroEncoder};
+#[cfg(feature = "protobuf")]
+pub use crate::codec::{ProtoEventKey, ProtobufEncoder};
 pub use crate::pipeline::{
     table_matches, HeterogeneousTableRouter, TableRoute, TableRouter, TableRouterBuilder,
 };

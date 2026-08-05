@@ -398,10 +398,13 @@ async fn run_postgres_process_kill_replay_scenario(
             "payload".to_string(),
             MaskRule::Encrypt(SecretString::new("integration-key")),
         );
-        runtime.add_transform(Box::new(MaskHashTransform::new(MaskHashConfig {
-            mask_rules,
-            default_rule: MaskRule::UnsaltedSha256,
-        })));
+        runtime.add_transform(Box::new(
+            MaskHashTransform::new(MaskHashConfig {
+                mask_rules,
+                default_rule: MaskRule::UnsaltedSha256,
+            })
+            .expect("valid mask configuration"),
+        ));
     }
 
     runtime.start().await?;

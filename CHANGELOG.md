@@ -5,6 +5,243 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.9.0
+
+Breaking release, driven almost entirely by downstream feedback from rustcdc-server's 0.7 →
+0.8 upgrade. Themes: **the WASM feature actually works**, **the schema-registry surface stops
+lying about what it carries**, and **a silent misconfiguration becomes an alert**.
+
+### Every WASM module with a data segment failed to load
+
+**This was a critical defect: the `wasm` transform feature was unusable for any real module.**
+
+```
+ConfigError("failed to instantiate WASM module for ABI probe: wasm trap: interrupt")
+```
+
+wasmtime evaluates the store's epoch deadline while initialising a module's `data` segments.
+A fresh `Store` starts at deadline `0`, which equals the engine's starting epoch, so the check
+tripped immediately. `WasmRuntime` armed the deadline *after* `linker.instantiate(..)` at two
+sites — the ABI probe and every instance-pool slot — so **every module carrying a data segment
+was rejected**. Rust, AssemblyScript and TinyGo all emit one for string literals and rodata,
+which is every module a real toolchain produces.
+
+It shipped because the entire WAT fixture suite happened to be data-segment-free: a fully
+green conformance run while no real module could load. There are now three regression
+fixtures with a `data` segment — a unit test, a multi-slot pool test, and
+`fixtures/wasm/data_segment.wat` in the conformance contract — because a one-line fixture
+covers the whole class.
+
+The load-time epoch ticker now also covers pool instantiation, not just the probe, so a module
+whose `start` function never returns is interrupted rather than hanging construction.
+
+### `AsyncCodec`: one type for every registry format
+
+`Codec` and `EventEncoder` are synchronous. `ConfluentJsonSchemaEncoder` and
+`ConfluentProtobufEncoder` resolve subjects lazily — correctly, since `RecordName` and
+`TopicRecordName` exist to give each type its own subject — so their `encode` is `async` and
+fitted neither trait. A sink holding "some codec" could not hold all three Confluent formats,
+and every embedder wrote the same three-variant dispatch enum by hand.
+
+`AsyncCodec` + `BoxedAsyncCodec`, with a blanket `impl<T: Codec> AsyncCodec for T`, is that
+enum once, in the library. The method is `encode_async`, **not** `encode`: a trait
+blanket-implemented over another must not reuse its method names, or `codec.encode(..)`
+becomes an `E0034` ambiguity on every synchronous codec with both traits in scope.
+
+### `ConfluentProtobufEncoder` has a key encoder
+
+`ConfluentAvroEncoder` had `encode_key`, `ConfluentJsonSchemaEncoder` had `encode_event_key`,
+and the Protobuf encoder had **no key path at all** — so a fan-out mixing codecs silently
+paired a registry-framed value with `ProtobufEncoder`'s unframed compact-JSON key, with
+nothing in the API signalling the mismatch.
+
+New `KEY_PROTO_SCHEMA` (`proto/event_key.proto`, its own file so the key subject's registered
+IDL contains exactly the message it uses) and `ConfluentProtobufEncoder::encode_event_key`.
+Keyless events produce a message with the `key` field absent — not empty — matching the
+`{"key": null}` the JSON Schema encoder emits and Debezium's behaviour.
+
+### `preflight_schema_registry` checked the wrong schemas
+
+It always checked the **Avro** schemas under Avro record names, whatever codec the pipeline
+used. A JSON Schema or Protobuf deployment with `auto_register = false` therefore failed
+preflight against a perfectly correct registry, and one with `auto_register = true` ran an
+Avro compatibility check against a JSON subject.
+
+It now takes a `SchemaType` and checks that format's schemas under the subject names that
+format actually uses — Protobuf derives them from the message's fully-qualified name
+(`rustcdc.Event`), not the Avro record name. Schema-identity comparison is per format too:
+Avro canonical form, structural JSON, and comment-stripped `.proto` source.
+
+It is also generic over the client (and `?Sized`), and `ApicurioRegistryConfig::preflight` is
+a direct entry point — an Apicurio deployment silently got no startup check while a Confluent
+one did.
+
+### `ConfluentJsonSchemaEncoder` never set a record name
+
+So `SubjectNameStrategy::RecordName` and `TopicRecordName` failed at **encode** time with
+"RecordName strategy requires a record name" — a config error that surfaced only once traffic
+was flowing, and only for the two strategies that exist to give each record type its own
+subject. Fixed to `io.rustcdc.Event` / `io.rustcdc.EventKey`, matching each schema's `$id` and
+the record names the Avro encoder uses.
+
+### `ApicurioRegistryConfig::as_schema_registry_config` silently dropped five fields
+
+`auth`, `request_timeout_ms`, `connect_timeout_ms`, `max_cache_entries` and `retry_policy` all
+vanished. A caller who set a retry policy got the `SchemaRegistryConfig::new` default with no
+indication their setting had been discarded — from a method whose documented purpose was
+keeping the two consistent.
+
+Every field now carries over, and the conversion destructures `self` **exhaustively**, so
+adding a field without deciding how it maps is a compile error rather than a setting that
+quietly stops taking effect. `pool_max_idle_per_host` and `references` were added to
+`ApicurioRegistryConfig` to close the gap; `normalize_schemas` has no Apicurio v3 equivalent
+and the method says so.
+
+### `warm_schema_cache` works behind `dyn` erasure
+
+It required the concrete `CachedSchemaRegistry<C>`, so erasure to
+`Arc<dyn DynSchemaRegistryClient>` made it uncallable — and erasure is exactly what a
+multi-registry deployment needs, since the encoders are generic over the client and every
+variant would otherwise exist twice. Warming is most valuable in precisely those deployments,
+so the two features could not be used together.
+
+It now takes any `SchemaRegistryClient + ?Sized`, warming through the same cache-populating
+path `CachedSchemaRegistry` uses internally.
+
+### An unmatched transform rule is now a metric, not a log line
+
+Masking, filtering and routing all match by pattern against a permissive default, so a typo or
+a renamed column disables a rule *silently*. A mask rule that never fires means a column is
+shipping in **clear text**; a route rule that never fires means events are going to the
+default destination. Nothing errors.
+
+`MaskHashTransform` had a hit counter and an accessor for this. It is now uniform:
+
+* `Transform::unmatched_rules() -> Vec<UnmatchedRule>` and `warn_on_unmatched_rules()` are on
+  the trait (default: empty), so `FilterProjectionTransform` and `RouteTransform` report too,
+  as does any stage an embedder writes.
+* `RuntimeAdminSnapshot::unmatched_transform_rules` aggregates the whole pipeline.
+* **`rustcdc_transform_rules_unmatched`** is emitted per unmatched rule, labelled
+  `transform`/`kind`/`rule` — and *only* when one is unmatched, so its absence is the healthy
+  state and `> 0` is a complete alert rule. Rule identifiers are Prometheus-escaped: a quote in
+  an operator-written path would otherwise take the whole scrape endpoint down.
+* Each `UnmatchedRule` carries the **consequence**, because that is what makes the alert
+  actionable and it differs per transform.
+
+Filter rules count evaluations separately from matches: `FilterMode::All` short-circuits, so a
+rule an earlier one prevented from running has not failed to match, and reporting it would be a
+false positive that trains operators to ignore the signal.
+
+### `MaskRule::Truncate(0)` is rejected at construction
+
+It produces an empty string, which downstream cannot distinguish from a genuinely empty column
+— so the masking is *invisible*, not merely useless, and it is almost always a typo for
+`Redact` or `Null`. `Redact("")` has the same defect, and an empty rule path can never match.
+All three are now rejected by the new `MaskHashConfig::validate()`, matching what
+`FilterProjectionConfig` and `RouteConfig` already did.
+
+### `auto_register = false` was silently ignored by two of the three encoders
+
+`SchemaRegistryConfig::auto_register = false` means *"require the schemas to already exist"* —
+the setting a careful operator picks in a managed Kafka environment. `ConfluentAvroEncoder`
+honoured it, because it resolves both subjects itself at construction. The JSON Schema and
+Protobuf encoders delegate subject resolution to `schemreg`, whose resolution path **is**
+`register_schema` with no lookup-only mode — so both **ignored the setting entirely**. An
+operator who set it got schemas registered anyway, and none of the schema-identity checking
+that setting exists to buy (the C5 Critical from the 0.8 audit).
+
+Found by auditing the same class the Apicurio conversion belonged to: a configured field that
+reaches the code and does nothing.
+
+Both encoders now verify at construction that the subjects exist and carry exactly the schema
+rustcdc will write, which makes `new` `async` on both — matching `ConfluentAvroEncoder`. With
+`auto_register = true` construction still performs no I/O. The one thing that cannot be
+prevented is the later `register_schema` call itself; because the content is verified identical
+first, a Confluent-compatible registry answers it with the existing id rather than a new
+version. That limit is stated on the API rather than glossed.
+
+`ConfluentJsonSchemaEncoder` was also dropping `config.references`, which the Avro and Protobuf
+encoders both passed.
+
+### AWS Glue is a backend now, not a promise
+
+The `glue` feature described itself as *"the AWS Glue Schema Registry as a backend"* and
+shipped **type re-exports only** — no `Event` encoder, no decoder. An embedder got none of what
+every other registry backend does for them and had to write the Avro conversion, the
+registration and the 18-byte framing by hand.
+
+New `GlueAvroEncoder`, `GlueAvroDecoder` and `GlueAvroConfig`. The payload is the same
+`AVRO_SCHEMA` envelope the Confluent encoder writes, so a consumer that already decodes
+rustcdc's Avro events needs only the framing changed. The decoder resolves the **writer**
+schema by the header's version UUID and uses it for resolution, so a message written under an
+older compatible schema decodes correctly rather than being read positionally against the
+current one. `GlueAvroConfig` deliberately has no `auto_register = false`: `schemreg`'s Glue
+client has no lookup-by-name API, so the setting could only have been accepted and ignored —
+which is the defect above.
+
+Glue remains the one backend with no live-service evidence, because it has no self-hostable
+implementation. Everything rustcdc owns — Avro conversion, framing, compression byte, schema
+identity, error classification, round trip, key union branch — is covered against an in-memory
+fake. That is stated in the feature docs and the API guide rather than implied away.
+
+### Crate-root re-export parity, enforced
+
+Five public items were reachable only as `rustcdc::codec::X` while their direct counterparts
+were `rustcdc::X`: `ConfluentProtobufEncoder`/`Decoder`, `AvroDecoder`, `avro_value_to_event`,
+and `OutboxTransform`/`OutboxResult`. Nothing was broken — it just cost a docs search per item
+and made the surface look arbitrary.
+
+0.8 added a module→parent gate for exactly this class; it now extends one level further, to
+crate-root parity — and running it across **every** module found more of the same: the three
+concrete `DdlExtractor` implementations sat below the trait, and `IncrementalSnapshotBackend`
+— the custom-source extension point the audit calls a differentiator — sat below the
+`IncrementalSnapshotConfig` and connector handles that were already at the root.
+
+The rule is now **all-or-nothing per module** and configures itself: if `lib.rs` re-exports
+anything from a module, it must re-export everything that module re-exports. Modules kept
+namespaced by design (`checkpoint`, `testkit`, `fault_injection`, `deterministic_replay`,
+`schema_history`) have no crate-root surface to be inconsistent with and are skipped; adding a
+single item from one of them opts it in, which is the intended tripwire.
+
+### Both registry `build()` methods are drift-proofed too
+
+`SchemaRegistryConfig::build` and `ApicurioRegistryConfig::build` now destructure `self`
+exhaustively, with the encoder-side fields bound to `_` and a reason. Neither was dropping a
+field, but both had the same latent shape as the conversion that was — a new transport option
+would have compiled and silently done nothing.
+
+### `sqlserver` brings a second, older TLS stack — and now says so
+
+Everything else in the crate is on `rustls 0.23`. `tiberius 0.12.3` hard-pins
+`tokio-rustls 0.24`, so enabling `sqlserver` links `rustls 0.21` / `rustls-webpki 0.101.7`,
+carrying RUSTSEC-2026-0098, -0099 and -0104 plus the unmaintained `rustls-pemfile 1.0`. The
+per-advisory reachability analysis was already in `site/content/docs/security.md` and
+`deny.toml` — but nothing in the README feature table, the Cargo feature list or the connector's
+own rustdoc said the feature changed the TLS stack, so a reader choosing features never saw it.
+All three now do.
+
+### Breaking changes
+
+| Was | Now | Why |
+|---|---|---|
+| `preflight_schema_registry(registry, config)` | `preflight_schema_registry(registry, config, schema_type)` | It checked Avro schemas for every codec |
+| `MaskHashTransform::new(config) -> Self` | `-> Result<Self>` | `Truncate(0)` and `Redact("")` are now rejected |
+| `MaskHashTransform::unmatched_rules() -> Vec<&str>` | `unmatched_rule_paths()`; the trait method returns `Vec<UnmatchedRule>` | The trait method is uniform across stages |
+| `warm_schema_cache(&CachedSchemaRegistry<C>, ..)` | `warm_schema_cache(&impl SchemaRegistryClient + ?Sized, ..)` | Unusable behind `dyn` erasure |
+| `RuntimeAdminSnapshot` gained `unmatched_transform_rules` | — | `#[non_exhaustive]`; use `..` in patterns |
+| `ConfluentProtobufEncoder::new` now requires `C: Clone` | — | The key encoder needs its own registry handle |
+| `ConfluentJsonSchemaEncoder::new` / `without_validation` are sync | `async` | They now enforce `auto_register = false` |
+| `ConfluentProtobufEncoder::new` is sync | `async` | Same |
+
+### Docs
+
+`api.md` gained an "AWS Glue" section, an "Unmatched rules" section and a "Holding several codecs behind one type"
+section; the Protobuf, preflight, cache-warming and Apicurio sections were rewritten against
+the new surfaces. `config-reference.md` and `runbook.md` document
+`rustcdc_transform_rules_unmatched`, the latter with per-`kind` remediation. The
+`IdempotencyOptions` rustdoc now shows the `?`-per-step form with a `compile_fail` example of
+the chain that does not work.
+
 ## 0.8.0
 
 Breaking release. Themes: **restart correctness**, **evidence that can fail**, a **full

@@ -919,9 +919,8 @@ fully suppressed in the downstream stream.</li>
 A typo, an upstream column rename, or a path-mutating transform (<code>FieldMappingTransform</code>,
 <code>UnwrapTransform</code>) placed <em>earlier</em> in the pipeline will therefore cause masking to do
 nothing for that field. Because that failure is invisible in the data, every rule carries a
-hit counter: <code>MaskHashTransform::unmatched_rules()</code> names rules that have never fired and
-<code>warn_on_unmatched_rules()</code> logs them. <strong>A rule with zero hits after real traffic means the
-field is not being masked.</strong> Wire it into a health check.</p>
+hit counter — see <a href="https://hupe1980.github.io/rustcdc/docs/api/#unmatched-rules">Unmatched rules</a> below. <strong>A rule with zero hits after
+real traffic means the field is not being masked.</strong></p>
 <p>Rules on object- and array-valued fields <strong>do</strong> apply: a rule on a <code>jsonb</code> column masks the
 whole subtree, and <code>field.*</code> covers every element of a variable-length array. Order
 <code>MaskHashTransform</code> before any path-mutating transform.</p>
@@ -930,8 +929,14 @@ whole subtree, and <code>field.*</code> covers every element of a variable-lengt
 through unchanged.  Use <code>MaskHashConfig::hash_all()</code> if you need the old
 "hash everything" behaviour.</p>
 </blockquote>
+<p><code>MaskHashTransform::new</code> returns a <code>Result</code>: <code>MaskHashConfig::validate()</code> rejects rules that
+cannot do what they appear to. <code>Truncate(0)</code> and <code>Redact("")</code> both produce an empty string,
+which downstream cannot distinguish from a genuinely empty column — so the masking is
+invisible rather than merely useless, and both are almost always typos for <code>Redact</code> with a
+marker or <code>Null</code>. An empty rule path is rejected for the same reason: it can never match.</p>
 <pre><code data-lang="rust">use rustcdc::{MaskHashConfig, MaskHashTransform, MaskRule};
 
+# fn main() -&gt; rustcdc::Result&lt;()&gt; {
 // Hash only specified PII fields; leave everything else unchanged.
 let mut config = MaskHashConfig::default();
 config.mask_rules.insert(&quot;email&quot;.into(), MaskRule::UnsaltedSha256);
@@ -941,9 +946,52 @@ config.mask_rules.insert(&quot;ssn&quot;.into(),   MaskRule::Null);
 #[cfg(feature = &quot;encryption&quot;)]
 config.mask_rules.insert(&quot;credit_card&quot;.into(), MaskRule::Encrypt(&quot;my-secret&quot;.into()));
 
+let transform = MaskHashTransform::new(config)?;
+
 // Opt-in aggressive mode: SHA-256 every field not explicitly configured.
-let aggressive = MaskHashConfig::hash_all();
+let aggressive = MaskHashTransform::new(MaskHashConfig::hash_all())?;
+# let _ = (transform, aggressive);
+# Ok(()) }
 </code></pre>
+<h3 id="unmatched-rules"><a class="zola-anchor" href="#unmatched-rules" aria-label="Anchor link for: unmatched-rules">Unmatched rules</a></h3>
+<p>Masking, filtering and routing all match by <strong>pattern against a permissive default</strong>, so a
+typo or a renamed column disables a rule <em>silently</em>. Nothing errors — the pipeline keeps
+running and produces plausible output while doing the opposite of what was configured:</p>
+<table><thead><tr><th>Transform</th><th>A rule that never fires means</th></tr></thead><tbody>
+<tr><td><code>MaskHashTransform</code></td><td>a column is shipping in <strong>clear text</strong></td></tr>
+<tr><td><code>FilterProjectionTransform</code></td><td>rows meant to be excluded are being delivered</td></tr>
+<tr><td><code>RouteTransform</code></td><td>events are going to the <strong>default destination</strong>, not the configured one</td></tr>
+</tbody></table>
+<p>Failing closed is not the answer — it would refuse to start over a rule for an optional
+column, and operators would respond by deleting rules. So every rule carries a hit counter,
+and <code>Transform::unmatched_rules()</code> returns the ones that never fired:</p>
+<pre><code data-lang="rust">use rustcdc::{Transform, UnmatchedRule};
+
+fn report(stage: &amp;dyn Transform) {
+    for rule in stage.unmatched_rules() {
+        // rule.transform  — the stage name
+        // rule.kind       — &quot;mask&quot; | &quot;filter&quot; | &quot;route&quot;
+        // rule.rule       — the pattern that never fired
+        // rule.consequence — what is silently happening because of it
+        eprintln!(&quot;{}: {} never matched. {}&quot;, rule.transform, rule.rule, rule.consequence);
+    }
+    // Or log them all at once:
+    stage.warn_on_unmatched_rules();
+}
+</code></pre>
+<p>The runtime aggregates them across the whole pipeline. <strong>Alert on the metric</strong> rather than
+reading a log line at shutdown:</p>
+<pre><code data-lang="text">rustcdc_transform_rules_unmatched{transform=&quot;mask_hash&quot;,kind=&quot;mask&quot;,rule=&quot;user.ssn&quot;} 1
+</code></pre>
+<p>The series is emitted <strong>only when a rule is unmatched</strong>, so its absence is the healthy state
+and <code>rustcdc_transform_rules_unmatched &gt; 0</code> is a complete alert rule. The same data is on
+<code>RuntimeAdminSnapshot::unmatched_transform_rules</code>.</p>
+<p>Zero hits is only meaningful <strong>after real traffic</strong>: every rule is unmatched before the first
+event, so evaluate against a representative sample rather than at startup.</p>
+<p>Filter rules are reported only once they have actually been <em>evaluated</em>. <code>FilterMode::All</code>
+short-circuits on the first <code>false</code>, so a rule an earlier one prevented from running has not
+failed to match — reporting it would be a false positive that trains operators to ignore the
+signal.</p>
 <h2 id="transforms"><a class="zola-anchor" href="#transforms" aria-label="Anchor link for: transforms">Transforms</a></h2>
 <p>Two traits, because most stages do not need to await:</p>
 <table><thead><tr><th>Trait</th><th>Use for</th><th>Cost</th></tr></thead><tbody>
@@ -1038,8 +1086,8 @@ after:  postgres tls connection failed: error connecting to server: Connection r
 <p>Confluent and Apicurio are <strong>interchangeable</strong>: both implement <code>SchemaRegistryClient</code>, so the
 same <code>ConfluentAvroEncoder</code> and <code>ConfluentJsonSchemaEncoder</code> work against either, and the
 framing on the wire is identical. Glue is not a drop-in swap — different header, different
-identity type, optional ZLIB compression — so a consumer must know which framing to expect,
-or call <code>detect_wire_format</code> per message.</p>
+identity type, optional ZLIB compression — so it has its own encoder pair, and a consumer must
+know which framing to expect or call <code>detect_wire_format</code> per message.</p>
 <h3 id="confluent"><a class="zola-anchor" href="#confluent" aria-label="Anchor link for: confluent">Confluent</a></h3>
 <pre><code data-lang="rust">use rustcdc::codec::{ConfluentAvroEncoder, SchemaRegistryConfig};
 use std::sync::Arc;
@@ -1055,11 +1103,59 @@ compatibility shim flattens away.</p>
 <pre><code data-lang="rust">use rustcdc::codec::{ApicurioRegistryConfig, ConfluentAvroEncoder};
 use std::sync::Arc;
 
-let apicurio = ApicurioRegistryConfig::new(&quot;http://localhost:8080/apis/registry/v3&quot;, &quot;cdc-events&quot;);
+let apicurio = ApicurioRegistryConfig::new(&quot;http://localhost:8080&quot;, &quot;cdc-events&quot;);
 let registry = Arc::new(apicurio.build()?);
 let encoder =
     ConfluentAvroEncoder::new(registry.as_ref(), &amp;apicurio.as_schema_registry_config()).await?;
 </code></pre>
+<p><code>as_schema_registry_config()</code> carries <strong>every</strong> field over — <code>auth</code>, both timeouts,
+<code>max_cache_entries</code>, <code>pool_max_idle_per_host</code>, <code>references</code> and <code>retry_policy</code> included. The
+conversion destructures <code>ApicurioRegistryConfig</code> exhaustively, so adding a field without
+deciding how it maps is a compile error rather than a setting that quietly stops taking
+effect. (Through 0.8 five of those were silently dropped; a caller who set a retry policy got
+the default with no indication it had been discarded.)</p>
+<p>Two things do not carry over. <code>normalize_schemas</code> is a Confluent query parameter with no
+Apicurio v3 equivalent. And <code>url</code> is copied verbatim, which for this type is the Apicurio
+<strong>server root</strong> — so do not call <code>.build()</code> on the derived config; use
+<code>ApicurioRegistryConfig::build</code> for the client and the derived config only for the policy
+half of an encoder constructor.</p>
+<h3 id="aws-glue"><a class="zola-anchor" href="#aws-glue" aria-label="Anchor link for: aws-glue">AWS Glue</a></h3>
+<p>Glue identifies schemas by <strong>name</strong> rather than by a topic/subject pair, so there is no
+<code>SubjectNameStrategy</code> on this path — <code>GlueAvroConfig</code> takes the schema name directly and
+defaults the key schema to <code>{schema_name}-key</code>.</p>
+<pre><code data-lang="rust">use rustcdc::codec::{GlueAvroConfig, GlueAvroDecoder, GlueAvroEncoder};
+use rustcdc::codec::glue::{AwsGlueSchemaRegistry, CachedGlueSchemaRegistry, GlueCompression};
+use std::sync::Arc;
+
+let registry = Arc::new(CachedGlueSchemaRegistry::new(
+    AwsGlueSchemaRegistry::builder().registry_name(&quot;cdc&quot;).build().await?,
+));
+
+let config = GlueAvroConfig::new(&quot;cdc-events&quot;).with_compression(GlueCompression::Zlib);
+let encoder = GlueAvroEncoder::new(Arc::clone(&amp;registry), config).await?;
+
+let value = encoder.encode_event(&amp;event)?;
+let key = encoder.encode_event_key(&amp;event)?;   // None for a keyless event
+
+let decoded = GlueAvroDecoder::new(registry)?.decode(&amp;value.bytes).await?;
+</code></pre>
+<p>The payload is the same <code>AVRO_SCHEMA</code> envelope the Confluent Avro encoder writes, so a
+consumer that already decodes rustcdc's Avro events needs only the framing changed. The
+decoder resolves the <strong>writer</strong> schema by the header's version UUID and uses it for
+resolution, so a message written under an older compatible schema decodes correctly rather
+than being read positionally against the current one.</p>
+<p><code>GlueAvroConfig</code> has no <code>auto_register = false</code>: <code>schemreg</code>'s Glue client offers no
+lookup-by-name API, so the setting could only have been accepted and ignored — which is
+exactly the defect the Confluent JSON Schema and Protobuf encoders shipped with through 0.8.
+Glue's <code>register_schema</code> is idempotent for identical content.</p>
+<blockquote>
+<p><strong>Glue is the one backend with no live-service evidence.</strong> It has no self-hostable
+implementation, so there is no container to point an integration suite at. Everything
+rustcdc owns — the Avro conversion, the 18-byte framing, the compression byte, schema
+identity, error classification, the round trip — is covered against an in-memory fake; the
+AWS transport itself is <code>schemreg</code>'s. This is stated as an evidence gap rather than
+implied away.</p>
+</blockquote>
 <h3 id="retry-policy"><a class="zola-anchor" href="#retry-policy" aria-label="Anchor link for: retry-policy">Retry policy</a></h3>
 <p>Registry calls carry a retry policy by default: jittered exponential back-off, honouring
 <code>Retry-After</code>. This matters more than it sounds. Schema resolution sits on the <strong>encode
@@ -1094,6 +1190,35 @@ wrong values, arbitrarily far downstream.</p>
 with, comparing Avro <strong>parsing canonical form</strong> — so a registry copy differing only in
 whitespace, docs, or JSON field ordering is accepted, while a structural difference is a
 hard error naming the remedy.</p>
+<h3 id="holding-several-codecs-behind-one-type"><a class="zola-anchor" href="#holding-several-codecs-behind-one-type" aria-label="Anchor link for: holding-several-codecs-behind-one-type">Holding several codecs behind one type</a></h3>
+<p><code>Codec</code> and <code>EventEncoder</code> are synchronous. <code>ConfluentAvroEncoder</code> resolves its schema once
+at construction, so it implements <code>EventEncoder</code> and reaches <code>BoxedCodec</code> through
+<code>EncoderCodec</code>. <code>ConfluentJsonSchemaEncoder</code> and <code>ConfluentProtobufEncoder</code> resolve subjects
+<strong>lazily</strong> — correctly so, since <code>RecordName</code> and <code>TopicRecordName</code> exist precisely to give
+each type its own subject — so their <code>encode</code> is <code>async</code> and fits neither trait.</p>
+<p><code>AsyncCodec</code> is the async counterpart, with a blanket <code>impl&lt;T: Codec&gt; AsyncCodec for T</code>, so a
+sink accepts one type for every format instead of hand-rolling the same three-variant
+dispatch enum:</p>
+<pre><code data-lang="rust">use rustcdc::codec::{AsyncCodec, BoxedAsyncCodec, JsonCodec};
+
+let codecs: Vec&lt;BoxedAsyncCodec&gt; = vec![
+    ConfluentProtobufEncoder::new(registry.clone(), &amp;config)?.boxed_async(),
+    ConfluentJsonSchemaEncoder::new(registry.clone(), &amp;config)?.boxed_async(),
+    JsonCodec::default().boxed_async(),   // synchronous, via the blanket impl
+];
+
+for codec in &amp;codecs {
+    let out = codec.encode_async(&amp;event).await?;
+}
+</code></pre>
+<p>The encode method is <code>encode_async</code>, <strong>not</strong> <code>encode</code>. A trait blanket-implemented over
+another must not reuse its method names: with both <code>Codec</code> and <code>AsyncCodec</code> in scope,
+<code>codec.encode(..)</code> would be an <code>E0034</code> ambiguity on every synchronous codec — an error the
+library would be handing its users on the hottest call in the API. <code>content_type</code> does share
+a name, because the blanket impl forwards it and both traits return the same value.</p>
+<p>Both registry-backed codecs return <code>key: None</code> for a keyless event rather than a framed
+empty key, so a Kafka producer round-robins them instead of collapsing every keyless event
+onto one partition. Call <code>encode_event_key</code> directly when you want the framed-always form.</p>
 <h3 id="decoding"><a class="zola-anchor" href="#decoding" aria-label="Anchor link for: decoding">Decoding</a></h3>
 <p><code>AvroDecoder</code> reverses <code>AvroEncoder</code> for bare Avro bytes; <code>ConfluentAvroDecoder</code> strips the
 5-byte header, resolves the writer schema from the registry, and delegates to the same
@@ -1116,19 +1241,44 @@ and a 404 from the server.</p>
 <p>Schema resolution is on the encode path, so a registry problem does not surface at startup —
 it surfaces as a failed event once traffic is flowing. <code>preflight_schema_registry</code> turns that
 into a startup check:</p>
-<pre><code data-lang="rust">use rustcdc::codec::{preflight_schema_registry, SchemaRegistryConfig};
+<pre><code data-lang="rust">use rustcdc::codec::{preflight_schema_registry, SchemaRegistryConfig, SchemaType};
 
 let config = SchemaRegistryConfig::new(&quot;http://localhost:8081&quot;, &quot;cdc-events&quot;);
 let registry = config.build()?;
 
 // Fails here, where an operator can still act on it.
-preflight_schema_registry(&amp;registry, &amp;config).await?;
+preflight_schema_registry(&amp;registry, &amp;config, SchemaType::Avro).await?;
 </code></pre>
 <p>It checks reachability, then — depending on <code>auto_register</code> — either that the subjects carry
 rustcdc's schema, or that rustcdc's schema is <em>compatible</em> with what is already registered,
 so an incompatible auto-registration fails with a clear message rather than an opaque HTTP
 409 on the first event. A registry that does not implement an optional endpoint reports
 <code>NotSupported</code>, which is skipped rather than treated as a failure.</p>
+<p><code>auto_register = false</code> is also enforced by the encoders themselves, not only by an explicit
+preflight call. <code>ConfluentAvroEncoder</code> always resolved both subjects itself, so it honoured
+the setting; the JSON Schema and Protobuf encoders delegate subject resolution to <code>schemreg</code>,
+whose resolution path <em>is</em> <code>register_schema</code> with no lookup-only mode — so through 0.8 the
+setting was <strong>silently ignored</strong> by both, and an operator who set it got schemas registered
+anyway plus none of the schema-identity checking it exists to buy. All three now verify at
+construction that the subjects exist and carry exactly the schema rustcdc will write. The one
+thing that cannot be prevented is the later <code>register_schema</code> call itself; because the content
+is verified identical first, a Confluent-compatible registry answers it with the existing id
+rather than a new version.</p>
+<p><strong>Pass the <code>SchemaType</code> your codec actually writes.</strong> Each format has different schemas under
+different subject names — Avro and JSON Schema derive subjects from the record name
+(<code>io.rustcdc.Event</code>), Protobuf from the message's fully-qualified name (<code>rustcdc.Event</code>).
+Through 0.8 preflight checked the Avro schemas unconditionally, so a JSON Schema or Protobuf
+deployment with <code>auto_register = false</code> failed against a perfectly correct registry, and one
+with <code>auto_register = true</code> ran an Avro compatibility check against a JSON subject.</p>
+<p>Preflight is generic over the client, so an Apicurio deployment gets the same startup check.
+<code>ApicurioRegistryConfig::preflight</code> is the shortcut:</p>
+<pre><code data-lang="rust">use rustcdc::codec::{ApicurioRegistryConfig, SchemaType};
+
+let apicurio = ApicurioRegistryConfig::new(&quot;http://localhost:8080&quot;, &quot;cdc-events&quot;);
+let registry = apicurio.build()?;
+
+apicurio.preflight(&amp;registry, SchemaType::Avro).await?;
+</code></pre>
 <h3 id="error-classification"><a class="zola-anchor" href="#error-classification" aria-label="Anchor link for: error-classification">Error classification</a></h3>
 <p>Registry errors carry the right retryability instead of all collapsing into one kind:</p>
 <table><thead><tr><th>Registry condition</th><th><code>ErrorKind</code></th><th>Why</th></tr></thead><tbody>
@@ -1152,13 +1302,23 @@ the wrong index misreads the header <strong>without erroring</strong>.</p>
 <p>The descriptor is compiled at build time with [<code>protox</code>], a pure-Rust protobuf compiler, so
 building rustcdc does not require <code>protoc</code>.</p>
 <pre><code data-lang="rust">use rustcdc::codec::{ConfluentProtobufEncoder, SchemaRegistryConfig};
+use std::sync::Arc;
 
 let config = SchemaRegistryConfig::new(&quot;http://localhost:8081&quot;, &quot;cdc-events&quot;);
-let encoder = ConfluentProtobufEncoder::new(config.build()?, &amp;config)?;
+let encoder = ConfluentProtobufEncoder::new(Arc::new(config.build()?), &amp;config)?;
 let framed = encoder.encode(&amp;event).await?;
+let key = encoder.encode_event_key(&amp;event).await?;
 </code></pre>
 <p>As with <code>ProtobufEncoder</code>, <code>before</code> and <code>after</code> carry UTF-8 JSON as protobuf <code>bytes</code> — the
 envelope is typed, the row payload stays schemaless.</p>
+<p><code>encode_event_key</code> frames the primary key against <code>KEY_PROTO_SCHEMA</code> (<code>proto/event_key.proto</code>)
+under the key subject, completing the three-format key story: <code>ConfluentAvroEncoder</code> has
+<code>encode_key</code>, <code>ConfluentJsonSchemaEncoder</code> has <code>encode_event_key</code>, and through 0.8 the
+Protobuf encoder had no key path at all — so a fan-out mixing codecs silently paired a
+registry-framed value with <code>ProtobufEncoder</code>'s unframed compact-JSON key, with nothing in the
+API signalling the mismatch. Keyless events (TRUNCATE, SCHEMA_CHANGE, tables with no declared
+primary key) produce a message with the <code>key</code> field <strong>absent</strong>, not empty, matching the
+<code>{"key": null}</code> the JSON Schema encoder emits and Debezium's behaviour.</p>
 <h3 id="cache-warming"><a class="zola-anchor" href="#cache-warming" aria-label="Anchor link for: cache-warming">Cache warming</a></h3>
 <p>Schema resolution is on the decode path, so a cold cache turns the first message for each
 distinct schema id into a synchronous registry call. For a consumer restarting against a
@@ -1170,6 +1330,20 @@ warm_schema_cache(&amp;registry, [SchemaId::new(1), SchemaId::new(2)]).await?;
 <p>Schema ids are immutable — a registry never reassigns one — so a warmed entry is valid for
 the process lifetime. That is why the cache warms ids but never <code>get_latest_schema</code>, which
 can change at any moment.</p>
+<p>It accepts <strong>any</strong> <code>SchemaRegistryClient</code>, including an erased
+<code>Arc&lt;dyn DynSchemaRegistryClient&gt;</code>. Through 0.8 it required the concrete
+<code>CachedSchemaRegistry&lt;C&gt;</code>, which made erasure and warming mutually exclusive — and erasure is
+exactly what a deployment with several registry backends needs, since the encoders are
+generic over the client and every variant would otherwise exist twice:</p>
+<pre><code data-lang="rust">use rustcdc::codec::{warm_schema_cache, DynSchemaRegistryClient};
+use std::sync::Arc;
+
+let erased: Arc&lt;dyn DynSchemaRegistryClient&gt; = Arc::new(config.build()?);
+warm_schema_cache(&amp;*erased, ids).await?;
+</code></pre>
+<p>Warming fetches through the trait, which is the same cache-populating path
+<code>CachedSchemaRegistry</code> uses internally. Against a client with <strong>no</strong> cache it issues the
+round-trips and retains nothing — a wasted warm rather than a wrong one.</p>
 <h3 id="debezium-key-schema-compatibility"><a class="zola-anchor" href="#debezium-key-schema-compatibility" aria-label="Anchor link for: debezium-key-schema-compatibility">Debezium key-schema compatibility</a></h3>
 <p>Debezium's Avro converter registers a separate key schema per topic (<code>{topic}-key</code>) as a
 record with a single nullable <code>key</code> field. <code>ConfluentAvroEncoder</code> mirrors this exactly, so a

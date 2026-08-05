@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package rustcdc;
+
+// Primary-key envelope for a captured CDC event — rustcdc envelope_version=1
+//
+// This is the Protobuf counterpart of `KEY_AVRO_SCHEMA` and `KEY_JSON_SCHEMA`, and it
+// carries the same payload as both: the event's primary key as a JSON object, encoded
+// as a string, or absent for keyless events.
+//
+// It lives in its own file rather than alongside `Event` because Confluent Protobuf
+// framing registers a whole `.proto` file as the subject's schema and selects the message
+// with a message-index path. A separate file gives the key subject a schema that contains
+// exactly the message it uses, matching how the Avro and JSON Schema key subjects work.
+//
+// Why a JSON string rather than typed key columns: the primary key of an arbitrary table
+// has an arbitrary shape, and protobuf has no way to express "whatever columns this table
+// keys on" in a fixed message. Encoding it as JSON keeps one schema valid for every table
+// — the same trade-off `Event.before` / `Event.after` already make for the row images.
+
+// ─── EventKey ─────────────────────────────────────────────────────────────────
+
+// A single event's primary key.
+message EventKey {
+  // JSON object mapping primary-key column names to values, e.g. `{"id":42}`.
+  //
+  // Absent for keyless events: TRUNCATE, SCHEMA_CHANGE, and tables with no declared
+  // primary key. Absent rather than empty-string, so a consumer can tell "no key" from
+  // "a key that serialised to nothing".
+  optional string key = 1;
+}

@@ -1,4 +1,23 @@
 //! SQL Server source configuration and connection lifecycle.
+//!
+//! # TLS: this connector uses a different stack than the rest of the crate
+//!
+//! Every other connector and sink in rustcdc negotiates TLS with `rustls 0.23`.
+//! `tiberius 0.12.3` hard-pins `tokio-rustls 0.24`, so enabling the `sqlserver` feature
+//! links a **second, older** copy — `rustls 0.21` / `rustls-webpki 0.101.7` — and that is
+//! the stack this connector actually speaks TLS with. It carries RUSTSEC-2026-0098,
+//! -0099 and -0104, plus the unmaintained `rustls-pemfile 1.0` via
+//! `rustls-native-certs 0.6`.
+//!
+//! It is not deduplicable and not fixable from rustcdc: the advisories are resolved only
+//! in `rustls-webpki >= 0.103.12`, which needs `rustls 0.23`, which is not
+//! semver-reachable from tiberius' pin. Two of the three are unreachable on rustcdc's code
+//! paths (no CRL is ever parsed; no URI name is ever asserted) and the third additionally
+//! requires a trusted CA to have misissued a certificate.
+//!
+//! The per-advisory reachability analysis, the mitigations, and the `cargo deny`
+//! suppressions live in `site/content/docs/security.md` and `deny.toml`. Deployments that
+//! cannot accept the exposure should leave the feature disabled — it is not a default.
 
 use std::{sync::Arc, time::Duration};
 

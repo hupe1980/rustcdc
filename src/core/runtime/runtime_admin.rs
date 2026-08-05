@@ -57,6 +57,7 @@ impl CdcRuntime {
             total_events_committed: self.total_events_committed,
             total_events_deduplicated: self.total_events_deduplicated,
             total_events_skipped: self.total_events_skipped,
+            unmatched_transform_rules: self.transform_pipeline.unmatched_rules(),
             idempotency_evictions: self
                 .idempotency_guard
                 .as_ref()
@@ -264,6 +265,31 @@ impl CdcRuntime {
             )?;
         }
 
+        // A transform rule that has never matched is a *silent* misconfiguration: masking
+        // fails open into clear text, routing fails open into the default destination.
+        // Neither errors, so an accessor read at shutdown is the only other way to see it —
+        // which means an operator has to go looking. As a gauge it becomes an alert rule.
+        //
+        // Emitted only when non-empty: a series per configured rule on every scrape would
+        // add cardinality for the overwhelmingly common all-rules-firing case. The absent
+        // series is the healthy state, so alert on presence.
+        if !admin.unmatched_transform_rules.is_empty() {
+            writeln!(
+                w,
+                "# HELP rustcdc_transform_rules_unmatched Configured transform rules that have never matched an event. A masking rule that never fires means a column is shipping in clear text; a routing rule that never fires means events are going to the default destination. Only meaningful after real traffic — every rule is unmatched before the first event.\n\
+                 # TYPE rustcdc_transform_rules_unmatched gauge"
+            )?;
+            for rule in &admin.unmatched_transform_rules {
+                writeln!(
+                    w,
+                    "rustcdc_transform_rules_unmatched{{source_type=\"{source_type}\",transform=\"{}\",kind=\"{}\",rule=\"{}\"}} 1",
+                    escape_prometheus_label(&rule.transform),
+                    escape_prometheus_label(&rule.kind),
+                    escape_prometheus_label(&rule.rule),
+                )?;
+            }
+        }
+
         writeln!(
             w,
             "# HELP rustcdc_runtime_health Derived health verdict (1 for the active verdict, 0 otherwise). Alert on verdict=\"stalled\"; idle is normal.\n\
@@ -363,5 +389,51 @@ impl CdcRuntime {
             .expect("writing to Vec<u8> is infallible");
         // SAFETY: all format strings above produce valid UTF-8.
         String::from_utf8(buf).expect("prometheus metrics output is always valid UTF-8")
+    }
+}
+
+/// Escape a string for use as a Prometheus label value.
+///
+/// Every other label this module emits is a value the crate controls. Rule identifiers are
+/// not: they are JSON paths, regexes and filter predicates an operator wrote, so a `"` or a
+/// backslash in one would otherwise produce an exposition body a scraper rejects — taking
+/// *every* metric on the endpoint down, not just this one.
+///
+/// Per the exposition format: backslash, double quote and newline are escaped. A carriage
+/// return is escaped too — the format does not require it, but a raw `\r` mid-line makes
+/// some scrapers truncate the sample, which is the same failure with a subtler symptom.
+fn escape_prometheus_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::escape_prometheus_label;
+
+    #[test]
+    fn every_character_that_can_break_a_scrape_is_escaped() {
+        assert_eq!(escape_prometheus_label(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_prometheus_label(r"a\b"), r"a\\b");
+        assert_eq!(escape_prometheus_label("a\nb"), r"a\nb");
+        assert_eq!(escape_prometheus_label("a\rb"), r"a\rb");
+        // Non-ASCII is legal in a label value and must pass through unchanged: a column
+        // name is whatever the database allows, and mangling it would make the series
+        // unmatchable.
+        assert_eq!(escape_prometheus_label("café.☕"), "café.☕");
+    }
+
+    #[test]
+    fn escaping_a_clean_value_changes_nothing() {
+        assert_eq!(escape_prometheus_label("user.ssn"), "user.ssn");
     }
 }

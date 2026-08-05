@@ -34,8 +34,9 @@
 
 use rustcdc::codec::{
     detect_wire_format, preflight_schema_registry, warm_schema_cache, ApicurioRegistryConfig,
-    ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaEncoder,
-    ConfluentProtobufDecoder, ConfluentProtobufEncoder, EventEncoder, SchemaRegistryConfig,
+    AsyncCodec, BoxedAsyncCodec, ConfluentAvroDecoder, ConfluentAvroEncoder,
+    ConfluentJsonSchemaEncoder, ConfluentProtobufDecoder, ConfluentProtobufEncoder,
+    DynSchemaRegistryClient, EventEncoder, SchemaRegistryConfig, SchemaType,
 };
 use rustcdc::{Event, Operation, SourceMetadata};
 use std::sync::Arc;
@@ -85,7 +86,10 @@ async fn start_registry() -> rustcdc::Result<(ContainerAsync<GenericImage>, Stri
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         if let Ok(registry) = probe.build() {
-            if preflight_schema_registry(&registry, &probe).await.is_ok() {
+            if preflight_schema_registry(&registry, &probe, SchemaType::Avro)
+                .await
+                .is_ok()
+            {
                 return Ok((container, base));
             }
         }
@@ -129,7 +133,7 @@ async fn confluent_avro_round_trips_through_a_live_registry() -> rustcdc::Result
 
     // Preflight is meant to fail *here*, where an operator can act, rather than on the
     // first event. Against a healthy registry it must succeed.
-    preflight_schema_registry(registry.as_ref(), &config).await?;
+    preflight_schema_registry(registry.as_ref(), &config, SchemaType::Avro).await?;
 
     let encoder = ConfluentAvroEncoder::new(registry.as_ref(), &config).await?;
     let schema_id = encoder.schema_id();
@@ -221,7 +225,7 @@ async fn confluent_json_schema_round_trips_through_a_live_registry() -> rustcdc:
     let config = SchemaRegistryConfig::new(format!("{base}/apis/ccompat/v7"), "cdc.json");
     let registry = Arc::new(config.build()?);
 
-    let encoder = ConfluentJsonSchemaEncoder::new(Arc::clone(&registry), &config)?;
+    let encoder = ConfluentJsonSchemaEncoder::new(Arc::clone(&registry), &config).await?;
     let event = sample_event(3);
     let encoded = encoder.encode_event(&event).await?;
 
@@ -282,7 +286,7 @@ async fn preflight_rejects_an_unreachable_registry() -> rustcdc::Result<()> {
         .with_request_timeout_ms(500);
     let registry = config.build()?;
 
-    let error = preflight_schema_registry(&registry, &config)
+    let error = preflight_schema_registry(&registry, &config, SchemaType::Avro)
         .await
         .expect_err("an unreachable registry must fail preflight");
     assert!(
@@ -326,6 +330,183 @@ async fn a_warmed_cache_serves_decodes_without_further_registry_calls() -> rustc
     Ok(())
 }
 
+/// Warming works through `Arc<dyn DynSchemaRegistryClient>`, not just the concrete cache.
+///
+/// Through 0.8 `warm_schema_cache` required `&CachedSchemaRegistry<C>`, so erasure and
+/// warming could not be used together — and erasure is exactly what a deployment with more
+/// than one registry backend needs, since the encoders are generic over the client.
+#[tokio::test]
+async fn warming_works_behind_dyn_erasure() -> rustcdc::Result<()> {
+    if skip() {
+        return Ok(());
+    }
+    let (container, base) = start_registry().await?;
+    let config = SchemaRegistryConfig::new(format!("{base}/apis/ccompat/v7"), "cdc.warm.dyn");
+
+    let cached = Arc::new(config.build()?);
+    let encoder = ConfluentAvroEncoder::new(cached.as_ref(), &config).await?;
+    let encoded = encoder.encode(&sample_event(21))?;
+
+    // The shape an embedder actually has: one erased handle for several backends.
+    let erased: Arc<dyn DynSchemaRegistryClient> = cached.clone();
+    warm_schema_cache(&*erased, [encoder.schema_id()]).await?;
+
+    container
+        .stop()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let decoded = ConfluentAvroDecoder::new(Arc::clone(&cached))?
+        .decode(&encoded.bytes)
+        .await?;
+    assert_eq!(
+        decoded.after,
+        sample_event(21).after,
+        "warming through the erased handle must populate the same cache"
+    );
+    Ok(())
+}
+
+/// Apicurio deployments get the same startup check Confluent ones do.
+#[tokio::test]
+async fn apicurio_preflights_against_its_native_api() -> rustcdc::Result<()> {
+    if skip() {
+        return Ok(());
+    }
+    let (_container, base) = start_registry().await?;
+    let apicurio = ApicurioRegistryConfig::new(&base, "cdc.apicurio.preflight");
+    let registry = apicurio.build()?;
+
+    apicurio.preflight(&registry, SchemaType::Avro).await?;
+
+    // And an unreachable one fails at startup rather than on the first event.
+    let unreachable = ApicurioRegistryConfig::new("http://127.0.0.1:1", "cdc.dead")
+        .with_connect_timeout_ms(500)
+        .with_request_timeout_ms(500);
+    let error = apicurio
+        .preflight(&unreachable.build()?, SchemaType::Avro)
+        .await;
+    assert!(
+        error.is_err(),
+        "an unreachable Apicurio registry must fail preflight"
+    );
+    Ok(())
+}
+
+/// Preflight checks the schemas the configured codec actually writes.
+///
+/// Through 0.8 it checked the Avro schemas whatever codec was in use, so a JSON Schema or
+/// Protobuf pipeline with `auto_register = false` failed against a correct registry.
+#[tokio::test]
+async fn preflight_checks_the_schemas_of_the_configured_format() -> rustcdc::Result<()> {
+    if skip() {
+        return Ok(());
+    }
+    let (_container, base) = start_registry().await?;
+    let ccompat = format!("{base}/apis/ccompat/v7");
+
+    // Register each format's schemas by encoding one event, then require preflight to pass
+    // with auto_register off — which is the mode that compares registered against expected.
+    let json_config = SchemaRegistryConfig::new(&ccompat, "cdc.pf.json");
+    let json_registry = Arc::new(json_config.build()?);
+    ConfluentJsonSchemaEncoder::new(Arc::clone(&json_registry), &json_config)
+        .await?
+        .encode_event(&sample_event(31))
+        .await?;
+    // The key subject is only registered once a key is encoded.
+    ConfluentJsonSchemaEncoder::new(Arc::clone(&json_registry), &json_config)
+        .await?
+        .encode_event_key(&sample_event(31))
+        .await?;
+    let strict_json = SchemaRegistryConfig::new(&ccompat, "cdc.pf.json").with_auto_register(false);
+    preflight_schema_registry(json_registry.as_ref(), &strict_json, SchemaType::Json).await?;
+
+    let proto_config = SchemaRegistryConfig::new(&ccompat, "cdc.pf.proto");
+    let proto_registry = Arc::new(proto_config.build()?);
+    let proto_encoder =
+        ConfluentProtobufEncoder::new(Arc::clone(&proto_registry), &proto_config).await?;
+    proto_encoder.encode(&sample_event(32)).await?;
+    proto_encoder.encode_event_key(&sample_event(32)).await?;
+    let strict_proto =
+        SchemaRegistryConfig::new(&ccompat, "cdc.pf.proto").with_auto_register(false);
+    preflight_schema_registry(proto_registry.as_ref(), &strict_proto, SchemaType::Protobuf).await?;
+
+    // The old behaviour, made explicit: asking for Avro against a JSON-only topic must
+    // fail, which is precisely what a JSON pipeline used to get unconditionally.
+    assert!(
+        preflight_schema_registry(json_registry.as_ref(), &strict_json, SchemaType::Avro)
+            .await
+            .is_err(),
+        "preflighting Avro against a JSON Schema topic must fail rather than pass by accident"
+    );
+    Ok(())
+}
+
+/// `auto_register = false` is enforced by the encoders, not just by preflight.
+///
+/// Through 0.8 both lazily-resolving encoders **ignored** the setting: `schemreg` resolves
+/// their subjects by registering, with no lookup-only mode, so an operator who asked for
+/// "require the schemas to already exist" got them registered anyway and none of the
+/// schema-identity checking the setting exists to buy.
+#[tokio::test]
+async fn auto_register_off_is_enforced_by_the_lazy_encoders() -> rustcdc::Result<()> {
+    if skip() {
+        return Ok(());
+    }
+    let (_container, base) = start_registry().await?;
+    let ccompat = format!("{base}/apis/ccompat/v7");
+
+    // Against a topic whose subjects do not exist, construction must fail rather than
+    // register them.
+    let strict_json =
+        SchemaRegistryConfig::new(&ccompat, "cdc.strict.json.unseen").with_auto_register(false);
+    let json_registry = Arc::new(strict_json.build()?);
+    let error = ConfluentJsonSchemaEncoder::new(Arc::clone(&json_registry), &strict_json)
+        .await
+        .expect_err("an unregistered subject must fail construction");
+    assert!(
+        error.to_string().contains("auto_register"),
+        "the error must name the setting: {error}"
+    );
+
+    let strict_proto =
+        SchemaRegistryConfig::new(&ccompat, "cdc.strict.proto.unseen").with_auto_register(false);
+    let proto_registry = Arc::new(strict_proto.build()?);
+    ConfluentProtobufEncoder::new(Arc::clone(&proto_registry), &strict_proto)
+        .await
+        .expect_err("an unregistered subject must fail construction");
+
+    // And nothing was registered as a side effect of the failed attempts — the whole
+    // point of the setting.
+    assert!(
+        preflight_schema_registry(json_registry.as_ref(), &strict_json, SchemaType::Json)
+            .await
+            .is_err(),
+        "a failed strict construction must not have created the subject"
+    );
+
+    // Once the subjects exist and carry rustcdc's schema, strict construction succeeds and
+    // the encoder works.
+    let lenient = SchemaRegistryConfig::new(&ccompat, "cdc.strict.json.seeded");
+    let lenient_registry = Arc::new(lenient.build()?);
+    let seeder = ConfluentJsonSchemaEncoder::new(Arc::clone(&lenient_registry), &lenient).await?;
+    seeder.encode_event(&sample_event(41)).await?;
+    seeder.encode_event_key(&sample_event(41)).await?;
+
+    let strict_seeded =
+        SchemaRegistryConfig::new(&ccompat, "cdc.strict.json.seeded").with_auto_register(false);
+    let encoder = ConfluentJsonSchemaEncoder::new(Arc::clone(&lenient_registry), &strict_seeded)
+        .await
+        .expect("subjects exist and carry rustcdc's schema");
+    assert!(!encoder
+        .encode_event(&sample_event(42))
+        .await?
+        .bytes
+        .is_empty());
+
+    Ok(())
+}
+
 /// Confluent Protobuf round trip, including the message-index path.
 ///
 /// The Protobuf wire format carries a **message-index path** locating the message inside
@@ -343,7 +524,7 @@ async fn confluent_protobuf_round_trips_through_a_live_registry() -> rustcdc::Re
     let config = SchemaRegistryConfig::new(format!("{base}/apis/ccompat/v7"), "cdc.proto");
     let registry = Arc::new(config.build()?);
 
-    let encoder = ConfluentProtobufEncoder::new(Arc::clone(&registry), &config)?;
+    let encoder = ConfluentProtobufEncoder::new(Arc::clone(&registry), &config).await?;
     assert_eq!(
         encoder.message_indexes(),
         [3],
@@ -378,6 +559,129 @@ async fn confluent_protobuf_round_trips_through_a_live_registry() -> rustcdc::Re
     Ok(())
 }
 
+/// The Protobuf key channel frames against `KEY_PROTO_SCHEMA`, under its own subject.
+///
+/// Through 0.8 `ConfluentProtobufEncoder` had no key path at all, so a fan-out mixing
+/// codecs paired a registry-framed Protobuf value with `ProtobufEncoder`'s unframed
+/// compact-JSON key and nothing in the API signalled the mismatch.
+#[tokio::test]
+async fn confluent_protobuf_keys_are_framed_against_their_own_subject() -> rustcdc::Result<()> {
+    if skip() {
+        return Ok(());
+    }
+    let (_container, base) = start_registry().await?;
+    let config = SchemaRegistryConfig::new(format!("{base}/apis/ccompat/v7"), "cdc.proto.key");
+    let registry = Arc::new(config.build()?);
+
+    let encoder = ConfluentProtobufEncoder::new(Arc::clone(&registry), &config).await?;
+    let event = sample_event(13);
+
+    let key = encoder.encode_event_key(&event).await?;
+    assert_eq!(key[0], 0x00, "the key must carry the Confluent header too");
+
+    let value = encoder.encode(&event).await?;
+    let value_id = u32::from_be_bytes([value[1], value[2], value[3], value[4]]);
+    let key_id = u32::from_be_bytes([key[1], key[2], key[3], key[4]]);
+    assert_ne!(
+        key_id, value_id,
+        "key and value are different schemas under different subjects, so the registry must \
+         have assigned them different ids"
+    );
+
+    // `EventKey` is the only message in proto/event_key.proto, so its index path is [0] —
+    // unlike `Event`, which is the fourth message in its file.
+    let decoded_key = decode_event_key(&key);
+    assert_eq!(
+        decoded_key.key.as_deref(),
+        Some(r#"{"id":13}"#),
+        "the key payload must be the primary key as a JSON object"
+    );
+
+    // A keyless event yields an absent field, not an empty string — a consumer has to be
+    // able to tell "no key" from "a key that serialised to nothing".
+    let keyless = Event::builder("users", Operation::Truncate)
+        .source(SourceMetadata::new("postgres", "0/100", 1_700_000_000))
+        .ts(1_700_000_000)
+        .build();
+    let keyless_framed = encoder.encode_event_key(&keyless).await?;
+    assert_eq!(decode_event_key(&keyless_framed).key, None);
+
+    Ok(())
+}
+
+/// Strip the Confluent header + message-index path and decode a `rustcdc.EventKey`.
+///
+/// The index path for a single-message file is one zigzag-encoded `0` byte, which is the
+/// Confluent shorthand for "the first message".
+fn decode_event_key(framed: &[u8]) -> rustcdc::codec::ProtoEventKey {
+    let payload = &framed[5..];
+    let (index_len, rest) = payload.split_first().expect("message-index path present");
+    assert_eq!(
+        *index_len, 0,
+        "EventKey is the only message in its file, so the index path is the single-byte \
+         shorthand for [0]"
+    );
+    prost::Message::decode(rest).expect("EventKey payload decodes")
+}
+
+/// Both lazily-resolving encoders satisfy one trait, so a sink can hold either.
+///
+/// Before `AsyncCodec`, `ConfluentAvroEncoder` reached `BoxedCodec` through `EncoderCodec`
+/// while these two fit no trait at all, and every embedder wrote the same three-variant
+/// dispatch enum by hand.
+#[tokio::test]
+async fn the_lazily_resolving_encoders_are_async_codecs() -> rustcdc::Result<()> {
+    if skip() {
+        return Ok(());
+    }
+    let (_container, base) = start_registry().await?;
+    let ccompat = format!("{base}/apis/ccompat/v7");
+
+    let proto_config = SchemaRegistryConfig::new(&ccompat, "cdc.async.proto");
+    let json_config = SchemaRegistryConfig::new(&ccompat, "cdc.async.json");
+
+    let codecs: Vec<BoxedAsyncCodec> = vec![
+        ConfluentProtobufEncoder::new(Arc::new(proto_config.build()?), &proto_config)
+            .await?
+            .boxed_async(),
+        ConfluentJsonSchemaEncoder::new(Arc::new(json_config.build()?), &json_config)
+            .await?
+            .boxed_async(),
+        // The blanket impl carries every synchronous codec across too.
+        rustcdc::codec::JsonCodec::default().boxed_async(),
+    ];
+
+    let event = sample_event(17);
+    for codec in &codecs {
+        let out = codec.encode_async(&event).await?;
+        assert!(
+            !out.value.is_empty(),
+            "{} produced no value",
+            AsyncCodec::content_type(codec)
+        );
+        assert!(
+            out.key.is_some(),
+            "{} dropped the key of a keyed event",
+            AsyncCodec::content_type(codec)
+        );
+    }
+
+    // A keyless event yields no key on every codec, so a producer round-robins it rather
+    // than collapsing every keyless event onto one partition.
+    let keyless = Event::builder("users", Operation::Truncate)
+        .source(SourceMetadata::new("postgres", "0/101", 1_700_000_000))
+        .ts(1_700_000_000)
+        .build();
+    for codec in &codecs {
+        assert!(
+            codec.encode_async(&keyless).await?.key.is_none(),
+            "{} framed a key for a keyless event",
+            AsyncCodec::content_type(codec)
+        );
+    }
+    Ok(())
+}
+
 /// A delete carries no after-image, and that must survive the protobuf round trip.
 ///
 /// Protobuf has no null: an absent `bytes` field and an empty one are the same on the wire.
@@ -392,7 +696,7 @@ async fn a_protobuf_delete_round_trips_without_an_after_image() -> rustcdc::Resu
     let config = SchemaRegistryConfig::new(format!("{base}/apis/ccompat/v7"), "cdc.proto.delete");
     let registry = Arc::new(config.build()?);
 
-    let encoder = ConfluentProtobufEncoder::new(Arc::clone(&registry), &config)?;
+    let encoder = ConfluentProtobufEncoder::new(Arc::clone(&registry), &config).await?;
     let event = Event::builder("users", Operation::Delete)
         .source(SourceMetadata::new("postgres", "0/99", 1_700_000_000))
         .schema("public")

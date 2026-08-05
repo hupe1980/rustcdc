@@ -16,22 +16,30 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=proto/event.proto");
+    println!("cargo:rerun-if-changed=proto/event_key.proto");
     println!("cargo:rerun-if-changed=build.rs");
 
     #[cfg(feature = "schemreg")]
-    compile_event_descriptor();
+    {
+        // Compiled separately, not as one descriptor set. The message-index path is
+        // relative to the *file* a message lives in, and the schema registered for a
+        // subject is that one file's source — so each descriptor pool must contain the
+        // file it describes and nothing else.
+        compile_descriptor("proto/event.proto", "event_descriptor.bin");
+        compile_descriptor("proto/event_key.proto", "event_key_descriptor.bin");
+    }
 }
 
 #[cfg(feature = "schemreg")]
-fn compile_event_descriptor() {
+fn compile_descriptor(proto: &str, output: &str) {
     let out_dir = std::path::PathBuf::from(
         std::env::var_os("OUT_DIR").expect("cargo always sets OUT_DIR for a build script"),
     );
 
-    let descriptor_set = protox::compile(["proto/event.proto"], ["."])
-        .unwrap_or_else(|error| panic!("failed to compile proto/event.proto: {error}"));
+    let descriptor_set = protox::compile([proto], ["."])
+        .unwrap_or_else(|error| panic!("failed to compile {proto}: {error}"));
 
     let encoded = prost::Message::encode_to_vec(&descriptor_set);
-    std::fs::write(out_dir.join("event_descriptor.bin"), encoded)
+    std::fs::write(out_dir.join(output), encoded)
         .expect("failed to write the compiled descriptor set");
 }

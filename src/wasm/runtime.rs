@@ -416,21 +416,18 @@ impl RealWasmModule {
                 Error::ConfigError(format!("failed to bind env.record_metric: {error}"))
             })?;
 
-        // Call rustcdc_abi_version() at load time so that incompatible modules are
-        // rejected here rather than at first invocation.
-        //
-        // The probe runs attacker-controlled guest code, so it needs a working
-        // interrupt. `set_epoch_deadline` alone is inert unless something is
-        // *incrementing* the epoch — the long-lived ticker is only spawned later, in
-        // `init()`, so a module whose `rustcdc_abi_version` is an infinite loop would
-        // spin here forever. This is a synchronous `call()` on a non-async store, so
-        // neither `tokio::time::timeout` nor task cancellation can reach it; the epoch
-        // is the only mechanism that can. Run a dedicated ticker for the probe's
-        // lifetime and stop it immediately afterwards.
-        let probe_ticker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let probe_ticker = {
+        // Everything below runs attacker-controlled guest code — instantiation runs the
+        // module's `start` function, and the ABI probe calls an exported function — so it
+        // all needs a working interrupt. These are synchronous calls on a non-async store,
+        // so neither `tokio::time::timeout` nor task cancellation can reach them; the epoch
+        // is the only mechanism that can. `set_epoch_deadline` alone is inert unless
+        // something is *incrementing* the epoch, and the long-lived ticker is only spawned
+        // later in `init()`. Run a dedicated ticker for the whole load and stop it
+        // immediately afterwards.
+        let load_ticker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load_ticker = {
             let engine = Arc::clone(&engine);
-            let stop = Arc::clone(&probe_ticker_stop);
+            let stop = Arc::clone(&load_ticker_stop);
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -438,8 +435,17 @@ impl RealWasmModule {
                 }
             })
         };
-        let probe_result = (|| -> Result<()> {
+        let pool_size = config.instance_pool_size.max(1);
+        let load_result = (|| -> Result<Vec<tokio::sync::Mutex<RealWasmState>>> {
             let mut probe_store = Store::new(&engine, StoreLimits::default());
+            // Arm *before* instantiating, not after. wasmtime checks the epoch deadline
+            // while initialising a module's data segments, and a fresh `Store` starts at
+            // deadline 0 — which equals the engine's starting epoch, so the check trips
+            // immediately and every module carrying a `data` segment fails to load with
+            // `wasm trap: interrupt`. Rust, AssemblyScript and TinyGo all emit one for
+            // string literals and rodata, so this is every real module. Arming first also
+            // covers the `start` function, which instantiation runs.
+            probe_store.set_epoch_deadline(config.timeout_ms);
             let probe_instance =
                 linker
                     .instantiate(&mut probe_store, &module)
@@ -453,6 +459,7 @@ impl RealWasmModule {
                 &probe_instance,
                 "rustcdc_abi_version",
             )?;
+            // Re-arm: instantiation may have consumed part of the budget.
             probe_store.set_epoch_deadline(config.timeout_ms);
             let reported = version_fn.call(&mut probe_store, ()).map_err(|e| {
                 Error::ConfigError(format!("rustcdc_abi_version() call failed: {e}"))
@@ -465,26 +472,26 @@ impl RealWasmModule {
                      WASM ABI documentation."
                 )));
             }
-            Ok(())
+
+            let mut pool = Vec::with_capacity(pool_size);
+            for _ in 0..pool_size {
+                let state = Self::create_instance_state(
+                    &engine,
+                    &module,
+                    &linker,
+                    fuel_yield,
+                    config.memory_limit_mb,
+                    config.timeout_ms,
+                )?;
+                pool.push(tokio::sync::Mutex::new(state));
+            }
+            Ok(pool)
         })();
 
-        // Always stop the probe ticker, including on the error paths above.
-        probe_ticker_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = probe_ticker.join();
-        probe_result?;
-
-        let pool_size = config.instance_pool_size.max(1);
-        let mut pool = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let state = Self::create_instance_state(
-                &engine,
-                &module,
-                &linker,
-                fuel_yield,
-                config.memory_limit_mb,
-            )?;
-            pool.push(tokio::sync::Mutex::new(state));
-        }
+        // Always stop the load ticker, including on the error paths above.
+        load_ticker_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = load_ticker.join();
+        let pool = load_result?;
 
         // Sentinel for the epoch-ticker task lifecycle.  The task is spawned
         // lazily in `init()` so that construction remains synchronous and does
@@ -512,6 +519,7 @@ impl RealWasmModule {
         linker: &Linker<StoreLimits>,
         fuel_async_yield_interval: Option<u64>,
         memory_limit_mb: u64,
+        timeout_ms: u64,
     ) -> Result<RealWasmState> {
         // Enforce `memory_limit_mb` on the *guest* via a ResourceLimiter.
         //
@@ -526,6 +534,12 @@ impl RealWasmModule {
         let limits = StoreLimitsBuilder::new().memory_size(limit_bytes).build();
         let mut store = Store::new(engine, limits);
         store.limiter(|limits| limits);
+        // Arm before `instantiate` — see the comment in `RealWasmModule::new`. A fresh
+        // store's deadline of 0 equals the engine's starting epoch, so data-segment
+        // initialisation traps with `wasm trap: interrupt` unless the deadline is set
+        // first. The caller keeps an epoch ticker running for the duration of the load,
+        // so a `start` function that never returns is still interrupted.
+        store.set_epoch_deadline(timeout_ms);
         if let Some(interval) = fuel_async_yield_interval {
             store
                 .set_fuel(u64::MAX)
@@ -1191,6 +1205,62 @@ mod tests {
                         (func (export "rustcdc_abi_version") (result i32) i32.const 2)
                         (func (export "transform") (param i32 i32) (result i64)
                             i64.const 0))"#
+    }
+
+    /// Same as `minimal_conformant_wat`, plus a `data` segment.
+    ///
+    /// wasmtime evaluates the store's epoch deadline while initialising data
+    /// segments, so arming the deadline after `instantiate` rejects this module —
+    /// and every module produced by a real toolchain, since Rust, AssemblyScript
+    /// and TinyGo all emit a data segment for string literals and rodata. The
+    /// rest of the WAT suite is data-segment-free and stays green regardless,
+    /// which is exactly how that regression shipped once already.
+    fn data_segment_wat() -> &'static str {
+        r#"(module
+                        (memory (export "memory") 2)
+                        (data (i32.const 65536) "rustcdc-data-segment")
+                        (global $heap (mut i32) (i32.const 8))
+                        (func (export "alloc") (param $len i32) (result i32)
+                            (local $ptr i32)
+                            global.get $heap
+                            local.tee $ptr
+                            local.get $len
+                            i32.add
+                            global.set $heap
+                            local.get $ptr)
+                        (func (export "dealloc") (param i32) (param i32))
+                        (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+                        (func (export "transform") (param i32 i32) (result i64)
+                            i64.const 0))"#
+    }
+
+    #[tokio::test]
+    async fn module_with_data_segment_loads() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.wasm");
+        write_wat_module(&module_path, data_segment_wat());
+
+        let runtime = WasmRuntime::new(module_path.to_str().expect("utf8"))
+            .expect("module with a data segment must load");
+        assert!(runtime.module_size_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn module_with_data_segment_loads_with_a_multi_slot_pool() {
+        // Every pool slot instantiates independently, so an unarmed store in
+        // `create_instance_state` fails here even when the ABI probe passes.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.wasm");
+        write_wat_module(&module_path, data_segment_wat());
+
+        WasmRuntime::new_with_config(WasmConfig {
+            module_path,
+            timeout_ms: DEFAULT_WASM_TIMEOUT_MS,
+            memory_limit_mb: DEFAULT_WASM_MEMORY_LIMIT_MB,
+            instance_pool_size: 4,
+            fuel_async_yield_interval: None,
+        })
+        .expect("every pool slot must instantiate a module with a data segment");
     }
 
     #[tokio::test]

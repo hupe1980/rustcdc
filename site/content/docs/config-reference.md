@@ -863,7 +863,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.8.0",                         // Service version
+    "0.9.0",                         // Service version
     "production",                    // Environment
 );
 
@@ -892,6 +892,7 @@ let config = RuntimeConfig::new(...)
 | `rustcdc_runtime_events_skipped_total` | Counter | Events permanently dropped by `TransformErrorPolicy::Skip`. **Any non-zero value means data was lost** — the checkpoint advances past skipped events, so they are never replayed. Alert on any increase. |
 | `rustcdc_runtime_idempotency_evictions_total` | Counter | Fingerprints evicted because the idempotency window filled. Growing steadily means the window is too small for this deployment's replay distance; raise `IdempotencyOptions::capacity`. |
 | `rustcdc_runtime_idempotency_unidentifiable_total` | Counter | Events passed through undeduplicated because they carry neither transaction metadata nor a resolvable primary key. Expected for keyless tables. |
+| `rustcdc_transform_rules_unmatched` | Gauge | Configured transform rules that have never matched an event, one series per rule (`transform`, `kind`, `rule` labels). **Emitted only when a rule is unmatched**, so its absence is the healthy state and `rustcdc_transform_rules_unmatched > 0` is a complete alert rule. A masking rule that never fires means a column is shipping in clear text; a routing rule that never fires means events are going to the default destination. Only meaningful after real traffic — every rule is unmatched before the first event. |
 | `rustcdc_runtime_health` | Gauge | Derived health verdict, one series per `verdict` label. **`rustcdc_runtime_health{verdict="stalled"} == 1` is the alert rule** — `state` alone cannot distinguish healthy-idle from stalled. |
 | `rustcdc_runtime_checkpoint_age_ms` | Gauge | Age of last durable checkpoint |
 | `rustcdc_runtime_replication_lag_ms` | Gauge | Estimated source lag in milliseconds |
