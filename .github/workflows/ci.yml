@@ -94,6 +94,19 @@ jobs:
         run: cargo doc --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+      # The all-features build cannot see a broken link *into* a feature-gated item,
+      # because every gate is on. Twelve such links existed and were invisible for exactly
+      # that reason: an intra-doc link from an ungated doc comment to a `schemreg`, `tls`,
+      # `sqlserver` or `encryption` item resolves only when that feature happens to be
+      # enabled, and is a broken link in every other build — including the one a downstream
+      # crate gets when it runs `cargo doc` on its own dependency set.
+      #
+      # `--no-default-features` is the complementary extreme; between the two, an ungated
+      # item cannot link to a gated one without one of the lanes failing.
+      - name: cargo doc --no-default-features --no-deps
+        run: cargo doc --no-default-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
       # Compiles every Rust block in README.md and docs/*.md as well as the rustdoc
       # examples. Published samples that no longer compile are integration failures
       # waiting to happen; before this ran, 36 of 96 documented samples were broken.

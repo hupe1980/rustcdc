@@ -229,9 +229,9 @@ impl TransportConfig {
 
     /// Return true when TLS certificate verification is disabled.
     ///
-    /// Always returns `false` for [`TransportConfig::RustlsConfig`] — the
-    /// injected `ClientConfig` is assumed to already encode the desired
-    /// verification policy.
+    /// Always returns `false` for the `tls`-gated `TransportConfig::RustlsConfig`
+    /// variant — the injected `ClientConfig` is assumed to already encode the
+    /// desired verification policy.
     pub fn allow_invalid_certificates(&self) -> bool {
         match self {
             Self::Tls {
@@ -244,9 +244,9 @@ impl TransportConfig {
 
     /// Return true when TLS hostname verification is disabled.
     ///
-    /// Always returns `false` for [`TransportConfig::RustlsConfig`] — the
-    /// injected `ClientConfig` is assumed to already encode the desired
-    /// hostname policy.
+    /// Always returns `false` for the `tls`-gated `TransportConfig::RustlsConfig`
+    /// variant — the injected `ClientConfig` is assumed to already encode the
+    /// desired hostname policy.
     pub fn allow_invalid_hostnames(&self) -> bool {
         match self {
             Self::Tls {

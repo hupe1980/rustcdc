@@ -307,6 +307,16 @@ run_workflow_drift_check() {
   require_match "^  push:$" "$CI_WORKFLOW" "push trigger"
   require_match "^      - \"v\*\"$" "$CI_WORKFLOW" "tag trigger for releases"
   require_match "bash scripts/ci-policy-gate.sh" "$CI_WORKFLOW" "policy gate"
+  # Both doc lanes, not just one. The all-features build is blind to a link from an
+  # ungated doc comment into a feature-gated item, because every gate is on; the
+  # no-default-features build is what catches it. Losing either lane restores the blind
+  # spot that hid twelve such links.
+  #
+  # Anchored on `run:` rather than on the bare command: a step's `name:` usually repeats
+  # the command, so an unanchored pattern is satisfied by the label alone and would still
+  # match after the command itself was changed.
+  require_match "^ +run: cargo doc --all-features --no-deps$" "$CI_WORKFLOW" "all-features doc build"
+  require_match "^ +run: cargo doc --no-default-features --no-deps$" "$CI_WORKFLOW" "no-default-features doc build"
   require_match "bash scripts/ci-pull-relational-images.sh --relational-smoke" "$CI_WORKFLOW" "relational smoke image pull mode"
   require_match "bash scripts/ci-benchmark-gate.sh" "$CI_WORKFLOW" "benchmark policy gate"
   require_match "bash scripts/run_full_integration_matrix_evidence.sh" "$CI_WORKFLOW" "full matrix evidence run"

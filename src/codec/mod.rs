@@ -373,23 +373,27 @@ impl Codec for BoxedCodec {
 /// # Why this exists
 ///
 /// Two of the three Confluent encoders resolve their subject **lazily**, on first
-/// encode, because [`SubjectNameStrategy::RecordName`] and
-/// [`TopicRecordName`](SubjectNameStrategy::TopicRecordName) exist precisely to give each
-/// record type its own subject — resolving eagerly at construction would defeat them.
-/// Their `encode` is therefore `async`, which fits neither [`Codec`] nor [`EventEncoder`].
+/// encode, because `SubjectNameStrategy::RecordName` and `TopicRecordName` exist precisely
+/// to give each record type its own subject — resolving eagerly at construction would
+/// defeat them. Their `encode` is therefore `async`, which fits neither [`Codec`] nor
+/// [`EventEncoder`].
 ///
 /// Before this trait, a sink that wanted to hold "some codec" could not hold all three
-/// Confluent formats behind one type: [`ConfluentAvroEncoder`] reached [`BoxedCodec`] via
-/// [`EncoderCodec`], while [`ConfluentJsonSchemaEncoder`] and [`ConfluentProtobufEncoder`]
+/// Confluent formats behind one type: `ConfluentAvroEncoder` reached [`BoxedCodec`] via
+/// [`EncoderCodec`], while `ConfluentJsonSchemaEncoder` and `ConfluentProtobufEncoder`
 /// sat outside the type system entirely, and every embedder hand-rolled the same
 /// three-variant dispatch enum. `AsyncCodec` is that enum, once, in the library.
+///
+/// (The Confluent encoders are named as plain code rather than linked: they live behind
+/// the `schemreg` feature, and an intra-doc link from this ungated trait to a gated item
+/// is a broken link in every build that does not enable it.)
 ///
 /// # Relationship to [`Codec`]
 ///
 /// There is a blanket `impl<T: Codec> AsyncCodec for T`, so **every synchronous codec is
 /// already an `AsyncCodec`** and a sink only ever needs to accept this one trait. Generic
 /// code bounded on `AsyncCodec` therefore takes [`JsonCodec`] and
-/// [`ConfluentProtobufEncoder`] alike.
+/// `ConfluentProtobufEncoder` alike.
 ///
 /// Two consequences of the blanket impl are worth knowing:
 ///
@@ -417,11 +421,6 @@ impl Codec for BoxedCodec {
 /// assert_eq!(out.content_type, "application/json");
 /// # Ok(()) }
 /// ```
-///
-/// [`SubjectNameStrategy::RecordName`]: crate::codec::SubjectNameStrategy
-/// [`ConfluentAvroEncoder`]: crate::codec::ConfluentAvroEncoder
-/// [`ConfluentJsonSchemaEncoder`]: crate::codec::ConfluentJsonSchemaEncoder
-/// [`ConfluentProtobufEncoder`]: crate::codec::ConfluentProtobufEncoder
 #[async_trait::async_trait]
 pub trait AsyncCodec: Send + Sync {
     /// Encode the event into a key + value pair, awaiting whatever the encoder needs.

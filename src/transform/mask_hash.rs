@@ -5,8 +5,9 @@
 //! [`MaskRule::UnsaltedSha256`] provides **obfuscation**, not pseudonymization.
 //! SHA-256 is a deterministic, fast hash: for low-cardinality fields (e.g. gender, country code)
 //! or enumerable values, the original value can be recovered via brute-force lookup.
-//! For GDPR-grade pseudonymization use [`MaskRule::HmacSha256`] (requires the `encryption`
-//! feature) or [`MaskRule::Encrypt`] instead.
+//! For GDPR-grade pseudonymization use `MaskRule::HmacSha256` or `MaskRule::Encrypt`
+//! instead — both require the `encryption` feature, which is why they are named here
+//! rather than linked.
 
 use ahash::AHashMap as HashMap;
 
@@ -30,7 +31,8 @@ pub enum MaskRule {
     /// Deterministic SHA-256 hash (no salt).
     ///
     /// Provides obfuscation only — **not** GDPR-safe pseudonymization for low-cardinality fields.
-    /// Use [`MaskRule::HmacSha256`] or [`MaskRule::Encrypt`] for keyed pseudonymization.
+    /// Use `MaskRule::HmacSha256` or `MaskRule::Encrypt` (both `encryption`-gated) for keyed
+    /// pseudonymization.
     UnsaltedSha256,
     /// Replace the value with a fixed placeholder.
     Redact(String),
@@ -138,7 +140,7 @@ impl MaskHashConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ConfigError`](crate::core::Error::ConfigError) naming the offending
+    /// Returns [`ConfigError`](crate::core::Error::ConfigError) naming the offending
     /// path and the rule to use instead.
     pub fn validate(&self) -> Result<()> {
         let rules = self
@@ -225,7 +227,7 @@ impl MaskHashTransform {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ConfigError`](crate::core::Error::ConfigError) when a rule cannot
+    /// Returns [`ConfigError`](crate::core::Error::ConfigError) when a rule cannot
     /// do what it appears to — see [`MaskHashConfig::validate`].
     pub fn new(config: MaskHashConfig) -> Result<Self> {
         config.validate()?;

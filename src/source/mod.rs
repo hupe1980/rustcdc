@@ -196,7 +196,7 @@ pub struct ConnectorCapabilities {
     ///
     /// **SQL Server CDC** (`cdc.fn_cdc_get_all_changes_*`) does **not** record
     /// `TRUNCATE TABLE` in the change tables because TRUNCATE bypasses row-level
-    /// logging.  When [`SqlServerSourceConfig::capture_truncate_events`] is
+    /// logging.  When `SqlServerSourceConfig::capture_truncate_events` is
     /// `true`, rustcdc installs a database-level DDL trigger that records each
     /// `TRUNCATE TABLE` in a shadow table and emits an `Operation::Truncate`
     /// event positioned after all DML changes at the LSN captured by the trigger.
