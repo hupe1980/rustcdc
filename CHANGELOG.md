@@ -233,6 +233,27 @@ All three now do.
 | `ConfluentJsonSchemaEncoder::new` / `without_validation` are sync | `async` | They now enforce `auto_register = false` |
 | `ConfluentProtobufEncoder::new` is sync | `async` | Same |
 
+### The doc build only ever ran with every feature on
+
+CI built documentation once, with `--all-features`. That configuration is structurally
+**blind to a link from an ungated doc comment into a feature-gated item**: with every gate
+on, every such link resolves. Turn a gate off — as any downstream crate does when it runs
+`cargo doc` on its own dependency set — and the link is broken.
+
+Twelve were, and had been for some time: `TransportConfig::RustlsConfig` (`tls`),
+`SqlServerSourceConfig::capture_truncate_events` (`sqlserver`), `MaskRule::HmacSha256` and
+`MaskRule::Encrypt` (`encryption`), and five more this release added in the `AsyncCodec` docs
+pointing at the `schemreg` encoders. All now name the gated item as plain code rather than
+claiming a link target that may not exist, with a note saying why.
+
+CI gained a second lane, `cargo doc --no-default-features --no-deps` under `-D warnings`. The
+two extremes are complementary: an ungated item cannot link to a gated one without one of them
+failing. The workflow-drift guard requires both, anchored on the `run:` line rather than the
+step name — an unanchored pattern is satisfied by the label alone and would still match after
+the command underneath it changed.
+
+The build is verified clean across eight feature combinations, not just the two CI runs.
+
 ### Docs
 
 `api.md` gained an "AWS Glue" section, an "Unmatched rules" section and a "Holding several codecs behind one type"
