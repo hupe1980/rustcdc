@@ -110,7 +110,7 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
         user: "postgres".to_string(),
         password: "postgres".into(),
         database: "cdc".to_string(),
-        replication_slot_name: "cdc_latency_evidence_slot".to_string(),
+        replication_slot_name: SLOT_NAME.to_string(),
         publication_name: "cdc_latency_evidence_pub".to_string(),
         // Ephemeral test container: the slot legitimately does not exist yet.
         create_replication_slot_if_missing: true,
@@ -163,6 +163,14 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
         Ok::<_, rustcdc::Error>(admin_client)
     });
 
+    // Separate connection: the admin client is moved into the writer task.
+    let (diag_client, diag_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    tokio::spawn(async move {
+        let _ = diag_conn.await;
+    });
+
     let mut recorder = LatencyRecorder::new();
     let mut events_committed = 0_u64;
     let started = Instant::now();
@@ -170,7 +178,24 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
         .watching_writer(std::sync::Arc::clone(&writer_status));
 
     while events_committed < rows_inserted {
-        deadline.check(events_committed)?;
+        // On a stall, dump the state that decides *where* to look before failing. Two CI
+        // runs were spent narrowing this by elimination; a stall message that carries the
+        // slot position, the runtime's own verdict and the connector's lag turns the next
+        // one into an answer rather than another round of guessing.
+        if let Err(stall) = deadline.check(events_committed) {
+            let admin = runtime.admin_snapshot();
+            let slot_state = diagnose_replication_slot(&diag_client, SLOT_NAME).await;
+            eprintln!(
+                "STALL DIAGNOSTIC\n  committed={events_committed}/{rows_inserted}\n  \
+                 health={:?}\n  state={:?}\n  events_polled={}\n  \
+                 slot_lag_bytes={:?}\n  {slot_state}",
+                admin.health,
+                admin.state,
+                admin.total_events_polled,
+                admin.replication_slot_lag_bytes,
+            );
+            return Err(stall);
+        }
 
         let poll_start = Instant::now();
         let batch = runtime.poll_event_batch().await?;
@@ -234,4 +259,36 @@ fn parse_pg_lsn(value: &str) -> rustcdc::Result<u64> {
     let low = u64::from_str_radix(low, 16)
         .map_err(|error| rustcdc::Error::SourceError(format!("invalid lsn low bits: {error}")))?;
     Ok((high << 32) | low)
+}
+
+/// Slot name used by the latency suite, shared with the stall diagnostic.
+const SLOT_NAME: &str = "cdc_latency_evidence_slot";
+
+/// Report what PostgreSQL itself thinks the slot's position is.
+///
+/// A stall is either "the slot still holds changes we have not consumed" (a consumer-side
+/// problem) or "the slot has been advanced past them" (data loss). `confirmed_flush_lsn`
+/// versus `pg_current_wal_lsn()` distinguishes the two, and nothing in the runtime's own
+/// metrics can.
+async fn diagnose_replication_slot(client: &tokio_postgres::Client, slot: &str) -> String {
+    let query = "SELECT s.confirmed_flush_lsn::text, pg_current_wal_lsn()::text, \
+                 pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn)::text, \
+                 s.active \
+                 FROM pg_replication_slots s WHERE s.slot_name = $1";
+    match client.query_opt(query, &[&slot]).await {
+        Ok(Some(row)) => {
+            let confirmed: String = row.get(0);
+            let current: String = row.get(1);
+            let lag: String = row.get(2);
+            let active: bool = row.get(3);
+            format!(
+                "slot: confirmed_flush_lsn={confirmed} current_wal_lsn={current} \
+                 lag_bytes={lag} active={active} \
+                 (lag>0 means the slot still holds undelivered changes — a consumer-side \
+                 stall; lag==0 with events missing means the slot was advanced past them)"
+            )
+        }
+        Ok(None) => format!("slot: '{slot}' does not exist"),
+        Err(error) => format!("slot: query failed: {error}"),
+    }
 }

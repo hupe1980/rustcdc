@@ -82,6 +82,29 @@ The full mapping is documented under the column type mapping section in the conf
 the SQL Server suite asserts non-null on every `NOT NULL` column specifically to catch a
 regression of the original null-substitution shape.
 
+### Fixed: the PostgreSQL stream could stop delivering permanently under load
+
+`pg_logical_slot_peek_binary_changes` is **non-consuming** — it re-decodes the entire
+un-acked backlog on every call. When a peek exceeded its `statement_timeout`, the connector
+retried with the *same* window, which meant repeating the identical decode that had just
+failed. On a saturated server that never succeeds: the pipeline stops delivering
+permanently while the changes sit unread in the WAL.
+
+This is what CI was reporting as *"no new events for 90s at 1994/2000 committed; the writer
+committed all 2000 rows, so the events exist and the pipeline stopped delivering them"* — a
+livelock, not a slow machine. It reproduced only under load, which is why three CI runs saw
+it and no local run did.
+
+The peek window is now adaptive: a timeout halves it (floor 1), so every retry asks the
+server for strictly less work than the attempt that just failed and the sequence converges
+on a window that decodes — forward progress is guaranteed rather than hoped for. A
+successful poll doubles it back toward `max_events_per_poll`, so a transient spike does not
+permanently cap throughput. The shrink logs a WARN naming both windows.
+
+The existing `slot_is_caught_up` guard already stopped a timed-out poll from being mistaken
+for an idle slot (which would have advanced the slot past the backlog and *lost* it). That
+guard was correct and remains; it prevented data loss but not the livelock.
+
 ### Latency evidence fails on a stall, not on a slow machine
 
 All three latency suites used a fixed total budget — "collect 2,000 events within 180 s". A

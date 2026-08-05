@@ -79,6 +79,14 @@ pub struct PostgresStreamHandle {
     partial_tx_events: Vec<Event>,
     events_polled: u64,
     max_events_per_poll: usize,
+    /// Changes requested from the next peek.
+    ///
+    /// Starts at `max_events_per_poll` and shrinks when a peek exceeds its budget.
+    /// `pg_logical_slot_peek_binary_changes` is **non-consuming**: it re-decodes the whole
+    /// un-acked backlog on every call, so retrying a window the server could not decode
+    /// repeats identical work and times out again. Without shrinking, a saturated server
+    /// stops the pipeline permanently — the events stay in the WAL and are never surfaced.
+    peek_window: usize,
     stream_poll_interval_ms: u64,
     /// Milliseconds between idle WAL advances (0 = disabled).
     slot_idle_advance_interval_ms: u64,
@@ -118,6 +126,7 @@ impl PostgresStreamHandle {
             partial_tx_events: Vec::new(),
             events_polled: 0,
             max_events_per_poll: max_events_per_poll.max(1),
+            peek_window: max_events_per_poll.max(1),
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
             slot_idle_advance_interval_ms,
             last_idle_advance_at: None,
@@ -943,10 +952,44 @@ impl StreamHandle for PostgresStreamHandle {
             // The outer timeout_ms contract is enforced by the elapsed-time check below.
             let poll_timeout = Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS);
 
+            let requested_window = self.peek_window;
             let poll_outcome = self
                 .provider
-                .poll_xlog_data(self.max_events_per_poll, poll_timeout)
+                .poll_xlog_data(requested_window, poll_timeout)
                 .await?;
+
+            match &poll_outcome {
+                decoder::PollOutcome::TimedOut => {
+                    // Halve the window so the retry asks the server for strictly less work
+                    // than the attempt that just failed. Repeated timeouts converge on a
+                    // single change, which always decodes — so forward progress is
+                    // guaranteed rather than merely likely.
+                    let shrunk = (requested_window / 2).max(1);
+                    if shrunk < self.peek_window {
+                        tracing::warn!(
+                            target: "rustcdc::source::postgres",
+                            slot = %self.stream.slot_name,
+                            previous_window = requested_window,
+                            new_window = shrunk,
+                            "postgres peek exceeded its budget; shrinking the decode window. \
+                             The peek is non-consuming, so retrying the same window would \
+                             repeat identical work and time out again — halting delivery \
+                             while the changes sit unread in the WAL.",
+                        );
+                        self.peek_window = shrunk;
+                    }
+                }
+                decoder::PollOutcome::Data(_) => {
+                    // Recover toward the configured ceiling so a transient load spike does
+                    // not permanently cap throughput.
+                    if self.peek_window < self.max_events_per_poll {
+                        self.peek_window = self
+                            .peek_window
+                            .saturating_mul(2)
+                            .min(self.max_events_per_poll);
+                    }
+                }
+            }
             // Only a *completed* poll that returned nothing proves the slot is caught
             // up. A timed-out poll means the opposite — there is more backlog than
             // could be decoded in the budget — so it must never reach the idle branch.
@@ -1247,6 +1290,152 @@ mod tests {
             *self.confirmed_lsn.lock().await = lsn;
             Ok(())
         }
+    }
+
+    /// Provider that models a server too loaded to decode the requested window.
+    ///
+    /// `pg_logical_slot_peek_binary_changes` is **non-consuming**: it re-decodes the whole
+    /// un-acked backlog on every call. So a peek that exceeds its `statement_timeout` is
+    /// not a transient hiccup — the identical work is retried next poll and times out
+    /// again. Asking for the same window forever is a livelock.
+    struct SaturatedProvider {
+        /// Largest window this server can decode inside the budget.
+        max_decodable: usize,
+        batches: VecDeque<Vec<PgOutputXLogData>>,
+        timeouts: Arc<Mutex<usize>>,
+        smallest_window_seen: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl PgOutputMessageProvider for SaturatedProvider {
+        async fn poll_xlog_data(
+            &mut self,
+            max: usize,
+            _poll_timeout: std::time::Duration,
+        ) -> crate::core::Result<PollOutcome> {
+            {
+                let mut smallest = self.smallest_window_seen.lock().await;
+                *smallest = (*smallest).min(max);
+            }
+            if max > self.max_decodable {
+                *self.timeouts.lock().await += 1;
+                return Ok(PollOutcome::TimedOut);
+            }
+            Ok(PollOutcome::Data(
+                self.batches.pop_front().unwrap_or_default(),
+            ))
+        }
+
+        async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peek_that_times_out_shrinks_its_window_until_it_makes_progress() {
+        // The failure this reproduces: under load the peek exceeds its budget, the
+        // connector retries the *same* oversized window, and the pipeline stops
+        // delivering permanently — events that exist in the WAL are never surfaced.
+        let timeouts = Arc::new(Mutex::new(0usize));
+        let smallest_window_seen = Arc::new(Mutex::new(usize::MAX));
+        let provider = SaturatedProvider {
+            // Only a tiny window decodes in time — the server is badly saturated.
+            max_decodable: 4,
+            batches: vec![vec![
+                xlog(
+                    800,
+                    build_relation(999, "public", "users", &[("id", true), ("name", false)]),
+                ),
+                xlog(800, build_begin(1000, 0, 7)),
+                xlog(900, build_insert(999, &[Some("1"), Some("row")])),
+                xlog(1000, build_commit(900, 1100, 0)),
+            ]]
+            .into_iter()
+            .collect(),
+            timeouts: Arc::clone(&timeouts),
+            smallest_window_seen: Arc::clone(&smallest_window_seen),
+        };
+
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            // Far larger than the server can decode: every peek at this size times out.
+            1_000,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
+        let events = handle
+            .next_events(2_000)
+            .await
+            .expect("polling must not error");
+
+        assert!(
+            *timeouts.lock().await > 0,
+            "the test must actually exercise the timeout path"
+        );
+        assert!(
+            *smallest_window_seen.lock().await <= 4,
+            "the connector must shrink the peek window after a timeout; it stayed at {} \
+             and would retry the same impossible decode forever",
+            *smallest_window_seen.lock().await
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "once the window is small enough to decode, the pending event must be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_peek_window_recovers_after_the_pressure_passes() {
+        // Shrinking must not be permanent: a transient load spike would otherwise cap
+        // throughput for the rest of the process's life.
+        let timeouts = Arc::new(Mutex::new(0usize));
+        let smallest = Arc::new(Mutex::new(usize::MAX));
+        let provider = SaturatedProvider {
+            max_decodable: usize::MAX, // server is healthy
+            batches: VecDeque::new(),
+            timeouts: Arc::clone(&timeouts),
+            smallest_window_seen: Arc::clone(&smallest),
+        };
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            1_000,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // Simulate having shrunk hard during an earlier spike.
+        handle.peek_window = 1;
+        let _ = handle.next_events(10).await.expect("poll");
+
+        assert!(
+            handle.peek_window > 1,
+            "a successful poll must widen the window again, got {}",
+            handle.peek_window
+        );
+        assert!(
+            handle.peek_window <= 1_000,
+            "recovery must not exceed the configured max_events_per_poll, got {}",
+            handle.peek_window
+        );
     }
 
     #[test]
