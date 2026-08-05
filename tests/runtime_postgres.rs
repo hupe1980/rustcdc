@@ -127,7 +127,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     let (accepted, _remaining) = token.split_at(50)?;
     runtime.commit_ack(accepted).await?;
 
-    let reader = FileCheckpoint::new(checkpoint_dir.path());
+    let reader = FileCheckpoint::read_only(checkpoint_dir.path());
     assert_eq!(reader.get_committed_count().await?, 50);
     let saved = reader
         .load()
@@ -171,7 +171,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     assert!(second_batch.len() >= 50);
 
     resumed.commit_ack(second_batch.ack_mode()).await?;
-    let reader_after = FileCheckpoint::new(checkpoint_dir.path());
+    let reader_after = FileCheckpoint::read_only(checkpoint_dir.path());
     assert!(reader_after.get_committed_count().await? >= 100);
 
     Ok(())

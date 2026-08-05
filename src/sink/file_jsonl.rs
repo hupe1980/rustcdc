@@ -89,7 +89,7 @@ impl Default for FileJsonlSinkConfig {
 /// # async fn main() -> rustcdc::core::Result<()> {
 /// // Simple: no rotation, fsync every flush.
 /// let mut sink = FileJsonlSink::open("/tmp/events.jsonl")?;
-/// let event = Event { op: Operation::Insert, ..Event::default() };
+/// let event = Event::builder("users", Operation::Insert).build();
 /// sink.send(&event).await?;
 /// sink.close().await?;
 ///

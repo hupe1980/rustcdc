@@ -176,6 +176,7 @@ async fn startup_self_heals_when_checkpoint_lsn_ahead_of_slot() {
     let offset = PostgresOffset {
         lsn: l2_lsn,
         slot_name: SLOT.to_string(),
+        incremental_snapshot: None,
     };
     use rustcdc::core::Offset as _;
     FileCheckpoint::restore_from_record(

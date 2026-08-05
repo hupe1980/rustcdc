@@ -266,7 +266,7 @@ impl CdcRuntime {
             }
         };
 
-        Ok(PostgresOffset { lsn, slot_name })
+        Ok(PostgresOffset::new(lsn, slot_name))
     }
 
     #[cfg(feature = "mysql")]

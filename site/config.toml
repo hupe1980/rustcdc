@@ -1,0 +1,37 @@
+# Zola configuration for the rustcdc site.
+#
+# The site is two things: a landing page that says what the library is and why it
+# exists, and the documentation set. Both are generated from Markdown that also
+# ships in the repository, so there is one source of truth rather than a copy that
+# drifts.
+
+base_url = "https://hupe1980.github.io/rustcdc"
+title = "rustcdc"
+description = "Embeddable change data capture for Rust. PostgreSQL, MySQL, MariaDB and SQL Server in one crate — no JVM, no sidecar."
+default_language = "en"
+
+compile_sass = true
+build_search_index = true
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+[markdown]
+render_emoji = false
+# Heading anchors make every section linkable, which is what people actually paste
+# into an issue or a support thread.
+insert_anchor_links = "heading"
+smart_punctuation = false
+
+[search]
+include_title = true
+include_description = true
+include_path = true
+include_content = true
+
+[extra]
+repo_url = "https://github.com/hupe1980/rustcdc"
+crate_url = "https://crates.io/crates/rustcdc"
+docs_rs_url = "https://docs.rs/rustcdc"
+author = "hupe1980"
+# Shown in the page footer and in structured data.
+license = "MIT OR Apache-2.0"

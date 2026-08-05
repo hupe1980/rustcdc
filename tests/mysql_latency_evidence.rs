@@ -16,7 +16,10 @@ use tokio::time::sleep;
 #[path = "latency_evidence_common.rs"]
 mod latency_evidence_common;
 
-use latency_evidence_common::{percentile, write_latency_artifacts, LatencySummary};
+use latency_evidence_common::{
+    assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
+    LatencyRecorder, ProgressDeadline, WriterStatus,
+};
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
     let mut last_error = None;
@@ -127,31 +130,46 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc
     runtime.start().await?;
 
     let rows_inserted = 2_000_u64;
-    for id in 1_i64..=rows_inserted as i64 {
-        sqlx::query("INSERT INTO latency_evidence_users (id, payload) VALUES (?, ?)")
-            .bind(id)
-            .bind(format!("payload-{id}"))
-            .execute(&admin_pool)
-            .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-    }
 
-    let mut poll_latencies_ms = Vec::new();
-    let mut commit_latencies_ms = Vec::new();
-    let mut batch_sizes = Vec::new();
+    // Write concurrently with polling — see `latency_evidence_common` for why measuring a
+    // pre-filled buffer measures nothing an operator can use.
+    // Published so a stall can name which side stopped, and so a writer failure is
+    // reported with its own error instead of as an ambiguous timeout.
+    let writer_status = WriterStatus::new();
+    let writer_progress = std::sync::Arc::clone(&writer_status);
+    let writer = tokio::spawn(async move {
+        for id in 1_i64..=rows_inserted as i64 {
+            // Payload carries this process's wall clock, so capture latency is measured
+            // against a single clock and container/host drift cannot skew it.
+            let payload = stamped_payload(&format!("row-{id}"));
+            if let Err(error) =
+                sqlx::query("INSERT INTO latency_evidence_users (id, payload) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(payload)
+                    .execute(&admin_pool)
+                    .await
+                    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
+            {
+                writer_progress.record_failure(&error);
+                return Err(error);
+            }
+            writer_progress.record_row();
+        }
+        Ok::<_, rustcdc::Error>(admin_pool)
+    });
+
+    let mut recorder = LatencyRecorder::new();
     let mut events_committed = 0_u64;
     let started = Instant::now();
+    let mut deadline = ProgressDeadline::with_defaults("mysql capture latency", rows_inserted)
+        .watching_writer(std::sync::Arc::clone(&writer_status));
 
-    let deadline = Instant::now() + Duration::from_secs(90);
     while events_committed < rows_inserted {
-        if Instant::now() > deadline {
-            return Err(rustcdc::Error::TimeoutError(format!(
-                "timed out while collecting mysql latency evidence (committed={events_committed}, expected={rows_inserted})"
-            )));
-        }
+        deadline.check(events_committed)?;
 
         let poll_start = Instant::now();
         let batch = runtime.poll_event_batch().await?;
+        let delivered_at = now_micros();
         let poll_ms = poll_start.elapsed().as_secs_f64() * 1000.0;
 
         if batch.is_empty() {
@@ -159,41 +177,42 @@ async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc
         }
 
         let batch_len = batch.len();
-        batch_sizes.push(batch_len as f64);
-        poll_latencies_ms.push(poll_ms);
+        recorder.observe_poll_ms(poll_ms);
+        recorder.observe_batch(batch.events(), delivered_at);
 
         let commit_start = Instant::now();
         runtime.commit_ack(batch.ack_mode()).await?;
-        let commit_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
-        commit_latencies_ms.push(commit_ms);
+        recorder.observe_commit_ms(commit_start.elapsed().as_secs_f64() * 1000.0);
 
         events_committed = events_committed.saturating_add(batch_len as u64);
     }
 
-    let summary = LatencySummary {
-        profile: "mysql_stream_commit",
+    let wall_clock_ms = started.elapsed().as_millis();
+    writer
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(format!("writer task panicked: {error}")))??;
+
+    let summary = recorder.finish(
+        "mysql_stream_capture",
         rows_inserted,
         events_committed,
-        batches: poll_latencies_ms.len(),
-        poll_latency_ms_p50: percentile(&poll_latencies_ms, 50.0),
-        poll_latency_ms_p95: percentile(&poll_latencies_ms, 95.0),
-        poll_latency_ms_p99: percentile(&poll_latencies_ms, 99.0),
-        commit_latency_ms_p50: percentile(&commit_latencies_ms, 50.0),
-        commit_latency_ms_p95: percentile(&commit_latencies_ms, 95.0),
-        commit_latency_ms_p99: percentile(&commit_latencies_ms, 99.0),
-        batch_size_p50: percentile(&batch_sizes, 50.0),
-        batch_size_p95: percentile(&batch_sizes, 95.0),
-        batch_size_p99: percentile(&batch_sizes, 99.0),
-        end_to_end_ms: started.elapsed().as_millis(),
-    };
+        wall_clock_ms,
+    );
 
     assert!(summary.events_committed >= rows_inserted);
-    assert!(summary.batches > 0, "expected at least one committed batch");
+    assert_sample_is_meaningful(&summary, rows_inserted / 2);
 
     write_latency_artifacts("mysql", &summary)?;
     println!(
-        "mysql latency evidence recorded: batches={} poll_p95_ms={:.3} commit_p95_ms={:.3}",
-        summary.batches, summary.poll_latency_ms_p95, summary.commit_latency_ms_p95
+        "mysql capture latency: p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms \
+         throughput={:.0}/s batches={} clock_skew={:+.1}ms",
+        summary.capture_latency_ms_p50,
+        summary.capture_latency_ms_p95,
+        summary.capture_latency_ms_p99,
+        summary.capture_latency_ms_max,
+        summary.events_per_second,
+        summary.batches,
+        summary.source_commit_skew_ms,
     );
 
     Ok(())

@@ -10,7 +10,6 @@
 
 use ahash::AHashMap as HashMap;
 
-use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -22,14 +21,25 @@ use super::Transform;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+/// What to do with a field the mask configuration names.
+///
+/// Rules match by **exact dotted JSON path** against a `default_rule`, so a typo or an
+/// upstream rename silently disables one. Every rule carries a hit counter for exactly
+/// that reason — see [`MaskHashTransform::unmatched_rules`].
 pub enum MaskRule {
     /// Deterministic SHA-256 hash (no salt).
     ///
     /// Provides obfuscation only — **not** GDPR-safe pseudonymization for low-cardinality fields.
     /// Use [`MaskRule::HmacSha256`] or [`MaskRule::Encrypt`] for keyed pseudonymization.
     UnsaltedSha256,
+    /// Replace the value with a fixed placeholder.
     Redact(String),
+    /// Replace the value with JSON `null`.
+    ///
+    /// Note this is indistinguishable downstream from a genuine `NULL`; use
+    /// [`MaskRule::Redact`] when a consumer must be able to tell the two apart.
     Null,
+    /// Keep the first `n` characters of a string value; leave non-strings unchanged.
     Truncate(usize),
     /// Leave the field value unchanged.
     ///
@@ -45,13 +55,31 @@ pub enum MaskRule {
     #[cfg(feature = "encryption")]
     HmacSha256(SecretString),
     #[cfg(feature = "encryption")]
+    /// AES-256-GCM encrypt to `enc:v1:<nonce>:<ciphertext>`.
+    ///
+    /// Ciphertexts are bound to `table + JSON path` as associated data, so a value
+    /// relocated to another column or row fails authentication instead of decrypting as
+    /// authentic. **Non-deterministic** — a fresh nonce per call means the same input
+    /// encrypts differently every time, so never apply this to a primary-key column or to
+    /// any field a downstream deduplicates on.
     Encrypt(SecretString),
     #[cfg(feature = "encryption")]
+    /// Reverse [`MaskRule::Encrypt`].
+    ///
+    /// Fails if the value is decrypted in a different context than it was encrypted in —
+    /// a different table or field — because the associated data will not match.
     Decrypt(SecretString),
 }
 
 #[derive(Debug, Clone)]
+/// Which fields to mask, and how.
 pub struct MaskHashConfig {
+    /// Rules keyed by dotted JSON path.
+    ///
+    /// A trailing `.*` matches every child one level down, which is what makes
+    /// variable-length arrays coverable — `emails.*` masks every element, whereas
+    /// enumerating `emails.0`, `emails.1`, … leaks whatever the operator did not guess.
+    /// A rule on an object- or array-valued field masks the whole subtree.
     pub mask_rules: HashMap<String, MaskRule>,
     /// Rule applied to any field not present in `mask_rules`.
     ///
@@ -92,14 +120,118 @@ impl MaskHashConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Applies masking, hashing and field encryption to event payloads.
+///
+/// # Masking fails open, so it reports
+///
+/// Rules match by exact dotted path against a `Passthrough` default. A typo, an
+/// upstream column rename, or a path-mutating transform placed earlier in the
+/// pipeline therefore disables the rule **silently** — the field flows through in
+/// clear text and nothing anywhere says so. That is the failure mode that matters
+/// most here, because the whole point of the transform is that the data never leaves
+/// unmasked.
+///
+/// Fail-closed is not the right answer either: it would refuse to start a pipeline
+/// over a rule for an optional column, and operators would work around it by removing
+/// rules. Instead every rule carries a hit counter.
+/// [`MaskHashTransform::unmatched_rules`] names the rules that have never fired, and
+/// [`MaskHashTransform::warn_on_unmatched_rules`] logs them. Call it after the first
+/// batches have flowed, or wire `unmatched_rules()` into a health check — a rule with
+/// zero hits after real traffic means the field is not being masked.
+#[derive(Debug, Default)]
 pub struct MaskHashTransform {
+    /// Rule configuration.
     pub config: MaskHashConfig,
+    /// Per-rule hit counters, parallel to `rule_paths`.
+    rule_hits: Vec<std::sync::atomic::AtomicU64>,
+    /// Rule paths in a stable order, so `rule_hits` can be a flat `Vec`.
+    rule_paths: Vec<String>,
+    /// Path → index into `rule_hits`.
+    rule_slots: ahash::AHashMap<String, usize>,
+}
+
+impl Clone for MaskHashTransform {
+    /// Clones the configuration; hit counters start fresh in the clone.
+    fn clone(&self) -> Self {
+        Self::new(self.config.clone())
+    }
 }
 
 impl MaskHashTransform {
+    /// Build a transform from rule configuration, with all hit counters at zero.
     pub fn new(config: MaskHashConfig) -> Self {
-        Self { config }
+        let mut rule_paths: Vec<String> = config.mask_rules.keys().cloned().collect();
+        // Deterministic order so `unmatched_rules()` output is stable across runs.
+        rule_paths.sort();
+        let rule_slots = rule_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.clone(), index))
+            .collect();
+        let rule_hits = rule_paths
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+
+        Self {
+            config,
+            rule_hits,
+            rule_paths,
+            rule_slots,
+        }
+    }
+
+    /// Configured rule paths that have never matched a field.
+    ///
+    /// **A non-empty result after real traffic means those fields are not being
+    /// masked.** Empty before any events have flowed, so evaluate it against a
+    /// meaningful sample rather than at startup.
+    pub fn unmatched_rules(&self) -> Vec<&str> {
+        use std::sync::atomic::Ordering;
+        self.rule_paths
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.rule_hits[*index].load(Ordering::Relaxed) == 0)
+            .map(|(_, path)| path.as_str())
+            .collect()
+    }
+
+    /// Number of fields this rule path has masked.
+    pub fn rule_hit_count(&self, path: &str) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        self.rule_slots
+            .get(path)
+            .map(|index| self.rule_hits[*index].load(Ordering::Relaxed))
+    }
+
+    /// Log a WARN naming every rule that has never matched, if any.
+    ///
+    /// Returns the number of unmatched rules so a caller can fail a readiness check
+    /// on it if the deployment requires masking to be provably active.
+    pub fn warn_on_unmatched_rules(&self) -> usize {
+        let unmatched = self.unmatched_rules();
+        if unmatched.is_empty() {
+            return 0;
+        }
+        tracing::warn!(
+            target: "rustcdc::transform::mask_hash",
+            unmatched_rules = ?unmatched,
+            configured_rules = self.rule_paths.len(),
+            "{} of {} masking rules have never matched a field. Those fields are NOT \
+             being masked — check for a typo in the path, a column renamed upstream, or \
+             an earlier transform that moved the field.",
+            unmatched.len(),
+            self.rule_paths.len(),
+        );
+        unmatched.len()
+    }
+
+    /// Record that the rule registered at `path` fired.
+    fn record_rule_hit(&self, path: &str) {
+        use std::sync::atomic::Ordering;
+        if let Some(index) = self.rule_slots.get(path) {
+            self.rule_hits[*index].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn apply_payload(&self, payload: &mut Option<Value>, table: &str) -> Result<()> {
@@ -120,12 +252,15 @@ impl MaskHashTransform {
     ///
     /// `emails.*` masks every element; `profile.*` masks every field of an object one
     /// level down.
-    fn lookup_rule(&self, path: &str) -> Option<&MaskRule> {
-        if let Some(rule) = self.config.mask_rules.get(path) {
-            return Some(rule);
+    fn lookup_rule(&self, path: &str) -> Option<(&MaskRule, &str)> {
+        if let Some(rule) = self.config.mask_rules.get_key_value(path) {
+            return Some((rule.1, rule.0.as_str()));
         }
         let (prefix, _) = path.rsplit_once('.')?;
-        self.config.mask_rules.get(&format!("{prefix}.*"))
+        self.config
+            .mask_rules
+            .get_key_value(&format!("{prefix}.*"))
+            .map(|(matched, rule)| (rule, matched.as_str()))
     }
 
     fn walk_value(&self, value: &mut Value, path: &mut String, table: &str) -> Result<()> {
@@ -147,6 +282,7 @@ impl MaskHashTransform {
             if let Some(rule) = self.config.mask_rules.get(path.as_str()) {
                 if !matches!(rule, MaskRule::Passthrough) {
                     *value = apply_rule(value, rule, &field_aad(table, path))?;
+                    self.record_rule_hit(path.as_str());
                     return Ok(());
                 }
             }
@@ -178,11 +314,15 @@ impl MaskHashTransform {
             }
             _ => {
                 if !path.is_empty() {
-                    let rule = self
-                        .lookup_rule(path.as_str())
-                        .unwrap_or(&self.config.default_rule);
+                    let matched = self.lookup_rule(path.as_str());
+                    let rule = matched.map_or(&self.config.default_rule, |(rule, _)| rule);
                     if !matches!(rule, MaskRule::Passthrough) {
                         *value = apply_rule(value, rule, &field_aad(table, path))?;
+                        if let Some((_, rule_path)) = matched {
+                            // Record against the *configured* path, not the field path,
+                            // so one `emails.*` rule counts every element it covered.
+                            self.record_rule_hit(rule_path);
+                        }
                     }
                 }
             }
@@ -210,9 +350,8 @@ fn field_aad(_table: &str, _path: &str) -> String {
     String::new()
 }
 
-#[async_trait]
 impl Transform for MaskHashTransform {
-    async fn apply(&self, event: &mut Event) -> Result<bool> {
+    fn apply(&self, event: &mut Event) -> Result<bool> {
         // Bind ciphertexts to the table they came from — see `field_aad`.
         let table = event.qualified_table_name();
         self.apply_payload(&mut event.before, &table)?;
@@ -234,12 +373,14 @@ fn apply_rule(value: &Value, rule: &MaskRule, aad: &str) -> Result<Value> {
     Ok(match rule {
         MaskRule::Passthrough => unreachable!("Passthrough is handled before apply_rule"),
         MaskRule::UnsaltedSha256 => {
+            // See `fingerprint_event_stable`: RustCrypto 0.11 digests no longer implement
+            // `LowerHex`, and the hex encoding here is externally visible data.
             let digest = Sha256::digest(value_as_hash_input(value).as_bytes());
-            Value::String(format!("{digest:x}"))
+            Value::String(digest.iter().map(|byte| format!("{byte:02x}")).collect())
         }
         #[cfg(feature = "encryption")]
         MaskRule::HmacSha256(secret) => {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit as _, Mac};
             type HmacSha256Instance = Hmac<Sha256>;
             let resolved = secret.resolve()?;
             let mut mac = HmacSha256Instance::new_from_slice(resolved.as_bytes())
@@ -275,7 +416,7 @@ fn value_as_hash_input(value: &Value) -> std::borrow::Cow<'_, str> {
 #[cfg(feature = "encryption")]
 fn encrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Value> {
     use aes_gcm::{
-        aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+        aead::{Aead, AeadCore, Generate as _, KeyInit},
         Aes256Gcm, Nonce,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -285,11 +426,21 @@ fn encrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Valu
         .map_err(|error| Error::TransformError(format!("invalid encryption key: {error}")))?;
 
     let plaintext = serde_json::to_vec(value)?;
-    let mut nonce = [0_u8; 12];
-    OsRng.fill_bytes(&mut nonce);
+    // `try_generate` rather than `generate`: the infallible variant panics if the OS
+    // entropy source fails, and a panic inside a transform takes the pipeline down with a
+    // backtrace instead of an actionable error. The fallible path also makes the stakes
+    // explicit — a predictable or repeated AES-GCM nonce under the same key is a
+    // key-recovery weakness, not a quality problem, so degrading is never an option.
+    let nonce = Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_generate().map_err(|error| {
+        Error::TransformError(format!(
+            "failed to draw a random AES-GCM nonce from the system entropy source: {error}. \
+             Refusing to encrypt: reusing a nonce under the same key leaks the XOR of the \
+             plaintexts and the GCM authentication subkey."
+        ))
+    })?;
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &nonce,
             aes_gcm::aead::Payload {
                 msg: plaintext.as_ref(),
                 aad: aad.as_bytes(),
@@ -309,7 +460,10 @@ fn encrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Valu
 
 #[cfg(feature = "encryption")]
 fn decrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Value> {
-    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    use aes_gcm::{
+        aead::{Aead, AeadCore},
+        Aes256Gcm, KeyInit, Nonce,
+    };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     let encoded = value.as_str().ok_or_else(|| {
@@ -333,9 +487,14 @@ fn decrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Valu
 
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|error| Error::TransformError(format!("invalid encryption key: {error}")))?;
+    // `TryFrom` rather than the deprecated `from_slice`, which panicked on a wrong length.
+    // The length was already checked above, so this cannot fail — but a panic on attacker-
+    // influenced input is not a failure mode worth keeping around for convenience.
+    let nonce = Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::try_from(nonce.as_slice())
+        .map_err(|_| Error::TransformError("invalid encrypted payload nonce length".into()))?;
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &nonce,
             aes_gcm::aead::Payload {
                 msg: ciphertext.as_ref(),
                 aad: aad.as_bytes(),
@@ -440,7 +599,7 @@ mod tests {
         let transform = MaskHashTransform::new(config);
 
         let mut event = event();
-        transform.apply(&mut event).await.unwrap();
+        transform.apply(&mut event).unwrap();
 
         let after = event.after.as_ref().unwrap();
         assert_eq!(
@@ -468,7 +627,7 @@ mod tests {
             "id": 1,
             "emails": ["a@example.com", "b@example.com", "c@example.com"],
         }));
-        transform.apply(&mut event).await.unwrap();
+        transform.apply(&mut event).unwrap();
 
         let emails = event.after.as_ref().unwrap().get("emails").unwrap();
         assert_eq!(
@@ -505,6 +664,14 @@ mod tests {
         }
     }
 
+    /// An event whose `after` payload is exactly `payload`, with no `before` image.
+    fn event_with(payload: serde_json::Value) -> Event {
+        let mut event = event();
+        event.before = None;
+        event.after = Some(payload);
+        event
+    }
+
     #[tokio::test]
     async fn hash_rule_is_applied() {
         let mut rules = HashMap::new();
@@ -515,7 +682,7 @@ mod tests {
         });
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         assert!(event.after.unwrap()["email"].as_str().unwrap().len() >= 64);
     }
 
@@ -529,7 +696,7 @@ mod tests {
         });
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         let after = event.after.unwrap();
         assert_eq!(after["email"], "***");
         assert!(after["id"].is_null());
@@ -545,7 +712,7 @@ mod tests {
         });
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         assert_eq!(event.after.unwrap()["email"], "alice");
     }
 
@@ -559,7 +726,7 @@ mod tests {
         });
 
         let mut event = event();
-        assert!(transform.apply(&mut event).await.unwrap());
+        assert!(transform.apply(&mut event).unwrap());
         assert_eq!(event.after.unwrap()["profile"]["phone"], "hidden");
     }
 
@@ -574,8 +741,8 @@ mod tests {
 
         let mut first = event();
         let mut second = event();
-        assert!(transform.apply(&mut first).await.unwrap());
-        assert!(transform.apply(&mut second).await.unwrap());
+        assert!(transform.apply(&mut first).unwrap());
+        assert!(transform.apply(&mut second).unwrap());
         assert_eq!(first.after, second.after);
     }
 
@@ -593,7 +760,7 @@ mod tests {
         });
 
         let mut encrypted_event = event();
-        assert!(encrypt.apply(&mut encrypted_event).await.unwrap());
+        assert!(encrypt.apply(&mut encrypted_event).unwrap());
         let ciphertext = encrypted_event.after.as_ref().unwrap()["profile"]["phone"]
             .as_str()
             .unwrap()
@@ -613,7 +780,7 @@ mod tests {
         });
 
         let mut decrypt_event = encrypted_event.clone();
-        assert!(decrypt.apply(&mut decrypt_event).await.unwrap());
+        assert!(decrypt.apply(&mut decrypt_event).unwrap());
         assert_eq!(decrypt_event.after.unwrap()["profile"]["phone"], "123456");
     }
 
@@ -632,8 +799,8 @@ mod tests {
 
         let mut first = event();
         let mut second = event();
-        assert!(transform.apply(&mut first).await.unwrap());
-        assert!(transform.apply(&mut second).await.unwrap());
+        assert!(transform.apply(&mut first).unwrap());
+        assert!(transform.apply(&mut second).unwrap());
         assert_ne!(first.after, second.after);
     }
 
@@ -651,7 +818,7 @@ mod tests {
         });
 
         let mut encrypted_event = event();
-        assert!(encrypt.apply(&mut encrypted_event).await.unwrap());
+        assert!(encrypt.apply(&mut encrypted_event).unwrap());
 
         let mut decrypt_rules = HashMap::new();
         decrypt_rules.insert(
@@ -664,7 +831,7 @@ mod tests {
         });
 
         let mut decrypt_event = encrypted_event;
-        assert!(decrypt.apply(&mut decrypt_event).await.is_err());
+        assert!(decrypt.apply(&mut decrypt_event).is_err());
     }
 
     #[cfg(feature = "encryption")]
@@ -687,7 +854,7 @@ mod tests {
             "profile": {"phone": "123456"}
         }));
 
-        let error = decrypt.apply(&mut malformed_event).await.unwrap_err();
+        let error = decrypt.apply(&mut malformed_event).unwrap_err();
         let message = format!("{error}");
         assert!(message.contains("enc:v1:<nonce>:<ciphertext>"), "{message}");
     }
@@ -713,7 +880,7 @@ mod tests {
 
         let mut source_event = event();
         source_event.before = None;
-        encrypt.apply(&mut source_event).await.unwrap();
+        encrypt.apply(&mut source_event).unwrap();
         let ciphertext = source_event
             .after
             .as_ref()
@@ -734,7 +901,7 @@ mod tests {
         let mut same = event();
         same.before = None;
         same.after = Some(json!({"id": 1, "email": ciphertext.clone()}));
-        decrypt.apply(&mut same).await.unwrap();
+        decrypt.apply(&mut same).unwrap();
         assert_eq!(
             same.after.as_ref().unwrap().get("email").unwrap(),
             "alice@example.com"
@@ -746,7 +913,6 @@ mod tests {
         moved_field.after = Some(json!({"id": 1, "phone": ciphertext.clone()}));
         let error = decrypt
             .apply(&mut moved_field)
-            .await
             .expect_err("a ciphertext moved to another column must not decrypt");
         assert!(format!("{error}").contains("different"), "{error}");
 
@@ -757,7 +923,6 @@ mod tests {
         moved_table.after = Some(json!({"id": 1, "email": ciphertext}));
         decrypt
             .apply(&mut moved_table)
-            .await
             .expect_err("a ciphertext moved to another table must not decrypt");
     }
 
@@ -774,8 +939,8 @@ mod tests {
 
         let mut first = event();
         let mut second = event();
-        assert!(transform.apply(&mut first).await.unwrap());
-        assert!(transform.apply(&mut second).await.unwrap());
+        assert!(transform.apply(&mut first).unwrap());
+        assert!(transform.apply(&mut second).unwrap());
         // Deterministic with same key.
         assert_eq!(first.after, second.after);
 
@@ -802,8 +967,8 @@ mod tests {
 
         let mut e1 = event();
         let mut e2 = event();
-        assert!(t1.apply(&mut e1).await.unwrap());
-        assert!(t2.apply(&mut e2).await.unwrap());
+        assert!(t1.apply(&mut e1).unwrap());
+        assert!(t2.apply(&mut e2).unwrap());
         assert_ne!(
             e1.after, e2.after,
             "different keys must produce different tags"
@@ -835,11 +1000,54 @@ mod tests {
 
         let mut e1 = event();
         let mut e2 = event();
-        assert!(unsalted.apply(&mut e1).await.unwrap());
-        assert!(keyed.apply(&mut e2).await.unwrap());
+        assert!(unsalted.apply(&mut e1).unwrap());
+        assert!(keyed.apply(&mut e2).unwrap());
         assert_ne!(
             e1.after, e2.after,
             "unsalted SHA-256 and HMAC-SHA256 must produce different output for same input"
         );
+    }
+
+    // ─── Fail-open reporting ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_rule_that_never_matches_is_reported_rather_than_silently_ignored() {
+        // Rules match by exact dotted path against a `Passthrough` default, so a typo
+        // or a renamed upstream column disables masking with no error and no log line.
+        // The field then flows through in clear text indefinitely.
+        let mut rules: HashMap<String, MaskRule> = HashMap::new();
+        rules.insert("email".into(), MaskRule::Redact("***".into()));
+        rules.insert("emial".into(), MaskRule::Redact("***".into())); // typo
+        let transform = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: rules,
+            default_rule: MaskRule::Passthrough,
+        });
+
+        let mut event = event_with(json!({"id": 1, "email": "a@example.com"}));
+        transform.apply(&mut event).unwrap();
+
+        assert_eq!(
+            transform.unmatched_rules(),
+            vec!["emial"],
+            "the typo'd rule must be reported as never having matched"
+        );
+        assert_eq!(transform.rule_hit_count("email"), Some(1));
+        assert_eq!(transform.warn_on_unmatched_rules(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_rule_counts_every_element_it_covered() {
+        let mut rules: HashMap<String, MaskRule> = HashMap::new();
+        rules.insert("emails.*".into(), MaskRule::Redact("***".into()));
+        let transform = MaskHashTransform::new(MaskHashConfig {
+            mask_rules: rules,
+            default_rule: MaskRule::Passthrough,
+        });
+
+        let mut event = event_with(json!({"emails": ["a@x.com", "b@x.com", "c@x.com"]}));
+        transform.apply(&mut event).unwrap();
+
+        assert_eq!(transform.rule_hit_count("emails.*"), Some(3));
+        assert!(transform.unmatched_rules().is_empty());
     }
 }

@@ -1,11 +1,15 @@
-//! `Transform`-trait adapter for `WasmRuntime`.
+//! [`AsyncTransform`]-trait adapter for `WasmRuntime`.
+//!
+//! WASM is the one stage in the crate that genuinely must `await`: guest execution runs
+//! behind an async mutex. Everything rustcdc ships otherwise implements the synchronous
+//! [`crate::transform::Transform`], which avoids a boxed future per event.
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
     core::{Event, Result},
-    transform::Transform,
+    transform::AsyncTransform,
     wasm::{TransformResult, WasmConfig, WasmRuntime},
 };
 
@@ -61,7 +65,7 @@ impl std::fmt::Debug for WasmTransform {
 }
 
 #[async_trait]
-impl Transform for WasmTransform {
+impl AsyncTransform for WasmTransform {
     async fn apply(&self, event: &mut Event) -> Result<bool> {
         let mut guard = self.runtime.lock().await;
         match guard.transform(event).await? {
@@ -75,5 +79,31 @@ impl Transform for WasmTransform {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Acquire the runtime lock **once for the batch** rather than once per event.
+    ///
+    /// The default implementation would re-take the async mutex for every event. That
+    /// mutex serialises all callers for the duration of guest execution, so re-taking it
+    /// per event multiplies the contention by the batch size for no benefit — the guest
+    /// is single-threaded either way.
+    async fn apply_batch(&self, events: &mut Vec<Event>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut guard = self.runtime.lock().await;
+        let mut kept = Vec::with_capacity(events.len());
+        for mut event in std::mem::take(events) {
+            match guard.transform(&event).await? {
+                TransformResult::Ok(transformed) => {
+                    event = *transformed;
+                    kept.push(event);
+                }
+                TransformResult::Filtered => {}
+            }
+        }
+        *events = kept;
+        Ok(())
     }
 }

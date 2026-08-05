@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Reliability testing · rustcdc</title><meta name="description" content="Deterministic replay, fault injection and crash simulation for verifying a rustcdc pipeline."><link rel="canonical" href="https://hupe1980.github.io/rustcdc/docs/reliability-testing/">
+
+<meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large">
+<meta name="author" content="hupe1980">
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta property="og:type" content="article">
+<meta property="og:site_name" content="rustcdc">
+<meta property="og:title" content="Reliability testing">
+<meta property="og:description" content="Deterministic replay, fault injection and crash simulation for verifying a rustcdc pipeline.">
+<meta property="og:url" content="https://hupe1980.github.io/rustcdc/docs/reliability-testing/">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Reliability testing">
+<meta name="twitter:description" content="Deterministic replay, fault injection and crash simulation for verifying a rustcdc pipeline.">
+<meta name="twitter:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+
+<link rel="icon" href="https://hupe1980.github.io/rustcdc/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="rustcdc" href="https://hupe1980.github.io/rustcdc/atom.xml">
+<link rel="stylesheet" href="https://hupe1980.github.io/rustcdc/main.css"><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "rustcdc",
+  "description": "Embeddable change data capture for Rust. PostgreSQL, MySQL, MariaDB and SQL Server in one crate — no JVM, no sidecar.",
+  "url": "https://hupe1980.github.io/rustcdc",
+  "codeRepository": "https://github.com/hupe1980/rustcdc",
+  "programmingLanguage": { "@type": "ComputerLanguage", "name": "Rust" },
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": { "@type": "Person", "name": "hupe1980" },
+  "keywords": "change data capture, CDC, Rust, PostgreSQL, MySQL, MariaDB, SQL Server, logical replication, binlog, Debezium alternative"
+}
+</script><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Reliability testing",
+  "description": "Deterministic replay, fault injection and crash simulation for verifying a rustcdc pipeline.",
+  "url": "https://hupe1980.github.io/rustcdc/docs/reliability-testing/",
+  "inLanguage": "en",
+  "isPartOf": {
+    "@type": "WebSite",
+    "name": "rustcdc",
+    "url": "https://hupe1980.github.io/rustcdc"
+  },
+  "author": { "@type": "Person", "name": "hupe1980" }
+}
+</script>
+
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="https://hupe1980.github.io/rustcdc/">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">rustcdc</span>
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="https://hupe1980.github.io/rustcdc/docs/">Docs</a>
+      <a href="https://hupe1980.github.io/rustcdc/docs/getting-started/">Get started</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">API</a>
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+    </nav>
+    <button class="theme-toggle" type="button" aria-label="Toggle colour theme" data-theme-toggle>
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="wrap docs-layout">
+  <nav class="docs-sidebar" aria-label="Documentation">
+  <h2>Start</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;getting-started&#x2F;"
+         >
+        Getting started
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;architecture&#x2F;"
+         >
+        Architecture
+      </a>
+    </li>
+  </ul>
+  <h2>Build</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;api&#x2F;"
+         >
+        API guide
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;config-reference&#x2F;"
+         >
+        Configuration reference
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;schema-evolution&#x2F;"
+         >
+        Schema evolution
+      </a>
+    </li>
+  </ul>
+  <h2>Extend</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;adapter-sdk&#x2F;"
+         >
+        Sink adapter SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-transform-sdk&#x2F;"
+         >
+        WASM transform SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-conformance-contract&#x2F;"
+         >
+        WASM conformance contract
+      </a>
+    </li>
+  </ul>
+  <h2>Operate</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;deployment&#x2F;"
+         >
+        Deployment
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;runbook&#x2F;"
+         >
+        Operations runbook
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;troubleshooting&#x2F;"
+         >
+        Troubleshooting
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;security&#x2F;"
+         >
+        Security
+      </a>
+    </li>
+  </ul>
+  <h2>Verify</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;reliability-testing&#x2F;"
+         class="active" aria-current="page">
+        Reliability testing
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;feature-policy&#x2F;"
+         >
+        Feature policy
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;library-parity-matrix&#x2F;"
+         >
+        Comparison &amp; scope
+      </a>
+    </li>
+  </ul>
+</nav>
+
+  <article class="prose">
+    <h1>Reliability testing</h1>
+    <p class="page-meta">Deterministic replay, fault injection and crash simulation for verifying a rustcdc pipeline.</p>
+    <p>This guide documents the rustcdc reliability validation toolchain and how to use it in CI and local development.</p>
+<h2 id="audience"><a class="zola-anchor" href="#audience" aria-label="Anchor link for: audience">Audience</a></h2>
+<ul>
+<li>Runtime maintainers validating correctness and regression safety</li>
+<li>Connector maintainers extending source behavior</li>
+<li>Integrators who want deterministic, repeatable failure testing</li>
+</ul>
+<h2 id="coverage-areas"><a class="zola-anchor" href="#coverage-areas" aria-label="Anchor link for: coverage-areas">Coverage Areas</a></h2>
+<p>The reliability stack is split into three complementary layers:</p>
+<ol>
+<li>Deterministic replay (<code>rustcdc::deterministic_replay</code>) for protocol-level regression checks.</li>
+<li>Fault injection (<code>rustcdc::fault_injection</code>) for crash and error-path validation.</li>
+<li>Adapter conformance harness (<code>rustcdc::testkit</code>) for sink lifecycle contract checks.</li>
+</ol>
+<p>Use all three layers together for high confidence before releases.</p>
+<h2 id="deterministic-replay"><a class="zola-anchor" href="#deterministic-replay" aria-label="Anchor link for: deterministic-replay">Deterministic Replay</a></h2>
+<h3 id="purpose"><a class="zola-anchor" href="#purpose" aria-label="Anchor link for: purpose">Purpose</a></h3>
+<p>Deterministic replay verifies that canonical event interpretation stays stable across parser and envelope changes.</p>
+<h3 id="key-types"><a class="zola-anchor" href="#key-types" aria-label="Anchor link for: key-types">Key Types</a></h3>
+<ul>
+<li><code>Fixture</code>, <code>FixtureMetadata</code>, <code>FixtureVersioning</code></li>
+<li><code>ReplaySession</code>, <code>ReplayResult</code>, <code>ReplayEvent</code></li>
+<li><code>semantic_diff</code>, <code>EventDiff</code>, <code>DiffLevel</code></li>
+</ul>
+<h3 id="typical-workflow"><a class="zola-anchor" href="#typical-workflow" aria-label="Anchor link for: typical-workflow">Typical Workflow</a></h3>
+<ol>
+<li>Capture protocol-level fixtures from real source traffic.</li>
+<li>Replay fixtures into canonical events with <code>ReplaySession</code>.</li>
+<li>Compare against golden output using semantic diff.</li>
+<li>Fail CI on high-severity semantic drift.</li>
+</ol>
+<h3 id="why-semantic-diff"><a class="zola-anchor" href="#why-semantic-diff" aria-label="Anchor link for: why-semantic-diff">Why Semantic Diff</a></h3>
+<p>Semantic diff intentionally ignores noisy changes (for example field ordering) and highlights behavior regressions (for example operation/type/key changes).</p>
+<h2 id="fault-injection"><a class="zola-anchor" href="#fault-injection" aria-label="Anchor link for: fault-injection">Fault Injection</a></h2>
+<h3 id="purpose-1"><a class="zola-anchor" href="#purpose-1" aria-label="Anchor link for: purpose-1">Purpose</a></h3>
+<p>Fault injection exercises code paths that are difficult to hit with live systems alone, including checkpoint failures and simulated process crashes.</p>
+<h3 id="key-components"><a class="zola-anchor" href="#key-components" aria-label="Anchor link for: key-components">Key Components</a></h3>
+<ul>
+<li><code>FaultInjectingSource</code>, <code>SourceFault</code></li>
+<li><code>FaultInjectingCheckpoint</code>, <code>CheckpointFault</code></li>
+<li><code>CrashSimulationValidator</code>, <code>CrashSimulationResult</code>, <code>CrashSimulationState</code></li>
+<li><code>DataLossValidator</code>, <code>DataLossReport</code></li>
+</ul>
+<h3 id="recommended-scenarios"><a class="zola-anchor" href="#recommended-scenarios" aria-label="Anchor link for: recommended-scenarios">Recommended Scenarios</a></h3>
+<ol>
+<li>Inject transient checkpoint save failures and verify recovery with no silent data loss.</li>
+<li>Inject source stream errors and verify retry policy behavior.</li>
+<li>Simulate crash/restart cycles around commit boundaries and validate replay correctness.</li>
+</ol>
+<h3 id="suite-classification"><a class="zola-anchor" href="#suite-classification" aria-label="Anchor link for: suite-classification">Suite Classification</a></h3>
+<ul>
+<li>Synthetic coverage: <code>tests/crash_recovery_model.rs</code>, <code>tests/data_loss_detection.rs</code></li>
+<li>Live connector/process-kill coverage: <code>tests/runtime_postgres_process_crash_integration.rs</code>, <code>tests/runtime_mysql_process_crash_integration.rs</code>, <code>tests/runtime_mariadb_process_crash_integration.rs</code>, <code>tests/runtime_sqlserver_process_crash_integration.rs</code></li>
+<li>Live process-kill suites require Docker and the <code>CDC_RS_RUN_DOCKER_TESTS=1</code> gate.</li>
+</ul>
+<h3 id="guarantee-boundaries"><a class="zola-anchor" href="#guarantee-boundaries" aria-label="Anchor link for: guarantee-boundaries">Guarantee Boundaries</a></h3>
+<ul>
+<li>Synthetic suites validate internal state-transition and recovery invariants under modeled faults.</li>
+<li>Synthetic suite pass status is not a substitute for OS-level process-kill restart validation.</li>
+<li>Process-kill suites validate restart behavior across real process termination boundaries.</li>
+<li>Production readiness claims for crash recovery must reference both synthetic and process-kill evidence.</li>
+</ul>
+<h2 id="adapter-conformance-harness"><a class="zola-anchor" href="#adapter-conformance-harness" aria-label="Anchor link for: adapter-conformance-harness">Adapter Conformance Harness</a></h2>
+<p><code>rustcdc::testkit</code> provides a reference <code>SinkAdapter</code> contract test suite.</p>
+<h3 id="key-types-1"><a class="zola-anchor" href="#key-types-1" aria-label="Anchor link for: key-types-1">Key Types</a></h3>
+<ul>
+<li><code>SinkAdapter</code></li>
+<li><code>AdapterConformanceSuite</code></li>
+<li><code>BasicAdapterConformance</code></li>
+<li><code>MemorySinkAdapter</code></li>
+</ul>
+<p>The conformance suite runs all baseline scenarios (<code>single_event</code>, <code>batch_send</code>,
+<code>ordering</code>, <code>crash_recovery</code>) through <code>AdapterConformanceSuite::run_all</code>.</p>
+<h3 id="minimum-ci-gate-for-new-adapters"><a class="zola-anchor" href="#minimum-ci-gate-for-new-adapters" aria-label="Anchor link for: minimum-ci-gate-for-new-adapters">Minimum CI Gate For New Adapters</a></h3>
+<ol>
+<li>Run the conformance suite with single-event, batch, ordering, and crash-recovery fixtures.</li>
+<li>Add at least one fixture asserting idempotent handling for duplicate deliveries.</li>
+<li>Record conformance failures as release blockers.</li>
+</ol>
+<h2 id="ci-integration-pattern"><a class="zola-anchor" href="#ci-integration-pattern" aria-label="Anchor link for: ci-integration-pattern">CI Integration Pattern</a></h2>
+<p>A practical CI strategy is:</p>
+<ol>
+<li>Fast path on every PR:
+<ul>
+<li>Deterministic replay golden fixture validation</li>
+<li>Adapter conformance tests for touched adapters</li>
+</ul>
+</li>
+<li>Nightly path:
+<ul>
+<li>Fault injection soak matrix</li>
+<li>Longer crash-recovery simulations</li>
+</ul>
+</li>
+</ol>
+<h2 id="local-validation-commands"><a class="zola-anchor" href="#local-validation-commands" aria-label="Anchor link for: local-validation-commands">Local Validation Commands</a></h2>
+<pre><code data-lang="bash">cargo test deterministic_replay_golden_fixtures
+cargo test fault_injection_soak_matrix
+cargo test runtime_postgres_process_crash_integration
+cargo test runtime_mysql_process_crash_integration --features mysql --bins
+cargo test runtime_mariadb_process_crash_integration --features mariadb --bins
+cargo test runtime_sqlserver_process_crash_integration --features sqlserver --bins
+cargo test data_loss_detection
+</code></pre>
+<h2 id="best-practices"><a class="zola-anchor" href="#best-practices" aria-label="Anchor link for: best-practices">Best Practices</a></h2>
+<ol>
+<li>Keep fixture corpora versioned and reviewed like code.</li>
+<li>Prefer deterministic fixtures over timing-sensitive end-to-end tests for parser regressions.</li>
+<li>Use fault injection to validate observability signals, not only functional outcomes.</li>
+<li>Treat data-loss and commit-barrier regressions as release-blocking defects.</li>
+</ol>
+<h2 id="feature-gate-test-harnesses"><a class="zola-anchor" href="#feature-gate-test-harnesses" aria-label="Anchor link for: feature-gate-test-harnesses">Feature Gate: <code>test-harnesses</code></a></h2>
+<p>The <code>test-harnesses</code> feature exposes <code>rustcdc::testkit</code>, <code>CrashSimulationValidator</code>,
+<code>DataLossValidator</code>, and related types that are only safe to use in test and
+validation environments.</p>
+<p>A compile-time guard prevents <code>test-harnesses</code> from being active in standard
+release builds:</p>
+<pre><code data-lang="rust">#[cfg(all(feature = &quot;test-harnesses&quot;, not(debug_assertions)))]
+compile_error!(&quot;...&quot;);
+</code></pre>
+<blockquote>
+<p><strong>Edge case:</strong> This guard relies on the <code>debug_assertions</code> cfg flag, which is
+<code>false</code> in standard <code>--release</code> builds.  A custom Cargo profile that sets
+<code>debug-assertions = true</code> in release mode (for example, a <code>[profile.release-dbg]</code>
+profile) will bypass the guard and allow <code>test-harnesses</code> to be compiled into a
+release artifact.  If your project uses custom profiles, audit them to ensure
+<code>debug-assertions</code> is <code>false</code> before shipping.</p>
+</blockquote>
+<h2 id="benchmark-evidence"><a class="zola-anchor" href="#benchmark-evidence" aria-label="Anchor link for: benchmark-evidence">Benchmark evidence</a></h2>
+<p>Benchmarks are produced by <code>scripts/ci-benchmark-gate.sh</code>. They are Criterion microbenchmarks
+over the transform and codec paths with <strong>no connector I/O</strong>, so they are a regression signal
+for in-process work — not an end-to-end throughput or latency claim. End-to-end capture
+latency comes from the separate Docker-backed latency harness described under
+<a href="https://hupe1980.github.io/rustcdc/docs/reliability-testing/#coverage-areas">Coverage Areas</a>.</p>
+<p>A local run is classified as non-release evidence:</p>
+<pre><code data-lang="bash">bash scripts/ci-benchmark-gate.sh
+</code></pre>
+<p>Release-grade classification requires commit-pinned metadata and a named Criterion baseline,
+so that a reported delta is between two known trees rather than between a tree and whatever
+happened to be cached:</p>
+<pre><code data-lang="bash">BENCHMARK_STRICT=1 \
+BENCHMARK_MAX_REGRESSION_PERCENT=5 \
+BENCHMARK_BASELINE_COMMIT=&quot;$(git rev-parse HEAD)&quot; \
+BENCHMARK_BASELINE_ARTIFACT=&quot;commit:$(git rev-parse HEAD)&quot; \
+CRITERION_BASELINE=&quot;ci-baseline&quot; \
+bash scripts/ci-benchmark-gate.sh
+</code></pre>
+<p>Use the same <code>CRITERION_BASELINE=ci-baseline</code> value in CI and locally, or the two are not
+comparing against the same reference. Regenerate <code>BENCHMARK_REPORT.md</code> on a clean tree before
+citing any number from it.</p>
+<h2 id="related-documentation"><a class="zola-anchor" href="#related-documentation" aria-label="Anchor link for: related-documentation">Related Documentation</a></h2>
+<ul>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/api/">API Guide</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/architecture/">Architecture</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/runbook/">Operator Runbook</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/troubleshooting/">Troubleshooting Guide</a></li>
+</ul>
+
+
+    <nav class="page-nav" aria-label="Documentation">
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;security&#x2F;">← Security</a>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;feature-policy&#x2F;">Feature policy →</a>
+    </nav>
+  </article>
+</div>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>rustcdc</strong> — embeddable change data capture for Rust.
+      Licensed MIT OR Apache-2.0.
+    </p>
+    <nav aria-label="Footer">
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+      <a href="https:&#x2F;&#x2F;crates.io&#x2F;crates&#x2F;rustcdc" rel="noopener">crates.io</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">docs.rs</a>
+      <a href="https://hupe1980.github.io/rustcdc/atom.xml">Feed</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+// Theme: honour the stored choice, else the OS preference. Inline and tiny so it
+// runs before paint and the page does not flash the wrong theme.
+(function () {
+  var key = "rustcdc-theme";
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem(key); } catch (e) { /* private mode */ }
+  if (stored) root.setAttribute("data-theme", stored);
+
+  var button = document.querySelector("[data-theme-toggle]");
+  if (!button) return;
+  button.addEventListener("click", function () {
+    var current = root.getAttribute("data-theme");
+    var next = current === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) { /* ignore */ }
+  });
+})();
+</script>
+</body>
+</html>

@@ -66,26 +66,13 @@ const CE_SPEC_VERSION: &str = "1.0";
 /// # use rustcdc::codec::{EventEncoder, CloudEventsEncoder};
 /// # use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// let encoder = CloudEventsEncoder::default();
-/// let event = Event {
-///     before: None,
-///     after: Some(serde_json::json!({"id": 1})),
-///     op: Operation::Insert,
-///     source: SourceMetadata {
-///         source_name: "postgres".into(),
-///         offset: "0/16B6A70".into(),
-///         timestamp: 1716595200000,
-///     },
-///     ts: 1716595200000,
-///     schema: Some("public".into()),
-///     table: "users".into(),
-///     primary_key: Some(vec!["id".into()]),
-///     snapshot: None,
-///     transaction: None,
-///     envelope_version: rustcdc::EVENT_ENVELOPE_VERSION,
-///     before_is_key_only: false,
-///     unavailable_columns: Vec::new(),
-///     before_unavailable_columns: Vec::new(),
-/// };
+/// let event = Event::builder("users", Operation::Insert)
+///     .after(serde_json::json!({"id": 1}))
+///     .source(SourceMetadata::new("postgres", "0/16B6A70", 1716595200000))
+///     .ts(1716595200000)
+///     .schema("public")
+///     .primary_key(["id"])
+///     .build();
 ///
 /// let out = encoder.encode(&event).unwrap();
 /// let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();

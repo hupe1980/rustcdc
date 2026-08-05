@@ -1,6 +1,23 @@
 use super::*;
 
 impl CdcRuntime {
+    /// Poll the next batch of events.
+    ///
+    /// Returns an **empty batch** when nothing is available within the poll budget —
+    /// that is normal, and is not end of stream. A non-empty batch carries an
+    /// [`AckToken`] that must be passed to [`CdcRuntime::commit_ack`] before the
+    /// checkpoint advances.
+    ///
+    /// An unacknowledged batch is **redelivered** by the next call rather than skipped,
+    /// so a consumer that drops one loses nothing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Backpressure`] when the commit barrier is full. This is flow control,
+    ///   not a failure: acknowledge the outstanding batch and call again.
+    /// - [`Error::StateError`] if the runtime is not running.
+    /// - Source, transform and checkpoint errors, classified by
+    ///   [`Error::kind`].
     pub async fn poll_event_batch(&mut self) -> Result<EventBatch> {
         if self.state != RuntimeState::Running {
             let error = Error::StateError("runtime is not running".into());
@@ -28,7 +45,20 @@ impl CdcRuntime {
         }
 
         if !self.pending_source_events.is_empty() {
-            return self.flush_pending_source_events();
+            let batch = self.flush_pending_source_events()?;
+            if !batch.is_empty() {
+                return Ok(batch);
+            }
+            // An empty batch here means every queued event was withheld to keep a
+            // transaction whole under `PreserveTransactions`. Returning would re-cut the
+            // same events on the next poll and never ask the source for more — the rest of
+            // the transaction could never arrive, and the pipeline would wedge. Falling
+            // through to the source is what lets it complete.
+            tracing::debug!(
+                target: "rustcdc::core::runtime",
+                withheld = self.pending_source_events.len(),
+                "withholding a partial transaction; polling the source for the remainder",
+            );
         }
 
         if !self.injected_events.is_empty() {
@@ -98,7 +128,7 @@ impl CdcRuntime {
                             tracing::warn!(
                                 target: "rustcdc::core::runtime",
                                 attempt = attempt + 1,
-                                error = %connect_error,
+                                error = %connect_error.report(),
                                 "source reconnect failed; will retry on next attempt",
                             );
                             metrics.record_error(&connect_error, "runtime.poll.stream_reconnect");
@@ -107,11 +137,19 @@ impl CdcRuntime {
                                 .map(|max| attempt >= max)
                                 .unwrap_or(false);
                             if exhausted {
-                                return Err(crate::core::Error::SourceError(format!(
-                                    "connection retries exhausted after {} attempt(s) during reconnect; \
-                                     check source connectivity and connection retry policy configuration",
+                                // Not `SourceError`: that is classified `Transient`,
+                                // so an embedder following the crate's own retry
+                                // guidance would retry a failure whose entire meaning
+                                // is "retrying has already been exhausted".
+                                return Err(crate::core::Error::Unrecoverable(format!(
+                                    "connection retries exhausted after {} attempt(s) during \
+                                     reconnect; the configured ConnectionRetryPolicy has given \
+                                     up. Check source connectivity and credentials, then \
+                                     restart the runtime. Last error is in the preceding \
+                                     warn-level log lines.",
                                     attempt + 1
-                                )));
+                                ))
+                                .context("resuming the stream after a source disconnect"));
                             }
                             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                             delay_ms = (delay_ms.saturating_mul(2)).min(policy.max_delay_ms);
@@ -147,7 +185,7 @@ impl CdcRuntime {
                                 tracing::warn!(
                                     target: "rustcdc::core::runtime",
                                     attempt = attempt + 1,
-                                    error = %start_error,
+                                    error = %start_error.report(),
                                     "stream restart after reconnect failed; will retry",
                                 );
                                 metrics.record_error(&start_error, "runtime.poll.stream_reconnect");
@@ -156,11 +194,18 @@ impl CdcRuntime {
                                     .map(|max| attempt >= max)
                                     .unwrap_or(false);
                                 if exhausted {
-                                    return Err(crate::core::Error::SourceError(format!(
+                                    // See the equivalent guard above: classifying an
+                                    // exhausted retry budget as retryable is a loop.
+                                    return Err(crate::core::Error::Unrecoverable(format!(
                                         "stream restart retries exhausted after {} attempt(s); \
-                                         check source connectivity and connection retry policy configuration",
+                                         the configured ConnectionRetryPolicy has given up. \
+                                         Check source connectivity and credentials, then \
+                                         restart the runtime.",
                                         attempt + 1
-                                    )));
+                                    ))
+                                    .context(
+                                        "restarting the stream after a recoverable source error",
+                                    ));
                                 }
                                 tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms))
                                     .await;
@@ -192,7 +237,7 @@ impl CdcRuntime {
                                 target: "rustcdc::core::runtime",
                                 attempt = attempt + 1,
                                 delay_ms,
-                                error = %error,
+                                error = %error.report(),
                                 "recoverable source error; reconnecting and retrying stream poll",
                             );
                             metrics.record_error(&error, "runtime.poll.stream_retry");
@@ -217,7 +262,7 @@ impl CdcRuntime {
                                 tracing::warn!(
                                     target: "rustcdc::core::runtime",
                                     attempt = attempt + 1,
-                                    error = %connect_error,
+                                    error = %connect_error.report(),
                                     "source reconnect failed; will retry on next attempt",
                                 );
                                 metrics
@@ -251,7 +296,7 @@ impl CdcRuntime {
                                         tracing::warn!(
                                             target: "rustcdc::core::runtime",
                                             attempt = attempt + 1,
-                                            error = %start_error,
+                                            error = %start_error.report(),
                                             "stream restart after reconnect failed; will retry",
                                         );
                                         metrics.record_error(
@@ -298,11 +343,25 @@ impl CdcRuntime {
     }
 
     /// Expose the runtime as a batch stream that yields non-empty deliveries.
+    ///
+    /// Empty polls are absorbed rather than yielded, so the stream only produces
+    /// batches a consumer can act on.
     pub fn event_batches(&mut self) -> BoxStream<'_, Result<EventBatch>> {
         stream::unfold(self, |runtime| async move {
             loop {
                 match runtime.poll_event_batch().await {
-                    Ok(batch) if batch.is_empty() => continue,
+                    Ok(batch) if batch.is_empty() => {
+                        // Yield to the scheduler before looping.
+                        //
+                        // A source that returns empty *synchronously* — a disabled
+                        // source, or any handle that does not honour
+                        // `max_poll_wait_ms` — turns this into an async fn that never
+                        // awaits, which starves its tokio worker thread and can wedge
+                        // an entire single-threaded runtime. `yield_now` costs nothing
+                        // on the normal path, where the source poll already awaited.
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     Ok(batch) => return Some((Ok(batch), runtime)),
                     Err(error) => return Some((Err(error), runtime)),
                 }
@@ -312,6 +371,35 @@ impl CdcRuntime {
     }
 
     pub(super) async fn apply_transforms(&mut self, events: Vec<Event>) -> Result<Vec<Event>> {
+        if self.transform_pipeline.is_empty() || events.is_empty() {
+            return Ok(events);
+        }
+
+        // Fast path: run the whole batch through each stage in turn.
+        //
+        // The pipeline used to be driven one event at a time, and because the trait was
+        // `async`, `#[async_trait]` boxed a future per stage per event — O(events × stages)
+        // heap allocations on the hottest path in the library, to await work that never
+        // yields. Batching also lets a stage amortise per-batch setup, and lets the WASM
+        // stage take its instance lock once instead of `batch.len()` times.
+        //
+        // `Halt` is the default, and under it a failure aborts the batch anyway, so there
+        // is nothing to attribute per event.
+        if self.config.options.transform_error_policy == TransformErrorPolicy::Halt {
+            let mut batch = events;
+            return match self.transform_pipeline.apply_batch(&mut batch).await {
+                Ok(()) => Ok(batch),
+                Err(error) => {
+                    self.record_runtime_error("runtime.transform.halt", &error);
+                    Err(error)
+                }
+            };
+        }
+
+        // `Skip` needs per-event attribution: which event failed, so it can be counted,
+        // logged with its offset, and handed to the dead-letter handler. That is
+        // inherently per-event work, and `Skip` already clones each event for the DLQ, so
+        // there is no fast path to lose here.
         let has_dlq = self.config.options.dead_letter_handler.is_some();
         let mut out = Vec::with_capacity(events.len());
         for event in events {
@@ -323,36 +411,30 @@ impl CdcRuntime {
             match self.transform_pipeline.apply(event).await {
                 Ok(Some(event)) => out.push(event),
                 Ok(None) => {}
-                Err(error) => match self.config.options.transform_error_policy {
-                    TransformErrorPolicy::Halt => {
-                        self.record_runtime_error("runtime.transform.halt", &error);
-                        return Err(error);
+                Err(error) => {
+                    // The checkpoint will advance past this event, so it is
+                    // unrecoverable. Count it — this is the metric the docs
+                    // promised and the crate never emitted.
+                    self.total_events_skipped = self.total_events_skipped.saturating_add(1);
+                    self.record_runtime_error("runtime.transform.skip", &error);
+                    tracing::warn!(
+                        target: "rustcdc::core::runtime",
+                        table = %table,
+                        offset = %offset,
+                        error = %error.report(),
+                        "runtime transform error; skipping event",
+                    );
+                    if let Some((handler, original)) = self
+                        .config
+                        .options
+                        .dead_letter_handler
+                        .as_ref()
+                        .zip(dlq_copy)
+                    {
+                        handler(original, error);
                     }
-                    TransformErrorPolicy::Skip => {
-                        // The checkpoint will advance past this event, so it is
-                        // unrecoverable. Count it — this is the metric the docs
-                        // promised and the crate never emitted.
-                        self.total_events_skipped = self.total_events_skipped.saturating_add(1);
-                        self.record_runtime_error("runtime.transform.skip", &error);
-                        tracing::warn!(
-                            target: "rustcdc::core::runtime",
-                            table = %table,
-                            offset = %offset,
-                            error = %error,
-                            "runtime transform error; skipping event",
-                        );
-                        if let Some((handler, original)) = self
-                            .config
-                            .options
-                            .dead_letter_handler
-                            .as_ref()
-                            .zip(dlq_copy)
-                        {
-                            handler(original, error);
-                        }
-                        continue;
-                    }
-                },
+                    continue;
+                }
             }
         }
         Ok(out)
@@ -389,7 +471,7 @@ impl CdcRuntime {
                 tracing::warn!(
                     target: "rustcdc::core::runtime",
                     lsn,
-                    error = %error,
+                    error = %error.report(),
                     "runtime could not confirm a durably committed source position; \
                      the source will keep replaying committed events",
                 );
@@ -504,7 +586,115 @@ impl CdcRuntime {
             chunk.push(event);
         }
 
+        self.trim_to_transaction_boundary(&mut chunk);
         self.buffer_and_deliver(chunk)
+    }
+
+    /// Withhold a trailing partial transaction from `chunk` under
+    /// [`TransactionBoundaryPolicy::PreserveTransactions`].
+    ///
+    /// A batch is cut on buffer capacity, byte budget, or simply on what the source has
+    /// delivered so far — none of which knows anything about transactions. This holds back
+    /// the trailing run of events belonging to a transaction that is not yet known to have
+    /// ended, so every delivered batch ends on a boundary.
+    ///
+    /// # Knowing that a transaction ended
+    ///
+    /// Two signals count as proof, and nothing else does:
+    ///
+    /// 1. The last event says so — `event_index + 1 == total_events`. Streaming decoders
+    ///    usually cannot fill `total_events` in, so this is the weaker signal.
+    /// 2. A later event belongs to a **different** transaction. Seeing the next
+    ///    transaction begin is how a log-based source proves the previous one is complete.
+    ///
+    /// Absence of proof is not proof: an earlier version returned early when the queue
+    /// behind the cut was empty, treating "I have not seen the rest yet" as "there is no
+    /// rest". That made the guarantee hold only for cuts caused by buffer limits — a
+    /// transaction spread across two polls, which is the *common* case for a streaming
+    /// source, was delivered split anyway.
+    ///
+    /// # Why this cannot wedge
+    ///
+    /// Holding back could stall delivery if a transaction never completes. It is bounded
+    /// by `max_buffer_size`: once a single unfinished transaction fills the batch, it is
+    /// delivered split with a WARN naming the transaction. A permanent silent stall is
+    /// strictly worse than the split this policy exists to avoid.
+    pub(super) fn trim_to_transaction_boundary(&mut self, chunk: &mut Vec<Event>) {
+        if self.config.options.transaction_boundary
+            != TransactionBoundaryPolicy::PreserveTransactions
+        {
+            return;
+        }
+
+        // An event with no transaction metadata — a snapshot row, or a connector that does
+        // not report boundaries — is its own boundary and is never withheld.
+        let Some(last_tx) = chunk
+            .last()
+            .and_then(|event| event.transaction.as_ref())
+            .map(|tx| tx.tx_id)
+        else {
+            return;
+        };
+
+        // Signal 1: the transaction declared its size and this is the final event.
+        if chunk
+            .last()
+            .and_then(|event| event.transaction.as_ref())
+            .is_some_and(|tx| {
+                tx.total_events
+                    .is_some_and(|total| tx.event_index.saturating_add(1) >= total)
+            })
+        {
+            return;
+        }
+
+        // Signal 2: something already queued belongs to a different transaction, which
+        // proves this one ended.
+        let ended = self.pending_source_events.iter().any(|event| {
+            event
+                .transaction
+                .as_ref()
+                .is_none_or(|tx| tx.tx_id != last_tx)
+        });
+        if ended {
+            return;
+        }
+
+        let same_tx = |event: &Event| {
+            event
+                .transaction
+                .as_ref()
+                .is_some_and(|tx| tx.tx_id == last_tx)
+        };
+
+        match chunk.iter().rposition(|event| !same_tx(event)) {
+            Some(index) => {
+                // Push the trailing partial transaction back, preserving order.
+                for event in chunk.drain(index + 1..).rev() {
+                    self.pending_source_events.push_front(event);
+                }
+            }
+            None => {
+                // The whole chunk is one transaction with no end in sight. Hold it back
+                // and wait — unless it already fills the batch, in which case waiting
+                // would be a permanent stall.
+                if chunk.len() >= self.config.options.max_buffer_size {
+                    tracing::warn!(
+                        target: "rustcdc::core::runtime",
+                        tx_id = last_tx,
+                        max_buffer_size = self.config.options.max_buffer_size,
+                        "transaction does not fit in one batch; delivering it split despite \
+                         TransactionBoundaryPolicy::PreserveTransactions. Raise \
+                         max_buffer_size above the largest transaction this source produces \
+                         to restore the guarantee.",
+                    );
+                    return;
+                }
+                for event in chunk.drain(..).rev() {
+                    self.pending_source_events.push_front(event);
+                }
+            }
+        }
     }
 
     fn buffer_and_deliver(&mut self, events: Vec<Event>) -> Result<EventBatch> {
@@ -513,10 +703,22 @@ impl CdcRuntime {
                 event.validate_or_error()?;
             }
             if event.snapshot.is_some() {
-                // Snapshot checkpoints are persisted via SnapshotHandle::checkpoint
-                // using connector-native structured state; avoid clobbering them
-                // with per-event offsets at commit barrier flush time.
-                self.commit_barrier.add_non_persistent_event()?;
+                // A snapshot row carries a chunk cursor, not a log position, so it has
+                // no offset of its own. Ask the stream handle for one: during an
+                // incremental snapshot that offset carries the chunk cursors, and
+                // without it a restart re-reads every table from row zero. A bulk
+                // snapshot handle returns `None`, and those rows stay non-persistent —
+                // their progress is persisted by `SnapshotHandle::checkpoint` instead,
+                // and a per-event offset here would clobber it.
+                match self
+                    .stream
+                    .as_ref()
+                    .filter(|_| self.snapshot.is_none())
+                    .and_then(|stream| stream.position_offset())
+                {
+                    Some(offset) => self.commit_barrier.add_boxed_event(offset)?,
+                    None => self.commit_barrier.add_non_persistent_event()?,
+                }
             } else {
                 let offset = self.build_checkpoint_offset(&event)?;
                 self.commit_barrier.add_event(offset)?;
@@ -533,11 +735,20 @@ impl CdcRuntime {
             .source_type()
             .unwrap_or(event.source.source_name.as_str());
 
+        // Incremental-snapshot chunk cursors must become durable in the *same* write
+        // as the stream position they were captured against — two separately written
+        // records could disagree after a crash between them.
+        let incremental_snapshot = self
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.incremental_snapshot_state());
+
         #[cfg(feature = "postgres")]
         if let RuntimeSourceConfig::Postgres(config) = &self.config.source {
             let lsn = parse_postgres_lsn(&event.source.offset)?;
             let slot_name = config.replication_slot_name.clone();
-            let offset = PostgresOffset { lsn, slot_name };
+            let offset =
+                PostgresOffset::new(lsn, slot_name).with_incremental_snapshot(incremental_snapshot);
             return Ok(GenericOffset::new(
                 "postgres",
                 offset
@@ -567,7 +778,8 @@ impl CdcRuntime {
                 .source_type()
                 .unwrap_or("mysql")
                 .to_string();
-            let offset = MysqlOffset::new(flavor, binlog_file, binlog_pos, gtid);
+            let offset = MysqlOffset::new(flavor, binlog_file, binlog_pos, gtid)
+                .with_incremental_snapshot(incremental_snapshot);
             return Ok(GenericOffset::new(
                 source_type.to_string(),
                 offset
@@ -576,10 +788,30 @@ impl CdcRuntime {
             ));
         }
 
+        #[cfg(feature = "sqlserver")]
+        if matches!(&self.config.source, RuntimeSourceConfig::SqlServer(_)) {
+            let offset = crate::checkpoint::SqlServerOffset::new(event.source.offset.clone())
+                .with_incremental_snapshot(incremental_snapshot);
+            return Ok(GenericOffset::new(
+                "sqlserver",
+                offset
+                    .encode()
+                    .map_err(|error| Error::CheckpointError(error.to_string()))?,
+            ));
+        }
+
+        let _ = incremental_snapshot;
+        // A source this runtime does not know: persist `source.offset` **verbatim**, which
+        // is what the `Source` docs promise and what `Offset::encode` requires ("whatever
+        // `encode` produces has to be decodable back into a resumable position by the
+        // connector that wrote it").
+        //
+        // This used to JSON-encode the string, so a connector whose offset was `42` got
+        // `"42"` back on restart — quotes and all. Anything parsing its own offset format
+        // either failed or, worse, parsed the quoted form into a different position.
         Ok(GenericOffset::new(
             source_type.to_string(),
-            serde_json::to_vec(&event.source.offset)
-                .map_err(|error| Error::SerializationError(error.to_string()))?,
+            event.source.offset.clone().into_bytes(),
         ))
     }
 

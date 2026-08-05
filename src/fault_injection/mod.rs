@@ -15,9 +15,12 @@ compile_error!(
      `[profile.test]` / `[profile.dev]` in Cargo.toml only."
 );
 
+/// Checkpoint-store fault injection.
 pub mod checkpoint;
 pub mod crash;
+/// Data-loss detection over a captured event stream.
 pub mod data_loss;
+/// Source-connector fault injection.
 pub mod source;
 
 pub use checkpoint::{CheckpointFault, FaultInjectingCheckpoint};

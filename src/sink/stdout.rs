@@ -35,7 +35,7 @@ use crate::sink::SinkAdapter;
 /// # #[tokio::main]
 /// # async fn main() {
 /// let mut sink = StdoutSink::new();
-/// let event = Event { op: Operation::Insert, ..Event::default() };
+/// let event = Event::builder("users", Operation::Insert).build();
 /// sink.send(&event).await.unwrap();
 /// # }
 /// ```

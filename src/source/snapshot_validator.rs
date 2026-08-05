@@ -13,11 +13,25 @@ const MAX_PK_SAMPLE: usize = 100;
 /// Result of snapshot validation.
 #[derive(Debug, Clone)]
 pub struct SnapshotValidationResult {
+    /// Rows the source reported for this table.
     pub rows_expected: u64,
+    /// Rows the snapshot actually delivered.
     pub rows_received: u64,
+    /// Rows delivered more than once. Permitted by the at-least-once contract.
     pub duplicate_count: u64,
-    pub missing_rows: Vec<String>, // PK values that were expected but missing
-    pub extra_rows: Vec<String>,   // PK values that were unexpected
+    /// Primary-key values expected but never delivered.
+    ///
+    /// **Non-empty means data loss.**
+    pub missing_rows: Vec<String>,
+    /// Primary-key values delivered but not expected.
+    ///
+    /// Usually concurrent inserts during the snapshot window, not a defect.
+    pub extra_rows: Vec<String>,
+    /// Whether this table passed validation.
+    ///
+    /// Evaluated **per table**. Comparing cross-table totals would let a shortfall in one
+    /// table cancel against an overage in another and report valid while rows were
+    /// genuinely missing.
     pub is_valid: bool,
 }
 

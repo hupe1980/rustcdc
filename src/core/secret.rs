@@ -9,6 +9,16 @@ type SecretCallback = dyn Fn() -> Result<String> + Send + Sync + 'static;
 
 /// Provider interface for loading secrets from an external system.
 pub trait SecretProvider: Send + Sync {
+    /// Resolve `reference` to its secret value.
+    ///
+    /// Called at connect time, not at config time, so short-lived credentials (an AWS IAM
+    /// auth token, a Vault lease) can be refreshed per connection rather than pinned when
+    /// the config was built.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reference cannot be resolved. Connection setup fails
+    /// loudly rather than falling back to an empty password.
     fn resolve_secret(&self, reference: &str) -> Result<String>;
 }
 

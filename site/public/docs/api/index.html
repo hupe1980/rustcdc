@@ -1,0 +1,1281 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>API guide · rustcdc</title><meta name="description" content="The rustcdc embedding model: runtime lifecycle, acknowledgement semantics, transforms, codecs and schema registries."><link rel="canonical" href="https://hupe1980.github.io/rustcdc/docs/api/">
+
+<meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large">
+<meta name="author" content="hupe1980">
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta property="og:type" content="article">
+<meta property="og:site_name" content="rustcdc">
+<meta property="og:title" content="API guide">
+<meta property="og:description" content="The rustcdc embedding model: runtime lifecycle, acknowledgement semantics, transforms, codecs and schema registries.">
+<meta property="og:url" content="https://hupe1980.github.io/rustcdc/docs/api/">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="API guide">
+<meta name="twitter:description" content="The rustcdc embedding model: runtime lifecycle, acknowledgement semantics, transforms, codecs and schema registries.">
+<meta name="twitter:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+
+<link rel="icon" href="https://hupe1980.github.io/rustcdc/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="rustcdc" href="https://hupe1980.github.io/rustcdc/atom.xml">
+<link rel="stylesheet" href="https://hupe1980.github.io/rustcdc/main.css"><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "rustcdc",
+  "description": "Embeddable change data capture for Rust. PostgreSQL, MySQL, MariaDB and SQL Server in one crate — no JVM, no sidecar.",
+  "url": "https://hupe1980.github.io/rustcdc",
+  "codeRepository": "https://github.com/hupe1980/rustcdc",
+  "programmingLanguage": { "@type": "ComputerLanguage", "name": "Rust" },
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": { "@type": "Person", "name": "hupe1980" },
+  "keywords": "change data capture, CDC, Rust, PostgreSQL, MySQL, MariaDB, SQL Server, logical replication, binlog, Debezium alternative"
+}
+</script><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "API guide",
+  "description": "The rustcdc embedding model: runtime lifecycle, acknowledgement semantics, transforms, codecs and schema registries.",
+  "url": "https://hupe1980.github.io/rustcdc/docs/api/",
+  "inLanguage": "en",
+  "isPartOf": {
+    "@type": "WebSite",
+    "name": "rustcdc",
+    "url": "https://hupe1980.github.io/rustcdc"
+  },
+  "author": { "@type": "Person", "name": "hupe1980" }
+}
+</script>
+
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="https://hupe1980.github.io/rustcdc/">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">rustcdc</span>
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="https://hupe1980.github.io/rustcdc/docs/">Docs</a>
+      <a href="https://hupe1980.github.io/rustcdc/docs/getting-started/">Get started</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">API</a>
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+    </nav>
+    <button class="theme-toggle" type="button" aria-label="Toggle colour theme" data-theme-toggle>
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="wrap docs-layout">
+  <nav class="docs-sidebar" aria-label="Documentation">
+  <h2>Start</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;getting-started&#x2F;"
+         >
+        Getting started
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;architecture&#x2F;"
+         >
+        Architecture
+      </a>
+    </li>
+  </ul>
+  <h2>Build</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;api&#x2F;"
+         class="active" aria-current="page">
+        API guide
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;config-reference&#x2F;"
+         >
+        Configuration reference
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;schema-evolution&#x2F;"
+         >
+        Schema evolution
+      </a>
+    </li>
+  </ul>
+  <h2>Extend</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;adapter-sdk&#x2F;"
+         >
+        Sink adapter SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-transform-sdk&#x2F;"
+         >
+        WASM transform SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-conformance-contract&#x2F;"
+         >
+        WASM conformance contract
+      </a>
+    </li>
+  </ul>
+  <h2>Operate</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;deployment&#x2F;"
+         >
+        Deployment
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;runbook&#x2F;"
+         >
+        Operations runbook
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;troubleshooting&#x2F;"
+         >
+        Troubleshooting
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;security&#x2F;"
+         >
+        Security
+      </a>
+    </li>
+  </ul>
+  <h2>Verify</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;reliability-testing&#x2F;"
+         >
+        Reliability testing
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;feature-policy&#x2F;"
+         >
+        Feature policy
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;library-parity-matrix&#x2F;"
+         >
+        Comparison &amp; scope
+      </a>
+    </li>
+  </ul>
+</nav>
+
+  <article class="prose">
+    <h1>API guide</h1>
+    <p class="page-meta">The rustcdc embedding model: runtime lifecycle, acknowledgement semantics, transforms, codecs and schema registries.</p>
+    <p>This document is the primary API reference for embedding rustcdc in Rust applications.</p>
+<h2 id="audience"><a class="zola-anchor" href="#audience" aria-label="Anchor link for: audience">Audience</a></h2>
+<p>This guide is for engineers integrating rustcdc as a library and building custom runtime loops.</p>
+<h2 id="api-surface"><a class="zola-anchor" href="#api-surface" aria-label="Anchor link for: api-surface">API Surface</a></h2>
+<p>The core embedder API is centered on:</p>
+<ul>
+<li><code>RuntimeConfig</code> for runtime construction</li>
+<li><code>CdcRuntime</code> for lifecycle and event delivery</li>
+<li><code>RuntimeSourceConfig</code> for source selection</li>
+<li><code>EventBatch</code> and <code>AckMode</code> for loss-safe delivery semantics</li>
+</ul>
+<h2 id="runtime-construction"><a class="zola-anchor" href="#runtime-construction" aria-label="Anchor link for: runtime-construction">Runtime Construction</a></h2>
+<p><code>RuntimeConfig</code> binds four concerns:</p>
+<ul>
+<li>source connector configuration</li>
+<li>checkpoint backend</li>
+<li>schema history backend</li>
+<li>runtime options and observability</li>
+</ul>
+<p>Typical shape:</p>
+<pre><code data-lang="rust">use rustcdc::{
+  checkpoint::InMemoryCheckpoint,
+  IdempotencyOptions,
+  schema_history::InMemorySchemaHistory,
+  RuntimeConfig,
+  RuntimeSourceConfig,
+};
+
+# fn example() -&gt; rustcdc::Result&lt;()&gt; {
+let checkpoint = InMemoryCheckpoint::default();
+let schema_history = InMemorySchemaHistory::default();
+
+let config = RuntimeConfig::new(
+  RuntimeSourceConfig::Disabled,
+  checkpoint,
+  schema_history,
+)
+.with_max_buffer_size(10_000)
+.with_idempotency(IdempotencyOptions::new(100_000)?)
+.with_max_poll_wait_ms(500);
+
+// InMemoryCheckpoint is for tests and local development only.
+// Use FileCheckpoint (or a custom durable backend) in production.
+
+// Runtime duplicate suppression is enabled by default.
+// Use this only when you need to opt out explicitly.
+let config_without_dedup = RuntimeConfig::new(
+  RuntimeSourceConfig::Disabled,
+  InMemoryCheckpoint::default(),
+  InMemorySchemaHistory::default(),
+)
+.with_idempotency_disabled();
+# let _ = (config, config_without_dedup);
+# Ok(())
+# }
+</code></pre>
+<p>Durable schema history for restart resilience:</p>
+<pre><code data-lang="rust">use rustcdc::{
+  checkpoint::InMemoryCheckpoint,
+  schema_history::FileSchemaHistory,
+  RuntimeConfig,
+  RuntimeSourceConfig,
+};
+
+async fn durable_schema_history_config() -&gt; rustcdc::Result&lt;()&gt; {
+  let checkpoint = InMemoryCheckpoint::default();
+  let schema_history = FileSchemaHistory::new(&quot;/var/lib/rustcdc/schema-history.json&quot;).await?;
+
+  let _config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+  Ok(())
+}
+</code></pre>
+<h2 id="runtime-lifecycle"><a class="zola-anchor" href="#runtime-lifecycle" aria-label="Anchor link for: runtime-lifecycle">Runtime Lifecycle</a></h2>
+<p>The canonical lifecycle is:</p>
+<ol>
+<li>create runtime with <code>CdcRuntime::new</code></li>
+<li>start runtime with <code>start()</code></li>
+<li>read batches with <code>poll_event_batch()</code> or <code>event_batches()</code></li>
+<li>acknowledge durable progress with <code>commit_ack()</code></li>
+<li>stop runtime with <code>stop()</code></li>
+</ol>
+<p>Minimal lifecycle example:</p>
+<pre><code data-lang="rust">use rustcdc::{CdcRuntime, Result, RuntimeConfig, RuntimeSourceConfig};
+use rustcdc::checkpoint::InMemoryCheckpoint;
+use rustcdc::schema_history::InMemorySchemaHistory;
+
+async fn run_once() -&gt; Result&lt;()&gt; {
+  let checkpoint = InMemoryCheckpoint::default();
+  let schema_history = InMemorySchemaHistory::default();
+  let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+
+  let mut runtime = CdcRuntime::new(config)?;
+  runtime.start().await?;
+
+  let batch = runtime.poll_event_batch().await?;
+  runtime.commit_ack(batch.ack_mode()).await?;
+
+  runtime.stop().await?;
+  Ok(())
+}
+</code></pre>
+<h2 id="source-selection"><a class="zola-anchor" href="#source-selection" aria-label="Anchor link for: source-selection">Source Selection</a></h2>
+<p><code>RuntimeSourceConfig</code> selects the source connector at runtime:</p>
+<ul>
+<li><code>Postgres(PostgresSourceConfig)</code></li>
+<li><code>Mysql(MysqlSourceConfig)</code></li>
+<li><code>MariaDb(MariaDbSourceConfig)</code></li>
+<li><code>SqlServer(SqlServerSourceConfig)</code></li>
+</ul>
+<p>Prefer the associated constructors when building embedder code for readability:</p>
+<p><code>RuntimeSourceConfig::postgres(...)</code>
+<code>RuntimeSourceConfig::mysql(...)</code>
+<code>RuntimeSourceConfig::mariadb(...)</code>
+<code>RuntimeSourceConfig::sqlserver(...)</code>
+<code>RuntimeSourceConfig::disabled()</code></p>
+<p>Source configuration in library code is explicit and typed; environment parsing
+belongs in host applications or examples that map <code>CDC_RS_*</code> variables into
+connector config values.</p>
+<p>The runtime also exposes connector capability metadata via <code>source_capabilities()</code> and validates incompatible settings (for example, snapshot tables for a source that does not support snapshots). Capability metadata includes <code>snapshot_checkpoint_resume</code>, which is <code>true</code> for PostgreSQL, MySQL, and SQL Server. Snapshot checkpoints now resume through connector-native cursor state and keep stream bootstrap aligned with the saved snapshot watermark.</p>
+<h2 id="event-model"><a class="zola-anchor" href="#event-model" aria-label="Anchor link for: event-model">Event Model</a></h2>
+<p><code>Event</code> is the canonical envelope consumed by downstream code.</p>
+<p>Key fields include:</p>
+<ul>
+<li><code>op</code>: one of <code>Insert</code>, <code>Update</code>, <code>Delete</code>, <code>Read</code>, <code>SchemaChange</code>, <code>Truncate</code></li>
+<li><code>source</code>: source metadata and offset context</li>
+<li><code>transaction</code>: optional transaction metadata</li>
+<li><code>snapshot</code>: optional snapshot metadata</li>
+</ul>
+<p><code>Operation::Truncate</code> is emitted when a <code>TRUNCATE</code> statement removes all rows from a table.
+<code>before</code> and <code>after</code> are always <code>None</code> for truncate events. Only connectors that advertise
+<code>ConnectorCapabilities::truncate</code> emit this variant (PostgreSQL, MySQL, MariaDB, and
+SQL Server when <code>capture_truncate_events</code> is enabled).
+<code>Operation::to_str()</code> returns a <code>&amp;'static str</code> for zero-allocation display and comparison.</p>
+<p>The event envelope is designed to support stable replay and source-agnostic processing.</p>
+<h3 id="constructing-events"><a class="zola-anchor" href="#constructing-events" aria-label="Anchor link for: constructing-events">Constructing events</a></h3>
+<p><code>Event</code>, <code>SourceMetadata</code>, <code>SnapshotMetadata</code> and <code>TransactionMetadata</code> are
+<code>#[non_exhaustive]</code>, so code outside this crate builds them through constructors rather than
+struct literals:</p>
+<pre><code data-lang="rust">use rustcdc::{Event, Operation, SourceMetadata};
+use serde_json::json;
+
+let event = Event::builder(&quot;users&quot;, Operation::Insert)
+    .source(SourceMetadata::new(&quot;postgres&quot;, &quot;0/16B2E48&quot;, 1_700_000_000_000))
+    .schema(&quot;public&quot;)
+    .after(json!({ &quot;id&quot;: 1, &quot;email&quot;: &quot;a@example.com&quot; }))
+    .primary_key([&quot;id&quot;])
+    .ts(1_700_000_000_000)
+    .build();
+
+assert!(event.validate().is_ok());
+</code></pre>
+<p>This is not ceremony for its own sake. Every field added to the envelope used to be a breaking
+change for every construction site — it broke this crate's own published adapter SDK example in
+0.7.0. With <code>#[non_exhaustive]</code> plus a builder, adding a field is a minor-version change.</p>
+<p>The builder also sets <code>envelope_version</code> for you. Writing that constant by hand is not a
+compile error but makes the event fail validation at the far end of the pipeline, which is a
+poor place to learn about it.</p>
+<p>Use <code>build_validated()</code> at a source boundary to enforce the envelope contract where the event
+is produced:</p>
+<pre><code data-lang="rust"># use rustcdc::{Event, Operation, SourceMetadata};
+# fn example() -&gt; rustcdc::Result&lt;()&gt; {
+let event = Event::builder(&quot;users&quot;, Operation::Insert)
+    .source(SourceMetadata::new(&quot;postgres&quot;, &quot;0/16B2E48&quot;, 1))
+    .after(serde_json::json!({ &quot;id&quot;: 1 }))
+    .ts(1)
+    .build_validated()?;
+# let _ = event;
+# Ok(())
+# }
+</code></pre>
+<h3 id="partial-payloads-read-this-before-writing-a-sink"><a class="zola-anchor" href="#partial-payloads-read-this-before-writing-a-sink" aria-label="Anchor link for: partial-payloads-read-this-before-writing-a-sink">Partial payloads — read this before writing a sink</a></h3>
+<p>Some events do not carry a complete row. Applying one as if it were complete is the classic
+CDC corruption: you write <code>NULL</code> over a column that never changed. <strong>The library gives you an
+API that cannot express that write — use it instead of reading <code>after</code> directly.</strong></p>
+<h4 id="event-row-write-the-safe-path"><a class="zola-anchor" href="#event-row-write-the-safe-path" aria-label="Anchor link for: event-row-write-the-safe-path"><code>Event::row_write()</code> — the safe path</a></h4>
+<p><code>row_write()</code> folds the payload, the missing columns and the primary key into the single
+write that is correct for the event:</p>
+<pre><code data-lang="rust">use rustcdc::{Event, RowWrite};
+# struct Sink;
+# impl Sink {
+#     fn replace(&amp;self, _key: Option&lt;serde_json::Value&gt;, _row: &amp;serde_json::Value) {}
+#     fn update_only(&amp;self, _key: serde_json::Value, _columns: &amp;serde_json::Value) {}
+#     fn delete(&amp;self, _key: serde_json::Value) {}
+#     fn truncate(&amp;self) {}
+# }
+# fn log_unwritable(_reason: rustcdc::NoRowWrite) {}
+# fn example(event: &amp;Event, sink: &amp;Sink) {
+match event.row_write() {
+    // The payload is complete. Write every column.
+    RowWrite::Replace { key, row } =&gt; sink.replace(key, row),
+
+    // The payload is INCOMPLETE. Write only `columns`; leave every other column in the
+    // target row untouched. In SQL: `UPDATE ... SET &lt;columns&gt; WHERE &lt;key&gt;` — never an
+    // upsert built from the full column list.
+    RowWrite::Merge { key, columns, .. } =&gt; sink.update_only(key, columns),
+
+    RowWrite::Delete { key } =&gt; sink.delete(key),
+    RowWrite::Truncate =&gt; sink.truncate(),
+
+    // DDL, or no addressable row (no primary key). Nothing to write.
+    RowWrite::None { reason } =&gt; log_unwritable(reason),
+    _ =&gt; {}
+}
+# }
+</code></pre>
+<p><code>RowWrite::Merge</code> hands you only the columns that are actually present, so there is no
+placeholder value available to write by mistake. <code>RowWrite::is_partial()</code> returns <code>true</code> for
+exactly that variant — branch on it if your sink cannot express a partial update (an
+append-only file, a whole-document replace).</p>
+<p>The enum is <code>#[non_exhaustive]</code>; match with a wildcard arm.</p>
+<h4 id="the-underlying-fields"><a class="zola-anchor" href="#the-underlying-fields" aria-label="Anchor link for: the-underlying-fields">The underlying fields</a></h4>
+<p><code>row_write()</code> is derived from these. Read them directly only if you need finer control.</p>
+<h5 id="unavailable-columns-vec-string"><a class="zola-anchor" href="#unavailable-columns-vec-string" aria-label="Anchor link for: unavailable-columns-vec-string"><code>unavailable_columns: Vec&lt;String&gt;</code></a></h5>
+<p>Columns that exist on the table but whose value the source <strong>could not supply</strong> for the
+<code>after</code> image. They are <strong>absent</strong> from <code>after</code> — not <code>null</code>. Without this list the two are
+indistinguishable.</p>
+<p>The concrete case is <strong>PostgreSQL unchanged-TOAST</strong>: when a large value (roughly &gt;8 KB —
+<code>text</code>, <code>bytea</code>, <code>jsonb</code>) is not modified by an <code>UPDATE</code>, PostgreSQL omits it from the WAL
+entirely and pgoutput sends a <code>'u'</code> placeholder. The value is unrecoverable; reading it back
+out-of-band would race concurrent writes and return a value from a different point in time.</p>
+<blockquote>
+<p>⚠️ <strong><code>REPLICA IDENTITY FULL</code> does not avoid this.</strong> Replica identity governs the <em>old</em>
+tuple only. The after-image still omits unmodified TOASTed values under every replica
+identity setting. <code>FULL</code> gives you a complete before-image (see <code>before_is_key_only</code>
+below); it does not make <code>after</code> complete.</p>
+</blockquote>
+<p>This is also why the failure mode is so late-breaking: it only begins once rows cross the
+TOAST threshold, typically long after the pipeline was validated against small test rows.</p>
+<h5 id="before-unavailable-columns-vec-string"><a class="zola-anchor" href="#before-unavailable-columns-vec-string" aria-label="Anchor link for: before-unavailable-columns-vec-string"><code>before_unavailable_columns: Vec&lt;String&gt;</code></a></h5>
+<p>The same thing for the <code>before</code> image, tracked <strong>separately</strong>, because the two sets are not
+the same. A TOASTed column that <em>was</em> modified arrives present in <code>after</code> and absent from
+<code>before</code>. Merging the lists would mark a column that genuinely changed as unwritable and
+silently drop the update — so they are never merged.</p>
+<p>Only relevant if you consume the before-image (computing diffs, building compensating
+writes). A column listed here had <em>some</em> prior value; the source could not report it. Do not
+read its absence as "was NULL".</p>
+<h5 id="before-is-key-only-bool"><a class="zola-anchor" href="#before-is-key-only-bool" aria-label="Anchor link for: before-is-key-only-bool"><code>before_is_key_only: bool</code></a></h5>
+<p><code>true</code> when <code>before</code> holds only the primary-key columns rather than a complete pre-image.
+Occurs on PostgreSQL <code>UPDATE</code>/<code>DELETE</code> when the table's <code>REPLICA IDENTITY</code> is <code>DEFAULT</code> (the
+PostgreSQL default). Code that computes row diffs or needs full prior state must check this —
+when <code>true</code>, <code>before</code> is not a row snapshot. Set <code>REPLICA IDENTITY FULL</code> on the table to get a
+complete before-image, at the cost of larger WAL volume and therefore more replication-slot
+retention pressure.</p>
+<p><code>before_unavailable_columns</code> is always empty when this is <code>true</code>: a key-only before-image
+omits its non-key columns by design, not because of TOAST.</p>
+<h2 id="delivery-and-acknowledgement-semantics"><a class="zola-anchor" href="#delivery-and-acknowledgement-semantics" aria-label="Anchor link for: delivery-and-acknowledgement-semantics">Delivery And Acknowledgement Semantics</a></h2>
+<p><code>poll_event_batch()</code> returns an <code>EventBatch</code> that contains events and an <code>AckMode</code>.</p>
+<pre><code data-lang="rust">// Shape only — `AckMode` is defined by the crate, not by your code.
+pub enum AckMode {
+    Required(AckToken),   // must commit; skipping risks replay on restart
+    NotRequired,          // empty batch or disabled source; commit_ack is a no-op
+}
+</code></pre>
+<p>Correct processing sequence:</p>
+<ol>
+<li>consume events in batch order</li>
+<li>durably commit sink side effects</li>
+<li>call <code>commit_ack(batch.ack_mode())</code></li>
+</ol>
+<p><code>commit_ack</code> accepts <code>impl Into&lt;AckMode&gt;</code> — passing <code>AckMode::NotRequired</code> is a documented zero-cost no-op. Raw <code>AckToken</code> values are also accepted (via <code>From&lt;AckToken&gt;</code>).</p>
+<p>Important semantics:</p>
+<ul>
+<li>not acknowledging after sink durability may replay already-delivered events</li>
+<li><code>stop()</code> fails fast if uncommitted events remain in-flight</li>
+<li><code>force_stop()</code> is intended for emergency drain where replay is acceptable; emits a <code>WARN</code> log with <code>shutdown_mode = "forced"</code></li>
+<li><code>drain_and_stop()</code> polls until the source is exhausted then stops cleanly</li>
+<li>process termination without <code>stop()</code> can replay the in-flight batch on restart (at-least-once)</li>
+<li>source confirmation failures after durable checkpoint commit now fail fast by default (<code>PostCommitSourceConfirmPolicy::FailFast</code>)</li>
+</ul>
+<p>To preserve pre-existing availability-biased behavior, opt into continue mode explicitly:</p>
+<pre><code data-lang="rust">use rustcdc::PostCommitSourceConfirmPolicy;
+# use rustcdc::{checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory,
+#     RuntimeConfig, RuntimeSourceConfig};
+# let config = RuntimeConfig::new(
+#     RuntimeSourceConfig::Disabled,
+#     InMemoryCheckpoint::default(),
+#     InMemorySchemaHistory::default(),
+# );
+
+let config = config.with_post_commit_source_confirm_policy(
+  PostCommitSourceConfirmPolicy::Continue,
+);
+# let _ = config;
+</code></pre>
+<h3 id="sink-side-idempotency-guard"><a class="zola-anchor" href="#sink-side-idempotency-guard" aria-label="Anchor link for: sink-side-idempotency-guard">Sink-Side Idempotency Guard</a></h3>
+<p>For at-least-once replay tolerance, rustcdc now provides a built-in
+<code>EventIdempotencyGuard</code> helper for consumer loops.</p>
+<pre><code data-lang="rust">use rustcdc::{EventIdempotencyGuard, Result};
+
+async fn process_batch(events: &amp;[rustcdc::Event]) -&gt; Result&lt;usize&gt; {
+  let mut guard = EventIdempotencyGuard::new(100_000)?.with_ttl_ms(60_000)?;
+  let mut applied = 0usize;
+
+  for event in events {
+    if !guard.should_process(event)? {
+      continue;
+    }
+    // apply sink side-effect here
+    applied += 1;
+  }
+
+  Ok(applied)
+}
+</code></pre>
+<p>The fingerprint includes source position, transaction sequence metadata, and
+payload shape so events that share coarse offsets remain distinguishable.</p>
+<h3 id="idempotency-guard-safety"><a class="zola-anchor" href="#idempotency-guard-safety" aria-label="Anchor link for: idempotency-guard-safety">Idempotency guard safety</a></h3>
+<p>The fingerprint is content-derived, so two genuinely distinct rows that happen to be
+byte-identical hash identically. That is not hypothetical: an audit or event-log table with no
+primary key can legitimately contain <code>INSERT INTO pings VALUES ('ok'), ('ok')</code>, and on a
+connector that supplies no intra-transaction sequencing both rows share one source offset.
+Suppressing the second is permanent, silent data loss — the checkpoint advances past it and
+nothing downstream can recover it.</p>
+<p>The guard therefore suppresses only events it can <strong>identify</strong>: those carrying transaction
+metadata (<code>tx_id</code> + <code>event_index</code>) or a primary key whose columns are actually present in the
+row image. Everything else passes through and is counted in
+<code>EventIdempotencyGuard::unidentifiable_passthrough_count()</code> (and
+<code>RuntimeAdminSnapshot::idempotency_unidentifiable_passthrough</code>).</p>
+<p>Passing a duplicate through is at-least-once — the guarantee the pipeline already documents.
+Dropping a distinct row is not recoverable by anyone.</p>
+<p>Evictions are counted too (<code>eviction_count()</code>): a steadily growing value means the window is
+too small for this deployment's replay distance, so duplicates older than the window stop being
+suppressed. Delivery stays correct; a sink relying on the guard will start seeing repeats.
+Raise <code>IdempotencyOptions::capacity</code>.</p>
+<h3 id="restart-replay-window"><a class="zola-anchor" href="#restart-replay-window" aria-label="Anchor link for: restart-replay-window">Restart Replay Window</a></h3>
+<p><strong>The in-memory idempotency guard resets on every process restart.</strong> It provides
+within-session deduplication only, not cross-restart deduplication.</p>
+<p>On restart the runtime replays all events between the last durable checkpoint and
+the current source position. Events in this window that were already delivered
+before the crash <strong>will be re-delivered</strong> and will not be detected as duplicates
+by the in-memory guard (because its state was lost).</p>
+<p><strong>Implications:</strong></p>
+<ul>
+<li>The replay window size is bounded by your commit frequency. Committing after
+each batch keeps the window small.</li>
+<li>For sink operations that are naturally idempotent (upsert-by-PK, conditional
+inserts, etc.) this is safe to ignore.</li>
+<li>For non-idempotent sinks (append-only log ingest, payment triggers, etc.) you
+<strong>must</strong> provide cross-restart deduplication at the sink layer.</li>
+</ul>
+<p><strong>Cross-restart deduplication pattern:</strong></p>
+<p>Use <code>fingerprint_event_stable</code> (SHA-256 based, deterministic across process
+restarts) and persist seen fingerprints in your sink's storage:</p>
+<pre><code data-lang="rust">use rustcdc::fingerprint_event_stable;
+# use rustcdc::{Event, Result};
+# async fn sink_has_seen(_fp: &amp;str) -&gt; Result&lt;bool&gt; { Ok(false) }
+# async fn sink_write(_event: &amp;Event) -&gt; Result&lt;()&gt; { Ok(()) }
+# async fn sink_mark_seen(_fp: &amp;str) -&gt; Result&lt;()&gt; { Ok(()) }
+# async fn example(event: &amp;Event) -&gt; Result&lt;()&gt; {
+// On each delivered event:
+let fingerprint = fingerprint_event_stable(event)?; // Result&lt;String, FingerprintError&gt;
+if !sink_has_seen(&amp;fingerprint).await? {
+    sink_write(event).await?;
+    sink_mark_seen(&amp;fingerprint).await?;
+}
+# Ok(())
+# }
+</code></pre>
+<p>Unlike <code>fingerprint_event_transient</code> (which uses a per-process random seed),
+<code>fingerprint_event_stable</code> produces the same fingerprint for the same event
+across restarts, making it safe to persist and check against a durable store.</p>
+<h2 id="streaming-consumption"><a class="zola-anchor" href="#streaming-consumption" aria-label="Anchor link for: streaming-consumption">Streaming Consumption</a></h2>
+<p><code>event_batches()</code> provides a stream-based consumption model for non-empty batches.</p>
+<pre><code data-lang="rust">use futures_util::StreamExt;
+# use rustcdc::{CdcRuntime, Result};
+# async fn example(runtime: &amp;mut CdcRuntime) -&gt; Result&lt;()&gt; {
+let mut batches = runtime.event_batches();
+while let Some(batch) = batches.next().await {
+  let batch = batch?;
+  // `event_batches` borrows the runtime for the life of the stream, so the ack
+  // goes through the batch&#39;s own token rather than through `runtime`.
+  let _ = batch;
+}
+# Ok(())
+# }
+</code></pre>
+<p>Note the borrow: <code>event_batches()</code> holds <code>&amp;mut runtime</code> for as long as the stream
+lives, so <code>commit_ack</code> cannot be called on <code>runtime</code> inside the loop. Use
+<code>poll_event_batch()</code> in a plain loop when you need to acknowledge inline:</p>
+<pre><code data-lang="rust"># use rustcdc::{CdcRuntime, Result};
+# async fn example(runtime: &amp;mut CdcRuntime) -&gt; Result&lt;()&gt; {
+loop {
+  let batch = runtime.poll_event_batch().await?;
+  if batch.is_empty() {
+    break;
+  }
+  // durably apply sink side effects here, then acknowledge
+  runtime.commit_ack(batch.ack_mode()).await?;
+}
+# Ok(())
+# }
+</code></pre>
+<p>For cooperative cancellation, use <code>event_batches_cancellable(token)</code> with a <code>CancellationToken</code>:</p>
+<pre><code data-lang="rust">use tokio_util::sync::CancellationToken;
+use futures_util::StreamExt;
+# use rustcdc::{CdcRuntime, Result};
+# async fn example(runtime: &amp;mut CdcRuntime) -&gt; Result&lt;()&gt; {
+let cancel = CancellationToken::new();
+let mut batches = std::pin::pin!(runtime.event_batches_cancellable(cancel.clone()));
+while let Some(batch) = batches.next().await {
+  let _batch = batch?;
+}
+// cancel.cancel() from another task unblocks the stream cleanly
+# Ok(())
+# }
+</code></pre>
+<h2 id="incremental-snapshot-api-dblog-pattern"><a class="zola-anchor" href="#incremental-snapshot-api-dblog-pattern" aria-label="Anchor link for: incremental-snapshot-api-dblog-pattern">Incremental Snapshot API (DBLog Pattern)</a></h2>
+<p><code>CdcRuntime::start()</code> supports both classic snapshot + stream handoff and
+runtime-driven incremental snapshot startup (when configured via
+<code>with_incremental_snapshot(...)</code>).</p>
+<p>If you want connector-managed non-blocking incremental snapshot behavior,
+you can also start it directly from a connector connection via
+<code>start_incremental_snapshot(...)</code>.</p>
+<pre><code data-lang="rust"># #[cfg(feature = &quot;postgres&quot;)]
+# mod example {
+use rustcdc::{
+  IncrementalSnapshotConfig, PostgresConnection, PostgresSourceConfig, Result,
+};
+
+pub async fn start_incremental_stream(config: PostgresSourceConfig) -&gt; Result&lt;()&gt; {
+  let mut connection = PostgresConnection::new(config);
+  connection.connect().await?;
+
+  let incremental = IncrementalSnapshotConfig::new(vec![&quot;public.users&quot;.to_string()])
+    .with_chunk_size(1_000);
+
+  let mut stream = connection
+    .start_incremental_snapshot(incremental, None)
+    .await?;
+
+  let _events = stream.next_events(5_000).await?;
+  Ok(())
+}
+# }
+</code></pre>
+<p>This connector-level API is also available for MySQL and SQL Server via
+<code>MysqlConnection::start_incremental_snapshot(...)</code> and
+<code>SqlServerConnection::start_incremental_snapshot(...)</code>.</p>
+<h3 id="resume-across-restarts"><a class="zola-anchor" href="#resume-across-restarts" aria-label="Anchor link for: resume-across-restarts">Resume across restarts</a></h3>
+<p>Each table is read in keyset-paginated chunks. The cursor for the last <strong>fully emitted</strong> chunk
+is persisted inside the connector checkpoint offset — <code>PostgresOffset::incremental_snapshot</code>,
+<code>MysqlOffset::incremental_snapshot</code>, <code>SqlServerOffset::incremental_snapshot</code> — so it becomes
+durable in the same atomic, fsynced, checksummed write as the stream position.</p>
+<p>That coupling is deliberate. A chunk cursor is only meaningful relative to the stream position
+it was captured against; two separately-written records could disagree after a crash between
+them.</p>
+<p>Pass the loaded checkpoint offset to <code>start_incremental_snapshot(config, resume_from)</code> and the
+snapshot continues from where it stopped. Resuming re-reads at most one chunk (the one in
+flight when the process stopped), which is at-least-once and bounded by <code>chunk_size</code> — not by
+table size. Without the persisted cursor, every restart re-reads every configured table from
+row zero: a duplicate flood proportional to the whole dataset, repeating until a snapshot
+happens to finish inside a single process lifetime.</p>
+<p><code>IncrementalSnapshotState</code> and <code>IncrementalSnapshotTableState</code> are public, so a custom
+<code>Checkpoint</code> backend can store and return them. If the table's primary key has changed since
+the checkpoint was written, the cursor's arity no longer matches and startup fails with a
+message naming the remedy, rather than silently skipping rows.</p>
+<h2 id="transaction-boundaries"><a class="zola-anchor" href="#transaction-boundaries" aria-label="Anchor link for: transaction-boundaries">Transaction Boundaries</a></h2>
+<p>A delivered batch is cut on <code>max_buffer_size</code>, <code>max_event_bytes</code> and the commit barrier's free
+capacity. None of those know anything about transactions, so by default a batch can end in the
+middle of one: the sink sees rows 1–3 of a five-row transaction, commits them, and only later
+receives rows 4–5. Between those two commits the sink holds a state that never existed in the
+source database.</p>
+<p>For most sinks that is fine, and it is why <code>TransactionBoundaryPolicy::Split</code> is the default —
+lowest latency, strictly bounded memory. It is not fine for a sink that must apply each source
+transaction atomically.</p>
+<pre><code data-lang="rust">use rustcdc::{RuntimeOptions, TransactionBoundaryPolicy};
+
+let options = RuntimeOptions::new()
+    .with_transaction_boundary(TransactionBoundaryPolicy::PreserveTransactions);
+# let _ = options;
+</code></pre>
+<p>Under <code>PreserveTransactions</code> the runtime withholds a trailing partial transaction from each
+batch and delivers it with the next one, so every batch ends on a boundary.</p>
+<p><strong>How the runtime knows a transaction ended.</strong> Two signals count, and nothing else does:
+the event declares its own position (<code>event_index + 1 == total_events</code>), or a later event
+belongs to a different transaction. Absence of a signal is not proof of an ending, so a
+transaction whose remaining events have not arrived yet is <strong>withheld</strong> rather than
+delivered partially — including when the rest is simply still in flight from the source,
+which for a streaming connector is the normal case rather than the exception.</p>
+<p><strong>The one case this cannot honour:</strong> a single transaction larger than <code>max_buffer_size</code> does not
+fit in any batch. Trimming it would produce an empty batch forever — a silent permanent stall,
+strictly worse than the split it is trying to avoid. The runtime delivers such a transaction
+split and logs a WARN naming the transaction id and <code>max_buffer_size</code>. Raise <code>max_buffer_size</code>
+above the largest transaction your source produces if the guarantee must hold absolutely.</p>
+<p>Events with no transaction metadata (snapshot rows, and connectors that do not report
+transaction boundaries) are treated as their own boundary and are never trimmed.</p>
+<h2 id="custom-sources"><a class="zola-anchor" href="#custom-sources" aria-label="Anchor link for: custom-sources">Custom Sources</a></h2>
+<p><code>CdcRuntime::register_source</code> drives the runtime from any <code>impl Source</code>, including one this
+crate does not ship:</p>
+<pre><code data-lang="rust">let mut runtime = CdcRuntime::new(config)?;
+runtime.register_source(Box::new(MyKafkaConnectSource::new(/* ... */)));
+runtime.start().await?;
+</code></pre>
+<p><code>Source::connect</code> and <code>Source::close</code> are trait methods with no-op defaults, so the runtime can
+drive connection setup and teardown for a source it has never heard of. Everything else the
+runtime provides applies unchanged: the commit barrier, checkpointing, transforms, the
+idempotency guard, health verdicts, and metrics.</p>
+<p>Two constraints:</p>
+<ul>
+<li>Call <code>register_source</code> <strong>before</strong> <code>start()</code>; the source is connected during <code>start()</code>.</li>
+<li>The runtime derives the checkpoint offset from the delivered event for the connectors it
+knows. For a custom source it persists <code>Event::source.offset</code> verbatim, so that field must be
+a complete, resumable position — the same string your <code>start_stream(resume_from)</code> can resume
+from. Implement <code>StreamHandle::position_offset</code> if you need to carry richer state.</li>
+</ul>
+<h3 id="incremental-snapshot-for-a-custom-source"><a class="zola-anchor" href="#incremental-snapshot-for-a-custom-source" aria-label="Anchor link for: incremental-snapshot-for-a-custom-source">Incremental snapshot for a custom source</a></h3>
+<p>The DBLog watermark algorithm is source-agnostic — only the position type and the SQL dialect
+differ — so it lives in one place, <code>IncrementalSnapshotDriver</code>, and connectors plug into it
+through <code>IncrementalSnapshotBackend</code>. The three built-in connectors use exactly this interface;
+there is no private path they take that yours cannot.</p>
+<p>Implement six methods and you inherit the state machine, the override window, cursor
+persistence and the <code>StreamHandle</code> contract:</p>
+<pre><code data-lang="rust">use rustcdc::source::{
+    ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotState, SnapshotTable,
+};
+use rustcdc::{Event, Offset, Result};
+use async_trait::async_trait;
+
+# struct MyBackend;
+#[async_trait]
+impl IncrementalSnapshotBackend for MyBackend {
+    /// Whatever totally-ordered position your log uses.
+    type Position = u64;
+
+    async fn describe_table(&amp;mut self, table_ref: &amp;str) -&gt; Result&lt;SnapshotTable&gt; {
+        # unimplemented!()
+        // Resolve &quot;schema.table&quot; against your catalog. Must reject a table with no
+        // primary key: chunking without one cannot resume.
+    }
+
+    async fn current_position(&amp;mut self) -&gt; Result&lt;u64&gt; {
+        # unimplemented!()
+        // Read the log&#39;s current head. Called twice per chunk, so keep it cheap.
+    }
+
+    async fn fetch_chunk(
+        &amp;mut self,
+        table: &amp;SnapshotTable,
+        cursor: Option&lt;&amp;[serde_json::Value]&gt;,
+        limit: usize,
+    ) -&gt; Result&lt;Vec&lt;ChunkRow&gt;&gt; {
+        # unimplemented!()
+        // Keyset-paginated read, ordered by primary key, OUTSIDE any transaction.
+    }
+
+    fn position_of_event(&amp;self, event: &amp;Event) -&gt; Option&lt;u64&gt; {
+        # unimplemented!()
+        // Recover the log position of a live event.
+    }
+
+    fn offset_with_snapshot_state(
+        &amp;self,
+        inner: &amp;dyn Offset,
+        state: IncrementalSnapshotState,
+    ) -&gt; Option&lt;Box&lt;dyn Offset&gt;&gt; {
+        # unimplemented!()
+        // Attach the snapshot state to your offset so it is checkpointed atomically
+        // with the log position.
+    }
+}
+</code></pre>
+<p>Then build the driver in your <code>Source::start_incremental_snapshot</code> and return it as the
+<code>StreamHandle</code>.</p>
+<p><strong>Three contract points decide whether this is correct or silently wrong:</strong></p>
+<ol>
+<li><code>current_position</code> and <code>position_of_event</code> must be on the <strong>same scale</strong>. If they are not,
+the override window never matches, and stale chunk rows are emitted over newer stream
+values — with no error, no metric, and no log line.</li>
+<li><code>fetch_chunk</code> must not hold a transaction open. Holding one across chunks reintroduces
+exactly the transaction-ID backlog the incremental snapshot exists to avoid.</li>
+<li><code>offset_with_snapshot_state</code> returning <code>None</code> falls back to the inner stream's own
+<code>save_position</code>, which <strong>discards every chunk cursor</strong> — every restart then re-reads each
+table from row zero. Return <code>None</code> only if your source genuinely has no typed offset.</li>
+</ol>
+<p>The keyset cursor is persisted inside your offset, so it is written by the same atomic, fsynced,
+checksummed record as the log position. <code>snapshot_tables</code> remains available for a blocking
+initial snapshot if you do not want to implement the backend.</p>
+<h2 id="eventbatch-inspection"><a class="zola-anchor" href="#eventbatch-inspection" aria-label="Anchor link for: eventbatch-inspection">EventBatch Inspection</a></h2>
+<p><code>EventBatch</code> provides several inspection methods:</p>
+<ul>
+<li><code>batch.len()</code> / <code>batch.is_empty()</code> — event count</li>
+<li><code>batch.ack_mode()</code> — <code>AckMode::Required(token)</code> or <code>AckMode::NotRequired</code></li>
+<li><code>batch.oldest_event_source_timestamp_ms()</code> — millisecond timestamp of the oldest event in the batch (for lag monitoring)</li>
+<li><code>batch.events()</code> — iterator over contained <code>Event</code> values</li>
+</ul>
+<h2 id="checkpoint-backends"><a class="zola-anchor" href="#checkpoint-backends" aria-label="Anchor link for: checkpoint-backends">Checkpoint Backends</a></h2>
+<p>Checkpoint implementations persist source offsets and determine restart position.</p>
+<p>Built-in options include:</p>
+<ul>
+<li><code>InMemoryCheckpoint</code> — zero-config, suitable for tests and short-lived processes. State is lost on restart.</li>
+<li><code>FileCheckpoint</code> — file-backed persistence; recommended for production.</li>
+</ul>
+<p>Custom checkpoint backends can be implemented through the <code>Checkpoint</code> trait.</p>
+<h2 id="runtime-introspection"><a class="zola-anchor" href="#runtime-introspection" aria-label="Anchor link for: runtime-introspection">Runtime Introspection</a></h2>
+<p>The runtime exposes embeddable control-plane state and metrics surfaces:</p>
+<ul>
+<li><code>admin_snapshot()</code></li>
+<li><code>admin_snapshot_json()</code></li>
+<li><code>admin_metrics_prometheus()</code></li>
+</ul>
+<p>Use these methods for health endpoints, diagnostics views, and lightweight observability bridges.</p>
+<h3 id="health-verdict"><a class="zola-anchor" href="#health-verdict" aria-label="Anchor link for: health-verdict">Health verdict</a></h3>
+<p><code>RuntimeAdminSnapshot::health</code> is a <code>HealthVerdict</code> — the runtime's own answer to "is this
+connector making progress?", which <code>RuntimeState</code> cannot give you (<code>state = Running</code> covers both
+a quiet database and a hung socket).</p>
+<pre><code data-lang="rust">use rustcdc::HealthVerdict;
+# use rustcdc::CdcRuntime;
+# fn example(runtime: &amp;CdcRuntime) {
+let snapshot = runtime.admin_snapshot();
+match &amp;snapshot.health {
+    HealthVerdict::Healthy | HealthVerdict::Idle =&gt; { /* serve 200 */ }
+    HealthVerdict::Stalled { reason } =&gt; {
+        // `reason` names the condition and the remedy.
+        eprintln!(&quot;cdc stalled: {reason}&quot;);
+    }
+    HealthVerdict::NotRunning =&gt; { /* not started, or stopped */ }
+    _ =&gt; {}
+}
+# }
+</code></pre>
+<p><code>RuntimeAdminSnapshot</code> also carries <code>idempotency_evictions</code> and
+<code>idempotency_unidentifiable_passthrough</code>. The first tells you the dedup window is too small for
+this deployment's replay distance (older duplicates stop being suppressed). The second counts
+events the guard deliberately did <strong>not</strong> deduplicate because they carry neither transaction
+metadata nor a resolvable primary key — see <a href="https://hupe1980.github.io/rustcdc/docs/api/#idempotency-guard-safety">Idempotency guard safety</a>.</p>
+<p><code>HealthVerdict::is_alertable()</code> returns <code>true</code> for exactly <code>Stalled</code>, so a readiness handler can
+gate on it without matching every variant. The enum is <code>#[non_exhaustive]</code> — match with a
+wildcard arm.</p>
+<p><code>Stalled</code> is raised for an unconfirmed source position, a poll loop that has not completed within
+<code>max_poll_wait_ms × 6</code> (floor 30s), or polled-but-uncommitted events with a stale last commit —
+that last case meaning the embedder stopped calling <code>commit_ack</code>, not a source fault. See
+<a href="https://hupe1980.github.io/rustcdc/docs/runbook/#health-verdict-idle-vs-stalled">Operations Runbook</a> for the alerting rules.</p>
+<h2 id="connection-retry-policy"><a class="zola-anchor" href="#connection-retry-policy" aria-label="Anchor link for: connection-retry-policy">Connection Retry Policy</a></h2>
+<p>For transient source connectivity failures, configure <code>ConnectionRetryPolicy</code> via
+<code>RuntimeOptions::with_connection_retry</code> and pass the options to <code>RuntimeConfig::with_options</code>.
+The runtime retries only recoverable errors — an unclassified <code>SourceError</code>, a <code>TimeoutError</code>,
+or a classified source error whose <code>SourceErrorKind</code> is recoverable. <code>AuthFailed</code>,
+<code>SchemaMismatch</code> and <code>SlotNotFound</code> are <strong>not</strong> retried: they need an operator, and retrying
+only delays the page. Fatal configuration errors propagate immediately.</p>
+<pre><code data-lang="rust">use rustcdc::{ConnectionRetryPolicy, RuntimeOptions};
+# use rustcdc::{checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory,
+#     RuntimeConfig, RuntimeSourceConfig};
+# let config = RuntimeConfig::new(
+#     RuntimeSourceConfig::Disabled,
+#     InMemoryCheckpoint::default(),
+#     InMemorySchemaHistory::default(),
+# );
+
+let policy = ConnectionRetryPolicy {
+    max_retries: Some(5),       // None = retry indefinitely
+    initial_delay_ms: 300,
+    max_delay_ms: 10_000,
+};
+
+let config = config.with_options(RuntimeOptions::new().with_connection_retry(policy));
+# let _ = config;
+</code></pre>
+<p>Defaults: 5 retries, 300 ms initial delay, 10 s cap, truncated exponential backoff.
+Set <code>max_retries: None</code> for indefinitely-retrying long-running pipelines.</p>
+<h2 id="transform-configuration"><a class="zola-anchor" href="#transform-configuration" aria-label="Anchor link for: transform-configuration">Transform Configuration</a></h2>
+<p><code>FilterProjectionTransform::new(config)</code> returns <code>Result&lt;Self&gt;</code> — configuration
+errors (for example empty filter values) are caught at construction time rather
+than silently at apply time.</p>
+<pre><code data-lang="rust">use rustcdc::transform::{
+  FilterField, FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule,
+};
+
+# fn example() -&gt; rustcdc::Result&lt;()&gt; {
+let transform = FilterProjectionTransform::new(FilterProjectionConfig {
+    // `filters` is a Vec combined per `filter_mode` (default: all must match).
+    filters: vec![FilterRule::new(FilterField::Op, FilterOperator::Eq, &quot;insert&quot;)],
+    include_columns: Some(vec![&quot;id&quot;.into(), &quot;email&quot;.into()]),
+    exclude_columns: None,
+    ..FilterProjectionConfig::default()
+})?;  // returns Err(ConfigError) for invalid filter values
+# let _ = transform;
+# Ok(())
+# }
+</code></pre>
+<h3 id="content-based-filtering"><a class="zola-anchor" href="#content-based-filtering" aria-label="Anchor link for: content-based-filtering">Content-based filtering</a></h3>
+<p><code>FilterField::AfterField(path)</code> and <code>FilterField::BeforeField(path)</code> match
+against fields inside the event payload using a dot-separated path (e.g. <code>"user.country"</code>).</p>
+<p>Available operators: <code>Eq</code>, <code>Ne</code>, <code>Contains</code>, <code>Regex</code>, <code>Lt</code>, <code>LtEq</code>, <code>Gt</code>, <code>GtEq</code>.</p>
+<pre><code data-lang="rust"># use rustcdc::transform::{FilterField, FilterOperator, FilterRule};
+// Keep only events where after[&quot;status&quot;] == &quot;active&quot;
+let by_status =
+    FilterRule::new(FilterField::AfterField(&quot;status&quot;.into()), FilterOperator::Eq, &quot;active&quot;);
+
+// Keep events where after[&quot;amount&quot;] &gt; 100
+let by_amount =
+    FilterRule::new(FilterField::AfterField(&quot;amount&quot;.into()), FilterOperator::Gt, &quot;100&quot;);
+
+// Keep events matching a regex on after[&quot;email&quot;]
+let by_email = FilterRule::new(
+    FilterField::AfterField(&quot;email&quot;.into()),
+    FilterOperator::Regex,
+    r&quot;@example\.com$&quot;,
+);
+# let _ = (by_status, by_amount, by_email);
+</code></pre>
+<p><code>FilterOperator::Regex</code> patterns are compiled once at construction; invalid
+patterns return <code>Err(ConfigError)</code> at <code>FilterProjectionTransform::new</code> time.</p>
+<h3 id="sensitive-data-masking-maskhashtransform"><a class="zola-anchor" href="#sensitive-data-masking-maskhashtransform" aria-label="Anchor link for: sensitive-data-masking-maskhashtransform">Sensitive-data masking (<code>MaskHashTransform</code>)</a></h3>
+<p>The available rules are <code>MaskRule::UnsaltedSha256</code>, <code>Redact(String)</code>, <code>Null</code>, <code>Truncate(usize)</code>
+and <code>Passthrough</code>, plus <code>HmacSha256(SecretString)</code>, <code>Encrypt(..)</code> and <code>Decrypt(..)</code> behind the
+<code>encryption</code> feature. (There is no <code>MaskRule::Hash</code>.)</p>
+<blockquote>
+<p><strong>⚠ GDPR / privacy warning</strong></p>
+<p><code>MaskRule::UnsaltedSha256</code> is, as the name says, <strong>deterministic and unsalted</strong>.  For
+low-cardinality fields (e.g., <code>gender</code>, <code>country_code</code>, <code>status</code>) or any
+field whose values are enumerable, an attacker can reverse the hash via a
+pre-computed lookup table.  <strong>Do not rely on it alone for GDPR
+pseudonymization compliance.</strong></p>
+<p>Recommended approaches for GDPR-compliant pseudonymization:</p>
+<ul>
+<li>Use <strong><code>MaskRule::HmacSha256(secret)</code></strong> — a keyed hash with a site-specific secret.
+This is the shipped, supported way to get salted pseudonymization; do not hand-roll it
+by pre-hashing <code>format!("{secret}:{value}")</code>.</li>
+<li>Use <code>MaskRule::Encrypt</code> (AES-256-GCM) when you need reversible but opaque tokens.
+Ciphertexts are bound to <code>table + JSON path</code> as associated data, so a value relocated to
+another column or row fails authentication rather than decrypting as authentic. The wire
+format is <code>enc:v1:&lt;nonce&gt;:&lt;ciphertext&gt;</code>; the <code>v1</code> generation marker exists so the format
+can be rotated, but there is still <strong>no per-key id</strong>, so changing the secret orphans
+existing ciphertexts rather than allowing a rolling migration. Decrypt and re-encrypt
+out of band if you need to rotate the key.</li>
+<li>Consider <code>MaskRule::Redact</code> or <code>MaskRule::Null</code> for fields that must be
+fully suppressed in the downstream stream.</li>
+</ul>
+<p><strong>Rules match by exact dotted JSON path</strong>, against a <code>default_rule</code> of <code>Passthrough</code>.
+A typo, an upstream column rename, or a path-mutating transform (<code>FieldMappingTransform</code>,
+<code>UnwrapTransform</code>) placed <em>earlier</em> in the pipeline will therefore cause masking to do
+nothing for that field. Because that failure is invisible in the data, every rule carries a
+hit counter: <code>MaskHashTransform::unmatched_rules()</code> names rules that have never fired and
+<code>warn_on_unmatched_rules()</code> logs them. <strong>A rule with zero hits after real traffic means the
+field is not being masked.</strong> Wire it into a health check.</p>
+<p>Rules on object- and array-valued fields <strong>do</strong> apply: a rule on a <code>jsonb</code> column masks the
+whole subtree, and <code>field.*</code> covers every element of a variable-length array. Order
+<code>MaskHashTransform</code> before any path-mutating transform.</p>
+<p><strong>Default behaviour change in 0.2</strong>: <code>MaskHashConfig::default()</code> now uses
+<code>default_rule: MaskRule::Passthrough</code>, meaning unlisted fields are passed
+through unchanged.  Use <code>MaskHashConfig::hash_all()</code> if you need the old
+"hash everything" behaviour.</p>
+</blockquote>
+<pre><code data-lang="rust">use rustcdc::{MaskHashConfig, MaskHashTransform, MaskRule};
+
+// Hash only specified PII fields; leave everything else unchanged.
+let mut config = MaskHashConfig::default();
+config.mask_rules.insert(&quot;email&quot;.into(), MaskRule::UnsaltedSha256);
+config.mask_rules.insert(&quot;ssn&quot;.into(),   MaskRule::Null);
+
+// Encrypt a field with AES-256-GCM (requires &quot;encryption&quot; feature).
+#[cfg(feature = &quot;encryption&quot;)]
+config.mask_rules.insert(&quot;credit_card&quot;.into(), MaskRule::Encrypt(&quot;my-secret&quot;.into()));
+
+// Opt-in aggressive mode: SHA-256 every field not explicitly configured.
+let aggressive = MaskHashConfig::hash_all();
+</code></pre>
+<h2 id="transforms"><a class="zola-anchor" href="#transforms" aria-label="Anchor link for: transforms">Transforms</a></h2>
+<p>Two traits, because most stages do not need to await:</p>
+<table><thead><tr><th>Trait</th><th>Use for</th><th>Cost</th></tr></thead><tbody>
+<tr><td><code>Transform</code></td><td>pure CPU work over an in-memory event</td><td>no allocation per event</td></tr>
+<tr><td><code>AsyncTransform</code></td><td>a stage that must <code>await</code> — WASM, a network lookup</td><td>one boxed future per event</td></tr>
+</tbody></table>
+<p>Every transform this crate ships is synchronous. Register with
+<code>CdcRuntime::add_transform</code>, or <code>add_async_transform</code> for the async variant.</p>
+<pre><code data-lang="rust">use rustcdc::{Event, Result, Transform};
+
+#[derive(Debug)]
+struct TagRows;
+
+impl Transform for TagRows {
+    fn apply(&amp;self, event: &amp;mut Event) -&gt; Result&lt;bool&gt; {
+        if let Some(serde_json::Value::Object(after)) = &amp;mut event.after {
+            after.insert(&quot;_pipeline&quot;.into(), serde_json::json!(&quot;orders&quot;));
+        }
+        Ok(true) // false drops the event
+    }
+
+    fn name(&amp;self) -&gt; &amp;str {
+        &quot;tag_rows&quot;
+    }
+}
+</code></pre>
+<p>Both traits also expose <code>apply_batch</code>, and the pipeline runs a whole delivery through each
+stage in turn rather than each event through the whole pipeline. Override it when a stage
+can amortise per-batch setup — the WASM stage uses it to take its instance lock once per
+batch rather than once per event, which matters because that lock serialises every caller
+for the duration of guest execution.</p>
+<p><strong>A transform must not destroy the message key.</strong> <code>Event::primary_key</code> names the key
+<em>columns</em>; the values live in the row payload. Projecting away, renaming, or re-encrypting a
+key column detaches the two and the event is emitted unkeyed — log compaction stops
+collapsing it and upsert consumers start inserting duplicates. The pipeline rejects this
+rather than letting it through, but the realistic ways to hit it are all ordinary-looking
+config: an <code>include_columns</code> list that omits the PK, a <code>FieldMappingTransform</code> rename, or
+<code>MaskRule::Encrypt</code> on a key column (a fresh nonce per call gives every event for the same
+row a different key).</p>
+<h2 id="errors-and-what-an-operator-sees"><a class="zola-anchor" href="#errors-and-what-an-operator-sees" aria-label="Anchor link for: errors-and-what-an-operator-sees">Errors and what an operator sees</a></h2>
+<p><code>Error</code> carries a coarse <a href="https://hupe1980.github.io/rustcdc/docs/api/#error-classification"><code>ErrorKind</code></a> for retry decisions and,
+optionally, a chain of context describing what was being attempted.</p>
+<h3 id="log-report-not-the-error"><a class="zola-anchor" href="#log-report-not-the-error" aria-label="Anchor link for: log-report-not-the-error">Log <code>report()</code>, not the error</a></h3>
+<p><code>Display</code> shows only the <strong>outermost</strong> layer. That is the <code>thiserror</code> convention, and it
+means the obvious logging line hides the very thing you need:</p>
+<pre><code data-lang="rust">use rustcdc::Error;
+
+let error = Error::CheckpointError(&quot;disk full&quot;.into())
+    .context(&quot;saving the commit barrier&quot;)
+    .context(&quot;acknowledging batch 7&quot;);
+
+// What `tracing::error!(&quot;{error}&quot;)` prints — the context, and nothing about the disk.
+assert_eq!(error.to_string(), &quot;acknowledging batch 7&quot;);
+
+// What an operator needs.
+assert_eq!(
+    error.report().to_string(),
+    &quot;acknowledging batch 7: saving the commit barrier: checkpoint error: disk full&quot;,
+);
+</code></pre>
+<p>Prefer <code>tracing::error!(error = %err.report(), "…")</code> at every site that logs an error for a
+human. This crate does the same internally.</p>
+<p><code>Error::chain()</code> iterates the layers outermost-first if you want to structure them rather
+than render one line, and <code>Error::root_cause()</code> returns the innermost error.</p>
+<h3 id="context-never-changes-a-retry-decision"><a class="zola-anchor" href="#context-never-changes-a-retry-decision" aria-label="Anchor link for: context-never-changes-a-retry-decision">Context never changes a retry decision</a></h3>
+<p><code>kind()</code> always delegates to the root cause, so wrapping an error in context cannot turn a
+retryable failure into a fatal one — or the reverse:</p>
+<pre><code data-lang="rust"># use rustcdc::{Error, ErrorKind};
+let transient = Error::SourceError(&quot;connection reset&quot;.into());
+assert_eq!(transient.kind(), ErrorKind::Transient);
+assert_eq!(
+    transient.context(&quot;reading the binlog&quot;).kind(),
+    ErrorKind::Transient,
+);
+</code></pre>
+<h3 id="foreign-errors-keep-their-own-causes"><a class="zola-anchor" href="#foreign-errors-keep-their-own-causes" aria-label="Anchor link for: foreign-errors-keep-their-own-causes">Foreign errors keep their own causes</a></h3>
+<p>Several client libraries have a <code>Display</code> that names the operation and leaves the real cause
+behind <code>source()</code>. <code>tokio_postgres::Error</code> renders as <em>"error connecting to server"</em> whether
+the socket was refused, DNS failed, or the handshake timed out — so a connector that
+formatted it with <code>{error}</code> threw away the one detail that distinguishes them.</p>
+<p><code>render_error_chain</code> walks the foreign chain when flattening, and the connectors use it:</p>
+<pre><code data-lang="text">before: postgres tls connection failed: error connecting to server
+after:  postgres tls connection failed: error connecting to server: Connection refused (os error 61)
+</code></pre>
+<h2 id="schema-registries"><a class="zola-anchor" href="#schema-registries" aria-label="Anchor link for: schema-registries">Schema Registries</a></h2>
+<p>Three backends, behind one encoder surface. All are optional features.</p>
+<table><thead><tr><th>Backend</th><th>Feature</th><th>Wire format</th><th>Schema identity</th></tr></thead><tbody>
+<tr><td>Confluent Schema Registry</td><td><code>schemreg</code></td><td>5-byte header (<code>0x00</code> + 4-byte BE id)</td><td>integer id</td></tr>
+<tr><td>Apicurio Registry v3</td><td><code>apicurio</code></td><td>5-byte header</td><td>integer id</td></tr>
+<tr><td>AWS Glue Schema Registry</td><td><code>glue</code></td><td>18-byte header (<code>0x03</code> + compression + 16-byte UUID)</td><td>version UUID</td></tr>
+</tbody></table>
+<p>Confluent and Apicurio are <strong>interchangeable</strong>: both implement <code>SchemaRegistryClient</code>, so the
+same <code>ConfluentAvroEncoder</code> and <code>ConfluentJsonSchemaEncoder</code> work against either, and the
+framing on the wire is identical. Glue is not a drop-in swap — different header, different
+identity type, optional ZLIB compression — so a consumer must know which framing to expect,
+or call <code>detect_wire_format</code> per message.</p>
+<h3 id="confluent"><a class="zola-anchor" href="#confluent" aria-label="Anchor link for: confluent">Confluent</a></h3>
+<pre><code data-lang="rust">use rustcdc::codec::{ConfluentAvroEncoder, SchemaRegistryConfig};
+use std::sync::Arc;
+
+let config = SchemaRegistryConfig::new(&quot;http://localhost:8081&quot;, &quot;cdc-events&quot;);
+let registry = Arc::new(config.build()?);
+let encoder = ConfluentAvroEncoder::new(registry.as_ref(), &amp;config).await?;
+</code></pre>
+<h3 id="apicurio-native-v3"><a class="zola-anchor" href="#apicurio-native-v3" aria-label="Anchor link for: apicurio-native-v3">Apicurio (native v3)</a></h3>
+<p>Apicurio also exposes a Confluent-compatible endpoint that <code>SchemaRegistryConfig</code> can talk
+to. Prefer the native API when you need artifact groups or the richer metadata that the
+compatibility shim flattens away.</p>
+<pre><code data-lang="rust">use rustcdc::codec::{ApicurioRegistryConfig, ConfluentAvroEncoder};
+use std::sync::Arc;
+
+let apicurio = ApicurioRegistryConfig::new(&quot;http://localhost:8080/apis/registry/v3&quot;, &quot;cdc-events&quot;);
+let registry = Arc::new(apicurio.build()?);
+let encoder =
+    ConfluentAvroEncoder::new(registry.as_ref(), &amp;apicurio.as_schema_registry_config()).await?;
+</code></pre>
+<h3 id="retry-policy"><a class="zola-anchor" href="#retry-policy" aria-label="Anchor link for: retry-policy">Retry policy</a></h3>
+<p>Registry calls carry a retry policy by default: jittered exponential back-off, honouring
+<code>Retry-After</code>. This matters more than it sounds. Schema resolution sits on the <strong>encode
+path</strong>, so before retries existed a single HTTP 503 or a dropped connection failed the
+event — taking the pipeline down for a condition that clears itself in seconds.</p>
+<p>Only <em>transient</em> conditions are retried: transport failures, HTTP 429, HTTP 5xx. Not-found,
+auth failures, and invalid-schema are permanent and fail immediately, so an outer retry loop
+cannot spin on them forever.</p>
+<pre><code data-lang="rust">use rustcdc::codec::{RetryPolicy, SchemaRegistryConfig};
+use std::time::Duration;
+
+let config = SchemaRegistryConfig::new(&quot;http://localhost:8081&quot;, &quot;cdc-events&quot;)
+    .with_retry_policy(
+        RetryPolicy::new()
+            .max_retries(5)
+            .base_backoff(Duration::from_millis(100))
+            .max_backoff(Duration::from_secs(5)),
+    );
+# let _ = config;
+</code></pre>
+<p>Set <code>RetryPolicy::none()</code> if you already retry at a higher layer and do not want the two to
+multiply.</p>
+<h3 id="the-schema-you-register-must-be-the-schema-you-write"><a class="zola-anchor" href="#the-schema-you-register-must-be-the-schema-you-write" aria-label="Anchor link for: the-schema-you-register-must-be-the-schema-you-write">The schema you register must be the schema you write</a></h3>
+<p>With <code>auto_register = false</code> — the safer-looking setting, and the one a careful operator
+picks in a managed Kafka environment — the encoder previously took the registry's schema
+<strong>id</strong> and then encoded the payload with rustcdc's own schema. If the two differed, every
+message said "decode me with schema X" while carrying bytes written under schema Y.</p>
+<p><strong>Avro binary carries no field names or types.</strong> It is positional and untagged, so a
+mismatch does not fail to decode. It silently yields shifted fields and plausible-looking
+wrong values, arbitrarily far downstream.</p>
+<p><code>ConfluentAvroEncoder::new</code> now verifies the registered schema is the one it will write
+with, comparing Avro <strong>parsing canonical form</strong> — so a registry copy differing only in
+whitespace, docs, or JSON field ordering is accepted, while a structural difference is a
+hard error naming the remedy.</p>
+<h3 id="decoding"><a class="zola-anchor" href="#decoding" aria-label="Anchor link for: decoding">Decoding</a></h3>
+<p><code>AvroDecoder</code> reverses <code>AvroEncoder</code> for bare Avro bytes; <code>ConfluentAvroDecoder</code> strips the
+5-byte header, resolves the writer schema from the registry, and delegates to the same
+conversion.</p>
+<p>The conversion is hand-written rather than derived, and that is load-bearing: <code>before</code> and
+<code>after</code> are encoded as Avro <strong><code>bytes</code> holding UTF-8 JSON</strong>, which is what keeps the Avro
+schema stable regardless of table structure. A blanket serde mapping sees a byte array where
+<code>Event</code> declares a JSON value and fails. Until a live round trip against a real registry was
+added, <code>ConfluentAvroDecoder</code> had never successfully decoded an event — the encoder's unit
+tests decoded to a raw Avro value and inspected individual fields rather than reconstructing
+an <code>Event</code>, so nothing exercised the path end to end.</p>
+<h3 id="registry-urls-are-not-interchangeable"><a class="zola-anchor" href="#registry-urls-are-not-interchangeable" aria-label="Anchor link for: registry-urls-are-not-interchangeable">Registry URLs are not interchangeable</a></h3>
+<p><code>SchemaRegistryConfig::url</code> is the <strong>API root that serves <code>/subjects</code></strong>. For Confluent Schema
+Registry that is the server root; for Apicurio's Confluent-compatible endpoint it is
+<code>http://apicurio:8080/apis/ccompat/v7</code>. The value is used as given — nothing is appended.</p>
+<p><code>ApicurioRegistryConfig::url</code> is the <strong>server root</strong> (<code>http://apicurio:8080</code>); the client
+appends <code>/apis/registry/v3</code> itself. Passing the full API path there produces a doubled URL
+and a 404 from the server.</p>
+<h3 id="preflight"><a class="zola-anchor" href="#preflight" aria-label="Anchor link for: preflight">Preflight</a></h3>
+<p>Schema resolution is on the encode path, so a registry problem does not surface at startup —
+it surfaces as a failed event once traffic is flowing. <code>preflight_schema_registry</code> turns that
+into a startup check:</p>
+<pre><code data-lang="rust">use rustcdc::codec::{preflight_schema_registry, SchemaRegistryConfig};
+
+let config = SchemaRegistryConfig::new(&quot;http://localhost:8081&quot;, &quot;cdc-events&quot;);
+let registry = config.build()?;
+
+// Fails here, where an operator can still act on it.
+preflight_schema_registry(&amp;registry, &amp;config).await?;
+</code></pre>
+<p>It checks reachability, then — depending on <code>auto_register</code> — either that the subjects carry
+rustcdc's schema, or that rustcdc's schema is <em>compatible</em> with what is already registered,
+so an incompatible auto-registration fails with a clear message rather than an opaque HTTP
+409 on the first event. A registry that does not implement an optional endpoint reports
+<code>NotSupported</code>, which is skipped rather than treated as a failure.</p>
+<h3 id="error-classification"><a class="zola-anchor" href="#error-classification" aria-label="Anchor link for: error-classification">Error classification</a></h3>
+<p>Registry errors carry the right retryability instead of all collapsing into one kind:</p>
+<table><thead><tr><th>Registry condition</th><th><code>ErrorKind</code></th><th>Why</th></tr></thead><tbody>
+<tr><td>transport failure, HTTP 429, HTTP 5xx</td><td><code>Transient</code></td><td>resolves on its own</td></tr>
+<tr><td>subject / version / schema not found</td><td><code>Terminal</code></td><td>needs the schema registered</td></tr>
+<tr><td>auth failure</td><td><code>Terminal</code></td><td>needs a credential change</td></tr>
+<tr><td>malformed Confluent framing</td><td><code>Terminal</code></td><td><strong>these exact bytes will never decode</strong></td></tr>
+<tr><td>Avro / JSON deserialisation failure</td><td><code>Terminal</code></td><td>same</td></tr>
+</tbody></table>
+<p>The last two matter most: framing and deserialisation failures used to surface as
+<code>SourceError</code>, which classifies as <code>Transient</code> — "safe to retry with backoff" — so an
+embedder following the crate's own guidance retried a message that cannot ever succeed.</p>
+<h3 id="protobuf"><a class="zola-anchor" href="#protobuf" aria-label="Anchor link for: protobuf">Protobuf</a></h3>
+<p>Confluent Protobuf does <strong>not</strong> use the plain 5-byte header:</p>
+<pre><code data-lang="text">[0x00 magic][4-byte BE schema_id][message-index path][protobuf payload]
+</code></pre>
+<p>The message-index path locates the message inside its <code>.proto</code> file. rustcdc derives it from
+the compiled descriptor rather than hardcoding it — for <code>rustcdc.Event</code> the correct path is
+<code>[3]</code>, not the <code>[0]</code> a single-message schema would use, and a Confluent deserialiser given
+the wrong index misreads the header <strong>without erroring</strong>.</p>
+<p>The descriptor is compiled at build time with [<code>protox</code>], a pure-Rust protobuf compiler, so
+building rustcdc does not require <code>protoc</code>.</p>
+<pre><code data-lang="rust">use rustcdc::codec::{ConfluentProtobufEncoder, SchemaRegistryConfig};
+
+let config = SchemaRegistryConfig::new(&quot;http://localhost:8081&quot;, &quot;cdc-events&quot;);
+let encoder = ConfluentProtobufEncoder::new(config.build()?, &amp;config)?;
+let framed = encoder.encode(&amp;event).await?;
+</code></pre>
+<p>As with <code>ProtobufEncoder</code>, <code>before</code> and <code>after</code> carry UTF-8 JSON as protobuf <code>bytes</code> — the
+envelope is typed, the row payload stays schemaless.</p>
+<h3 id="cache-warming"><a class="zola-anchor" href="#cache-warming" aria-label="Anchor link for: cache-warming">Cache warming</a></h3>
+<p>Schema resolution is on the decode path, so a cold cache turns the first message for each
+distinct schema id into a synchronous registry call. For a consumer restarting against a
+backlog that is a burst of round-trips at exactly the moment throughput matters most.</p>
+<pre><code data-lang="rust">use rustcdc::codec::warm_schema_cache;
+
+warm_schema_cache(&amp;registry, [SchemaId::new(1), SchemaId::new(2)]).await?;
+</code></pre>
+<p>Schema ids are immutable — a registry never reassigns one — so a warmed entry is valid for
+the process lifetime. That is why the cache warms ids but never <code>get_latest_schema</code>, which
+can change at any moment.</p>
+<h3 id="debezium-key-schema-compatibility"><a class="zola-anchor" href="#debezium-key-schema-compatibility" aria-label="Anchor link for: debezium-key-schema-compatibility">Debezium key-schema compatibility</a></h3>
+<p>Debezium's Avro converter registers a separate key schema per topic (<code>{topic}-key</code>) as a
+record with a single nullable <code>key</code> field. <code>ConfluentAvroEncoder</code> mirrors this exactly, so a
+consumer written against Debezium's key subject works unchanged.</p>
+<h2 id="related-documentation"><a class="zola-anchor" href="#related-documentation" aria-label="Anchor link for: related-documentation">Related Documentation</a></h2>
+<ul>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/getting-started/">Getting Started</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/config-reference/">Configuration Reference</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/architecture/">Architecture</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/schema-evolution/">Schema Evolution and DDL Capture</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/reliability-testing/">Reliability Testing Guide</a></li>
+<li><a href="https://hupe1980.github.io/rustcdc/docs/adapter-sdk/">Adapter SDK</a></li>
+</ul>
+<hr />
+<h2 id="mariadb-support"><a class="zola-anchor" href="#mariadb-support" aria-label="Anchor link for: mariadb-support">MariaDB Support</a></h2>
+<p>rustcdc supports <strong>MariaDB 10.5, 10.6, and 10.11</strong> via the MySQL protocol stack. The
+<code>mysql_async</code> library handles the MariaDB binlog wire protocol transparently.
+rustcdc also provides a first-class <code>MariaDbSourceConfig</code> wrapper for explicit
+runtime source typing (<code>mariadb</code>) and separate checkpoint namespace handling.</p>
+<h3 id="capability-matrix"><a class="zola-anchor" href="#capability-matrix" aria-label="Anchor link for: capability-matrix">Capability Matrix</a></h3>
+<table><thead><tr><th>Capability</th><th style="text-align: center">PostgreSQL</th><th style="text-align: center">MySQL 8+</th><th style="text-align: center">MariaDB 10.5/10.6/10.11</th><th style="text-align: center">SQL Server</th></tr></thead><tbody>
+<tr><td>Full-table snapshot</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td><td style="text-align: center">✅ (validated on 10.5 and 10.6)</td><td style="text-align: center">✅</td></tr>
+<tr><td>Resumable snapshot (keyset)</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td><td style="text-align: center">✅ (validated on 10.5 and 10.6)</td><td style="text-align: center">✅</td></tr>
+<tr><td>CDC streaming</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td><td style="text-align: center">✅ (validated on 10.5 and 10.6)</td><td style="text-align: center">✅</td></tr>
+<tr><td>GTID-based position</td><td style="text-align: center">—</td><td style="text-align: center">✅</td><td style="text-align: center">✅ (connector support)</td><td style="text-align: center">—</td></tr>
+<tr><td>Binlog position fallback</td><td style="text-align: center">—</td><td style="text-align: center">✅</td><td style="text-align: center">✅ (connector support)</td><td style="text-align: center">—</td></tr>
+<tr><td>TLS connections</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td><td style="text-align: center">✅ (connector support)</td><td style="text-align: center">✅</td></tr>
+<tr><td>Transaction boundaries</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td><td style="text-align: center">✅ (validated on 10.5 and 10.6)</td><td style="text-align: center">✅</td></tr>
+<tr><td>Schema change events</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td><td style="text-align: center">✅</td></tr>
+</tbody></table>
+<p>MariaDB 10.11 currently has explicit process-crash and replay evidence coverage,
+while 10.5/10.6 are validated across the core connection and end-to-end lanes.</p>
+<p><strong>Note on schema change events</strong>: Runtime connectors emit canonical <code>Operation::SchemaChange</code> events for supported DDL capture paths. Use <code>rustcdc::ddl_capture</code> and <code>rustcdc::schema_history</code> together when building schema-aware downstream consumers.</p>
+<p><strong>MariaDB nuance</strong>: MariaDB schema-change behavior follows the MySQL connector path and is exercised in integration coverage, but depth may vary by engine/version-specific DDL semantics.</p>
+<h3 id="connecting-to-mariadb"><a class="zola-anchor" href="#connecting-to-mariadb" aria-label="Anchor link for: connecting-to-mariadb">Connecting to MariaDB</a></h3>
+<p>Use <code>MysqlSourceConfig</code> exactly as you would for MySQL:</p>
+<pre><code data-lang="rust">use rustcdc::source::mysql::MysqlSourceConfig;
+
+let config = MysqlSourceConfig {
+    host: &quot;mariadb-host&quot;.into(),
+    port: 3306,
+    user: &quot;replication_user&quot;.into(),
+    password: rustcdc::SecretString::new(&quot;secret&quot;),
+    database: &quot;my_db&quot;.into(),
+    ..Default::default()
+};
+</code></pre>
+<h3 id="known-limitations"><a class="zola-anchor" href="#known-limitations" aria-label="Anchor link for: known-limitations">Known Limitations</a></h3>
+<ul>
+<li>MariaDB 10.3 and earlier are <strong>not tested</strong> and may work with basic binlog
+events but are unsupported.</li>
+<li>MariaDB Galera Cluster is not tested; CDC from a Galera node may exhibit
+unexpected behaviour due to write-set replication semantics.</li>
+<li><code>ROW_FORMAT=COMPRESSED</code> tables require <code>binlog_row_image = FULL</code> on the
+server; partial images are not supported.</li>
+</ul>
+<p>MariaDB integration evidence includes dedicated end-to-end suites for snapshot
+resume, stream CDC, and snapshot-to-stream handoff on MariaDB 10.5 and 10.6 in
+<code>tests/mariadb_e2e_integration.rs</code>, plus connection lifecycle coverage in
+<code>tests/mariadb_connection_integration.rs</code>, and process-crash replay coverage on
+MariaDB 10.11 in <code>tests/runtime_mariadb_process_crash_integration.rs</code>.</p>
+
+
+    <nav class="page-nav" aria-label="Documentation">
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;architecture&#x2F;">← Architecture</a>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;config-reference&#x2F;">Configuration reference →</a>
+    </nav>
+  </article>
+</div>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>rustcdc</strong> — embeddable change data capture for Rust.
+      Licensed MIT OR Apache-2.0.
+    </p>
+    <nav aria-label="Footer">
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+      <a href="https:&#x2F;&#x2F;crates.io&#x2F;crates&#x2F;rustcdc" rel="noopener">crates.io</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">docs.rs</a>
+      <a href="https://hupe1980.github.io/rustcdc/atom.xml">Feed</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+// Theme: honour the stored choice, else the OS preference. Inline and tiny so it
+// runs before paint and the page does not flash the wrong theme.
+(function () {
+  var key = "rustcdc-theme";
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem(key); } catch (e) { /* private mode */ }
+  if (stored) root.setAttribute("data-theme", stored);
+
+  var button = document.querySelector("[data-theme-toggle]");
+  if (!button) return;
+  button.addEventListener("click", function () {
+    var current = root.getAttribute("data-theme");
+    var next = current === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) { /* ignore */ }
+  });
+})();
+</script>
+</body>
+</html>

@@ -15,11 +15,23 @@ pub const EVENT_ENVELOPE_VERSION: u16 = 1;
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Operation {
+    /// A row was created. `before` is `None`; `after` carries the new row.
     #[default]
     Insert,
+    /// A row was modified. `after` carries the new image; `before` carries the old one,
+    /// subject to the source's replica-identity / row-image configuration.
     Update,
+    /// A row was removed. `after` is `None`; `before` identifies the deleted row.
     Delete,
+    /// A row read during a snapshot, not a live change.
+    ///
+    /// `before` is `None` and `after` carries the row as of the snapshot's consistent
+    /// view. Carries [`SnapshotMetadata`]; a live change never does.
     Read,
+    /// A DDL statement changed a captured table's schema.
+    ///
+    /// Recorded in the durable schema history **before** this event is delivered, so a
+    /// consumer can never observe a schema change the history lacks.
     SchemaChange,
     /// All rows were removed from the table by a `TRUNCATE` statement.
     ///
@@ -136,17 +148,39 @@ impl std::str::FromStr for Operation {
 
 /// Source identity and position metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct SourceMetadata {
     /// Logical name of the source connector.
     pub source_name: String,
     /// Source-specific durable position encoded as a string.
     pub offset: String,
-    /// Source timestamp associated with the position.
+    /// Source commit timestamp in Unix epoch milliseconds.
+    ///
+    /// # Resolution differs by connector, and MySQL's is coarse
+    ///
+    /// | Connector | Source | Resolution |
+    /// |---|---|---|
+    /// | PostgreSQL | pgoutput `COMMIT` message | microseconds — exact |
+    /// | SQL Server | `sys.fn_cdc_map_lsn_to_time` | milliseconds — exact |
+    /// | MySQL / MariaDB | binlog common header | **whole seconds** |
+    ///
+    /// The MySQL binlog header stores the commit time in seconds, so this field is
+    /// truncated *down* to the second: a row committed at `T+0.999s` reports `T+0.000s`.
+    /// Lag computed as `now - timestamp` is therefore **over-reported by up to 1,000 ms**
+    /// on MySQL and MariaDB — measured median over-report against MySQL 8 is ~480 ms,
+    /// the expected half-second for uniformly distributed sub-second commits.
+    ///
+    /// This matters when setting alert thresholds: a MySQL pipeline reporting
+    /// `replication_lag_ms` near 500 ms may be running at near-zero real lag. Do not set
+    /// a MySQL lag alert below about 2 s, and prefer alerting on the *derivative* rather
+    /// than the level. For an exact figure, timestamp the row in the application and
+    /// compare against that instead.
     pub timestamp: u64,
 }
 
 /// Snapshot progress information when an event is emitted during snapshotting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SnapshotMetadata {
     /// Identifier for the snapshot session.
     pub snapshot_id: String,
@@ -158,6 +192,7 @@ pub struct SnapshotMetadata {
 
 /// Transaction metadata when an event belongs to a multi-event transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TransactionMetadata {
     /// Transaction identifier assigned by the source.
     pub tx_id: u64,
@@ -291,26 +326,13 @@ impl From<ValidationErrors> for Error {
 /// use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// use serde_json::json;
 ///
-/// let event = Event {
-///     before: None,
-///     after: Some(json!({"id": 1, "name": "alice"})),
-///     op: Operation::Insert,
-///     source: SourceMetadata {
-///         source_name: "postgres".into(),
-///         offset: "0/16B6A70".into(),
-///         timestamp: 1,
-///     },
-///     ts: 1,
-///     schema: Some("public".into()),
-///     table: "users".into(),
-///     primary_key: Some(vec!["id".into()]),
-///     snapshot: None,
-///     transaction: None,
-///     envelope_version: EVENT_ENVELOPE_VERSION,
-///     before_is_key_only: false,
-///     unavailable_columns: Vec::new(),
-///     before_unavailable_columns: Vec::new(),
-/// };
+/// let event = Event::builder("users", Operation::Insert)
+///     .after(json!({"id": 1, "name": "alice"}))
+///     .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+///     .ts(1)
+///     .schema("public")
+///     .primary_key(["id"])
+///     .build();
 ///
 /// let encoded = event.to_json().unwrap();
 /// let decoded = Event::from_json(&encoded).unwrap();
@@ -318,6 +340,7 @@ impl From<ValidationErrors> for Error {
 /// assert!(decoded.validate().is_ok());
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Event {
     /// Row state before the operation, when available.
     pub before: Option<Value>,
@@ -602,7 +625,7 @@ impl Event {
     /// ```
     /// use rustcdc::{Event, Operation, EVENT_ENVELOPE_VERSION};
     ///
-    /// let mut event = Event { table: "orders".into(), ..Event::default() };
+    /// let mut event = Event::builder("orders", Operation::Insert).build();
     /// assert_eq!(event.qualified_table_name(), "orders");
     ///
     /// event.schema = Some("public".into());
@@ -834,17 +857,13 @@ impl Event {
     /// use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     /// use serde_json::json;
     ///
-    /// let mut event = Event {
-    ///     before: Some(json!({"id": 1})),
-    ///     after: Some(json!({"id": 1, "name": "bob"})),
-    ///     op: Operation::Update,
-    ///     before_is_key_only: true,
-    ///     unavailable_columns: Vec::new(),
-    ///     ..Event::default()
-    /// };
-    /// event.ts = 1;
-    /// event.table = "users".into();
-    /// event.source.source_name = "pg".into();
+    /// let mut event = Event::builder("users", Operation::Update)
+    ///     .before(json!({"id": 1}))
+    ///     .after(json!({"id": 1, "name": "bob"}))
+    ///     .before_is_key_only(true)
+    ///     .source(SourceMetadata::new("pg", "0/1", 1))
+    ///     .ts(1)
+    ///     .build();
     ///
     /// // Key-only before: `before` is present but partial.
     /// assert!(!event.has_full_before());
@@ -875,13 +894,10 @@ impl Event {
     /// use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     /// use serde_json::json;
     ///
-    /// let event = Event {
-    ///     before: None,
-    ///     after: Some(json!({"id": 42, "name": "alice", "age": 30})),
-    ///     op: Operation::Insert,
-    ///     primary_key: Some(vec!["id".into()]),
-    ///     ..Event::default()
-    /// };
+    /// let event = Event::builder("", Operation::Insert)
+    ///     .after(json!({"id": 42, "name": "alice", "age": 30}))
+    ///     .primary_key(["id"])
+    ///     .build();
     ///
     /// let key = event.primary_key_values().unwrap();
     /// assert_eq!(key["id"], json!(42));
@@ -1494,5 +1510,277 @@ mod tests {
             ..Event::default()
         };
         assert_eq!(event.qualified_table_name(), "users");
+    }
+}
+
+// ─── Builders ─────────────────────────────────────────────────────────────────
+
+impl SourceMetadata {
+    /// Build source metadata.
+    ///
+    /// `offset` must be a **complete, resumable position** for the source — the same
+    /// string a later `start_stream(resume_from)` can restart from. The runtime
+    /// persists it verbatim for sources it does not natively know, so a partial or
+    /// display-only value there resumes capture at the wrong place after a restart.
+    pub fn new(source_name: impl Into<String>, offset: impl Into<String>, timestamp: u64) -> Self {
+        Self {
+            source_name: source_name.into(),
+            offset: offset.into(),
+            timestamp,
+        }
+    }
+}
+
+impl SnapshotMetadata {
+    /// Build snapshot metadata for a chunked read.
+    ///
+    /// `snapshot_id` must be **stable across restarts** so a consumer correlating rows
+    /// by it sees one snapshot rather than one per process lifetime.
+    pub fn new(snapshot_id: impl Into<String>, chunk_index: u32, is_last_chunk: bool) -> Self {
+        Self {
+            snapshot_id: snapshot_id.into(),
+            chunk_index,
+            is_last_chunk,
+        }
+    }
+}
+
+impl TransactionMetadata {
+    /// Build transaction metadata.
+    ///
+    /// `total_events` is `None` when the source cannot report the transaction size
+    /// before the transaction ends — which is the normal case for streaming decoders.
+    /// A consumer must not treat `None` as zero.
+    pub fn new(tx_id: u64, event_index: u32, total_events: Option<u32>) -> Self {
+        Self {
+            tx_id,
+            total_events,
+            event_index,
+        }
+    }
+}
+
+/// Fluent builder for [`Event`].
+///
+/// [`Event`] is `#[non_exhaustive]`, so downstream crates construct it through this
+/// builder rather than a struct literal. That is deliberate: adding a field to the
+/// envelope is then a non-breaking change, where previously every new field broke every
+/// construction site — including the ones in this crate's own published examples.
+///
+/// The builder sets `envelope_version` for you. Getting that constant wrong by hand is
+/// not a compile error but makes the event fail validation at the far end of the
+/// pipeline, which is a poor place to learn about it.
+///
+/// ```
+/// use rustcdc::core::{Event, Operation, SourceMetadata};
+/// use serde_json::json;
+///
+/// let event = Event::builder("users", Operation::Insert)
+///     .source(SourceMetadata::new("postgres", "0/16B2E48", 1_700_000_000_000))
+///     .schema("public")
+///     .after(json!({ "id": 1, "email": "a@example.com" }))
+///     .primary_key(["id"])
+///     .ts(1_700_000_000_000)
+///     .build();
+///
+/// assert!(event.validate().is_ok());
+/// ```
+#[derive(Debug, Clone)]
+pub struct EventBuilder {
+    event: Event,
+}
+
+impl EventBuilder {
+    /// Row state before the operation.
+    #[must_use]
+    pub fn before(mut self, before: Value) -> Self {
+        self.event.before = Some(before);
+        self
+    }
+
+    /// Row state after the operation.
+    #[must_use]
+    pub fn after(mut self, after: Value) -> Self {
+        self.event.after = Some(after);
+        self
+    }
+
+    /// Source identity and durable position.
+    #[must_use]
+    pub fn source(mut self, source: SourceMetadata) -> Self {
+        self.event.source = source;
+        self
+    }
+
+    /// Event timestamp in milliseconds since the Unix epoch.
+    #[must_use]
+    pub fn ts(mut self, ts: u64) -> Self {
+        self.event.ts = ts;
+        self
+    }
+
+    /// Schema (or database) the table lives in.
+    #[must_use]
+    pub fn schema(mut self, schema: impl Into<String>) -> Self {
+        self.event.schema = Some(schema.into());
+        self
+    }
+
+    /// Primary-key column names, in key order.
+    ///
+    /// Order matters: consumers and the incremental-snapshot override window both
+    /// derive a row identity from these columns in the order given.
+    #[must_use]
+    pub fn primary_key<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.event.primary_key = Some(columns.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Snapshot metadata, for an event produced by a snapshot read.
+    #[must_use]
+    pub fn snapshot(mut self, snapshot: SnapshotMetadata) -> Self {
+        self.event.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Transaction metadata, for a source that reports transaction boundaries.
+    #[must_use]
+    pub fn transaction(mut self, transaction: TransactionMetadata) -> Self {
+        self.event.transaction = Some(transaction);
+        self
+    }
+
+    /// Mark `before` as containing only primary-key columns rather than a full
+    /// pre-image. See [`Event::before_is_key_only`].
+    #[must_use]
+    pub fn before_is_key_only(mut self, key_only: bool) -> Self {
+        self.event.before_is_key_only = key_only;
+        self
+    }
+
+    /// Columns absent from `after` because the source could not supply them.
+    ///
+    /// See [`Event::unavailable_columns`] — a consumer that writes whole rows must
+    /// exclude these from the write rather than writing `NULL`.
+    #[must_use]
+    pub fn unavailable_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.event.unavailable_columns = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Columns absent from `before`. Tracked separately from
+    /// [`unavailable_columns`](Self::unavailable_columns): the two sets are not the same,
+    /// and merging them marks genuinely changed columns as unwritable.
+    #[must_use]
+    pub fn before_unavailable_columns<I, S>(mut self, columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.event.before_unavailable_columns = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Finish without validating.
+    ///
+    /// Prefer [`build_validated`](Self::build_validated) at a source boundary; an
+    /// envelope that violates the contract is otherwise discovered by a sink, far from
+    /// the code that produced it.
+    #[must_use]
+    pub fn build(self) -> Event {
+        self.event
+    }
+
+    /// Finish, returning an error if the envelope contract is violated.
+    pub fn build_validated(self) -> Result<Event> {
+        self.event.validate()?;
+        Ok(self.event)
+    }
+}
+
+impl Event {
+    /// Start building an event for `table`.
+    ///
+    /// `envelope_version` is set for you; every other field starts empty.
+    pub fn builder(table: impl Into<String>, op: Operation) -> EventBuilder {
+        EventBuilder {
+            event: Event {
+                table: table.into(),
+                op,
+                ..Event::default()
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_builder_sets_the_envelope_version_so_a_caller_cannot_forget_it() {
+        // A hand-written literal with the wrong constant is not a compile error; it
+        // fails validation at the far end of the pipeline instead.
+        let event = Event::builder("users", Operation::Insert).build();
+        assert_eq!(event.envelope_version, EVENT_ENVELOPE_VERSION);
+    }
+
+    #[test]
+    fn a_built_event_round_trips_through_json() {
+        let event = Event::builder("users", Operation::Update)
+            .source(SourceMetadata::new("postgres", "0/16B2E48", 42))
+            .schema("public")
+            .before(json!({ "id": 1, "email": "old@example.com" }))
+            .after(json!({ "id": 1, "email": "new@example.com" }))
+            .primary_key(["id"])
+            .ts(42)
+            .build();
+
+        let decoded = Event::from_json(&event.to_json().expect("encode")).expect("decode");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn build_validated_rejects_an_envelope_that_violates_the_contract() {
+        // An UPDATE with neither before nor after carries no row state at all.
+        let error = Event::builder("users", Operation::Update)
+            .source(SourceMetadata::new("postgres", "0/1", 1))
+            .ts(1)
+            .build_validated()
+            .expect_err("an update with no payload must be rejected");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn primary_key_preserves_the_order_it_was_given() {
+        // The override window and every consumer derive row identity positionally.
+        let event = Event::builder("t", Operation::Insert)
+            .primary_key(["tenant", "id"])
+            .build();
+        assert_eq!(
+            event.primary_key.as_deref(),
+            Some(["tenant".to_string(), "id".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn the_two_unavailable_column_lists_stay_separate() {
+        // Merging them marks a column that genuinely changed as unwritable, silently
+        // dropping the update.
+        let event = Event::builder("t", Operation::Update)
+            .unavailable_columns(["blob_a"])
+            .before_unavailable_columns(["blob_b"])
+            .build();
+        assert_eq!(event.unavailable_columns, vec!["blob_a".to_string()]);
+        assert_eq!(event.before_unavailable_columns, vec!["blob_b".to_string()]);
     }
 }

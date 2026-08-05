@@ -15,11 +15,20 @@ use crate::{
 /// Faults that can be injected into source stream/snapshot operations.
 #[derive(Debug)]
 pub enum SourceFault {
+    /// Fail the next operation with this error.
     ConnectionFault(Error),
+    /// Stall for this long before returning, exercising the caller's poll budget.
     TimeoutFault(Duration),
+    /// Corrupt this percentage of event payloads, exercising envelope validation.
     CorruptionFault(u8),
+    /// Delay each operation by this much, exercising latency handling.
     DelayFault(Duration),
+    /// Silently drop this many events.
+    ///
+    /// Models the failure class this crate exists to prevent, so a pipeline that does not
+    /// detect it has a gap in its own validation.
     DropEventsFault(u64),
+    /// Re-deliver this many events, exercising the consumer's duplicate tolerance.
     DuplicateEventsFault(u64),
 }
 
@@ -204,6 +213,7 @@ pub struct FaultInjectingSource<S> {
 }
 
 impl<S> FaultInjectingSource<S> {
+    /// Wrap a source, injecting no faults until one is configured.
     pub fn new(inner: S) -> Self {
         Self {
             inner,
@@ -216,6 +226,7 @@ impl<S> FaultInjectingSource<S> {
         self.controller.inject(fault, after_event_count);
     }
 
+    /// Clear all configured faults and counters.
     pub fn reset(&mut self) {
         self.controller.reset();
     }

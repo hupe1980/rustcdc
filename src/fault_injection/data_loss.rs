@@ -11,11 +11,20 @@ use crate::{
 /// Data-loss validation report for a captured event batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataLossReport {
+    /// Events the source was expected to produce.
     pub expected_events: u64,
+    /// Events received, including duplicates.
     pub received_total: u64,
+    /// Distinct events received, by stable fingerprint.
     pub received_unique: u64,
+    /// Expected events never received.
+    ///
+    /// **Non-zero means data loss.** Duplicates are permitted by the at-least-once
+    /// contract; a gap is not.
     pub missing_events: u64,
+    /// Events received more than once. Expected after a crash — not a failure.
     pub duplicate_events: u64,
+    /// Events that failed envelope validation.
     pub corrupt_events: u64,
 }
 
@@ -30,6 +39,7 @@ pub struct DataLossValidator {
 }
 
 impl DataLossValidator {
+    /// Start a validator expecting `expected_events` distinct events.
     pub fn new(expected_events: u64) -> Self {
         Self {
             expected_events,
@@ -40,6 +50,10 @@ impl DataLossValidator {
         }
     }
 
+    /// Record one delivered event.
+    ///
+    /// Fingerprints with the stable (cross-process) hash so a replay after a restart is
+    /// recognised as a duplicate rather than counted as a new event.
     pub fn track_event(&mut self, event: &Event) {
         self.received_total = self.received_total.saturating_add(1);
 
@@ -53,6 +67,11 @@ impl DataLossValidator {
         }
     }
 
+    /// Consume the validator and produce the report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fingerprinting failed for any tracked event.
     pub fn finalize(self) -> Result<DataLossReport> {
         let received_unique = u64::try_from(self.seen_fingerprints.len()).unwrap_or(u64::MAX);
         let missing_events = self.expected_events.saturating_sub(received_unique);
@@ -83,10 +102,20 @@ impl DataLossValidator {
         Ok(report)
     }
 
+    /// Validate a complete captured stream in one call.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataLossValidator::finalize`].
     pub fn validate(expected: u64, received: Vec<Event>) -> Result<DataLossReport> {
         Self::validate_iter(expected, received)
     }
 
+    /// Validate a stream without materialising it.
+    ///
+    /// # Errors
+    ///
+    /// As [`DataLossValidator::finalize`].
     pub fn validate_iter<I>(expected: u64, received: I) -> Result<DataLossReport>
     where
         I: IntoIterator<Item = Event>,

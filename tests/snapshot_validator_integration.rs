@@ -1,39 +1,22 @@
 use rustcdc::{
     Operation, SnapshotMetadata, SnapshotValidator, SourceMetadata, TransactionMetadata,
-    EVENT_ENVELOPE_VERSION,
 };
 
 fn snapshot_read_event(table: &str, id: i64) -> rustcdc::Event {
-    rustcdc::Event {
-        before: None,
-        after: Some(serde_json::json!({"id": id, "name": format!("user-{id}")})),
-        op: Operation::Read,
-        source: SourceMetadata {
-            source_name: "snapshot-integration".into(),
-            offset: id.to_string(),
-            timestamp: 1_700_000_000 + id as u64,
-        },
-        ts: 1_700_000_000 + id as u64,
-        schema: Some("dbo".into()),
-        table: table.into(),
-        primary_key: Some(vec!["id".into()]),
-        snapshot: Some(SnapshotMetadata {
-            snapshot_id: "validator-integration".into(),
-            chunk_index: 0,
-            is_last_chunk: false,
-        }),
-        transaction: Some(TransactionMetadata {
-            tx_id: 0,
-            total_events: Some(1),
-            event_index: 0,
-        }),
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    rustcdc::Event::builder(table, Operation::Read)
+        .after(serde_json::json!({"id": id, "name": format!("user-{id}")}))
+        .source(SourceMetadata::new(
+            "snapshot-integration",
+            id.to_string(),
+            1_700_000_000 + id as u64,
+        ))
+        .ts(1_700_000_000 + id as u64)
+        .schema("dbo")
+        .primary_key(["id"])
+        .snapshot(SnapshotMetadata::new("validator-integration", 0, false))
+        .transaction(TransactionMetadata::new(0, 0, Some(1)))
+        .build()
 }
-
 #[test]
 fn snapshot_validator_detects_missing_rows_for_10k_snapshot() {
     let table = "users";

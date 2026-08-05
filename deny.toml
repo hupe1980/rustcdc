@@ -23,22 +23,19 @@ all-features = true
 
 [advisories]
 ignore = [
-    # ── dev-dependency: testcontainers / astral-tokio-tar ────────────────────
-    # All four advisories below affect `astral-tokio-tar`, a transitive dep of
-    # `testcontainers 0.25.x` (dev-dep only; not present in production builds).
-    # The fix requires `astral-tokio-tar >= 0.6.1`, which needs a testcontainers
-    # release that bumps its own dep.
-    { id = "RUSTSEC-2026-0066", reason = "dev-dep only: testcontainers -> astral-tokio-tar 0.5.6; blocked on testcontainers upstream releasing astral-tokio-tar >=0.6.0" },
-    { id = "RUSTSEC-2026-0112", reason = "dev-dep only: testcontainers -> astral-tokio-tar 0.5.6; blocked on testcontainers upstream releasing astral-tokio-tar >=0.6.1" },
-    { id = "RUSTSEC-2026-0113", reason = "dev-dep only: testcontainers -> astral-tokio-tar 0.5.6; blocked on testcontainers upstream releasing astral-tokio-tar >=0.6.1" },
-    { id = "RUSTSEC-2026-0145", reason = "dev-dep only: testcontainers 0.25.x itself; blocked on testcontainers upstream release" },
-    { id = "RUSTSEC-2025-0134", reason = "dev-dep only: testcontainers 0.25.x itself; blocked on testcontainers upstream release" },
-    # ── dev-dependency: sqlx / rsa ───────────────────────────────────────────
-    # RUSTSEC-2023-0071 (RSA Marvin timing side-channel) affects rsa 0.9.x,
-    # pulled in by sqlx-mysql which is a dev-dep (integration test helper only).
-    # rustcdc production code paths perform no RSA operations.
-    # Remove when sqlx >= 0.9 migration is completed.
-    { id = "RUSTSEC-2023-0071", reason = "dev-dep only: sqlx -> sqlx-mysql -> rsa 0.9.x; no RSA in production paths; blocked on sqlx 0.9 migration" },
+    # ── Resolved by upgrades; kept here only as a record ─────────────────────
+    #
+    # The testcontainers 0.25 -> 0.27 and sqlx 0.8 -> 0.9 upgrades removed every
+    # advisory that used to be ignored in this section:
+    #
+    #   RUSTSEC-2026-0066/0112/0113  astral-tokio-tar, via testcontainers 0.25
+    #   RUSTSEC-2026-0145            testcontainers 0.25 itself
+    #   RUSTSEC-2025-0134            testcontainers 0.25 itself
+    #   RUSTSEC-2023-0071            rsa 0.9 (Marvin timing side-channel), via sqlx-mysql
+    #
+    # `cargo deny` warns on an ignore that no longer matches anything, so leaving
+    # them listed would train the reader to ignore that warning — which is exactly
+    # how a genuinely stale exception survives. They are deleted, not commented out.
 
     # ── PRODUCTION dependency: sqlserver feature -> tiberius -> rustls 0.21 ──
     #
@@ -79,11 +76,20 @@ ignore = [
     #     name-constrained intermediates are not materially exposed.
     #
     # Users who cannot accept this should not enable the `sqlserver` feature.
-    # Documented in docs/security.md. Remove both entries as soon as tiberius
+    # Documented in site/content/docs/security.md. Remove both entries as soon as tiberius
     # releases against rustls 0.23.
-    { id = "RUSTSEC-2026-0098", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; URI names are never asserted by rustcdc; requires CA misissuance to exploit; see docs/security.md" },
-    { id = "RUSTSEC-2026-0099", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; requires CA misissuance to exploit; see docs/security.md" },
-    { id = "RUSTSEC-2026-0104", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; unreachable because rustcdc never parses CRLs and tiberius exposes no CRL API; see docs/security.md" },
+    { id = "RUSTSEC-2026-0098", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; URI names are never asserted by rustcdc; requires CA misissuance to exploit; see site/content/docs/security.md" },
+    { id = "RUSTSEC-2026-0099", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; requires CA misissuance to exploit; see site/content/docs/security.md" },
+    { id = "RUSTSEC-2026-0104", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; unreachable because rustcdc never parses CRLs and tiberius exposes no CRL API; see site/content/docs/security.md" },
+
+    #   RUSTSEC-2025-0134 (rustls-pemfile unmaintained):
+    #     Unmaintained, not a vulnerability. rustcdc's own code no longer uses it —
+    #     PEM parsing moved to `rustls_pki_types::pem::PemObject`, which is the
+    #     same implementation the final rustls-pemfile release wrapped — and the
+    #     direct dependency was removed. It survives only under the `sqlserver`
+    #     feature, via tiberius 0.12.3 -> rustls-native-certs 0.6 -> rustls-pemfile
+    #     1.0, on the same upstream blocker as the entries above.
+    { id = "RUSTSEC-2025-0134", reason = "production (sqlserver feature only): unmaintained, not a vulnerability; rustcdc migrated its own PEM parsing to rustls-pki-types and dropped the direct dependency; reachable only via tiberius 0.12.3 -> rustls-native-certs 0.6; blocked on tiberius releasing against rustls 0.23; see site/content/docs/security.md" },
 ]
 
 [licenses]

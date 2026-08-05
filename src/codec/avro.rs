@@ -13,6 +13,13 @@
 //! Consumers decode the bytes as a JSON object and can re-validate against a
 //! table-specific schema if desired.
 //!
+//! # Decoding
+//!
+//! [`AvroDecoder`] reverses this encoding. It is hand-written rather than derived because
+//! `apache_avro::from_value::<Event>` cannot reverse the `bytes`-holding-JSON
+//! representation of `before`/`after` above — it sees a byte array where `Event` declares
+//! a `serde_json::Value`.
+//!
 //! # Confluent Schema Registry integration
 //!
 //! The `AvroEncoder` produces bare Avro binary (no framing).  To integrate with
@@ -82,26 +89,11 @@ fn op_avro_symbol(op: Operation) -> &'static str {
 /// # use rustcdc::codec::{EventEncoder, AvroEncoder};
 /// # use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 /// let encoder = AvroEncoder::new().unwrap();
-/// let event = Event {
-///     before: None,
-///     after: Some(serde_json::json!({"id": 1})),
-///     op: Operation::Insert,
-///     source: SourceMetadata {
-///         source_name: "postgres".into(),
-///         offset: "0/16B6A70".into(),
-///         timestamp: 1,
-///     },
-///     ts: 1,
-///     schema: None,
-///     table: "users".into(),
-///     primary_key: None,
-///     snapshot: None,
-///     transaction: None,
-///     envelope_version: EVENT_ENVELOPE_VERSION,
-///     before_is_key_only: false,
-///     unavailable_columns: Vec::new(),
-///     before_unavailable_columns: Vec::new(),
-/// };
+/// let event = Event::builder("users", Operation::Insert)
+///     .after(serde_json::json!({"id": 1}))
+///     .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+///     .ts(1)
+///     .build();
 /// let out = encoder.encode(&event).unwrap();
 /// assert_eq!(out.content_type, "avro/binary");
 /// ```
@@ -486,5 +478,474 @@ mod tests {
         } else {
             panic!("expected Record");
         }
+    }
+}
+
+// ─── AvroValue → Event ────────────────────────────────────────────────────────
+
+/// Reconstruct an [`Event`] from the Avro record produced by [`AvroEncoder`].
+///
+/// # Why this is hand-written
+///
+/// `apache_avro::from_value::<Event>` cannot reverse this encoding. `before` and `after`
+/// are deliberately Avro **`bytes` holding UTF-8 JSON** — that is what keeps the Avro
+/// schema stable regardless of table structure — so a blanket serde mapping sees a byte
+/// array where `Event` declares a `serde_json::Value` and fails with
+/// *"invalid type: byte array, expected any valid JSON value"*.
+///
+/// Until this existed there was no Avro → `Event` path that worked at all: the encoder had
+/// no counterpart, and the registry decoder used the blanket mapping. The unit tests did
+/// not catch it because they decoded to a raw `AvroValue` and asserted on individual
+/// fields rather than reconstructing an event. Only a live round trip through a real
+/// registry surfaced it.
+pub fn avro_value_to_event(value: &AvroValue) -> Result<Event> {
+    let AvroValue::Record(fields) = value else {
+        return Err(Error::SerializationError(
+            "avro → Event: expected a record at the top level".into(),
+        ));
+    };
+
+    let get = |name: &str| -> Option<&AvroValue> {
+        fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    };
+    let required = |name: &str| -> Result<&AvroValue> {
+        get(name).ok_or_else(|| {
+            Error::SerializationError(format!("avro → Event: missing field '{name}'"))
+        })
+    };
+
+    /// Unwrap a union to its payload, or `None` for the null branch.
+    fn unwrap_union(value: &AvroValue) -> Option<&AvroValue> {
+        match value {
+            AvroValue::Union(_, inner) => match inner.as_ref() {
+                AvroValue::Null => None,
+                other => Some(other),
+            },
+            AvroValue::Null => None,
+            other => Some(other),
+        }
+    }
+
+    fn json_field(value: &AvroValue, name: &str) -> Result<Option<serde_json::Value>> {
+        let Some(inner) = unwrap_union(value) else {
+            return Ok(None);
+        };
+        let bytes = match inner {
+            AvroValue::Bytes(bytes) => bytes.as_slice(),
+            // Tolerated because some registries normalise `bytes` to `string` when a
+            // schema is re-registered through a compatibility layer.
+            AvroValue::String(text) => text.as_bytes(),
+            other => {
+                return Err(Error::SerializationError(format!(
+                    "avro → Event: field '{name}' must be bytes holding JSON, got {other:?}"
+                )))
+            }
+        };
+        serde_json::from_slice(bytes).map(Some).map_err(|error| {
+            Error::SerializationError(format!(
+                "avro → Event: field '{name}' is not valid JSON: {error}"
+            ))
+        })
+    }
+
+    fn string_field(value: &AvroValue, name: &str) -> Result<String> {
+        match unwrap_union(value) {
+            Some(AvroValue::String(text)) => Ok(text.clone()),
+            Some(AvroValue::Enum(_, symbol)) => Ok(symbol.clone()),
+            other => Err(Error::SerializationError(format!(
+                "avro → Event: field '{name}' must be a string, got {other:?}"
+            ))),
+        }
+    }
+
+    fn long_field(value: &AvroValue, name: &str) -> Result<i64> {
+        match unwrap_union(value) {
+            Some(AvroValue::Long(number)) => Ok(*number),
+            Some(AvroValue::Int(number)) => Ok(i64::from(*number)),
+            other => Err(Error::SerializationError(format!(
+                "avro → Event: field '{name}' must be an integer, got {other:?}"
+            ))),
+        }
+    }
+
+    fn string_array(value: Option<&AvroValue>) -> Vec<String> {
+        match value.and_then(unwrap_union) {
+            Some(AvroValue::Array(items)) => items
+                .iter()
+                .filter_map(|item| match item {
+                    AvroValue::String(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn record_fields(value: &AvroValue) -> Option<&Vec<(String, AvroValue)>> {
+        match unwrap_union(value)? {
+            AvroValue::Record(fields) => Some(fields),
+            _ => None,
+        }
+    }
+
+    let op = match string_field(required("op")?, "op")?.as_str() {
+        "INSERT" => Operation::Insert,
+        "UPDATE" => Operation::Update,
+        "DELETE" => Operation::Delete,
+        "READ" => Operation::Read,
+        "SCHEMA_CHANGE" => Operation::SchemaChange,
+        "TRUNCATE" => Operation::Truncate,
+        other => {
+            // Defaulting an unknown symbol would fabricate an operation — an unrecognised
+            // op silently read as INSERT turns a foreign message into a row creation a
+            // sink would apply.
+            return Err(Error::SerializationError(format!(
+                "avro → Event: unknown operation symbol '{other}'"
+            )));
+        }
+    };
+
+    let source_fields = record_fields(required("source")?).ok_or_else(|| {
+        Error::SerializationError("avro → Event: field 'source' must be a record".into())
+    })?;
+    let source_get = |name: &str| -> Option<&AvroValue> {
+        source_fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    };
+    let source = crate::core::SourceMetadata::new(
+        source_get("source_name")
+            .map(|value| string_field(value, "source.source_name"))
+            .transpose()?
+            .unwrap_or_default(),
+        source_get("offset")
+            .map(|value| string_field(value, "source.offset"))
+            .transpose()?
+            .unwrap_or_default(),
+        source_get("timestamp")
+            .map(|value| long_field(value, "source.timestamp"))
+            .transpose()?
+            .unwrap_or_default() as u64,
+    );
+
+    let snapshot = record_fields(required("snapshot")?).map(|snapshot_fields| {
+        let field = |name: &str| {
+            snapshot_fields
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value)
+        };
+        crate::core::SnapshotMetadata::new(
+            field("snapshot_id")
+                .and_then(|value| string_field(value, "snapshot.snapshot_id").ok())
+                .unwrap_or_default(),
+            field("chunk_index")
+                .and_then(|value| long_field(value, "snapshot.chunk_index").ok())
+                .unwrap_or_default() as u32,
+            matches!(
+                field("is_last_chunk").and_then(unwrap_union),
+                Some(AvroValue::Boolean(true))
+            ),
+        )
+    });
+
+    let transaction = record_fields(required("transaction")?).map(|transaction_fields| {
+        let field = |name: &str| {
+            transaction_fields
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value)
+        };
+        let total = field("total_events")
+            .and_then(|value| long_field(value, "transaction.total_events").ok())
+            .unwrap_or_default() as u32;
+        crate::core::TransactionMetadata::new(
+            field("tx_id")
+                .and_then(|value| long_field(value, "transaction.tx_id").ok())
+                .unwrap_or_default() as u64,
+            field("event_index")
+                .and_then(|value| long_field(value, "transaction.event_index").ok())
+                .unwrap_or_default() as u32,
+            // The encoder writes 0 for an absent count because the Avro field is not
+            // nullable. Zero is not a meaningful transaction size, so it maps back to
+            // `None` rather than to a transaction claiming to hold no events.
+            (total > 0).then_some(total),
+        )
+    });
+
+    let mut builder = Event::builder(string_field(required("table")?, "table")?, op)
+        .source(source)
+        .ts(long_field(required("ts")?, "ts")? as u64)
+        .primary_key(string_array(get("primary_key")))
+        .unavailable_columns(string_array(get("unavailable_columns")))
+        .before_unavailable_columns(string_array(get("before_unavailable_columns")))
+        .before_is_key_only(matches!(
+            get("before_is_key_only").and_then(unwrap_union),
+            Some(AvroValue::Boolean(true))
+        ));
+
+    if let Some(before) = json_field(required("before")?, "before")? {
+        builder = builder.before(before);
+    }
+    if let Some(after) = json_field(required("after")?, "after")? {
+        builder = builder.after(after);
+    }
+    if let Some(schema) = unwrap_union(required("schema")?) {
+        builder = builder.schema(string_field(schema, "schema")?);
+    }
+    if let Some(snapshot) = snapshot {
+        builder = builder.snapshot(snapshot);
+    }
+    if let Some(transaction) = transaction {
+        builder = builder.transaction(transaction);
+    }
+
+    let mut event = builder.build();
+    // The envelope version is carried on the wire rather than re-stamped, so a consumer
+    // can detect a producer running an older envelope.
+    if let Some(version) = get("envelope_version") {
+        event.envelope_version = long_field(version, "envelope_version")? as u16;
+    }
+    // An empty primary-key array on the wire means "no key", not "a key with no columns".
+    if event
+        .primary_key
+        .as_ref()
+        .is_some_and(|columns| columns.is_empty())
+    {
+        event.primary_key = None;
+    }
+    Ok(event)
+}
+
+/// Decodes CDC events from bare Avro binary produced by [`AvroEncoder`].
+///
+/// For Confluent-framed payloads use `ConfluentAvroDecoder`, which strips the 5-byte
+/// header and resolves the writer schema from the registry before delegating here.
+#[derive(Debug)]
+pub struct AvroDecoder {
+    schema: Schema,
+}
+
+impl AvroDecoder {
+    /// Build a decoder against the canonical envelope schema.
+    pub fn new() -> Result<Self> {
+        let schema = Schema::parse_str(AVRO_SCHEMA)
+            .map_err(|e| Error::SerializationError(format!("Avro schema parse error: {e}")))?;
+        Ok(Self { schema })
+    }
+
+    /// Decode bare Avro binary into an [`Event`].
+    pub fn decode(&self, bytes: &[u8]) -> Result<Event> {
+        let value = apache_avro::from_avro_datum(&self.schema, &mut { bytes }, None)
+            .map_err(|e| Error::SerializationError(format!("Avro decode error: {e}")))?;
+        avro_value_to_event(&value)
+    }
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    use super::*;
+    use crate::core::{SnapshotMetadata, SourceMetadata, TransactionMetadata};
+    use serde_json::json;
+
+    fn round_trip(event: &Event) -> Event {
+        let encoded = AvroEncoder::new()
+            .expect("encoder")
+            .encode(event)
+            .expect("encode");
+        AvroDecoder::new()
+            .expect("decoder")
+            .decode(&encoded.bytes)
+            .expect("decode")
+    }
+
+    #[test]
+    fn a_full_event_round_trips_through_avro() {
+        // Until `avro_value_to_event` existed there was no Avro → Event path that worked
+        // at all. The encoder's tests decoded to a raw AvroValue and inspected fields,
+        // which is why an unusable decoder went unnoticed.
+        let event = Event::builder("users", Operation::Update)
+            .source(SourceMetadata::new("postgres", "0/16B2E48", 1_700_000_000))
+            .schema("public")
+            .before(json!({ "id": 1, "email": "old@example.com" }))
+            .after(json!({ "id": 1, "email": "new@example.com" }))
+            .primary_key(["id"])
+            .ts(1_700_000_000)
+            .build();
+
+        assert_eq!(round_trip(&event), event);
+    }
+
+    #[test]
+    fn row_payloads_survive_as_json_not_as_opaque_bytes() {
+        // `before`/`after` are Avro `bytes` holding JSON. A decoder that returned the raw
+        // bytes, or stringified them, would hand a sink a string where it expects an
+        // object — and the sink would write that string into the row.
+        let event = Event::builder("t", Operation::Insert)
+            .source(SourceMetadata::new("s", "1", 1))
+            .after(json!({ "nested": { "array": [1, 2, 3] }, "flag": true }))
+            .ts(1)
+            .build();
+        let decoded = round_trip(&event);
+        assert_eq!(
+            decoded.after.as_ref().and_then(|value| value.get("nested")),
+            Some(&json!({ "array": [1, 2, 3] })),
+        );
+    }
+
+    #[test]
+    fn a_delete_with_no_after_image_round_trips_as_none() {
+        // `Some(Value::Null)` and `None` are different: the first says "the row is null",
+        // the second says "there is no after image".
+        let event = Event::builder("t", Operation::Delete)
+            .source(SourceMetadata::new("s", "1", 1))
+            .before(json!({ "id": 9 }))
+            .ts(1)
+            .build();
+        let decoded = round_trip(&event);
+        assert!(decoded.after.is_none(), "absent must not become null");
+        assert_eq!(decoded.before, Some(json!({ "id": 9 })));
+        assert_eq!(decoded.op, Operation::Delete);
+    }
+
+    #[test]
+    fn every_operation_symbol_round_trips() {
+        for op in [
+            Operation::Insert,
+            Operation::Update,
+            Operation::Delete,
+            Operation::Read,
+            Operation::SchemaChange,
+            Operation::Truncate,
+        ] {
+            let event = Event::builder("t", op)
+                .source(SourceMetadata::new("s", "1", 1))
+                .after(json!({ "id": 1 }))
+                .ts(1)
+                .build();
+            assert_eq!(
+                round_trip(&event).op,
+                op,
+                "operation {op:?} did not survive"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_operation_symbol_is_rejected_rather_than_defaulted() {
+        // Defaulting to INSERT would turn a foreign or truncated message into a row
+        // creation that a sink would apply.
+        let record = AvroValue::Record(vec![
+            (
+                "before".into(),
+                AvroValue::Union(0, Box::new(AvroValue::Null)),
+            ),
+            (
+                "after".into(),
+                AvroValue::Union(0, Box::new(AvroValue::Null)),
+            ),
+            ("op".into(), AvroValue::Enum(9, "FROM_THE_FUTURE".into())),
+            (
+                "source".into(),
+                AvroValue::Record(vec![
+                    ("source_name".into(), AvroValue::String("s".into())),
+                    ("offset".into(), AvroValue::String("1".into())),
+                    ("timestamp".into(), AvroValue::Long(1)),
+                ]),
+            ),
+            ("ts".into(), AvroValue::Long(1)),
+            (
+                "schema".into(),
+                AvroValue::Union(0, Box::new(AvroValue::Null)),
+            ),
+            ("table".into(), AvroValue::String("t".into())),
+            ("primary_key".into(), AvroValue::Array(Vec::new())),
+            (
+                "snapshot".into(),
+                AvroValue::Union(0, Box::new(AvroValue::Null)),
+            ),
+            (
+                "transaction".into(),
+                AvroValue::Union(0, Box::new(AvroValue::Null)),
+            ),
+            ("envelope_version".into(), AvroValue::Int(1)),
+            ("before_is_key_only".into(), AvroValue::Boolean(false)),
+            ("unavailable_columns".into(), AvroValue::Array(Vec::new())),
+            (
+                "before_unavailable_columns".into(),
+                AvroValue::Array(Vec::new()),
+            ),
+        ]);
+        let error = avro_value_to_event(&record).expect_err("unknown symbol must be rejected");
+        assert!(
+            error.to_string().contains("unknown operation symbol"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn snapshot_and_transaction_metadata_round_trip() {
+        let event = Event::builder("t", Operation::Read)
+            .source(SourceMetadata::new("s", "1", 1))
+            .after(json!({ "id": 1 }))
+            .ts(1)
+            .snapshot(SnapshotMetadata::new("snap-1", 3, true))
+            .transaction(TransactionMetadata::new(77, 2, Some(5)))
+            .build();
+        let decoded = round_trip(&event);
+        assert_eq!(decoded.snapshot, event.snapshot);
+        assert_eq!(decoded.transaction, event.transaction);
+    }
+
+    #[test]
+    fn an_absent_transaction_size_stays_absent() {
+        // The Avro field is not nullable, so the encoder writes 0. Reading 0 back as
+        // `Some(0)` would claim a transaction holds no events.
+        let event = Event::builder("t", Operation::Insert)
+            .source(SourceMetadata::new("s", "1", 1))
+            .after(json!({ "id": 1 }))
+            .ts(1)
+            .transaction(TransactionMetadata::new(5, 0, None))
+            .build();
+        let decoded = round_trip(&event);
+        assert_eq!(
+            decoded.transaction.as_ref().and_then(|tx| tx.total_events),
+            None,
+        );
+    }
+
+    #[test]
+    fn the_two_availability_lists_stay_separate_across_the_round_trip() {
+        // Merging them marks a genuinely changed column as unwritable and drops the update.
+        let event = Event::builder("t", Operation::Update)
+            .source(SourceMetadata::new("s", "1", 1))
+            .before(json!({ "id": 1 }))
+            .after(json!({ "id": 1 }))
+            .unavailable_columns(["big_kept"])
+            .before_unavailable_columns(["big_changed"])
+            .ts(1)
+            .build();
+        let decoded = round_trip(&event);
+        assert_eq!(decoded.unavailable_columns, vec!["big_kept".to_string()]);
+        assert_eq!(
+            decoded.before_unavailable_columns,
+            vec!["big_changed".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_keyless_table_round_trips_as_no_key_rather_than_an_empty_key() {
+        // An empty column list is not the same as "this table has a key with no columns";
+        // the idempotency guard treats the two differently.
+        let event = Event::builder("logs", Operation::Insert)
+            .source(SourceMetadata::new("s", "1", 1))
+            .after(json!({ "line": "x" }))
+            .ts(1)
+            .build();
+        assert!(round_trip(&event).primary_key.is_none());
     }
 }

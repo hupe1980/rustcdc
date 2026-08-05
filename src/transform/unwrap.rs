@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 
-use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use crate::core::{Error, Event, Result};
@@ -10,9 +9,20 @@ use crate::core::{Error, Event, Result};
 use super::Transform;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Flattens nested JSON structures in event payloads.
 pub struct UnwrapConfig {
+    /// When `false`, events pass through untouched.
     pub enabled: bool,
+    /// Maximum nesting depth to flatten. Deeper structures are left intact.
+    ///
+    /// A bound rather than full recursion: an unbounded flatten on a deeply nested
+    /// `jsonb` document produces a very wide row and can blow the payload size limit.
     pub max_depth: u8,
+    /// Also flatten array elements into indexed keys.
+    ///
+    /// **Consider what this does to masking**: flattening moves fields to new paths, so a
+    /// `MaskHashTransform` ordered *after* this one will no longer match rules written
+    /// against the original paths. Order masking first.
     pub flatten_arrays: bool,
 }
 
@@ -27,15 +37,24 @@ impl Default for UnwrapConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Applies [`UnwrapConfig`] to event payloads.
 pub struct UnwrapTransform {
+    /// Flattening configuration.
     pub config: UnwrapConfig,
 }
 
 impl UnwrapTransform {
+    /// Build a transform from configuration.
     pub fn new(config: UnwrapConfig) -> Self {
         Self { config }
     }
 
+    /// Flatten an event's before- and after-images in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flattening produces a key collision, which would otherwise
+    /// silently drop a field.
     pub fn apply_event(&self, event: &mut Event) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
@@ -47,9 +66,8 @@ impl UnwrapTransform {
     }
 }
 
-#[async_trait]
 impl Transform for UnwrapTransform {
-    async fn apply(&self, event: &mut Event) -> Result<bool> {
+    fn apply(&self, event: &mut Event) -> Result<bool> {
         self.apply_event(event)?;
         Ok(true)
     }

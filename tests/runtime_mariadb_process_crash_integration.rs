@@ -147,7 +147,9 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
     worker.kill().map_err(rustcdc::Error::IoError)?;
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
-    let reader_after_worker = FileCheckpoint::new(checkpoint_dir.path());
+    // Read-only: a writer instance here would hold the owner lease that the runtime's
+    // own checkpoint store needs a few lines below.
+    let reader_after_worker = FileCheckpoint::read_only(checkpoint_dir.path());
     let saved = reader_after_worker.load().await?.ok_or_else(|| {
         rustcdc::Error::StateError("checkpoint should exist after worker ack".into())
     })?;
@@ -311,6 +313,7 @@ async fn run_mariadb_process_kill_replay_scenario(
         binlog_file: baseline_file,
         binlog_pos: baseline_pos,
         source_flavor: "mysql".into(),
+        incremental_snapshot: None,
     };
     let baseline_bytes = serde_json::to_vec(&baseline_offset)
         .map_err(|error| rustcdc::Error::CheckpointError(error.to_string()))?;
@@ -343,7 +346,8 @@ async fn run_mariadb_process_kill_replay_scenario(
     worker.kill().map_err(rustcdc::Error::IoError)?;
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
 
-    let reader_before = FileCheckpoint::new(checkpoint_dir.path());
+    // Read-only, for the same reason as above.
+    let reader_before = FileCheckpoint::read_only(checkpoint_dir.path());
     assert_eq!(reader_before.get_committed_count().await?, 0);
 
     let source_cfg = MariaDbSourceConfig::from(MysqlSourceConfig {
@@ -411,7 +415,7 @@ async fn run_mariadb_process_kill_replay_scenario(
 
     runtime.commit_ack(replay_batch.ack_mode()).await?;
 
-    let reader_after = FileCheckpoint::new(checkpoint_dir.path());
+    let reader_after = FileCheckpoint::read_only(checkpoint_dir.path());
     assert_eq!(
         reader_after.get_committed_count().await?,
         worker_batch_len as u64

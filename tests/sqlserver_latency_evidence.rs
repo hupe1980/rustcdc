@@ -12,7 +12,10 @@ mod sqlserver_testkit;
 #[path = "latency_evidence_common.rs"]
 mod latency_evidence_common;
 
-use latency_evidence_common::{percentile, write_latency_artifacts, LatencySummary};
+use latency_evidence_common::{
+    assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
+    LatencyRecorder, ProgressDeadline, WriterStatus,
+};
 
 async fn sql_exec(client: &mut sqlserver_testkit::SqlClient, sql: &str) -> rustcdc::Result<()> {
     client
@@ -62,6 +65,7 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
     .await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
+    let (writer_host, writer_port) = (host.clone(), port);
     let source_cfg = sqlserver_testkit::source_config(host, port, "rustcdc_latency".into(), 30);
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
@@ -78,69 +82,97 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
     runtime.start().await?;
 
     let rows_inserted = 4_096_u64;
-    for id in 1_u64..=rows_inserted {
-        let sql = format!(
-            "USE rustcdc_latency; INSERT INTO dbo.latency_users (id, payload) VALUES ({}, 'payload-{}')",
-            id, id
-        );
-        sql_exec(&mut admin, &sql).await?;
-    }
 
-    let mut poll_latencies_ms = Vec::new();
-    let mut commit_latencies_ms = Vec::new();
-    let mut batch_sizes = Vec::new();
+    // Write concurrently with polling, on a dedicated connection: `admin` stays with the
+    // reader loop, which drives `sp_cdc_scan` to keep the capture job moving.
+    // Published so a stall can name which side stopped, and so a writer failure is
+    // reported with its own error instead of as an ambiguous timeout.
+    let writer_status = WriterStatus::new();
+    let writer_progress = std::sync::Arc::clone(&writer_status);
+    let writer = tokio::spawn(async move {
+        let mut writer_client = sqlserver_testkit::connect_admin_with_retry(
+            &writer_host,
+            writer_port,
+            40,
+            Duration::from_secs(2),
+        )
+        .await?;
+        for id in 1_u64..=rows_inserted {
+            // Payload carries this process's wall clock — capture latency is measured
+            // against a single clock, so container/host drift cannot skew it.
+            let payload = stamped_payload(&format!("row-{id}"));
+            let sql = format!(
+                "USE rustcdc_latency; INSERT INTO dbo.latency_users (id, payload) \
+                 VALUES ({id}, '{payload}')"
+            );
+            if let Err(error) = sql_exec(&mut writer_client, &sql).await {
+                writer_progress.record_failure(&error);
+                return Err(error);
+            }
+            writer_progress.record_row();
+        }
+        Ok::<_, rustcdc::Error>(())
+    });
+
+    let mut recorder = LatencyRecorder::new();
     let mut events_committed = 0_u64;
     let started = Instant::now();
 
     let cdc_scan_sql = "USE rustcdc_latency; EXEC sys.sp_cdc_scan";
-    let deadline = Instant::now() + Duration::from_secs(180);
+    // SQL Server CDC is polling-based and its capture job runs on the server's schedule,
+    // so a longer stall window is legitimate here — but it is still a stall window, not a
+    // total-time budget.
+    let mut deadline = ProgressDeadline::new(
+        "sqlserver capture latency",
+        rows_inserted,
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(900),
+    )
+    .watching_writer(std::sync::Arc::clone(&writer_status));
     while events_committed < rows_inserted {
-        if Instant::now() > deadline {
-            return Err(rustcdc::Error::TimeoutError(format!(
-                "timed out while collecting sqlserver latency evidence (committed={events_committed}, expected={rows_inserted})"
-            )));
-        }
+        deadline.check(events_committed)?;
 
         let poll_start = Instant::now();
         let batch = runtime.poll_event_batch().await?;
+        let delivered_at = now_micros();
         let poll_ms = poll_start.elapsed().as_secs_f64() * 1000.0;
 
         if batch.is_empty() {
+            // SQL Server CDC is capture-agent based: rows are not visible to the
+            // connector until the capture job has scanned the log. Driving the scan
+            // manually is what a latency-sensitive deployment does with a tightened
+            // `sp_cdc_change_job` polling interval; without it this measures the agent's
+            // default 5-second cadence, not the connector.
             let _ = sql_exec(&mut admin, cdc_scan_sql).await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         }
 
         let batch_len = batch.len();
-        batch_sizes.push(batch_len as f64);
-        poll_latencies_ms.push(poll_ms);
+        recorder.observe_poll_ms(poll_ms);
+        recorder.observe_batch(batch.events(), delivered_at);
 
         let commit_start = Instant::now();
         runtime.commit_ack(batch.ack_mode()).await?;
-        let commit_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
-        commit_latencies_ms.push(commit_ms);
+        recorder.observe_commit_ms(commit_start.elapsed().as_secs_f64() * 1000.0);
 
         events_committed = events_committed.saturating_add(batch_len as u64);
     }
 
-    let summary = LatencySummary {
-        profile: "sqlserver_stream_commit",
+    let wall_clock_ms = started.elapsed().as_millis();
+    writer
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(format!("writer task panicked: {error}")))??;
+
+    let summary = recorder.finish(
+        "sqlserver_stream_capture",
         rows_inserted,
         events_committed,
-        batches: poll_latencies_ms.len(),
-        poll_latency_ms_p50: percentile(&poll_latencies_ms, 50.0),
-        poll_latency_ms_p95: percentile(&poll_latencies_ms, 95.0),
-        poll_latency_ms_p99: percentile(&poll_latencies_ms, 99.0),
-        commit_latency_ms_p50: percentile(&commit_latencies_ms, 50.0),
-        commit_latency_ms_p95: percentile(&commit_latencies_ms, 95.0),
-        commit_latency_ms_p99: percentile(&commit_latencies_ms, 99.0),
-        batch_size_p50: percentile(&batch_sizes, 50.0),
-        batch_size_p95: percentile(&batch_sizes, 95.0),
-        batch_size_p99: percentile(&batch_sizes, 99.0),
-        end_to_end_ms: started.elapsed().as_millis(),
-    };
+        wall_clock_ms,
+    );
 
     assert!(summary.events_committed >= rows_inserted);
+    assert_sample_is_meaningful(&summary, rows_inserted / 2);
     assert!(
         summary.batches >= 16,
         "expected sustained multi-batch evidence"
@@ -148,8 +180,15 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
 
     write_latency_artifacts("sqlserver", &summary)?;
     println!(
-        "sqlserver latency evidence recorded: batches={} poll_p95_ms={:.3} commit_p95_ms={:.3}",
-        summary.batches, summary.poll_latency_ms_p95, summary.commit_latency_ms_p95
+        "sqlserver capture latency: p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms \
+         throughput={:.0}/s batches={} clock_skew={:+.1}ms",
+        summary.capture_latency_ms_p50,
+        summary.capture_latency_ms_p95,
+        summary.capture_latency_ms_p99,
+        summary.capture_latency_ms_max,
+        summary.events_per_second,
+        summary.batches,
+        summary.source_commit_skew_ms,
     );
 
     Ok(())

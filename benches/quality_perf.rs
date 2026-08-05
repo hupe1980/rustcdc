@@ -1,7 +1,6 @@
-use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rustcdc::transform::{Transform, TransformPipeline};
-use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata};
 use serde_json::json;
 use std::collections::HashSet;
 use std::hint::black_box;
@@ -15,30 +14,14 @@ fn build_transform_pipeline() -> TransformPipeline {
 }
 
 fn build_event(id: u64) -> Event {
-    Event {
-        before: None,
-        after: Some(
-            json!({"id": id, "name": format!("user-{id}"), "email": format!("user-{id}@example.com")}),
-        ),
-        op: Operation::Read,
-        source: SourceMetadata {
-            source_name: "bench".to_string(),
-            offset: id.to_string(),
-            timestamp: id + 1,
-        },
-        ts: id + 1,
-        schema: Some("public".to_string()),
-        table: "users".to_string(),
-        primary_key: Some(vec!["id".to_string()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    Event::builder("users".to_string(), Operation::Read)
+        .after(json!({"id": id, "name": format!("user-{id}"), "email": format!("user-{id}@example.com")}),)
+        .source(SourceMetadata::new("bench".to_string(), id.to_string(), id + 1))
+        .ts(id + 1)
+        .schema("public".to_string())
+        .primary_key(["id"])
+        .build()
 }
-
 fn run_pipeline_batch(
     runtime: &tokio::runtime::Runtime,
     pipeline: &mut TransformPipeline,
@@ -70,9 +53,8 @@ fn dedup_by_id(mut events: Vec<Event>) -> Vec<Event> {
 #[derive(Debug)]
 struct AddTagTransform;
 
-#[async_trait]
 impl Transform for AddTagTransform {
-    async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
+    fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
             after.insert("bench_tag".to_string(), json!("quality"));
         }
@@ -87,9 +69,8 @@ impl Transform for AddTagTransform {
 #[derive(Debug)]
 struct NormalizeNameTransform;
 
-#[async_trait]
 impl Transform for NormalizeNameTransform {
-    async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
+    fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
             if let Some(serde_json::Value::String(name)) = after.get_mut("name") {
                 name.make_ascii_uppercase();

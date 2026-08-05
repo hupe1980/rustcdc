@@ -139,7 +139,7 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
             query.push_str(&format!("('row-{i}')"));
             first = false;
         }
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .execute(&admin_pool)
             .await
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
@@ -421,7 +421,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
             query.push_str(&format!("('initial-{i}')"));
             first = false;
         }
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .execute(&admin_pool)
             .await
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
@@ -475,7 +475,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
             query.push_str(&format!("('post-handoff-{i}')"));
             first = false;
         }
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .execute(&admin_pool)
             .await
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;

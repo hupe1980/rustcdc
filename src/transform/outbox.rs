@@ -1,6 +1,5 @@
 //! Outbox helper transform and parsing result.
 
-use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::core::{Error, Event, Result};
@@ -9,22 +8,36 @@ use super::Transform;
 
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+/// Whether an event came from the configured outbox table, and what it carried.
 pub enum OutboxResult {
+    /// The event is an outbox record; its domain payload has been unwrapped.
     IsOutboxEvent {
+        /// Aggregate the domain event belongs to — the natural partition key.
         aggregate_id: String,
+        /// Domain event type, for downstream routing.
         event_type: String,
+        /// The domain payload, unwrapped from the outbox row.
         payload: Value,
     },
+    /// The event is not from the outbox table, or the transform is disabled.
     NotOutboxEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Unwraps the transactional-outbox pattern: turns an outbox row into its domain event.
+///
+/// Only `Insert` operations are treated as domain events — an outbox row is written once
+/// and never updated, so an `Update` or `Delete` against the outbox table is housekeeping
+/// (a cleanup job), not a new domain event.
 pub struct OutboxTransform {
+    /// When `false`, every event passes through untouched.
     pub enabled: bool,
+    /// Table in which outbox rows are written.
     pub outbox_table: String,
 }
 
 impl OutboxTransform {
+    /// Build an enabled transform for `outbox_table`.
     pub fn new(outbox_table: impl Into<String>) -> Self {
         Self {
             enabled: true,
@@ -32,6 +45,11 @@ impl OutboxTransform {
         }
     }
 
+    /// Classify and unwrap an event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row is missing the columns the outbox pattern requires.
     pub fn apply_outbox(&self, event: &mut Event) -> Result<OutboxResult> {
         if !self.enabled || event.table != self.outbox_table {
             return Ok(OutboxResult::NotOutboxEvent);
@@ -78,7 +96,6 @@ impl OutboxTransform {
     }
 }
 
-#[async_trait]
 impl Transform for OutboxTransform {
     /// For events from the configured outbox table:
     /// - Rewrites `event.table` to the extracted `event_type` (analogous to
@@ -86,7 +103,7 @@ impl Transform for OutboxTransform {
     /// - Replaces `event.after` with the extracted business-event `payload`.
     ///
     /// Events from other tables pass through unchanged.
-    async fn apply(&self, event: &mut Event) -> Result<bool> {
+    fn apply(&self, event: &mut Event) -> Result<bool> {
         match self.apply_outbox(event)? {
             OutboxResult::NotOutboxEvent => Ok(true),
             OutboxResult::IsOutboxEvent {
@@ -187,7 +204,7 @@ mod tests {
             }),
         );
 
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         // event.table must become the event_type.
         assert_eq!(e.table, "order.placed");
         // event.after must be the extracted business payload only.
@@ -201,7 +218,7 @@ mod tests {
             "outbox",
             json!({"aggregate_id": "order-42", "event_type": "order.placed", "payload": {}}),
         );
-        transform.apply(&mut e).await.unwrap();
+        transform.apply(&mut e).unwrap();
         assert_eq!(
             e.primary_key.as_deref(),
             Some([String::from("order-42")].as_slice()),
@@ -215,7 +232,7 @@ mod tests {
         let payload = json!({"id": 7});
         let mut e = event("users", payload.clone());
 
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         // Nothing modified.
         assert_eq!(e.table, "users");
         assert_eq!(e.after.unwrap(), payload);
@@ -226,7 +243,7 @@ mod tests {
         let transform = OutboxTransform::new("outbox");
         let mut e = event("outbox", json!({"aggregate_id": "x"}));
         assert!(
-            transform.apply(&mut e).await.is_err(),
+            transform.apply(&mut e).is_err(),
             "missing event_type must yield an error"
         );
     }
@@ -259,7 +276,7 @@ mod tests {
         };
         // Must not error — cleanup rows must be passed through (or filtered upstream).
         assert!(
-            transform.apply(&mut e).await.unwrap(),
+            transform.apply(&mut e).unwrap(),
             "Delete on outbox table must pass through"
         );
         assert_eq!(e.table, "outbox", "table must remain unchanged");
@@ -289,7 +306,7 @@ mod tests {
             before_unavailable_columns: Vec::new(),
         };
         assert!(
-            transform.apply(&mut e).await.unwrap(),
+            transform.apply(&mut e).unwrap(),
             "Truncate on outbox table must not error"
         );
         assert_eq!(
@@ -326,7 +343,7 @@ mod tests {
             unavailable_columns: Vec::new(),
             before_unavailable_columns: Vec::new(),
         };
-        assert!(transform.apply(&mut e).await.unwrap());
+        assert!(transform.apply(&mut e).unwrap());
         // Table must NOT be rewritten — Update should pass through unchanged.
         assert_eq!(e.table, "outbox");
     }

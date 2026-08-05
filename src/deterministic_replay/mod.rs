@@ -1,3 +1,4 @@
+/// Structural diffing of replayed streams against golden records.
 pub mod diff;
 /// Deterministic replay framework for testing CDC protocol correctness without live databases.
 ///
@@ -7,6 +8,7 @@ pub mod diff;
 /// - Deterministic replay without live database connections
 /// - Semantic diff tooling for envelope changes
 pub mod fixtures;
+/// The replay driver.
 pub mod replay;
 
 pub use diff::{semantic_diff, DiffLevel, EventDiff};

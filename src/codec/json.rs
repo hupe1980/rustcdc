@@ -64,12 +64,10 @@ impl EventEncoder for JsonPrettyEncoder {
 /// use rustcdc::{Event, Operation, EVENT_ENVELOPE_VERSION};
 /// use serde_json::json;
 ///
-/// let event = Event {
-///     after: Some(json!({"id": 42, "name": "alice"})),
-///     op: Operation::Insert,
-///     primary_key: Some(vec!["id".into()]),
-///     ..Event::default()
-/// };
+/// let event = Event::builder("", Operation::Insert)
+///     .after(json!({"id": 42, "name": "alice"}))
+///     .primary_key(["id"])
+///     .build();
 ///
 /// let codec = JsonCodec::default();
 /// let out = codec.encode(&event).unwrap();

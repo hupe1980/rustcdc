@@ -8,11 +8,59 @@
 // remains unsafe-free, and each exception must carry an explicit
 // `#[allow(unsafe_code)]` with a safety comment.
 #![deny(unsafe_code)]
+// Every public item carries documentation, and the lint keeps it that way.
+//
+// This is a library whose public surface *is* the product: an undocumented `pub fn` on a
+// checkpoint or connector type is a reader guessing at a correctness contract. The
+// backfill that made this lint pass was 416 items, and roughly a fifth of them turned out
+// to be places where the *behaviour* needed explaining rather than the signature restated
+// — which is the argument for enforcing it rather than leaving it aspirational.
+#![deny(missing_docs)]
+
+/// Compiles every Rust code block in the published Markdown documentation.
+///
+/// Documentation drift is not a cosmetic problem for a library: a sample that no
+/// longer compiles is a support ticket, and one that compiles but describes a
+/// superseded contract is worse. Rustdoc examples on public items were already
+/// doctested; the Markdown under `docs/` and the README were not, so they could rot
+/// silently — and did.
+///
+/// Gated on `cfg(doctest)` so the text is never embedded into the crate's own
+/// rendered documentation; only the code blocks are compiled and run.
+///
+/// The pages live under `site/content/docs/` and are published by Zola to the project
+/// site. Compiling them here is what keeps the published site and the crate in step.
+///
+/// Blocks that genuinely cannot run in a doctest (they need a live database, or show
+/// a fragment rather than a program) must be marked `ignore` with a one-line reason,
+/// or `no_run` when they should still be type-checked. An unmarked block that fails
+/// to compile is a real defect in the documentation.
+#[cfg(doctest)]
+mod markdown_doctests {
+    #[doc = include_str!("../README.md")]
+    mod readme {}
+
+    #[doc = include_str!("../site/content/docs/api.md")]
+    mod api {}
+
+    #[doc = include_str!("../site/content/docs/config-reference.md")]
+    mod config_reference {}
+
+    #[doc = include_str!("../site/content/docs/getting-started.md")]
+    mod getting_started {}
+
+    #[doc = include_str!("../site/content/docs/adapter-sdk.md")]
+    mod adapter_sdk {}
+
+    #[doc = include_str!("../site/content/docs/schema-evolution.md")]
+    mod schema_evolution {}
+}
 
 pub mod checkpoint;
 pub mod codec;
 pub mod core;
 pub mod ddl_capture;
+/// Replay a captured event stream deterministically, and diff it against a golden record.
 pub mod deterministic_replay;
 #[cfg(feature = "test-harnesses")]
 pub mod fault_injection;
@@ -32,12 +80,13 @@ pub mod wasm;
 pub use crate::core::RustlsClientConfig;
 pub use crate::core::{
     fingerprint_event_stable, fingerprint_event_transient, AckMode, AckToken, CdcRuntime,
-    ConnectionRetryPolicy, Error, ErrorKind, Event, EventBatch, EventIdempotencyGuard, EventTracer,
-    FingerprintError, HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer,
-    NoOpMetricsCollector, NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result,
-    RowWrite, RuntimeAdminSnapshot, RuntimeConfig, RuntimeObservability, RuntimeOptions,
-    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
-    SourceErrorKind, SourceMetadata, StructuredLogger, TransactionMetadata, TransformErrorPolicy,
+    ConnectionRetryPolicy, Error, ErrorChain, ErrorKind, ErrorReport, Event, EventBatch,
+    EventBuilder, EventIdempotencyGuard, EventTracer, FingerprintError, HealthVerdict,
+    IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector, NoRowWrite,
+    Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite, RuntimeAdminSnapshot,
+    RuntimeConfig, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
+    SecretProvider, SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata,
+    StructuredLogger, TransactionBoundaryPolicy, TransactionMetadata, TransformErrorPolicy,
     TransportConfig, ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "metrics")]
@@ -73,8 +122,8 @@ pub use crate::source::{PostgresConnection, PostgresSourceConfig};
 #[cfg(feature = "sqlserver")]
 pub use crate::source::{SqlServerConnection, SqlServerSourceConfig};
 pub use crate::transform::{
-    FieldMappingConfig, FieldMappingTransform, FilterField, FilterMode, FilterOperator,
-    FilterProjectionConfig, FilterProjectionTransform, FilterRule, MaskHashConfig,
+    AsyncTransform, FieldMappingConfig, FieldMappingTransform, FilterField, FilterMode,
+    FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule, MaskHashConfig,
     MaskHashTransform, MaskRule, RouteConfig, RouteTransform, Transform, TransformPipeline,
     UnwrapConfig, UnwrapTransform,
 };
@@ -84,6 +133,8 @@ pub use crate::wasm::{
     WasmRuntimeMetrics, WasmTransform, DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,
 };
 
+#[cfg(feature = "apicurio")]
+pub use crate::codec::ApicurioRegistryConfig;
 #[cfg(feature = "avro")]
 pub use crate::codec::AvroEncoder;
 #[cfg(feature = "cloudevents")]
@@ -92,11 +143,15 @@ pub use crate::codec::CloudEventsEncoder;
 pub use crate::codec::ProtobufEncoder;
 #[cfg(feature = "schemreg")]
 pub use crate::codec::{
-    decode_wire_format, encode_wire_format, CachedSchemaRegistry, CompatibilityLevel,
+    decode_wire_format, detect_wire_format, encode_wire_format, preflight_schema_registry,
+    warm_schema_cache, AnySchemaCache, CachedSchemaRegistry, CompatibilityLevel,
     ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
-    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentSchemaRegistry, EncodeTarget,
-    SchemaId, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType,
-    SubjectNameStrategy, EVENT_JSON_SCHEMA, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
+    ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentSchemaRegistry,
+    DecodedMessage, DetectedWireFormat, DynSchemaRegistryClient, EncodeTarget, RetryPolicy,
+    SchemaDecoder, SchemaEncoder, SchemaFormat, SchemaId, SchemaReference, SchemaRegError,
+    SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType, SchemaVersion,
+    SubjectNameStrategy, WireFormatDecoder, DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF,
+    DEFAULT_MAX_RETRIES, EVENT_JSON_SCHEMA, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA,
 };
 pub use crate::codec::{
     BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec, EventEncoder, JsonCodec,

@@ -1,10 +1,6 @@
-use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rustcdc::transform::{Transform, TransformPipeline};
-use rustcdc::{
-    Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime,
-    EVENT_ENVELOPE_VERSION,
-};
+use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime};
 use serde_json::json;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -18,30 +14,14 @@ fn build_transform_pipeline() -> TransformPipeline {
 }
 
 fn build_event(id: u64) -> Event {
-    Event {
-        before: None,
-        after: Some(
-            json!({"id": id, "name": format!("user-{id}"), "email": format!("user-{id}@example.com")}),
-        ),
-        op: Operation::Read,
-        source: SourceMetadata {
-            source_name: "bench".to_string(),
-            offset: id.to_string(),
-            timestamp: id + 1,
-        },
-        ts: id + 1,
-        schema: Some("public".to_string()),
-        table: "users".to_string(),
-        primary_key: Some(vec!["id".to_string()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    Event::builder("users".to_string(), Operation::Read)
+        .after(json!({"id": id, "name": format!("user-{id}"), "email": format!("user-{id}@example.com")}),)
+        .source(SourceMetadata::new("bench".to_string(), id.to_string(), id + 1))
+        .ts(id + 1)
+        .schema("public".to_string())
+        .primary_key(["id"])
+        .build()
 }
-
 fn run_pipeline_batch(
     runtime: &tokio::runtime::Runtime,
     pipeline: &mut TransformPipeline,
@@ -86,9 +66,8 @@ fn dedup_by_id(mut events: Vec<Event>) -> Vec<Event> {
 #[derive(Debug)]
 struct AddTagTransform;
 
-#[async_trait]
 impl Transform for AddTagTransform {
-    async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
+    fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
             after.insert("bench_tag".to_string(), json!("benchmark"));
         }
@@ -103,9 +82,8 @@ impl Transform for AddTagTransform {
 #[derive(Debug)]
 struct NormalizeNameTransform;
 
-#[async_trait]
 impl Transform for NormalizeNameTransform {
-    async fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
+    fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
         if let Some(name) = event
             .after
             .as_mut()
@@ -151,6 +129,53 @@ fn bench_transform_pipeline(c: &mut Criterion) {
             black_box(transformed)
         })
     });
+
+    // The shape the runtime actually drives. `apply_transforms` runs a whole delivery
+    // through each stage in turn rather than each event through the whole pipeline, so
+    // this is the number that moves when the transform path changes.
+    // The shape the runtime actually drives. `apply_transforms` runs a whole delivery
+    // through each stage in turn rather than each event through the whole pipeline.
+    //
+    // Both variants below construct their events *outside* the timed region and process
+    // the same count, so the difference between them is the transform path itself and not
+    // event construction. That symmetry is the point: the previous benchmark built its
+    // event inside the timed loop, which is exactly the kind of confound that makes a
+    // performance number unciteable.
+    let batch_size = 1_000_u64;
+    let mut group = c.benchmark_group("cdc_perf/transform_pipeline_batch");
+    group.throughput(Throughput::Elements(batch_size));
+
+    group.bench_function("batched_1k_events", |b| {
+        b.iter_batched(
+            || (1..=batch_size).map(build_event).collect::<Vec<Event>>(),
+            |mut events| {
+                runtime
+                    .block_on(pipeline.apply_batch(&mut events))
+                    .expect("apply transform batch");
+                black_box(events)
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("per_event_1k_events", |b| {
+        b.iter_batched(
+            || (1..=batch_size).map(build_event).collect::<Vec<Event>>(),
+            |events| {
+                let kept: Vec<Event> = events
+                    .into_iter()
+                    .filter_map(|event| {
+                        runtime
+                            .block_on(pipeline.apply(event))
+                            .expect("apply transform pipeline")
+                    })
+                    .collect();
+                black_box(kept)
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+    group.finish();
 }
 
 fn bench_snapshot_10k_rows(c: &mut Criterion) {
@@ -349,7 +374,7 @@ fn wasm_tempfile(wasm: &[u8]) -> tempfile::NamedTempFile {
 }
 
 /// Benchmark the WASM pass-through transform (event in → same event out).
-/// Documents per-invocation overhead against the <1ms target in docs/wasm_transform_sdk.md.
+/// Documents per-invocation overhead against the <1ms target in site/content/docs/wasm-transform-sdk.md.
 fn bench_wasm_transform_pass_through(c: &mut Criterion) {
     let wasm_bytes = compile_wat("pass_through.wat");
     let wasm_file = wasm_tempfile(&wasm_bytes);

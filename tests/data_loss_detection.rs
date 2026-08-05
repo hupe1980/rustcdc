@@ -5,7 +5,6 @@ use rustcdc::{
     fault_injection::{CrashSimulationState, DataLossValidator, FaultInjectingSource, SourceFault},
     source::{HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle},
     Event, Offset, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
-    EVENT_ENVELOPE_VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -22,36 +21,16 @@ impl Offset for TestOffset {
 }
 
 fn event(id: u64) -> Event {
-    Event {
-        before: None,
-        after: Some(serde_json::json!({"id": id, "payload": format!("v-{id}")})),
-        op: Operation::Insert,
-        source: SourceMetadata {
-            source_name: "mock".into(),
-            offset: id.to_string(),
-            timestamp: id + 1,
-        },
-        ts: id + 1,
-        schema: Some("public".into()),
-        table: "events".into(),
-        primary_key: Some(vec!["id".into()]),
-        snapshot: Some(SnapshotMetadata {
-            snapshot_id: "integration".into(),
-            chunk_index: 0,
-            is_last_chunk: false,
-        }),
-        transaction: Some(TransactionMetadata {
-            tx_id: id / 10,
-            total_events: Some(1),
-            event_index: 0,
-        }),
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    Event::builder("events", Operation::Insert)
+        .after(serde_json::json!({"id": id, "payload": format!("v-{id}")}))
+        .source(SourceMetadata::new("mock", id.to_string(), id + 1))
+        .ts(id + 1)
+        .schema("public")
+        .primary_key(["id"])
+        .snapshot(SnapshotMetadata::new("integration", 0, false))
+        .transaction(TransactionMetadata::new(id / 10, 0, Some(1)))
+        .build()
 }
-
 struct NoopSnapshotHandle;
 
 #[async_trait]

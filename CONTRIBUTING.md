@@ -4,7 +4,7 @@ Thank you for your interest in contributing to rustcdc!
 
 ## Prerequisites
 
-- Rust (MSRV 1.92, edition 2021) — must match `rust-version` in `Cargo.toml`
+- Rust (MSRV 1.94, edition 2021) — must match `rust-version` in `Cargo.toml`
 - Docker and Docker Compose (for integration tests against live databases)
 
 ## Building

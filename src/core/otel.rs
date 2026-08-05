@@ -17,21 +17,52 @@ use opentelemetry::{
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::PeriodicReader;
-use opentelemetry_sdk::{metrics::SdkMeterProvider, runtime, trace as sdktrace, Resource};
+use opentelemetry_sdk::{metrics::SdkMeterProvider, trace as sdktrace, Resource};
 
 use crate::core::{Error, Event, EventTracer, MetricsCollector, Operation, Result};
 
+/// Build the OpenTelemetry `Resource` describing this service.
+///
+/// The service triple is what a backend groups and filters on, so it is set in one place
+/// rather than restated per signal — metrics and traces disagreeing about their own
+/// identity is a debugging trap.
+fn otel_resource(service_name: &str, service_version: &str, environment: &str) -> Resource {
+    Resource::builder()
+        .with_attributes([
+            KeyValue::new("service.name", service_name.to_string()),
+            KeyValue::new("service.version", service_version.to_string()),
+            KeyValue::new("deployment.environment", environment.to_string()),
+        ])
+        .build()
+}
+
+/// Connection and identity settings for the OTLP exporters.
+///
+/// The service triple (`service_name`, `service_version`, `environment`) becomes the
+/// OpenTelemetry `Resource` attached to every metric and span, so it is what a backend
+/// groups and filters on. Set `environment` to something that distinguishes deployments —
+/// otherwise staging and production series merge silently.
 #[derive(Debug, Clone)]
 pub struct OTelConfig {
+    /// OTLP gRPC endpoint, e.g. `http://otel-collector:4317`.
     pub endpoint: String,
+    /// `service.name` resource attribute.
     pub service_name: String,
+    /// `service.version` resource attribute.
     pub service_version: String,
+    /// `deployment.environment` resource attribute.
     pub environment: String,
+    /// How often the periodic reader exports metrics, in milliseconds. Default 1,000.
+    ///
+    /// Shorter intervals cost more network traffic and give the backend more points;
+    /// they do not make the runtime's own measurements finer-grained.
     pub export_interval_ms: u64,
+    /// Deadline for a single export attempt, in milliseconds. Default 5,000.
     pub export_timeout_ms: u64,
 }
 
 impl OTelConfig {
+    /// Build a config with the default export interval (1 s) and timeout (5 s).
     pub fn new(
         endpoint: impl Into<String>,
         service_name: impl Into<String>,
@@ -50,6 +81,11 @@ impl OTelConfig {
 }
 
 #[derive(Clone)]
+/// [`MetricsCollector`] backed by OpenTelemetry, with an in-memory mirror.
+///
+/// Cheap to clone — clones share one state. The events-processed counter is a lockless
+/// atomic on the hot path; everything else takes a mutex, so recorders other than
+/// `record_events_processed` should not be called per event at high volume.
 pub struct OTelMetricsCollector {
     state: Arc<Mutex<MetricsState>>,
     sdk: Option<Arc<MetricsSdk>>,
@@ -93,6 +129,10 @@ struct MetricsInstruments {
 }
 
 impl OTelMetricsCollector {
+    /// Build a collector that records metrics in memory but exports nothing.
+    ///
+    /// Useful for tests and for reading `export_metrics()` directly. Use
+    /// [`OTelMetricsCollector::with_otlp_exporter`] to actually ship them.
     pub fn new(service_name: &str, service_version: &str, environment: &str) -> Self {
         let state = MetricsState {
             service_name: service_name.to_string(),
@@ -108,6 +148,14 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Build a collector that exports over OTLP/gRPC on a periodic reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] if the exporter or meter provider cannot be built —
+    /// typically a malformed endpoint. Note that a *reachable* endpoint is not verified
+    /// here: export failures surface later through the OpenTelemetry SDK's own error
+    /// handler, not from this call.
     pub fn with_otlp_exporter(config: OTelConfig) -> Result<Self> {
         let exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_tonic()
@@ -117,17 +165,16 @@ impl OTelMetricsCollector {
                 Error::ConfigError(format!("failed to build OTLP metric exporter: {error}"))
             })?;
 
-        let reader = PeriodicReader::builder(exporter, runtime::Tokio)
+        let reader = PeriodicReader::builder(exporter)
             .with_interval(Duration::from_millis(config.export_interval_ms))
-            .with_timeout(Duration::from_millis(config.export_timeout_ms))
             .build();
 
         let meter_provider = SdkMeterProvider::builder()
-            .with_resource(Resource::new(vec![
-                KeyValue::new("service.name", config.service_name.clone()),
-                KeyValue::new("service.version", config.service_version.clone()),
-                KeyValue::new("deployment.environment", config.environment.clone()),
-            ]))
+            .with_resource(otel_resource(
+                &config.service_name,
+                &config.service_version,
+                &config.environment,
+            ))
             .with_reader(reader)
             .build();
 
@@ -202,6 +249,15 @@ impl OTelMetricsCollector {
         })
     }
 
+    /// Flush pending metrics and shut the exporter down.
+    ///
+    /// Call this before process exit: the periodic reader buffers up to
+    /// `export_interval_ms` of data, which is otherwise lost. A no-op when no exporter
+    /// is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StateError`] if the flush or shutdown fails.
     pub fn shutdown(&self) -> Result<()> {
         if let Some(sdk) = &self.sdk {
             sdk.provider.force_flush().map_err(|error| {
@@ -214,6 +270,7 @@ impl OTelMetricsCollector {
         Ok(())
     }
 
+    /// Record `count` events of operation `op` as processed.
     pub fn record_events_processed(&self, op: Operation, count: u64) {
         // Hot path: increment the lockless total first, without acquiring the mutex.
         self.events_processed_total
@@ -260,6 +317,7 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record `count` events dropped by the transform pipeline.
     pub fn record_events_filtered(&self, count: u64) {
         if let Ok(mut state) = self.state.lock() {
             let entry = state
@@ -274,6 +332,11 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record the current replication lag in milliseconds.
+    ///
+    /// On MySQL and MariaDB this is derived from a binlog timestamp with **one-second**
+    /// resolution, so it over-reports by up to 1,000 ms — see
+    /// [`SourceMetadata::timestamp`](crate::core::SourceMetadata::timestamp).
     pub fn record_replication_lag_gauge_ms(&self, lag_ms: u64) {
         if let Ok(mut state) = self.state.lock() {
             state
@@ -286,6 +349,11 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record PostgreSQL replication-slot WAL lag in bytes.
+    ///
+    /// The single most operationally critical PostgreSQL signal: a slot pins WAL on the
+    /// primary, so unbounded growth ends in a full `pg_wal` volume. Alert on the
+    /// derivative, not the level — a non-zero value during idle periods is normal.
     pub fn record_replication_slot_lag_bytes_gauge(&self, lag_bytes: u64) {
         if let Ok(mut state) = self.state.lock() {
             state.gauges.insert(
@@ -300,6 +368,10 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record the current checkpoint offset.
+    ///
+    /// Offsets are connector-specific strings, so this is exported as a numeric gauge
+    /// only when it parses as one; otherwise it is retained for `export_metrics()`.
     pub fn record_checkpoint_offset(&self, offset: &str) {
         if let Ok(mut state) = self.state.lock() {
             let surrogate = offset.len() as u64;
@@ -313,6 +385,7 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record one event's processing duration in milliseconds.
     pub fn record_event_processing_duration(&self, duration_ms: u64) {
         if let Ok(mut state) = self.state.lock() {
             push_bounded(
@@ -331,6 +404,7 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record one checkpoint commit duration in milliseconds — dominated by the fsync.
     pub fn record_checkpoint_commit_duration(&self, duration_ms: u64) {
         if let Ok(mut state) = self.state.lock() {
             push_bounded(
@@ -349,6 +423,7 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record the current in-flight event buffer depth.
     pub fn record_buffer_size(&self, size: u64) {
         if let Ok(mut state) = self.state.lock() {
             state
@@ -361,6 +436,7 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Record snapshot completion as a percentage.
     pub fn record_snapshot_progress(&self, percent: u64) {
         if let Ok(mut state) = self.state.lock() {
             state.gauges.insert(
@@ -374,6 +450,14 @@ impl OTelMetricsCollector {
         }
     }
 
+    /// Snapshot the in-memory metric state.
+    ///
+    /// Independent of the OTLP exporter: this reads the collector's own counters and
+    /// bounded histogram windows, so it works with [`OTelMetricsCollector::new`] too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the internal state mutex is poisoned.
     pub fn export_metrics(&self) -> std::result::Result<MetricsReport, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
         Ok(MetricsReport {
@@ -396,6 +480,10 @@ impl OTelMetricsCollector {
         self.events_processed_total.load(Ordering::Relaxed)
     }
 
+    /// Clear all counters, gauges and histogram samples.
+    ///
+    /// For tests. Resetting a monotonic counter mid-flight makes a backend read it as a
+    /// counter reset and interpolate, so do not call this in production.
     pub fn reset(&self) {
         self.events_processed_total.store(0, Ordering::Relaxed);
         if let Ok(mut state) = self.state.lock() {
@@ -476,7 +564,10 @@ impl MetricsCollector for OTelMetricsCollector {
 
 fn error_metric_class(error: &Error) -> &'static str {
     match error {
-        Error::SourceError(_) => "source",
+        // Context frames are transparent: the metric must describe the failure, not
+        // the layer that annotated it, or one label would cover every cause.
+        Error::Context { source, .. } => error_metric_class(source),
+        Error::SourceError(_) | Error::ClassifiedSourceError { .. } => "source",
         Error::CheckpointError(_) => "checkpoint",
         Error::SchemaError(_) => "schema",
         Error::ValidationError(_) => "validation",
@@ -515,25 +606,46 @@ fn push_bounded(samples: &mut Vec<u64>, value: u64) {
     samples.push(value);
 }
 
+/// A point-in-time snapshot of the collector's in-memory metric state.
+///
+/// Produced by [`OTelMetricsCollector::export_metrics`], and independent of the OTLP
+/// exporter — useful for assertions in tests and for embedders that want to serve their
+/// own metrics endpoint.
 #[derive(Debug, Clone)]
 pub struct MetricsReport {
+    /// `service.name` resource attribute.
     pub service_name: String,
+    /// `service.version` resource attribute.
     pub service_version: String,
+    /// `deployment.environment` resource attribute.
     pub environment: String,
+    /// Monotonic counters keyed by metric name, with their label set.
     pub counters: HashMap<String, (u64, HashMap<String, String>)>,
+    /// Last-written gauge values keyed by metric name.
     pub gauges: HashMap<String, f64>,
+    /// Retained histogram samples keyed by metric name.
+    ///
+    /// **Bounded**: only the most recent samples are kept (see the collector's window
+    /// size). These previously grew one `u64` per event forever, which leaked roughly
+    /// 2.8 GB/hour at 100k events/sec.
     pub histograms: HashMap<String, Vec<u64>>,
 }
 
 impl MetricsReport {
+    /// Read a counter by exact metric name.
     pub fn get_counter(&self, name: &str) -> Option<u64> {
         self.counters.get(name).map(|(value, _)| *value)
     }
 
+    /// Read a gauge by exact metric name.
     pub fn get_gauge(&self, name: &str) -> Option<f64> {
         self.gauges.get(name).copied()
     }
 
+    /// Compute a percentile over a histogram's retained samples.
+    ///
+    /// `percentile` is expressed 0–100. The result covers only the retained window, not
+    /// the full history — a long-running process's p99 here is the p99 of recent traffic.
     pub fn get_histogram_percentile(&self, name: &str, percentile: f64) -> Option<u64> {
         self.histograms.get(name).and_then(|values| {
             let mut sorted = values.clone();
@@ -545,6 +657,7 @@ impl MetricsReport {
         })
     }
 
+    /// Sum of every `rustcdc.events.processed` counter across all operation labels.
     pub fn total_events_processed(&self) -> u64 {
         self.counters
             .iter()
@@ -553,6 +666,10 @@ impl MetricsReport {
             .sum()
     }
 
+    /// Mean event-processing duration over the retained histogram window, in ms.
+    ///
+    /// `None` when no samples have been recorded. A mean is not a latency SLO — prefer
+    /// [`MetricsReport::get_histogram_percentile`] for tail behaviour.
     pub fn avg_event_processing_latency(&self) -> Option<f64> {
         self.histograms
             .get("rustcdc.event_processing_duration_ms")
@@ -568,10 +685,20 @@ impl MetricsReport {
 }
 
 #[derive(Clone)]
+/// [`EventTracer`] backed by OpenTelemetry, with an in-memory span mirror.
+///
+/// Cheap to clone — clones share one state. `is_enabled()` returns `true`, so the runtime
+/// will build trace ids on the event path; use [`crate::core::NoOpEventTracer`] when
+/// tracing is off, which skips that work entirely.
 pub struct OTelEventTracer {
     state: Arc<Mutex<TracingState>>,
     tracer: Arc<opentelemetry::global::BoxedTracer>,
     source_type: String,
+    /// Retained so [`OTelEventTracer::shutdown`] can flush the batch exporter.
+    ///
+    /// `None` when this tracer did not install a provider (it is using whatever the
+    /// process already had), in which case shutting it down is not this tracer's business.
+    provider: Option<Arc<sdktrace::SdkTracerProvider>>,
 }
 
 #[derive(Default)]
@@ -595,24 +722,48 @@ struct CorrelationContext {
     span_id: String,
 }
 
+/// A completed span retained in memory for inspection.
+///
+/// The tracer also exports spans over OTLP when configured; this record exists so tests
+/// and embedders can assert on span shape without an external collector.
 #[derive(Debug, Clone)]
 pub struct SpanRecord {
+    /// Caller-supplied span identifier.
     pub span_id: String,
+    /// Span name.
     pub name: String,
+    /// Unix epoch milliseconds when the span started.
     pub start_time_ms: u64,
+    /// Unix epoch milliseconds when the span ended.
     pub end_time_ms: u64,
+    /// Span attributes.
     pub attributes: HashMap<String, String>,
 }
 
 impl OTelEventTracer {
+    /// Build a tracer against the globally installed tracer provider.
+    ///
+    /// Records spans in memory; exports only if a provider has been installed elsewhere.
+    /// Use [`OTelEventTracer::with_otlp_exporter`] to install one.
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(TracingState::default())),
             tracer: Arc::new(global::tracer("rustcdc")),
             source_type: "unknown".to_string(),
+            // This tracer did not install a provider, so shutting one down is not its
+            // business — flushing a provider another component owns would cut its spans off.
+            provider: None,
         }
     }
 
+    /// Build a tracer that exports spans over OTLP/gRPC via a batch exporter.
+    ///
+    /// **Installs a process-global tracer provider.** Calling this more than once in a
+    /// process replaces the previous provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigError`] if the span exporter cannot be built.
     pub fn with_otlp_exporter(config: OTelConfig) -> Result<Self> {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
@@ -622,37 +773,58 @@ impl OTelEventTracer {
                 Error::ConfigError(format!("failed to build OTLP span exporter: {error}"))
             })?;
 
-        let tracer_provider = sdktrace::TracerProvider::builder()
-            .with_batch_exporter(exporter, runtime::Tokio)
-            .with_resource(Resource::new(vec![
-                KeyValue::new("service.name", config.service_name),
-                KeyValue::new("service.version", config.service_version),
-                KeyValue::new("deployment.environment", config.environment),
-            ]))
+        let tracer_provider = sdktrace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(otel_resource(
+                &config.service_name,
+                &config.service_version,
+                &config.environment,
+            ))
             .build();
 
-        global::set_tracer_provider(tracer_provider);
+        // Retained so `shutdown()` can flush it: as of opentelemetry 0.32 there is no
+        // `global::shutdown_tracer_provider()`, and dropping the global without flushing
+        // silently discards whatever the batch exporter still holds.
+        global::set_tracer_provider(tracer_provider.clone());
 
         Ok(Self {
             state: Arc::new(Mutex::new(TracingState::default())),
             tracer: Arc::new(global::tracer("rustcdc")),
             source_type: "unknown".to_string(),
+            provider: Some(Arc::new(tracer_provider)),
         })
     }
 
+    /// Label every span this tracer produces with a connector type.
+    #[must_use]
     pub fn with_source_type(mut self, source_type: impl Into<String>) -> Self {
         self.source_type = source_type.into();
         self
     }
 
+    /// Flush and shut down the process-global tracer provider.
+    ///
+    /// Call before process exit: the batch exporter buffers spans that are otherwise lost.
     pub fn shutdown(&self) {
-        global::shutdown_tracer_provider();
+        if let Some(provider) = &self.provider {
+            if let Err(error) = provider.shutdown() {
+                tracing::warn!(
+                    target: "rustcdc::core::otel",
+                    error = %error,
+                    "tracer provider shutdown failed; buffered spans may be lost",
+                );
+            }
+        }
     }
 
+    /// Start a root span under the caller-supplied `span_id`.
     pub fn start_span(&self, span_id: &str, span_name: &str, attributes: HashMap<String, String>) {
         self.start_span_with_parent(span_id, span_name, attributes, None);
     }
 
+    /// Start a span, optionally as a child of a currently-active span.
+    ///
+    /// An unknown `parent_span_id` starts a root span rather than failing.
     pub fn start_span_with_parent(
         &self,
         span_id: &str,
@@ -698,6 +870,9 @@ impl OTelEventTracer {
         }
     }
 
+    /// End a span, recording an outcome status and an optional error classification.
+    ///
+    /// Unknown `span_id` values are ignored — ending a span twice is not an error.
     pub fn end_span_with_status(&self, span_id: &str, status: &str, error_type: Option<&str>) {
         if let Ok(mut state) = self.state.lock() {
             if let Some(mut active) = state.active_spans.remove(span_id) {
@@ -728,10 +903,12 @@ impl OTelEventTracer {
         }
     }
 
+    /// End a span with status `"ok"`.
     pub fn end_span(&self, span_id: &str) {
         self.end_span_with_status(span_id, "ok", None);
     }
 
+    /// Start a span covering a table's whole snapshot.
     pub fn start_snapshot_span(&self, span_id: &str, table: &str, row_count: u64) {
         let mut attrs = HashMap::new();
         attrs.insert("source.table".to_string(), table.to_string());
@@ -739,6 +916,7 @@ impl OTelEventTracer {
         self.start_span(span_id, "rustcdc.snapshot", attrs);
     }
 
+    /// Start a span covering one snapshot chunk.
     pub fn start_snapshot_chunk_span(
         &self,
         span_id: &str,
@@ -759,6 +937,7 @@ impl OTelEventTracer {
         );
     }
 
+    /// Start a span covering one batch of streamed events.
     pub fn start_stream_span(&self, span_id: &str, table: Option<&str>, events_count: u64) {
         let mut attrs = HashMap::new();
         attrs.insert("stream.events_count".to_string(), events_count.to_string());
@@ -769,6 +948,7 @@ impl OTelEventTracer {
         self.start_span(span_id, "rustcdc.stream", attrs);
     }
 
+    /// Start a span covering one transform stage.
     pub fn start_transform_span(
         &self,
         span_id: &str,
@@ -785,6 +965,7 @@ impl OTelEventTracer {
         self.start_span_with_parent(span_id, "rustcdc.event.transform", attrs, parent_span_id);
     }
 
+    /// Start a span covering one durable checkpoint commit.
     pub fn start_checkpoint_commit_span(&self, span_id: &str, events_count: u64) {
         let mut attrs = HashMap::new();
         attrs.insert(
@@ -795,6 +976,7 @@ impl OTelEventTracer {
         self.start_span(span_id, "rustcdc.checkpoint.commit", attrs);
     }
 
+    /// Start a span covering the snapshot-to-stream handoff.
     pub fn start_handoff_span(
         &self,
         span_id: &str,
@@ -813,6 +995,11 @@ impl OTelEventTracer {
         self.start_span(span_id, "rustcdc.handoff", attrs);
     }
 
+    /// Snapshot the completed spans retained in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the internal state mutex is poisoned.
     pub fn export_spans(&self) -> std::result::Result<Vec<SpanRecord>, String> {
         self.state
             .lock()
@@ -820,6 +1007,7 @@ impl OTelEventTracer {
             .map(|state| state.completed_spans.clone())
     }
 
+    /// Drop all active and completed spans. For tests.
     pub fn reset(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.active_spans.clear();
@@ -828,6 +1016,10 @@ impl OTelEventTracer {
         }
     }
 
+    /// Attach this tracer's trace/span ids to an event payload for downstream correlation.
+    ///
+    /// Returns `false` when no correlation context is recorded for `event_id`, leaving the
+    /// event untouched — a consumer must not treat an absent trace id as an empty one.
     pub fn propagate_baggage_to_event(&self, event_id: &str, event: &mut Event) -> bool {
         let correlation = if let Ok(state) = self.state.lock() {
             state.event_correlation.get(event_id).cloned()

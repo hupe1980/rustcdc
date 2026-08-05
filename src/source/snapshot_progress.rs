@@ -9,10 +9,19 @@ use crate::core::{Error, Result};
 /// Per-table snapshot progress tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableProgress {
+    /// Table in `"schema.table"` form.
     pub table_name: String,
+    /// Rows emitted so far.
     pub row_count: u64,
+    /// Index of the next chunk to read.
     pub chunk_index: u64,
-    pub cursor_token: Option<Vec<u8>>, // Opaque keyset pagination token for resumption
+    /// Opaque keyset-pagination token for resuming this table.
+    ///
+    /// Connector-specific bytes; the shared layer never interprets them. `None` before
+    /// the first chunk. **Losing this restarts the table from row zero**, which is a
+    /// duplicate flood proportional to the table rather than to the crash window.
+    pub cursor_token: Option<Vec<u8>>,
+    /// Whether this table has been read to exhaustion.
     pub is_complete: bool,
 }
 
@@ -44,8 +53,11 @@ impl TableProgress {
 /// Snapshot progress tracking across multiple tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotProgress {
+    /// Stable identifier for this snapshot run.
     pub snapshot_id: String,
+    /// Unix epoch milliseconds when the snapshot began.
     pub created_at: u64,
+    /// Per-table progress, keyed by `"schema.table"`.
     pub table_progress: HashMap<String, TableProgress>,
 }
 

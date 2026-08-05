@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Sink adapter SDK · rustcdc</title><meta name="description" content="Build a custom sink adapter for rustcdc, and verify it against the conformance suite."><link rel="canonical" href="https://hupe1980.github.io/rustcdc/docs/adapter-sdk/">
+
+<meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large">
+<meta name="author" content="hupe1980">
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta property="og:type" content="article">
+<meta property="og:site_name" content="rustcdc">
+<meta property="og:title" content="Sink adapter SDK">
+<meta property="og:description" content="Build a custom sink adapter for rustcdc, and verify it against the conformance suite.">
+<meta property="og:url" content="https://hupe1980.github.io/rustcdc/docs/adapter-sdk/">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Sink adapter SDK">
+<meta name="twitter:description" content="Build a custom sink adapter for rustcdc, and verify it against the conformance suite.">
+<meta name="twitter:image" content="https://hupe1980.github.io/rustcdc/og-image.svg">
+
+<link rel="icon" href="https://hupe1980.github.io/rustcdc/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="rustcdc" href="https://hupe1980.github.io/rustcdc/atom.xml">
+<link rel="stylesheet" href="https://hupe1980.github.io/rustcdc/main.css"><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "rustcdc",
+  "description": "Embeddable change data capture for Rust. PostgreSQL, MySQL, MariaDB and SQL Server in one crate — no JVM, no sidecar.",
+  "url": "https://hupe1980.github.io/rustcdc",
+  "codeRepository": "https://github.com/hupe1980/rustcdc",
+  "programmingLanguage": { "@type": "ComputerLanguage", "name": "Rust" },
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": { "@type": "Person", "name": "hupe1980" },
+  "keywords": "change data capture, CDC, Rust, PostgreSQL, MySQL, MariaDB, SQL Server, logical replication, binlog, Debezium alternative"
+}
+</script><script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Sink adapter SDK",
+  "description": "Build a custom sink adapter for rustcdc, and verify it against the conformance suite.",
+  "url": "https://hupe1980.github.io/rustcdc/docs/adapter-sdk/",
+  "inLanguage": "en",
+  "isPartOf": {
+    "@type": "WebSite",
+    "name": "rustcdc",
+    "url": "https://hupe1980.github.io/rustcdc"
+  },
+  "author": { "@type": "Person", "name": "hupe1980" }
+}
+</script>
+
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="https://hupe1980.github.io/rustcdc/">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">rustcdc</span>
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="https://hupe1980.github.io/rustcdc/docs/">Docs</a>
+      <a href="https://hupe1980.github.io/rustcdc/docs/getting-started/">Get started</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">API</a>
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+    </nav>
+    <button class="theme-toggle" type="button" aria-label="Toggle colour theme" data-theme-toggle>
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="wrap docs-layout">
+  <nav class="docs-sidebar" aria-label="Documentation">
+  <h2>Start</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;getting-started&#x2F;"
+         >
+        Getting started
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;architecture&#x2F;"
+         >
+        Architecture
+      </a>
+    </li>
+  </ul>
+  <h2>Build</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;api&#x2F;"
+         >
+        API guide
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;config-reference&#x2F;"
+         >
+        Configuration reference
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;schema-evolution&#x2F;"
+         >
+        Schema evolution
+      </a>
+    </li>
+  </ul>
+  <h2>Extend</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;adapter-sdk&#x2F;"
+         class="active" aria-current="page">
+        Sink adapter SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-transform-sdk&#x2F;"
+         >
+        WASM transform SDK
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-conformance-contract&#x2F;"
+         >
+        WASM conformance contract
+      </a>
+    </li>
+  </ul>
+  <h2>Operate</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;deployment&#x2F;"
+         >
+        Deployment
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;runbook&#x2F;"
+         >
+        Operations runbook
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;troubleshooting&#x2F;"
+         >
+        Troubleshooting
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;security&#x2F;"
+         >
+        Security
+      </a>
+    </li>
+  </ul>
+  <h2>Verify</h2>
+  <ul>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;reliability-testing&#x2F;"
+         >
+        Reliability testing
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;feature-policy&#x2F;"
+         >
+        Feature policy
+      </a>
+    </li>
+    <li>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;library-parity-matrix&#x2F;"
+         >
+        Comparison &amp; scope
+      </a>
+    </li>
+  </ul>
+</nav>
+
+  <article class="prose">
+    <h1>Sink adapter SDK</h1>
+    <p class="page-meta">Build a custom sink adapter for rustcdc, and verify it against the conformance suite.</p>
+    <h2 id="contract"><a class="zola-anchor" href="#contract" aria-label="Anchor link for: contract">Contract</a></h2>
+<p><code>SinkAdapter</code> is an async trait for adapter development. It uses native <code>async fn in traits</code>
+(RPITIT, stabilised in Rust 1.75). <strong>No <code>#[async_trait]</code> macro is required</strong> in implementations —
+just write plain <code>async fn</code> methods.</p>
+<p>Required methods:</p>
+<ul>
+<li><code>send(&amp;mut self, event: &amp;Event) -&gt; Result&lt;()&gt;</code>: accept one canonical event.</li>
+<li><code>flush(&amp;mut self) -&gt; Result&lt;()&gt;</code>: durably flush buffered sends.</li>
+<li><code>close(&amp;mut self) -&gt; Result&lt;()&gt;</code>: graceful shutdown.</li>
+<li><code>name(&amp;self) -&gt; &amp;str</code>: stable adapter identifier.</li>
+</ul>
+<p>Optional capability methods (all default to no-op / <code>false</code>):</p>
+<ul>
+<li><code>delivery_guarantee() -&gt; SinkDeliveryGuarantee</code>: advertise <code>AtLeastOnce</code>, <code>AtLeastOnceIdempotent</code>, or <code>EffectivelyOnce</code>.</li>
+<li><code>idempotent_delivery_capable() -&gt; bool</code>: whether retrying the same event is idempotent.</li>
+<li><code>transactional_checkpoint_barrier_capable() -&gt; bool</code>: whether the adapter implements the full barrier protocol.</li>
+<li><code>queue_depth() -&gt; Option&lt;usize&gt;</code>: current in-memory buffer depth for back-pressure observation.</li>
+<li><code>flush_tick_interval() -&gt; Option&lt;Duration&gt;</code>: hint for periodic time-based flushing.</li>
+<li><code>begin_checkpoint_barrier / commit_checkpoint_barrier / abort_checkpoint_barrier</code>: two-phase-commit-style barrier protocol for effectively-once delivery.</li>
+<li><code>preflight_check()</code>: connectivity validation called once at startup.</li>
+<li><code>close_with_timeout(ms)</code>: pre-built graceful close with timeout (no override needed).</li>
+<li><code>exported_events() -&gt; Option&lt;&amp;[Event]&gt;</code>: for in-memory/test adapters; enables conformance assertions.</li>
+<li><code>delivery_metrics() -&gt; Option&lt;SinkDeliveryMetrics&gt;</code>: snapshot of delivery counters (<code>events_sent</code>, <code>events_errored</code>, <code>events_retried</code>, <code>last_delivered_offset</code>) for admin endpoints and Prometheus scrapers. <code>SinkDeliveryMetrics::merge()</code> is provided for composed sinks.</li>
+<li><code>is_closed() -&gt; bool</code>: closed-state hook used by conformance suite; defaults to <code>false</code>.</li>
+</ul>
+<p>Behavioral expectations:</p>
+<ul>
+<li>Preserve event ordering per <code>send</code> call sequence.</li>
+<li>Return structured errors instead of panicking.</li>
+<li>Treat <code>flush</code> as a durability boundary.</li>
+<li>Reject sends after <code>close</code> with a state error.</li>
+</ul>
+<h2 id="implementation-guide"><a class="zola-anchor" href="#implementation-guide" aria-label="Anchor link for: implementation-guide">Implementation Guide</a></h2>
+<ol>
+<li>Implement a concrete sink type that stores connection/client state.</li>
+<li>Implement <code>SinkAdapter</code> on that type (only <code>send</code>, <code>flush</code>, <code>close</code>, <code>name</code> are required).</li>
+<li>Ensure idempotent <code>close</code> behavior.</li>
+<li>Redact credentials from logs and debug output.</li>
+<li>Surface recoverable versus unrecoverable errors using <code>rustcdc::Error</code> variants.</li>
+<li>Override <code>delivery_guarantee</code> if your sink can offer stronger-than-default guarantees.</li>
+<li>Override <code>delivery_metrics</code> to expose per-sink counters to admin/observability endpoints.</li>
+<li>Use <code>your_sink.boxed()</code> (or <code>BoxedSink::new(your_sink)</code>) when you need type-erased storage or <code>FanOutSinkAdapter</code> / <code>TableRouter&lt;BoxedSink&gt;</code> composition.</li>
+</ol>
+<p>Recommended pattern:</p>
+<ul>
+<li><code>send</code>: enqueue and optionally batch.</li>
+<li><code>flush</code>: commit batch to external sink.</li>
+<li><code>close</code>: call <code>flush</code>, then release resources.</li>
+</ul>
+<h2 id="conformance-instructions"><a class="zola-anchor" href="#conformance-instructions" aria-label="Anchor link for: conformance-instructions">Conformance Instructions</a></h2>
+<p>Use <code>AdapterGoldenFixture</code>, <code>BasicAdapterConformance</code>, and <code>AdapterConformanceSuite</code> from <code>testkit</code>:</p>
+<ul>
+<li><code>single_event</code>: validates basic acceptance path.</li>
+<li><code>batch_send</code>: validates batch handling and flush behavior.</li>
+<li><code>ordering</code>: validates stable send order.</li>
+<li><code>crash_recovery</code>: validates close semantics after sends.</li>
+</ul>
+<p>Minimum validation loop:</p>
+<ol>
+<li>Build fixture sequences with <code>AdapterGoldenFixture::{single_event,batch,ordering,crash_recovery}</code>.</li>
+<li>Run <code>AdapterConformanceSuite::run_all()</code> against your adapter and fixture.</li>
+<li>Assert all returned <code>TestResult</code> values are <code>passed = true</code>.</li>
+<li>Add adapter-specific fault tests (network loss, sink timeout, partial flush failure).</li>
+</ol>
+<p>Quick smoke harness:</p>
+<pre><code data-lang="rust">use rustcdc::testkit::{AdapterConformanceSuite, AdapterGoldenFixture};
+use rustcdc::{Event, MemorySinkAdapter, Operation, SourceMetadata};
+use serde_json::json;
+
+async fn validate_adapter() -&gt; rustcdc::Result&lt;()&gt; {
+    // Build from `Event::default()` and override what matters. A full struct literal
+    // breaks every time the envelope gains a field, which is exactly how this sample
+    // rotted before the Markdown was wired into the doctest run.
+    let fixture = AdapterGoldenFixture::single_event(
+        Event::builder(&quot;items&quot;, Operation::Insert)
+            .after(json!({&quot;id&quot;: 1}))
+            .source(SourceMetadata::new(&quot;test&quot;, &quot;1&quot;, 1))
+            .ts(1)
+            .schema(&quot;public&quot;)
+            .primary_key([&quot;id&quot;])
+            .build(),
+    );
+    let suite = AdapterConformanceSuite::new();
+    let mut adapter = MemorySinkAdapter::default();
+
+    let results = suite.run_all(&amp;mut adapter, &amp;fixture).await?;
+    assert!(results.iter().all(|result| result.passed));
+    Ok(())
+}
+</code></pre>
+<h2 id="dynamic-dispatch-fan-out-and-routing"><a class="zola-anchor" href="#dynamic-dispatch-fan-out-and-routing" aria-label="Anchor link for: dynamic-dispatch-fan-out-and-routing">Dynamic Dispatch, Fan-Out, and Routing</a></h2>
+<p>To store sinks heterogeneously or compose multiple sinks:</p>
+<pre><code data-lang="rust">use rustcdc::sink::{BoxedSink, FanOutSinkAdapter, MemorySinkAdapter, SinkAdapter};
+use rustcdc::pipeline::HeterogeneousTableRouter;
+
+// Type-erase any SinkAdapter (two equivalent spellings):
+let boxed: BoxedSink = MemorySinkAdapter::new(&quot;mem&quot;).boxed();
+let boxed2: BoxedSink = BoxedSink::new(MemorySinkAdapter::new(&quot;mem2&quot;));
+
+// Fan out to multiple sinks concurrently:
+let fan = FanOutSinkAdapter::new(vec![
+    MemorySinkAdapter::new(&quot;a&quot;).boxed(),
+    MemorySinkAdapter::new(&quot;b&quot;).boxed(),
+]);
+// fan.send(event) drives all children concurrently; latency = max(children)
+
+// Route events by table name to heterogeneous sinks:
+let router = HeterogeneousTableRouter::builder(&quot;demo&quot;)
+    .route(&quot;public.orders&quot;, MemorySinkAdapter::new(&quot;orders&quot;).boxed())
+    .route(&quot;public.audit&quot;, MemorySinkAdapter::new(&quot;audit&quot;).boxed())
+    .default(MemorySinkAdapter::new(&quot;fallback&quot;).boxed())
+    .build()
+    .expect(&quot;valid patterns&quot;);
+</code></pre>
+<h2 id="notes"><a class="zola-anchor" href="#notes" aria-label="Anchor link for: notes">Notes</a></h2>
+<ul>
+<li>The four required methods (<code>send</code>, <code>flush</code>, <code>close</code>, <code>name</code>) are the minimum viable implementation.</li>
+<li>All optional capability methods have no-op defaults; override only what your sink actually supports.</li>
+<li>Retry policies and delivery semantics are the responsibility of the embedding application.</li>
+<li><code>MemorySinkAdapter</code> is exported from the crate root for convenience in tests.</li>
+</ul>
+<h2 id="effectivelyonce-delivery-barrier-protocol"><a class="zola-anchor" href="#effectivelyonce-delivery-barrier-protocol" aria-label="Anchor link for: effectivelyonce-delivery-barrier-protocol">EffectivelyOnce Delivery: Barrier Protocol</a></h2>
+<p><code>SinkDeliveryGuarantee::EffectivelyOnce</code> is the strongest guarantee available. It requires
+the sink to participate in a <strong>two-phase checkpoint barrier</strong> so that the runtime and the sink
+advance their durable state atomically — no event is lost on crash, and no event is emitted
+twice to the downstream system (assuming the downstream is a transactional target such as a
+database or a Kafka topic with transactions enabled).</p>
+<h3 id="responsibility-split"><a class="zola-anchor" href="#responsibility-split" aria-label="Anchor link for: responsibility-split">Responsibility split</a></h3>
+<blockquote>
+<p><strong>Important:</strong> The runtime does <strong>not</strong> call <code>begin_checkpoint_barrier</code>, <code>commit_checkpoint_barrier</code>,
+or <code>abort_checkpoint_barrier</code> automatically. No runtime code drives the barrier.
+The <strong>embedder</strong> must call these methods explicitly around the commit path.
+The barrier methods are pure hooks on the <code>SinkAdapter</code> trait — they exist so the embedder
+can drive them in a coordinated sequence with <code>commit_ack</code>.</p>
+</blockquote>
+<p>The <strong>embedder</strong> is responsible for:</p>
+<ul>
+<li>Calling <code>sink.begin_checkpoint_barrier()</code> before the commit window opens.</li>
+<li>Calling <code>sink.commit_checkpoint_barrier()</code> after <code>runtime.commit_ack(...)</code> succeeds.</li>
+<li>Calling <code>sink.abort_checkpoint_barrier()</code> on any error in the commit window.</li>
+</ul>
+<p>The <strong>sink</strong> is responsible for:</p>
+<ul>
+<li>Opening a transaction (or writing to a transactional staging area) on <code>begin_checkpoint_barrier</code>.</li>
+<li>Making all <code>send()</code> calls part of that transaction during the window.</li>
+<li>Committing the transaction atomically with the checkpoint on <code>commit_checkpoint_barrier</code>.</li>
+<li>Rolling back on <code>abort_checkpoint_barrier</code>.</li>
+</ul>
+<h3 id="minimal-implementation-skeleton"><a class="zola-anchor" href="#minimal-implementation-skeleton" aria-label="Anchor link for: minimal-implementation-skeleton">Minimal implementation skeleton</a></h3>
+<pre><code data-lang="rust">use rustcdc::sink::{SinkAdapter, SinkDeliveryGuarantee};
+use rustcdc::{Event, Result};
+
+/// A sink that writes to a transactional target and participates in the
+/// checkpoint barrier protocol to provide EffectivelyOnce delivery.
+pub struct TransactionalSink {
+    name: String,
+    pending: Vec&lt;Event&gt;,
+    in_barrier: bool,
+    closed: bool,
+}
+
+impl TransactionalSink {
+    pub fn new(name: impl Into&lt;String&gt;) -&gt; Self {
+        Self {
+            name: name.into(),
+            pending: Vec::new(),
+            in_barrier: false,
+            closed: false,
+        }
+    }
+
+    async fn begin_transaction(&amp;mut self) -&gt; Result&lt;()&gt; {
+        // Open a database transaction, Kafka transaction, etc.
+        self.in_barrier = true;
+        Ok(())
+    }
+
+    async fn commit_transaction(&amp;mut self) -&gt; Result&lt;()&gt; {
+        // Commit all pending events atomically with the checkpoint.
+        self.pending.clear();
+        self.in_barrier = false;
+        Ok(())
+    }
+
+    async fn rollback_transaction(&amp;mut self) -&gt; Result&lt;()&gt; {
+        self.pending.clear();
+        self.in_barrier = false;
+        Ok(())
+    }
+}
+
+impl SinkAdapter for TransactionalSink {
+    async fn send(&amp;mut self, event: &amp;Event) -&gt; Result&lt;()&gt; {
+        // Buffer into the open transaction.
+        self.pending.push(event.clone());
+        Ok(())
+    }
+
+    async fn flush(&amp;mut self) -&gt; Result&lt;()&gt; {
+        // Flush pending events within the current transaction (no commit yet).
+        Ok(())
+    }
+
+    async fn close(&amp;mut self) -&gt; Result&lt;()&gt; {
+        if self.in_barrier {
+            self.rollback_transaction().await?;
+        }
+        self.closed = true;
+        Ok(())
+    }
+
+    fn name(&amp;self) -&gt; &amp;str {
+        &amp;self.name
+    }
+
+    fn delivery_guarantee(&amp;self) -&gt; SinkDeliveryGuarantee {
+        SinkDeliveryGuarantee::EffectivelyOnce
+    }
+
+    fn transactional_checkpoint_barrier_capable(&amp;self) -&gt; bool {
+        true
+    }
+
+    fn is_closed(&amp;self) -&gt; bool {
+        self.closed
+    }
+
+    async fn begin_checkpoint_barrier(&amp;mut self) -&gt; Result&lt;()&gt; {
+        self.begin_transaction().await
+    }
+
+    async fn commit_checkpoint_barrier(&amp;mut self) -&gt; Result&lt;()&gt; {
+        self.commit_transaction().await
+    }
+
+    async fn abort_checkpoint_barrier(&amp;mut self) -&gt; Result&lt;()&gt; {
+        self.rollback_transaction().await
+    }
+}
+</code></pre>
+<h3 id="embedder-side-barrier-orchestration"><a class="zola-anchor" href="#embedder-side-barrier-orchestration" aria-label="Anchor link for: embedder-side-barrier-orchestration">Embedder-side barrier orchestration</a></h3>
+<pre><code data-lang="rust"># use rustcdc::{CdcRuntime, sink::SinkAdapter};
+async fn run(mut runtime: CdcRuntime, mut sink: impl SinkAdapter) -&gt; rustcdc::Result&lt;()&gt; {
+    loop {
+        let batch = runtime.poll_event_batch().await?;
+        if batch.is_empty() {
+            break;
+        }
+        // Send all events in the batch to the sink.
+        for event in batch.events() {
+            sink.send(event).await?;
+        }
+        // Open the barrier — sink begins its transaction.
+        sink.begin_checkpoint_barrier().await?;
+        // Commit the checkpoint durably.
+        match runtime.commit_ack(batch.ack_mode()).await {
+            Ok(_) =&gt; {
+                // Checkpoint is durable — commit the sink transaction.
+                sink.commit_checkpoint_barrier().await?;
+            }
+            Err(e) =&gt; {
+                // Checkpoint failed — roll back the sink transaction.
+                sink.abort_checkpoint_barrier().await?;
+                return Err(e);
+            }
+        }
+    }
+    sink.close().await?;
+    Ok(())
+}
+</code></pre>
+
+
+    <nav class="page-nav" aria-label="Documentation">
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;schema-evolution&#x2F;">← Schema evolution</a>
+      <a href="https:&#x2F;&#x2F;hupe1980.github.io&#x2F;rustcdc&#x2F;docs&#x2F;wasm-transform-sdk&#x2F;">WASM transform SDK →</a>
+    </nav>
+  </article>
+</div>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>rustcdc</strong> — embeddable change data capture for Rust.
+      Licensed MIT OR Apache-2.0.
+    </p>
+    <nav aria-label="Footer">
+      <a href="https:&#x2F;&#x2F;github.com&#x2F;hupe1980&#x2F;rustcdc" rel="noopener">GitHub</a>
+      <a href="https:&#x2F;&#x2F;crates.io&#x2F;crates&#x2F;rustcdc" rel="noopener">crates.io</a>
+      <a href="https:&#x2F;&#x2F;docs.rs&#x2F;rustcdc" rel="noopener">docs.rs</a>
+      <a href="https://hupe1980.github.io/rustcdc/atom.xml">Feed</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+// Theme: honour the stored choice, else the OS preference. Inline and tiny so it
+// runs before paint and the page does not flash the wrong theme.
+(function () {
+  var key = "rustcdc-theme";
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem(key); } catch (e) { /* private mode */ }
+  if (stored) root.setAttribute("data-theme", stored);
+
+  var button = document.querySelector("[data-theme-toggle]");
+  if (!button) return;
+  button.addEventListener("click", function () {
+    var current = root.getAttribute("data-theme");
+    var next = current === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) { /* ignore */ }
+  });
+})();
+</script>
+</body>
+</html>

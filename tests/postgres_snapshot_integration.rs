@@ -1373,3 +1373,260 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::R
     connection.close().await;
     Ok(())
 }
+
+/// An incremental snapshot interrupted mid-way must resume at its chunk boundary.
+///
+/// **This is the test whose absence allowed the defect.** The per-table keyset cursor lived
+/// only in memory: `save_position` persisted the stream offset and dropped the cursor, so
+/// every restart re-read every configured table from row zero. That is a duplicate flood
+/// proportional to the whole dataset rather than to the crash window, and it repeats on
+/// every restart until a snapshot happens to finish inside one process lifetime. The module
+/// documentation claimed each chunk was "independently resumable after a crash".
+///
+/// Unit tests could not see it: the state round-trips through a checkpoint correctly in
+/// isolation. Only driving a real snapshot, dropping the handle, and starting a new one
+/// against the same checkpoint exercises the path that was broken.
+///
+/// The load-bearing assertion is the **second** one: not merely that every row arrives, but
+/// that the resumed run re-reads far fewer than the whole table. A run that re-read
+/// everything would still deliver every row, and would still pass a completeness check.
+#[tokio::test]
+async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_restart(
+) -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres incremental resume test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+
+    let container = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=8",
+            "-c",
+            "max_wal_senders=8",
+        ])
+        .start()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let host = container
+        .get_host()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let admin_dsn = format!(
+        "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
+    );
+    let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+
+    admin_client
+        .batch_execute(
+            "
+            CREATE TABLE IF NOT EXISTS public.incremental_resume_test (
+              id BIGINT PRIMARY KEY,
+              payload TEXT NOT NULL
+            );
+            ALTER TABLE public.incremental_resume_test REPLICA IDENTITY FULL;
+            DROP PUBLICATION IF EXISTS incremental_resume_pub;
+            CREATE PUBLICATION incremental_resume_pub FOR TABLE public.incremental_resume_test;
+            TRUNCATE TABLE public.incremental_resume_test;
+            ",
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let row_count = 4_000_i64;
+    let chunk_size = 200_usize;
+    for id in 1_i64..=row_count {
+        admin_client
+            .execute(
+                "INSERT INTO public.incremental_resume_test (id, payload) VALUES ($1, $2)",
+                &[&id, &format!("seed-{id}")],
+            )
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    }
+
+    let source_cfg = PostgresSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "postgres".to_string(),
+        password: "postgres".to_string().into(),
+        database: "cdc".to_string(),
+        replication_slot_name: "incremental_resume_slot".to_string(),
+        publication_name: "incremental_resume_pub".to_string(),
+        create_replication_slot_if_missing: true,
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        ..PostgresSourceConfig::default()
+    };
+
+    let incremental =
+        IncrementalSnapshotConfig::new(vec!["public.incremental_resume_test".to_string()])
+            .with_chunk_size(chunk_size);
+
+    // ── First run: consume roughly half the table, then stop abruptly ─────────
+    //
+    // `save_position` stands in for the crash: it is what a wrapper calls on SIGTERM, and
+    // it is the exact call that used to persist the stream offset while dropping the
+    // chunk cursor.
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
+    let stop_after = (row_count / 2) as usize;
+
+    let mut first_run_ids = std::collections::HashSet::new();
+    let resume_offset = {
+        let mut connection = PostgresConnection::new(source_cfg.clone());
+        connection.connect().await?;
+        let mut handle = connection
+            .start_incremental_snapshot(incremental.clone(), None)
+            .await?;
+
+        let mut empty_polls = 0usize;
+        for _ in 0..400 {
+            if first_run_ids.len() >= stop_after {
+                break;
+            }
+            let events = handle.next_events(250).await?;
+            if events.is_empty() {
+                empty_polls += 1;
+                if empty_polls >= 20 {
+                    break;
+                }
+                continue;
+            }
+            empty_polls = 0;
+            for event in events {
+                if let Some(id) = snapshot_row_id(&event, "incremental_resume_test") {
+                    first_run_ids.insert(id);
+                }
+            }
+        }
+
+        let mut checkpoint = FileCheckpoint::new(checkpoint_dir.path());
+        handle.save_position(&mut checkpoint).await?;
+        connection.close().await;
+
+        // Read the persisted offset back exactly as a restarted process would.
+        drop(checkpoint);
+        let reader = FileCheckpoint::read_only(checkpoint_dir.path());
+        reader
+            .load()
+            .await?
+            .ok_or_else(|| rustcdc::Error::StateError("no checkpoint after first run".into()))?
+    };
+
+    assert!(
+        first_run_ids.len() >= chunk_size,
+        "first run must emit at least one full chunk before restarting; got {}",
+        first_run_ids.len()
+    );
+
+    // The persisted offset must actually carry the cursor. Without this the assertions
+    // below could pass for the wrong reason on a future refactor.
+    let persisted =
+        rustcdc::source::incremental_snapshot_state_from_offset(Some(resume_offset.as_ref()))
+            .expect("the checkpoint must carry incremental-snapshot progress");
+    let table_state = persisted
+        .table("public.incremental_resume_test")
+        .expect("per-table progress must be recorded");
+    assert!(
+        table_state.pk_cursor.is_some(),
+        "an in-flight table must persist a keyset cursor; without it the resumed run \
+         restarts the table from row zero"
+    );
+
+    // ── Second run: restart from the checkpoint ───────────────────────────────
+    let mut second_run_rows = 0usize;
+    let mut all_ids = first_run_ids.clone();
+    {
+        let mut connection = PostgresConnection::new(source_cfg);
+        connection.connect().await?;
+        let mut handle = connection
+            .start_incremental_snapshot(incremental, Some(resume_offset.as_ref()))
+            .await?;
+
+        let mut empty_polls = 0usize;
+        for _ in 0..600 {
+            if all_ids.len() == row_count as usize {
+                break;
+            }
+            let events = handle.next_events(250).await?;
+            if events.is_empty() {
+                empty_polls += 1;
+                if empty_polls >= 25 {
+                    break;
+                }
+                continue;
+            }
+            empty_polls = 0;
+            for event in events {
+                if let Some(id) = snapshot_row_id(&event, "incremental_resume_test") {
+                    second_run_rows += 1;
+                    all_ids.insert(id);
+                }
+            }
+        }
+        connection.close().await;
+    }
+
+    // 1. No loss: every row arrives across the two runs.
+    assert_eq!(
+        all_ids.len(),
+        row_count as usize,
+        "resuming must not lose rows: saw {} of {row_count}",
+        all_ids.len()
+    );
+
+    // 2. The load-bearing assertion. A run that re-read the table from row zero would
+    //    also satisfy (1), which is exactly why the defect survived: completeness alone
+    //    cannot distinguish "resumed" from "started over".
+    //
+    //    Bound: the rows still outstanding, plus at most one chunk re-read (the cursor
+    //    advances only once a chunk is fully emitted, so the in-flight chunk repeats —
+    //    that is at-least-once and bounded by chunk_size), plus slack for the chunk
+    //    boundary not aligning with where the first run stopped.
+    let outstanding = row_count as usize - first_run_ids.len();
+    let resume_budget = outstanding + (2 * chunk_size);
+    assert!(
+        second_run_rows <= resume_budget,
+        "resumed run re-read {second_run_rows} rows but only {resume_budget} were \
+         justified ({outstanding} outstanding + at most 2 chunks of overlap). A count \
+         near {row_count} means the cursor was not restored and the table restarted from \
+         row zero."
+    );
+
+    Ok(())
+}
+
+/// Extract the primary key from a snapshot `Read` event for `table`, if it is one.
+fn snapshot_row_id(event: &rustcdc::Event, table: &str) -> Option<i64> {
+    if event.table != table || event.op != rustcdc::Operation::Read {
+        return None;
+    }
+    event
+        .after
+        .as_ref()?
+        .get("id")?
+        .as_i64()
+        .or_else(|| event.after.as_ref()?.get("id")?.as_str()?.parse().ok())
+}

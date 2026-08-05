@@ -66,17 +66,31 @@ pub(super) fn lsn_from_source_offset(offset: &str) -> Option<[u8; 10]> {
     lsn_hex_to_bytes(candidate).ok()
 }
 
-pub(super) fn sqlserver_resume_lsn_from_offset_bytes(encoded: &[u8]) -> Result<[u8; 10]> {
+/// Recover the CDC cursor string from an encoded SQL Server checkpoint offset.
+///
+/// The offset is `SqlServerOffset` JSON — `{"cursor": "..."}`, optionally carrying
+/// incremental-snapshot progress alongside it. A bare JSON string is also accepted,
+/// because `SqlServerSnapshot` handoff produces one directly rather than going through
+/// the typed offset.
+pub(super) fn sqlserver_cursor_from_offset_bytes(encoded: &[u8]) -> Result<String> {
+    if let Ok(offset) = serde_json::from_slice::<crate::checkpoint::SqlServerOffset>(encoded) {
+        return Ok(offset.cursor);
+    }
     if let Ok(text) = serde_json::from_slice::<String>(encoded) {
-        return lsn_from_source_offset(&text).ok_or_else(|| {
-            Error::CheckpointError(format!(
-                "invalid sqlserver checkpoint offset string: {text}"
-            ))
-        });
+        return Ok(text);
     }
 
-    <[u8; 10]>::try_from(encoded).map_err(|_| {
-        Error::CheckpointError("sqlserver checkpoint offset must contain exactly 10 bytes".into())
+    Err(Error::CheckpointError(format!(
+        "sqlserver checkpoint offset is neither a SqlServerOffset object nor a cursor \
+         string: {}",
+        String::from_utf8_lossy(encoded)
+    )))
+}
+
+pub(super) fn sqlserver_resume_lsn_from_offset_bytes(encoded: &[u8]) -> Result<[u8; 10]> {
+    let cursor = sqlserver_cursor_from_offset_bytes(encoded)?;
+    lsn_from_source_offset(&cursor).ok_or_else(|| {
+        Error::CheckpointError(format!("invalid sqlserver checkpoint offset: {cursor}"))
     })
 }
 

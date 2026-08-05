@@ -50,16 +50,41 @@ done
 echo "Latency evidence run completed successfully." | tee -a "$latency_evidence_report_path"
 echo "Report written to $latency_evidence_report_path" | tee -a "$latency_evidence_report_path"
 
-# Global defaults are intentionally conservative to avoid flake-driven noise.
-DEFAULT_P95_MS="${LATENCY_GATE_DEFAULT_P95_MS:-500}"
-DEFAULT_P99_MS="${LATENCY_GATE_DEFAULT_P99_MS:-1000}"
+# ─── Thresholds ──────────────────────────────────────────────────────────────
+#
+# These gate CAPTURE LATENCY: wall-clock time from the writer committing a row to the
+# event reaching the consumer, measured against a single clock with writes running
+# concurrently with polling. See tests/latency_evidence_common.rs.
+#
+# The previous thresholds (p95 <= 500 ms) gated `poll_latency`, which timed draining an
+# already-populated in-process VecDeque. That is a sub-millisecond operation, so a 500 ms
+# ceiling could not fail for performance reasons — the gate was decorative.
+#
+# Values below are set per connector from observed local runs, with roughly an order of
+# magnitude of headroom for slower and noisier CI hardware. They are meant to catch a
+# structural regression (a poll interval left at seconds, a lost wakeup, an accidental
+# sleep in the hot path), not to certify a performance number.
+#
+#   PostgreSQL  observed p95 ~18 ms   -> gate 250 ms
+#   MySQL       observed p95 ~30 ms   -> gate 400 ms
+#   SQL Server  capture-agent based; latency is dominated by the capture job scan
+#               cadence, not by the connector -> gate 5000 ms
+DEFAULT_P95_MS="${LATENCY_GATE_DEFAULT_P95_MS:-250}"
+DEFAULT_P99_MS="${LATENCY_GATE_DEFAULT_P99_MS:-500}"
 
 POSTGRES_P95_MS="${LATENCY_GATE_POSTGRES_P95_MS:-$DEFAULT_P95_MS}"
 POSTGRES_P99_MS="${LATENCY_GATE_POSTGRES_P99_MS:-$DEFAULT_P99_MS}"
-MYSQL_P95_MS="${LATENCY_GATE_MYSQL_P95_MS:-$DEFAULT_P95_MS}"
-MYSQL_P99_MS="${LATENCY_GATE_MYSQL_P99_MS:-$DEFAULT_P99_MS}"
-SQLSERVER_P95_MS="${LATENCY_GATE_SQLSERVER_P95_MS:-$DEFAULT_P95_MS}"
-SQLSERVER_P99_MS="${LATENCY_GATE_SQLSERVER_P99_MS:-$DEFAULT_P99_MS}"
+MYSQL_P95_MS="${LATENCY_GATE_MYSQL_P95_MS:-400}"
+MYSQL_P99_MS="${LATENCY_GATE_MYSQL_P99_MS:-800}"
+# SQL Server CDC is not low-latency by design: rows are invisible to any consumer until
+# the capture agent has scanned the log. This ceiling reflects that architecture rather
+# than a slower connector, and is documented as such in site/content/docs/config-reference.md.
+SQLSERVER_P95_MS="${LATENCY_GATE_SQLSERVER_P95_MS:-5000}"
+SQLSERVER_P99_MS="${LATENCY_GATE_SQLSERVER_P99_MS:-10000}"
+
+# Minimum measured events required for a percentile to mean anything. A p99 over a
+# handful of samples is noise; the old gate's only assertion was `batches > 0`.
+MIN_MEASURED_EVENTS="${LATENCY_GATE_MIN_MEASURED_EVENTS:-500}"
 
 report_path="target/latency-gate.txt"
 : > "$report_path"
@@ -77,6 +102,19 @@ assert_le() {
   fi
 }
 
+assert_ge() {
+  local metric_label="$1"
+  local actual="$2"
+  local floor="$3"
+
+  if awk -v actual="$actual" -v floor="$floor" 'BEGIN { exit (actual >= floor ? 0 : 1) }'; then
+    echo "PASS: ${metric_label}=${actual} >= ${floor}" | tee -a "$report_path"
+  else
+    echo "FAIL: ${metric_label}=${actual} < ${floor}" | tee -a "$report_path"
+    return 1
+  fi
+}
+
 gate_file() {
   local connector="$1"
   local file="$2"
@@ -88,16 +126,32 @@ gate_file() {
     return 1
   fi
 
-  local poll_p95 commit_p95 poll_p99 commit_p99
+  local capture_p95 capture_p99 measured unstamped
+  capture_p95="$(jq -r '.capture_latency_ms_p95' "$file")"
+  capture_p99="$(jq -r '.capture_latency_ms_p99' "$file")"
+  measured="$(jq -r '.events_measured' "$file")"
+  unstamped="$(jq -r '.unstamped_events' "$file")"
+
+  local connector_failed=0
+
+  # Sample validity first: a threshold applied to two samples proves nothing, and a run
+  # where events were not measurable at all must not read as a pass.
+  assert_ge "${connector}.events_measured" "$measured" "$MIN_MEASURED_EVENTS" || connector_failed=1
+  assert_le "${connector}.unstamped_events" "$unstamped" 0 || connector_failed=1
+
+  # The operator-facing metric: source commit -> consumer delivery.
+  assert_le "${connector}.capture.p95_ms" "$capture_p95" "$p95_limit" || connector_failed=1
+  assert_le "${connector}.capture.p99_ms" "$capture_p99" "$p99_limit" || connector_failed=1
+
+  # Runtime bookkeeping is reported for context but not gated: it is sub-millisecond by
+  # construction, so any ceiling on it is either decorative or a flake generator.
+  local poll_p95 commit_p95 throughput
   poll_p95="$(jq -r '.poll_latency_ms_p95' "$file")"
   commit_p95="$(jq -r '.commit_latency_ms_p95' "$file")"
-  poll_p99="$(jq -r '.poll_latency_ms_p99' "$file")"
-  commit_p99="$(jq -r '.commit_latency_ms_p99' "$file")"
+  throughput="$(jq -r '.events_per_second' "$file")"
+  echo "INFO: ${connector}.poll.p95_ms=${poll_p95} ${connector}.commit.p95_ms=${commit_p95} ${connector}.throughput_eps=${throughput}" | tee -a "$report_path"
 
-  assert_le "${connector}.poll.p95_ms" "$poll_p95" "$p95_limit"
-  assert_le "${connector}.commit.p95_ms" "$commit_p95" "$p95_limit"
-  assert_le "${connector}.poll.p99_ms" "$poll_p99" "$p99_limit"
-  assert_le "${connector}.commit.p99_ms" "$commit_p99" "$p99_limit"
+  return "$connector_failed"
 }
 
 failed=0

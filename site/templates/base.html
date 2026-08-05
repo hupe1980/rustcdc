@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Resolve the current page or section once. Zola exposes `page` in page templates
+    and `section` in section templates; reading a bare `title` picks up neither, which
+    silently collapses every page's title, description and canonical URL onto the site
+    defaults. -#}
+{%- set_global this_title = config.title -%}
+{%- set_global this_description = config.description -%}
+{%- set_global this_url = config.base_url ~ "/" -%}
+{%- set_global is_home = true -%}
+{%- if page -%}
+  {%- set_global this_title = page.title | default(value=config.title) -%}
+  {%- set_global this_description = page.description | default(value=config.description) -%}
+  {%- set_global this_url = page.permalink -%}
+  {%- set_global is_home = false -%}
+{%- elif section -%}
+  {%- set_global this_url = section.permalink -%}
+  {%- set_global is_home = section.permalink == config.base_url ~ "/" -%}
+  {%- if not is_home -%}
+    {%- set_global this_title = section.title | default(value=config.title) -%}
+  {%- endif -%}
+  {%- set_global this_description = section.description | default(value=config.description) -%}
+{%- endif -%}
+
+{#- Title: page title first, so a search result reads "API guide · rustcdc" rather than
+    the site name repeated on every entry. -#}
+<title>{% if is_home %}{{ config.title }} — {{ config.description | truncate(length=60, end="") }}{% else %}{{ this_title }} · {{ config.title }}{% endif %}</title>
+
+{#- Description: the page's own, falling back to the site's. A generic description
+    repeated across every page is the single most common way docs lose search
+    traffic — the snippet no longer matches what the reader asked for. -#}
+<meta name="description" content="{{ this_description }}">
+
+{#- Canonical URL: prevents the same page being indexed under several forms. -#}
+<link rel="canonical" href="{{ this_url | safe }}">
+
+<meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large">
+<meta name="author" content="{{ config.extra.author }}">
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+
+{#- Open Graph / Twitter: what a link preview shows in Slack, GitHub, X. -#}
+<meta property="og:type" content="{% if is_home %}website{% else %}article{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ this_title }}">
+<meta property="og:description" content="{{ this_description }}">
+<meta property="og:url" content="{{ this_url | safe }}">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="{{ get_url(path='og-image.svg', trailing_slash=false) }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ this_title }}">
+<meta name="twitter:description" content="{{ this_description }}">
+<meta name="twitter:image" content="{{ get_url(path='og-image.svg', trailing_slash=false) }}">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg', trailing_slash=false) }}" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="{{ config.title }}" href="{{ get_url(path='atom.xml', trailing_slash=false) }}">
+<link rel="stylesheet" href="{{ get_url(path='main.css', trailing_slash=false) }}">
+
+{#- Structured data. `SoftwareSourceCode` is the accurate type for a library; using
+    `SoftwareApplication` would be a claim about something installable and runnable,
+    which this is not. -#}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "rustcdc",
+  "description": {{ config.description | json_encode | safe }},
+  "url": {{ config.base_url | json_encode | safe }},
+  "codeRepository": {{ config.extra.repo_url | json_encode | safe }},
+  "programmingLanguage": { "@type": "ComputerLanguage", "name": "Rust" },
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": { "@type": "Person", "name": {{ config.extra.author | json_encode | safe }} },
+  "keywords": "change data capture, CDC, Rust, PostgreSQL, MySQL, MariaDB, SQL Server, logical replication, binlog, Debezium alternative"
+}
+</script>
+{%- block structured_data %}{% endblock %}
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="{{ get_url(path='@/_index.md') }}">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">rustcdc</span>
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <a href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a href="{{ config.extra.docs_rs_url }}" rel="noopener">API</a>
+      <a href="{{ config.extra.repo_url }}" rel="noopener">GitHub</a>
+    </nav>
+    <button class="theme-toggle" type="button" aria-label="Toggle colour theme" data-theme-toggle>
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+{% block content %}{% endblock %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>rustcdc</strong> — embeddable change data capture for Rust.
+      Licensed {{ config.extra.license }}.
+    </p>
+    <nav aria-label="Footer">
+      <a href="{{ config.extra.repo_url }}" rel="noopener">GitHub</a>
+      <a href="{{ config.extra.crate_url }}" rel="noopener">crates.io</a>
+      <a href="{{ config.extra.docs_rs_url }}" rel="noopener">docs.rs</a>
+      <a href="{{ get_url(path='atom.xml', trailing_slash=false) }}">Feed</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+// Theme: honour the stored choice, else the OS preference. Inline and tiny so it
+// runs before paint and the page does not flash the wrong theme.
+(function () {
+  var key = "rustcdc-theme";
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem(key); } catch (e) { /* private mode */ }
+  if (stored) root.setAttribute("data-theme", stored);
+
+  var button = document.querySelector("[data-theme-toggle]");
+  if (!button) return;
+  button.addEventListener("click", function () {
+    var current = root.getAttribute("data-theme");
+    var next = current === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem(key, next); } catch (e) { /* ignore */ }
+  });
+})();
+</script>
+</body>
+</html>

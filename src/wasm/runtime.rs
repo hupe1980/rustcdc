@@ -19,7 +19,16 @@ use wasmtime::{
 
 use crate::core::{Error, Event, Result};
 
+/// Default per-event execution budget for a WASM transform, in milliseconds.
+///
+/// Enforced by the wasmtime epoch interrupt, so a guest that loops forever is trapped
+/// rather than blocking the pipeline.
 pub const DEFAULT_WASM_TIMEOUT_MS: u64 = 50;
+/// Default linear-memory ceiling for a WASM guest, in mebibytes.
+///
+/// Enforced through `StoreLimits`, so `memory.grow` past it traps. Without that
+/// enforcement a guest reaches the wasm32 ceiling of 4 GiB per instance, and wasmtime
+/// never shrinks linear memory — growth is monotonic for the process lifetime.
 pub const DEFAULT_WASM_MEMORY_LIMIT_MB: u64 = 16;
 /// Default number of concurrent WASM instances in the pool.
 pub const DEFAULT_WASM_INSTANCE_POOL_SIZE: usize = 1;
@@ -73,9 +82,13 @@ impl WasmCounters {
 }
 
 #[derive(Debug, Clone)]
+/// Sandbox limits and module location for a WASM transform.
 pub struct WasmConfig {
+    /// Path to the `.wasm` module.
     pub module_path: PathBuf,
+    /// Per-event execution budget in milliseconds.
     pub timeout_ms: u64,
+    /// Linear-memory ceiling in mebibytes, enforced on the guest.
     pub memory_limit_mb: u64,
     /// Number of concurrent WASM instances.
     ///
@@ -112,6 +125,7 @@ impl Default for WasmConfig {
 }
 
 #[derive(Debug, Clone)]
+/// What a WASM transform decided about an event.
 pub enum TransformResult {
     /// The WASM module transformed the event successfully.
     Ok(Box<Event>),
@@ -121,6 +135,11 @@ pub enum TransformResult {
     Filtered,
 }
 
+/// The guest-module surface the runtime drives.
+///
+/// Implemented by the real wasmtime-backed module and by test doubles. **A test double
+/// bypasses wasmtime entirely**, so sandbox properties (memory limit, epoch timeout,
+/// import allowlist) are not exercised by tests that use one.
 #[async_trait]
 pub trait WasmModule: Send + Sync {
     /// Execute the WASM transform on a pre-serialised JSON event payload.
@@ -133,17 +152,25 @@ pub trait WasmModule: Send + Sync {
     /// Returns the transformed event, or `None` when the module filtered
     /// (dropped) the event.
     async fn transform_bytes(&self, event_json: &[u8]) -> Result<Option<Event>>;
+    /// Per-event execution budget this module was loaded with.
     fn timeout_ms(&self) -> u64;
 
+    /// Initialise the guest before the first `transform_bytes` call.
+    ///
+    /// Defaults to a no-op for modules that need no setup.
     async fn init(&self, _config: &WasmConfig) -> Result<()> {
         Ok(())
     }
 
+    /// Release guest resources.
+    ///
+    /// Defaults to a no-op.
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
 }
 
+/// Loads and drives a sandboxed WASM transform module.
 pub struct WasmRuntime {
     config: WasmConfig,
     module_bytes: Vec<u8>,
@@ -190,6 +217,12 @@ struct RealWasmState {
 }
 
 impl WasmRuntime {
+    /// Load a module from `wasm_module_path` with the default sandbox limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the module cannot be read, fails static import validation, or
+    /// does not export the required ABI symbols.
     pub fn new(wasm_module_path: &str) -> Result<Self> {
         let config = WasmConfig {
             module_path: PathBuf::from(wasm_module_path),
@@ -198,6 +231,11 @@ impl WasmRuntime {
         Self::new_with_config(config)
     }
 
+    /// Load a module with explicit sandbox limits.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::new`].
     pub fn new_with_config(config: WasmConfig) -> Result<Self> {
         validate_wasm_config(&config)?;
         let module_bytes = std::fs::read(&config.module_path)?;
@@ -214,6 +252,10 @@ impl WasmRuntime {
         })
     }
 
+    /// Substitute the guest module.
+    ///
+    /// **This bypasses wasmtime**, so the sandbox guarantees are not in force. For tests.
+    #[must_use]
     pub fn with_module(mut self, module: Arc<dyn WasmModule>) -> Self {
         // Reset counters so that test modules start from zero.
         self.counters = Arc::new(WasmCounters::default());
@@ -221,12 +263,23 @@ impl WasmRuntime {
         self
     }
 
+    /// Instantiate the module and start the epoch ticker that enforces timeouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if guest initialisation fails.
     pub async fn init(&mut self) -> Result<()> {
         self.module.init(&self.config).await?;
         self.initialized = true;
         Ok(())
     }
 
+    /// Run one event through the guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the guest traps, exceeds its time budget, exceeds its memory
+    /// limit, or returns a payload that does not decode.
     pub async fn transform(&mut self, event: &Event) -> Result<TransformResult> {
         if !self.initialized {
             self.init().await?;
@@ -280,16 +333,23 @@ impl WasmRuntime {
         }
     }
 
+    /// Call the guest's shutdown hook and stop the epoch ticker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the guest's shutdown hook fails.
     pub async fn shutdown(&mut self) -> Result<()> {
         self.module.shutdown().await?;
         self.initialized = false;
         Ok(())
     }
 
+    /// Sandbox limits this runtime was built with.
     pub fn config(&self) -> &WasmConfig {
         &self.config
     }
 
+    /// Size of the loaded module in bytes.
     pub fn module_size_bytes(&self) -> usize {
         self.module_bytes.len()
     }
