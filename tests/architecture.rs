@@ -291,7 +291,9 @@ fn every_statement_of_the_msrv_matches_cargo_toml() {
 
     let site_config = read_src("site/zola.toml");
     if !site_config.contains(&format!(r#"rust_version = "{msrv}""#)) {
-        wrong.push(format!("site/zola.toml: expected `rust_version = \"{msrv}\"`"));
+        wrong.push(format!(
+            "site/zola.toml: expected `rust_version = \"{msrv}\"`"
+        ));
     }
 
     let readme = read_src("README.md");

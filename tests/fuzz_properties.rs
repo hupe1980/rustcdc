@@ -287,10 +287,10 @@ fn the_config_loader_rejects_rather_than_panics() {
         let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
         let mut toml = String::new();
         for _ in 0..rng.below(16) {
-            // Dereferenced explicitly: `pick` returns `&T`, and letting inference pick
-            // `T` from `push_str`'s `&str` parameter resolves to the unsized `str` on
-            // older compilers within the supported range.
-            toml.push_str(*rng.pick(&fragments));
+            // Turbofished: inferring `T` from `push_str`'s `&str` parameter resolves to
+            // the unsized `str` on the oldest supported compiler, and a type annotation on
+            // the binding is not enough to steer it. Naming `T` is.
+            toml.push_str(rng.pick::<&str>(&fragments));
         }
 
         let path = dir.path().join(format!("fuzz-{seed}.toml"));
