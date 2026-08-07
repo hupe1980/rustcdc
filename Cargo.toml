@@ -2,7 +2,13 @@
 name = "rustcdc-server"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.94"
+# The shipped container image builds `--all-features`, so this is the requirement for the
+# artifact users actually consume. The default feature set alone still builds on 1.94.0
+# (wasmtime is the binding constraint there); the AWS SDK, pulled in only by `glue`, is
+# what needs 1.94.1. Declaring the lower number would be true for a `cargo build` and false
+# for the published image, and would hand anyone enabling `glue` a resolver error instead
+# of a documented requirement.
+rust-version = "1.94.1"
 publish = false
 description = "Change-data-capture server powered by rustcdc"
 repository = "https://github.com/hupe1980/rustcdc-server"

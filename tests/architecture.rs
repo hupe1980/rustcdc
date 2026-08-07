@@ -255,3 +255,63 @@ fn no_source_file_grows_past_the_point_of_navigability() {
          (tests move to a sibling `*_tests.rs` cheaply): {oversized:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Minimum supported Rust version
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract the MSRV from `Cargo.toml`.
+fn declared_msrv() -> String {
+    read_src("Cargo.toml")
+        .lines()
+        .find_map(|line| line.strip_prefix("rust-version"))
+        .and_then(|rest| rest.split('"').nth(1).map(str::to_owned))
+        .expect("Cargo.toml must declare rust-version")
+}
+
+/// Every place that restates the MSRV must agree with `Cargo.toml`.
+///
+/// The number appears in four files — the manifest, the Dockerfile's build stage, the
+/// documentation site, and (derived, not hardcoded) the CI job. They were hand-synchronised
+/// and they drifted: the manifest said `1.94` while CI pinned `1.94.0`, so when a
+/// dependency raised its own requirement to `1.94.1` the build broke with no indication
+/// which of the two numbers was wrong.
+///
+/// The README badge is deliberately included. A badge is the first MSRV statement most
+/// people read, and a stale one is worse than none.
+#[test]
+fn every_statement_of_the_msrv_matches_cargo_toml() {
+    let msrv = declared_msrv();
+    let mut wrong = Vec::new();
+
+    let dockerfile = read_src("Dockerfile");
+    if !dockerfile.contains(&format!("ARG RUST_VERSION={msrv}")) {
+        wrong.push(format!("Dockerfile: expected `ARG RUST_VERSION={msrv}`"));
+    }
+
+    let site_config = read_src("site/zola.toml");
+    if !site_config.contains(&format!(r#"rust_version = "{msrv}""#)) {
+        wrong.push(format!("site/zola.toml: expected `rust_version = \"{msrv}\"`"));
+    }
+
+    let readme = read_src("README.md");
+    if !readme.contains(&format!("Rust {msrv}+")) {
+        wrong.push(format!("README.md: badge/text should say `Rust {msrv}+`"));
+    }
+
+    // The CI job must *derive* the toolchain rather than restate it, or this test would
+    // have to be updated in lockstep with a value it is supposed to be policing.
+    let ci = read_src(".github/workflows/ci.yml");
+    if !ci.contains("steps.msrv.outputs.version") {
+        wrong.push(
+            ".github/workflows/ci.yml: the MSRV job must read rust-version from Cargo.toml \
+             rather than pin a literal toolchain"
+                .to_owned(),
+        );
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "MSRV is declared as {msrv} in Cargo.toml but these disagree: {wrong:?}"
+    );
+}

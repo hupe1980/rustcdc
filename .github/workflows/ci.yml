@@ -82,17 +82,37 @@ jobs:
   # `rust-version` in Cargo.toml is a promise to downstream consumers. Without a job
   # pinned to it, the promise is only ever tested against whatever `stable` happens to
   # be, and a newer-than-MSRV feature ships unnoticed.
+  #
+  # The toolchain is **read from Cargo.toml** rather than written here. This job used to
+  # hardcode `1.94.0` while the manifest said `1.94`, which is two sources of truth for one
+  # number and exactly how they drift: a dependency raised its own requirement, the pinned
+  # job started failing, and nothing said which of the two values was wrong.
   msrv:
-    name: MSRV (1.94)
+    name: MSRV
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "$version" || { echo "no rust-version in Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
+      # Both feature sets, because they have different binding constraints: the default set
+      # is held by wasmtime and `--all-features` by the AWS SDK that `glue` pulls in. The
+      # declared MSRV has to satisfy the higher of the two, and the shipped container image
+      # builds `--all-features`.
+      - run: cargo check --all-targets --no-default-features --locked
       - run: cargo check --all-targets --all-features --locked
 
   # ── Fuzz targets (build + short smoke run) ──────────────────────────────────

@@ -21,7 +21,7 @@
 #   /etc/ssl/certs       — CA bundle (included in the distroless image)
 # ─────────────────────────────────────────────────────────────────────────────
 
-ARG RUST_VERSION=1.94
+ARG RUST_VERSION=1.94.1
 ARG DEBIAN_CODENAME=bookworm
 
 # ── Stage 1: install cargo-chef onto the Rust toolchain image ────────────────
