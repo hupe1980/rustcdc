@@ -42,6 +42,13 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 # Copy workspace member manifests (none here, but future-proof)
 COPY src src
+# `benches/` is required even though the image never runs benchmarks: `cargo
+# metadata` silently drops targets whose source file is absent, so without it
+# the recipe would omit the explicit `[[bench]] pipeline` target while still
+# carrying the `[[bench]]` section from Cargo.toml. The cook stage would then
+# reconstruct a skeleton with no benches/pipeline.rs and fail to parse the
+# manifest ("can't find `pipeline` bench").
+COPY benches benches
 
 RUN cargo chef prepare --recipe-path recipe.json
 
