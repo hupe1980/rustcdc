@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod dlq;
 mod loader;
 mod migrations;
 pub mod pipeline;

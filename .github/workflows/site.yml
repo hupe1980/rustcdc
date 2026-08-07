@@ -1,0 +1,78 @@
+name: Site
+
+# Builds the Zola documentation site and publishes it to GitHub Pages.
+#
+# Pull requests build but do not deploy, so a broken link or a template error fails review
+# rather than the default branch. The build is the check: `zola build` resolves every
+# `@/…md` internal link and fails on a dangling one, which is why the docs use that syntax
+# instead of plain relative paths.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/site.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - ".github/workflows/site.yml"
+  # Lets a docs fix go out without an unrelated commit to main.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded deploy is worth cancelling; two racing publishes are not.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ZOLA_VERSION: "0.22.1"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zola
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            "https://github.com/getzola/zola/releases/download/v${ZOLA_VERSION}/zola-v${ZOLA_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+          zola --version
+
+      # `--drafts` is deliberately absent: a draft page must not reach production.
+      - name: Build
+        run: zola --root site build
+
+      # Internal links are already validated by the build. This additionally checks that
+      # external links still resolve, and is non-blocking because a third-party site being
+      # down is not a reason to fail our deploy.
+      - name: Check links
+        continue-on-error: true
+        run: zola --root site check
+
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    name: Deploy
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write      # publish to Pages
+      id-token: write   # OIDC token the Pages deployment is authenticated with
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

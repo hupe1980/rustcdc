@@ -17,7 +17,6 @@ use super::run_recovery::{
 };
 
 pub(super) struct RuntimeLoopConfig {
-    pub(super) max_event_bytes: usize,
     pub(super) prepare_parallelism: usize,
     pub(super) sink_flush_interval_events: usize,
     pub(super) sink_delivery_queue_capacity: usize,
@@ -49,6 +48,7 @@ pub(super) async fn execute_event_loop(
     admin_exit_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
     checkpoint_age_source: &CheckpointAgeSource,
     checkpoint_txn_reconciler: &mut CheckpointTxnReconciler,
+    dlq: Option<&tokio::sync::Mutex<crate::dlq::DeadLetterQueue>>,
     config: RuntimeLoopConfig,
 ) -> RuntimeLoopOutcome {
     let recovery_policy = RecoveryPolicyConfig {
@@ -114,6 +114,7 @@ pub(super) async fn execute_event_loop(
                             &recovery_policy,
                             &mut recoverable,
                             &mut metrics_accumulator,
+                            dlq,
                             batch,
                         )
                         .await {
@@ -128,7 +129,7 @@ pub(super) async fn execute_event_loop(
                         }
                         // Update the admin consecutive-error counter so /readyz
                         // can signal source degradation before the circuit-breaker
-                        // escalates (CR-010).
+                        // escalates.
                         let consecutive = recoverable.snapshot().consecutive;
                         admin_state
                             .record_source_consecutive_errors(consecutive)

@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use rustcdc::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use rustcdc::core::{Event, Operation, SourceMetadata};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -22,30 +22,17 @@ use rustcdc_server::pipeline::transform::TransformPipeline;
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn sample_event() -> Event {
-    Event {
-        before: None,
-        after: Some(json!({
+    Event::builder("orders", Operation::Insert)
+        .after(json!({
             "id": 1,
             "name": "alice",
             "amount": 99.50
-        })),
-        op: Operation::Insert,
-        source: SourceMetadata {
-            source_name: "postgres".to_string(),
-            offset: "0/1".to_string(),
-            timestamp: 1_000_000,
-        },
-        ts: 1_000_001,
-        schema: Some("public".to_string()),
-        table: "orders".to_string(),
-        primary_key: Some(vec!["id".to_string()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+        }))
+        .source(SourceMetadata::new("postgres", "0/1", 1_000_000))
+        .ts(1_000_001)
+        .schema("public")
+        .primary_key(["id"])
+        .build()
 }
 
 /// Compile WAT source to a `.wasm` file and return its path.
@@ -186,6 +173,19 @@ async fn wasm_drop_transform_returns_none() {
 // Field mutation (table rename via JSON manipulation in WASM)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A module carrying a **data segment** must load.
+///
+/// This is the regression guard for the rustcdc 0.8 + wasmtime 47 defect that made the
+/// entire WASM feature unusable: wasmtime evaluates the store's epoch deadline while
+/// initialising data segments, a fresh `Store` starts at deadline `0` which equals the
+/// engine's starting epoch, and `WasmRuntime` armed the deadline only *after*
+/// `linker.instantiate(..)`. Every module carrying a data segment was rejected with
+/// `wasm trap: interrupt` — which is every module a real Rust, AssemblyScript or TinyGo
+/// build produces, since string literals and rodata land there.
+///
+/// The whole WAT fixture suite happened to be data-segment-free, so it stayed green
+/// while nothing real could load. This module embeds the replacement event as a data
+/// segment, so it covers the class by construction. Fixed in rustcdc 0.9.
 #[tokio::test]
 async fn wasm_transform_can_mutate_event_table_name() {
     // This test uses a Rust-like approach: compile a WAT module that reads the
@@ -197,10 +197,8 @@ async fn wasm_transform_can_mutate_event_table_name() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Build a replacement event with the table renamed to "renamed_orders".
-    let replacement_event = Event {
-        table: "renamed_orders".to_string(),
-        ..sample_event()
-    };
+    let mut replacement_event = sample_event();
+    replacement_event.table = "renamed_orders".to_string();
     let replacement_json = serde_json::to_vec(&replacement_event).expect("serialize");
     let json_len = replacement_json.len();
 
@@ -249,6 +247,63 @@ async fn wasm_transform_can_mutate_event_table_name() {
         output.table, "renamed_orders",
         "WASM transform must be able to rename the event table"
     );
+}
+
+/// The instance **pool** must also accept data-segment modules.
+///
+/// The 0.8 defect had two sites: the ABI probe and `create_instance_state`, which runs
+/// once per pool slot. A single-instance test would have passed against a fix applied
+/// only to the probe, so this drives several slots concurrently.
+#[tokio::test]
+async fn wasm_pool_slots_accept_a_data_segment_module() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let module_path = compile_wasm(
+        &dir,
+        "pool_data.wasm",
+        r#"
+        (module
+          (memory (export "memory") 2 2)
+          (data (i32.const 1024) "rodata-like-any-real-toolchain-emits")
+          (global $heap (mut i32) (i32.const 8))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            global.get $heap
+            local.tee $ptr
+            local.get $size
+            i32.add
+            global.set $heap
+            local.get $ptr)
+          (func (export "dealloc") (param i32) (param i32))
+          (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+          (func (export "transform") (param $ptr i32) (param $len i32) (result i64)
+            i32.const 65536
+            local.get $ptr
+            local.get $len
+            memory.copy
+            i32.const 65536
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            local.get $len
+            i64.extend_i32_u
+            i64.or))
+        "#,
+    );
+
+    let mut cfg = wasm_cfg(module_path);
+    cfg.wasm.instance_pool_size = 4;
+    let pipeline = TransformPipeline::from_config(cfg, vec![]).expect("pool must instantiate");
+
+    for i in 0..20u64 {
+        let mut event = sample_event();
+        event.ts += i;
+        let out = pipeline
+            .apply(event.clone())
+            .await
+            .expect("apply")
+            .expect("kept");
+        assert_eq!(out.after, event.after);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -444,4 +499,123 @@ fn native_pipeline_filter_rule_drops_delete_events() {
         .expect("apply")
         .expect("insert should be kept");
     assert_eq!(kept.table, "orders");
+}
+
+/// **The pool must actually run transforms in parallel.**
+///
+/// `wasm.instance_pool_size` allocated N wasmtime instances while a single mutex around
+/// `WasmRuntime::transform` ensured exactly one could ever run — so the knob, and
+/// `runtime.prepare_parallelism` with it, did nothing at all in WASM mode. An operator
+/// tuning either measured no change.
+///
+/// The module below busy-spins for a fixed number of iterations, giving each transform
+/// a floor on its duration. If the pipeline were still serialised, N concurrent
+/// transforms would take N × that floor. Asserting wall-clock is the only way to
+/// distinguish real concurrency from a pool that merely exists — a test that just
+/// checked the outputs would pass equally well against the serialised version.
+///
+/// **`multi_thread` is required.** `#[tokio::test]` defaults to a current-thread
+/// runtime, where spawned tasks interleave but CPU-bound guest execution cannot
+/// overlap — the test would fail against a perfectly good pool. Production runs on a
+/// multi-threaded runtime, so this matches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wasm_pool_transforms_concurrently() {
+    const POOL: usize = 4;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let module_path = compile_wasm(
+        &dir,
+        "spin.wasm",
+        r#"
+        (module
+          (memory (export "memory") 2 2)
+          (global $heap (mut i32) (i32.const 8))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            global.get $heap
+            local.tee $ptr
+            local.get $size
+            i32.add
+            global.set $heap
+            local.get $ptr)
+          (func (export "dealloc") (param i32) (param i32))
+          (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+          (func (export "transform") (param $ptr i32) (param $len i32) (result i64)
+            (local $i i32)
+            i32.const 0
+            local.set $i
+            (block $done
+              (loop $spin
+                local.get $i
+                i32.const 4000000
+                i32.ge_s
+                br_if $done
+                local.get $i
+                i32.const 1
+                i32.add
+                local.set $i
+                br $spin))
+            i32.const 65536
+            local.get $ptr
+            local.get $len
+            memory.copy
+            i32.const 65536
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            local.get $len
+            i64.extend_i32_u
+            i64.or))
+        "#,
+    );
+
+    let mut cfg = wasm_cfg(module_path);
+    cfg.wasm.instance_pool_size = POOL;
+    cfg.wasm.timeout_ms = 30_000;
+    let pipeline =
+        std::sync::Arc::new(TransformPipeline::from_config(cfg, vec![]).expect("pool builds"));
+
+    // Warm every slot first. Each `WasmRuntime` initialises its guest lazily on first
+    // transform, and counting that one-off cost inside the measurement would understate
+    // the concurrency it is trying to detect.
+    for _ in 0..POOL {
+        pipeline
+            .apply(sample_event())
+            .await
+            .expect("warm-up transform")
+            .expect("event survives");
+    }
+
+    // One transform on its own establishes the per-event floor on this machine, so the
+    // assertion below is not calibrated against a hardware guess. Take the best of a
+    // few runs so a scheduling hiccup inflates the floor rather than the verdict.
+    let mut single = std::time::Duration::MAX;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        pipeline.apply(sample_event()).await.expect("transform");
+        single = single.min(started.elapsed());
+    }
+
+    let concurrent_started = std::time::Instant::now();
+    let mut handles = Vec::with_capacity(POOL);
+    for i in 0..POOL {
+        let pipeline = std::sync::Arc::clone(&pipeline);
+        handles.push(tokio::spawn(async move {
+            let mut event = sample_event();
+            event.ts += i as u64;
+            pipeline.apply(event).await.expect("transform").is_some()
+        }));
+    }
+    for handle in handles {
+        assert!(handle.await.expect("join"), "every event must survive");
+    }
+    let concurrent = concurrent_started.elapsed();
+
+    let serialised_floor = single * (POOL as u32);
+    assert!(
+        concurrent < serialised_floor,
+        "{POOL} transforms took {concurrent:?}; one takes {single:?}, so a serialised \
+         pipeline would need about {serialised_floor:?}. The pool is not running \
+         concurrently."
+    );
 }

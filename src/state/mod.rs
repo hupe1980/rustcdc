@@ -11,6 +11,7 @@ use crate::error::AppError;
 
 pub(crate) mod metrics;
 pub(crate) mod offset;
+pub(crate) mod remote_lease;
 mod schema_history;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +91,11 @@ pub(crate) struct RuntimeState {
     pub(crate) checkpoint: CheckpointBox,
     pub(crate) schema_history: SchemaHistoryBox,
     pub(crate) checkpoint_age_source: CheckpointAgeSource,
+    /// Remote owner lease, for the backends that hold one (`redis`, `postgresql`).
+    ///
+    /// `local_fs` uses a lease *file* that its own `Drop` removes, and `kafka_topic`
+    /// fences at the broker by producer epoch — neither has a record to release.
+    pub(crate) remote_lease: Option<std::sync::Arc<offset::opendal::OwnedLease>>,
 }
 
 /// Source of checkpoint freshness metrics, resolved at build time.
@@ -128,9 +134,18 @@ impl CheckpointAgeSource {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build both offset and schema-history backends from configuration.
-pub(crate) async fn build(config: &StateConfig) -> Result<RuntimeState, AppError> {
-    let (checkpoint, checkpoint_age_source) =
-        offset::build(&config.offset.backend, &config.offset.dir).await?;
+/// Build the runtime's state backends.
+///
+/// `sink_transaction` is a share in the Kafka sink's transaction, when there is one. The
+/// `kafka_topic` offset backend uses it to write each checkpoint *inside* the transaction
+/// that carries the batch's data, which is what makes `effectively_once` exactly-once
+/// end to end rather than only at the sink. Every other backend ignores it.
+pub(crate) async fn build(
+    config: &StateConfig,
+    sink_transaction: Option<crate::sink::KafkaTransactionHandle>,
+) -> Result<RuntimeState, AppError> {
+    let (checkpoint, checkpoint_age_source, remote_lease) =
+        offset::build(&config.offset.backend, &config.offset.dir, sink_transaction).await?;
     let schema_history =
         schema_history::build(&config.schema_history.backend, &config.schema_history.dir).await?;
 
@@ -138,5 +153,6 @@ pub(crate) async fn build(config: &StateConfig) -> Result<RuntimeState, AppError
         checkpoint: CheckpointBox(checkpoint),
         schema_history: SchemaHistoryBox(schema_history),
         checkpoint_age_source,
+        remote_lease,
     })
 }

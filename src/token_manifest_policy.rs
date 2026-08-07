@@ -200,7 +200,12 @@ fn verify_manifest_signature(
 }
 
 /// Produce a deterministic, canonical JSON byte payload for signing/verification.
-pub(crate) fn canonical_signing_payload(
+/// The exact bytes a manifest signature covers.
+///
+/// Public because signing a manifest is an operator task performed by external tooling:
+/// without this, anyone building a signer has to reverse-engineer the canonical form,
+/// and a mismatch produces a manifest the server silently refuses.
+pub fn canonical_signing_payload(
     unsigned: &TokenManifestUnsigned,
 ) -> Result<Vec<u8>, serde_json::Error> {
     // Represent each token as a BTreeMap so field order is alphabetical.

@@ -40,7 +40,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -75,7 +75,7 @@ api_version = "v1"
 host = "localhost"
 port = 3306
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 server_id = 42
 gtid_mode_enabled = false
@@ -116,7 +116,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -155,7 +155,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -205,7 +205,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -256,7 +256,7 @@ api_version = "v1alpha1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -296,7 +296,7 @@ api_version = "v99"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -338,7 +338,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -386,7 +386,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -433,7 +433,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -502,7 +502,7 @@ api_version = "v1"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "secret"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
 database = "mydb"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"
@@ -526,11 +526,11 @@ mode = "wasm"
 
 [pipeline.transform_runtime.wasm]
 module_path = "{}"
-entrypoint = "transform"
 instance_pool_size = 2
 max_memory_bytes = 1048576
 max_event_bytes = 65536
-max_fuel = 10000000
+timeout_ms = 75
+fuel_yield_interval = 10000
 "#,
         wasm_path.display()
     );
@@ -544,4 +544,477 @@ max_fuel = 10000000
         rustcdc_server::config::schema::TransformRuntimeMode::Wasm
     ));
     assert_eq!(tr.wasm.instance_pool_size, 2);
+    assert_eq!(tr.wasm.max_memory_bytes, 1_048_576);
+    assert_eq!(tr.wasm.max_event_bytes, 65_536);
+    assert_eq!(tr.wasm.timeout_ms, 75);
+    assert_eq!(tr.wasm.fuel_yield_interval, Some(10_000));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema registry pool + registry_ref resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A shared `[registries.<name>]` entry must actually reach the codec. Before
+/// the pool was wired up it parsed and was then ignored, so every sink had to
+/// repeat the URL and credentials — and the copies are what drift apart.
+#[test]
+fn registry_ref_is_resolved_from_the_shared_pool() {
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[registries.prod]
+url = "https://registry.example.com"
+subject_name_strategy = "topic_record_name"
+auto_register = false
+
+[sink]
+type = "kafka"
+brokers = "broker:9092"
+topic = "cdc-events"
+
+[sink.codec]
+type = "avro_confluent"
+registry_ref = "prod"
+"#
+    ))
+    .expect("registry_ref config must load");
+
+    let SinkConfig::Kafka(kafka) = &cfg.sink else {
+        panic!("expected Kafka sink");
+    };
+    let binding = kafka
+        .codec
+        .as_ref()
+        .expect("codec")
+        .binding()
+        .expect("registry binding");
+    let registry = binding.resolved().expect("registry resolved by the loader");
+    assert_eq!(registry.url, "https://registry.example.com");
+    assert!(!registry.auto_register);
+}
+
+#[test]
+fn unknown_registry_ref_is_rejected_with_the_known_names() {
+    let err = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[registries.prod]
+url = "https://registry.example.com"
+
+[sink]
+type = "kafka"
+brokers = "broker:9092"
+topic = "cdc-events"
+
+[sink.codec]
+type = "avro_confluent"
+registry_ref = "staging"
+"#
+    ))
+    .expect_err("unknown registry_ref must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("staging"), "unexpected: {msg}");
+    assert!(msg.contains("known: prod"), "unexpected: {msg}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kafka SASL
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn kafka_sasl_ssl_plain_config_loads() {
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "kafka"
+brokers = "broker:9093"
+topic = "cdc-events"
+compression = "zstd"
+compression_level = 6
+
+[sink.security]
+protocol = "sasl_ssl"
+
+[sink.security.sasl]
+mechanism = "plain"
+username = "api-key"
+password = "api-secret"
+
+[sink.transport]
+tcp_keepalive_ms = 30000
+tls_reload_interval_ms = 300000
+"#
+    ))
+    .expect("SASL_SSL config must load");
+
+    let SinkConfig::Kafka(kafka) = &cfg.sink else {
+        panic!("expected Kafka sink");
+    };
+    assert!(kafka.security.protocol.uses_sasl());
+    assert!(kafka.security.protocol.uses_tls());
+    assert_eq!(kafka.compression_level, Some(6));
+    assert_eq!(kafka.transport.tls_reload_interval_ms, 300_000);
+    kafka
+        .security
+        .to_auth_config()
+        .expect("auth config must build");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Snapshots
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn incremental_snapshot_config_loads() {
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[incremental_snapshot]
+tables = ["public.orders"]
+chunk_size = 2500
+"#
+    ))
+    .expect("incremental snapshot config must load");
+
+    assert!(cfg.incremental_snapshot.is_enabled());
+    assert_eq!(cfg.incremental_snapshot.chunk_size, 2500);
+}
+
+/// Both paths bootstrap the same tables; accepting both would read every table
+/// twice and the duplicate would look like genuine change data downstream.
+#[test]
+fn blocking_and_incremental_snapshots_are_mutually_exclusive() {
+    let err = load_from_str(&format!(
+        r#"snapshot_tables = ["public.orders"]
+{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[incremental_snapshot]
+tables = ["public.orders"]
+"#
+    ))
+    .expect_err("both snapshot paths must be rejected");
+    assert!(err.to_string().contains("exactly one"), "unexpected: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Masking secrets
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A key written into the config file makes every value it masked
+/// re-identifiable for as long as that file exists.
+#[test]
+fn inline_mask_key_literal_is_rejected() {
+    let err = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[[pipeline.transforms]]
+name = "redact"
+
+[[pipeline.transforms.actions]]
+type = "mask"
+
+[pipeline.transforms.actions.rules]
+ssn = {{ type = "hmac_sha256", key = "hardcoded-key" }}
+"#
+    ))
+    .expect_err("an inline masking key must be rejected");
+    assert!(
+        err.to_string().contains("deferred secret reference"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn mask_transform_with_env_key_loads() {
+    // Safety: single-threaded test setup; no other thread reads this variable.
+    unsafe { std::env::set_var("CDC_TEST_MASK_KEY", "s3cret") };
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[[pipeline.transforms]]
+name = "redact"
+
+[[pipeline.transforms.actions]]
+type = "mask"
+
+[pipeline.transforms.actions.rules]
+email = {{ type = "redact", placeholder = "***" }}
+ssn = {{ type = "hmac_sha256", key = {{ env = "CDC_TEST_MASK_KEY" }} }}
+"#
+    ));
+    unsafe { std::env::remove_var("CDC_TEST_MASK_KEY") };
+
+    let cfg = cfg.expect("mask config with an env key must load");
+    assert_eq!(cfg.pipeline.transforms.len(), 1);
+    // The pipeline must also *compile*: secrets resolve at startup, not on the
+    // first event that happens to carry the field.
+    rustcdc_server::pipeline::transform::TransformPipeline::from_config(
+        cfg.pipeline.transform_runtime.clone(),
+        cfg.pipeline.transforms.clone(),
+    )
+    .expect("mask pipeline must compile");
+}
+
+/// Shared source + state preamble for the configs above.
+const SOURCE_AND_STATE: &str = r#"api_version = "v1"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+conn_timeout_secs = 10
+stream_poll_interval_ms = 200
+max_events_per_poll = 1000
+table_include_list = []
+table_exclude_list = []
+
+[source.postgres.transport]
+mode = "plaintext"
+
+[state]
+dir = "/tmp/cdc-test""#;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Removed / rejected configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `at_most_once` was accepted, labelled and validated but never acted on — the code
+/// that would have advanced the checkpoint before delivery was defined and never
+/// called, so every deployment that selected it silently received at_least_once.
+/// It must now fail loudly, naming the replacement.
+#[test]
+fn removed_at_most_once_contract_is_rejected_with_the_replacement() {
+    let err = load_from_str(&format!(
+        r#"delivery_contract = "at_most_once"
+{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+"#
+    ))
+    .expect_err("at_most_once must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("was removed"), "unexpected: {msg}");
+    assert!(
+        msg.contains("at_least_once"),
+        "the error must name the replacement: {msg}"
+    );
+}
+
+/// A misspelled key is not a typo-ergonomics problem: `table_include_lst` leaves the
+/// include list empty, which captures **every table in the database**.
+#[test]
+fn unknown_config_keys_are_rejected_with_their_path() {
+    let err = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[runtime]
+max_buffer_sze = 500
+"#
+    ))
+    .expect_err("an unknown key must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("runtime.max_buffer_sze"),
+        "the error must name the full path: {msg}"
+    );
+}
+
+/// Unknown-key detection must diff the config **file**, never the env-merged document.
+///
+/// `Env::prefixed("RUSTCDC_")` turns every variable in that namespace into a top-level
+/// config key, but the namespace is shared: `RUSTCDC_ADMIN_READ_TOKEN` is read by name
+/// to authorise the admin bind and `RUSTCDC_LOG_LEVEL` is applied before the config is
+/// parsed. Neither is a field of `AppConfig`. Diffing the merged document rejected the
+/// project's own documented environment variables — it broke the demo, which sets both.
+///
+/// `.cargo/config.toml` exports them for the whole test run, so this asserts the
+/// condition directly rather than mutating the process environment mid-suite.
+#[test]
+fn env_vars_sharing_the_prefix_are_not_mistaken_for_unknown_keys() {
+    assert!(
+        std::env::var("RUSTCDC_ADMIN_READ_TOKEN").is_ok()
+            && std::env::var("RUSTCDC_LOG_LEVEL").is_ok(),
+        "this test is only meaningful with the prefixed non-config variables set; \
+         see the [env] block in .cargo/config.toml"
+    );
+
+    load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+"#
+    ))
+    .expect("a prefixed variable that is not a config field must not be a typo");
+}
+
+/// The real defect this guard was built from: a key indented under the wrong table
+/// parses cleanly and does nothing.
+#[test]
+fn a_key_under_the_wrong_table_is_rejected() {
+    let err = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+snapshot_tables = ["public.orders"]
+
+[sink]
+type = "stdout"
+"#
+    ))
+    .expect_err("snapshot_tables under [state] must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("[state]"), "unexpected: {msg}");
+    assert!(msg.contains("snapshot_tables"), "unexpected: {msg}");
+    assert!(
+        msg.contains("above the [state] header"),
+        "the error must say how to fix it: {msg}"
+    );
+}
+
+/// A replication credential written as a literal is readable by anyone who can read
+/// the config file, and it grants read access to every captured table. Sink tokens,
+/// Iceberg credentials and masking keys were already required to be deferred; the
+/// source password was the asymmetry.
+#[test]
+fn literal_source_password_is_rejected() {
+    let err = load_from_str(
+        r#"api_version = "v1"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc"
+password = "hardcoded-in-the-file"
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+conn_timeout_secs = 10
+stream_poll_interval_ms = 200
+max_events_per_poll = 1000
+table_include_list = []
+table_exclude_list = []
+
+[source.postgres.transport]
+mode = "plaintext"
+
+[sink]
+type = "stdout"
+
+[state]
+dir = "/tmp/cdc-test"
+"#,
+    )
+    .expect_err("a literal source password must be rejected");
+    assert!(
+        err.to_string().contains("deferred secret reference"),
+        "unexpected: {err}"
+    );
+}
+
+/// A real `[dlq]` block must survive the unknown-key guard.
+///
+/// `DlqConfig` uses `#[serde(flatten)]` for the target, and flatten is exactly what
+/// makes `deny_unknown_fields` unusable — which is why the guard is a post-parse
+/// round-trip diff instead. A flattened, internally-tagged enum is the shape most
+/// likely to round-trip differently from its input, so it needs its own test rather
+/// than trust.
+#[test]
+fn a_file_dead_letter_queue_configuration_loads() {
+    let config = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[dlq]
+enabled   = true
+type      = "file"
+path      = "/var/lib/rustcdc/dlq.jsonl"
+max_bytes = 134217728
+"#
+    ))
+    .expect("a documented dlq block must load");
+
+    assert!(config.dlq.enabled);
+    match &config.dlq.target {
+        rustcdc_server::config::dlq::DlqTarget::File(file) => {
+            assert_eq!(file.path, "/var/lib/rustcdc/dlq.jsonl");
+            assert_eq!(file.max_bytes, 134_217_728);
+        }
+        other => panic!("expected the file target, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_kafka_dead_letter_queue_configuration_loads() {
+    let config = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[dlq]
+enabled = true
+type    = "kafka"
+brokers = "kafka:9092"
+topic   = "cdc.dlq"
+"#
+    ))
+    .expect("a documented kafka dlq block must load");
+
+    match &config.dlq.target {
+        rustcdc_server::config::dlq::DlqTarget::Kafka(kafka) => {
+            assert_eq!(kafka.topic, "cdc.dlq");
+        }
+        other => panic!("expected the kafka target, got {other:?}"),
+    }
+}
+
+/// The removed per-sink DLQ keys must be rejected, not ignored.
+///
+/// Silently dropping them would be the worst outcome: an operator who configured a
+/// dead-letter queue would get none, and would only discover it when the first poison
+/// event took the pipeline down.
+#[test]
+fn the_relocated_http_dlq_keys_are_rejected_with_the_replacement() {
+    let err = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "http"
+url  = "https://api.example.com/events"
+dlq_path = "/var/log/cdc/dlq.jsonl"
+"#
+    ))
+    .expect_err("the removed key must be rejected");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("[dlq]"),
+        "must name the new section: {message}"
+    );
+    assert!(
+        message.contains("opt-in") || message.contains("halts"),
+        "must say the behaviour changed, not just the key name: {message}"
+    );
 }

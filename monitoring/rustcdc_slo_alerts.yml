@@ -3,8 +3,8 @@ groups:
     rules:
       - alert: RUSTCDCReadinessRateLow
         expr: >
-          rate(rustcdc_readiness_ready_total[5m])
-          / rate(rustcdc_readiness_checks_total[5m]) < 0.999
+          rate(rustcdc_slo_readiness_ready_total[5m])
+          / rate(rustcdc_slo_readiness_checks_total[5m]) < 0.999
         for: 5m
         labels:
           severity: critical
@@ -16,7 +16,7 @@ groups:
             breaker state.
 
       - alert: RUSTCDCCheckpointAgeHigh
-        expr: rustcdc_checkpoint_age_seconds > 300
+        expr: rustcdc_slo_checkpoint_age_seconds > 300
         for: 5m
         labels:
           severity: warning
@@ -24,7 +24,7 @@ groups:
           summary: CDC checkpoint age is too high
 
       - alert: RUSTCDCAdminAPILatencyHigh
-        expr: histogram_quantile(0.99, rustcdc_admin_api_duration_seconds_bucket) > 1.0
+        expr: histogram_quantile(0.99, rustcdc_slo_admin_api_latency_seconds_histogram_bucket) > 1.0
         for: 5m
         labels:
           severity: warning
@@ -32,7 +32,7 @@ groups:
           summary: CDC admin API latency is high
 
       - alert: RUSTCDCRestartRecoverySlow
-        expr: rustcdc_restart_recovery_duration_seconds > 60
+        expr: rustcdc_slo_restart_recovery_seconds > 60
         for: 1m
         labels:
           severity: warning
@@ -40,7 +40,7 @@ groups:
           summary: CDC restart recovery is taking too long
 
       - alert: RUSTCDCAdminManifestReloadFailed
-        expr: rustcdc_admin_manifest_reload_failures_total > 0
+        expr: rustcdc_admin_auth_manifest_reload_ok == 0
         for: 1m
         labels:
           severity: critical
@@ -56,7 +56,7 @@ groups:
           summary: CDC admin control plane is down
 
       - alert: RUSTCDCAdminManifestStaleBlocked
-        expr: rustcdc_admin_manifest_stale_blocked == 1
+        expr: rustcdc_admin_auth_manifest_stale_blocked == 1
         for: 5m
         labels:
           severity: critical
@@ -64,7 +64,7 @@ groups:
           summary: CDC admin manifest is stale and blocked
 
       - alert: RUSTCDCAdminRevokedTokenUseDetected
-        expr: increase(rustcdc_admin_revoked_token_use_total[5m]) > 0
+        expr: increase(rustcdc_admin_auth_revoked_token_hits_total[5m]) > 0
         for: 1m
         labels:
           severity: critical
@@ -72,7 +72,7 @@ groups:
           summary: Revoked token use detected on CDC admin API
 
       - alert: RUSTCDCAdminShutdownCompletionErrors
-        expr: rustcdc_admin_shutdown_completion_errors_total > 0
+        expr: rustcdc_admin_shutdown_completions_error_total > 0
         for: 1m
         labels:
           severity: warning
@@ -80,7 +80,7 @@ groups:
           summary: CDC admin shutdown completed with errors
 
       - alert: RUSTCDCReconciliationRecoveryDetected
-        expr: rustcdc_reconciliation_recovery_detected_total > 0
+        expr: rustcdc_admin_reconciliation_recoveries_total > 0
         for: 1m
         labels:
           severity: warning
@@ -88,7 +88,7 @@ groups:
           summary: CDC reconciliation recovery was triggered
 
       - alert: RUSTCDCReconciliationRecoveryProofFailed
-        expr: rustcdc_reconciliation_recovery_proof_failed_total > 0
+        expr: rustcdc_admin_reconciliation_recovery_proof_last_ok == 0
         for: 1m
         labels:
           severity: critical
@@ -96,7 +96,9 @@ groups:
           summary: CDC reconciliation recovery proof failed
 
       - alert: RUSTCDCAdminAuthAbuse
-        expr: increase(rustcdc_admin_auth_abuse_total[5m]) > 0
+        expr: increase(rustcdc_admin_rate_limited_metrics_total[5m])
+          + increase(rustcdc_admin_rate_limited_status_total[5m])
+          + increase(rustcdc_admin_rate_limited_readyz_total[5m]) > 0
         for: 1m
         labels:
           severity: critical
@@ -104,7 +106,7 @@ groups:
           summary: CDC admin auth abuse detected
 
       - alert: RUSTCDCAdminRateLimiterContentionHigh
-        expr: rustcdc_admin_rate_limiter_contention_ratio > 0.5
+        expr: rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_max > 0.005
         for: 5m
         labels:
           severity: warning
@@ -112,7 +114,7 @@ groups:
           summary: CDC admin rate limiter contention is high
 
       - alert: RUSTCDCDataCorrectnessDegradation
-        expr: rustcdc_data_correctness_degradation_total > 0
+        expr: rustcdc_data_duplicate_rate > 0 or rustcdc_data_reorder_rate > 0
         for: 1m
         labels:
           severity: critical
@@ -120,7 +122,7 @@ groups:
           summary: CDC data correctness degradation detected
 
       - alert: RUSTCDCHttpBatchOldestEventAgeHigh
-        expr: rustcdc_http_batch_oldest_event_age_seconds > 300
+        expr: rustcdc_sink_http_batch_oldest_event_age_ms > 300000
         for: 5m
         labels:
           severity: warning
@@ -128,7 +130,7 @@ groups:
           summary: CDC HTTP batch oldest event age is too high
 
       - alert: RUSTCDCRuntimeRecoverableBreakerOpen
-        expr: rustcdc_runtime_recoverable_breaker_open == 1
+        expr: rustcdc_runtime_recoverable_breaker_open_consecutive > 0
         for: 1m
         labels:
           severity: warning
@@ -136,7 +138,7 @@ groups:
           summary: CDC runtime recoverable circuit breaker is open
 
       - alert: RUSTCDCRuntimeRecoverableBreakerEscalationRisk
-        expr: rustcdc_runtime_recoverable_breaker_escalation_risk > 0
+        expr: rustcdc_runtime_recoverable_breaker_open_consecutive > 1
         for: 5m
         labels:
           severity: warning
@@ -156,7 +158,7 @@ groups:
             manual cleanup pass before they accumulate and inflate storage costs.
 
       - alert: CDCEventDeliveryLatencyHigh
-        expr: histogram_quantile(0.99, rate(rustcdc_event_delivery_latency_ms_bucket[5m])) > 30000
+        expr: histogram_quantile(0.99, rate(rustcdc_runtime_batch_delivery_latency_seconds_bucket[5m])) > 30
         for: 5m
         labels:
           severity: warning
@@ -164,6 +166,19 @@ groups:
           summary: >
             CDC event delivery P99 latency exceeds 30 s — sink back-pressure,
             slow catalog commits, or network congestion suspected.
+
+      - alert: RUSTCDCEventsQuarantined
+        expr: increase(rustcdc_dlq_events_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Events are being quarantined to the dead-letter queue. Each one was NOT
+            delivered to the sink and the checkpoint advanced past it — this is
+            recorded data loss, not a retry. Drain the DLQ, establish why the events
+            were undeliverable (oversized payload, codec/schema mismatch), and replay
+            them with `rustcdc replay` once the cause is fixed.
 
       - alert: RUSTCDCAuditLogDropDetected
         expr: increase(rustcdc_audit_log_drop_total[5m]) > 0
@@ -230,3 +245,75 @@ groups:
             invalidation = unrecoverable data loss) or filling the WAL
             volume.  Check sink throughput and the RUSTCDCRuntimeStalled
             alert.
+
+      - alert: RUSTCDCKafkaOAuthTokenFetchFailing
+        expr: increase(rustcdc_sink_kafka_oauth_token_fetch_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            SASL/OAUTHBEARER token fetches to the identity provider are
+            failing.  krafka resolves a token on every new broker connection,
+            so a persistent failure stops the sink reconnecting after any
+            broker restart or rebalance — and without this counter it is
+            indistinguishable from an unreachable broker, because both
+            surface only as connection failures.  Check
+            sink.kafka.security.sasl.oidc.token_endpoint, the client
+            credentials, and network egress to the provider.
+
+      - alert: RUSTCDCKafkaOAuthTokenNearExpiry
+        expr: >
+          rustcdc_sink_kafka_oauth_token_expiry_epoch_ms > 0
+          and (rustcdc_sink_kafka_oauth_token_expiry_epoch_ms / 1000) - time() < 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            The cached OAUTHBEARER token expires in under 5 minutes and has
+            not been refreshed.  Paired with
+            RUSTCDCKafkaOAuthTokenFetchFailing this is a refresh loop that is
+            failing before the current token runs out; alone it can mean the
+            provider is issuing very short-lived tokens.  Once the token
+            expires every new broker connection is rejected.
+
+      - alert: RUSTCDCTransformRuleUnmatched
+        expr: rustcdc_transform_rules_unmatched > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Transform rule "{{ $labels.rule }}" ({{ $labels.kind }}) in
+            "{{ $labels.transform }}" has never matched.  Transform rules match
+            by pattern against a permissive default, so a typo or a renamed
+            column disables one silently and nothing errors.  The consequence
+            depends on the kind: a "mask" rule that never fires means that
+            column is shipping in CLEAR TEXT; a "route" rule that never fires
+            means events are going to the default destination; a "filter" rule
+            that never fires means nothing is being dropped.  Check the rule's
+            path against the current source schema.  This metric is emitted only
+            for unmatched rules, so its absence is the healthy state.
+
+      - alert: RUSTCDCEndToEndLagHigh
+        expr: >
+          histogram_quantile(
+            0.95,
+            sum by (le, sink) (rate(rustcdc_end_to_end_ack_lag_seconds_bucket[5m]))
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            95th-percentile end-to-end lag for sink "{{ $labels.sink }}" is above
+            30 s.  This is the number a data consumer actually experiences: the
+            time from the source committing a row to that change being durable at
+            the sink.  It is deliberately a percentile and not the
+            rustcdc_end_to_end_ack_lag_seconds_avg gauge, because a pipeline
+            delivering 99% of events in 200 ms and 1% ten minutes late reports a
+            healthy average and pages nobody.  Check replication slot lag, sink
+            throughput, and whether the pipeline is working through a backlog
+            after a restart -- a recovering pipeline breaches this legitimately
+            and should clear on its own.

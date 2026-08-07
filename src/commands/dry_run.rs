@@ -1,4 +1,4 @@
-use rustcdc::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use rustcdc::core::{Event, Operation, SourceMetadata};
 use serde_json::json;
 use std::path::Path;
 
@@ -24,10 +24,10 @@ async fn dry_run_pipeline(
     event_limit: usize,
     checkpoint_parity_mode: CheckpointParityMode,
 ) -> Result<(), AppError> {
-    let mut sink = build_router(&app_config).await?;
+    let mut sink = build_router(&app_config).await?.router;
 
     // Fail fast if the requested parity mode is incompatible with the delivery
-    // contract and this sink's capabilities (CR-016).
+    // contract and this sink's capabilities.
     run_batch::validate_parity_contract(
         checkpoint_parity_mode,
         &sink,
@@ -46,13 +46,14 @@ async fn dry_run_pipeline(
         &mut sink,
         (0..event_limit).map(synthetic_event),
         &transform_pipeline,
-        app_config.runtime.max_event_bytes,
         app_config.runtime.prepare_parallelism,
         app_config.runtime.sink_flush_interval_events,
         app_config.runtime.sink_delivery_queue_capacity,
         app_config.runtime.sink_send_timeout_ms,
         app_config.runtime.sink_flush_timeout_ms,
         checkpoint_parity_mode,
+        // No quarantine for a one-shot diagnostic: a failure here should be seen.
+        None,
     )
     .await?;
 
@@ -73,29 +74,20 @@ fn synthetic_event(idx: usize) -> Event {
     let row_id = idx as i64 + 1;
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
 
-    Event {
-        before: None,
-        after: Some(json!({
+    Event::builder("dry_run_events", Operation::Insert)
+        .after(json!({
             "id": row_id,
             "name": format!("dry-run-{row_id}"),
-        })),
-        op: Operation::Insert,
-        source: SourceMetadata {
-            source_name: "dry-run".to_string(),
-            offset: format!("synthetic-{row_id}"),
-            timestamp: now_ms,
-        },
-        ts: now_ms,
-        schema: Some("public".to_string()),
-        table: "dry_run_events".to_string(),
-        primary_key: Some(vec!["id".to_string()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+        }))
+        .source(SourceMetadata::new(
+            "dry-run",
+            format!("synthetic-{row_id}"),
+            now_ms,
+        ))
+        .ts(now_ms)
+        .schema("public")
+        .primary_key(["id"])
+        .build()
 }
 
 #[cfg(test)]
@@ -118,7 +110,7 @@ mod tests {
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "cdc"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
 database = "cdc"
 replication_slot_name = "cdc_slot"
 publication_name = "cdc_pub"

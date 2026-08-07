@@ -22,35 +22,41 @@ ignore = [
     { id = "RUSTSEC-2024-0436" },
 
     # RUSTSEC-2023-0071: rsa 0.9.x — Marvin timing side-channel in PKCS#1 v1.5 decryption.
-    # No safe upgrade available. We do not use RSA decryption in any hot path; rsa is a
-    # transitive dependency pulled in by rustcdc crypto feature. Track upstream fix.
+    # No safe upgrade available. Affected path: rsa <- reqsign-azure-storage <-
+    # opendal-service-azblob <- opendal, i.e. only Azure request signing. Nothing here
+    # performs RSA decryption. Remove when reqsign releases against rsa >= 0.10.
     { id = "RUSTSEC-2023-0071" },
 
-    # RUSTSEC-2025-0134: rustls-pemfile 1.x and 2.x — no safe upgrade available upstream.
-    # We do not directly parse PEM files; rustls-pemfile is a transitive dep via rustcdc/tonic.
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained (since August 2025).
+    # cdc-server no longer parses PEM through it — the admin TLS loader moved to
+    # `rustls_pki_types::pem::PemObject` — but two transitive paths remain:
+    #   * rustls-pemfile 2.2.0 <- axum-server 0.7 (`tls-rustls` feature), for the
+    #     admin HTTPS listener;
+    #   * rustls-pemfile 1.0.4 <- rustls-native-certs 0.6.3 <- tiberius 0.12
+    #     <- rustcdc's `sqlserver` feature.
+    # Both parse files this process supplies, never network input. Remove when
+    # axum-server and tiberius move to rustls-pki-types.
     { id = "RUSTSEC-2025-0134" },
 
-    # RUSTSEC-2026-0098 / RUSTSEC-2026-0099: rustls-webpki 0.101.x and 0.102.x TLS issues.
-    # Affected path: rustls-webpki -> rustls -> tokio-rustls -> rustcdc 0.3.0 (transitive).
-    # Upgrade to rustls-webpki >=0.103.12 blocked until rustcdc releases a compatible version.
+    # RUSTSEC-2026-0098 / -0099 / -0104: rustls-webpki 0.101.x — URI name-constraint
+    # and wildcard-name-constraint acceptance, plus a CRL parsing panic.
+    # Sole path: rustls-webpki 0.101.7 <- rustls 0.21 <- tokio-rustls 0.24
+    # <- tiberius 0.12 <- rustcdc's `sqlserver` feature. It affects only the SQL Server
+    # connector's TLS, not the admin listener or any sink (those are on rustls 0.23),
+    # and none of the three is reachable without name constraints or CRLs in the chain.
+    # Blocked until tiberius releases against a current rustls.
     { id = "RUSTSEC-2026-0098" },
     { id = "RUSTSEC-2026-0099" },
+    { id = "RUSTSEC-2026-0104" },
 
-    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 — quadratic duplicate-attribute
-    # check and unbounded namespace-declaration allocation (both DoS-class, no memory unsafety).
-    # Affected paths: quick-xml 0.38.x <- opendal 0.55 (pinned by iceberg-storage-opendal ^0.55)
-    # and quick-xml 0.37.x <- reqsign 0.16 (pinned by opendal 0.55). Neither parent can reach
-    # quick-xml >=0.41 within semver. Exposure is limited to parsing XML responses from the
-    # *configured* cloud-storage endpoints (S3/Azure APIs), not arbitrary user input.
-    # Remove when opendal/reqsign release with quick-xml >=0.41 and iceberg follows.
+    # RUSTSEC-2026-0194 / -0195: quick-xml < 0.41 — quadratic duplicate-attribute
+    # scanning and unbounded namespace-declaration allocation (both DoS-class; no
+    # memory unsafety). Path: quick-xml 0.39.4 <- opendal-core 0.57. Exposure is
+    # limited to XML responses from the *configured* S3/Azure endpoints, not arbitrary
+    # input. Remove when opendal moves to quick-xml >= 0.41 (it already pulls 0.41
+    # elsewhere in the graph).
     { id = "RUSTSEC-2026-0194" },
     { id = "RUSTSEC-2026-0195" },
-
-    # RUSTSEC-2026-0104: rustls-webpki 0.102.x panic in CRL parsing via BorrowedCertRevocationList::from_der.
-    # Affected path: rustls-webpki 0.102.8 -> rustls 0.22.4 -> tokio-rustls -> rustcdc 0.3.0.
-    # We do not use CRL-based certificate revocation; applications that do not use CRLs are not affected.
-    # Upgrade to rustls-webpki >=0.103.13 blocked until rustcdc releases a compatible version.
-    { id = "RUSTSEC-2026-0104" },
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
@@ -73,6 +79,10 @@ allow = [
     # Used by webpki-roots (trusted root CA certificates bundle).
     # Permissive — permits use, reproduction, modification, and redistribution.
     "CDLA-Permissive-2.0",
+    # BSL-1.0: Boost Software License. OSI-approved and FSF Free/Libre; permissive,
+    # with no attribution requirement for binary distribution. Used by xxhash-rust
+    # (via redis <- opendal's Redis state backend).
+    "BSL-1.0",
 ]
 
 [[licenses.clarify]]
@@ -107,23 +117,64 @@ deny = [
 # Remove entries when the upstream diamond is resolved.
 # ──────────────────────────────────────────────────────────────────────────
 skip = [
-    # OpenTelemetry/tonic axum diamond (tonic 0.12 needs axum 0.7, cdc needs 0.8)
-    { name = "axum" },
-    { name = "axum-core" },
-    { name = "matchit" },
-    { name = "tower" },
+    # RustCrypto generation split: rustcdc 0.8 moved to the 0.11/0.6 generation
+    # (aes-gcm 0.11, sha2 0.11, hkdf 0.13) while iceberg 0.10 still pins aes-gcm 0.10
+    # for its Puffin/KMS encryption. Both are pure-Rust AEAD implementations of the
+    # same primitive; neither can move without its parent. Revisit when iceberg-rust
+    # upgrades aes-gcm.
+    { name = "aead" },
+    { name = "aes" },
+    { name = "aes-gcm" },
+    { name = "cipher" },
+    { name = "ctr" },
+    { name = "ghash" },
+    { name = "hkdf" },
+    { name = "inout" },
+    { name = "polyval" },
+    { name = "universal-hash" },
+    # sha1: mysql_common 0.37 (rustcdc) uses 0.10; reqsign-aws-core 3.x (opendal S3
+    # signing) uses 0.11. SHA-1 here is protocol framing — MySQL native auth and AWS
+    # SigV4 canonicalisation — not a security decision either crate makes.
+    { name = "sha1" },
+    # reqwest: iceberg 0.10 pins 0.12; opendal-core 0.57 moved to 0.13. Both are
+    # configured rustls-only by their parents. Resolves when iceberg follows opendal.
+    { name = "reqwest" },
+    # wasmparser / wasm-encoder / logos*: wasmtime 47's own tooling crates
+    # (wasm-compose, wast) lag the version rustcdc pins directly. Compile-time and
+    # module-validation only.
+    { name = "logos" },
+    { name = "logos-codegen" },
+    { name = "logos-derive" },
+    { name = "wasmparser" },
+    # unicode-width: clap 4 uses 0.2; older diagnostics crates in the wasmtime tree
+    # use 0.1. Display-width tables only.
+    { name = "unicode-width" },
+    # `glue` feature only (off by default; on in the published image). The AWS SDK's
+    # generated service crates still carry the hyper 0.14 / http 0.2 generation, while
+    # aws-config and everything else here are on hyper 1 / http 1. Both stacks are
+    # rustls-only — `aws-sdk-glue` and `aws-config` are pulled with
+    # `default-features = false, features = ["rustls"]`, so no native-tls path exists.
+    # Resolves when the AWS SDK finishes its hyper 1 migration.
+    { name = "h2" },
+    { name = "http" },
+    { name = "http-body" },
+    { name = "hyper" },
+    { name = "hyper-rustls" },
     # Crypto / TLS version diamonds.
-    # Root causes:
-    #   - rustls / tokio-rustls: krafka 0.10 (rdkafka) pulls 0.22.x; rustcdc pulls 0.23.x
-    #   - base64: various old crates use 0.13.x; new crates use 0.21.x+
+    # Root causes (re-verified against the rustcdc 0.8 / krafka 0.15 / iceberg 0.10
+    # graph — `cargo tree -i <crate>@<version> --target all -e all`):
+    #   - rustls / tokio-rustls / rustls-native-certs / rustls-pemfile / rustls-webpki /
+    #       webpki-roots / const-oid / core-foundation / security-framework:
+    #       tiberius 0.12 (rustcdc's `sqlserver` feature) still pins the rustls 0.21
+    #       stack; everything else in the tree is on rustls 0.23. See the matching
+    #       advisory ignores above — this is the single diamond worth closing.
+    #   - base64: opendal/reqsign are on 0.23; older transitive crates on 0.21/0.22
     #   - sha2 / hmac / md-5 / digest / block-buffer / crypto-common / cpufeatures:
-    #       old sqlx / ring vs newer aws-lc-rs / rustcrypto ecosystem split
-    #   - rand / rand_chacha / rand_core / getrandom: sqlx and tokio use older 0.8.x;
-    #       newer crates use 0.9.x — resolve when sqlx upgrades rand
-    #   - hashbrown / rustc-hash / foldhash: indexmap 1.x vs 2.x diamond (via krafka)
-    #   - const-oid / core-foundation / security-framework: rustls-native-certs version splits
-    #   - rustls-native-certs / rustls-pemfile / rustls-webpki / webpki-roots:
-    #       tonic 0.12 pins older versions; direct deps use newer
+    #       the RustCrypto 0.10→0.11 generation change; rustcdc 0.8 moved, its
+    #       transitive deps (mysql_common, tiberius) have not
+    #   - rand / rand_chacha / rand_core / getrandom: 0.8 vs 0.9 split across the
+    #       database drivers and the newer crates
+    #   - hashbrown: indexmap 1.x vs 2.x diamond
     { name = "base64" },
     { name = "block-buffer" },
     { name = "const-oid" },
@@ -150,13 +201,10 @@ skip = [
     # Root causes:
     #   - darling / darling_core / darling_macro: proc-macro crates used by both
     #       old and new serde/derive crates in the graph
-    #   - heck: proc-macro utility; old clap vs new strum versions
-    #   - indexmap / itertools / ordered-float: krafka 0.10 (rdkafka) pulls 1.x;
-    #       iceberg-rust and opendal pull 2.x
-    #   - linux-raw-sys / rustix: nix ecosystem version split between io-uring
-    #       backends and standard async runtimes
-    #   - openssl-probe: rdkafka pulls a version; rustls-native-certs pulls another
-    #   - quick-xml: opendal vs serde-xml-rs use different minor versions
+    #   - itertools / ordered-float: iceberg-rust and opendal disagree on the minor
+    #   - openssl-probe: rustls-native-certs 0.6 (tiberius) vs 0.8 (rustcdc/krafka)
+    #   - quick-xml: opendal-core 0.57 pulls 0.39 for S3/Azure XML while another
+    #       branch of the graph is already on 0.41
     #   - socket2: older tokio vs newer tokio/hyper version split
     #   - serde_spanned / toml / toml_datetime / winnow: figment uses toml 0.5.x;
     #       other crates use toml 0.8.x
@@ -167,7 +215,6 @@ skip = [
     { name = "darling_core" },
     { name = "darling_macro" },
     { name = "foldhash" },
-    { name = "indexmap" },
     { name = "itertools" },
     { name = "openssl-probe" },
     { name = "ordered-float" },
@@ -179,14 +226,10 @@ skip = [
     { name = "toml" },
     { name = "toml_datetime" },
     { name = "winnow" },
-    # schemreg/avro feature diamond: schemreg 0.3 (via rustcdc) pins older apache-avro,
-    # lz4_flex, strum*, typed-builder*, wasm-encoder, whoami than iceberg/wasmtime pull.
-    { name = "apache-avro" },
+    # Compression / wasm-tooling diamonds: lz4_flex and wasm-encoder are pulled at
+    # different minors by krafka's LZ4 codec, iceberg's parquet, and wasmtime's own
+    # tooling crates; whoami by two independent telemetry paths.
     { name = "lz4_flex" },
-    { name = "strum" },
-    { name = "strum_macros" },
-    { name = "typed-builder" },
-    { name = "typed-builder-macro" },
     { name = "wasm-encoder" },
     { name = "whoami" },
     # syn 2.x vs 3.x: proc-macro ecosystem mid-transition; both versions are

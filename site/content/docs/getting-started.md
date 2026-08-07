@@ -1,32 +1,22 @@
-# Getting Started with rustcdc
++++
+title = "Getting started"
+description = "Install rustcdc, write a minimal configuration, and stream your first row-level change from PostgreSQL, MySQL, MariaDB or SQL Server in about ten minutes."
+weight = 10
++++
 
-> 🎥 **Want to see it in action first?** Run the [self-contained demo](../demo/README.md) — streams live PostgreSQL changes to your terminal in under two minutes, no config required:
-> ```bash
-> cd demo && docker compose up
-> ```
+> [!TIP]
+> To see it working before configuring anything, run the
+> [self-contained demo](https://github.com/hupe1980/rustcdc-server/blob/main/demo/README.md).
+> It streams live PostgreSQL changes to your terminal in under two minutes:
+> `cd demo && docker compose up`
 
-**rustcdc** streams every row-level change (`INSERT`, `UPDATE`, `DELETE`) from
-your database — PostgreSQL, MySQL, MariaDB, or SQL Server — to HTTP, Kafka,
-Iceberg, or files. Ordering and delivery guarantees are built in.
-
-This guide gets you to a working pipeline in under 10 minutes.
-
----
-
-## Choose your install path
-
-| Path | Best for |
-|---|---|
-| [Binary](#install-the-binary) | local dev, bare-metal, VMs |
-| [Docker](#run-with-docker) | containers, Kubernetes, CI |
-
----
+You need a database you can enable replication on, and either Rust or Docker. Pick the
+install path that matches where this will run — a binary for local development, VMs and
+bare metal, or the container image for Kubernetes and CI.
 
 ## Install the binary
 
-### Build from source (recommended)
-
-Requires Rust ≥ 1.93 (`rustup update stable`).
+Requires Rust {{ rust_version() }} or later (`rustup update stable`).
 
 ```bash
 git clone https://github.com/hupe1980/rustcdc-server
@@ -36,13 +26,9 @@ sudo cp target/release/rustcdc /usr/local/bin/
 rustcdc --version
 ```
 
-### Quick smoke-test
+Building from source needs `cmake`, `clang` and `perl` on the build host — they are
+required by `aws-lc-sys`, the cryptography backend used for TLS.
 
-```bash
-rustcdc --help
-```
-
----
 
 ## Run with Docker
 
@@ -61,7 +47,6 @@ docker pull ghcr.io/hupe1980/rustcdc-server:latest
 docker run --rm ghcr.io/hupe1980/rustcdc-server:latest --version
 ```
 
----
 
 ## Prepare PostgreSQL
 
@@ -84,9 +69,8 @@ CREATE PUBLICATION cdc_pub FOR TABLE public.orders, public.customers;
 
 > **Cloud databases:** RDS, Azure Database for PostgreSQL, and Cloud SQL all
 > support logical replication — see the
-> [PostgreSQL connector guide](connectors/postgres.md#cloud-databases).
+> [PostgreSQL connector guide](@/docs/connectors/postgres.md#4-cloud-databases).
 
----
 
 ## Create your config
 
@@ -137,7 +121,6 @@ Validate before running:
 rustcdc validate-config --config-file cdc.toml
 ```
 
----
 
 ## First run
 
@@ -201,7 +184,6 @@ volumes:
 docker compose up
 ```
 
----
 
 ## Verify it's working
 
@@ -229,7 +211,6 @@ curl -H "Authorization: Bearer $RUSTCDC_ADMIN_READ_TOKEN" http://localhost:8080/
 curl -H "Authorization: Bearer $RUSTCDC_ADMIN_READ_TOKEN" http://localhost:8080/metrics
 ```
 
----
 
 ## Add a transform (optional)
 
@@ -280,39 +261,37 @@ mode = "wasm"
   instance_pool_size = 4
 ```
 
-→ [Writing WASM transforms](transforms.md) for build steps, patterns, testing,
+→ [Writing WASM transforms](@/docs/transforms.md) for build steps, patterns, testing,
 and Kubernetes deployment.
 
----
 
 ## Production checklist
 
 Before going to production, work through these items:
 
 - [ ] **Sink** — swap `stdout` for `kafka`, `http`, or `iceberg`
-  ([sink configuration](configuration.md#sinks))
+  ([sink configuration](@/docs/configuration.md#3-sink-sink-sinks))
 - [ ] **Delivery contract** — set `delivery_contract = "at_least_once"` (default)
   or `"effectively_once"` for Kafka
-  ([delivery contracts](concepts.md#delivery-contracts))
+  ([delivery contracts](@/docs/concepts.md#3-delivery-contracts))
 - [ ] **State backend** — replace `local_fs` with `kafka_topic`, `redis`, or
-  `postgresql` for HA ([state backends](configuration.md#4-state-backends-state))
+  `postgresql` for HA ([state backends](@/docs/configuration.md#4-state-backends-state))
 - [ ] **Secrets** — all passwords via `{ env = "VAR" }`, never inline
 - [ ] **Audit trail** — enable signing and IP pseudonymisation
-  ([security hardening](configuration.md#security-hardening))
+  ([security hardening](@/docs/configuration.md#7-admin-api-admin))
 - [ ] **Health probes** — wire `/livez` and `/readyz` to your orchestrator
-  ([admin API](configuration.md#admin-api))
+  ([admin API](@/docs/configuration.md#7-admin-api-admin))
 - [ ] **SLO alerts** — deploy `monitoring/rustcdc_slo_alerts.yml` to Prometheus
 
----
 
 ## Next steps
 
 | Guide | What it covers |
 |---|---|
-| [PostgreSQL connector](connectors/postgres.md) | Publications, slots, replica identity, RDS/Azure/GCP, HA failover |
-| [MySQL / MariaDB connector](connectors/mysql.md) | `binlog_format`, `server_id`, grants, GTID |
-| [SQL Server connector](connectors/sqlserver.md) | `sp_cdc_enable_db`, permissions, polling interval |
-| [Core concepts](concepts.md) | Event model, pipeline lifecycle, delivery contracts, circuit breaker |
-| [Configuration reference](configuration.md) | Every TOML field with defaults and examples |
-| [Operations guide](operations.md) | Replay, migrate-state, graceful shutdown, performance tuning |
-| [Writing WASM transforms](transforms.md) | Write custom transforms in Rust, AssemblyScript, or any WASM language |
+| [PostgreSQL connector](@/docs/connectors/postgres.md) | Publications, slots, replica identity, RDS/Azure/GCP, HA failover |
+| [MySQL / MariaDB connector](@/docs/connectors/mysql.md) | `binlog_format`, `server_id`, grants, GTID |
+| [SQL Server connector](@/docs/connectors/sqlserver.md) | `sp_cdc_enable_db`, permissions, polling interval |
+| [Core concepts](@/docs/concepts.md) | Event model, pipeline lifecycle, delivery contracts, circuit breaker |
+| [Configuration reference](@/docs/configuration.md) | Every TOML field with defaults and examples |
+| [Operations guide](@/docs/operations.md) | Replay, migrate-state, graceful shutdown, performance tuning |
+| [Writing WASM transforms](@/docs/transforms.md) | Write custom transforms in Rust, AssemblyScript, or any WASM language |

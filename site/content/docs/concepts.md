@@ -1,21 +1,17 @@
-# Core concepts
++++
+title = "Core concepts"
+description = "The rustcdc event model, delivery contracts, checkpoints and circuit breaker — what each guarantees, and exactly where the limits are."
+weight = 20
++++
 
-This page explains the fundamental ideas behind rustcdc — how events are
-structured, how the pipeline processes them, and what guarantees you can rely on.
-Read this before diving into the connector-specific or operations guides.
+Four ideas carry most of the weight, and the rest of the documentation assumes them: the
+**event envelope** every source produces, the **delivery contract** that says what a crash
+can and cannot do to your data, the **checkpoint** that makes restarts resumable, and the
+**circuit breaker** that decides when to stop trying.
 
----
+Each section below states the guarantee first and its limits immediately after. Where a
+limit exists it is named here rather than left for production to reveal.
 
-## Table of contents
-
-1. [Event model](#1-event-model)
-2. [Pipeline lifecycle](#2-pipeline-lifecycle)
-3. [Delivery contracts](#3-delivery-contracts)
-4. [Transform pipeline](#4-transform-pipeline)
-5. [State backends](#5-state-backends)
-6. [Circuit breaker](#6-circuit-breaker)
-
----
 
 ## 1. Event model
 
@@ -107,9 +103,8 @@ None` decision so the corrupting write is not expressible.
 Within `rustcdc-server`, sinks forward the full envelope (the lists travel with the
 event), the Iceberg sink additionally materializes a `has_complete_after_image` column
 for cheap data-quality queries, and transforms that add or rename payload columns
-automatically reconcile the lists (see [Transforms](transforms.md)).
+automatically reconcile the lists (see [Transforms](@/docs/transforms.md)).
 
----
 
 ## 2. Pipeline lifecycle
 
@@ -166,7 +161,6 @@ After a batch is successfully delivered, rustcdc advances the checkpoint in the
 state backend. On restart, capture resumes exactly from that checkpoint — no events
 are missed, and the number of duplicates is bounded by the batch size.
 
----
 
 ## 3. Delivery contracts
 
@@ -194,34 +188,70 @@ upsert sinks) handle this transparently.
 
 | Property | Value |
 |---|---|
-| Checkpoint advances | **atomically** inside the Kafka transaction |
-| Duplicates on restart | impossible |
+| Batch atomicity at the sink | **guaranteed** — all of a batch commits, or none |
+| Duplicates during steady-state retries | impossible |
+| Duplicates after a crash | impossible |
 | Data gaps | impossible |
 | Compatible sinks | Kafka only |
 
-Requires:
-- `sink.type = "kafka"`
-- `sink.delivery_mode = "transactional"`
-- A unique `sink.transactional_id` per pipeline instance
+Requires all of:
 
-The checkpoint is written as a Kafka consumer-group offset commit inside the same
-transaction as the event records. This guarantees that either all records and the
-checkpoint land together, or neither does.
+- `sink.type = "kafka"` with `sink.delivery_mode = "transactional"`
+- a unique `sink.transactional_id` per pipeline
+- `state.offset.backend = "kafka_topic"`, on the **same** Kafka cluster as the sink
 
-### `at_most_once`
+The loader rejects any other combination rather than accepting it and degrading — see
+[why the state backend is not optional](#why-the-checkpoint-has-to-live-in-kafka).
 
-| Property | Value |
-|---|---|
-| Checkpoint advances | **before** delivery |
-| Duplicates on restart | impossible |
-| Data gaps | possible (events skipped on delivery failure) |
-| Compatible sinks | all |
+#### How it works
 
-The checkpoint advances first. If delivery then fails, the event is silently
-skipped. Use only where gaps are acceptable (e.g., analytics) and the HTTP DLQ
-(`dlq_path`) can capture skipped events for out-of-band investigation.
+Each batch is one Kafka transaction, and the checkpoint is a record *inside* it:
 
----
+1. begin the transaction
+2. deliver the batch's records
+3. write the checkpoint record — into the **same** transaction
+4. commit
+
+One `commit_transaction` makes the data and the position that describes it durable
+together. A crash before step 4 discards both, so the batch replays cleanly from the
+previous position. A crash after it keeps both, so the batch is not replayed at all. There
+is no ordering in which one survives without the other, which is what makes this
+exactly-once end to end and not merely atomic at the sink.
+
+A delivery failure aborts the transaction, so a `read_committed` consumer never sees a
+partial batch.
+
+#### Why the checkpoint has to live in Kafka
+
+The source position is a WAL LSN or a binlog coordinate, not a Kafka consumer offset, so
+`sendOffsetsToTransaction` — the mechanism a Kafka-to-Kafka pipeline would use — does not
+apply. The only way to make the position atomic with the data is to write it as an
+ordinary record in the same transaction, and that requires it to live on the same cluster,
+produced by the same producer.
+
+Any other state backend is a second durability domain. The batch and the position would
+commit separately, and a crash between the two would replay the batch — the window this
+contract exists to avoid. That combination used to be accepted with the residual window
+documented as a caveat; it is now a configuration error, because a guarantee an operator
+has to read a paragraph to qualify is not a guarantee.
+
+> [!NOTE]
+> One consequence worth planning for: the checkpoint topic must be a compacted topic on
+> the sink's own cluster. If your sink cluster and your operational-state cluster are
+> different, `effectively_once` is not available and `at_least_once` is the honest choice.
+
+#### What you still need to know
+
+- **Ordering across a restart.** Exactly-once does not mean the pipeline cannot pause. A
+  crash mid-batch replays that batch from the source; the records are produced again under
+  a new producer epoch, but the aborted transaction means no consumer ever saw the first
+  attempt.
+- **Consumers must read `read_committed`.** A `read_uncommitted` consumer sees aborted
+  records, and no producer-side guarantee can prevent that.
+- **The reconciliation marker still runs.** It is written before delivery and cleared after
+  the commit, and a marker surviving a restart tells you the crash landed mid-batch. It is
+  now purely diagnostic — the transaction, not the marker, is what protects the data.
+
 
 ## 4. Transform pipeline
 
@@ -243,6 +273,9 @@ Declared as `[[pipeline.transforms]]` in TOML. Each rule has an optional
 | `route` | Rewrite the event's routing `schema` and/or `table` |
 | `metadata_projection` | Copy source metadata into `after[target_field]` |
 | `key_shaping` | Materialise a deterministic key from `primary_key` or `fingerprint` into `after[target_field]` |
+| `mask` | Redact, truncate, SHA-256, keyed HMAC-SHA256, or AES-256-GCM encrypt/decrypt fields by dotted path |
+| `field_mapping` | Copy / rename / set / remove fields, optionally `strict` |
+| `outbox` | Unwrap the transactional-outbox pattern into the domain event it carries |
 
 **`when` predicate fields:**
 
@@ -289,9 +322,10 @@ any other `wasm32-unknown-unknown` target.
 |---|---|---|
 | Drop / filter events | ✅ | ✅ |
 | Redact / rename fields | ✅ | ✅ |
+| Keyed pseudonymisation (HMAC) / field encryption (AES-GCM) | ✅ | ✅ |
+| Transactional-outbox unwrapping | ✅ | ✅ |
 | Arbitrary enrichment logic | ❌ | ✅ |
 | External data lookups (in-memory cache) | ❌ | ✅ |
-| Custom pseudonymisation | ❌ | ✅ |
 | Complex routing decisions | ❌ | ✅ |
 
 ```toml
@@ -316,7 +350,7 @@ transform(ptr: i32, len: i32) -> i64
 
 - Input: JSON event bytes at `ptr`/`len`
 - Output: `0` to drop the event, or `(out_ptr << 32) | out_len` to emit a modified event
-- See [Writing WASM transforms](transforms.md) for the full ABI contract and authoring guide
+- See [Writing WASM transforms](@/docs/transforms.md) for the full ABI contract and authoring guide
 
 **Transform error policy:**
 
@@ -328,7 +362,6 @@ transform_error_policy = "halt"   # halt (default) | skip
 - `halt` — pipeline stops on transform error (safe default; prevents silent data loss)
 - `skip` — logs the error, drops the event, continues
 
----
 
 ## 5. State backends
 
@@ -360,9 +393,8 @@ rustcdc migrate-state \
   --output migration-report.json
 ```
 
-See the [operations guide](operations.md#migrate-state) for the full procedure.
+See the [operations guide](@/docs/operations.md#6-migrate-state) for the full procedure.
 
----
 
 ## 6. Circuit breaker
 
@@ -399,14 +431,23 @@ exponential backoff and opens a circuit breaker:
 After `max_open_cycles` open cycles, the pipeline transitions to `Error` state.
 `/livez` returns 503, triggering a container restart in Kubernetes.
 
----
+**These parameters govern both halves of the pipeline.** Source poll failures and sink
+delivery failures share one policy and one breaker. That was not always true: sink
+failures used to be unconditionally terminal, so a few-second broker leader election
+became a process exit and a full replay from the last checkpoint while these settings
+looked like they applied.
 
-## See also
+A sink retry re-delivers the **same batch**. Under `at_least_once` that is duplication,
+which the contract permits; under `effectively_once` the aborted transaction discards
+the partial batch, so a `read_committed` consumer sees only the successful attempt.
 
-- [Getting started](getting-started.md) — 10-minute quickstart
-- [Configuration reference](configuration.md) — every TOML field
-- [Operations guide](operations.md) — circuit-breaker recovery, replay, performance
-- [Writing WASM transforms](transforms.md) — Rust + AssemblyScript examples, testing, deployment
-- [PostgreSQL connector](connectors/postgres.md)
-- [MySQL / MariaDB connector](connectors/mysql.md)
-- [SQL Server connector](connectors/sqlserver.md)
+Two classes of failure are deliberately **not** retried:
+
+* **Events over `runtime.max_event_bytes`.** The same event is the same size on every
+  attempt, so retrying is a loop that never makes progress and never reaches the events
+  behind it.
+* **Configuration errors.** Deterministic by nature.
+
+One gap worth knowing: an error surfacing from a sink **flush** rather than a send is
+currently treated as terminal even when it is transient. The router collapses per-sink
+flush errors into a single string, which loses the classification. Sends are unaffected.

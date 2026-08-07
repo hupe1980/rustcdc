@@ -5,7 +5,7 @@ pub(crate) static KAFKA_TOPIC_STATE_BOOTSTRAP_SEEDED_TOTAL: AtomicU64 = AtomicU6
 /// Total OpenDAL checkpoint / schema-history write failures since process start.
 /// Incremented in `opendal_kv` whenever an OpenDAL `op.write(...)` call returns
 /// an error, providing early visibility into remote state-backend degradation
-/// without waiting for the next alert scrape cycle (CR-007).
+/// without waiting for the next alert scrape cycle.
 pub(crate) static OPENDAL_STATE_WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn kafka_topic_state_corruption_detected_total() -> u64 {

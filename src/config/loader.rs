@@ -22,6 +22,11 @@ pub fn load(config_path: &Path) -> Result<AppConfig, ConfigError> {
 }
 
 pub fn load_and_migrate(config_path: &Path) -> Result<AppConfig, ConfigError> {
+    let file_only: serde_json::Value = Figment::new()
+        .merge(Toml::file(config_path))
+        .extract()
+        .map_err(|e| ConfigError::Load(Box::new(e)))?;
+
     let raw: serde_json::Value = Figment::new()
         .merge(Toml::file(config_path))
         .merge(Env::prefixed("RUSTCDC_").map(|key| {
@@ -45,12 +50,249 @@ pub fn load_and_migrate(config_path: &Path) -> Result<AppConfig, ConfigError> {
     // credentials in the file.
     resolve_env_secret_references(&mut migrated_raw, "")?;
 
-    let config: AppConfig = serde_json::from_value(migrated_raw).map_err(|e| {
+    reject_removed_delivery_contracts(&migrated_raw)?;
+    reject_relocated_http_dlq(&migrated_raw)?;
+
+    let mut config: AppConfig = serde_json::from_value(migrated_raw).map_err(|e| {
         ConfigError::InvalidState(format!("failed to deserialize migrated configuration: {e}"))
     })?;
 
+    // Typo detection runs against the *file*, never the env-merged document. The
+    // `RUSTCDC_` prefix is a shared namespace: `RUSTCDC_ADMIN_READ_TOKEN` and
+    // `RUSTCDC_LOG_LEVEL` are read by name elsewhere and are not config keys at all,
+    // so diffing the merged document would reject the project's own documented
+    // environment variables. A key an operator exports deliberately is also a much
+    // weaker typo signal than one they wrote into a config file.
+    if let Ok(mut file_raw) =
+        super::migrations::load_and_migrate_value(file_only, AppConfig::SUPPORTED_API_VERSION)
+    {
+        // Errors here were already reported by the merged pass above; a file that only
+        // parses with the env overlay applied simply skips the check.
+        if resolve_env_secret_references(&mut file_raw, "").is_ok() {
+            reject_unknown_config_keys(&file_raw, &config)?;
+        }
+    }
+
+    resolve_registry_refs(&mut config)?;
     validate(&config)?;
     Ok(config)
+}
+
+/// Reject configuration keys the schema does not recognise.
+///
+/// `#[serde(deny_unknown_fields)]` cannot be used here: the config leans on
+/// `#[serde(flatten)]` for `SourceConfig`, `NamedSinkConfig` and `RegistryBinding`, and
+/// the two attributes are mutually exclusive — serde cannot know which flattened target
+/// a key belongs to, so it accepts everything.
+///
+/// So the check runs after parsing instead: re-serialise the parsed `AppConfig` and diff
+/// its key paths against the raw document. Anything present in the input and absent from
+/// the round trip was silently dropped.
+///
+/// This matters more than typo ergonomics. A misspelled `table_include_list` does not
+/// fail — it captures **every table in the database**, which is a data-exposure change
+/// the operator never asked for. Verified against the real defect this found: a
+/// `snapshot_tables` key indented under `[state]` parsed cleanly and did nothing.
+fn reject_unknown_config_keys(
+    raw: &serde_json::Value,
+    parsed: &AppConfig,
+) -> Result<(), ConfigError> {
+    let round_tripped = serde_json::to_value(parsed).map_err(|e| {
+        ConfigError::InvalidState(format!("failed to re-serialise configuration: {e}"))
+    })?;
+
+    let mut unknown = Vec::new();
+    collect_unknown_keys(raw, &round_tripped, String::new(), &mut unknown);
+
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    Err(ConfigError::InvalidState(format!(
+        "unrecognised configuration key(s): {}. A key the schema does not know is \
+         silently ignored, so a typo does not disable a setting — it leaves the default \
+         in place. Check the spelling and the table it sits under against \
+         https://hupe1980.github.io/rustcdc-server/docs/configuration/.",
+        unknown.join(", ")
+    )))
+}
+
+/// Walk `raw` against the round-tripped document, recording paths that only exist in
+/// `raw`.
+///
+/// Arrays are compared element-wise by index; a length difference is not itself an
+/// error, because `skip_serializing_if` can legitimately shorten the output.
+fn collect_unknown_keys(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+    path: String,
+    unknown: &mut Vec<String>,
+) {
+    match (raw, known) {
+        (serde_json::Value::Object(raw_map), serde_json::Value::Object(known_map)) => {
+            for (key, raw_child) in raw_map {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match known_map.get(key) {
+                    Some(known_child) => {
+                        collect_unknown_keys(raw_child, known_child, child_path, unknown)
+                    }
+                    // A secret that resolved to a plain string, or a field the parsed
+                    // form represents differently, still round-trips under its own key —
+                    // so a genuinely missing key is a key the schema never had.
+                    None => unknown.push(child_path),
+                }
+            }
+        }
+        (serde_json::Value::Array(raw_items), serde_json::Value::Array(known_items)) => {
+            for (index, raw_item) in raw_items.iter().enumerate() {
+                if let Some(known_item) = known_items.get(index) {
+                    collect_unknown_keys(raw_item, known_item, format!("{path}[{index}]"), unknown);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reject `delivery_contract` values that were removed, naming the replacement.
+///
+/// Serde would otherwise report `unknown variant "at_most_once"` and list the valid
+/// ones, which tells an operator *what* is wrong but not *why* it went away or what to
+/// do — and the why matters here, because `at_most_once` used to be accepted and
+/// silently behaved as `at_least_once`.
+/// The HTTP sink's private dead-letter queue moved to the top-level `[dlq]` section.
+///
+/// Quarantining is a pipeline concern: every sink needs it, and whether an event is
+/// permanently undeliverable is decided by the error classification rather than by the
+/// transport. Leaving the old key to be silently ignored would have been the worst
+/// outcome — an operator who configured a DLQ would get none, and would not find out
+/// until the first poison event took the pipeline down.
+fn reject_relocated_http_dlq(raw: &serde_json::Value) -> Result<(), ConfigError> {
+    let uses_old_key = |sink: &serde_json::Value| -> bool {
+        sink.get("dlq_path").is_some() || sink.get("dlq_max_bytes").is_some()
+    };
+
+    let mut offenders = Vec::new();
+    if raw.get("sink").is_some_and(uses_old_key) {
+        offenders.push("sink".to_string());
+    }
+    if let Some(sinks) = raw.get("sinks").and_then(serde_json::Value::as_array) {
+        for (index, named) in sinks.iter().enumerate() {
+            if named.get("sink").is_some_and(uses_old_key) {
+                offenders.push(format!("sinks[{index}].sink"));
+            }
+        }
+    }
+
+    if offenders.is_empty() {
+        return Ok(());
+    }
+
+    Err(ConfigError::InvalidState(format!(
+        "`dlq_path` / `dlq_max_bytes` under {} were removed. The dead-letter queue is \
+         now a top-level `[dlq]` section that applies to every sink and can target a \
+         file or a Kafka topic:\n\n\
+         \x20 [dlq]\n\
+         \x20 enabled   = true\n\
+         \x20 type      = \"file\"            # or \"kafka\"\n\
+         \x20 path      = \"/var/lib/rustcdc/dlq.jsonl\"\n\
+         \x20 max_bytes = 134217728\n\n\
+         Note that it is now opt-in: quarantining advances the checkpoint past an event \
+         that was never delivered, which is data loss — recorded rather than silent, but \
+         loss. Without `[dlq]` the pipeline halts on a permanently undeliverable event.",
+        offenders.join(", ")
+    )))
+}
+
+fn reject_removed_delivery_contracts(raw: &serde_json::Value) -> Result<(), ConfigError> {
+    if raw
+        .get("delivery_contract")
+        .and_then(serde_json::Value::as_str)
+        == Some("at_most_once")
+    {
+        return Err(ConfigError::InvalidState(
+            "delivery_contract = \"at_most_once\" was removed. It was accepted but never \
+             implemented — the checkpoint still advanced after delivery, so deployments \
+             that selected it silently received at_least_once. It is not being fixed \
+             because delivery is batched: advancing the checkpoint before a batch skips \
+             an arbitrary suffix of that batch on failure, not a single event, so the \
+             loss boundary is unpredictable. Use delivery_contract = \"at_least_once\" \
+             and deduplicate in the sink on a key you control."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Inline every `registry_ref = "<name>"` from the shared `[registries.<name>]` pool.
+///
+/// The pool existed in the schema and was documented, but nothing read it — a codec
+/// could only carry its registry inline, so three sinks against one registry meant
+/// three copies of the URL and credentials, and the copies are what drift apart.
+/// Resolving here means everything downstream sees one shape.
+fn resolve_registry_refs(config: &mut AppConfig) -> Result<(), ConfigError> {
+    let pool = config.registries.clone();
+
+    for (name, registry) in &pool {
+        registry
+            .validate()
+            .map_err(|e| ConfigError::InvalidState(format!("registries.{name}: {e}")))?;
+    }
+
+    let mut sinks: Vec<(String, &mut SinkConfig)> = vec![("sink".to_string(), &mut config.sink)];
+    for named in &mut config.sinks {
+        sinks.push((format!("sinks.{}", named.name), &mut named.sink));
+    }
+
+    for (path, sink) in sinks {
+        resolve_sink_registry_refs(&path, sink, &pool)?;
+    }
+    Ok(())
+}
+
+fn resolve_sink_registry_refs(
+    path: &str,
+    sink: &mut SinkConfig,
+    pool: &std::collections::BTreeMap<String, super::registry::ConfluentRegistryConfig>,
+) -> Result<(), ConfigError> {
+    if let SinkConfig::Fan(fan) = sink {
+        for (i, child) in fan.sinks.iter_mut().enumerate() {
+            resolve_sink_registry_refs(&format!("{path}.sinks[{i}]"), child, pool)?;
+        }
+        return Ok(());
+    }
+
+    let codec = match sink {
+        SinkConfig::Kafka(kafka) => kafka.codec.as_mut(),
+        SinkConfig::Http(http) => http.codec.as_mut(),
+        _ => None,
+    };
+    let Some(binding) = codec.and_then(|codec| codec.binding_mut()) else {
+        return Ok(());
+    };
+    let Some(name) = binding.registry_ref.clone() else {
+        return Ok(());
+    };
+    let resolved = pool.get(&name).ok_or_else(|| {
+        let known = if pool.is_empty() {
+            "no [registries.*] entries are defined".to_string()
+        } else {
+            format!("known: {}", pool.keys().cloned().collect::<Vec<_>>().join(", "))
+        };
+        ConfigError::InvalidState(format!(
+            "{path}.codec.registry_ref = \"{name}\" does not match any [registries.*] entry ({known})"
+        ))
+    })?;
+    binding.registry = Some(resolved.clone());
+    // Clear the reference now that it is resolved, so the binding has exactly one
+    // canonical shape downstream. Leaving both set would trip the "declares both an
+    // inline table and registry_ref" check that runs right after this pass.
+    binding.registry_ref = None;
+    Ok(())
 }
 
 /// Is this JSON value an `{ env = "VAR" }` reference?
@@ -113,6 +355,36 @@ fn resolve_env_secret_references(
 /// rustcdc); bearer tokens and catalog credentials are long-lived and routinely
 /// pasted into version control, so those stay hard-rejected.
 fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), ConfigError> {
+    // The source password is the credential with the widest blast radius in the file —
+    // it grants replication-level read on the whole database. Sink tokens, Iceberg
+    // credentials and masking keys already had to be deferred references; the source
+    // password did not, which is the wrong way round.
+    if let Some(source) = raw.get("source") {
+        // The driver table is either flattened into `[source]` or nested under
+        // `[source.<driver>]`; check both shapes so neither escapes the rule.
+        let candidates = std::iter::once(source).chain(
+            source
+                .as_object()
+                .into_iter()
+                .flat_map(|obj| obj.values())
+                .filter(|value| value.is_object()),
+        );
+        for candidate in candidates {
+            if candidate
+                .get("password")
+                .is_some_and(serde_json::Value::is_string)
+            {
+                return Err(ConfigError::InvalidState(
+                    "source password must use a deferred secret reference (for example \
+                     { env = \"POSTGRES_PASSWORD\" }). A replication credential written \
+                     as a literal is readable by anyone who can read the config file, \
+                     and it grants read access to every captured table."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     let mut sink_values: Vec<&serde_json::Value> = Vec::new();
     if let Some(sink) = raw.get("sink") {
         sink_values.push(sink);
@@ -145,6 +417,51 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
                     if value.is_string() {
                         return Err(ConfigError::InvalidState(format!(
                             "sink.iceberg.catalog.rest.{field} must use deferred secret references (for example {{ env = \"VAR\" }})"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // Masking keys are the credential whose leak is least recoverable: an HMAC key
+    // published in the config file makes every pseudonymised value re-identifiable
+    // retroactively, and an AES key decrypts everything already written downstream.
+    if let Some(rules) = raw
+        .get("pipeline")
+        .and_then(|p| p.get("transforms"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for rule in rules {
+            let Some(actions) = rule.get("actions").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for action in actions {
+                if action.get("type").and_then(serde_json::Value::as_str) != Some("mask") {
+                    continue;
+                }
+                let mask_rules = action
+                    .get("rules")
+                    .and_then(serde_json::Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .map(|(path, rule)| (path.as_str(), rule))
+                    .chain(action.get("default_rule").map(|r| ("", r)));
+                for (path, mask_rule) in mask_rules {
+                    if mask_rule
+                        .get("key")
+                        .is_some_and(serde_json::Value::is_string)
+                    {
+                        let where_ = if path.is_empty() {
+                            "default_rule".to_string()
+                        } else {
+                            format!("rules.\"{path}\"")
+                        };
+                        return Err(ConfigError::InvalidState(format!(
+                            "pipeline.transforms[..].actions[..] mask {where_}.key must use a \
+                             deferred secret reference (for example {{ env = \"VAR\" }}); a key \
+                             written into the config file makes every value it masked \
+                             re-identifiable for as long as that file exists"
                         )));
                     }
                 }
@@ -594,34 +911,6 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
                 "sink.http.batch_retry_time_budget_ms must be > 0".to_string(),
             ));
         }
-        if http.dlq_max_bytes == 0 {
-            return Err(ConfigError::InvalidState(
-                "sink.http.dlq_max_bytes must be > 0".to_string(),
-            ));
-        }
-        if let Some(dlq_path) = &http.dlq_path {
-            if dlq_path.as_os_str().is_empty() {
-                return Err(ConfigError::InvalidState(
-                    "sink.http.dlq_path must not be empty when configured".to_string(),
-                ));
-            }
-
-            if dlq_path.exists() && !dlq_path.is_file() {
-                return Err(ConfigError::InvalidState(format!(
-                    "sink.http.dlq_path exists but is not a file: {}",
-                    dlq_path.display()
-                )));
-            }
-
-            if let Some(parent) = dlq_path.parent() {
-                if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                    return Err(ConfigError::InvalidState(format!(
-                        "sink.http.dlq_path parent directory does not exist: {}",
-                        parent.display()
-                    )));
-                }
-            }
-        }
         if let Some(token) = &http.bearer_token {
             // Plaintext literals in the config file are rejected earlier, on the
             // raw document (`enforce_deferred_secret_literals`) — by this point
@@ -649,6 +938,14 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
     if let SinkConfig::Fan(fan) = &config.sink {
         validate_fan_sink_config(fan)?;
+    }
+
+    // Codec configuration was never validated: a codec naming a plaintext registry URL,
+    // or a registry-backed codec with no registry at all, only failed when the sink was
+    // built — after the source had already connected.
+    validate_sink_codec("sink", &config.sink)?;
+    for named in &config.sinks {
+        validate_sink_codec(&format!("sinks.{}", named.name), &named.sink)?;
     }
 
     validate_delivery_contract(config)?;
@@ -695,6 +992,23 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         .validate()
         .map_err(ConfigError::InvalidState)?;
 
+    config
+        .incremental_snapshot
+        .validate()
+        .map_err(ConfigError::InvalidState)?;
+
+    // Both bootstrap the same tables by different means. Accepting both would read
+    // every listed table twice — once blocking, once through the watermark window —
+    // and the duplicate would look like genuine change data downstream.
+    if config.incremental_snapshot.is_enabled() && !config.snapshot_tables.is_empty() {
+        return Err(ConfigError::InvalidState(
+            "snapshot_tables and incremental_snapshot.tables are two bootstrapping paths \
+             for the same job; set exactly one. incremental_snapshot does not block the \
+             stream and resumes from its persisted chunk cursor after a restart."
+                .to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -740,7 +1054,69 @@ fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
         )));
     }
 
+    if config.delivery_contract == DeliveryContract::EffectivelyOnce {
+        validate_effectively_once_state_backend(config)?;
+    }
+
     Ok(())
+}
+
+/// `effectively_once` is only exactly-once end to end when the checkpoint is written
+/// inside the sink's Kafka transaction, and that is only possible when the checkpoint
+/// lives in Kafka on the same cluster.
+///
+/// Rejecting the alternatives is the point. Any other state backend is a second durability
+/// domain, so the batch and the position that describes it commit separately and a crash
+/// between them replays the batch — the exact window this contract is chosen to avoid. The
+/// combination used to be accepted and the residual window documented; requiring the
+/// backend instead turns a caveat an operator has to read into a configuration they cannot
+/// express.
+fn validate_effectively_once_state_backend(config: &AppConfig) -> Result<(), ConfigError> {
+    let SinkConfig::Kafka(sink) = &config.sink else {
+        // A non-Kafka sink cannot satisfy the contract at all; the capability check above
+        // has already rejected it.
+        return Ok(());
+    };
+
+    let super::state::StateBackend::KafkaTopic(state) = &config.state.offset.backend else {
+        return Err(ConfigError::InvalidState(format!(
+            "delivery_contract='effectively_once' requires state.offset.backend=\"kafka_topic\", \
+             but it is \"{}\". End-to-end exactly-once needs the checkpoint written inside the \
+             sink's Kafka transaction, so the checkpoint has to live in Kafka; any other backend \
+             commits the position separately from the data and a crash between the two replays \
+             the batch. Either move the checkpoint to a compacted Kafka topic on the same \
+             cluster, or set delivery_contract=\"at_least_once\".",
+            state_backend_label(&config.state.offset.backend)
+        )));
+    };
+
+    // A Kafka transaction cannot span two clusters. Compared as normalised sets because
+    // broker lists are routinely written in a different order or with different spacing
+    // for the same cluster, and rejecting that would be a false alarm.
+    let sink_brokers: std::collections::BTreeSet<String> =
+        sink.normalized_brokers().into_iter().collect();
+    let state_brokers: std::collections::BTreeSet<String> =
+        state.normalized_brokers().into_iter().collect();
+
+    if sink_brokers != state_brokers {
+        return Err(ConfigError::InvalidState(format!(
+            "delivery_contract='effectively_once' requires the sink and the checkpoint topic to \
+             be on the same Kafka cluster, because one transaction cannot span two. \
+             sink.kafka.brokers is '{}' and state.offset.backend.kafka_topic.brokers is '{}'.",
+            sink.brokers, state.brokers
+        )));
+    }
+
+    Ok(())
+}
+
+fn state_backend_label(backend: &super::state::StateBackend) -> &'static str {
+    match backend {
+        super::state::StateBackend::LocalFs => "local_fs",
+        super::state::StateBackend::KafkaTopic(_) => "kafka_topic",
+        super::state::StateBackend::Redis(_) => "redis",
+        super::state::StateBackend::Postgresql(_) => "postgresql",
+    }
 }
 
 fn sink_name(sink: &SinkConfig) -> &'static str {
@@ -778,6 +1154,31 @@ fn sink_transactional_checkpoint_barrier_capable(sink: &SinkConfig) -> bool {
     }
 }
 
+/// Validate the codec of a sink (and, recursively, of every fan-out child).
+fn validate_sink_codec(path: &str, sink: &SinkConfig) -> Result<(), ConfigError> {
+    match sink {
+        SinkConfig::Fan(fan) => {
+            for (i, child) in fan.sinks.iter().enumerate() {
+                validate_sink_codec(&format!("{path}.sinks[{i}]"), child)?;
+            }
+            Ok(())
+        }
+        _ => {
+            let codec = match sink {
+                SinkConfig::Kafka(kafka) => kafka.codec.as_ref(),
+                SinkConfig::Http(http) => http.codec.as_ref(),
+                _ => None,
+            };
+            match codec {
+                Some(codec) => codec
+                    .validate()
+                    .map_err(|e| ConfigError::InvalidState(format!("{path}.codec: {e}"))),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
 fn validate_fan_sink_config(fan: &super::schema::FanSinkConfig) -> Result<(), ConfigError> {
     if fan.sinks.is_empty() {
         return Err(ConfigError::InvalidState(
@@ -799,6 +1200,20 @@ pub(crate) fn validate_http_sink_url_policy(url: &str) -> Result<(), ConfigError
         ConfigError::InvalidState(format!("sink.http.url must be a valid URL: {e}"))
     })?;
 
+    // A credential in the URL is readable by anyone holding a *read*-scoped admin
+    // token: `/status` returns the config snapshot, and a URL is not a `SecretString`,
+    // so no amount of redaction downstream is guaranteed to catch it. Rejecting it here
+    // means the credential never enters the process in a form that can leak.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ConfigError::InvalidState(
+            "sink.http.url must not embed credentials. A userinfo component travels \
+             into every config snapshot, log line and diagnostic that touches the URL, \
+             and it is readable by any holder of a read-scoped admin token. Use \
+             [sink.http.headers] with an `authorization` entry, or `bearer_token`."
+                .to_string(),
+        ));
+    }
+
     match parsed.scheme() {
         "https" => Ok(()),
         "http" => {
@@ -819,3180 +1234,5 @@ pub(crate) fn validate_http_sink_url_policy(url: &str) -> Result<(), ConfigError
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::{Path, PathBuf};
-
-    use super::{load, load_and_migrate};
-    use crate::config::schema::AppConfig;
-    use crate::token_manifest_policy::{
-        canonical_signing_payload, TokenManifestFile, TokenManifestSignature, TokenManifestToken,
-        TokenManifestUnsigned,
-    };
-    use ed25519_dalek::{Signer, SigningKey};
-
-    fn write_signed_manifest(path: &Path, tokens: Vec<TokenManifestToken>) -> String {
-        let signing_key = SigningKey::from_bytes(&[0x11; 32]);
-        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
-
-        let unsigned = TokenManifestUnsigned {
-            tokens: tokens.clone(),
-        };
-        let unsigned_bytes =
-            canonical_signing_payload(&unsigned).expect("serialize unsigned manifest");
-        let signature = signing_key.sign(&unsigned_bytes);
-
-        let manifest = TokenManifestFile {
-            tokens,
-            signature: TokenManifestSignature {
-                algorithm: "ed25519".to_string(),
-                public_key_hex: public_key_hex.clone(),
-                signature_hex: hex::encode(signature.to_bytes()),
-            },
-        };
-
-        std::fs::write(
-            path,
-            serde_json::to_vec_pretty(&manifest).expect("serialize signed manifest"),
-        )
-        .expect("write manifest");
-
-        public_key_hex
-    }
-
-    #[test]
-    fn loads_valid_config_without_admin_or_observability_sections() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_dir = dir.path().join("state");
-        let config_path = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-delivery_contract = "at_least_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "kafka"
-brokers = "localhost:9092"
-topic = "cdc-events"
-
-[state]
-dir = "{}"
-"#,
-                state_dir.display()
-            ),
-        )
-        .expect("write config");
-
-        let cfg = load(&config_path).expect("config should load");
-        assert_eq!(cfg.admin.bind, "127.0.0.1:8080");
-        assert_eq!(cfg.observability.service_name, "rustcdc-server");
-        assert!(cfg.observability.otlp_endpoint.is_none());
-    }
-
-    #[test]
-    fn rejects_unsupported_older_api_version() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha0"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("unsupported older api version should fail closed");
-        assert!(
-            err.to_string()
-                .contains("api_version must be \"v1\", got \"v1alpha0\""),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_api_version_when_no_migration_path_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v9"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("unknown api version should fail closed");
-        assert!(
-            err.to_string()
-                .contains("api_version must be \"v1\", got \"v9\""),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn load_and_migrate_uses_supported_target_only() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let cfg = load_and_migrate(&config_path)
-            .expect("load_and_migrate should succeed for supported version");
-        assert_eq!(cfg.api_version, AppConfig::SUPPORTED_API_VERSION);
-    }
-
-    #[test]
-    fn accepts_non_loopback_plaintext_postgres_source_transport() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "postgres.internal"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("non-loopback plaintext should be allowed for DX");
-    }
-
-    #[test]
-    fn accepts_non_loopback_postgres_source_with_tls_transport() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "postgres.internal"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "tls"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("tls transport should pass for non-loopback source host");
-    }
-
-    #[test]
-    fn accepts_mysql_source_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.mysql]
-host = "localhost"
-port = 3306
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-server_id = 101
-gtid_mode_enabled = false
-binlog_format_check = true
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.mysql.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("mysql source should be accepted");
-    }
-
-    #[test]
-    fn accepts_mariadb_source_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.mariadb]
-host = "localhost"
-port = 3306
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-server_id = 202
-gtid_mode_enabled = false
-binlog_format_check = true
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.mariadb.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("mariadb source should be accepted");
-    }
-
-    #[test]
-    fn accepts_mssql_source_profile_alias() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.mssql]
-host = "localhost"
-port = 1433
-user = "sa"
-password = "secret"
-database = "mydb"
-instance_name = "SQLEXPRESS"
-conn_timeout_secs = 10
-cdc_enabled = true
-cdc_schema = "cdc"
-prereq_pool_size = 2
-stream_poll_interval_ms = 1000
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.mssql.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("mssql alias source should be accepted");
-    }
-
-    #[test]
-    fn rejects_multiple_source_profiles() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "at_least_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[source.mysql]
-host = "mysql.internal"
-port = 3306
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("multiple sources should fail closed");
-        assert!(
-            err.to_string()
-                .contains("exactly one source block must be configured"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_effectively_once_contract_for_non_idempotent_sink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "effectively_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected delivery contract rejection");
-        assert!(
-            err.to_string().contains(
-                "delivery_contract='effectively_once' is incompatible with sink.type='stdout'"
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_effectively_once_contract_for_non_transactional_kafka_sink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "effectively_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "kafka"
-brokers = "localhost:9092"
-topic = "cdc-events"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path)
-            .expect_err("expected effectively_once contract rejection without transactional mode");
-        assert!(
-            err.to_string().contains(
-                "delivery_contract='effectively_once' is incompatible with sink.type='kafka': missing idempotent delivery and transactional checkpoint barrier coupling"
-            ) || err.to_string().contains(
-                "delivery_contract='effectively_once' is incompatible with sink.type='kafka': missing transactional checkpoint barrier coupling"
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_effectively_once_contract_with_transactional_kafka_sink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "effectively_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "kafka"
-brokers = "localhost:9092"
-topic = "cdc-events"
-delivery_mode = "transactional"
-transactional_id = "cdc-eos-1"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("transactional kafka sink should satisfy effectively_once");
-    }
-
-    #[test]
-    fn rejects_transactional_kafka_sink_when_delivery_contract_is_at_least_once() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "at_least_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "kafka"
-brokers = "localhost:9092"
-topic = "cdc-events"
-delivery_mode = "transactional"
-transactional_id = "cdc-eos-1"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path)
-            .expect_err("expected delivery_contract mismatch for transactional kafka mode");
-        assert!(
-            err.to_string().contains(
-                "delivery_contract must be \"effectively_once\" when sink.kafka.delivery_mode=\"transactional\""
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_source_kind_when_matching_configured_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source]
-kind = "postgres"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("matching source.kind should load");
-    }
-
-    #[test]
-    fn rejects_source_kind_when_not_matching_configured_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source]
-kind = "postgres"
-
-[source.mysql]
-host = "mysql.internal"
-port = 3306
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("mismatched source.kind should fail");
-        assert!(
-            err.to_string().contains("missing field")
-                || err.to_string().contains("failed to deserialize"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_iceberg_upsert_mode() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let table_path = dir.path().join("iceberg-table");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-    api_version = "v1alpha1"
-
-    [source.postgres]
-    host = "localhost"
-    port = 5432
-    user = "cdc_user"
-    password = "secret"
-    database = "mydb"
-    replication_slot_name = "cdc_slot"
-    publication_name = "cdc_pub"
-    conn_timeout_secs = 10
-    stream_poll_interval_ms = 100
-    max_events_per_poll = 1000
-    table_include_list = []
-    table_exclude_list = []
-
-    [source.postgres.transport]
-    mode = "plaintext"
-
-    [sink]
-    type = "iceberg"
-    table_path = "{}"
-    write_mode = "upsert"
-
-    [sink.catalog.rest]
-    uri = "http://127.0.0.1:8181"
-    warehouse = "file:///tmp/cdc-iceberg-warehouse"
-
-    [state]
-    dir = "/tmp/cdc-state"
-    "#,
-                table_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid iceberg sink config");
-        assert!(err.to_string().contains("unknown variant"));
-    }
-
-    #[test]
-    fn rejects_wrong_api_version() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v9"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid api version error");
-        assert!(err.to_string().contains("v9"));
-    }
-
-    #[test]
-    fn rejects_non_loopback_admin_without_tls() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "at_least_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-bind = "0.0.0.0:8080"
-read_token_env = "RUSTCDC_ADMIN_READ_TOKEN"
-write_token_env = "RUSTCDC_ADMIN_WRITE_TOKEN"
-notification_log_file = "/tmp/cdc-test-notifications.jsonl"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected non-loopback TLS requirement failure");
-        assert!(err.to_string().contains("admin.tls is required"));
-    }
-
-    #[test]
-    fn rejects_empty_admin_audit_log_file_when_configured() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-audit_log_file = ""
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected empty audit log file rejection");
-        assert!(
-            err.to_string()
-                .contains("admin.audit_log_file must not be empty when configured"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_admin_audit_log_file_when_parent_directory_is_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let missing_parent = dir.path().join("missing");
-        let audit_log_file = missing_parent.join("admin-audit.jsonl");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-audit_log_file = "{}"
-"#,
-                audit_log_file.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected missing audit log parent rejection");
-        assert!(
-            err.to_string()
-                .contains("admin.audit_log_file parent directory does not exist"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_admin_audit_log_file_when_parent_directory_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let log_dir = dir.path().join("logs");
-        let audit_log_file = log_dir.join("admin-audit.jsonl");
-        std::fs::create_dir_all(&log_dir).expect("create log directory");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-audit_log_file = "{}"
-"#,
-                audit_log_file.display()
-            ),
-        )
-        .expect("write config");
-
-        load(&config_path).expect("expected valid audit log file config");
-    }
-
-    #[test]
-    fn rejects_empty_admin_notification_log_file_when_configured() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-notification_log_file = ""
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected empty notification log file rejection");
-        assert!(
-            err.to_string()
-                .contains("admin.notification_log_file must not be empty when configured"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_admin_notification_log_file_when_parent_directory_is_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let missing_parent = dir.path().join("missing");
-        let notification_log_file = missing_parent.join("admin-notifications.jsonl");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-notification_log_file = "{}"
-"#,
-                notification_log_file.display()
-            ),
-        )
-        .expect("write config");
-
-        let err =
-            load(&config_path).expect_err("expected missing notification log parent rejection");
-        assert!(
-            err.to_string()
-                .contains("admin.notification_log_file parent directory does not exist"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_admin_notification_log_file_when_parent_directory_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let log_dir = dir.path().join("logs");
-        let notification_log_file = log_dir.join("admin-notifications.jsonl");
-        std::fs::create_dir_all(&log_dir).expect("create log directory");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-notification_log_file = "{}"
-"#,
-                notification_log_file.display()
-            ),
-        )
-        .expect("write config");
-
-        load(&config_path).expect("expected valid notification log file config");
-    }
-
-    #[test]
-    fn rejects_admin_signal_ingress_file_when_parent_directory_is_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let missing_parent = dir.path().join("missing");
-        let signal_ingress_file = missing_parent.join("admin-signal-ingress.jsonl");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-signal_ingress_file = "{}"
-"#,
-                signal_ingress_file.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path)
-            .expect_err("expected missing signal ingress parent directory rejection");
-        assert!(
-            err.to_string()
-                .contains("admin.signal_ingress_file parent directory does not exist"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_admin_signal_ingress_file_when_parent_directory_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let ingress_dir = dir.path().join("ingress");
-        let signal_ingress_file = ingress_dir.join("admin-signal-ingress.jsonl");
-        std::fs::create_dir_all(&ingress_dir).expect("create ingress directory");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-signal_ingress_file = "{}"
-"#,
-                signal_ingress_file.display()
-            ),
-        )
-        .expect("write config");
-
-        load(&config_path).expect("expected valid signal ingress file config");
-    }
-
-    #[test]
-    fn rejects_admin_notification_kafka_with_empty_brokers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin.notification_kafka]
-brokers = ""
-topic = "cdc-admin-notifications"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid admin notification kafka config");
-        assert!(
-            err.to_string()
-                .contains("admin.notification_kafka.brokers must not be empty"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_admin_notification_kafka_with_valid_plaintext_config() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin.notification_kafka]
-brokers = "kafka-1:9092"
-topic = "cdc-admin-notifications"
-client_id = "cdc-admin-test"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("expected valid admin notification kafka config");
-    }
-
-    #[test]
-    fn rejects_admin_signal_ingress_kafka_with_empty_brokers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin.signal_ingress_kafka]
-brokers = ""
-topic = "cdc-admin-signals"
-group_id = "cdc-admin-signals-group"
-"#,
-        )
-        .expect("write config");
-
-        let err =
-            load(&config_path).expect_err("expected invalid admin signal ingress kafka config");
-        assert!(
-            err.to_string()
-                .contains("admin.signal_ingress_kafka.brokers must not be empty"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_admin_signal_ingress_kafka_with_valid_plaintext_config() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin.signal_ingress_kafka]
-brokers = "localhost:9092"
-topic = "cdc-admin-signals"
-group_id = "cdc-admin-signals-group"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("expected valid admin signal ingress kafka config");
-    }
-
-    #[test]
-    fn rejects_write_capable_admin_without_non_admin_notification_channels() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-write_token_env = "RUSTCDC_ADMIN_WRITE_TOKEN"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path)
-            .expect_err("expected rejection for write-capable admin without notification channels");
-        assert!(
-            err.to_string().contains(
-                "admin.notification_log_file or admin.notification_kafka is required when write-capable admin signaling is enabled"
-            ),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn accepts_write_capable_admin_with_non_admin_notification_log_channel() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let log_dir = dir.path().join("logs");
-        let notification_log_file = log_dir.join("admin-notifications.jsonl");
-        std::fs::create_dir_all(&log_dir).expect("create log directory");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-write_token_env = "RUSTCDC_ADMIN_WRITE_TOKEN"
-notification_log_file = "{}"
-"#,
-                notification_log_file.display()
-            ),
-        )
-        .expect("write config");
-
-        load(&config_path).expect("expected valid write-capable admin with notification channel");
-    }
-
-    #[test]
-    fn rejects_admin_tls_mtls_without_client_ca_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let cert_path = dir.path().join("admin-cert.pem");
-        let key_path = dir.path().join("admin-key.pem");
-
-        std::fs::write(&cert_path, "dummy cert").expect("write cert");
-        std::fs::write(&key_path, "dummy key").expect("write key");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-bind = "127.0.0.1:8080"
-
-[admin.tls]
-cert_file = "{}"
-key_file = "{}"
-require_client_cert = true
-"#,
-                cert_path.display(),
-                key_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected mTLS client CA requirement failure");
-        assert!(err
-            .to_string()
-            .contains("admin.tls.client_ca_file is required"));
-    }
-
-    #[test]
-    fn rejects_invalid_admin_token_manifest_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let manifest_path = dir.path().join("admin-tokens.json");
-
-        let trusted_public_key_hex = write_signed_manifest(
-            &manifest_path,
-            vec![TokenManifestToken {
-                id: "ops".to_string(),
-                token_sha256_hex: "bad".to_string(),
-                scopes: vec!["read".to_string()],
-                not_before: None,
-                expires_at: None,
-                revoked: false,
-            }],
-        );
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-token_manifest_file = "{}"
-token_manifest_trusted_public_keys_hex = ["{}"]
-token_manifest_max_staleness_ms = 60000
-notification_log_file = "/tmp/cdc-test-notifications.jsonl"
-"#,
-                manifest_path.display(),
-                trusted_public_key_hex
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid manifest hash failure");
-        assert!(err.to_string().contains("token_sha256_hex"));
-    }
-
-    #[test]
-    fn rejects_empty_admin_token_manifest_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let manifest_path = dir.path().join("admin-tokens.json");
-
-        let trusted_public_key_hex = write_signed_manifest(&manifest_path, vec![]);
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-token_manifest_file = "{}"
-token_manifest_trusted_public_keys_hex = ["{}"]
-token_manifest_max_staleness_ms = 60000
-notification_log_file = "/tmp/cdc-test-notifications.jsonl"
-"#,
-                manifest_path.display(),
-                trusted_public_key_hex
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected empty manifest rejection");
-        assert!(err
-            .to_string()
-            .contains("must contain at least one token entry"));
-    }
-
-    #[test]
-    fn rejects_admin_token_manifest_without_trusted_public_keys() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let manifest_path = dir.path().join("admin-tokens.json");
-
-        write_signed_manifest(
-            &manifest_path,
-            vec![TokenManifestToken {
-                id: "ops".to_string(),
-                token_sha256_hex:
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                scopes: vec!["read".to_string()],
-                not_before: None,
-                expires_at: None,
-                revoked: false,
-            }],
-        );
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-token_manifest_file = "{}"
-token_manifest_max_staleness_ms = 60000
-notification_log_file = "/tmp/cdc-test-notifications.jsonl"
-"#,
-                manifest_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected trusted key requirement failure");
-        assert!(err
-            .to_string()
-            .contains("token_manifest_trusted_public_keys_hex"));
-    }
-
-    #[test]
-    fn rejects_non_loopback_admin_without_write_token_env() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let cert_path = dir.path().join("admin-cert.pem");
-        let key_path = dir.path().join("admin-key.pem");
-
-        std::fs::write(&cert_path, "dummy cert").expect("write cert");
-        std::fs::write(&key_path, "dummy key").expect("write key");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-bind = "0.0.0.0:8080"
-read_token_env = "RUSTCDC_ADMIN_READ_TOKEN"
-
-[admin.tls]
-cert_file = "{}"
-key_file = "{}"
-"#,
-                cert_path.display(),
-                key_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected write token requirement failure");
-        assert!(err.to_string().contains("admin.write_token_env"));
-    }
-
-    #[test]
-    fn accepts_non_loopback_admin_with_token_manifest_and_tls() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let manifest_path = dir.path().join("admin-tokens.json");
-        let cert_path = dir.path().join("admin-cert.pem");
-        let key_path = dir.path().join("admin-key.pem");
-
-        let trusted_public_key_hex = write_signed_manifest(
-            &manifest_path,
-            vec![TokenManifestToken {
-                id: "ops-read".to_string(),
-                token_sha256_hex:
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                scopes: vec!["read".to_string(), "write".to_string()],
-                not_before: None,
-                expires_at: Some(
-                    chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
-                        .expect("parse expires_at")
-                        .with_timezone(&chrono::Utc),
-                ),
-                revoked: false,
-            }],
-        );
-        std::fs::write(&cert_path, "dummy cert").expect("write cert");
-        std::fs::write(&key_path, "dummy key").expect("write key");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-bind = "0.0.0.0:8080"
-token_manifest_file = "{}"
-token_manifest_trusted_public_keys_hex = ["{}"]
-token_manifest_max_staleness_ms = 60000
-notification_log_file = "/tmp/cdc-test-notifications.jsonl"
-
-[admin.tls]
-cert_file = "{}"
-key_file = "{}"
-"#,
-                manifest_path.display(),
-                trusted_public_key_hex,
-                cert_path.display(),
-                key_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let cfg = load(&config_path).expect("expected config to load");
-        assert_eq!(cfg.admin.bind, "0.0.0.0:8080");
-        assert_eq!(cfg.admin.token_manifest_file, Some(manifest_path));
-    }
-
-    #[test]
-    fn rejects_zero_admin_token_manifest_refresh_interval() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "effectively_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-token_manifest_refresh_ms = 0
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid manifest refresh interval");
-        assert!(err.to_string().contains("token_manifest_refresh_ms"));
-    }
-
-    #[test]
-    fn rejects_admin_token_manifest_without_max_staleness_policy() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let manifest_path = dir.path().join("admin-tokens.json");
-
-        let trusted_public_key_hex = write_signed_manifest(
-            &manifest_path,
-            vec![TokenManifestToken {
-                id: "ops".to_string(),
-                token_sha256_hex:
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                scopes: vec!["read".to_string(), "write".to_string()],
-                not_before: None,
-                expires_at: None,
-                revoked: false,
-            }],
-        );
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-token_manifest_file = "{}"
-token_manifest_trusted_public_keys_hex = ["{}"]
-notification_log_file = "/tmp/cdc-test-notifications.jsonl"
-"#,
-                manifest_path.display(),
-                trusted_public_key_hex
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path)
-            .expect_err("expected staleness policy requirement for manifest-backed auth");
-        assert!(err
-            .to_string()
-            .contains("token_manifest_max_staleness_ms is required"));
-    }
-
-    #[test]
-    fn rejects_admin_manifest_max_staleness_without_manifest_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "effectively_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-token_manifest_max_staleness_ms = 1000
-"#,
-        )
-        .expect("write config");
-
-        let err =
-            load(&config_path).expect_err("expected staleness policy to require manifest file");
-        assert!(err
-            .to_string()
-            .contains("token_manifest_max_staleness_ms requires admin.token_manifest_file"));
-    }
-
-    #[test]
-    fn accepts_loopback_admin_with_unauthenticated_probe_mode() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-probe_auth_mode = "allow_unauthenticated_loopback"
-"#,
-        )
-        .expect("write config");
-
-        let cfg = load(&config_path).expect("expected config to load");
-        assert_eq!(cfg.admin.bind, "127.0.0.1:8080");
-    }
-
-    #[test]
-    fn rejects_non_loopback_admin_with_unauthenticated_probe_mode() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let cert_path = dir.path().join("admin-cert.pem");
-        let key_path = dir.path().join("admin-key.pem");
-
-        std::fs::write(&cert_path, "dummy cert").expect("write cert");
-        std::fs::write(&key_path, "dummy key").expect("write key");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-bind = "0.0.0.0:8080"
-read_token_env = "RUSTCDC_ADMIN_READ_TOKEN"
-write_token_env = "RUSTCDC_ADMIN_WRITE_TOKEN"
-probe_auth_mode = "allow_unauthenticated_loopback"
-
-[admin.tls]
-cert_file = "{}"
-key_file = "{}"
-"#,
-                cert_path.display(),
-                key_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let err =
-            load(&config_path).expect_err("expected loopback-only probe auth mode enforcement");
-        assert!(err.to_string().contains(
-            "admin.probe_auth_mode=allow_unauthenticated_loopback requires loopback admin.bind"
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_admin_rate_limit_configuration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-metrics_rate_limit_rps = 10
-metrics_rate_limit_burst = 5
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected admin rate-limit validation failure");
-        assert!(err
-            .to_string()
-            .contains("admin.metrics_rate_limit_burst must be >= admin.metrics_rate_limit_rps"));
-    }
-
-    #[test]
-    fn rejects_invalid_admin_trusted_proxy_ip() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[admin]
-trusted_proxy_ips = ["not-an-ip"]
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid trusted proxy ip");
-        assert!(err.to_string().contains("admin.trusted_proxy_ips"));
-    }
-
-    #[test]
-    fn rejects_http_sink_with_empty_url() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = ""
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid http sink URL");
-        assert!(err.to_string().contains("sink.http.url"));
-    }
-
-    #[test]
-    fn rejects_http_sink_with_invalid_backoff_range() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = "http://localhost:8080/events"
-backoff_initial_ms = 5000
-backoff_max_ms = 100
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid backoff range");
-        assert!(err.to_string().contains("backoff_initial_ms"));
-    }
-
-    #[test]
-    fn rejects_runtime_zero_max_event_bytes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[runtime]
-max_event_bytes = 0
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid runtime max_event_bytes");
-        assert!(err.to_string().contains("runtime.max_event_bytes"));
-    }
-
-    #[test]
-    fn rejects_runtime_flush_interval_above_max_buffer_size() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[runtime]
-max_buffer_size = 50
-sink_flush_interval_events = 100
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid runtime flush interval");
-        assert!(err
-            .to_string()
-            .contains("runtime.sink_flush_interval_events must be <= runtime.max_buffer_size"));
-    }
-
-    #[test]
-    fn rejects_kafka_sink_with_empty_brokers_or_topic() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "kafka"
-brokers = " , "
-topic = ""
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid kafka sink config");
-        assert!(
-            err.to_string().contains("sink.kafka.brokers")
-                || err.to_string().contains("sink.kafka.topic")
-        );
-    }
-
-    #[test]
-    fn rejects_kafka_topic_state_backend_with_invalid_thresholds() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[state.backend]
-kafka_topic = { brokers = "kafka-1:9092", topic = "cdc-state", min_replication_factor = 1, min_insync_replicas = 2, durability_profile = "development" }
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid kafka topic state config");
-        assert!(err.to_string().contains("min_insync_replicas"));
-    }
-
-    #[test]
-    fn rejects_avro_sink_with_empty_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "avro"
-path = ""
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid avro sink config");
-        assert!(
-            err.to_string().contains("avro") && err.to_string().contains("no longer supported"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_wasm_runtime_without_module_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[transform_runtime]
-mode = "wasm"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid wasm runtime config");
-        assert!(err
-            .to_string()
-            .contains("transform_runtime.wasm.module_path"));
-    }
-
-    #[test]
-    fn rejects_transform_rule_with_empty_actions() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-
-[[transforms]]
-name = "bad"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid transform config");
-        assert!(err.to_string().contains("at least one action"));
-    }
-
-    #[test]
-    fn rejects_kafka_tls_with_verify_peer_disabled_and_missing_ca_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let missing_ca = dir.path().join("missing-ca.pem");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "kafka"
-brokers = "localhost:9092"
-topic = "cdc-events"
-
-[sink.security]
-protocol = "tls"
-verify_peer = false
-ssl_ca_location = "{}"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-                missing_ca.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid kafka tls config");
-        let message = err.to_string();
-        assert!(
-            message.contains("verify_peer") || message.contains("ssl_ca_location"),
-            "unexpected error: {message}"
-        );
-    }
-
-    #[test]
-    fn accepts_transactional_kafka_sink_mode() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-delivery_contract = "effectively_once"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "kafka"
-brokers = "localhost:9092"
-topic = "cdc-events"
-delivery_mode = "transactional"
-transactional_id = "cdc-eos-1"
-
-[state]
-dir = "/tmp/cdc-state"
-backend = "local_fs"
-"#,
-        )
-        .expect("write config");
-
-        load(&config_path).expect("transactional kafka sink config should load");
-    }
-
-    #[test]
-    fn rejects_http_sink_with_verify_tls_disabled() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = "http://127.0.0.1:8081/events"
-verify_tls = false
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid insecure http sink config");
-        assert!(err
-            .to_string()
-            .contains("sink.http.verify_tls must be true"));
-    }
-
-    #[test]
-    fn rejects_http_sink_with_non_https_non_loopback_url() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = "http://example.com/events"
-verify_tls = true
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected invalid non-https http sink url");
-        assert!(err
-            .to_string()
-            .contains("sink.http.url must use https except for localhost loopback testing"));
-    }
-
-    #[test]
-    fn rejects_http_sink_with_inline_bearer_secret_literal() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = "http://127.0.0.1:8080/events"
-bearer_token = "top-secret-token"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err =
-            load(&config_path).expect_err("expected inline bearer token literal to be rejected");
-        assert!(err
-            .to_string()
-            .contains("sink.http.bearer_token must use deferred secret references"));
-    }
-
-    /// `{ env = "VAR" }` references resolve to the environment value for every
-    /// secret-bearing field — the pattern the docs and `rustcdc init` templates
-    /// use must actually load.
-    #[test]
-    fn resolves_env_secret_references_at_load_time() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        // Unique names to avoid collisions with parallel tests.
-        std::env::set_var("CDC_LOADER_TEST_PG_PASSWORD", "pg-secret-from-env");
-        std::env::set_var("CDC_LOADER_TEST_BEARER", "bearer-from-env");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = { env = "CDC_LOADER_TEST_PG_PASSWORD" }
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = "http://127.0.0.1:8080/events"
-bearer_token = { env = "CDC_LOADER_TEST_BEARER" }
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let config = load(&config_path).expect("env-referenced secrets must load");
-
-        let crate::config::schema::SourceDriver::Postgres(pg) = &config.source.driver else {
-            panic!("expected postgres source");
-        };
-        assert_eq!(
-            pg.password.resolve().expect("resolve password"),
-            "pg-secret-from-env"
-        );
-        let crate::config::schema::SinkConfig::Http(http) = &config.sink else {
-            panic!("expected http sink");
-        };
-        assert_eq!(
-            http.bearer_token
-                .as_ref()
-                .expect("bearer token present")
-                .resolve()
-                .expect("resolve bearer token"),
-            "bearer-from-env"
-        );
-    }
-
-    /// An unset env reference must fail loudly, naming the variable and the
-    /// config path — not default to an empty credential.
-    #[test]
-    fn rejects_unset_env_secret_reference() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = { env = "CDC_LOADER_TEST_DEFINITELY_UNSET_VAR" }
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "stdout"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("unset env reference must be rejected");
-        let message = err.to_string();
-        assert!(
-            message.contains("CDC_LOADER_TEST_DEFINITELY_UNSET_VAR"),
-            "error must name the variable: {message}"
-        );
-        assert!(
-            message.contains("source.password"),
-            "error must name the config path: {message}"
-        );
-    }
-
-    #[test]
-    fn rejects_iceberg_sink_with_inline_catalog_token_literal() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-
-        std::fs::write(
-            &config_path,
-            r#"
-api_version = "v1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "iceberg"
-table_path = "/tmp/iceberg-table"
-namespace = "cdc"
-table_name = "events"
-
-[sink.catalog.rest]
-uri = "http://127.0.0.1:8181"
-warehouse = "file:///tmp/iceberg-warehouse"
-token = "inline-token-literal"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-        )
-        .expect("write config");
-
-        let err =
-            load(&config_path).expect_err("expected inline iceberg token literal to be rejected");
-        assert!(err
-            .to_string()
-            .contains("sink.iceberg.catalog.rest.token must use deferred secret references"));
-    }
-
-    #[test]
-    fn rejects_http_sink_with_zero_dlq_max_bytes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let dlq_path = dir.path().join("http-dlq.jsonl");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = "http://127.0.0.1:8080/events"
-verify_tls = true
-dlq_path = "{}"
-dlq_max_bytes = 0
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-                dlq_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected dlq_max_bytes validation failure");
-        assert!(
-            err.to_string()
-                .contains("sink.http.dlq_max_bytes must be > 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_http_sink_dlq_path_with_missing_parent_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config_path: PathBuf = dir.path().join("cdc.toml");
-        let dlq_path = dir.path().join("missing").join("http-dlq.jsonl");
-
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-api_version = "v1alpha1"
-
-[source.postgres]
-host = "localhost"
-port = 5432
-user = "cdc_user"
-password = "secret"
-database = "mydb"
-replication_slot_name = "cdc_slot"
-publication_name = "cdc_pub"
-conn_timeout_secs = 10
-stream_poll_interval_ms = 100
-max_events_per_poll = 1000
-table_include_list = []
-table_exclude_list = []
-
-[source.postgres.transport]
-mode = "plaintext"
-
-[sink]
-type = "http"
-url = "http://127.0.0.1:8080/events"
-verify_tls = true
-dlq_path = "{}"
-
-[state]
-dir = "/tmp/cdc-state"
-"#,
-                dlq_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let err = load(&config_path).expect_err("expected dlq path parent validation failure");
-        assert!(
-            err.to_string()
-                .contains("sink.http.dlq_path parent directory does not exist"),
-            "unexpected error: {err}"
-        );
-    }
-}
+#[path = "loader_tests.rs"]
+mod tests;

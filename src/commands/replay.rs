@@ -74,11 +74,12 @@ pub async fn execute(args: ReplayArgs, config_path: Option<&Path>) -> Result<(),
         }
     };
     let effective_sink_config = override_sink.unwrap_or(sink_config);
-    let mut sink =
-        crate::pipeline::router::single(sink::build_binding(&effective_sink_config).await?);
+    let mut sink = crate::pipeline::router::single(
+        sink::build_binding(&effective_sink_config, runtime_tuning.max_event_bytes).await?,
+    );
 
     // Fail fast if the parity mode is incompatible with the delivery contract
-    // and this sink's capabilities (CR-016).
+    // and this sink's capabilities.
     run_batch::validate_parity_contract(args.checkpoint_parity_mode, &sink, delivery_contract)?;
 
     let checkpoint_parity_plan =
@@ -194,13 +195,14 @@ pub async fn execute(args: ReplayArgs, config_path: Option<&Path>) -> Result<(),
             &mut sink,
             events,
             &transform_pipeline,
-            runtime_tuning.max_event_bytes,
             runtime_tuning.prepare_parallelism,
             runtime_tuning.sink_flush_interval_events,
             runtime_tuning.sink_delivery_queue_capacity,
             runtime_tuning.sink_send_timeout_ms,
             runtime_tuning.sink_flush_timeout_ms,
             args.checkpoint_parity_mode,
+            // No quarantine for a one-shot command: a failure here should be seen.
+            None,
         )
         .await?;
 
@@ -349,7 +351,7 @@ mod tests {
     use crate::cli::{CheckpointParityMode, ReplayArgs, ReplaySink};
     use crate::config::schema::{KafkaSecurityConfig, KafkaSecurityProtocol};
     use krafka::consumer::{AutoOffsetReset, Consumer};
-    use rustcdc::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use rustcdc::core::{Event, Operation, SourceMetadata};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Write;
@@ -369,26 +371,13 @@ mod tests {
     }
 
     fn sample_event(offset: String, ts: u64) -> Event {
-        Event {
-            before: None,
-            after: Some(json!({"id": ts, "name": "replay"})),
-            op: Operation::Insert,
-            source: SourceMetadata {
-                source_name: "postgres".to_string(),
-                offset,
-                timestamp: ts,
-            },
-            ts,
-            schema: Some("public".to_string()),
-            table: "users".to_string(),
-            primary_key: Some(vec!["id".to_string()]),
-            snapshot: None,
-            transaction: None,
-            envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
-            unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
-        }
+        Event::builder("users", Operation::Insert)
+            .after(json!({"id": ts, "name": "replay"}))
+            .source(SourceMetadata::new("postgres", offset, ts))
+            .ts(ts)
+            .schema("public")
+            .primary_key(["id"])
+            .build()
     }
 
     fn write_replay_file(path: &Path, events: &[Event]) {
@@ -460,7 +449,7 @@ mod tests {
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "cdc"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
 database = "cdc"
 replication_slot_name = "rustcdc_slot"
 publication_name = "rustcdc_pub"
@@ -524,7 +513,7 @@ service_name = "cdc-server"
 host = "localhost"
 port = 5432
 user = "cdc"
-password = "cdc"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
 database = "cdc"
 replication_slot_name = "rustcdc_slot"
 publication_name = "rustcdc_pub"

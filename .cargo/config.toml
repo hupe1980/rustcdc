@@ -1,0 +1,31 @@
+# Test-only environment.
+#
+# Config fixtures across the test suite reference the source password as a deferred
+# secret (`{ env = "CDC_TEST_SOURCE_PASSWORD" }`), because the loader now refuses a
+# literal there — a replication credential in a config file is readable by anyone who
+# can read the file. Cargo exports this for every process it runs so the fixtures
+# resolve without each test hand-setting a process-global variable (which races under
+# the default multi-threaded test harness).
+#
+# `[env]` does not override a value already present in the environment, so this cannot
+# mask a real deployment's setting.
+[env]
+CDC_TEST_SOURCE_PASSWORD = "test-only-not-a-real-credential"
+
+# `RUSTCDC_` is a shared namespace, not a config-key namespace: these two are read by
+# name (the admin bind requires a token; the log level is applied before the config is
+# parsed) and neither is a field of `AppConfig`. Exporting them for the whole test run
+# means every config-loading test doubles as a guard that unknown-key detection is
+# diffing the config *file* and not the env-merged document — the day it regresses,
+# the suite fails wholesale rather than only in production.
+RUSTCDC_LOG_LEVEL = "info"
+RUSTCDC_ADMIN_READ_TOKEN = "test-only-not-a-real-token"
+
+# A syntactically valid (and entirely fake) Ed25519 signing key, so the audit-signing
+# test can assert that `admin.audit_signing_key_env` resolves the variable it names.
+CDC_TEST_AUDIT_SIGNING_KEY_HEX = "0000000000000000000000000000000000000000000000000000000000000001"
+
+# The negative-path security suite plants this value in every credential-bearing field
+# a config has and then asserts it never appears in `/status`. Exported here so the
+# assertion is about redaction rather than about whether a variable happened to be set.
+CDC_TEST_SENTINEL_SECRET = "sentinel-secret-9f3a7c"

@@ -8,6 +8,19 @@ use crate::config::schema::AdminConfig;
 
 /// Maximum distinct client keys tracked before LRU eviction.
 pub(super) const RATE_LIMIT_MAX_CLIENT_KEYS: usize = 4096;
+/// Distinct client keys above which a new client is admitted with a single token
+/// rather than its configured burst.
+///
+/// A rapidly-rotating attacker mints a fresh key per request, so a full burst per new
+/// key would multiply their allowance by the burst size. Starting new clients at one
+/// token defeats that — but applied *unconditionally* it also means an ordinary client
+/// gets one request rather than the burst the operator configured, which made
+/// `*_rate_limit_burst` inert for anyone who had not been seen before.
+///
+/// A filling key table is the signature of the attack, so the restriction is applied
+/// only under that pressure. In steady state (a handful of scrapers and probes) the
+/// configured burst is honoured; under a rotation flood the old behaviour returns.
+pub(super) const RATE_LIMIT_NEW_CLIENT_BURST_PRESSURE: usize = RATE_LIMIT_MAX_CLIENT_KEYS / 2;
 /// How long a client entry may be idle before being swept.
 pub(super) const RATE_LIMIT_STALE_CLIENT_TTL: Duration = Duration::from_secs(600);
 
@@ -122,7 +135,7 @@ impl AdminAbuseGuard {
                     // X-Forwarded-For.  Loopback, link-local, private, and
                     // unspecified addresses can be spoofed by an attacker
                     // behind a trusted proxy to exhaust unrelated rate-limit
-                    // buckets or claim a "trusted" identity (CR-010).
+                    // buckets or claim a "trusted" identity.
                     if is_globally_routable(ip) {
                         return format!("xff:{ip}");
                     }
@@ -233,13 +246,20 @@ impl EndpointRateLimiter {
             }
         }
 
-        // New clients start with a single token, not full burst, to prevent
-        // burst amplification by rapid IP rotation under load.
+        // A new client gets its configured burst, unless the key table is under the
+        // pressure that makes burst amplification by IP rotation possible — see
+        // `RATE_LIMIT_NEW_CLIENT_BURST_PRESSURE`.
+        let initial_tokens = if self.clients.len() >= RATE_LIMIT_NEW_CLIENT_BURST_PRESSURE {
+            1.0_f64.min(self.burst_capacity)
+        } else {
+            self.burst_capacity
+        };
+
         let mut bucket = self
             .clients
             .entry(client_key.to_string())
             .or_insert(ClientTokenBucket {
-                tokens: 1.0_f64.min(self.burst_capacity),
+                tokens: initial_tokens,
                 last_refill: now,
                 last_seen: now,
             });
@@ -274,16 +294,31 @@ mod tests {
     #[test]
     fn burst_allows_initial_requests() {
         let guard = make_guard(1, 5);
-        // New clients start with exactly 1 token (not full burst) to prevent
-        // burst amplification via rapid IP rotation.
-        assert!(guard.readyz_limiter.allow("client1"));
-        // Immediate second request (no time elapsed) exceeds the single initial token.
-        assert!(!guard.readyz_limiter.allow("client1"));
+        // In steady state a new client gets the burst the operator configured. It used
+        // to get exactly one token regardless, which made `*_rate_limit_burst` inert
+        // for anyone not already in the table — an operator setting 40 got 1.
+        for attempt in 0..5 {
+            assert!(
+                guard.readyz_limiter.allow("client1"),
+                "request {attempt} must be within the configured burst of 5"
+            );
+        }
+        assert!(
+            !guard.readyz_limiter.allow("client1"),
+            "the sixth request exceeds the burst and must be refused"
+        );
     }
 
     #[test]
-    fn new_client_gets_single_token_not_full_burst() {
+    fn new_client_gets_single_token_not_full_burst_under_key_table_pressure() {
         let guard = make_guard(1, 100);
+
+        // Simulate the attack this rule exists for: enough distinct keys to put the
+        // table under pressure. Only then does a new key drop to a single token.
+        for index in 0..RATE_LIMIT_NEW_CLIENT_BURST_PRESSURE {
+            guard.readyz_limiter.allow(&format!("rotating-{index}"));
+        }
+
         // First call should be allowed (1 token).
         assert!(guard.readyz_limiter.allow("new_client"));
         // Second call on the same Instant-tick (no refill time) should fail.

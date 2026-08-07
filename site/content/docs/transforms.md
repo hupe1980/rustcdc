@@ -1,32 +1,32 @@
-# Writing WASM transforms
++++
+title = "WASM transforms"
+description = "Write, test and deploy a sandboxed WebAssembly transform for rustcdc in Rust or AssemblyScript: the host ABI, worked examples and troubleshooting."
+weight = 40
++++
 
-rustcdc supports **arbitrary event transforms** compiled to WebAssembly. Any
-language that targets WASM can be used — Rust, AssemblyScript, Go (TinyGo),
-C/C++, and others.
+Transforms run your own code against every event, in-process, inside a WebAssembly
+sandbox. Any language that targets WASM works — this guide uses Rust, the most ergonomic
+choice, and AssemblyScript, the lightest option for teams that know JavaScript.
 
-This guide walks through writing, testing, and deploying a transform module from
-scratch using Rust (the most ergonomic choice) and AssemblyScript (the lightest
-option for JavaScript-familiar teams). The low-level ABI contract is in
-the [ABI reference](#1-how-transforms-work) section below.
+> [!NOTE]
+> You may not need a module at all. Masking, field mapping, filtering, routing and
+> transactional-outbox unwrapping are **native rules** configured in TOML — see
+> [Pipeline](@/docs/configuration.md#5-pipeline-pipeline). Reach for WASM when you need
+> arbitrary logic those rules cannot express, such as enrichment or a lookup.
 
----
-
-## Table of contents
-
-1. [How transforms work](#1-how-transforms-work)
-2. [Writing a transform in Rust](#2-writing-a-transform-in-rust)
-3. [Writing a transform in AssemblyScript](#3-writing-a-transform-in-assemblyscript)
-4. [Transform patterns](#4-transform-patterns)
-5. [Testing transforms](#5-testing-transforms)
-6. [Deploying transforms](#6-deploying-transforms)
-7. [Troubleshooting](#7-troubleshooting)
-
----
 
 ## 1. How transforms work
 
-The WASM module is loaded once at startup and executed in a sandboxed pool of
-`instance_pool_size` instances (default: 1). For every event:
+The WASM module is compiled at startup into a pool of `instance_pool_size` sandboxed
+runtimes, and events are dispatched across them round-robin. The pool is what bounds
+transform concurrency: with `instance_pool_size = 4`, up to four events are transformed
+at once, and `runtime.prepare_parallelism` governs how many the pipeline offers it.
+
+Measured on the maintainer's machine, four concurrent transforms of a CPU-bound module
+complete in 1.55 ms against 1.28 ms for a single one — 3.3× the serialised time. Raising
+the pool beyond the core count buys nothing; guest execution is CPU-bound.
+
+For every event:
 
 1. The host serialises the event to JSON and copies it into the module's linear memory.
 2. The host calls `transform(ptr, len) → i64`.
@@ -46,7 +46,6 @@ dealloc(ptr: i32, size: i32)    release memory after host reads it
 transform(ptr: i32, len: i32) → i64   main entrypoint
 ```
 
----
 
 ## 2. Writing a transform in Rust
 
@@ -175,7 +174,6 @@ wasm-opt -Oz \
 cp target/wasm32-unknown-unknown/release/rustcdc_transform.wasm transform.wasm
 ```
 
----
 
 ## 3. Writing a transform in AssemblyScript
 
@@ -253,7 +251,6 @@ npx asc assembly/index.ts \
   --shrinkLevel 1
 ```
 
----
 
 ## 4. Transform patterns
 
@@ -262,7 +259,7 @@ npx asc assembly/index.ts \
 The event JSON may carry `unavailable_columns` / `before_unavailable_columns` —
 columns the source could not supply (PostgreSQL unchanged-TOAST). Those columns
 are **absent** from the payload, not `null`; see
-[Core concepts — partial row images](concepts.md#partial-row-images-unchanged-toast).
+[Core concepts — partial row images](@/docs/concepts.md#partial-row-images-unchanged-toast).
 
 Rules for transforms:
 
@@ -339,7 +336,6 @@ if let Some(after) = event["after"].as_object_mut() {
 }
 ```
 
----
 
 ## 5. Testing transforms
 
@@ -423,7 +419,6 @@ rustcdc replay events.jsonl --config cdc.toml --sink stdout --limit 10000
 # Watch: rustcdc_runtime_events_committed_total rate in /metrics
 ```
 
----
 
 ## 6. Deploying transforms
 
@@ -481,7 +476,6 @@ volumeMounts:
    kubectl rollout restart deployment/rustcdc
    ```
 
----
 
 ## 7. Troubleshooting
 
@@ -491,13 +485,11 @@ volumeMounts:
 
 **Fix:** add `rustcdc_abi_version() → i32` returning `2`.
 
----
 
 **Error:** `wasm transform module rejected: abi version mismatch (got 1, expected 2)`
 
 **Fix:** update your exports to match the ABI v2 contract described in [How transforms work](#1-how-transforms-work).
 
----
 
 ### Events silently dropped
 
@@ -514,7 +506,6 @@ transform returns `0`:
 3. Set `transform_error_policy = "skip"` temporarily to see if trapping/OOM is
    the cause.
 
----
 
 ### Transform timeout
 
@@ -524,7 +515,6 @@ transform returns `0`:
 Common causes: expensive JSON parsing of large arrays, unbounded loops,
 excessive allocations.
 
----
 
 ### OOM inside module
 
@@ -533,10 +523,9 @@ excessive allocations.
 **Fix:** increase `max_memory_bytes`. Also check for memory leaks — ensure every
 `alloc` call in your module has a matching `dealloc`.
 
----
 
 ## See also
 
-- [Configuration reference → WASM transform runtime](configuration.md#wasm-transform-runtime)
-- [Core concepts → Transform pipeline](concepts.md#4-transform-pipeline)
-- [Operations guide → Dry run](operations.md#7-dry-run)
+- [Configuration reference → WASM transform runtime](@/docs/configuration.md#wasm-transform-runtime)
+- [Core concepts → Transform pipeline](@/docs/concepts.md#4-transform-pipeline)
+- [Operations guide → Dry run](@/docs/operations.md#7-dry-run)

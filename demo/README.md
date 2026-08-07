@@ -26,8 +26,11 @@ Each line is a full rustcdc event envelope (abridged here — real events also
 carry `source`, `ts`, `transaction`, and `envelope_version`):
 
 ```jsonc
-// Initial snapshot — one "read" event per existing row
-{"op":"read","schema":"public","table":"customers","before":null,"after":{"id":"1","name":"Alice Johnson","email":"alice@example.com","tier":"pro","created_at":"..."},"snapshot":{...},"before_is_key_only":false}
+// Initial snapshot — one "read" event per existing row.
+// `customers` passes through the masking transform in cdc.toml: `email` is
+// redacted outright and `name` becomes a keyed HMAC, so rows stay joinable on
+// the pseudonym without being re-identifiable.
+{"op":"read","schema":"public","table":"customers","before":null,"after":{"id":"1","name":"9f2c…","email":"***@redacted","tier":"pro","created_at":"..."},"snapshot":{...},"before_is_key_only":false}
 
 // Ongoing changes from the seeder
 {"op":"insert","schema":"public","table":"orders","before":null,"after":{"id":"4","customer_id":"3","sku":"WGT-001","quantity":"2","total_cents":"1998","status":"pending","created_at":"..."},"before_is_key_only":false}
@@ -39,7 +42,7 @@ Updates carry a **full `before` image** because `init.sql` sets
 `REPLICA IDENTITY FULL` on the demo tables. Events with partial payloads
 (PostgreSQL unchanged-TOAST) would additionally list the missing columns in
 `unavailable_columns` / `before_unavailable_columns` — see
-[Core concepts](../docs/concepts.md#partial-row-images-unchanged-toast).
+[Core concepts](https://hupe1980.github.io/rustcdc-server/docs/concepts/#partial-row-images-unchanged-toast).
 
 ## Inspect the admin API
 
@@ -97,7 +100,9 @@ docker compose down -v
 | Goal | How |
 |---|---|
 | Stream to Kafka | Replace `[sink]` in `cdc.toml` with `type = "kafka"` and add a [Redpanda](https://hub.docker.com/r/redpandadata/redpanda) service to `compose.yml` |
-| Add a WASM transform (e.g. redact emails) | See [docs/transforms.md](../docs/transforms.md) |
-| Use MySQL instead of PostgreSQL | See [docs/connectors/mysql.md](../docs/connectors/mysql.md) |
-| Deploy to Kubernetes | See [docs/operations.md](../docs/operations.md#11-kubernetes-deployment) |
-| All configuration options | See [docs/configuration.md](../docs/configuration.md) |
+| Encode as Avro / Protobuf against a registry | Add `[sink.codec]` with `type = "avro_confluent"` and a `[registries.<name>]` block — see [the configuration reference](https://hupe1980.github.io/rustcdc-server/docs/configuration/#codecs-sink-codec) |
+| Tune or extend the masking rules | The `redact_customer_pii` rule in `cdc.toml`; all rule types are in [the configuration reference](https://hupe1980.github.io/rustcdc-server/docs/configuration/#mask-redact-hash-or-encrypt-fields) |
+| Add a WASM transform | See [the WASM transforms guide](https://hupe1980.github.io/rustcdc-server/docs/transforms/) |
+| Use MySQL instead of PostgreSQL | See [the MySQL connector guide](https://hupe1980.github.io/rustcdc-server/docs/connectors/mysql/) |
+| Deploy to Kubernetes | See [the operations guide](https://hupe1980.github.io/rustcdc-server/docs/operations/#11-kubernetes-deployment) |
+| All configuration options | See [the configuration reference](https://hupe1980.github.io/rustcdc-server/docs/configuration/) |

@@ -21,7 +21,7 @@
 #   /etc/ssl/certs       — CA bundle (included in the distroless image)
 # ─────────────────────────────────────────────────────────────────────────────
 
-ARG RUST_VERSION=1.93
+ARG RUST_VERSION=1.94
 ARG DEBIAN_CODENAME=bookworm
 
 # ── Stage 1: install cargo-chef onto the Rust toolchain image ────────────────
@@ -109,8 +109,12 @@ LABEL org.opencontainers.image.title="rustcdc-server" \
       org.opencontainers.image.description="Change Data Capture server" \
       org.opencontainers.image.url="https://github.com/hupe1980/rustcdc-server" \
       org.opencontainers.image.source="https://github.com/hupe1980/rustcdc-server" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.vendor="hupe1980"
+
+# Licence texts. The image is redistributed, and the `licenses` label above is an SPDX
+# expression, not a substitute for the grants themselves.
+COPY LICENSE-MIT LICENSE-APACHE /usr/share/licenses/rustcdc-server/
 
 # Copy the statically-complete release binary from the builder stage.
 COPY --from=builder /build/target/release/rustcdc /usr/local/bin/rustcdc

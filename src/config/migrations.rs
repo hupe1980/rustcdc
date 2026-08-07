@@ -34,7 +34,7 @@ fn normalize(mut raw: serde_json::Value) -> Result<serde_json::Value, ConfigErro
     raw = normalize_source(raw)?;
     normalize_sink(&raw)?;
     raw = normalize_pipeline(raw);
-    raw = normalize_state(raw);
+    raw = normalize_state(raw)?;
     Ok(raw)
 }
 
@@ -124,7 +124,13 @@ fn normalize_sink(raw: &serde_json::Value) -> Result<(), ConfigError> {
 }
 
 fn normalize_pipeline(mut raw: serde_json::Value) -> serde_json::Value {
-    let obj = raw.as_object_mut().expect("config is a JSON object");
+    // Total rather than `.expect("config is a JSON object")`: figment can hand us a
+    // non-object document (an empty file, or a TOML array at the root), and a panic in
+    // the config loader is the worst possible way to report a malformed file. A
+    // non-object simply has nothing to hoist; the typed deserialise reports it properly.
+    let Some(obj) = raw.as_object_mut() else {
+        return raw;
+    };
     let transforms = obj.remove("transforms");
     let transform_runtime = obj.remove("transform_runtime");
 
@@ -149,7 +155,14 @@ fn normalize_pipeline(mut raw: serde_json::Value) -> serde_json::Value {
     raw
 }
 
-fn normalize_state(mut raw: serde_json::Value) -> serde_json::Value {
+/// Split the legacy flat `[state]` table into `state.offset` / `state.schema_history`.
+///
+/// Rejects any other key under the flat shape. This function rebuilds the table from
+/// `dir` and `backend` alone, so anything else was previously **discarded in silence** —
+/// a `snapshot_tables` key indented one table too far parsed cleanly and did nothing,
+/// and the unknown-key guard in the loader could not see it because the migration had
+/// already removed it.
+fn normalize_state(mut raw: serde_json::Value) -> Result<serde_json::Value, ConfigError> {
     if let Some(obj) = raw.as_object_mut() {
         // Only split if state is a flat object (has dir/backend at the top level).
         let needs_split = obj
@@ -159,7 +172,30 @@ fn normalize_state(mut raw: serde_json::Value) -> serde_json::Value {
             .unwrap_or(false);
 
         if needs_split {
-            let state = obj.remove("state").unwrap();
+            // `needs_split` proved this is an object, but returning an error costs
+            // nothing and keeps the function total.
+            let Some(state) = obj.remove("state") else {
+                return Ok(raw);
+            };
+
+            let mut stray: Vec<String> = state
+                .as_object()
+                .into_iter()
+                .flat_map(|map| map.keys())
+                .filter(|key| key.as_str() != "dir" && key.as_str() != "backend")
+                .cloned()
+                .collect();
+            if !stray.is_empty() {
+                stray.sort();
+                return Err(ConfigError::InvalidState(format!(
+                    "unrecognised key(s) under [state]: {}. The flat [state] table \
+                     accepts only `dir` and `backend`; anything else was previously \
+                     dropped without a word. If you meant a top-level setting, move it \
+                     above the [state] header.",
+                    stray.join(", ")
+                )));
+            }
+
             let dir = state
                 .get("dir")
                 .cloned()
@@ -187,7 +223,7 @@ fn normalize_state(mut raw: serde_json::Value) -> serde_json::Value {
             obj.insert("state".to_string(), serde_json::Value::Object(new_state));
         }
     }
-    raw
+    Ok(raw)
 }
 
 fn config_api_version(raw: &serde_json::Value) -> Result<String, ConfigError> {

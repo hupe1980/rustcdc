@@ -174,7 +174,7 @@ pub(super) fn with_recoverable_error_jitter_ms(base_ms: u64, jitter_ratio: f64, 
     (base_ms as i64).saturating_add(offset).max(1) as u64
 }
 
-/// CR-011 fix: mix in a monotonic counter so the seed is non-zero even when the
+/// Mix in a monotonic counter so the seed is non-zero even when the
 /// system clock is behind UNIX_EPOCH (NTP step, container cold-start, etc.).
 pub(super) fn jitter_seed() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};

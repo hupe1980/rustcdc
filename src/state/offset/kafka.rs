@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use krafka::admin::{AdminClient, ConfigEntry, DescribeConfigsRequest};
 use krafka::consumer::CompactedTopicConsumer;
-use krafka::producer::{Acks, Producer};
+use krafka::producer::TransactionalProducer;
 use rustcdc::checkpoint::{Checkpoint, FileCheckpoint, GenericOffset};
 use rustcdc::core::Offset;
 use rustcdc::schema_history::{
@@ -71,12 +71,44 @@ pub(crate) struct KafkaTopicSchemaHistoryRecord {
 // State writer
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Where the state writer's records are produced from.
+///
+/// The distinction is the whole of end-to-end exactly-once.
+///
+/// * [`StateProducer::Own`] — a private transactional producer. Each state write is its
+///   own transaction, so the checkpoint becomes durable independently of the batch it
+///   describes. A crash between the sink's commit and this write replays the batch, and a
+///   `read_committed` consumer sees the duplicates. That window is the reason
+///   `effectively_once` was documented as *batch-atomic* rather than exactly-once.
+///
+/// * [`StateProducer::Shared`] — the sink's own producer. The checkpoint record is written
+///   into the *same* transaction as the batch's data, so a single `commit_transaction`
+///   makes both durable together and there is no window between them. A crash before the
+///   commit discards both; after it, both survive.
+///
+/// Either way the producer is transactional, because that is also what fences a second
+/// writer: `init_transactions()` bumps the producer epoch at the broker and permanently
+/// fences any earlier holder of the same `transactional.id` (KIP-447). This topic once
+/// used a plain idempotent producer, so two instances — which a rolling update creates on
+/// every deploy — both wrote, and last-write-wins could move the durable position
+/// *backwards*.
+enum StateProducer {
+    /// Boxed: a `TransactionalProducer` is ~1.3 KB and would otherwise size every
+    /// `StateProducer`, including the shared arm that is a pair of pointers.
+    Own(Box<tokio::sync::Mutex<TransactionalProducer>>),
+    Shared(crate::sink::KafkaTransactionHandle),
+}
+
 /// Publishes checkpoint and schema-history records to the Kafka compacted topic.
 ///
-/// Holds the last published values so that callers can compute checkpoint age
-/// and roll back schema-history on publish failure.
+/// Holds the last published values so that callers can compute checkpoint age and roll
+/// back schema history on publish failure.
 pub(crate) struct KafkaTopicStateWriter {
-    producer: tokio::sync::Mutex<Producer>,
+    /// How state records reach Kafka.
+    ///
+    /// Two shapes, and which one is in use decides whether `effectively_once` is
+    /// end-to-end exactly-once or only atomic at the sink — see [`StateProducer`].
+    producer: StateProducer,
     topic: String,
     last_checkpoint: tokio::sync::Mutex<Option<KafkaTopicCheckpointRecord>>,
     last_schema_history_bytes: tokio::sync::Mutex<Option<Vec<u8>>>,
@@ -85,13 +117,54 @@ pub(crate) struct KafkaTopicStateWriter {
 }
 
 impl KafkaTopicStateWriter {
+    /// Build a writer with its own transactional producer.
+    ///
+    /// Used by `init-state` and by every backend combination that is not end-to-end
+    /// exactly-once. See [`Self::with_sink_transaction`] for the shared-producer form.
     pub(super) async fn new(config: &KafkaTopicStateConfig) -> Result<Self, AppError> {
+        Ok(Self::wrap(config, Self::own_producer(config).await?))
+    }
+
+    /// Build a writer that produces through the sink's transaction.
+    ///
+    /// The handle's producer is *already* fenced by its own `init_transactions()`, and it
+    /// is deliberately the only writer of this topic in this mode: a second transactional
+    /// id writing the same topic would give two independent fencing domains, so neither
+    /// would exclude the other.
+    pub(super) fn with_sink_transaction(
+        config: &KafkaTopicStateConfig,
+        handle: crate::sink::KafkaTransactionHandle,
+    ) -> Self {
+        tracing::info!(
+            topic = %config.topic,
+            "kafka state writer is sharing the sink's transaction; checkpoints commit \
+             atomically with the data they describe"
+        );
+        Self::wrap(config, StateProducer::Shared(handle))
+    }
+
+    fn wrap(config: &KafkaTopicStateConfig, producer: StateProducer) -> Self {
+        Self {
+            producer,
+            topic: config.topic.clone(),
+            last_checkpoint: tokio::sync::Mutex::new(None),
+            last_schema_history_bytes: tokio::sync::Mutex::new(None),
+            schema_history_dirty: AtomicBool::new(false),
+        }
+    }
+
+    async fn own_producer(config: &KafkaTopicStateConfig) -> Result<StateProducer, AppError> {
         let auth = config.security.to_auth_config().map_err(AppError::Other)?;
-        let producer = Producer::builder()
+        // Derived from the state topic and client id so it is stable across restarts of
+        // the same logical pipeline — which is the whole point, since fencing works by
+        // two instances claiming the *same* id — and distinct between pipelines sharing
+        // a cluster.
+        let transactional_id = format!("{}-state-{}", config.client_id, config.topic);
+
+        let producer = TransactionalProducer::builder()
             .bootstrap_servers(config.brokers.clone())
             .client_id(format!("{}-state-writer", config.client_id))
-            .acks(Acks::All)
-            .idempotent(true)
+            .transactional_id(transactional_id.clone())
             .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
             .connect_timeout(crate::sink::kafka_connect_timeout(
                 std::time::Duration::from_millis(config.request_timeout_ms),
@@ -103,31 +176,83 @@ impl KafkaTopicStateWriter {
                 AppError::Other(format!("failed to build kafka topic state producer: {e}"))
             })?;
 
-        Ok(Self {
-            producer: tokio::sync::Mutex::new(producer),
-            topic: config.topic.clone(),
-            last_checkpoint: tokio::sync::Mutex::new(None),
-            last_schema_history_bytes: tokio::sync::Mutex::new(None),
-            schema_history_dirty: AtomicBool::new(false),
-        })
+        // Fences any previous owner of this transactional id.
+        producer.init_transactions().await.map_err(|e| {
+            AppError::Other(format!(
+                "failed to initialize the kafka state producer's transactional state                  (transactional_id '{transactional_id}'): {e}. If another instance is                  running against this pipeline, stop it first — two writers on one state                  topic interleave checkpoints and the durable position can move backwards."
+            ))
+        })?;
+
+        tracing::info!(
+            transactional_id = %transactional_id,
+            "kafka state writer fenced any previous owner"
+        );
+
+        Ok(StateProducer::Own(Box::new(tokio::sync::Mutex::new(
+            producer,
+        ))))
     }
 
-    async fn publish_record(&self, key: &[u8], payload: &[u8]) -> Result<(), AppError> {
-        let producer = self.producer.lock().await;
-        let record_metadata = producer
-            .send(&self.topic, Some(key), payload)
-            .await
-            .map_err(|e| {
-                AppError::Other(format!(
-                    "failed writing kafka state record to topic '{}': {e}",
-                    self.topic
-                ))
-            })?;
-        // State records are checkpoints — an unacknowledged write here would let
-        // the pipeline advance past a position Kafka never durably stored.
-        crate::sink::enforce_durable_confirmation(&record_metadata, "state")
-            .map_err(|e| AppError::Other(e.to_string()))?;
-        Ok(())
+    /// Publish one state record.
+    ///
+    /// Returns `true` when the record joined the sink's open transaction and is therefore
+    /// not durable until that transaction commits. Callers use this to decide whether the
+    /// in-memory "last published" mirror may be updated yet.
+    async fn publish_record(&self, key: &[u8], payload: &[u8]) -> Result<bool, AppError> {
+        match &self.producer {
+            StateProducer::Shared(handle) => handle
+                .send_in_transaction(&self.topic, key, payload)
+                .await
+                .map_err(|e| {
+                    AppError::Other(format!(
+                        "failed writing kafka state record to topic '{}': {e}. A \
+                         producer-fenced error here means another instance has taken over \
+                         this pipeline's state.",
+                        self.topic
+                    ))
+                }),
+            StateProducer::Own(producer) => {
+                let producer = producer.lock().await;
+
+                producer.begin_transaction().map_err(|e| {
+                    AppError::Other(format!("failed to begin kafka state transaction: {e}"))
+                })?;
+
+                let send_result = producer.send(&self.topic, Some(key), payload).await;
+
+                let record_metadata = match send_result {
+                    Ok(metadata) => metadata,
+                    Err(e) => {
+                        // Abort is best-effort: a fenced producer cannot abort either, and
+                        // the send error is the one worth surfacing.
+                        if let Err(abort_err) = producer.abort_transaction().await {
+                            tracing::warn!(
+                                error = %abort_err,
+                                "aborting the kafka state transaction failed after a send error"
+                            );
+                        }
+                        return Err(AppError::Other(format!(
+                            "failed writing kafka state record to topic '{}': {e}. A \
+                             producer-fenced error here means another instance has taken over \
+                             this pipeline's state.",
+                            self.topic
+                        )));
+                    }
+                };
+
+                producer.commit_transaction().await.map_err(|e| {
+                    AppError::Other(format!(
+                        "failed to commit the kafka state transaction for topic '{}': {e}",
+                        self.topic
+                    ))
+                })?;
+                // State records are checkpoints — an unacknowledged write here would let
+                // the pipeline advance past a position Kafka never durably stored.
+                crate::sink::enforce_durable_confirmation(&record_metadata, "state")
+                    .map_err(|e| AppError::Other(e.to_string()))?;
+                Ok(false)
+            }
+        }
     }
 
     pub(super) async fn seed_bootstrap(&self) -> Result<(), AppError> {
@@ -167,16 +292,27 @@ impl KafkaTopicStateWriter {
         self.schema_history_dirty.store(false, Ordering::Relaxed);
     }
 
+    /// Publish a checkpoint record.
+    ///
+    /// Returns `true` when the record joined the sink's open transaction, and is therefore
+    /// only durable once that transaction commits.
     async fn update_checkpoint(
         &self,
         checkpoint_record: KafkaTopicCheckpointRecord,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let payload = serde_json::to_vec(&checkpoint_record)
             .map_err(|e| AppError::Other(format!("failed to serialize checkpoint record: {e}")))?;
-        self.publish_record(KAFKA_STATE_KEY_CHECKPOINT, &payload)
+        let joined = self
+            .publish_record(KAFKA_STATE_KEY_CHECKPOINT, &payload)
             .await?;
-        *self.last_checkpoint.lock().await = Some(checkpoint_record);
-        Ok(())
+        // The mirror is what `/status` reports as checkpoint age. Updating it for a record
+        // still inside an uncommitted transaction would report a freshness the cluster has
+        // not confirmed; if the commit then fails the process exits, so the mirror is never
+        // observed to be stale for long.
+        if !joined {
+            *self.last_checkpoint.lock().await = Some(checkpoint_record);
+        }
+        Ok(joined)
     }
 
     /// Publish schema history only when the dirty flag is set, avoiding
@@ -258,7 +394,10 @@ impl Checkpoint for KafkaTopicCheckpoint {
             .await
             .map_err(|e| rustcdc::core::Error::StateError(e.to_string()))?;
 
-        // Persist to local file only after Kafka publish succeeds.
+        // The local file is written whether or not the Kafka record is durable yet. It is
+        // a cache, and `build_both` rebuilds it from the topic on every startup — so a
+        // file that ran ahead of an aborted transaction is corrected before it is ever
+        // read, and one that matches a committed transaction is simply already right.
         self.inner.save(offset, committed_event_count).await?;
 
         Ok(())
@@ -302,7 +441,11 @@ impl KafkaTopicSchemaHistory {
     /// On publish failure, rolls back the local file to the last successfully
     /// published bytes to keep local and remote state consistent.
     async fn flush_dirty_snapshot(&mut self) -> rustcdc::core::Result<()> {
-        let snapshot_bytes = std::fs::read(&self.state_file).map_err(|e| {
+        // `tokio::fs` rather than `std::fs`: this runs on the checkpoint/flush path, and
+        // a blocking read here stalls the whole runtime worker. Small files make that
+        // cheap today, but the checkpoint path is the one that must not head-of-line
+        // block on a slow or network-backed filesystem.
+        let snapshot_bytes = tokio::fs::read(&self.state_file).await.map_err(|e| {
             rustcdc::core::Error::StateError(format!(
                 "failed reading schema history snapshot '{}': {e}",
                 self.state_file.display()
@@ -317,8 +460,8 @@ impl KafkaTopicSchemaHistory {
             .await
         {
             let rollback_result = match self.writer.last_published_schema_history_bytes().await {
-                Some(previous_bytes) => std::fs::write(&self.state_file, previous_bytes),
-                None => match std::fs::remove_file(&self.state_file) {
+                Some(previous_bytes) => tokio::fs::write(&self.state_file, previous_bytes).await,
+                None => match tokio::fs::remove_file(&self.state_file).await {
                     Ok(()) => Ok(()),
                     Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
                     Err(err) => Err(err),
@@ -401,6 +544,7 @@ impl SchemaHistory for KafkaTopicSchemaHistory {
 async fn build_both(
     state_dir: &Path,
     config: &KafkaTopicStateConfig,
+    sink_transaction: Option<crate::sink::KafkaTransactionHandle>,
 ) -> Result<
     (
         KafkaTopicCheckpoint,
@@ -415,7 +559,20 @@ async fn build_both(
     let loaded = load_records(config).await?;
     validate_loaded_records(&loaded, config)?;
 
+    // The local file is a **cache** of what Kafka holds, never a second source of truth,
+    // so it is rebuilt from the topic on every startup — including when the topic says
+    // there is no position yet.
+    //
+    // Purging first is the part that matters. Restoring only when Kafka has a real record
+    // left a stale local file in place whenever the topic held nothing, and `load()` reads
+    // the file: the pipeline would resume from a position Kafka had never confirmed and
+    // skip everything after it. That is silent data loss, and it became easier to reach
+    // once the checkpoint moved inside the sink transaction, where an aborted transaction
+    // deliberately leaves the topic without the record the local file may already have.
     let checkpoint_dir = state_dir.join("checkpoint");
+    if checkpoint_dir.exists() {
+        std::fs::remove_dir_all(&checkpoint_dir)?;
+    }
     std::fs::create_dir_all(&checkpoint_dir)?;
     let mut file_checkpoint = FileCheckpoint::new(checkpoint_dir.clone());
     if let Some(record) = loaded.checkpoint.clone() {
@@ -450,7 +607,13 @@ async fn build_both(
             ))
         })?;
 
-    let writer = Arc::new(KafkaTopicStateWriter::new(config).await?);
+    // A shared handle means the sink's producer writes this topic, so no second
+    // transactional producer is built — and, importantly, no second fencing domain is
+    // created for the same topic.
+    let writer = Arc::new(match sink_transaction {
+        Some(handle) => KafkaTopicStateWriter::with_sink_transaction(config, handle),
+        None => KafkaTopicStateWriter::new(config).await?,
+    });
     writer
         .restore_from_loaded(loaded.checkpoint, loaded.schema_history_bytes)
         .await;
@@ -467,8 +630,10 @@ async fn build_both(
 pub(crate) async fn build_checkpoint(
     state_dir: &Path,
     config: &KafkaTopicStateConfig,
+    sink_transaction: Option<crate::sink::KafkaTransactionHandle>,
 ) -> Result<(KafkaTopicCheckpoint, Arc<KafkaTopicStateWriter>), AppError> {
-    let (checkpoint, _schema_history, writer) = build_both(state_dir, config).await?;
+    let (checkpoint, _schema_history, writer) =
+        build_both(state_dir, config, sink_transaction).await?;
     Ok((checkpoint, writer))
 }
 
@@ -477,7 +642,10 @@ pub(crate) async fn build_schema_history(
     state_dir: &Path,
     config: &KafkaTopicStateConfig,
 ) -> Result<KafkaTopicSchemaHistory, AppError> {
-    let (_checkpoint, schema_history, _writer) = build_both(state_dir, config).await?;
+    // Schema history is built on its own path (a different `[state.schema_history]`
+    // backend), so it never shares the sink transaction: a DDL record is not part of any
+    // one batch.
+    let (_checkpoint, schema_history, _writer) = build_both(state_dir, config, None).await?;
     Ok(schema_history)
 }
 
@@ -879,6 +1047,267 @@ mod tests {
             durability_profile: crate::config::schema::KafkaStateDurabilityProfile::Development,
             security: KafkaSecurityConfig::default(),
         }
+    }
+
+    // ── End-to-end exactly-once: checkpoint inside the sink's transaction ─────
+    //
+    // These are the evidence that `effectively_once` is exactly-once end to end and not
+    // merely atomic at the sink. The property is not "the checkpoint is written" — the old
+    // design wrote it too. It is that the checkpoint and the data it describes share one
+    // transaction, so **neither can survive without the other**.
+
+    /// Build a transactional Kafka sink and a state writer that shares its transaction,
+    /// the way `run_pipeline` wires them together.
+    async fn eos_pipeline(
+        broker: &krafka::testing::FakeBroker,
+        data_topic: &str,
+        state_topic: &str,
+    ) -> (crate::sink::KafkaSink, KafkaTopicStateWriter) {
+        broker.create_topic(data_topic, 1);
+        broker.create_topic(state_topic, 1);
+
+        let mut sink_config: crate::config::schema::KafkaSinkConfig =
+            serde_json::from_value(serde_json::json!({
+                "brokers": broker.bootstrap_servers(),
+                "topic": data_topic,
+                "delivery_mode": "transactional",
+                "transactional_id": "cdc-eos-harness",
+                "ack_timeout_ms": 1_000,
+            }))
+            .expect("kafka sink config");
+        sink_config.client_id = "cdc-eos-harness".to_string();
+
+        let sink = crate::sink::KafkaSink::new(&sink_config)
+            .await
+            .expect("transactional sink");
+        let handle = sink
+            .transaction_handle()
+            .expect("a transactional sink must offer a transaction handle");
+
+        let mut state_config = sample_config();
+        state_config.brokers = broker.bootstrap_servers();
+        state_config.topic = state_topic.to_string();
+
+        let writer = KafkaTopicStateWriter::with_sink_transaction(&state_config, handle);
+        (sink, writer)
+    }
+
+    /// Read a topic as a `read_committed` consumer does — aborted records excluded.
+    async fn committed_values(brokers: &str, topic: &str) -> Vec<String> {
+        use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+
+        let consumer = Consumer::builder()
+            .bootstrap_servers(brokers.to_string())
+            .group_id(format!("{topic}-verify"))
+            .client_id(format!("{topic}-verify"))
+            .auto_offset_reset(AutoOffsetReset::Earliest)
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .enable_auto_commit(false)
+            .build()
+            .await
+            .expect("verification consumer");
+        consumer.subscribe(&[topic]).await.expect("subscribe");
+
+        let mut values = Vec::new();
+        for _ in 0..8 {
+            for record in consumer
+                .poll(std::time::Duration::from_millis(250))
+                .await
+                .expect("poll")
+            {
+                if let Some(value) = &record.value {
+                    values.push(String::from_utf8_lossy(value.as_ref()).into_owned());
+                }
+            }
+        }
+        consumer.close().await.expect("close");
+        values
+    }
+
+    fn checkpoint_at(offset_hex: &str) -> KafkaTopicCheckpointRecord {
+        KafkaTopicCheckpointRecord {
+            record_version: KAFKA_TOPIC_CHECKPOINT_VERSION,
+            source_type: "postgres".to_string(),
+            offset_hex: offset_hex.to_string(),
+            committed_event_count: 3,
+            saved_at_unix_ms: now_unix_ms(),
+        }
+    }
+
+    /// **The crash window, closed.** An aborted batch must leave *neither* the data nor
+    /// the checkpoint that describes it visible.
+    ///
+    /// This is the case the old design could not handle. The checkpoint went through its
+    /// own producer and its own transaction, so it committed independently of the batch: a
+    /// crash after the sink's commit and before the checkpoint replayed the batch, and a
+    /// crash the other way round advanced the position past data that was never published.
+    /// Sharing one transaction removes both, and this asserts the first.
+    #[tokio::test]
+    async fn an_aborted_batch_publishes_neither_data_nor_checkpoint() {
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        let (mut sink, writer) = eos_pipeline(&broker, "eos.data.abort", "eos.state.abort").await;
+
+        sink.begin_checkpoint_barrier()
+            .await
+            .expect("begin barrier");
+        sink.send_encoded(
+            bytes::Bytes::from_static(b"k1"),
+            bytes::Bytes::from_static(b"doomed-row"),
+        )
+        .await
+        .expect("send accepted");
+
+        let joined = writer
+            .update_checkpoint(checkpoint_at("00ff"))
+            .await
+            .expect("checkpoint written into the open transaction");
+        assert!(
+            joined,
+            "the checkpoint must join the sink's transaction, not open its own — \
+             otherwise it commits independently and the crash window is still there"
+        );
+
+        sink.abort_checkpoint_barrier()
+            .await
+            .expect("abort barrier");
+
+        let brokers = broker.bootstrap_servers();
+        assert!(
+            committed_values(&brokers, "eos.data.abort")
+                .await
+                .is_empty(),
+            "aborted data must not be visible to a read_committed consumer"
+        );
+        assert!(
+            committed_values(&brokers, "eos.state.abort")
+                .await
+                .is_empty(),
+            "the checkpoint must be discarded with the batch it describes; if it survives, \
+             the pipeline resumes past data that was never published"
+        );
+
+        sink.close().await.expect("close");
+    }
+
+    /// The other half: a committed batch publishes both, atomically.
+    #[tokio::test]
+    async fn a_committed_batch_publishes_data_and_checkpoint_together() {
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        let (mut sink, writer) = eos_pipeline(&broker, "eos.data.commit", "eos.state.commit").await;
+
+        sink.begin_checkpoint_barrier()
+            .await
+            .expect("begin barrier");
+        sink.send_encoded(
+            bytes::Bytes::from_static(b"k1"),
+            bytes::Bytes::from_static(b"row-1"),
+        )
+        .await
+        .expect("send accepted");
+        writer
+            .update_checkpoint(checkpoint_at("0100"))
+            .await
+            .expect("checkpoint written into the open transaction");
+
+        sink.commit_checkpoint_barrier()
+            .await
+            .expect("commit barrier");
+
+        let brokers = broker.bootstrap_servers();
+        assert_eq!(
+            committed_values(&brokers, "eos.data.commit").await,
+            vec!["row-1".to_string()],
+            "committed data must be visible"
+        );
+        let state = committed_values(&brokers, "eos.state.commit").await;
+        assert_eq!(
+            state.len(),
+            1,
+            "exactly one checkpoint record, got {state:?}"
+        );
+        assert!(
+            state[0].contains("\"offset_hex\":\"0100\""),
+            "the committed checkpoint must be the one written inside the transaction: {}",
+            state[0]
+        );
+
+        sink.close().await.expect("close");
+    }
+
+    /// A state write outside any barrier still needs its own transaction, or it would sit
+    /// uncommitted forever. Bootstrap seeding and startup restores take this path.
+    #[tokio::test]
+    async fn a_state_write_outside_a_barrier_commits_on_its_own() {
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        let (mut sink, writer) = eos_pipeline(&broker, "eos.data.solo", "eos.state.solo").await;
+
+        // No `begin_checkpoint_barrier` — nothing is open.
+        let joined = writer
+            .update_checkpoint(checkpoint_at("0200"))
+            .await
+            .expect("checkpoint written");
+        assert!(
+            !joined,
+            "with no barrier open the writer must open and commit its own transaction"
+        );
+
+        let state = committed_values(&broker.bootstrap_servers(), "eos.state.solo").await;
+        assert_eq!(
+            state.len(),
+            1,
+            "the record must be durable immediately, got {state:?}"
+        );
+
+        sink.close().await.expect("close");
+    }
+
+    /// **A second instance fences the first at the broker.**
+    ///
+    /// This state topic used to use a plain idempotent producer, so two instances — which
+    /// a Kubernetes rolling update creates on every deploy — both wrote checkpoints, and
+    /// last-write-wins could move the durable position *backwards*. A transactional id
+    /// makes the broker enforce single-writer: `init_transactions()` bumps the producer
+    /// epoch and permanently fences the previous holder.
+    ///
+    /// Asserting on the epoch is the real check. A test that only asserted "the second
+    /// instance started" would pass just as well with no fencing at all.
+    #[tokio::test]
+    async fn a_second_state_writer_fences_the_first() {
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        broker.create_topic("cdc-state-fencing", 1);
+
+        let mut config = sample_config();
+        config.brokers = broker.bootstrap_servers();
+        config.topic = "cdc-state-fencing".to_string();
+
+        let _first = KafkaTopicStateWriter::new(&config)
+            .await
+            .expect("first state writer");
+        let expected_id = format!("{}-state-{}", config.client_id, config.topic);
+        let (_, epoch_before) = broker
+            .transactional_producer(&expected_id)
+            .expect("the state writer must register under the derived transactional id");
+
+        let _second = KafkaTopicStateWriter::new(&config)
+            .await
+            .expect("second state writer");
+        let (_, epoch_after) = broker
+            .transactional_producer(&expected_id)
+            .expect("producer still registered");
+
+        assert!(
+            epoch_after > epoch_before,
+            "the second instance must bump the producer epoch, fencing the first \
+             (before {epoch_before}, after {epoch_after})"
+        );
     }
 
     fn sample_checkpoint() -> KafkaTopicCheckpointRecord {

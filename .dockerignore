@@ -13,11 +13,12 @@ deny.toml
 rust-toolchain.toml
 
 # ── documentation ─────────────────────────────────────────────────────────────
-docs/
+site/
 README.md
 REVIEW.md
 FINDINGS.md
-LICENSE
+# LICENSE-MIT / LICENSE-APACHE are deliberately NOT excluded — they are copied
+# into the runtime image.
 
 # ── monitoring rules (not part of the binary) ────────────────────────────────
 monitoring/

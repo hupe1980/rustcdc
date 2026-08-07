@@ -41,7 +41,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
+      # Both feature configurations. `glue` is off for a plain `cargo build` — that is
+      # the configuration a developer and a downstream consumer get by default, and it
+      # was never built in CI, so a `#[cfg(feature = "glue")]` boundary error could
+      # compile green here and break on the first `cargo build`.
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
 
   # ── Check (all targets, all features) ───────────────────────────────────────
   check:
@@ -56,6 +61,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
       - run: cargo check --all-targets --all-features --locked
+      - run: cargo check --all-targets --no-default-features --locked
 
   # ── Test ────────────────────────────────────────────────────────────────────
   test:
@@ -70,6 +76,49 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
       - run: cargo test --all-features --locked
+      - run: cargo test --no-default-features --locked
+
+  # ── MSRV ────────────────────────────────────────────────────────────────────
+  # `rust-version` in Cargo.toml is a promise to downstream consumers. Without a job
+  # pinned to it, the promise is only ever tested against whatever `stable` happens to
+  # be, and a newer-than-MSRV feature ships unnoticed.
+  msrv:
+    name: MSRV (1.94)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
+      - run: cargo check --all-targets --all-features --locked
+
+  # ── Fuzz targets (build + short smoke run) ──────────────────────────────────
+  #
+  # The invariants these targets check also run on stable, every build, in
+  # `tests/fuzz_properties.rs` — that suite is the continuous guarantee. This job exists
+  # so the libFuzzer targets cannot silently stop compiling: an uncompilable fuzz target
+  # is indistinguishable from a fuzz target nobody ever ran.
+  #
+  # 60 seconds each is a smoke test, not a campaign. Deep fuzzing is an on-demand
+  # `cargo +nightly fuzz run <target>` with a corpus, not something to put on the
+  # pull-request path.
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build
+        working-directory: .
+      - run: cargo +nightly fuzz run redact_secrets -- -max_total_time=60
+      - run: cargo +nightly fuzz run config_loader -- -max_total_time=60
 
   # ── Deny (license / duplicate dep audit) ────────────────────────────────────
   deny:

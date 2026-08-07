@@ -49,30 +49,116 @@ pub struct AppConfig {
     #[serde(default)]
     pub sinks: Vec<NamedSinkConfig>,
 
-    /// Tables to include in the initial snapshot, `"schema.table"` format.
+    /// Tables to include in the initial **blocking** snapshot, `"schema.table"` format.
+    ///
+    /// The stream does not start until the snapshot finishes. Prefer
+    /// `[incremental_snapshot]` for anything large enough that the wait matters.
     #[serde(default)]
     pub snapshot_tables: Vec<String>,
+
+    /// Non-blocking backfill using the DBLog watermark algorithm.
+    ///
+    /// Chunks are interleaved with the live stream instead of gating it, so capture
+    /// starts immediately and a large table does not hold the replication slot open
+    /// while it is read. Mutually exclusive with `snapshot_tables`.
+    #[serde(default)]
+    pub incremental_snapshot: IncrementalSnapshotConfig,
+
+    /// Where undeliverable events are quarantined. Absent = halt instead.
+    #[serde(default)]
+    pub dlq: crate::config::dlq::DlqConfig,
+}
+
+/// Non-blocking backfill (DBLog watermark).
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct IncrementalSnapshotConfig {
+    /// Tables to backfill, `"schema.table"` format, processed in order.
+    ///
+    /// Empty (the default) disables incremental snapshotting.
+    #[serde(default)]
+    pub tables: Vec<String>,
+
+    /// Rows read per chunk (default: 5 000).
+    ///
+    /// Each chunk is one keyset-paginated `SELECT` bracketed by watermarks. Bigger
+    /// chunks backfill faster and hold the override window open longer; smaller ones
+    /// interleave more finely with the stream.
+    #[serde(default = "default_incremental_snapshot_chunk_size")]
+    pub chunk_size: usize,
+}
+
+fn default_incremental_snapshot_chunk_size() -> usize {
+    5_000
+}
+
+impl Default for IncrementalSnapshotConfig {
+    /// Hand-written: a derived `Default` would ignore the serde field default and
+    /// leave `chunk_size` at zero.
+    fn default() -> Self {
+        Self {
+            tables: Vec::new(),
+            chunk_size: default_incremental_snapshot_chunk_size(),
+        }
+    }
+}
+
+impl IncrementalSnapshotConfig {
+    /// Is incremental snapshotting requested?
+    pub fn is_enabled(&self) -> bool {
+        !self.tables.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        if self.chunk_size == 0 {
+            return Err("incremental_snapshot.chunk_size must be > 0".to_string());
+        }
+        for table in &self.tables {
+            if !table.contains('.') {
+                return Err(format!(
+                    "incremental_snapshot.tables entry '{table}' must be qualified as \
+                     \"schema.table\""
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AppConfig {
     pub const SUPPORTED_API_VERSION: &'static str = "v1";
 }
 
+/// End-to-end delivery guarantee requested by the operator.
+///
+/// `at_most_once` **was removed.** It was accepted, labelled and validated but never
+/// acted on: the code that would have advanced the checkpoint before delivery was
+/// defined and never called, so every deployment that selected it silently received
+/// at-least-once — the opposite of the decision the operator had made.
+///
+/// It was removed rather than implemented because it cannot be given a meaningful
+/// definition on this pipeline: delivery is batched, so advancing the checkpoint before
+/// a batch skips an *arbitrary suffix* of that batch on failure, not one event. A
+/// contract whose loss boundary an operator cannot predict is not a contract. Use
+/// `at_least_once` and deduplicate in the sink on a key you control.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryContract {
+    /// Every event reaches the sink at least once; duplicates are possible after a
+    /// restart. The checkpoint advances only after delivery is durable.
     #[default]
     AtLeastOnce,
+
+    /// Each delivered batch is atomic at the sink: a Kafka transaction commits all of
+    /// it or none of it.
+    ///
+    /// **This is not end-to-end exactly-once.** The transaction commits before the
+    /// checkpoint, so a crash in between replays the batch under a new producer epoch
+    /// and the consumer sees duplicates. See
+    /// <https://hupe1980.github.io/rustcdc-server/docs/concepts/#3-delivery-contracts>.
     EffectivelyOnce,
-    /// Best-effort delivery: checkpoint is advanced **before** sink delivery
-    /// so that failed events are skipped on recovery rather than replayed.
-    ///
-    /// Use for audit-log archival and analytics workloads where duplicates are
-    /// worse than occasional gaps.  Retries are still attempted within the
-    /// configured retry budget, but after the checkpoint has advanced.
-    ///
-    /// **Warning**: data loss on delivery failure is expected and by design.
-    AtMostOnce,
 }
 
 impl DeliveryContract {
@@ -80,18 +166,11 @@ impl DeliveryContract {
         match self {
             Self::AtLeastOnce => "at_least_once",
             Self::EffectivelyOnce => "effectively_once",
-            Self::AtMostOnce => "at_most_once",
         }
     }
 
     pub fn requires_idempotent_delivery(self) -> bool {
         matches!(self, Self::EffectivelyOnce)
-    }
-
-    /// Whether this contract requires the checkpoint to be committed **before**
-    /// sink delivery (at-most-once semantics).
-    pub fn advance_checkpoint_before_delivery(self) -> bool {
-        matches!(self, Self::AtMostOnce)
     }
 
     pub fn requires_transactional_checkpoint_barrier(self) -> bool {
@@ -464,6 +543,95 @@ pub struct RuntimeTuningConfig {
 
     #[serde(default = "default_correctness_dedup_window_size")]
     pub correctness_dedup_window_size: usize,
+
+    /// Where a delivered batch is allowed to end.
+    #[serde(default)]
+    pub transaction_boundary: RuntimeTransactionBoundaryPolicy,
+
+    /// Runtime-level duplicate suppression across restarts.
+    #[serde(default)]
+    pub idempotency: RuntimeIdempotencyConfig,
+
+    /// Validate every event's envelope inside the runtime (default: `true`).
+    ///
+    /// Turn this off only for a measured hot path where the source is trusted: it
+    /// removes the check that catches a self-contradictory envelope (a column both
+    /// listed as unavailable and present in the payload) before a sink acts on it.
+    #[serde(default = "bool_true")]
+    pub validate_events: bool,
+
+    /// Deadline for the sink's `close()` during shutdown, in milliseconds.
+    ///
+    /// `0` waits indefinitely. A sink wedged on an unreachable broker otherwise
+    /// hangs the process past whatever grace period the supervisor allows, which
+    /// turns an orderly drain into a SIGKILL.
+    #[serde(default = "default_runtime_sink_close_timeout_ms")]
+    pub sink_close_timeout_ms: u64,
+
+    /// Historical schema versions retained per table. `0` keeps every version.
+    ///
+    /// Unbounded history grows the schema-history store for the lifetime of the
+    /// deployment; only the versions spanning the replay window are ever read.
+    #[serde(default)]
+    pub schema_history_max_versions_per_table: usize,
+}
+
+/// Where a delivered batch is allowed to end.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTransactionBoundaryPolicy {
+    /// Cut batches wherever the buffer limits fall (default): lowest latency,
+    /// strictly bounded memory.
+    #[default]
+    Split,
+
+    /// Never end a batch mid-transaction.
+    ///
+    /// Batches are cut on `max_buffer_size`, `max_event_bytes` and barrier capacity,
+    /// none of which know anything about transactions — so by default a batch can end
+    /// after rows 1–3 of a five-row transaction and a sink commits a state that never
+    /// existed in the source. This trims the trailing partial transaction and delivers
+    /// it with the next batch.
+    ///
+    /// A single transaction larger than `max_buffer_size` is still delivered split,
+    /// with a WARN, because a permanent silent stall would be worse.
+    PreserveTransactions,
+}
+
+/// Runtime-level duplicate suppression.
+///
+/// The guard suppresses only events it can *identify* — one carrying transaction
+/// metadata, or a primary key whose columns are present in the row image. Anything
+/// else passes through and is counted, because at-least-once is the documented
+/// contract while dropping a distinct row is unrecoverable.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct RuntimeIdempotencyConfig {
+    /// Enable the sliding-window duplicate guard (default: `true`).
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+
+    /// Fingerprints retained in the window.
+    ///
+    /// Size this for the deployment's replay distance, not its event rate: once the
+    /// window fills, duplicates older than it stop being suppressed. Evictions are
+    /// exported as `rustcdc_runtime_idempotency_evictions_total`.
+    #[serde(default = "default_runtime_idempotency_capacity")]
+    pub capacity: usize,
+
+    /// Optional fingerprint lifetime in milliseconds. `0` keeps a fingerprint until
+    /// capacity evicts it.
+    #[serde(default)]
+    pub ttl_ms: u64,
+}
+
+impl Default for RuntimeIdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity: default_runtime_idempotency_capacity(),
+            ttl_ms: 0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -536,6 +704,11 @@ impl Default for RuntimeTuningConfig {
             recoverable_error_breaker_max_open_cycles:
                 default_runtime_recoverable_error_breaker_max_open_cycles(),
             correctness_dedup_window_size: default_correctness_dedup_window_size(),
+            transaction_boundary: RuntimeTransactionBoundaryPolicy::default(),
+            idempotency: RuntimeIdempotencyConfig::default(),
+            validate_events: true,
+            sink_close_timeout_ms: default_runtime_sink_close_timeout_ms(),
+            schema_history_max_versions_per_table: 0,
         }
     }
 }
@@ -668,6 +841,14 @@ impl RuntimeTuningConfig {
             }
         }
 
+        if self.idempotency.enabled && self.idempotency.capacity == 0 {
+            return Err(
+                "runtime.idempotency.capacity must be > 0 when the guard is enabled \
+                 (set enabled = false to turn it off)"
+                    .to_string(),
+            );
+        }
+
         Ok(())
     }
 }
@@ -748,6 +929,14 @@ fn default_correctness_dedup_window_size() -> usize {
     50_000
 }
 
+fn default_runtime_idempotency_capacity() -> usize {
+    100_000
+}
+
+fn default_runtime_sink_close_timeout_ms() -> u64 {
+    30_000
+}
+
 fn bool_true() -> bool {
     true
 }
@@ -757,12 +946,14 @@ mod tests {
     use super::{
         AdminSignalIngressKafkaConfig, IcebergCatalogConfig, IcebergRestCatalogConfig,
         IcebergSchemaMode, IcebergSinkConfig, IcebergWriteMode, KafkaCompression,
-        KafkaDeliveryMode, KafkaSecurityConfig, KafkaSinkConfig, KafkaStateDurabilityProfile,
+        KafkaDeliveryMode, KafkaOidcConfig, KafkaSaslConfig, KafkaSaslMechanism,
+        KafkaSecurityConfig, KafkaSecurityProtocol, KafkaSinkConfig, KafkaStateDurabilityProfile,
         KafkaTopicStateConfig, PostgresStateConfig, RuntimeConnectionRetryConfig,
         RuntimeTuningConfig, TransformActionConfig, TransformRuleConfig, TransformRuntimeConfig,
         TransformRuntimeMode, WasmTransformConfig,
     };
     use rustcdc::SecretString;
+    use std::path::PathBuf;
 
     fn sample_kafka_config(brokers: &str) -> KafkaSinkConfig {
         KafkaSinkConfig {
@@ -773,6 +964,12 @@ mod tests {
             retry_backoff_ms: 100,
             retry_max_attempts: 3,
             compression: KafkaCompression::None,
+            compression_level: None,
+            batch_size: 16 * 1024,
+            linger_ms: 0,
+            max_pipelined_sends: 128,
+            max_in_flight: 5,
+            transport: Default::default(),
             delivery_mode: KafkaDeliveryMode::AtLeastOnceIdempotent,
             transactional_id: None,
             transaction_timeout_ms: 60_000,
@@ -787,6 +984,368 @@ mod tests {
         assert_eq!(
             cfg.normalized_brokers(),
             vec!["kafka-1:9092", "kafka-2:9092", "kafka-3:9092"]
+        );
+    }
+
+    // ─── Kafka security ──────────────────────────────────────────────────────
+
+    fn sasl(mechanism: KafkaSaslMechanism) -> Box<KafkaSaslConfig> {
+        Box::new(KafkaSaslConfig {
+            mechanism,
+            username: Some("api-key".to_string()),
+            password: Some(SecretString::new("api-secret".to_string())),
+            token: None,
+            extensions: Default::default(),
+            oidc: None,
+            region: None,
+        })
+    }
+
+    fn sasl_ssl(mechanism: KafkaSaslMechanism) -> KafkaSecurityConfig {
+        KafkaSecurityConfig {
+            protocol: KafkaSecurityProtocol::SaslSsl,
+            sasl: Some(sasl(mechanism)),
+            ..KafkaSecurityConfig::default()
+        }
+    }
+
+    /// A derived `Default` ignores `#[serde(default = "bool_true")]`, so omitting the
+    /// whole `[sink.kafka.security]` table used to disable certificate verification.
+    #[test]
+    fn security_default_verifies_peer_certificates() {
+        assert!(KafkaSecurityConfig::default().verify_peer);
+    }
+
+    #[test]
+    fn sasl_ssl_plain_is_accepted_and_builds_an_auth_config() {
+        let security = sasl_ssl(KafkaSaslMechanism::Plain);
+        security.validate().expect("sasl_ssl + plain is valid");
+        let auth = security.to_auth_config().expect("auth config");
+        assert!(auth.requires_tls(), "sasl_ssl must negotiate TLS");
+        assert!(auth.requires_sasl());
+    }
+
+    /// SASL/PLAIN puts the password on the wire verbatim; pairing it with a
+    /// plaintext transport hands the credential to anyone on the path.
+    #[test]
+    fn sasl_plaintext_rejects_the_plain_mechanism() {
+        let security = KafkaSecurityConfig {
+            protocol: KafkaSecurityProtocol::SaslPlaintext,
+            sasl: Some(sasl(KafkaSaslMechanism::Plain)),
+            ..KafkaSecurityConfig::default()
+        };
+        let err = security.validate().expect_err("must reject");
+        assert!(err.contains("in the clear"), "unexpected: {err}");
+    }
+
+    /// `SASL_SSL` + SCRAM-SHA-512 is the default secured listener on most managed
+    /// brokers. krafka 0.15 could not construct it, so this sink used to refuse the
+    /// combination; krafka 0.16's `with_tls` makes it reachable, and the negotiated
+    /// protocol must actually be `SASL_SSL` — a config that quietly stayed on
+    /// `SASL_PLAINTEXT` would put the SCRAM exchange on the wire unencrypted.
+    #[test]
+    fn sasl_ssl_scram_negotiates_tls() {
+        for mechanism in [
+            KafkaSaslMechanism::ScramSha256,
+            KafkaSaslMechanism::ScramSha512,
+        ] {
+            let security = sasl_ssl(mechanism);
+            security
+                .validate()
+                .unwrap_or_else(|e| panic!("{mechanism:?} over sasl_ssl must be valid: {e}"));
+
+            let auth = security.to_auth_config().expect("auth config");
+            assert!(
+                auth.requires_tls(),
+                "{mechanism:?} over sasl_ssl must negotiate TLS"
+            );
+            assert!(auth.requires_sasl());
+            assert!(
+                auth.tls_config().is_some(),
+                "{mechanism:?} must carry the TLS settings"
+            );
+        }
+    }
+
+    /// Every mechanism must reach TLS through the same path, so a future one cannot
+    /// be added over `sasl_plaintext` only.
+    #[test]
+    fn every_sasl_mechanism_composes_with_tls() {
+        for mechanism in [
+            KafkaSaslMechanism::Plain,
+            KafkaSaslMechanism::ScramSha256,
+            KafkaSaslMechanism::ScramSha512,
+            KafkaSaslMechanism::OauthBearer,
+        ] {
+            let mut security = sasl_ssl(mechanism);
+            if mechanism == KafkaSaslMechanism::OauthBearer {
+                let sasl_cfg = security.sasl.as_mut().expect("sasl");
+                sasl_cfg.username = None;
+                sasl_cfg.password = None;
+                sasl_cfg.token = Some(SecretString::new("jwt".to_string()));
+            }
+            security
+                .validate()
+                .unwrap_or_else(|e| panic!("{mechanism:?} over sasl_ssl must validate: {e}"));
+            let auth = security
+                .to_auth_config()
+                .unwrap_or_else(|e| panic!("{mechanism:?} over sasl_ssl must build: {e}"));
+            assert!(
+                auth.requires_tls(),
+                "{mechanism:?} must negotiate TLS under sasl_ssl"
+            );
+        }
+    }
+
+    /// A CA path / client certificate / SNI override configured alongside SASL must
+    /// survive onto the negotiated TLS config, not be dropped by the mechanism branch.
+    #[test]
+    fn tls_material_survives_onto_the_sasl_auth_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").expect("write ca");
+
+        let mut security = sasl_ssl(KafkaSaslMechanism::ScramSha512);
+        security.ssl_ca_location = Some(ca.clone());
+        security.sni_hostname = Some("broker.internal".to_string());
+        security.validate().expect("valid");
+
+        let auth = security.to_auth_config().expect("auth config");
+        let tls = auth.tls_config().expect("tls config");
+        assert_eq!(tls.ca_cert_path(), Some(ca.display().to_string().as_str()));
+        assert_eq!(tls.sni_hostname(), Some("broker.internal"));
+    }
+
+    #[test]
+    fn scram_over_sasl_plaintext_is_accepted() {
+        let security = KafkaSecurityConfig {
+            protocol: KafkaSecurityProtocol::SaslPlaintext,
+            sasl: Some(sasl(KafkaSaslMechanism::ScramSha256)),
+            ..KafkaSecurityConfig::default()
+        };
+        security.validate().expect("scram over plaintext is valid");
+        security.to_auth_config().expect("auth config");
+    }
+
+    /// TLS material under a plaintext protocol reads as configured and does nothing.
+    #[test]
+    fn tls_material_without_a_tls_protocol_is_rejected() {
+        let security = KafkaSecurityConfig {
+            protocol: KafkaSecurityProtocol::Plaintext,
+            ssl_ca_location: Some(PathBuf::from("/etc/ssl/ca.pem")),
+            ..KafkaSecurityConfig::default()
+        };
+        let err = security.validate().expect_err("must reject");
+        assert!(err.contains("silently ignored"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn sasl_credentials_without_a_sasl_protocol_are_rejected() {
+        let security = KafkaSecurityConfig {
+            protocol: KafkaSecurityProtocol::Tls,
+            sasl: Some(sasl(KafkaSaslMechanism::Plain)),
+            ..KafkaSecurityConfig::default()
+        };
+        let err = security.validate().expect_err("must reject");
+        assert!(err.contains("never be sent"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn oauthbearer_needs_exactly_one_token_source() {
+        let mut security = sasl_ssl(KafkaSaslMechanism::OauthBearer);
+        let sasl_cfg = security.sasl.as_mut().expect("sasl");
+        sasl_cfg.username = None;
+        sasl_cfg.password = None;
+
+        let err = security.validate().expect_err("neither source configured");
+        assert!(err.contains("[.oidc] block"), "unexpected: {err}");
+
+        security.sasl.as_mut().expect("sasl").token = Some(SecretString::new("jwt".to_string()));
+        security.validate().expect("static token is enough");
+
+        security.sasl.as_mut().expect("sasl").oidc = Some(Box::new(KafkaOidcConfig {
+            token_endpoint: "https://idp.example.com/token".to_string(),
+            client_id: "cdc".to_string(),
+            client_secret: SecretString::new("s3cret".to_string()),
+            scope: None,
+            form_parameters: Default::default(),
+            request_timeout_ms: 10_000,
+        }));
+        let err = security.validate().expect_err("both configured");
+        assert!(err.contains("pick one"), "unexpected: {err}");
+    }
+
+    /// The client secret and the issued token would both cross a plaintext hop.
+    #[test]
+    fn oidc_token_endpoint_must_be_https() {
+        let mut security = sasl_ssl(KafkaSaslMechanism::OauthBearer);
+        let sasl_cfg = security.sasl.as_mut().expect("sasl");
+        sasl_cfg.username = None;
+        sasl_cfg.password = None;
+        sasl_cfg.oidc = Some(Box::new(KafkaOidcConfig {
+            token_endpoint: "http://idp.example.com/token".to_string(),
+            client_id: "cdc".to_string(),
+            client_secret: SecretString::new("s3cret".to_string()),
+            scope: None,
+            form_parameters: Default::default(),
+            request_timeout_ms: 10_000,
+        }));
+        let err = security.validate().expect_err("must reject");
+        assert!(err.contains("plaintext"), "unexpected: {err}");
+    }
+
+    /// MSK IAM's constructor already implies `SASL_SSL`. Layering our TLS settings on
+    /// top must take the CA path / client certificate / SNI without *downgrading* the
+    /// protocol — before krafka 0.16 the MSK arm silently ignored all of them, so a
+    /// private-CA MSK cluster could not be reached at all.
+    #[test]
+    fn msk_iam_keeps_sasl_ssl_and_takes_our_tls_settings() {
+        let _guard = AWS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Safety: serialised by AWS_ENV_LOCK; no other thread reads these here.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA_TEST");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+            std::env::set_var("AWS_REGION", "eu-central-1");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"-----BEGIN CERTIFICATE-----\n").expect("write ca");
+
+        let mut security = sasl_ssl(KafkaSaslMechanism::AwsMskIam);
+        let sasl_cfg = security.sasl.as_mut().expect("sasl");
+        sasl_cfg.username = None;
+        sasl_cfg.password = None;
+        security.ssl_ca_location = Some(ca.clone());
+
+        security.validate().expect("valid");
+        let auth = security.to_auth_config().expect("auth config");
+
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("AWS_REGION");
+        }
+
+        assert!(auth.requires_tls(), "MSK IAM must stay on SASL_SSL");
+        assert_eq!(
+            auth.tls_config().and_then(|t| t.ca_cert_path()),
+            Some(ca.display().to_string().as_str()),
+            "our CA path must reach the MSK connection"
+        );
+    }
+
+    /// Applying an explicit `region` must not drop `AWS_SESSION_TOKEN`. Assumed
+    /// roles, instance profiles and EKS web identities all issue temporary
+    /// credentials, and MSK rejects a SigV4 signature made without the token.
+    #[test]
+    fn msk_region_override_preserves_the_session_token() {
+        let _guard = AWS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Safety: serialised by AWS_ENV_LOCK; no other thread reads these here.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA_TEST");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+            std::env::set_var("AWS_SESSION_TOKEN", "session-token");
+        }
+
+        let mut security = sasl_ssl(KafkaSaslMechanism::AwsMskIam);
+        let sasl_cfg = security.sasl.as_mut().expect("sasl");
+        sasl_cfg.username = None;
+        sasl_cfg.password = None;
+        sasl_cfg.region = Some("eu-central-1".to_string());
+
+        let auth = security.to_auth_config().expect("auth config");
+        let credentials = auth.aws_msk_iam_credentials().expect("msk credentials");
+
+        unsafe {
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("AWS_SESSION_TOKEN");
+        }
+
+        assert_eq!(credentials.region(), "eu-central-1");
+        assert!(
+            credentials.has_session_token(),
+            "the region override must not discard AWS_SESSION_TOKEN"
+        );
+    }
+
+    static AWS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A certificate without its key falls back to a server-only handshake, and
+    /// the broker then rejects the client with an error naming neither field.
+    #[test]
+    fn mtls_requires_both_certificate_and_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("client.pem");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\n").expect("write cert");
+
+        let security = KafkaSecurityConfig {
+            protocol: KafkaSecurityProtocol::Tls,
+            ssl_certificate_location: Some(cert),
+            ..KafkaSecurityConfig::default()
+        };
+        let err = security.validate().expect_err("must reject");
+        assert!(err.contains("ssl_key_location"), "unexpected: {err}");
+    }
+
+    // ─── Kafka producer tuning ───────────────────────────────────────────────
+
+    /// krafka 0.15's transactional builder had no `compression_level`, so this sink
+    /// rejected the pairing rather than accept a silently discarded setting. 0.16
+    /// brought the transactional builder to parity, so exactly-once no longer costs
+    /// the tuning knob.
+    #[test]
+    fn compression_level_is_accepted_for_transactional_delivery() {
+        let mut cfg = sample_kafka_config("kafka:9092");
+        cfg.delivery_mode = KafkaDeliveryMode::Transactional;
+        cfg.transactional_id = Some("cdc-pipeline-1".to_string());
+        cfg.compression = KafkaCompression::Zstd;
+        cfg.compression_level = Some(9);
+        cfg.validate()
+            .expect("transactional + compression_level must be valid");
+    }
+
+    #[test]
+    fn compression_level_is_rejected_for_codecs_without_one() {
+        let mut cfg = sample_kafka_config("kafka:9092");
+        cfg.compression = KafkaCompression::Snappy;
+        cfg.compression_level = Some(3);
+        let err = cfg.validate().expect_err("must reject");
+        assert!(err.contains("has no level"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn compression_level_is_range_checked_per_codec() {
+        let mut cfg = sample_kafka_config("kafka:9092");
+        cfg.compression = KafkaCompression::Gzip;
+        cfg.compression_level = Some(12);
+        let err = cfg.validate().expect_err("must reject");
+        assert!(err.contains("out of range for gzip"), "unexpected: {err}");
+
+        cfg.compression = KafkaCompression::Zstd;
+        cfg.compression_level = Some(12);
+        cfg.validate().expect("12 is in zstd's range");
+    }
+
+    /// Above five in-flight requests, a retried batch can land after one produced
+    /// later — the ordering guarantee the idempotent producer exists to give.
+    #[test]
+    fn max_in_flight_is_capped_at_the_idempotence_limit() {
+        let mut cfg = sample_kafka_config("kafka:9092");
+        cfg.max_in_flight = 6;
+        let err = cfg.validate().expect_err("must reject");
+        assert!(err.contains("preserves ordering"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn tls_reload_without_tls_is_rejected() {
+        let mut cfg = sample_kafka_config("kafka:9092");
+        cfg.transport.tls_reload_interval_ms = 30_000;
+        let err = cfg.validate().expect_err("must reject");
+        assert!(
+            err.contains("no certificate to reload"),
+            "unexpected: {err}"
         );
     }
 
@@ -1174,6 +1733,9 @@ topic = "cdc-checkpoint-state"
             max_commit_retries: 5,
             retry_backoff_ms: 50,
             retry_backoff_max_ms: 1_000,
+            parquet_compression: Default::default(),
+            parquet_row_group_rows: 1_048_576,
+            snapshot_expiry: Default::default(),
             max_pending_events: 100_000,
             max_pending_bytes: 256 * 1024 * 1024,
             storage: Default::default(),
@@ -1206,6 +1768,9 @@ topic = "cdc-checkpoint-state"
             max_commit_retries: 5,
             retry_backoff_ms: 50,
             retry_backoff_max_ms: 1_000,
+            parquet_compression: Default::default(),
+            parquet_row_group_rows: 1_048_576,
+            snapshot_expiry: Default::default(),
             max_pending_events: 100_000,
             max_pending_bytes: 256 * 1024 * 1024,
             storage: Default::default(),

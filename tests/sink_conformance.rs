@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use rustcdc::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use rustcdc::core::{Event, Operation, SourceMetadata};
 use rustcdc::sink::{AdapterConformanceSuite, AdapterGoldenFixture, BasicAdapterConformance};
 use serde_json::json;
 use tempfile::tempdir;
@@ -21,26 +21,13 @@ use rustcdc::sink::StdoutSink;
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn make_event(table: &str, id: i64) -> Event {
-    Event {
-        before: None,
-        after: Some(json!({"id": id, "table": table})),
-        op: Operation::Insert,
-        source: SourceMetadata {
-            source_name: "test".to_string(),
-            offset: format!("0/{id}"),
-            timestamp: id as u64,
-        },
-        ts: id as u64,
-        schema: Some("public".to_string()),
-        table: table.to_string(),
-        primary_key: Some(vec!["id".to_string()]),
-        snapshot: None,
-        transaction: None,
-        envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
-        unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
-    }
+    Event::builder(table, Operation::Insert)
+        .after(json!({"id": id, "table": table}))
+        .source(SourceMetadata::new("test", format!("0/{id}"), id as u64))
+        .ts(id as u64)
+        .schema("public")
+        .primary_key(["id"])
+        .build()
 }
 
 fn fixture_batch(table: &str, count: usize) -> AdapterGoldenFixture {
@@ -247,7 +234,7 @@ async fn file_jsonl_sink_rotation_produces_unique_filenames() {
         .collect();
 
     // All rotated filenames must be unique (the instance_id UUID ensures this
-    // even when multiple rotations happen within the same millisecond — CR-019).
+    // even when multiple rotations happen within the same millisecond).
     let unique_count = rotated
         .iter()
         .collect::<std::collections::HashSet<_>>()

@@ -2,8 +2,8 @@ use super::run_lifecycle::finalize_runtime_shutdown;
 use super::run_loop::{execute_event_loop, RuntimeLoopConfig};
 use super::run_reconciliation::{CheckpointTxnReconciler, RecoveredMarkerInfo};
 use rustcdc::core::{
-    CdcRuntime, ConnectionRetryPolicy, PostCommitSourceConfirmPolicy, RuntimeConfig,
-    RuntimeOptions, TransformErrorPolicy,
+    CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, PostCommitSourceConfirmPolicy,
+    RuntimeConfig, RuntimeOptions, TransactionBoundaryPolicy, TransformErrorPolicy,
 };
 use rustcdc::PostgresSourceConfig;
 use std::path::{Path, PathBuf};
@@ -101,14 +101,22 @@ async fn run_pipeline(
     }
 
     // ── Sink ──────────────────────────────────────────────────────────────
-    let mut sink = crate::pipeline::binding::build_router(&app_config).await?;
+    //
+    // Built before the state backend, and that order is load-bearing rather than
+    // incidental: end-to-end exactly-once needs the checkpoint written inside the sink's
+    // Kafka transaction, so the state backend has to be handed the sink's producer. The
+    // dependency runs sink → state, so the sink must exist first.
+    let crate::pipeline::binding::BuiltRouter {
+        router: mut sink,
+        transaction_handle,
+    } = crate::pipeline::binding::build_router(&app_config).await?;
     let transform_pipeline = transform::TransformPipeline::from_config(
         app_config.pipeline.transform_runtime.clone(),
         app_config.pipeline.transforms.clone(),
     )?;
 
     // ── Backend dispatch ──────────────────────────────────────────────────
-    let state = crate::state::build(&app_config.state).await?;
+    let state = crate::state::build(&app_config.state, transaction_handle).await?;
     run_with_runtime_state(
         app_config,
         admin_state,
@@ -137,6 +145,7 @@ async fn run_with_runtime_state(
         checkpoint,
         schema_history,
         checkpoint_age_source,
+        remote_lease,
     } = state;
 
     if let Some(recovery) = recovered_marker.as_ref() {
@@ -161,14 +170,63 @@ async fn run_with_runtime_state(
                     PostCommitSourceConfirmPolicy::FailFast
                 }
             },
+        )
+        .with_transaction_boundary(match app_config.runtime.transaction_boundary {
+            config::schema::RuntimeTransactionBoundaryPolicy::Split => {
+                TransactionBoundaryPolicy::Split
+            }
+            config::schema::RuntimeTransactionBoundaryPolicy::PreserveTransactions => {
+                TransactionBoundaryPolicy::PreserveTransactions
+            }
+        })
+        .with_event_validation(app_config.runtime.validate_events)
+        // The runtime's own byte guard, so an oversized event is refused where it is
+        // produced. cdc-server also checks at encode time, which is the later of the
+        // two and cannot stop the event from being buffered first.
+        .with_max_event_bytes(app_config.runtime.max_event_bytes)
+        .with_sink_close_timeout_ms(
+            (app_config.runtime.sink_close_timeout_ms > 0)
+                .then_some(app_config.runtime.sink_close_timeout_ms),
         );
 
+    let options = if app_config.runtime.idempotency.enabled {
+        let idempotency = IdempotencyOptions::new(app_config.runtime.idempotency.capacity)
+            .map_err(|e| AppError::Other(format!("runtime.idempotency.capacity: {e}")))?;
+        let idempotency = if app_config.runtime.idempotency.ttl_ms > 0 {
+            idempotency
+                .with_ttl_ms(app_config.runtime.idempotency.ttl_ms)
+                .map_err(|e| AppError::Other(format!("runtime.idempotency.ttl_ms: {e}")))?
+        } else {
+            idempotency
+        };
+        options.with_idempotency(idempotency)
+    } else {
+        options.with_idempotency_disabled()
+    };
+
+    let options = if app_config.runtime.schema_history_max_versions_per_table > 0 {
+        let retention = rustcdc::schema_history::SchemaHistoryRetention::keep_last(
+            app_config.runtime.schema_history_max_versions_per_table,
+        )
+        .map_err(|e| {
+            AppError::Other(format!(
+                "runtime.schema_history_max_versions_per_table: {e}"
+            ))
+        })?;
+        options.with_schema_history_retention(retention)
+    } else {
+        options
+    };
+
     let options = if app_config.runtime.source_connection_retry.enabled {
-        let mut policy = ConnectionRetryPolicy::default();
-        policy.max_retries = app_config.runtime.source_connection_retry.max_retries;
-        policy.initial_delay_ms = app_config.runtime.source_connection_retry.initial_delay_ms;
-        policy.max_delay_ms = app_config.runtime.source_connection_retry.max_delay_ms;
-        options.with_connection_retry(policy)
+        // `ConnectionRetryPolicy` stopped being `#[non_exhaustive]` in rustcdc 0.8, so
+        // every field is named here — a field added upstream becomes a compile error
+        // instead of silently keeping its default under an operator's explicit config.
+        options.with_connection_retry(ConnectionRetryPolicy {
+            max_retries: app_config.runtime.source_connection_retry.max_retries,
+            initial_delay_ms: app_config.runtime.source_connection_retry.initial_delay_ms,
+            max_delay_ms: app_config.runtime.source_connection_retry.max_delay_ms,
+        })
     } else {
         let mut options = options;
         options.connection_retry = None;
@@ -178,7 +236,15 @@ async fn run_with_runtime_state(
     let runtime_config =
         RuntimeConfig::new(source_config, checkpoint, schema_history).with_options(options);
 
-    let runtime_config = if app_config.snapshot_tables.is_empty() {
+    // `snapshot_tables` and `incremental_snapshot` are two bootstrapping paths for the
+    // same job, and the loader rejects setting both — a runtime that received both would
+    // read every listed table twice.
+    let runtime_config = if app_config.incremental_snapshot.is_enabled() {
+        runtime_config.with_incremental_snapshot(
+            rustcdc::IncrementalSnapshotConfig::new(app_config.incremental_snapshot.tables.clone())
+                .with_chunk_size(app_config.incremental_snapshot.chunk_size),
+        )
+    } else if app_config.snapshot_tables.is_empty() {
         runtime_config
     } else {
         runtime_config.with_snapshot_tables(app_config.snapshot_tables.clone())
@@ -201,7 +267,7 @@ async fn run_with_runtime_state(
     let sink_transactional_checkpoint_barrier_capable =
         sink.transactional_checkpoint_barrier_capable();
 
-    // CR-016: Enforce parity-mode contract at startup so the operator gets an
+    // Enforce the parity-mode contract at startup so the operator gets an
     // explicit error rather than a silently-degraded effectively_once guarantee.
     super::run_batch::validate_parity_contract(
         checkpoint_parity_mode,
@@ -242,6 +308,19 @@ async fn run_with_runtime_state(
     // We use poll_event_batch() instead of event_batches() so we can call
     // commit_ack / stop / admin snapshot in the same loop body
     // without a persistent mutable borrow of `runtime`.
+    // Built before the loop so a misconfigured dead-letter target fails at startup
+    // rather than at the moment it is first needed — which is during an incident.
+    let dlq = crate::dlq::DeadLetterQueue::build(&app_config.dlq)
+        .await?
+        .map(tokio::sync::Mutex::new);
+    if let Some(queue) = dlq.as_ref() {
+        tracing::info!(
+            target = queue.lock().await.target_name(),
+            "dead-letter quarantine enabled: permanently undeliverable events will be \
+             recorded and the pipeline will advance past them"
+        );
+    }
+
     let loop_outcome = execute_event_loop(
         &mut runtime,
         sink,
@@ -250,8 +329,8 @@ async fn run_with_runtime_state(
         admin_exit_rx,
         &checkpoint_age_source,
         &mut checkpoint_txn_reconciler,
+        dlq.as_ref(),
         RuntimeLoopConfig {
-            max_event_bytes: app_config.runtime.max_event_bytes,
             prepare_parallelism: app_config.runtime.prepare_parallelism,
             sink_flush_interval_events: app_config.runtime.sink_flush_interval_events,
             sink_delivery_queue_capacity: app_config.runtime.sink_delivery_queue_capacity,
@@ -290,7 +369,32 @@ async fn run_with_runtime_state(
     )
     .await;
 
-    finalize_runtime_shutdown(&mut runtime, sink, &admin_state, loop_outcome).await
+    // Reported at shutdown, where the hit counters cover the whole run: a mask rule
+    // that never matched means those columns went out unmasked, and nothing else says
+    // so — the rule looks configured and does nothing.
+    transform_pipeline.report_unmatched_rules();
+
+    let shutdown = finalize_runtime_shutdown(&mut runtime, sink, &admin_state, loop_outcome).await;
+
+    // Stop the admin background workers before the lease is released. The signal-action
+    // worker mutates the same `AdminStateData` the shutdown counters above were just
+    // written to, and the signal ingress workers can still enqueue work; leaving either
+    // running past this point makes the exit-time state a race rather than a report.
+    admin_state.shutdown_workers().await;
+
+    // Release the remote state lease last, once nothing can write a checkpoint any
+    // more. Doing it earlier would open a window where a successor could acquire the
+    // lease while this process still had a durability path open.
+    //
+    // This is best-effort by design — the TTL is what makes the lease correct, and this
+    // only spares a successor from waiting it out. That matters in practice: with
+    // `strategy: Recreate` the replacement pod starts the moment this one exits, and
+    // without the release it would sit refusing to start for a full lease TTL.
+    if let Some(lease) = remote_lease {
+        lease.release().await;
+    }
+
+    shutdown
 }
 
 async fn record_post_recovery_checkpoint_proof(
@@ -395,7 +499,7 @@ impl Drop for StateDirLock {
 ///
 /// The name-verification step prevents a recycled PID from blocking startup:
 /// if an unrelated process now holds that PID the lock is considered stale
-/// and is overwritten (CR-017).
+/// and is overwritten.
 ///
 /// Existence is checked via POSIX `kill -0` semantics (no signal is sent).
 /// The name is then verified via `/proc/{pid}/cmdline` (Linux) or
@@ -567,9 +671,8 @@ async fn query_slot_lag_bytes(pg: &PostgresSourceConfig) -> Result<i64, AppError
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::ensure_state_layout;
-    use crate::commands::run_batch::{encode_event_json_bytes, enforce_event_size_limit};
     use crate::commands::run_metrics::{
         recoverable_error_metrics_prometheus, sink_metrics_prometheus,
     };
@@ -582,46 +685,53 @@ mod tests {
         OffsetStoreConfig, SchemaHistoryStoreConfig, SinkConfig, StateBackend, StateConfig,
         StdoutSinkConfig,
     };
-    use rustcdc::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use rustcdc::core::{Event, Operation, SourceMetadata};
     use serde_json::json;
 
     fn sample_event(name: &str) -> Event {
-        Event {
-            before: None,
-            after: Some(json!({"id": 1, "name": name})),
-            op: Operation::Insert,
-            source: SourceMetadata {
-                source_name: "postgres".to_string(),
-                offset: "0/16B6A70".to_string(),
-                timestamp: 1,
-            },
-            ts: 1,
-            schema: Some("public".to_string()),
-            table: "users".to_string(),
-            primary_key: Some(vec!["id".to_string()]),
-            snapshot: None,
-            transaction: None,
-            envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
-            unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
-        }
+        Event::builder("users", Operation::Insert)
+            .after(json!({"id": 1, "name": name}))
+            .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+            .ts(1)
+            .schema("public")
+            .primary_key(["id"])
+            .build()
     }
 
-    #[test]
-    fn event_size_limit_rejects_oversized_event() {
-        let event = sample_event(&"x".repeat(4096));
-        let event_json =
-            encode_event_json_bytes(&event, 64).expect_err("expected size limit failure");
-        let err = event_json;
-        assert!(err.to_string().contains("runtime.max_event_bytes"));
+    /// The limit is enforced against the payload the transport actually sends.
+    ///
+    /// It used to be enforced against a JSON rendering produced solely to be measured
+    /// and then discarded — 13.9 us per event of waste, and for a non-JSON codec it
+    /// measured bytes that were never transmitted. These tests drive a real
+    /// `SinkBinding`, so they check the limit where it now lives.
+    #[tokio::test]
+    async fn event_size_limit_rejects_an_oversized_encoded_payload() {
+        let mut binding =
+            crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()), 64)
+                .await
+                .expect("stdout binding");
+
+        let err = binding
+            .send_event(&sample_event(&"x".repeat(4096)))
+            .await
+            .expect_err("an event far over the limit must be rejected");
+        assert!(
+            err.to_string().contains("runtime.max_event_bytes"),
+            "the error must name the setting the operator has to change: {err}"
+        );
     }
 
-    #[test]
-    fn event_size_limit_allows_small_event() {
-        let event = sample_event("ok");
-        let event_json = encode_event_json_bytes(&event, 4096).expect("expected size limit pass");
-        enforce_event_size_limit(&event_json, 4096).expect("expected size limit pass");
+    #[tokio::test]
+    async fn event_size_limit_allows_a_payload_within_the_limit() {
+        let mut binding =
+            crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()), 4096)
+                .await
+                .expect("stdout binding");
+
+        binding
+            .send_event(&sample_event("ok"))
+            .await
+            .expect("a small event must pass");
     }
 
     #[test]
@@ -670,12 +780,12 @@ mod tests {
 
     #[test]
     fn sink_metrics_include_send_and_flush_signals() {
-        let sink_send_latency_buckets = [1, 1, 0, 0, 0, 0, 0, 0];
-        let sink_flush_latency_buckets = [0, 0, 1, 0, 1, 0, 0, 0];
-        let transform_latency_buckets = [0, 1, 0, 1, 0, 0, 0, 0];
-        let prepare_latency_buckets = [0, 0, 1, 1, 0, 0, 0, 0];
-        let batch_latency_buckets = [0, 1, 0, 1, 0, 0, 1, 0];
-        let checkpoint_latency_buckets = [0, 0, 1, 0, 1, 0, 0, 0];
+        let sink_send_latency_buckets = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let sink_flush_latency_buckets = [0, 0, 1, 0, 1, 0, 0, 0, 0, 0];
+        let transform_latency_buckets = [0, 1, 0, 1, 0, 0, 0, 0, 0, 0];
+        let prepare_latency_buckets = [0, 0, 1, 1, 0, 0, 0, 0, 0, 0];
+        let batch_latency_buckets = [0, 1, 0, 1, 0, 0, 1, 0, 0, 0];
+        let checkpoint_latency_buckets = [0, 0, 1, 0, 1, 0, 0, 0, 0, 0];
         let metrics = sink_metrics_prometheus(
             "stdout",
             "at_least_once",
@@ -721,11 +831,13 @@ mod tests {
             6,
             7,
             8,
+            12, // sink_iceberg_orphaned_data_files_total
             9,
             10,
             11,
         );
         assert!(metrics.contains("rustcdc_sink_send_ops_total{sink=\"stdout\"} 10"));
+        assert!(metrics.contains("rustcdc_iceberg_orphaned_data_files_total{sink=\"stdout\"} 12"));
         assert!(metrics.contains(
             "rustcdc_sink_delivery_contract_requested{sink=\"stdout\",contract=\"at_least_once\"} 1"
         ));
@@ -738,10 +850,15 @@ mod tests {
         assert!(metrics
             .contains("rustcdc_sink_transactional_checkpoint_barrier_capable{sink=\"stdout\"} 0"));
         assert!(metrics.contains("rustcdc_sink_flush_ops_total{sink=\"stdout\"} 4"));
-        assert!(metrics.contains("rustcdc_sink_send_latency_ms_last{sink=\"stdout\"} 7"));
-        assert!(metrics.contains("rustcdc_sink_flush_latency_ms_last{sink=\"stdout\"} 25"));
+        assert!(
+            metrics.contains("rustcdc_sink_send_latency_seconds_last{sink=\"stdout\"} 0.000007")
+        );
+        assert!(
+            metrics.contains("rustcdc_sink_flush_latency_seconds_last{sink=\"stdout\"} 0.000025")
+        );
         assert!(metrics.contains("rustcdc_runtime_transform_ops_total{sink=\"stdout\"} 12"));
-        assert!(metrics.contains("rustcdc_runtime_transform_latency_ms_last{sink=\"stdout\"} 6"));
+        assert!(metrics
+            .contains("rustcdc_runtime_transform_latency_seconds_last{sink=\"stdout\"} 0.000006"));
         assert!(metrics
             .contains("rustcdc_runtime_transform_wasm_instance_pool_size{sink=\"stdout\"} 0"));
         assert!(
@@ -753,29 +870,35 @@ mod tests {
         );
         assert!(metrics.contains("rustcdc_runtime_transform_wasm_timeout_total{sink=\"stdout\"} 0"));
         assert!(metrics.contains("rustcdc_runtime_prepare_ops_total{sink=\"stdout\"} 14"));
-        assert!(metrics.contains("rustcdc_runtime_prepare_latency_ms_last{sink=\"stdout\"} 8"));
-        assert!(
-            metrics.contains("rustcdc_runtime_batch_delivery_latency_ms_last{sink=\"stdout\"} 70")
-        );
         assert!(metrics
-            .contains("rustcdc_runtime_checkpoint_commit_latency_ms_last{sink=\"stdout\"} 9"));
-        assert!(metrics.contains("rustcdc_sink_send_latency_ms_bucket{sink=\"stdout\",le=\"5\"}"));
-        assert!(metrics.contains("rustcdc_sink_flush_latency_ms_bucket{sink=\"stdout\",le=\"50\"}"));
-        assert!(metrics
-            .contains("rustcdc_runtime_transform_latency_ms_bucket{sink=\"stdout\",le=\"25\"}"));
-        assert!(metrics
-            .contains("rustcdc_runtime_prepare_latency_ms_bucket{sink=\"stdout\",le=\"25\"}"));
+            .contains("rustcdc_runtime_prepare_latency_seconds_last{sink=\"stdout\"} 0.000008"));
         assert!(metrics.contains(
-            "rustcdc_runtime_batch_delivery_latency_ms_bucket{sink=\"stdout\",le=\"5\"}"
+            "rustcdc_runtime_batch_delivery_latency_seconds_last{sink=\"stdout\"} 0.00007"
         ));
-        assert!(
-            metrics.contains("rustcdc_runtime_batch_delivery_latency_ms_count{sink=\"stdout\"} 3")
-        );
         assert!(metrics.contains(
-            "rustcdc_runtime_checkpoint_commit_latency_ms_bucket{sink=\"stdout\",le=\"10\"}"
+            "rustcdc_runtime_checkpoint_commit_latency_seconds_last{sink=\"stdout\"} 0.000009"
         ));
         assert!(metrics
-            .contains("rustcdc_runtime_checkpoint_commit_latency_ms_count{sink=\"stdout\"} 2"));
+            .contains("rustcdc_sink_send_latency_seconds_bucket{sink=\"stdout\",le=\"0.0005\"}"));
+        assert!(metrics
+            .contains("rustcdc_sink_flush_latency_seconds_bucket{sink=\"stdout\",le=\"0.01\"}"));
+        assert!(metrics.contains(
+            "rustcdc_runtime_transform_latency_seconds_bucket{sink=\"stdout\",le=\"0.005\"}"
+        ));
+        assert!(metrics.contains(
+            "rustcdc_runtime_prepare_latency_seconds_bucket{sink=\"stdout\",le=\"0.005\"}"
+        ));
+        assert!(metrics.contains(
+            "rustcdc_runtime_batch_delivery_latency_seconds_bucket{sink=\"stdout\",le=\"0.0005\"}"
+        ));
+        assert!(metrics
+            .contains("rustcdc_runtime_batch_delivery_latency_seconds_count{sink=\"stdout\"} 3"));
+        assert!(metrics.contains(
+            "rustcdc_runtime_checkpoint_commit_latency_seconds_bucket{sink=\"stdout\",le=\"0.001\"}"
+        ));
+        assert!(metrics.contains(
+            "rustcdc_runtime_checkpoint_commit_latency_seconds_count{sink=\"stdout\"} 2"
+        ));
         assert!(metrics.contains("rustcdc_sink_queue_depth{sink=\"stdout\"} 3"));
         assert!(metrics.contains("rustcdc_sink_queue_depth_p95{sink=\"stdout\"} 2"));
         assert!(metrics.contains("rustcdc_runtime_soak_duration_seconds{sink=\"stdout\"} 30"));
@@ -788,8 +911,8 @@ mod tests {
         assert!(metrics.contains("rustcdc_sink_http_batch_size_p95{sink=\"stdout\"} 0"));
         assert!(metrics.contains("rustcdc_sink_http_batch_oldest_event_age_ms{sink=\"stdout\"} 0"));
         assert!(metrics.contains("rustcdc_sink_http_pending_events{sink=\"stdout\"} 0"));
-        assert!(metrics.contains("rustcdc_sink_http_retry_delay_ms_p50{sink=\"stdout\"} 0"));
-        assert!(metrics.contains("rustcdc_sink_http_retry_delay_ms_p95{sink=\"stdout\"} 0"));
+        assert!(metrics.contains("rustcdc_sink_http_retry_delay_seconds_p50{sink=\"stdout\"} 0"));
+        assert!(metrics.contains("rustcdc_sink_http_retry_delay_seconds_p95{sink=\"stdout\"} 0"));
         assert!(metrics.contains("rustcdc_sink_retryable_status_429_total{sink=\"stdout\"} 1"));
         assert!(metrics.contains("rustcdc_sink_retryable_status_5xx_total{sink=\"stdout\"} 2"));
         assert!(metrics.contains("rustcdc_sink_retryable_error_timeout_total{sink=\"stdout\"} 3"));
@@ -808,12 +931,12 @@ mod tests {
         assert!(metrics.contains("cdc_data_events_total{sink=\"stdout\"} 0"));
         assert!(metrics.contains("cdc_data_duplicate_rate{sink=\"stdout\"} 0"));
         assert!(metrics.contains("cdc_data_reorder_rate{sink=\"stdout\"} 0"));
-        assert!(metrics.contains("cdc_end_to_end_ack_lag_ms_avg{sink=\"stdout\"} 0"));
+        assert!(metrics.contains("cdc_end_to_end_ack_lag_seconds_avg{sink=\"stdout\"} 0"));
     }
 
     #[test]
     fn sink_metrics_include_idempotent_kafka_signals() {
-        let zeros = [0u64; 8];
+        let zeros = [0u64; 10];
         let metrics = sink_metrics_prometheus(
             "kafka",
             "effectively_once",
@@ -862,6 +985,7 @@ mod tests {
             0,
             0,
             0,
+            0,
         );
 
         assert!(metrics.contains(
@@ -878,7 +1002,12 @@ mod tests {
             .contains("rustcdc_sink_transactional_checkpoint_barrier_capable{sink=\"kafka\"} 0"));
     }
 
-    fn minimal_config(state_dir: std::path::PathBuf, backend: StateBackend) -> AppConfig {
+    /// Also used by `delivery_contract_tests`, which needs a valid `AppConfig` to
+    /// build a real router, admin state and state backend.
+    pub(crate) fn minimal_config(
+        state_dir: std::path::PathBuf,
+        backend: StateBackend,
+    ) -> AppConfig {
         use crate::config::schema::{SourceConfig, SourceDriver};
         let pg = rustcdc::PostgresSourceConfig {
             host: "localhost".to_string(),
@@ -923,6 +1052,8 @@ mod tests {
             pipeline: Default::default(),
             registries: Default::default(),
             snapshot_tables: Vec::new(),
+            incremental_snapshot: Default::default(),
+            dlq: Default::default(),
             sinks: Vec::new(),
         }
     }

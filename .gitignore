@@ -2,8 +2,12 @@
 /target/
 **/*.rs.bk
 
-# Tooling caches
-/.cargo/
+# Tooling caches — but not the checked-in build config. `.cargo/config.toml` carries
+# the `[env]` block the test suite depends on (deferred-secret fixtures, the prefixed
+# non-config variables that guard unknown-key detection). Without it a fresh clone
+# fails the whole suite for reasons that look nothing like the cause.
+/.cargo/*
+!/.cargo/config.toml
 
 # OS/editor noise
 .DS_Store
@@ -19,3 +23,11 @@
 FINDINGS.md
 REVIEW.md
 REFACTOR.md
+
+# Zola build output — the site is built in CI and published to Pages, never committed.
+/site/public/
+
+# cargo-fuzz artefacts (corpora and crashes are kept out of the repo).
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/

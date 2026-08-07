@@ -14,25 +14,100 @@ use crate::sink::{
 };
 use crate::state;
 
-pub(super) const LATENCY_HISTOGRAM_BUCKETS_MS: [u64; 8] = [1, 5, 10, 25, 50, 100, 250, 500];
+/// Histogram bounds in **microseconds**, exported as seconds.
+///
+/// Latency was previously captured with `as_millis()` against bounds starting at 1 ms.
+/// Per-event work is microseconds — a JSON encode of a representative event measures
+/// 13.9 us — so every observation truncated to `0` and landed in the `le="1"` bucket.
+/// `_sum` accumulated zeros, every quantile returned the same bucket floor, and a 90x
+/// regression produced no change in any exported series. That is how the double-encode
+/// on the send path (a measured 13.9 us per event) stayed invisible.
+///
+/// These bounds span both regimes in one family: 100 us to 5 ms covers per-event
+/// transform, prepare and encode work; 10 ms to 5 s covers network sinks and
+/// checkpoint commits.
+pub(super) const LATENCY_HISTOGRAM_BUCKETS_US: [u64; 10] = [
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
+];
 
-pub(super) fn observe_latency_histogram_bucket(
-    buckets: &mut [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
-    latency_ms: u64,
+/// Bucket bounds for **end-to-end lag**, in milliseconds.
+///
+/// A separate family from [`LATENCY_HISTOGRAM_BUCKETS_US`] because the two measure
+/// different things over different ranges. Per-operation latency tops out at 5 s, and a
+/// freshness histogram cut to those bounds collapses into `+Inf` the moment a pipeline
+/// falls behind — which is precisely when the percentile is worth reading.
+///
+/// The bounds span 100 ms to an hour so that `histogram_quantile` stays meaningful across
+/// the whole useful range: sub-second for a healthy pipeline, seconds for a busy one,
+/// minutes for one recovering from a backlog, and an hour before a value is genuinely
+/// off-scale.
+pub(super) const END_TO_END_LAG_BUCKETS_MS: [u64; 12] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 300_000, 900_000, 3_600_000,
+];
+
+pub(super) fn observe_lag_histogram_bucket(
+    buckets: &mut [u64; END_TO_END_LAG_BUCKETS_MS.len()],
+    lag_ms: u64,
 ) {
-    for (index, upper_bound_ms) in LATENCY_HISTOGRAM_BUCKETS_MS.iter().enumerate() {
-        if latency_ms <= *upper_bound_ms {
+    for (index, upper_bound_ms) in END_TO_END_LAG_BUCKETS_MS.iter().enumerate() {
+        if lag_ms <= *upper_bound_ms {
             buckets[index] = buckets[index].saturating_add(1);
             return;
         }
     }
 }
 
-fn average_latency_ms(total_latency_ms: u64, sample_count: u64) -> f64 {
+/// Microseconds to seconds — Prometheus exports base units.
+pub(super) fn micros_to_seconds(micros: u64) -> f64 {
+    micros as f64 / 1_000_000.0
+}
+
+pub(super) fn observe_latency_histogram_bucket(
+    buckets: &mut [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
+    latency_us: u64,
+) {
+    for (index, upper_bound_us) in LATENCY_HISTOGRAM_BUCKETS_US.iter().enumerate() {
+        if latency_us <= *upper_bound_us {
+            buckets[index] = buckets[index].saturating_add(1);
+            return;
+        }
+    }
+}
+
+/// Plain arithmetic mean. No unit conversion — use for ratios and counts.
+///
+/// This exists separately from [`average_latency_seconds`] because the latency helper
+/// used to be a general-purpose mean, and converting *it* to seconds silently divided
+/// a reorder **ratio** by a million. A helper whose name promises a unit must not be
+/// reachable from a call site that has no unit.
+fn mean(total: u64, sample_count: u64) -> f64 {
     if sample_count == 0 {
         0.0
     } else {
-        total_latency_ms as f64 / sample_count as f64
+        total as f64 / sample_count as f64
+    }
+}
+
+/// Milliseconds to seconds, for the few signals captured at millisecond scale.
+pub(super) fn millis_to_seconds(millis: u64) -> f64 {
+    millis as f64 / 1_000.0
+}
+
+/// Mean latency in **seconds**, from a millisecond total.
+fn average_latency_seconds_from_millis(total_latency_ms: u64, sample_count: u64) -> f64 {
+    if sample_count == 0 {
+        0.0
+    } else {
+        millis_to_seconds(total_latency_ms) / sample_count as f64
+    }
+}
+
+/// Mean latency in **seconds**, from a microsecond total.
+fn average_latency_seconds(total_latency_us: u64, sample_count: u64) -> f64 {
+    if sample_count == 0 {
+        0.0
+    } else {
+        micros_to_seconds(total_latency_us) / sample_count as f64
     }
 }
 
@@ -59,6 +134,14 @@ fn quantile_u64_histogram_upper_bound(
 }
 
 const MAX_CORRECTNESS_STREAMS: usize = 128;
+
+/// Cap on `rustcdc_transform_rules_unmatched` series.
+///
+/// Cardinality is bounded by *configured* rules rather than by data, so this is a
+/// backstop rather than a live risk — but the correctness-stream metric next to it is
+/// capped, and an uncapped neighbour is how the next metric ends up uncapped too. A
+/// config with hundreds of mask paths would otherwise emit hundreds of series.
+const MAX_UNMATCHED_RULE_SERIES: usize = 64;
 const MILLIS_THRESHOLD: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone)]
@@ -207,7 +290,36 @@ impl PrometheusTextEncoder {
         name: &str,
         help: &str,
         labels: &[MetricLabel<'_>],
-        buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+        buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
+        sum: u64,
+        count: u64,
+    ) {
+        self.histogram_with_bounds(
+            name,
+            help,
+            labels,
+            &LATENCY_HISTOGRAM_BUCKETS_US,
+            buckets,
+            micros_to_seconds,
+            sum,
+            count,
+        );
+    }
+
+    /// Emit a histogram family over an arbitrary set of upper bounds.
+    ///
+    /// `to_seconds` converts both the bounds and the sum, because a Prometheus histogram
+    /// is only coherent when `le` labels and `_sum` share one unit — and
+    /// `histogram_quantile` inherits whatever unit the bounds carry.
+    #[allow(clippy::too_many_arguments)] // one Prometheus family, fully specified
+    fn histogram_with_bounds(
+        &mut self,
+        name: &str,
+        help: &str,
+        labels: &[MetricLabel<'_>],
+        bounds: &[u64],
+        buckets: &[u64],
+        to_seconds: fn(u64) -> f64,
         sum: u64,
         count: u64,
     ) {
@@ -216,31 +328,34 @@ impl PrometheusTextEncoder {
             let _ = writeln!(self.output, "# TYPE {name} histogram");
         }
 
+        // Hoisted: this used to be re-`format!`ed once per bucket per series per scrape.
+        let bucket_name = format!("{name}_bucket");
+
         let mut cumulative_count = 0u64;
-        for (index, upper_bound_ms) in LATENCY_HISTOGRAM_BUCKETS_MS.iter().enumerate() {
+        let mut bucket_labels = Vec::with_capacity(labels.len() + 1);
+        for (index, upper_bound) in bounds.iter().enumerate() {
             cumulative_count = cumulative_count.saturating_add(buckets[index]);
 
-            let mut bucket_labels = Vec::with_capacity(labels.len() + 1);
+            bucket_labels.clear();
             bucket_labels.extend_from_slice(labels);
             bucket_labels.push(MetricLabel {
                 key: "le",
-                value: Cow::Owned(upper_bound_ms.to_string()),
+                // Bounds are stored in the family's native integer unit and exported in
+                // seconds, because Prometheus metric families are denominated in base
+                // units and `histogram_quantile` results inherit the bound's unit.
+                value: Cow::Owned(to_seconds(*upper_bound).to_string()),
             });
-            self.write_metric_value_line(
-                &format!("{name}_bucket"),
-                &bucket_labels,
-                cumulative_count,
-            );
+            self.write_metric_value_line(&bucket_name, &bucket_labels, cumulative_count);
         }
 
-        let mut inf_labels = Vec::with_capacity(labels.len() + 1);
-        inf_labels.extend_from_slice(labels);
-        inf_labels.push(MetricLabel {
+        bucket_labels.clear();
+        bucket_labels.extend_from_slice(labels);
+        bucket_labels.push(MetricLabel {
             key: "le",
             value: Cow::Borrowed("+Inf"),
         });
-        self.write_metric_value_line(&format!("{name}_bucket"), &inf_labels, count);
-        self.write_metric_value_line(&format!("{name}_sum"), labels, sum);
+        self.write_metric_value_line(&bucket_name, &bucket_labels, count);
+        self.write_metric_value_line(&format!("{name}_sum"), labels, to_seconds(sum));
         self.write_metric_value_line(&format!("{name}_count"), labels, count);
     }
 
@@ -357,7 +472,7 @@ impl RecoverableErrorMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SinkMetricsSnapshot {
     sink_name: String,
     requested_delivery_contract: String,
@@ -366,40 +481,42 @@ pub(crate) struct SinkMetricsSnapshot {
     sink_idempotent_delivery_capable: bool,
     sink_transactional_checkpoint_barrier_capable: bool,
     sink_send_ops_total: u64,
-    sink_send_latency_ms_total: u64,
-    sink_send_latency_ms_last: u64,
-    sink_send_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_send_latency_us_total: u64,
+    sink_send_latency_us_last: u64,
+    sink_send_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_flush_ops_total: u64,
-    sink_flush_latency_ms_total: u64,
-    sink_flush_latency_ms_last: u64,
-    sink_flush_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_flush_latency_us_total: u64,
+    sink_flush_latency_us_last: u64,
+    sink_flush_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     transform_ops_total: u64,
-    transform_latency_ms_total: u64,
-    transform_latency_ms_last: u64,
-    transform_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    transform_latency_us_total: u64,
+    transform_latency_us_last: u64,
+    transform_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     transform_wasm_instance_pool_size: u64,
     transform_wasm_invocations_total: u64,
     transform_wasm_errors_total: u64,
     transform_wasm_filtered_total: u64,
     transform_wasm_timeout_total: u64,
+    unmatched_transform_rules: Vec<rustcdc::transform::UnmatchedRule>,
     prepare_ops_total: u64,
-    prepare_latency_ms_total: u64,
-    prepare_latency_ms_last: u64,
-    prepare_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    prepare_latency_us_total: u64,
+    prepare_latency_us_last: u64,
+    prepare_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     batch_delivery_ops_total: u64,
-    batch_delivery_latency_ms_total: u64,
-    batch_delivery_latency_ms_last: u64,
-    batch_delivery_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    batch_delivery_latency_us_total: u64,
+    batch_delivery_latency_us_last: u64,
+    batch_delivery_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     checkpoint_commit_ops_total: u64,
-    checkpoint_commit_latency_ms_total: u64,
-    checkpoint_commit_latency_ms_last: u64,
-    checkpoint_commit_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    checkpoint_commit_latency_us_total: u64,
+    checkpoint_commit_latency_us_last: u64,
+    checkpoint_commit_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_queue_depth_last: u64,
     sink_queue_depth_p95: u64,
     runtime_soak_duration_seconds: u64,
     sink_retry_rate: f64,
     sink_retries_total: u64,
     sink_dlq_total: u64,
+    dlq_events_quarantined_total: u64,
     sink_http_requests_total: u64,
     sink_http_request_amplification: f64,
     sink_http_batch_size_p50: u64,
@@ -423,15 +540,23 @@ pub(crate) struct SinkMetricsSnapshot {
     sink_terminal_status_other_total: u64,
     sink_terminal_error_timeout_total: u64,
     sink_terminal_error_other_total: u64,
+    sink_iceberg_orphaned_data_files_total: u64,
     sink_iceberg_flush_lock_contention_events_total: u64,
     sink_iceberg_flush_lock_contention_ms_total: u64,
     sink_iceberg_flush_lock_contention_ms_max: u64,
+    sink_kafka_oauth_token_fetches_total: u64,
+    sink_kafka_oauth_token_fetch_failures_total: u64,
+    sink_kafka_oauth_token_expiry_epoch_ms: u64,
     data_events_total: u64,
     data_duplicates_total: u64,
     data_reorders_total: u64,
     end_to_end_ack_lag_samples_total: u64,
     end_to_end_ack_lag_ms_total: u64,
     end_to_end_ack_lag_ms_last: u64,
+    /// Bucketed lag, so a percentile SLO is expressible. The mean alone cannot
+    /// express one: 99% at 200 ms and 1% at ten minutes reports a healthy
+    /// average and pages nobody.
+    end_to_end_ack_lag_ms_buckets: [u64; END_TO_END_LAG_BUCKETS_MS.len()],
     stream_correctness: Vec<StreamCorrectnessMetricsSnapshot>,
 }
 
@@ -534,16 +659,16 @@ impl SinkMetricsSnapshot {
             },
         );
         encoder.gauge(
-            "rustcdc_sink_send_latency_ms_avg",
-            "Average sink send latency in milliseconds",
+            "rustcdc_sink_send_latency_seconds_avg",
+            "Average sink send latency in seconds",
             &sink_labels,
-            average_latency_ms(self.sink_send_latency_ms_total, self.sink_send_ops_total),
+            average_latency_seconds(self.sink_send_latency_us_total, self.sink_send_ops_total),
         );
         encoder.gauge(
-            "rustcdc_sink_send_latency_ms_last",
-            "Last sink send latency in milliseconds",
+            "rustcdc_sink_send_latency_seconds_last",
+            "Last sink send latency in seconds",
             &sink_labels,
-            self.sink_send_latency_ms_last,
+            micros_to_seconds(self.sink_send_latency_us_last),
         );
         encoder.counter(
             "rustcdc_sink_flush_ops_total",
@@ -552,16 +677,16 @@ impl SinkMetricsSnapshot {
             self.sink_flush_ops_total,
         );
         encoder.gauge(
-            "rustcdc_sink_flush_latency_ms_avg",
-            "Average sink flush latency in milliseconds",
+            "rustcdc_sink_flush_latency_seconds_avg",
+            "Average sink flush latency in seconds",
             &sink_labels,
-            average_latency_ms(self.sink_flush_latency_ms_total, self.sink_flush_ops_total),
+            average_latency_seconds(self.sink_flush_latency_us_total, self.sink_flush_ops_total),
         );
         encoder.gauge(
-            "rustcdc_sink_flush_latency_ms_last",
-            "Last sink flush latency in milliseconds",
+            "rustcdc_sink_flush_latency_seconds_last",
+            "Last sink flush latency in seconds",
             &sink_labels,
-            self.sink_flush_latency_ms_last,
+            micros_to_seconds(self.sink_flush_latency_us_last),
         );
         encoder.counter(
             "rustcdc_runtime_transform_ops_total",
@@ -570,16 +695,16 @@ impl SinkMetricsSnapshot {
             self.transform_ops_total,
         );
         encoder.gauge(
-            "rustcdc_runtime_transform_latency_ms_avg",
-            "Average event transform latency in milliseconds",
+            "rustcdc_runtime_transform_latency_seconds_avg",
+            "Average event transform latency in seconds",
             &sink_labels,
-            average_latency_ms(self.transform_latency_ms_total, self.transform_ops_total),
+            average_latency_seconds(self.transform_latency_us_total, self.transform_ops_total),
         );
         encoder.gauge(
-            "rustcdc_runtime_transform_latency_ms_last",
-            "Last event transform latency in milliseconds",
+            "rustcdc_runtime_transform_latency_seconds_last",
+            "Last event transform latency in seconds",
             &sink_labels,
-            self.transform_latency_ms_last,
+            micros_to_seconds(self.transform_latency_us_last),
         );
         encoder.gauge(
             "rustcdc_runtime_transform_wasm_instance_pool_size",
@@ -611,6 +736,62 @@ impl SinkMetricsSnapshot {
             &sink_labels,
             self.transform_wasm_timeout_total,
         );
+        // Emitted **only** for rules that are unmatched, so the metric's absence is the
+        // healthy state and `> 0` is a complete alert rule. A rule that starts matching
+        // later stops being reported, because the accumulator recomputes rather than
+        // accumulating. Label values are escaped by the encoder — an operator-written
+        // JSON path can contain a quote, which would otherwise break the whole scrape.
+        for unmatched in self
+            .unmatched_transform_rules
+            .iter()
+            .take(MAX_UNMATCHED_RULE_SERIES)
+        {
+            let labels = [
+                MetricLabel {
+                    key: "sink",
+                    value: Cow::Borrowed(self.sink_name.as_str()),
+                },
+                MetricLabel {
+                    key: "transform",
+                    value: Cow::Borrowed(unmatched.transform.as_str()),
+                },
+                MetricLabel {
+                    key: "kind",
+                    value: Cow::Borrowed(unmatched.kind.as_str()),
+                },
+                MetricLabel {
+                    key: "rule",
+                    value: Cow::Borrowed(unmatched.rule.as_str()),
+                },
+            ];
+            encoder.gauge(
+                "rustcdc_transform_rules_unmatched",
+                "A configured transform rule that has never matched. Transform rules \
+                 match by pattern against a permissive default, so a typo or a renamed \
+                 column disables one silently and nothing errors — a mask rule that \
+                 never fires means a column is shipping in clear text, a route rule \
+                 that never fires means events are going to the default destination",
+                &labels,
+                1u64,
+            );
+        }
+
+        // A silent cap reads as "everything is reported". Publish the overflow so the
+        // alert on this family cannot be quietly incomplete.
+        let suppressed = self
+            .unmatched_transform_rules
+            .len()
+            .saturating_sub(MAX_UNMATCHED_RULE_SERIES);
+        if suppressed > 0 {
+            encoder.gauge(
+                "rustcdc_transform_rules_unmatched_suppressed",
+                "Unmatched transform rules not reported individually because the \
+                 per-scrape series cap was reached. Non-zero means the unmatched-rule \
+                 metric is incomplete",
+                &sink_labels,
+                suppressed as u64,
+            );
+        }
         encoder.counter(
             "rustcdc_runtime_prepare_ops_total",
             "Total event prepare operations (transform + encode)",
@@ -618,16 +799,16 @@ impl SinkMetricsSnapshot {
             self.prepare_ops_total,
         );
         encoder.gauge(
-            "rustcdc_runtime_prepare_latency_ms_avg",
-            "Average event prepare latency in milliseconds",
+            "rustcdc_runtime_prepare_latency_seconds_avg",
+            "Average event prepare latency in seconds",
             &sink_labels,
-            average_latency_ms(self.prepare_latency_ms_total, self.prepare_ops_total),
+            average_latency_seconds(self.prepare_latency_us_total, self.prepare_ops_total),
         );
         encoder.gauge(
-            "rustcdc_runtime_prepare_latency_ms_last",
-            "Last event prepare latency in milliseconds",
+            "rustcdc_runtime_prepare_latency_seconds_last",
+            "Last event prepare latency in seconds",
             &sink_labels,
-            self.prepare_latency_ms_last,
+            micros_to_seconds(self.prepare_latency_us_last),
         );
         encoder.counter(
             "rustcdc_runtime_batch_delivery_ops_total",
@@ -636,19 +817,19 @@ impl SinkMetricsSnapshot {
             self.batch_delivery_ops_total,
         );
         encoder.gauge(
-            "rustcdc_runtime_batch_delivery_latency_ms_avg",
-            "Average runtime batch delivery latency in milliseconds",
+            "rustcdc_runtime_batch_delivery_latency_seconds_avg",
+            "Average runtime batch delivery latency in seconds",
             &sink_labels,
-            average_latency_ms(
-                self.batch_delivery_latency_ms_total,
+            average_latency_seconds(
+                self.batch_delivery_latency_us_total,
                 self.batch_delivery_ops_total,
             ),
         );
         encoder.gauge(
-            "rustcdc_runtime_batch_delivery_latency_ms_last",
-            "Last runtime batch delivery latency in milliseconds",
+            "rustcdc_runtime_batch_delivery_latency_seconds_last",
+            "Last runtime batch delivery latency in seconds",
             &sink_labels,
-            self.batch_delivery_latency_ms_last,
+            micros_to_seconds(self.batch_delivery_latency_us_last),
         );
         encoder.counter(
             "rustcdc_runtime_checkpoint_commit_ops_total",
@@ -657,19 +838,19 @@ impl SinkMetricsSnapshot {
             self.checkpoint_commit_ops_total,
         );
         encoder.gauge(
-            "rustcdc_runtime_checkpoint_commit_latency_ms_avg",
-            "Average checkpoint commit latency in milliseconds",
+            "rustcdc_runtime_checkpoint_commit_latency_seconds_avg",
+            "Average checkpoint commit latency in seconds",
             &sink_labels,
-            average_latency_ms(
-                self.checkpoint_commit_latency_ms_total,
+            average_latency_seconds(
+                self.checkpoint_commit_latency_us_total,
                 self.checkpoint_commit_ops_total,
             ),
         );
         encoder.gauge(
-            "rustcdc_runtime_checkpoint_commit_latency_ms_last",
-            "Last checkpoint commit latency in milliseconds",
+            "rustcdc_runtime_checkpoint_commit_latency_seconds_last",
+            "Last checkpoint commit latency in seconds",
             &sink_labels,
-            self.checkpoint_commit_latency_ms_last,
+            micros_to_seconds(self.checkpoint_commit_latency_us_last),
         );
         encoder.gauge(
             "rustcdc_sink_queue_depth",
@@ -706,6 +887,13 @@ impl SinkMetricsSnapshot {
             "Total sink events written to DLQ",
             &sink_labels,
             self.sink_dlq_total,
+        );
+        encoder.counter(
+            "rustcdc_dlq_events_total",
+            "Events quarantined to the dead-letter queue. Each one was NOT delivered \
+             and the checkpoint advanced past it — recorded data loss",
+            &sink_labels,
+            self.dlq_events_quarantined_total,
         );
         encoder.counter(
             "rustcdc_sink_http_requests_total",
@@ -756,46 +944,46 @@ impl SinkMetricsSnapshot {
             self.sink_http_pending_bytes_high_watermark,
         );
         encoder.gauge(
-            "rustcdc_sink_http_retry_delay_ms_p50",
-            "Approximate p50 HTTP sink retry backoff delay in milliseconds",
+            "rustcdc_sink_http_retry_delay_seconds_p50",
+            "Approximate p50 HTTP sink retry backoff delay in seconds",
             &sink_labels,
-            self.sink_http_retry_delay_ms_p50,
+            millis_to_seconds(self.sink_http_retry_delay_ms_p50),
         );
         encoder.gauge(
-            "rustcdc_sink_http_retry_delay_ms_p95",
-            "Approximate p95 HTTP sink retry backoff delay in milliseconds",
+            "rustcdc_sink_http_retry_delay_seconds_p95",
+            "Approximate p95 HTTP sink retry backoff delay in seconds",
             &sink_labels,
-            self.sink_http_retry_delay_ms_p95,
+            millis_to_seconds(self.sink_http_retry_delay_ms_p95),
         );
         encoder.counter(
-            "rustcdc_sink_http_batch_retry_duration_ms_total",
-            "Total elapsed retry/salvage time in milliseconds across flushed HTTP batches",
+            "rustcdc_sink_http_batch_retry_duration_seconds_total",
+            "Total elapsed retry/salvage time in seconds across flushed HTTP batches",
             &sink_labels,
-            self.sink_http_batch_retry_duration_ms_total,
+            millis_to_seconds(self.sink_http_batch_retry_duration_ms_total),
         );
         encoder.gauge(
-            "rustcdc_sink_http_batch_retry_duration_ms_avg",
-            "Average elapsed retry/salvage time in milliseconds per flushed HTTP batch",
+            "rustcdc_sink_http_batch_retry_duration_seconds_avg",
+            "Average elapsed retry/salvage time in seconds per flushed HTTP batch",
             &sink_labels,
             self.sink_http_batch_retry_duration_ms_avg,
         );
         encoder.gauge(
-            "rustcdc_sink_http_batch_retry_duration_ms_last",
-            "Elapsed retry/salvage time in milliseconds for the last flushed HTTP batch",
+            "rustcdc_sink_http_batch_retry_duration_seconds_last",
+            "Elapsed retry/salvage time in seconds for the last flushed HTTP batch",
             &sink_labels,
-            self.sink_http_batch_retry_duration_ms_last,
+            millis_to_seconds(self.sink_http_batch_retry_duration_ms_last),
         );
         encoder.gauge(
-            "rustcdc_sink_http_batch_retry_duration_ms_p50",
-            "Approximate p50 elapsed retry/salvage time in milliseconds per flushed HTTP batch",
+            "rustcdc_sink_http_batch_retry_duration_seconds_p50",
+            "Approximate p50 elapsed retry/salvage time in seconds per flushed HTTP batch",
             &sink_labels,
-            self.sink_http_batch_retry_duration_ms_p50,
+            millis_to_seconds(self.sink_http_batch_retry_duration_ms_p50),
         );
         encoder.gauge(
-            "rustcdc_sink_http_batch_retry_duration_ms_p95",
-            "Approximate p95 elapsed retry/salvage time in milliseconds per flushed HTTP batch",
+            "rustcdc_sink_http_batch_retry_duration_seconds_p95",
+            "Approximate p95 elapsed retry/salvage time in seconds per flushed HTTP batch",
             &sink_labels,
-            self.sink_http_batch_retry_duration_ms_p95,
+            millis_to_seconds(self.sink_http_batch_retry_duration_ms_p95),
         );
         encoder.counter(
             "rustcdc_sink_retryable_status_429_total",
@@ -846,6 +1034,13 @@ impl SinkMetricsSnapshot {
             self.sink_terminal_error_other_total,
         );
         encoder.counter(
+            "rustcdc_iceberg_orphaned_data_files_total",
+            "Data files written to storage that no Iceberg snapshot references, \
+             orphaned by a terminal commit failure",
+            &sink_labels,
+            self.sink_iceberg_orphaned_data_files_total,
+        );
+        encoder.counter(
             "rustcdc_sink_iceberg_flush_lock_contention_events_total",
             "Total iceberg flush calls that observed lock contention",
             &sink_labels,
@@ -856,6 +1051,29 @@ impl SinkMetricsSnapshot {
             "Total iceberg flush lock wait time in milliseconds",
             &sink_labels,
             self.sink_iceberg_flush_lock_contention_ms_total,
+        );
+        encoder.counter(
+            "rustcdc_sink_kafka_oauth_token_fetches_total",
+            "Total SASL/OAUTHBEARER token fetches performed by the Kafka producer",
+            &sink_labels,
+            self.sink_kafka_oauth_token_fetches_total,
+        );
+        encoder.counter(
+            "rustcdc_sink_kafka_oauth_token_fetch_failures_total",
+            "Total SASL/OAUTHBEARER token fetches that failed. Any increase means the \
+             identity provider is rejecting or unreachable; without this an OAuth round \
+             trip failing on every connection looks identical to an unreachable broker",
+            &sink_labels,
+            self.sink_kafka_oauth_token_fetch_failures_total,
+        );
+        encoder.gauge(
+            "rustcdc_sink_kafka_oauth_token_expiry_epoch_ms",
+            "Expiry of the cached SASL/OAUTHBEARER token, milliseconds since the Unix \
+             epoch. 0 means no token has been fetched yet or the provider returned no \
+             expires_in. Subtract the scrape time to alert on a refresh loop that is \
+             failing before the current token expires",
+            &sink_labels,
+            self.sink_kafka_oauth_token_expiry_epoch_ms,
         );
         encoder.gauge(
             "rustcdc_sink_iceberg_flush_lock_contention_ms_max",
@@ -879,7 +1097,7 @@ impl SinkMetricsSnapshot {
             "rustcdc_data_duplicate_rate",
             "Duplicate event ratio duplicates_total/events_total",
             &sink_labels,
-            average_latency_ms(self.data_duplicates_total, self.data_events_total),
+            average_latency_seconds(self.data_duplicates_total, self.data_events_total),
         );
         encoder.counter(
             "rustcdc_data_reorders_total",
@@ -891,22 +1109,36 @@ impl SinkMetricsSnapshot {
             "rustcdc_data_reorder_rate",
             "Reordered event ratio reorders_total/events_total",
             &sink_labels,
-            average_latency_ms(self.data_reorders_total, self.data_events_total),
+            mean(self.data_reorders_total, self.data_events_total),
         );
         encoder.gauge(
-            "rustcdc_end_to_end_ack_lag_ms_avg",
-            "Average source-to-delivery acknowledgement lag in milliseconds",
+            "rustcdc_end_to_end_ack_lag_seconds_avg",
+            "Average source-to-delivery acknowledgement lag in seconds",
             &sink_labels,
-            average_latency_ms(
+            average_latency_seconds_from_millis(
                 self.end_to_end_ack_lag_ms_total,
                 self.end_to_end_ack_lag_samples_total,
             ),
         );
         encoder.gauge(
-            "rustcdc_end_to_end_ack_lag_ms_last",
-            "Last observed source-to-delivery acknowledgement lag in milliseconds",
+            "rustcdc_end_to_end_ack_lag_seconds_last",
+            "Last observed source-to-delivery acknowledgement lag in seconds",
             &sink_labels,
-            self.end_to_end_ack_lag_ms_last,
+            millis_to_seconds(self.end_to_end_ack_lag_ms_last),
+        );
+        // The freshness SLO is a percentile, and neither gauge above can express one. This
+        // is the family `histogram_quantile(0.95, ...)` reads.
+        encoder.histogram_with_bounds(
+            "rustcdc_end_to_end_ack_lag_seconds",
+            "Histogram of source-commit-to-sink-durability lag in seconds. This is the \
+             end-to-end freshness signal: use histogram_quantile over it rather than the \
+             _avg gauge, which hides the tail an SLO is written about.",
+            &sink_labels,
+            &END_TO_END_LAG_BUCKETS_MS,
+            &self.end_to_end_ack_lag_ms_buckets,
+            millis_to_seconds,
+            self.end_to_end_ack_lag_ms_total,
+            self.end_to_end_ack_lag_samples_total,
         );
 
         for stream in &self.stream_correctness {
@@ -934,7 +1166,7 @@ impl SinkMetricsSnapshot {
             encoder.write_metric_value_line(
                 "rustcdc_data_duplicate_rate",
                 &labels,
-                average_latency_ms(stream.duplicates_total, stream.events_total),
+                average_latency_seconds(stream.duplicates_total, stream.events_total),
             );
             encoder.write_metric_value_line(
                 "rustcdc_data_reorders_total",
@@ -944,61 +1176,64 @@ impl SinkMetricsSnapshot {
             encoder.write_metric_value_line(
                 "rustcdc_data_reorder_rate",
                 &labels,
-                average_latency_ms(stream.reorders_total, stream.events_total),
+                mean(stream.reorders_total, stream.events_total),
             );
             encoder.write_metric_value_line(
-                "rustcdc_end_to_end_ack_lag_ms_avg",
+                "rustcdc_end_to_end_ack_lag_seconds_avg",
                 &labels,
-                average_latency_ms(stream.ack_lag_ms_total, stream.ack_lag_samples_total),
+                average_latency_seconds_from_millis(
+                    stream.ack_lag_ms_total,
+                    stream.ack_lag_samples_total,
+                ),
             );
             encoder.write_metric_value_line(
-                "rustcdc_end_to_end_ack_lag_ms_last",
+                "rustcdc_end_to_end_ack_lag_seconds_last",
                 &labels,
-                stream.ack_lag_ms_last,
+                millis_to_seconds(stream.ack_lag_ms_last),
             );
         }
 
         for (metric_name, help, buckets, total, count) in [
             (
-                "rustcdc_sink_send_latency_ms",
-                "Histogram of sink send latency in milliseconds",
-                self.sink_send_latency_ms_buckets,
-                self.sink_send_latency_ms_total,
+                "rustcdc_sink_send_latency_seconds",
+                "Histogram of sink send latency in seconds",
+                self.sink_send_latency_us_buckets,
+                self.sink_send_latency_us_total,
                 self.sink_send_ops_total,
             ),
             (
-                "rustcdc_sink_flush_latency_ms",
-                "Histogram of sink flush latency in milliseconds",
-                self.sink_flush_latency_ms_buckets,
-                self.sink_flush_latency_ms_total,
+                "rustcdc_sink_flush_latency_seconds",
+                "Histogram of sink flush latency in seconds",
+                self.sink_flush_latency_us_buckets,
+                self.sink_flush_latency_us_total,
                 self.sink_flush_ops_total,
             ),
             (
-                "rustcdc_runtime_transform_latency_ms",
-                "Histogram of event transform latency in milliseconds",
-                self.transform_latency_ms_buckets,
-                self.transform_latency_ms_total,
+                "rustcdc_runtime_transform_latency_seconds",
+                "Histogram of event transform latency in seconds",
+                self.transform_latency_us_buckets,
+                self.transform_latency_us_total,
                 self.transform_ops_total,
             ),
             (
-                "rustcdc_runtime_prepare_latency_ms",
-                "Histogram of event prepare latency in milliseconds",
-                self.prepare_latency_ms_buckets,
-                self.prepare_latency_ms_total,
+                "rustcdc_runtime_prepare_latency_seconds",
+                "Histogram of event prepare latency in seconds",
+                self.prepare_latency_us_buckets,
+                self.prepare_latency_us_total,
                 self.prepare_ops_total,
             ),
             (
-                "rustcdc_runtime_batch_delivery_latency_ms",
-                "Histogram of runtime batch delivery latency in milliseconds",
-                self.batch_delivery_latency_ms_buckets,
-                self.batch_delivery_latency_ms_total,
+                "rustcdc_runtime_batch_delivery_latency_seconds",
+                "Histogram of runtime batch delivery latency in seconds",
+                self.batch_delivery_latency_us_buckets,
+                self.batch_delivery_latency_us_total,
                 self.batch_delivery_ops_total,
             ),
             (
-                "rustcdc_runtime_checkpoint_commit_latency_ms",
-                "Histogram of checkpoint commit latency in milliseconds",
-                self.checkpoint_commit_latency_ms_buckets,
-                self.checkpoint_commit_latency_ms_total,
+                "rustcdc_runtime_checkpoint_commit_latency_seconds",
+                "Histogram of checkpoint commit latency in seconds",
+                self.checkpoint_commit_latency_us_buckets,
+                self.checkpoint_commit_latency_us_total,
                 self.checkpoint_commit_ops_total,
             ),
         ] {
@@ -1019,29 +1254,29 @@ pub(super) fn sink_metrics_prometheus(
     sink_idempotent_delivery_capable: bool,
     sink_transactional_checkpoint_barrier_capable: bool,
     sink_send_ops_total: u64,
-    sink_send_latency_ms_total: u64,
-    sink_send_latency_ms_last: u64,
-    sink_send_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_send_latency_us_total: u64,
+    sink_send_latency_us_last: u64,
+    sink_send_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_flush_ops_total: u64,
-    sink_flush_latency_ms_total: u64,
-    sink_flush_latency_ms_last: u64,
-    sink_flush_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_flush_latency_us_total: u64,
+    sink_flush_latency_us_last: u64,
+    sink_flush_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     transform_ops_total: u64,
-    transform_latency_ms_total: u64,
-    transform_latency_ms_last: u64,
-    transform_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    transform_latency_us_total: u64,
+    transform_latency_us_last: u64,
+    transform_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     prepare_ops_total: u64,
-    prepare_latency_ms_total: u64,
-    prepare_latency_ms_last: u64,
-    prepare_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    prepare_latency_us_total: u64,
+    prepare_latency_us_last: u64,
+    prepare_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     batch_delivery_ops_total: u64,
-    batch_delivery_latency_ms_total: u64,
-    batch_delivery_latency_ms_last: u64,
-    batch_delivery_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    batch_delivery_latency_us_total: u64,
+    batch_delivery_latency_us_last: u64,
+    batch_delivery_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     checkpoint_commit_ops_total: u64,
-    checkpoint_commit_latency_ms_total: u64,
-    checkpoint_commit_latency_ms_last: u64,
-    checkpoint_commit_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    checkpoint_commit_latency_us_total: u64,
+    checkpoint_commit_latency_us_last: u64,
+    checkpoint_commit_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_queue_depth_last: u64,
     sink_queue_depth_p95: u64,
     runtime_soak_duration_seconds: u64,
@@ -1056,6 +1291,7 @@ pub(super) fn sink_metrics_prometheus(
     sink_terminal_status_other_total: u64,
     sink_terminal_error_timeout_total: u64,
     sink_terminal_error_other_total: u64,
+    sink_iceberg_orphaned_data_files_total: u64,
     sink_iceberg_flush_lock_contention_events_total: u64,
     sink_iceberg_flush_lock_contention_ms_total: u64,
     sink_iceberg_flush_lock_contention_ms_max: u64,
@@ -1068,30 +1304,30 @@ pub(super) fn sink_metrics_prometheus(
         sink_idempotent_delivery_capable,
         sink_transactional_checkpoint_barrier_capable,
         sink_send_ops_total,
-        sink_send_latency_ms_total,
-        sink_send_latency_ms_last,
-        sink_send_latency_ms_buckets,
+        sink_send_latency_us_total,
+        sink_send_latency_us_last,
+        sink_send_latency_us_buckets,
         sink_flush_ops_total,
-        sink_flush_latency_ms_total,
-        sink_flush_latency_ms_last,
-        sink_flush_latency_ms_buckets,
+        sink_flush_latency_us_total,
+        sink_flush_latency_us_last,
+        sink_flush_latency_us_buckets,
         transform_ops_total,
-        transform_latency_ms_total,
-        transform_latency_ms_last,
-        transform_latency_ms_buckets,
+        transform_latency_us_total,
+        transform_latency_us_last,
+        transform_latency_us_buckets,
         &transform::WasmRuntimeMetricsSnapshot::default(),
         prepare_ops_total,
-        prepare_latency_ms_total,
-        prepare_latency_ms_last,
-        prepare_latency_ms_buckets,
+        prepare_latency_us_total,
+        prepare_latency_us_last,
+        prepare_latency_us_buckets,
         batch_delivery_ops_total,
-        batch_delivery_latency_ms_total,
-        batch_delivery_latency_ms_last,
-        batch_delivery_latency_ms_buckets,
+        batch_delivery_latency_us_total,
+        batch_delivery_latency_us_last,
+        batch_delivery_latency_us_buckets,
         checkpoint_commit_ops_total,
-        checkpoint_commit_latency_ms_total,
-        checkpoint_commit_latency_ms_last,
-        checkpoint_commit_latency_ms_buckets,
+        checkpoint_commit_latency_us_total,
+        checkpoint_commit_latency_us_last,
+        checkpoint_commit_latency_us_buckets,
         sink_queue_depth_last,
         sink_queue_depth_p95,
         runtime_soak_duration_seconds,
@@ -1106,6 +1342,7 @@ pub(super) fn sink_metrics_prometheus(
         sink_terminal_status_other_total,
         sink_terminal_error_timeout_total,
         sink_terminal_error_other_total,
+        sink_iceberg_orphaned_data_files_total,
         sink_iceberg_flush_lock_contention_events_total,
         sink_iceberg_flush_lock_contention_ms_total,
         sink_iceberg_flush_lock_contention_ms_max,
@@ -1122,30 +1359,30 @@ pub(super) fn sink_metrics_snapshot(
     sink_idempotent_delivery_capable: bool,
     sink_transactional_checkpoint_barrier_capable: bool,
     sink_send_ops_total: u64,
-    sink_send_latency_ms_total: u64,
-    sink_send_latency_ms_last: u64,
-    sink_send_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_send_latency_us_total: u64,
+    sink_send_latency_us_last: u64,
+    sink_send_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_flush_ops_total: u64,
-    sink_flush_latency_ms_total: u64,
-    sink_flush_latency_ms_last: u64,
-    sink_flush_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_flush_latency_us_total: u64,
+    sink_flush_latency_us_last: u64,
+    sink_flush_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     transform_ops_total: u64,
-    transform_latency_ms_total: u64,
-    transform_latency_ms_last: u64,
-    transform_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    transform_latency_us_total: u64,
+    transform_latency_us_last: u64,
+    transform_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     wasm_metrics: &transform::WasmRuntimeMetricsSnapshot,
     prepare_ops_total: u64,
-    prepare_latency_ms_total: u64,
-    prepare_latency_ms_last: u64,
-    prepare_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    prepare_latency_us_total: u64,
+    prepare_latency_us_last: u64,
+    prepare_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     batch_delivery_ops_total: u64,
-    batch_delivery_latency_ms_total: u64,
-    batch_delivery_latency_ms_last: u64,
-    batch_delivery_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    batch_delivery_latency_us_total: u64,
+    batch_delivery_latency_us_last: u64,
+    batch_delivery_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     checkpoint_commit_ops_total: u64,
-    checkpoint_commit_latency_ms_total: u64,
-    checkpoint_commit_latency_ms_last: u64,
-    checkpoint_commit_latency_ms_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    checkpoint_commit_latency_us_total: u64,
+    checkpoint_commit_latency_us_last: u64,
+    checkpoint_commit_latency_us_buckets: &[u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_queue_depth_last: u64,
     sink_queue_depth_p95: u64,
     runtime_soak_duration_seconds: u64,
@@ -1160,11 +1397,13 @@ pub(super) fn sink_metrics_snapshot(
     sink_terminal_status_other_total: u64,
     sink_terminal_error_timeout_total: u64,
     sink_terminal_error_other_total: u64,
+    sink_iceberg_orphaned_data_files_total: u64,
     sink_iceberg_flush_lock_contention_events_total: u64,
     sink_iceberg_flush_lock_contention_ms_total: u64,
     sink_iceberg_flush_lock_contention_ms_max: u64,
 ) -> SinkMetricsSnapshot {
     SinkMetricsSnapshot {
+        dlq_events_quarantined_total: 0,
         sink_name: sink_name.to_string(),
         requested_delivery_contract: requested_delivery_contract.to_string(),
         delivery_contract_satisfied,
@@ -1172,34 +1411,35 @@ pub(super) fn sink_metrics_snapshot(
         sink_idempotent_delivery_capable,
         sink_transactional_checkpoint_barrier_capable,
         sink_send_ops_total,
-        sink_send_latency_ms_total,
-        sink_send_latency_ms_last,
-        sink_send_latency_ms_buckets: *sink_send_latency_ms_buckets,
+        sink_send_latency_us_total,
+        sink_send_latency_us_last,
+        sink_send_latency_us_buckets: *sink_send_latency_us_buckets,
         sink_flush_ops_total,
-        sink_flush_latency_ms_total,
-        sink_flush_latency_ms_last,
-        sink_flush_latency_ms_buckets: *sink_flush_latency_ms_buckets,
+        sink_flush_latency_us_total,
+        sink_flush_latency_us_last,
+        sink_flush_latency_us_buckets: *sink_flush_latency_us_buckets,
         transform_ops_total,
-        transform_latency_ms_total,
-        transform_latency_ms_last,
-        transform_latency_ms_buckets: *transform_latency_ms_buckets,
+        transform_latency_us_total,
+        transform_latency_us_last,
+        transform_latency_us_buckets: *transform_latency_us_buckets,
         transform_wasm_instance_pool_size: wasm_metrics.instance_pool_size,
         transform_wasm_invocations_total: wasm_metrics.transform_total,
         transform_wasm_errors_total: wasm_metrics.transform_error_total,
         transform_wasm_filtered_total: wasm_metrics.filtered_total,
         transform_wasm_timeout_total: wasm_metrics.timeout_total,
+        unmatched_transform_rules: Vec::new(),
         prepare_ops_total,
-        prepare_latency_ms_total,
-        prepare_latency_ms_last,
-        prepare_latency_ms_buckets: *prepare_latency_ms_buckets,
+        prepare_latency_us_total,
+        prepare_latency_us_last,
+        prepare_latency_us_buckets: *prepare_latency_us_buckets,
         batch_delivery_ops_total,
-        batch_delivery_latency_ms_total,
-        batch_delivery_latency_ms_last,
-        batch_delivery_latency_ms_buckets: *batch_delivery_latency_ms_buckets,
+        batch_delivery_latency_us_total,
+        batch_delivery_latency_us_last,
+        batch_delivery_latency_us_buckets: *batch_delivery_latency_us_buckets,
         checkpoint_commit_ops_total,
-        checkpoint_commit_latency_ms_total,
-        checkpoint_commit_latency_ms_last,
-        checkpoint_commit_latency_ms_buckets: *checkpoint_commit_latency_ms_buckets,
+        checkpoint_commit_latency_us_total,
+        checkpoint_commit_latency_us_last,
+        checkpoint_commit_latency_us_buckets: *checkpoint_commit_latency_us_buckets,
         sink_queue_depth_last,
         sink_queue_depth_p95,
         runtime_soak_duration_seconds,
@@ -1229,15 +1469,23 @@ pub(super) fn sink_metrics_snapshot(
         sink_terminal_status_other_total,
         sink_terminal_error_timeout_total,
         sink_terminal_error_other_total,
+        sink_iceberg_orphaned_data_files_total,
         sink_iceberg_flush_lock_contention_events_total,
         sink_iceberg_flush_lock_contention_ms_total,
         sink_iceberg_flush_lock_contention_ms_max,
+        // Populated by `with_kafka_oauth` at the one call site that holds the
+        // accumulator; not part of this function's positional argument list, which
+        // is already at the clippy limit.
+        sink_kafka_oauth_token_fetches_total: 0,
+        sink_kafka_oauth_token_fetch_failures_total: 0,
+        sink_kafka_oauth_token_expiry_epoch_ms: 0,
         data_events_total: 0,
         data_duplicates_total: 0,
         data_reorders_total: 0,
         end_to_end_ack_lag_samples_total: 0,
         end_to_end_ack_lag_ms_total: 0,
         end_to_end_ack_lag_ms_last: 0,
+        end_to_end_ack_lag_ms_buckets: [0; END_TO_END_LAG_BUCKETS_MS.len()],
         stream_correctness: Vec::new(),
     }
 }
@@ -1288,6 +1536,11 @@ pub(super) fn recoverable_error_metrics_snapshot(
 }
 
 pub(super) struct RuntimeLoopMetricsAccumulator {
+    /// Events quarantined to the dead-letter queue.
+    ///
+    /// Every one of these is an event that was **not delivered** and whose checkpoint
+    /// advanced anyway — recorded data loss. Any non-zero rate deserves a page.
+    dlq_events_total: u64,
     sink_name: String,
     requested_delivery_contract: String,
     delivery_contract_satisfied: bool,
@@ -1295,29 +1548,29 @@ pub(super) struct RuntimeLoopMetricsAccumulator {
     sink_idempotent_delivery_capable: bool,
     sink_transactional_checkpoint_barrier_capable: bool,
     sink_send_ops_total: u64,
-    sink_send_latency_ms_total: u64,
-    sink_send_latency_ms_last: u64,
-    sink_send_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_send_latency_us_total: u64,
+    sink_send_latency_us_last: u64,
+    sink_send_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_flush_ops_total: u64,
-    sink_flush_latency_ms_total: u64,
-    sink_flush_latency_ms_last: u64,
-    sink_flush_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    sink_flush_latency_us_total: u64,
+    sink_flush_latency_us_last: u64,
+    sink_flush_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     transform_ops_total: u64,
-    transform_latency_ms_total: u64,
-    transform_latency_ms_last: u64,
-    transform_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    transform_latency_us_total: u64,
+    transform_latency_us_last: u64,
+    transform_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     prepare_ops_total: u64,
-    prepare_latency_ms_total: u64,
-    prepare_latency_ms_last: u64,
-    prepare_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    prepare_latency_us_total: u64,
+    prepare_latency_us_last: u64,
+    prepare_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     batch_delivery_ops_total: u64,
-    batch_delivery_latency_ms_total: u64,
-    batch_delivery_latency_ms_last: u64,
-    batch_delivery_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    batch_delivery_latency_us_total: u64,
+    batch_delivery_latency_us_last: u64,
+    batch_delivery_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     checkpoint_commit_ops_total: u64,
-    checkpoint_commit_latency_ms_total: u64,
-    checkpoint_commit_latency_ms_last: u64,
-    checkpoint_commit_latency_ms_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+    checkpoint_commit_latency_us_total: u64,
+    checkpoint_commit_latency_us_last: u64,
+    checkpoint_commit_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     sink_retries_total: u64,
     sink_dlq_total: u64,
     sink_http_requests_total: u64,
@@ -1341,15 +1594,23 @@ pub(super) struct RuntimeLoopMetricsAccumulator {
     sink_terminal_status_other_total: u64,
     sink_terminal_error_timeout_total: u64,
     sink_terminal_error_other_total: u64,
+    sink_iceberg_orphaned_data_files_total: u64,
     sink_iceberg_flush_lock_contention_events_total: u64,
     sink_iceberg_flush_lock_contention_ms_total: u64,
     sink_iceberg_flush_lock_contention_ms_max: u64,
+    sink_kafka_oauth_token_fetches_total: u64,
+    sink_kafka_oauth_token_fetch_failures_total: u64,
+    sink_kafka_oauth_token_expiry_epoch_ms: u64,
     data_events_total: u64,
     data_duplicates_total: u64,
     data_reorders_total: u64,
     end_to_end_ack_lag_samples_total: u64,
     end_to_end_ack_lag_ms_total: u64,
     end_to_end_ack_lag_ms_last: u64,
+    /// Bucketed lag, so a percentile SLO is expressible. The mean alone cannot
+    /// express one: 99% at 200 ms and 1% at ten minutes reports a healthy
+    /// average and pages nobody.
+    end_to_end_ack_lag_ms_buckets: [u64; END_TO_END_LAG_BUCKETS_MS.len()],
     stream_correctness: BTreeMap<String, StreamCorrectnessMetricsAccumulator>,
     stream_last_source_ts_ms: HashMap<String, u64>,
     stream_last_source_sequence: HashMap<String, u64>,
@@ -1361,6 +1622,7 @@ pub(super) struct RuntimeLoopMetricsAccumulator {
     queue_depth_p95_window_samples: usize,
     pipeline_started: Instant,
     wasm_metrics: transform::WasmRuntimeMetricsSnapshot,
+    unmatched_transform_rules: Vec<rustcdc::transform::UnmatchedRule>,
     last_health_verdict: Option<rustcdc::core::HealthVerdict>,
 }
 
@@ -1377,6 +1639,7 @@ impl RuntimeLoopMetricsAccumulator {
         dedup_window_size: usize,
     ) -> Self {
         Self {
+            dlq_events_total: 0,
             sink_name: sink_name.to_string(),
             requested_delivery_contract: requested_delivery_contract.to_string(),
             delivery_contract_satisfied,
@@ -1384,29 +1647,29 @@ impl RuntimeLoopMetricsAccumulator {
             sink_idempotent_delivery_capable,
             sink_transactional_checkpoint_barrier_capable,
             sink_send_ops_total: 0,
-            sink_send_latency_ms_total: 0,
-            sink_send_latency_ms_last: 0,
-            sink_send_latency_ms_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+            sink_send_latency_us_total: 0,
+            sink_send_latency_us_last: 0,
+            sink_send_latency_us_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_US.len()],
             sink_flush_ops_total: 0,
-            sink_flush_latency_ms_total: 0,
-            sink_flush_latency_ms_last: 0,
-            sink_flush_latency_ms_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+            sink_flush_latency_us_total: 0,
+            sink_flush_latency_us_last: 0,
+            sink_flush_latency_us_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_US.len()],
             transform_ops_total: 0,
-            transform_latency_ms_total: 0,
-            transform_latency_ms_last: 0,
-            transform_latency_ms_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+            transform_latency_us_total: 0,
+            transform_latency_us_last: 0,
+            transform_latency_us_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_US.len()],
             prepare_ops_total: 0,
-            prepare_latency_ms_total: 0,
-            prepare_latency_ms_last: 0,
-            prepare_latency_ms_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+            prepare_latency_us_total: 0,
+            prepare_latency_us_last: 0,
+            prepare_latency_us_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_US.len()],
             batch_delivery_ops_total: 0,
-            batch_delivery_latency_ms_total: 0,
-            batch_delivery_latency_ms_last: 0,
-            batch_delivery_latency_ms_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+            batch_delivery_latency_us_total: 0,
+            batch_delivery_latency_us_last: 0,
+            batch_delivery_latency_us_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_US.len()],
             checkpoint_commit_ops_total: 0,
-            checkpoint_commit_latency_ms_total: 0,
-            checkpoint_commit_latency_ms_last: 0,
-            checkpoint_commit_latency_ms_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_MS.len()],
+            checkpoint_commit_latency_us_total: 0,
+            checkpoint_commit_latency_us_last: 0,
+            checkpoint_commit_latency_us_buckets: [0; LATENCY_HISTOGRAM_BUCKETS_US.len()],
             sink_retries_total: 0,
             sink_dlq_total: 0,
             sink_http_requests_total: 0,
@@ -1431,15 +1694,20 @@ impl RuntimeLoopMetricsAccumulator {
             sink_terminal_status_other_total: 0,
             sink_terminal_error_timeout_total: 0,
             sink_terminal_error_other_total: 0,
+            sink_iceberg_orphaned_data_files_total: 0,
             sink_iceberg_flush_lock_contention_events_total: 0,
             sink_iceberg_flush_lock_contention_ms_total: 0,
             sink_iceberg_flush_lock_contention_ms_max: 0,
+            sink_kafka_oauth_token_fetches_total: 0,
+            sink_kafka_oauth_token_fetch_failures_total: 0,
+            sink_kafka_oauth_token_expiry_epoch_ms: 0,
             data_events_total: 0,
             data_duplicates_total: 0,
             data_reorders_total: 0,
             end_to_end_ack_lag_samples_total: 0,
             end_to_end_ack_lag_ms_total: 0,
             end_to_end_ack_lag_ms_last: 0,
+            end_to_end_ack_lag_ms_buckets: [0; END_TO_END_LAG_BUCKETS_MS.len()],
             stream_correctness: BTreeMap::new(),
             stream_last_source_ts_ms: HashMap::new(),
             stream_last_source_sequence: HashMap::new(),
@@ -1451,6 +1719,7 @@ impl RuntimeLoopMetricsAccumulator {
             queue_depth_p95_window_samples,
             pipeline_started: Instant::now(),
             wasm_metrics: transform::WasmRuntimeMetricsSnapshot::default(),
+            unmatched_transform_rules: Vec::new(),
             last_health_verdict: None,
         }
     }
@@ -1496,94 +1765,103 @@ impl RuntimeLoopMetricsAccumulator {
 
     /// Refresh the cached WASM metrics snapshot from the live runtime.
     /// Called once per batch by `record_batch_metrics_and_admin`.
-    pub(super) async fn update_wasm_metrics(&mut self, pipeline: &transform::TransformPipeline) {
+    pub(super) async fn update_transform_metrics(
+        &mut self,
+        pipeline: &transform::TransformPipeline,
+    ) {
         self.wasm_metrics = pipeline.wasm_metrics().await;
+        // Recomputed rather than accumulated: a rule that matches later must stop being
+        // reported, so the metric tracks the live state of the pipeline.
+        self.unmatched_transform_rules = pipeline.unmatched_rules();
     }
 
     pub(super) fn merge_batch_processing_stats(&mut self, stats: &run_batch::BatchProcessingStats) {
+        self.dlq_events_total = self
+            .dlq_events_total
+            .saturating_add(stats.delivery.dlq_events_total);
         self.transform_ops_total = self
             .transform_ops_total
             .saturating_add(stats.prepare.transform_ops_total);
-        self.transform_latency_ms_total = self
-            .transform_latency_ms_total
-            .saturating_add(stats.prepare.transform_latency_ms_total);
-        self.transform_latency_ms_last = stats.prepare.transform_latency_ms_last;
+        self.transform_latency_us_total = self
+            .transform_latency_us_total
+            .saturating_add(stats.prepare.transform_latency_us_total);
+        self.transform_latency_us_last = stats.prepare.transform_latency_us_last;
         for (index, count) in stats
             .prepare
-            .transform_latency_ms_buckets
+            .transform_latency_us_buckets
             .iter()
             .enumerate()
         {
-            self.transform_latency_ms_buckets[index] =
-                self.transform_latency_ms_buckets[index].saturating_add(*count);
+            self.transform_latency_us_buckets[index] =
+                self.transform_latency_us_buckets[index].saturating_add(*count);
         }
 
         self.prepare_ops_total = self
             .prepare_ops_total
             .saturating_add(stats.prepare.prepare_ops_total);
-        self.prepare_latency_ms_total = self
-            .prepare_latency_ms_total
-            .saturating_add(stats.prepare.prepare_latency_ms_total);
-        self.prepare_latency_ms_last = stats.prepare.prepare_latency_ms_last;
-        for (index, count) in stats.prepare.prepare_latency_ms_buckets.iter().enumerate() {
-            self.prepare_latency_ms_buckets[index] =
-                self.prepare_latency_ms_buckets[index].saturating_add(*count);
+        self.prepare_latency_us_total = self
+            .prepare_latency_us_total
+            .saturating_add(stats.prepare.prepare_latency_us_total);
+        self.prepare_latency_us_last = stats.prepare.prepare_latency_us_last;
+        for (index, count) in stats.prepare.prepare_latency_us_buckets.iter().enumerate() {
+            self.prepare_latency_us_buckets[index] =
+                self.prepare_latency_us_buckets[index].saturating_add(*count);
         }
 
         self.sink_send_ops_total = self
             .sink_send_ops_total
             .saturating_add(stats.delivery.sink_send_ops_total);
-        self.sink_send_latency_ms_total = self
-            .sink_send_latency_ms_total
-            .saturating_add(stats.delivery.sink_send_latency_ms_total);
-        self.sink_send_latency_ms_last = stats.delivery.sink_send_latency_ms_last;
+        self.sink_send_latency_us_total = self
+            .sink_send_latency_us_total
+            .saturating_add(stats.delivery.sink_send_latency_us_total);
+        self.sink_send_latency_us_last = stats.delivery.sink_send_latency_us_last;
         for (index, count) in stats
             .delivery
-            .sink_send_latency_ms_buckets
+            .sink_send_latency_us_buckets
             .iter()
             .enumerate()
         {
-            self.sink_send_latency_ms_buckets[index] =
-                self.sink_send_latency_ms_buckets[index].saturating_add(*count);
+            self.sink_send_latency_us_buckets[index] =
+                self.sink_send_latency_us_buckets[index].saturating_add(*count);
         }
 
         self.sink_flush_ops_total = self
             .sink_flush_ops_total
             .saturating_add(stats.delivery.sink_flush_ops_total);
-        self.sink_flush_latency_ms_total = self
-            .sink_flush_latency_ms_total
-            .saturating_add(stats.delivery.sink_flush_latency_ms_total);
-        self.sink_flush_latency_ms_last = stats.delivery.sink_flush_latency_ms_last;
+        self.sink_flush_latency_us_total = self
+            .sink_flush_latency_us_total
+            .saturating_add(stats.delivery.sink_flush_latency_us_total);
+        self.sink_flush_latency_us_last = stats.delivery.sink_flush_latency_us_last;
         for (index, count) in stats
             .delivery
-            .sink_flush_latency_ms_buckets
+            .sink_flush_latency_us_buckets
             .iter()
             .enumerate()
         {
-            self.sink_flush_latency_ms_buckets[index] =
-                self.sink_flush_latency_ms_buckets[index].saturating_add(*count);
+            self.sink_flush_latency_us_buckets[index] =
+                self.sink_flush_latency_us_buckets[index].saturating_add(*count);
         }
     }
 
-    pub(super) fn record_checkpoint_commit_latency(&mut self, latency_ms: u64) {
+    pub(super) fn record_checkpoint_commit_latency(&mut self, latency_us: u64) {
         self.checkpoint_commit_ops_total = self.checkpoint_commit_ops_total.saturating_add(1);
-        self.checkpoint_commit_latency_ms_total = self
-            .checkpoint_commit_latency_ms_total
-            .saturating_add(latency_ms);
-        self.checkpoint_commit_latency_ms_last = latency_ms;
+        self.checkpoint_commit_latency_us_total = self
+            .checkpoint_commit_latency_us_total
+            .saturating_add(latency_us);
+        self.checkpoint_commit_latency_us_last = latency_us;
         observe_latency_histogram_bucket(
-            &mut self.checkpoint_commit_latency_ms_buckets,
-            latency_ms,
+            &mut self.checkpoint_commit_latency_us_buckets,
+            latency_us,
         );
     }
 
-    pub(super) fn record_batch_delivery_latency(&mut self, latency_ms: u64) {
+    pub(super) fn record_batch_delivery_latency(&mut self, latency_us: u64) {
         self.batch_delivery_ops_total = self.batch_delivery_ops_total.saturating_add(1);
-        self.batch_delivery_latency_ms_total = self
-            .batch_delivery_latency_ms_total
-            .saturating_add(latency_ms);
-        self.batch_delivery_latency_ms_last = latency_ms;
-        observe_latency_histogram_bucket(&mut self.batch_delivery_latency_ms_buckets, latency_ms);
+        self.batch_delivery_latency_us_total = self
+            .batch_delivery_latency_us_total
+            .saturating_add(latency_us);
+        self.batch_delivery_latency_us_last = latency_us;
+        observe_latency_histogram_bucket(&mut self.batch_delivery_latency_us_buckets, latency_us);
     }
 
     pub(super) fn record_sink_queue_depth(&mut self, queue_depth: u64) {
@@ -1716,6 +1994,12 @@ impl RuntimeLoopMetricsAccumulator {
                 .terminal_error_other_total
                 .saturating_sub(before.terminal_error_other_total),
         );
+        self.sink_iceberg_orphaned_data_files_total =
+            self.sink_iceberg_orphaned_data_files_total.saturating_add(
+                after
+                    .iceberg_orphaned_data_files_total
+                    .saturating_sub(before.iceberg_orphaned_data_files_total),
+            );
         self.sink_iceberg_flush_lock_contention_events_total = self
             .sink_iceberg_flush_lock_contention_events_total
             .saturating_add(
@@ -1733,6 +2017,14 @@ impl RuntimeLoopMetricsAccumulator {
         self.sink_iceberg_flush_lock_contention_ms_max = self
             .sink_iceberg_flush_lock_contention_ms_max
             .max(after.iceberg_flush_lock_contention_ms_max);
+
+        // krafka's counters are already process-cumulative, so these are taken as-is
+        // rather than accumulated from the before/after delta. The expiry is a gauge:
+        // the latest observation is the one that matters.
+        self.sink_kafka_oauth_token_fetches_total = after.kafka_oauth_token_fetches_total;
+        self.sink_kafka_oauth_token_fetch_failures_total =
+            after.kafka_oauth_token_fetch_failures_total;
+        self.sink_kafka_oauth_token_expiry_epoch_ms = after.kafka_oauth_token_expiry_epoch_ms;
     }
 
     pub(super) fn record_correctness_sample(&mut self, sample: &CorrectnessSample) {
@@ -1801,6 +2093,7 @@ impl RuntimeLoopMetricsAccumulator {
             self.end_to_end_ack_lag_ms_total =
                 self.end_to_end_ack_lag_ms_total.saturating_add(lag_ms);
             self.end_to_end_ack_lag_ms_last = lag_ms;
+            observe_lag_histogram_bucket(&mut self.end_to_end_ack_lag_ms_buckets, lag_ms);
         }
 
         let stream = self.stream_correctness.entry(stream_slot).or_default();
@@ -1837,30 +2130,30 @@ impl RuntimeLoopMetricsAccumulator {
             self.sink_idempotent_delivery_capable,
             self.sink_transactional_checkpoint_barrier_capable,
             self.sink_send_ops_total,
-            self.sink_send_latency_ms_total,
-            self.sink_send_latency_ms_last,
-            &self.sink_send_latency_ms_buckets,
+            self.sink_send_latency_us_total,
+            self.sink_send_latency_us_last,
+            &self.sink_send_latency_us_buckets,
             self.sink_flush_ops_total,
-            self.sink_flush_latency_ms_total,
-            self.sink_flush_latency_ms_last,
-            &self.sink_flush_latency_ms_buckets,
+            self.sink_flush_latency_us_total,
+            self.sink_flush_latency_us_last,
+            &self.sink_flush_latency_us_buckets,
             self.transform_ops_total,
-            self.transform_latency_ms_total,
-            self.transform_latency_ms_last,
-            &self.transform_latency_ms_buckets,
+            self.transform_latency_us_total,
+            self.transform_latency_us_last,
+            &self.transform_latency_us_buckets,
             &self.wasm_metrics,
             self.prepare_ops_total,
-            self.prepare_latency_ms_total,
-            self.prepare_latency_ms_last,
-            &self.prepare_latency_ms_buckets,
+            self.prepare_latency_us_total,
+            self.prepare_latency_us_last,
+            &self.prepare_latency_us_buckets,
             self.batch_delivery_ops_total,
-            self.batch_delivery_latency_ms_total,
-            self.batch_delivery_latency_ms_last,
-            &self.batch_delivery_latency_ms_buckets,
+            self.batch_delivery_latency_us_total,
+            self.batch_delivery_latency_us_last,
+            &self.batch_delivery_latency_us_buckets,
             self.checkpoint_commit_ops_total,
-            self.checkpoint_commit_latency_ms_total,
-            self.checkpoint_commit_latency_ms_last,
-            &self.checkpoint_commit_latency_ms_buckets,
+            self.checkpoint_commit_latency_us_total,
+            self.checkpoint_commit_latency_us_last,
+            &self.checkpoint_commit_latency_us_buckets,
             self.sink_queue_depth_last,
             p95_u64_window(&self.sink_queue_depth_window),
             self.pipeline_started.elapsed().as_secs(),
@@ -1875,17 +2168,28 @@ impl RuntimeLoopMetricsAccumulator {
             self.sink_terminal_status_other_total,
             self.sink_terminal_error_timeout_total,
             self.sink_terminal_error_other_total,
+            self.sink_iceberg_orphaned_data_files_total,
             self.sink_iceberg_flush_lock_contention_events_total,
             self.sink_iceberg_flush_lock_contention_ms_total,
             self.sink_iceberg_flush_lock_contention_ms_max,
         );
 
+        sink_metrics
+            .unmatched_transform_rules
+            .clone_from(&self.unmatched_transform_rules);
+        sink_metrics.sink_kafka_oauth_token_fetches_total =
+            self.sink_kafka_oauth_token_fetches_total;
+        sink_metrics.sink_kafka_oauth_token_fetch_failures_total =
+            self.sink_kafka_oauth_token_fetch_failures_total;
+        sink_metrics.sink_kafka_oauth_token_expiry_epoch_ms =
+            self.sink_kafka_oauth_token_expiry_epoch_ms;
         sink_metrics.data_events_total = self.data_events_total;
         sink_metrics.data_duplicates_total = self.data_duplicates_total;
         sink_metrics.data_reorders_total = self.data_reorders_total;
         sink_metrics.end_to_end_ack_lag_samples_total = self.end_to_end_ack_lag_samples_total;
         sink_metrics.end_to_end_ack_lag_ms_total = self.end_to_end_ack_lag_ms_total;
         sink_metrics.end_to_end_ack_lag_ms_last = self.end_to_end_ack_lag_ms_last;
+        sink_metrics.end_to_end_ack_lag_ms_buckets = self.end_to_end_ack_lag_ms_buckets;
         sink_metrics.sink_http_requests_total = self.sink_http_requests_total;
         sink_metrics.sink_http_request_amplification = if self.sink_send_ops_total == 0 {
             0.0
@@ -1924,7 +2228,7 @@ impl RuntimeLoopMetricsAccumulator {
         );
         sink_metrics.sink_http_batch_retry_duration_ms_total =
             self.sink_http_batch_retry_duration_ms_total;
-        sink_metrics.sink_http_batch_retry_duration_ms_avg = average_latency_ms(
+        sink_metrics.sink_http_batch_retry_duration_ms_avg = average_latency_seconds_from_millis(
             self.sink_http_batch_retry_duration_ms_total,
             self.sink_http_batch_retry_duration_samples_total,
         );
@@ -2168,7 +2472,7 @@ pub(super) fn p95_u64_window(window: &VecDeque<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use rustcdc::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use rustcdc::core::{Event, Operation, SourceMetadata};
     use serde_json::json;
 
     use super::RuntimeLoopMetricsAccumulator;
@@ -2177,26 +2481,13 @@ mod tests {
     use std::borrow::Cow;
 
     fn sample_event(source_name: &str, offset: &str, source_timestamp: u64, ts: u64) -> Event {
-        Event {
-            before: None,
-            after: Some(json!({"id": offset, "value": source_timestamp})),
-            op: Operation::Insert,
-            source: SourceMetadata {
-                source_name: source_name.to_string(),
-                offset: offset.to_string(),
-                timestamp: source_timestamp,
-            },
-            ts,
-            schema: Some("public".to_string()),
-            table: "orders".to_string(),
-            primary_key: Some(vec!["id".to_string()]),
-            snapshot: None,
-            transaction: None,
-            envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
-            unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
-        }
+        Event::builder("orders", Operation::Insert)
+            .after(json!({"id": offset, "value": source_timestamp}))
+            .source(SourceMetadata::new(source_name, offset, source_timestamp))
+            .ts(ts)
+            .schema("public")
+            .primary_key(["id"])
+            .build()
     }
 
     #[test]
@@ -2339,7 +2630,8 @@ mod tests {
             "last_commit_at_ms": 3,
             "checkpoint_age_ms": 5,
             "replication_lag_ms": 7,
-            "replication_slot_lag_bytes": 42
+            "replication_slot_lag_bytes": 42,
+            "unmatched_transform_rules": []
         }))
         .expect("snapshot deserializes");
 
@@ -2425,5 +2717,172 @@ mod tests {
             "kafka value missing:\n{out}"
         );
         assert!(out.contains(r#"sink="http""#), "http value missing:\n{out}");
+    }
+
+    /// `rustcdc_transform_rules_unmatched` must be emitted **only** for rules that are
+    /// unmatched — that is what makes `> 0` a complete alert rule with no threshold to
+    /// pick. Label values must be escaped: an operator-written JSON path can contain a
+    /// quote, and an unescaped one breaks the whole scrape endpoint, not just this line.
+    #[test]
+    fn unmatched_transform_rules_render_only_when_present_and_escape_labels() {
+        let clean = super::SinkMetricsSnapshot {
+            sink_name: "kafka".to_string(),
+            ..super::SinkMetricsSnapshot::default()
+        };
+        assert!(
+            !clean
+                .render_prometheus()
+                .contains("rustcdc_transform_rules_unmatched"),
+            "the healthy state must emit no series at all"
+        );
+
+        let dirty = super::SinkMetricsSnapshot {
+            sink_name: "kafka".to_string(),
+            unmatched_transform_rules: vec![rustcdc::transform::UnmatchedRule::new(
+                "redact_pii/mask_hash",
+                "mask",
+                r#"customer."e mail""#,
+                "the column is shipping in clear text",
+            )],
+            ..super::SinkMetricsSnapshot::default()
+        };
+        let out = dirty.render_prometheus();
+
+        assert!(
+            out.contains("rustcdc_transform_rules_unmatched"),
+            "an unmatched rule must be reported:\n{out}"
+        );
+        assert!(
+            out.contains(r#"transform="redact_pii/mask_hash""#),
+            "the operator's rule name must be the label:\n{out}"
+        );
+        assert!(
+            out.contains(r#"kind="mask""#),
+            "the kind label drives per-kind remediation:\n{out}"
+        );
+        assert!(
+            !out.contains(r#"rule="customer."e mail"""#),
+            "the embedded quotes must be escaped, not emitted raw:\n{out}"
+        );
+        assert!(
+            out.contains(r#"\""#),
+            "escaped quotes must appear in the rule label:\n{out}"
+        );
+    }
+
+    /// The OAUTHBEARER token counters must reach the scrape output. A misconfigured
+    /// `token_endpoint` otherwise looks exactly like an unreachable broker: both show
+    /// up only as connection failures, and neither names the identity provider.
+    #[test]
+    fn kafka_oauth_token_metrics_reach_the_prometheus_output() {
+        let mut acc = RuntimeLoopMetricsAccumulator::new(
+            "kafka",
+            "effectively_once",
+            true,
+            "effectively_once",
+            true,
+            true,
+            8,
+            50_000,
+        );
+
+        acc.record_sink_delivery_delta(
+            crate::sink::SinkDeliveryMetrics::default(),
+            crate::sink::SinkDeliveryMetrics {
+                kafka_oauth_token_fetches_total: 7,
+                kafka_oauth_token_fetch_failures_total: 2,
+                kafka_oauth_token_expiry_epoch_ms: 1_785_915_000_000,
+                ..crate::sink::SinkDeliveryMetrics::default()
+            },
+        );
+
+        assert_eq!(acc.sink_kafka_oauth_token_fetches_total, 7);
+        assert_eq!(acc.sink_kafka_oauth_token_fetch_failures_total, 2);
+        assert_eq!(
+            acc.sink_kafka_oauth_token_expiry_epoch_ms,
+            1_785_915_000_000
+        );
+
+        // And the render path must emit all three families.
+        let snapshot = super::SinkMetricsSnapshot {
+            sink_name: "kafka".to_string(),
+            sink_kafka_oauth_token_fetches_total: acc.sink_kafka_oauth_token_fetches_total,
+            sink_kafka_oauth_token_fetch_failures_total: acc
+                .sink_kafka_oauth_token_fetch_failures_total,
+            sink_kafka_oauth_token_expiry_epoch_ms: acc.sink_kafka_oauth_token_expiry_epoch_ms,
+            ..super::SinkMetricsSnapshot::default()
+        };
+
+        let out = snapshot.render_prometheus();
+        for family in [
+            "rustcdc_sink_kafka_oauth_token_fetches_total",
+            "rustcdc_sink_kafka_oauth_token_fetch_failures_total",
+            "rustcdc_sink_kafka_oauth_token_expiry_epoch_ms",
+        ] {
+            assert!(out.contains(family), "{family} missing:\n{out}");
+        }
+        // The failure counter is what an alert rule fires on — its value must be the
+        // observed one, not a zero placeholder.
+        assert!(
+            out.contains(r#"rustcdc_sink_kafka_oauth_token_fetch_failures_total{sink="kafka"} 2"#),
+            "failure count not carried through:\n{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod end_to_end_lag_tests {
+    use super::{
+        observe_lag_histogram_bucket, END_TO_END_LAG_BUCKETS_MS, LATENCY_HISTOGRAM_BUCKETS_US,
+    };
+
+    /// The freshness SLO is a 95th percentile, and `histogram_quantile` needs buckets that
+    /// still have resolution where the interesting values are. Reusing the per-operation
+    /// latency bounds would put every lag above five seconds into `+Inf` — exactly the
+    /// range a lag alert is written about — so the two families are deliberately separate.
+    #[test]
+    fn lag_buckets_extend_far_beyond_the_per_operation_latency_bounds() {
+        let latency_max_ms = LATENCY_HISTOGRAM_BUCKETS_US
+            .last()
+            .expect("latency bounds are non-empty")
+            / 1_000;
+        let lag_max_ms = *END_TO_END_LAG_BUCKETS_MS
+            .last()
+            .expect("lag bounds are non-empty");
+
+        assert!(
+            lag_max_ms >= latency_max_ms * 100,
+            "lag bounds ({lag_max_ms} ms) must cover a far wider range than the \
+             per-operation latency bounds ({latency_max_ms} ms), or a backlogged \
+             pipeline reports every sample in +Inf and the percentile is unusable"
+        );
+        assert!(
+            END_TO_END_LAG_BUCKETS_MS.windows(2).all(|w| w[0] < w[1]),
+            "bucket bounds must be strictly increasing"
+        );
+    }
+
+    /// A sample lands in the first bound it does not exceed, and one past every bound is
+    /// counted only by `+Inf` — which the encoder derives from the total, not from the
+    /// bucket array.
+    #[test]
+    fn a_sample_lands_in_the_first_bound_it_does_not_exceed() {
+        let mut buckets = [0u64; END_TO_END_LAG_BUCKETS_MS.len()];
+
+        observe_lag_histogram_bucket(&mut buckets, 0);
+        observe_lag_histogram_bucket(&mut buckets, END_TO_END_LAG_BUCKETS_MS[0]);
+        assert_eq!(buckets[0], 2, "both samples belong in the first bucket");
+
+        observe_lag_histogram_bucket(&mut buckets, END_TO_END_LAG_BUCKETS_MS[0] + 1);
+        assert_eq!(buckets[1], 1, "one past a bound belongs in the next bucket");
+
+        let over = END_TO_END_LAG_BUCKETS_MS.last().expect("bounds") + 1;
+        observe_lag_histogram_bucket(&mut buckets, over);
+        assert_eq!(
+            buckets.iter().sum::<u64>(),
+            3,
+            "a sample beyond the last bound is counted by +Inf only, which the encoder \
+             takes from the sample total rather than from this array"
+        );
     }
 }

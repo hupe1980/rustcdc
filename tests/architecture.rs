@@ -1,8 +1,11 @@
 /// Architecture invariant tests.
 ///
-/// These source-level assertions enforce the structural boundaries defined in
-/// REFACTOR.md so that breaking changes are caught at compile/test time rather
-/// than at code review.
+/// These source-level assertions enforce the structural boundaries this crate relies on,
+/// so that breaking one is caught by the test suite rather than at code review — or not
+/// at all.
+///
+/// Each test states the invariant and why it exists; a bare grep with no rationale is
+/// indistinguishable from a lint nobody can safely delete.
 use std::fs;
 use std::path::Path; // used by glob_src / read_src
 
@@ -41,14 +44,54 @@ fn read_schema_src() -> String {
     combined
 }
 
+/// The body of the `SinkConfig` enum — the *transport* enum specifically.
+///
+/// The codec/transport guards below have to look here rather than at all of
+/// `src/config/`: a substring search over the whole directory also matches codec
+/// variants, and `CodecConfig::GlueAvro(..)` is a perfectly legitimate codec that a
+/// naive `contains("Avro(")` reported as a forbidden sink transport.
+fn read_sink_config_enum_body() -> String {
+    let src = read_schema_src();
+    let start = src
+        .find("pub enum SinkConfig {")
+        .expect("SinkConfig enum must exist in src/config/");
+    let rest = &src[start..];
+    let end = rest
+        .find("\n}")
+        .expect("SinkConfig enum must be brace-terminated");
+    rest[..end].to_string()
+}
+
 /// `SinkConfig` must not have an `Avro` variant — Avro is a codec, not a
 /// transport. Use `KafkaSinkConfig.codec` with `type = "avro_confluent"`.
 #[test]
 fn sink_config_has_no_avro_variant() {
-    let src = read_schema_src();
+    let body = read_sink_config_enum_body();
     assert!(
-        !src.contains("Avro("),
-        "SinkConfig::Avro must not exist — encode via KafkaSinkConfig.codec instead"
+        !body.contains("Avro"),
+        "SinkConfig must have no Avro variant — encode via the sink's `codec` instead:\n{body}"
+    );
+}
+
+/// The guard above must actually be looking at the enum, not the whole file.
+///
+/// A `contains` over all of `src/config/` passes trivially once the string moves
+/// somewhere harmless, which is how a structural guard silently stops guarding.
+#[test]
+fn sink_config_enum_body_is_extracted_not_the_whole_file() {
+    let body = read_sink_config_enum_body();
+    assert!(
+        body.contains("Kafka(") && body.contains("Iceberg("),
+        "the extracted body must be the real SinkConfig enum:\n{body}"
+    );
+    assert!(
+        !body.contains("pub enum CodecConfig"),
+        "extraction must stop at the enum's closing brace, not run into the next item"
+    );
+    // The codec enum legitimately has an Avro-named variant; the guard must not see it.
+    assert!(
+        read_schema_src().contains("GlueAvro("),
+        "this test is only meaningful while a codec variant contains \"Avro(\""
     );
 }
 
@@ -56,10 +99,11 @@ fn sink_config_has_no_avro_variant() {
 /// target. CDC events reach OTEL through the telemetry stack in telemetry.rs.
 #[test]
 fn sink_config_has_no_otel_variant() {
-    let src = read_schema_src();
+    let body = read_sink_config_enum_body();
     assert!(
-        !src.contains("Otel("),
-        "SinkConfig::Otel must not exist — OTEL is telemetry infrastructure, not a sink"
+        !body.contains("Otel"),
+        "SinkConfig must have no Otel variant — OTEL is telemetry infrastructure, not a \
+         sink:\n{body}"
     );
 }
 
@@ -123,5 +167,91 @@ fn migrations_has_no_v2_or_v3_hop() {
     assert!(
         !src.contains("\"v3\""),
         "migrations.rs must not reference v3 — only v1 is the target version"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Worker lifecycle invariants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Background work belongs on the ambient tokio runtime, not on detached OS threads
+/// running private ones.
+///
+/// The admin state used to start four workers with `std::thread::spawn`, each building a
+/// `current_thread` runtime and looping unconditionally. That is four extra OS threads and
+/// four extra timer/IO drivers per process, none of which could be stopped: no handle was
+/// kept and no loop had an exit condition. Shutdown was therefore not orderly — the
+/// signal-action worker went on mutating admin state while the pipeline finalised — and
+/// every test that built an `AdminState` leaked its four threads for the lifetime of the
+/// test binary.
+///
+/// The needle is assembled with `concat!` so this assertion does not match its own source.
+#[test]
+fn no_module_spawns_a_detached_thread_with_its_own_runtime() {
+    let needle = concat!("thread::", "spawn(move");
+    let mut offenders = Vec::new();
+
+    for dir in ["src", "src/admin", "src/commands", "src/sink", "src/state"] {
+        for (name, src) in glob_src(dir) {
+            if src.contains(needle) {
+                offenders.push(name);
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "detached threads cannot be shut down and each carries a private tokio runtime; \
+         use tokio::spawn with a shutdown watch instead. Offenders: {offenders:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Module size
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// No source file may exceed a size at which it stops being navigable.
+///
+/// This exists because the two largest modules grew for five consecutive review cycles
+/// while "split them" sat on the plan. `admin/mod.rs` reached 7 927 lines and
+/// `config/loader.rs` 4 318, and each round that deferred the split also added to them —
+/// the cost rose monotonically with the delay and nothing made that visible until someone
+/// counted.
+///
+/// The limit is deliberately generous. It is not a style preference about ideal file
+/// length; it is a ratchet that stops the specific failure of a module doubling while
+/// everyone agrees it should shrink. Splitting a file is mechanical and the compiler
+/// verifies it, so hitting this is a prompt to do fifteen minutes of work, not to raise
+/// the number.
+#[test]
+fn no_source_file_grows_past_the_point_of_navigability() {
+    const MAX_LINES: usize = 4_000;
+
+    let mut oversized = Vec::new();
+    let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().map(|e| e == "rs").unwrap_or(false) {
+                let lines = fs::read_to_string(&path)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                if lines > MAX_LINES {
+                    oversized.push((path.display().to_string(), lines));
+                }
+            }
+        }
+    }
+
+    oversized.sort_by_key(|(_, lines)| std::cmp::Reverse(*lines));
+    assert!(
+        oversized.is_empty(),
+        "these files exceed {MAX_LINES} lines and should be split by concern \
+         (tests move to a sibling `*_tests.rs` cheaply): {oversized:?}"
     );
 }

@@ -1,4 +1,8 @@
-# PostgreSQL connector
++++
+title = "PostgreSQL connector"
+description = "Capture PostgreSQL changes with logical replication: publications, replication slots, REPLICA IDENTITY, unchanged TOAST and managed cloud databases."
+weight = 51
++++
 
 The rustcdc PostgreSQL connector reads every committed row-level change from a
 PostgreSQL database and streams it as a structured event to your configured sink.
@@ -6,21 +10,6 @@ It uses **logical replication** — PostgreSQL's native change-data-capture
 mechanism — so it captures changes in real time without polling, table triggers,
 or additional plugins.
 
----
-
-## Table of contents
-
-1. [Overview](#1-overview)
-2. [How the connector works](#2-how-the-connector-works)
-3. [Setting up PostgreSQL](#3-setting-up-postgresql)
-4. [Cloud databases](#4-cloud-databases)
-5. [Supported topologies and HA](#5-supported-topologies-and-ha)
-6. [WAL disk space](#6-wal-disk-space)
-7. [Configuration reference](#7-configuration-reference)
-8. [Monitoring](#8-monitoring)
-9. [Behavior when things go wrong](#9-behavior-when-things-go-wrong)
-
----
 
 ## 1. Overview
 
@@ -48,7 +37,6 @@ additional installation required).
 | `wal_level` | `logical` |
 | User privilege | `REPLICATION` + `SELECT` on target tables |
 
----
 
 ## 2. How the connector works
 
@@ -71,6 +59,36 @@ slot position — existing rows are not re-read.
 If the connector is interrupted during the snapshot, it restarts the snapshot
 from the beginning. Only a fully completed snapshot advances the checkpoint.
 
+### Incremental snapshot (non-blocking)
+
+`[incremental_snapshot]` backfills with the **DBLog watermark algorithm** instead
+of a blocking scan:
+
+```toml
+[incremental_snapshot]
+tables     = ["public.orders", "public.customers"]
+chunk_size = 5000
+```
+
+Streaming starts immediately, and each chunk is a keyset-paginated `SELECT`
+bracketed by low/high watermarks written into the WAL. Rows the stream also
+delivered inside the override window are reconciled by row identity, so a row
+changed mid-chunk is not delivered twice with stale content.
+
+Two consequences matter operationally:
+
+* **The replication slot is not held open for the length of a table scan.** A
+  blocking snapshot of a large table keeps the slot from advancing, so WAL
+  accumulates on the primary for the whole scan.
+* **A restart resumes mid-backfill.** Chunk cursors travel inside the connector
+  checkpoint offset, in the same atomic, fsynced, checksummed write as the stream
+  position — a cursor is only meaningful relative to the position it was captured
+  against, and two separately-written records could disagree after a crash.
+
+`snapshot_tables` and `incremental_snapshot.tables` are mutually exclusive; the
+loader rejects both, because every listed table would otherwise be read twice and
+the duplicate would look like genuine change data downstream.
+
 ### Streaming
 
 After the snapshot, the connector streams changes by reading from the replication
@@ -79,7 +97,7 @@ slot:
 - Each committed transaction's WAL records are decoded by `pgoutput` and
   forwarded to the connector
 - The connector converts them into the rustcdc event envelope (see
-  [event model](../concepts.md#1-event-model))
+  [event model](@/docs/concepts.md#1-event-model))
 - After a batch is delivered to the sink, the connector acknowledges the LSN to
   PostgreSQL, allowing WAL segments to be reclaimed
 
@@ -122,9 +140,8 @@ The connector surfaces this precisely instead of papering over it: affected colu
 names are listed in the event's `unavailable_columns` (holes in `after`) and
 `before_unavailable_columns` (holes in `before`). An absent column is **not**
 `NULL` — consumers must exclude listed columns from any write they build from the
-payload. See [Core concepts — partial row images](../concepts.md#partial-row-images-unchanged-toast).
+payload. See [Core concepts — partial row images](@/docs/concepts.md#partial-row-images-unchanged-toast).
 
----
 
 ## 3. Setting up PostgreSQL
 
@@ -247,7 +264,6 @@ SELECT pubname, puballtables FROM pg_publication;
 SELECT usename, userepl FROM pg_user WHERE usename = 'cdc_user';
 ```
 
----
 
 ## 4. Cloud databases
 
@@ -294,7 +310,6 @@ SELECT usename, userepl FROM pg_user WHERE usename = 'cdc_user';
    CREATE USER cdc_user WITH REPLICATION IN ROLE cloudsqlsuperuser LOGIN PASSWORD 'changeme';
    ```
 
----
 
 ## 5. Supported topologies and HA
 
@@ -336,7 +351,6 @@ slot_name   = "cdc_slot_pipeline_b"
 publication_name      = "cdc_pub_pipeline_b"
 ```
 
----
 
 ## 6. WAL disk space
 
@@ -396,7 +410,6 @@ table_include_list = ["public.orders", "public._cdc_heartbeat"]
 Periodically insert into the heartbeat table from a cron job or the admin API's
 `log_marker` signal.
 
----
 
 ## 7. Configuration reference
 
@@ -456,7 +469,6 @@ mode = "plaintext"    # plaintext | tls
 | `table_exclude_list` | empty | Exact `schema.table` names to suppress; ignored when the include list is non-empty |
 | `require_primary` | `true` | (`[source]` level) Fail at startup if the server is a replica |
 
----
 
 ## 8. Monitoring
 
@@ -474,12 +486,11 @@ metrics:
 | `rustcdc_runtime_recoverable_breaker_open_total` | counter | Number of times the circuit breaker has opened |
 
 SLO alert rules are in
-[`monitoring/rustcdc_slo_alerts.yml`](../../monitoring/rustcdc_slo_alerts.yml).
+[`monitoring/rustcdc_slo_alerts.yml`](https://github.com/hupe1980/rustcdc-server/blob/main/monitoring/rustcdc_slo_alerts.yml).
 `RUSTCDCRuntimeStalled`, `RUSTCDCReplicationSlotLagHigh`,
 `RUSTCDCEventsSkippedDataLoss`, `RUSTCDCCheckpointAgeHigh`, and
 `RUSTCDCReadinessRateLow` are most relevant for PostgreSQL replication health.
 
----
 
 ## 9. Behavior when things go wrong
 
@@ -541,12 +552,3 @@ is large.
 ```sql
 CREATE PUBLICATION cdc_pub FOR TABLE public.orders, public.customers;
 ```
-
----
-
-## See also
-
-- [Getting started](../getting-started.md)
-- [Core concepts](../concepts.md)
-- [Configuration reference](../configuration.md)
-- [Operations guide](../operations.md)

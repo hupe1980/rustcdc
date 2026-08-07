@@ -87,6 +87,15 @@ services:
       # curl usage: -H "Authorization: Bearer rustcdc-demo-read-token"
       RUSTCDC_ADMIN_READ_TOKEN: "rustcdc-demo-read-token"
       RUSTCDC_ADMIN_WRITE_TOKEN: "rustcdc-demo-write-token"
+      # HMAC key for the customer-name masking rule in cdc.toml. Demo-only —
+      # in production this comes from a secret manager, and rotating it changes
+      # every pseudonym it has ever produced.
+      RUSTCDC_DEMO_PII_KEY: "rustcdc-demo-pii-key-not-for-production"
+      # The loader refuses a literal source password: a replication credential in a
+      # config file is readable by anyone who can read the file, and it grants read
+      # access to every captured table. Demo-only value; use a secret manager in
+      # production.
+      RUSTCDC_DEMO_SOURCE_PASSWORD: "cdc_password"
     command: ["run", "--config-file", "/etc/rustcdc/config.toml"]
     restart: unless-stopped
 

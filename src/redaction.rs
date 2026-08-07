@@ -2,7 +2,7 @@
 ///
 /// This operates on parsed JSON so key ordering and whitespace do not matter,
 /// and only known paths/keys are redacted.
-pub(crate) fn redact_secrets(json: &str) -> String {
+pub fn redact_secrets(json: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(json) {
         Ok(mut v) => {
             let mut path = Vec::new();
@@ -13,12 +13,18 @@ pub(crate) fn redact_secrets(json: &str) -> String {
     }
 }
 
+/// Paths that must be redacted **whole**, not merely stripped of userinfo.
+///
+/// These are written in the **post-migration** shape. `normalize_source` flattens
+/// `source.<kind>.*` into `source.*`, so the entries that used to read
+/// `source.postgres.password` matched nothing that `redacted_config_snapshot` could
+/// ever produce — the list implied a coverage it did not have, and MySQL and MariaDB
+/// were absent entirely. A connection URL is listed because the credential is not
+/// always in the userinfo: `?sslpassword=` and friends live in the query string.
 const SENSITIVE_PATHS: &[&str] = &[
-    // Source credentials
-    "source.postgres.password",
-    "source.postgres.url",
-    "source.sqlserver.password",
-    "source.sqlserver.url",
+    // Source credentials — flat shape; `type` selects the driver.
+    "source.password",
+    "source.url",
     // Sink credentials
     "sink.bearer_token",
     "sink.kafka.security.sasl_password",
@@ -115,6 +121,44 @@ fn should_redact_key(path: &[String], key: &str) -> bool {
     is_sensitive_path(&candidate_path) || is_sensitive_key_name(key)
 }
 
+/// Replace the userinfo of a URL-shaped string with `[REDACTED]`, or return `None` if
+/// the value is not a URL carrying credentials.
+///
+/// This is deliberately **value**-driven rather than key-driven. Every other rule in
+/// this module asks "is this field named like a secret?", which only protects fields
+/// somebody remembered to name or list — and `sink.http.url` was neither, so a
+/// connection string with `user:pass@` was returned verbatim by `/status` to any
+/// read-scoped token. A rule that looks at the value catches the next such field
+/// without an edit here.
+///
+/// Matching is intentionally narrow: a `scheme://` prefix and an `@` before the first
+/// `/` of the authority. Free-text values containing an `@` (an email in a table
+/// comment, say) have no scheme and are left alone.
+fn strip_url_userinfo(text: &str) -> Option<String> {
+    let scheme_end = text.find("://")?;
+    if scheme_end == 0
+        || !text[..scheme_end]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        return None;
+    }
+
+    let authority_start = scheme_end + 3;
+    let authority_end = text[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(text.len(), |offset| authority_start + offset);
+
+    let at = text[authority_start..authority_end].rfind('@')?;
+    let userinfo_end = authority_start + at;
+
+    let mut redacted = String::with_capacity(text.len());
+    redacted.push_str(&text[..authority_start]);
+    redacted.push_str("[REDACTED]");
+    redacted.push_str(&text[userinfo_end..]);
+    Some(redacted)
+}
+
 fn redact_value(v: &mut serde_json::Value, path: &mut Vec<String>) {
     match v {
         serde_json::Value::Object(map) => {
@@ -131,6 +175,11 @@ fn redact_value(v: &mut serde_json::Value, path: &mut Vec<String>) {
                 path.push(k.clone());
                 redact_value(val, path);
                 path.pop();
+            }
+        }
+        serde_json::Value::String(text) => {
+            if let Some(stripped) = strip_url_userinfo(text) {
+                *text = stripped;
             }
         }
         serde_json::Value::Array(arr) => {
@@ -150,19 +199,27 @@ mod tests {
 
     use super::{redact_secrets, should_redact_key, NON_SECRET_KEY_NAME_EXCEPTIONS};
 
+    /// The shape here is the **post-migration, flat** one — `source.password`, not
+    /// `source.postgres.password`.
+    ///
+    /// This test used to assert against the nested shape, which `normalize_source`
+    /// flattens away before anything is serialised. It exercised a document
+    /// `redacted_config_snapshot` can never produce, so it passed while proving
+    /// nothing about production. `redacts_a_real_app_config` below is the guard
+    /// against that happening again.
     #[test]
-    fn redacts_schema_sensitive_fields() {
+    fn redacts_schema_sensitive_fields_in_the_flat_source_shape() {
         let input = r#"{
     "source": {
-        "postgres": {
-            "host": "db.local",
-            "password": "one",
-            "url": "postgres://cdc:pw@db.local:5432/cdc"
-        }
+        "type": "postgres",
+        "host": "db.local",
+        "password": "one",
+        "url": "postgres://cdc:pw@db.local:5432/cdc"
     },
     "sink": {
         "type": "http",
-        "bearer_token": "two"
+        "bearer_token": "two",
+        "url": "https://admin:hunter2@api.example.com/events"
     },
     "state": {
         "backend": {
@@ -176,10 +233,100 @@ mod tests {
         let out = redact_secrets(input);
         let v: Value = serde_json::from_str(&out).expect("valid redacted json");
 
-        assert_eq!(v["source"]["postgres"]["password"], "[REDACTED]");
-        assert_eq!(v["source"]["postgres"]["url"], "[REDACTED]");
+        assert_eq!(v["source"]["password"], "[REDACTED]");
+        assert_eq!(
+            v["source"]["url"], "[REDACTED]",
+            "a source connection URL is redacted whole: a credential can sit in the \
+             query string as well as the userinfo"
+        );
         assert_eq!(v["sink"]["bearer_token"], "[REDACTED]");
+        assert_eq!(
+            v["sink"]["url"], "https://[REDACTED]@api.example.com/events",
+            "a sink URL keeps its host so the snapshot stays useful for diagnostics, \
+             but never its credentials"
+        );
         assert_eq!(v["state"]["backend"]["postgres"]["url"], "[REDACTED]");
+    }
+
+    /// A credential embedded in a URL must not survive redaction.
+    ///
+    /// The loader now rejects userinfo in `sink.http.url` outright, so this is the
+    /// second of two layers. It exists because the first layer is a validation rule
+    /// that a future URL-bearing field could simply forget to call, and because
+    /// `url` is matched by neither the sensitive-path list nor the key-name tokens —
+    /// which is exactly how the value reached `/status` verbatim.
+    #[test]
+    fn url_userinfo_is_stripped_wherever_it_appears() {
+        let input = serde_json::json!({
+            "sink": { "url": "https://admin:hunter2@api.example.com/events" },
+            "nested": { "list": ["mysql://root:toor@db:3306/app"] },
+            "no_scheme_no_touch": "contact ops@example.com about this table",
+            "plain_endpoint": "https://api.example.com/events",
+        })
+        .to_string();
+
+        let out = redact_secrets(&input);
+        assert!(
+            !out.contains("hunter2") && !out.contains("toor"),
+            "credentials survived redaction: {out}"
+        );
+
+        let v: Value = serde_json::from_str(&out).expect("valid redacted json");
+        assert_eq!(
+            v["sink"]["url"],
+            "https://[REDACTED]@api.example.com/events"
+        );
+        assert_eq!(v["nested"]["list"][0], "mysql://[REDACTED]@db:3306/app");
+        assert_eq!(
+            v["no_scheme_no_touch"], "contact ops@example.com about this table",
+            "a bare @ without a scheme is not a URL and must not be rewritten"
+        );
+        assert_eq!(
+            v["plain_endpoint"], "https://api.example.com/events",
+            "a URL without userinfo must be left exactly as it was"
+        );
+    }
+
+    /// Redact a genuine `AppConfig`, not a hand-written JSON literal.
+    ///
+    /// Every other test in this module asserts against a fixture somebody typed, which
+    /// is why the flat-shape drift went unnoticed for so long. This one serialises the
+    /// real struct through the real snapshot function, so a schema change that moves a
+    /// secret shows up here instead of in production.
+    #[test]
+    fn redacts_a_real_app_config() {
+        const SECRET: &str = "unmistakable-secret-value-9f3a";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::commands::minimal_config_for_tests(
+            dir.path().to_path_buf(),
+            crate::config::schema::StateBackend::LocalFs,
+        );
+
+        // Three different carriers, three different rules: a `SecretString` (redacted by
+        // its own `Serialize`), a header map entry (redacted by name within
+        // `sink.headers`), and a URL userinfo (redacted by value). If any one rule
+        // regresses, this fails.
+        config.sink = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": format!("https://svc:{SECRET}@api.example.com/events"),
+            "bearer_token": SECRET,
+            "headers": { "authorization": format!("Bearer {SECRET}") },
+        }))
+        .expect("http sink config");
+
+        let snapshot = redact_secrets(
+            &serde_json::to_string_pretty(&config).expect("serialise the real config"),
+        );
+
+        assert!(
+            !snapshot.contains(SECRET),
+            "a secret from the real AppConfig survived redaction:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("[REDACTED]"),
+            "the snapshot must show that redaction ran at all"
+        );
     }
 
     #[test]

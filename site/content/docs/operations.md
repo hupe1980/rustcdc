@@ -1,26 +1,12 @@
-# Operations guide
++++
+title = "Operations"
+description = "Run rustcdc in production: CLI commands, health and readiness probes, Prometheus metrics, OpenTelemetry, replay, tuning profiles and Kubernetes deployment."
+weight = 60
++++
 
 Day-2 operations for rustcdc — keeping it running, diagnosing problems,
 and recovering from failures.
 
----
-
-## Table of contents
-
-1. [CLI reference](#1-cli-reference)
-2. [Health and status](#2-health-and-status)
-3. [Graceful shutdown](#3-graceful-shutdown)
-4. [Inspect checkpoint](#4-inspect-checkpoint)
-5. [Replay events](#5-replay-events)
-6. [Migrate state](#6-migrate-state)
-7. [Dry run](#7-dry-run)
-8. [Circuit-breaker recovery](#8-circuit-breaker-recovery)
-9. [Performance tuning](#9-performance-tuning)
-10. [Security hardening](#10-security-hardening)
-11. [Kubernetes deployment](#11-kubernetes-deployment)
-12. [Upgrading](#12-upgrading)
-
----
 
 ## 1. CLI reference
 
@@ -92,7 +78,6 @@ Options:
   --checkpoint-parity-mode   auto | enabled | disabled
 ```
 
----
 
 ## 2. Health and status
 
@@ -140,11 +125,30 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | `rustcdc_runtime_recoverable_breaker_open_total` | increasing | Circuit breaker firing repeatedly |
 | `rustcdc_slo_readiness_ready_total / rustcdc_slo_readiness_checks_total` | < 0.99 | Readiness probe failures |
 | `rustcdc_audit_log_drop_total` | > 0 | Audit log queue saturated |
+| `rustcdc_end_to_end_ack_lag_seconds` | p95 > 30 s | **Freshness** — source commit to sink durability, the number a data consumer actually experiences. A histogram, so read it with `histogram_quantile`; see below |
+
+#### Freshness: read the percentile, not the average
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, sink) (rate(rustcdc_end_to_end_ack_lag_seconds_bucket[5m]))
+)
+```
+
+`rustcdc_end_to_end_ack_lag_seconds_avg` and `_last` are also exported and are useful on a
+dashboard, but neither can express a freshness SLO. A pipeline delivering 99% of events in
+200 ms and 1% ten minutes late reports a healthy average and a `_last` that depends on
+which event happened to be most recent. The histogram bounds run from 100 ms to one hour,
+so the quantile stays meaningful while a pipeline works through a backlog rather than
+collapsing into `+Inf`.
+
+A recovering pipeline breaches this legitimately and clears on its own; sustained breach
+with no restart behind it means the sink cannot keep up with the source.
 
 SLO alert rules for Prometheus are in
-[`monitoring/rustcdc_slo_alerts.yml`](../monitoring/rustcdc_slo_alerts.yml).
+[`monitoring/rustcdc_slo_alerts.yml`](https://github.com/hupe1980/rustcdc-server/blob/main/monitoring/rustcdc_slo_alerts.yml).
 
----
 
 ## 3. Graceful shutdown
 
@@ -166,7 +170,6 @@ spec:
 **Do not** send `SIGKILL` before the grace period expires — the current batch
 will not be checkpointed and will be redelivered on the next start.
 
----
 
 ## 4. Inspect checkpoint
 
@@ -226,7 +229,6 @@ Consequences:
   `migrate-state` verifies every migrated checkpoint by loading it through the
   runtime's own checksum/permission/offset gates before reporting success.
 
----
 
 ## 5. Replay events
 
@@ -256,7 +258,6 @@ rustcdc replay events.jsonl --config-file cdc.toml \
 Replay does not advance the checkpoint of a running pipeline. It is safe to run
 while the pipeline is stopped.
 
----
 
 ## 6. Migrate state
 
@@ -294,7 +295,6 @@ verified by loading them through the runtime's own integrity gates.
 5. Verify with `rustcdc inspect-checkpoint --config-file cdc.toml` and the
    Prometheus metrics.
 
----
 
 ## 7. Dry run
 
@@ -312,13 +312,12 @@ use the schema of the first table in `table_include_list`. Use this to:
 - Test WASM transforms without a live database
 - Benchmark throughput
 
----
 
 ## 8. Circuit-breaker recovery
 
 When the source becomes intermittently unavailable, rustcdc opens the circuit
 breaker and enters exponential backoff. See
-[concepts → circuit breaker](concepts.md#6-circuit-breaker) for the state diagram.
+[concepts → circuit breaker](@/docs/concepts.md#6-circuit-breaker) for the state diagram.
 
 ### Manual recovery
 
@@ -349,7 +348,6 @@ recoverable_error_breaker_cooldown_ms           = 60000  # 1 min was 30s
 recoverable_error_breaker_max_open_cycles       = 10     # was 3
 ```
 
----
 
 ## 9. Performance tuning
 
@@ -385,16 +383,33 @@ tcp_keepalive_secs     = 30
 
 ```toml
 [runtime]
-max_buffer_size            = 10000
-sink_flush_interval_events = 1000
-prepare_parallelism        = 1   # Kafka producer is already async
+max_buffer_size             = 10000
+sink_flush_interval_events  = 1000   # a flush drains the pipelining window — keep it >= max_pipelined_sends
+sink_delivery_queue_capacity = 1024  # how far the prepare stage may run ahead of delivery
+prepare_parallelism         = 1      # Kafka producer is already async
 
 [sink]
-type         = "kafka"
-brokers      = "broker1:9092,broker2:9092,broker3:9092"
-compression  = "zstd"
-delivery_mode = "at_least_once_idempotent"
+type                = "kafka"
+brokers             = "broker1:9092,broker2:9092,broker3:9092"
+compression         = "zstd"
+delivery_mode       = "at_least_once_idempotent"
+max_pipelined_sends = 512   # records accepted before waiting for an acknowledgement
+linger_ms           = 5     # amortised across the window; trades latency for larger batches
 ```
+
+**The three settings interact, and the smallest wins.** The effective pipelining depth is
+`min(max_pipelined_sends, sink_flush_interval_events, sink_delivery_queue_capacity)`,
+because a flush drains the window and the delivery queue bounds how far the prepare stage
+runs ahead. Raising `max_pipelined_sends` alone past either of the others does nothing.
+
+Depth is what makes `linger_ms` worth setting: with records in flight concurrently, a batch
+fills from many sends and the linger is paid once for the batch rather than once per
+record. Measured against an in-process broker, 300 records: a depth-1 window took 712 ms
+and 300 produce requests; a depth-256 window took 7.9 ms and 3. Per-partition ordering is
+identical either way.
+
+Memory cost is bounded by the window: `max_pipelined_sends` encoded payloads held for
+retry, per Kafka sink.
 
 ### Iceberg (batch-oriented)
 
@@ -416,7 +431,6 @@ If the container OOMs:
 2. If using Iceberg, reduce `max_pending_bytes`.
 3. If using WASM transforms, reduce `instance_pool_size` or `max_memory_bytes`.
 
----
 
 ## 10. Security hardening
 
@@ -431,6 +445,45 @@ bearer_token = { env = "INGEST_TOKEN" }
 
 Credentials backed by `SecretString` are never emitted in logs, config snapshots
 (`/status`), or support bundles.
+
+### Metric units
+
+Every duration and latency family is exported in **seconds**, per the Prometheus
+base-unit convention, and captured at microsecond resolution.
+
+This was not always true. Latency was previously captured with millisecond truncation
+against histogram bounds starting at 1 ms — so per-event work, which is measured in
+microseconds, truncated to `0`, landed entirely in the `le="1"` bucket, and made every
+quantile identical. A tenfold regression produced no visible change. If you have
+dashboards predating this, the families were renamed:
+
+| Old | New |
+|---|---|
+| `rustcdc_*_latency_ms` / `_ms_avg` / `_ms_last` | `rustcdc_*_latency_seconds` / `_seconds_avg` / `_seconds_last` |
+| `rustcdc_end_to_end_ack_lag_ms_*` | `rustcdc_end_to_end_ack_lag_seconds_*` |
+| `rustcdc_sink_http_retry_delay_ms_*` | `rustcdc_sink_http_retry_delay_seconds_*` |
+| `rustcdc_sink_http_batch_retry_duration_ms_*` | `rustcdc_sink_http_batch_retry_duration_seconds_*` |
+| `rustcdc_slo_admin_api_latency_ms_histogram` | `rustcdc_slo_admin_api_latency_seconds_histogram` |
+| `rustcdc_admin_rate_limiter_*_decision_latency_ms_*` | `..._decision_latency_seconds_*` |
+
+`rustcdc_runtime_checkpoint_age_ms` is deliberately unchanged; use
+`rustcdc_slo_checkpoint_age_seconds` for alerting, which is what the shipped rules do.
+
+### Alert rules
+
+`monitoring/rustcdc_slo_alerts.yml` is validated two ways, and both matter:
+
+* `promtool check rules` — PromQL **syntax**.
+* `tests/alert_rules.rs` — that every metric a rule references is one the server
+  actually **emits**.
+
+The second exists because promtool cannot know which metrics exist. Eighteen of the
+twenty-nine metrics the rules referenced turned out not to exist at all, so two thirds of
+the alerting was silent while looking configured — including the checkpoint-age,
+delivery-latency, revoked-token and crash-window-detection alerts. A rule that cannot
+fire is worse than no rule: its silence reads as health.
+
+If you add a rule, run `cargo test --test alert_rules`.
 
 ### Audit trail
 
@@ -461,6 +514,14 @@ openssl rand -hex 16
 
 When `audit_ip_salt_env` is unset, a random salt is generated at startup —
 pseudonyms are not correlatable across restarts.
+
+**Verify signing is actually on.** Both settings degrade to "no signature" /
+"ephemeral salt" rather than refusing to start, because an audit-trail
+misconfiguration should not take a running pipeline down. That makes the failure
+quiet by design, so check for it: an unset or malformed
+`audit_signing_key_env` variable logs at `warn` on startup, and exports carry no
+signature. Grep the first seconds of the log after any change to these settings —
+an unsigned audit trail found during an incident is an audit trail you do not have.
 
 ### Admin API hardening
 
@@ -494,7 +555,6 @@ token_manifest_refresh_ms              = 30000       # poll interval
 token_manifest_max_staleness_ms        = 120000      # fail closed after 2 min stale
 ```
 
----
 
 ## 11. Kubernetes deployment
 
@@ -512,7 +572,23 @@ kind: Deployment
 metadata:
   name: rustcdc
 spec:
-  replicas: 1   # CDC is stateful; run exactly 1 replica
+  replicas: 1
+  # `Recreate`, not the default `RollingUpdate` — this is load-bearing, not tidiness.
+  #
+  # A Deployment with replicas: 1 and no strategy gets maxSurge 25% (→ 1) and
+  # maxUnavailable 25% (→ 0). Kubernetes therefore starts the new pod and waits for it
+  # to become Ready *before* terminating the old one, so every `kubectl rollout restart`
+  # runs two instances against one pipeline's state. With a remote state backend they
+  # both write checkpoints and the durable position can move backwards; with local_fs
+  # the owner lease correctly refuses the second pod, which never becomes Ready, and the
+  # rollout deadlocks because maxUnavailable is 0.
+  #
+  # `Recreate` terminates the old pod first. That means a visible gap in capture during
+  # the rollout — bounded by terminationGracePeriodSeconds plus startup. For a
+  # single-writer system that gap is the correct trade, and the source retains the
+  # changes: the pipeline resumes from its checkpoint.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: rustcdc
@@ -623,6 +699,11 @@ spec:
 
 > For production, prefer `kafka_topic` or `postgres` state backends over
 > `local_fs` so the state survives pod rescheduling without a PVC.
+>
+> **Whichever you choose, `strategy: Recreate` above is mandatory.** The remote
+> backends hold an owner lease that refuses a second concurrent writer, and a rolling
+> update would make the new pod fail its lease acquisition and crash-loop until the old
+> pod exits — which, with `maxUnavailable: 0`, it never does.
 
 ### ConfigMap
 
@@ -648,7 +729,10 @@ data:
     conn_timeout_secs       = 10
     stream_poll_interval_ms = 100
     max_events_per_poll     = 1000
-    table_include_list = []
+    # Name the tables. An EMPTY include list does not mean "capture nothing" — it means
+    # capture EVERY table in the database, including ones added later, and every column
+    # in them. Enumerate what you intend to publish.
+    table_include_list = ["public.orders", "public.customers"]
     table_exclude_list = []
 
     [source.postgres.transport]
@@ -675,7 +759,6 @@ data:
     key_file  = "/etc/rustcdc/tls/tls.key"
 ```
 
----
 
 ## 12. Upgrading
 
@@ -684,6 +767,12 @@ data:
 1. Update the image tag in the Deployment.
 2. `kubectl rollout restart deployment/rustcdc` (triggers graceful shutdown).
 3. The connector resumes from the last checkpoint automatically.
+
+With `strategy: Recreate` (see the manifest above — it is required, not optional) the
+old pod is fully terminated before the new one starts. Capture pauses for roughly
+`terminationGracePeriodSeconds` plus startup time; the source retains the changes and
+the new pod resumes from the checkpoint. Watch `rustcdc_slo_checkpoint_age_seconds`
+return to baseline to confirm the resume.
 
 ### State format changes
 
@@ -704,15 +793,3 @@ connector reworks):
 3. Re-create it: `SELECT pg_create_logical_replication_slot('cdc_slot', 'pgoutput');`
    (or start once with `create_replication_slot_if_missing = true`, then revert).
 4. Start the pipeline. A full snapshot will run.
-
----
-
-## See also
-
-- [Getting started](getting-started.md)
-- [Core concepts](concepts.md)
-- [Configuration reference](configuration.md)
-- [Writing WASM transforms](transforms.md)
-- [PostgreSQL connector](connectors/postgres.md)
-- [MySQL / MariaDB connector](connectors/mysql.md)
-- [SQL Server connector](connectors/sqlserver.md)

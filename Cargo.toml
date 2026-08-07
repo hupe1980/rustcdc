@@ -1,8 +1,8 @@
 [package]
 name = "rustcdc-server"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.93"
+rust-version = "1.94"
 publish = false
 description = "Change-data-capture server powered by rustcdc"
 repository = "https://github.com/hupe1980/rustcdc-server"
@@ -15,12 +15,38 @@ path = "src/main.rs"
 
 [workspace]
 resolver = "2"
+# The libFuzzer targets need a nightly toolchain and `cargo fuzz`. Excluding them keeps
+# `cargo build` on stable from depending on either; `tests/fuzz_properties.rs` carries the
+# same invariants on stable so CI still checks them on every commit.
+exclude = ["fuzz"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[features]
+# AWS Glue Schema Registry as a codec backend.
+#
+# Off for a plain `cargo build` because it pulls the AWS SDK (~45 crates) that no
+# other deployment needs; **on** in the published container image, which builds with
+# `--all-features`, so the shipped artifact carries every backend.
+glue = ["rustcdc/glue", "dep:aws-config", "dep:aws-sdk-glue"]
+
 [dependencies]
-rustcdc = { version = "0.7.0", features = ["postgres", "mysql", "mariadb", "sqlserver", "metrics", "avro", "schemreg", "wasm", "cloudevents"] }
+rustcdc = { version = "0.9.0", features = [
+    "postgres",
+    "mysql",
+    "mariadb",
+    "sqlserver",
+    "metrics",
+    "avro",
+    "schemreg",
+    "apicurio",
+    "protobuf",
+    "wasm",
+    "cloudevents",
+    "encryption",
+    "outbox",
+] }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "process"] }
@@ -43,16 +69,19 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["trace", "timeout"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rustls = "0.23"
-rustls-pemfile = "2"
+# PEM parsing comes from rustls-pki-types, not the unmaintained `rustls-pemfile`
+# (RUSTSEC-2025-0134) — `PemObject` is the same implementation that crate's final
+# release wrapped, and it keeps one PEM parser in the tree alongside rustcdc 0.8.
+rustls-pki-types = { version = "1", features = ["std"] }
 url = "2"
 
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = { version = "0.27" }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "metrics"] }
-tracing-opentelemetry = "0.28"
+opentelemetry = { version = "0.32" }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics"] }
+tracing-opentelemetry = "0.33"
 
 # Error handling
 thiserror = "2"
@@ -60,7 +89,7 @@ thiserror = "2"
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 ed25519-dalek = "2"
 zip = "2"
@@ -72,23 +101,53 @@ tokio-postgres = "0.7"
 # installed in main.rs) and every compression codec the docs offer (zstd is not
 # in krafka's default set — without compression-all a `compression = "zstd"`
 # config would fail validation at startup).
-krafka = { version = "0.13.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs"] }
+krafka = { version = "0.16.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
 
-iceberg = "0.9.1"
-iceberg-catalog-rest = "0.9.1"
-iceberg-storage-opendal = { version = "0.9.1", features = ["opendal-fs", "opendal-s3", "opendal-gcs", "opendal-azdls"] }
-arrow-array = "57.1"
-arrow-schema = "57.1"
-parquet = "57.1"
+# AWS SDK, only for the optional `glue` feature: the Glue registry client is
+# constructed from an `aws_sdk_glue::Client`, which needs the credential chain.
+aws-config = { version = "1", optional = true, default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-sdk-glue = { version = "1", optional = true, default-features = false, features = ["rustls"] }
 
-# Storage abstraction (E02-S03)
-opendal = { version = "0.55", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+iceberg-storage-opendal = { version = "0.10.1", features = ["opendal-fs", "opendal-s3", "opendal-gcs", "opendal-azdls"] }
+arrow-array = "58"
+arrow-schema = "58"
+parquet = "58"
+
+# Storage abstraction (E02-S03) — pinned to the same major as iceberg-storage-opendal
+# so the state backends and the Iceberg sink share one opendal in the graph.
+opendal = { version = "0.57", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
 
 [dev-dependencies]
+# Drives the real axum router in-process, so the security suite probes the same
+# middleware, extractors and handlers a network client would hit — not a
+# hand-called function that skips the layers where a bypass would live.
+tower = { version = "0.5", features = ["util"] }
+# Statistical benchmarking with baseline comparison — the regression gate for the
+# hot path (CR-004). `default-features = false` drops the unmaintained `plotters`
+# tree; cargo-deny flags it and the HTML report is not what CI consumes.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
-rustcdc = { version = "0.7.0", features = ["postgres", "mysql", "mariadb", "sqlserver", "metrics"] }
+# test-harnesses: rustcdc's `testkit::AdapterConformanceSuite`, so the sinks are
+# checked against the library's own adapter contract instead of a local restatement.
+rustcdc = { version = "0.9.0", features = ["test-harnesses"] }
 wat = "1"
 # test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
 # in unit tests without Docker.
-krafka = { version = "0.13.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "test-broker"] }
+krafka = { version = "0.16.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
+
+# Benchmarks compile against the dev-dependency graph, which carries rustcdc's
+# `test-harnesses` feature (the delivery-contract tests need its fault injection).
+# That feature refuses to build with `debug_assertions` off, on the sound principle
+# that fault-injection code has no business in an optimised artefact. Keeping the
+# assertions on for `cargo bench` satisfies the guard while retaining `opt-level = 3`,
+# so the numbers still reflect optimised code. Compare benchmarks only against
+# baselines taken with this same profile.
+[profile.bench]
+debug-assertions = true

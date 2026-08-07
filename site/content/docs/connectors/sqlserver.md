@@ -1,24 +1,14 @@
-# SQL Server connector
++++
+title = "SQL Server connector"
+description = "Capture changes from Microsoft SQL Server via CDC change tables: capture instances, cleanup jobs, schema evolution and Always On availability groups."
+weight = 53
++++
 
 The rustcdc SQL Server connector reads row-level changes from Microsoft SQL
 Server's built-in **CDC feature** and streams them as structured events to your
 configured sink. No third-party plugins or server extensions are required —
 SQL Server CDC is a native enterprise feature available in SQL Server 2016+.
 
----
-
-## Table of contents
-
-1. [Overview](#1-overview)
-2. [How the connector works](#2-how-the-connector-works)
-3. [Setting up SQL Server](#3-setting-up-sql-server)
-4. [Cloud databases](#4-cloud-databases)
-5. [Supported topologies](#5-supported-topologies)
-6. [Configuration reference](#6-configuration-reference)
-7. [Monitoring](#7-monitoring)
-8. [Behavior when things go wrong](#9-behavior-when-things-go-wrong)
-
----
 
 ## 1. Overview
 
@@ -46,7 +36,6 @@ rows into the rustcdc event envelope.
 | SQL Server Agent | must be running (drives the CDC cleanup and capture jobs) |
 | User privilege | `db_datareader` on CDC change tables + `EXECUTE` on CDC system procedures |
 
----
 
 ## 2. How the connector works
 
@@ -86,7 +75,6 @@ On first run, the connector:
 3. Sets the checkpoint to the LSN recorded in step 1
 4. Begins polling for changes from that LSN
 
----
 
 ## 3. Setting up SQL Server
 
@@ -208,7 +196,6 @@ rustcdc run --config-file cdc.toml
 # (only the kafka_topic state backend needs a one-time `rustcdc init-state` first)
 ```
 
----
 
 ## 4. Cloud databases
 
@@ -250,7 +237,6 @@ Then enable per-table CDC using the standard `sp_cdc_enable_table` procedure.
 > **Note:** on RDS, the SQL Server Agent jobs are managed by AWS. You do not need
 > to start them manually.
 
----
 
 ## 5. Supported topologies
 
@@ -276,7 +262,6 @@ Each pipeline must use distinct `table_include_list` entries or distinct CDC
 capture instances. Two connectors polling the same change table with the same LSN
 will produce duplicate events.
 
----
 
 ## 6. Configuration reference
 
@@ -334,7 +319,6 @@ mode = "tls"
 | `table_include_list` | empty (= all CDC-enabled) | Exact `schema.table` names; takes precedence over the exclude list |
 | `table_exclude_list` | empty | Exact `schema.table` names to suppress; ignored when the include list is non-empty |
 
----
 
 ## 7. Monitoring
 
@@ -345,7 +329,6 @@ mode = "tls"
 | `rustcdc_runtime_checkpoint_age_ms` | gauge | Age of last durable checkpoint (milliseconds) |
 | `rustcdc_runtime_events_committed_total` | counter | Total events acknowledged and checkpointed |
 
----
 
 ## 8. Behavior when things go wrong
 
@@ -388,7 +371,7 @@ table is being modified.
 
 **Cause:** the SQL Server Agent (which runs the CDC capture job) is stopped.
 
-**Resolution:** start SQL Server Agent (see [Step 1](#step-1--enable-sql-server-agent)).
+**Resolution:** start SQL Server Agent (see [Step 1](#step-1-enable-sql-server-agent)).
 
 ### TLS certificate errors in dev environments
 
@@ -404,12 +387,3 @@ allow_invalid_certificates = true
 
 Do not set this in production — provide the CA instead via
 `transport.ca_cert_path`.
-
----
-
-## See also
-
-- [Getting started](../getting-started.md)
-- [Core concepts](../concepts.md)
-- [Configuration reference](../configuration.md)
-- [Operations guide](../operations.md)

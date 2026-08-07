@@ -1,4 +1,8 @@
-# MySQL / MariaDB connector
++++
+title = "MySQL / MariaDB connector"
+description = "Capture changes from MySQL and MariaDB via the binary log: GTID positioning, row image settings, schema history, required grants and managed cloud databases."
+weight = 52
++++
 
 The rustcdc MySQL and MariaDB connector reads row-level changes from the database
 binary log (binlog) and streams them as structured events to your configured sink.
@@ -9,21 +13,6 @@ schema modifications required.
 Both MySQL (5.7+) and MariaDB (10.3+) are supported. The configuration is
 identical except for `type = "mysql"` vs `type = "mariadb"`.
 
----
-
-## Table of contents
-
-1. [Overview](#1-overview)
-2. [How the connector works](#2-how-the-connector-works)
-3. [Setting up MySQL](#3-setting-up-mysql)
-4. [Setting up MariaDB](#4-setting-up-mariadb)
-5. [Cloud databases](#5-cloud-databases)
-6. [Supported topologies](#6-supported-topologies)
-7. [Configuration reference](#7-configuration-reference)
-8. [Monitoring](#8-monitoring)
-9. [Behavior when things go wrong](#9-behavior-when-things-go-wrong)
-
----
 
 ## 1. Overview
 
@@ -51,7 +40,6 @@ replica with a unique `server_id`.
 | `binlog_row_image` | `FULL` | `FULL` |
 | User privilege | `REPLICATION SLAVE`, `REPLICATION CLIENT`, `SELECT` | same |
 
----
 
 ## 2. How the connector works
 
@@ -94,7 +82,6 @@ server must have `gtid_mode = ON` / `enforce_gtid_consistency = ON`). With
 | Binlog position | `mysql-bin.000001:1234` | Manual (update host + offset) |
 | GTID | `3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5` | Automatic (GTID set is server-global) |
 
----
 
 ## 3. Setting up MySQL
 
@@ -188,7 +175,6 @@ rustcdc run --config cdc.toml
 # (only the kafka_topic state backend needs a one-time `rustcdc init-state` first)
 ```
 
----
 
 ## 4. Setting up MariaDB
 
@@ -236,7 +222,6 @@ table_exclude_list = []
 mode = "plaintext"
 ```
 
----
 
 ## 5. Cloud databases
 
@@ -267,7 +252,6 @@ Aurora requires a cluster-level parameter group change, not an instance-level on
 Enable binary logging in the Cloud SQL instance settings. GTID is available on
 Cloud SQL MySQL 5.7+. Grant standard replication privileges as shown above.
 
----
 
 ## 6. Supported topologies
 
@@ -300,7 +284,6 @@ server_id = 1001
 server_id = 1002
 ```
 
----
 
 ## 7. Configuration reference
 
@@ -359,7 +342,6 @@ mode = "plaintext"    # plaintext | tls
 | `table_exclude_list` | empty | Exact `database.table` names to suppress; ignored when the include list is non-empty |
 | `auth_mode` | `password` | `password` or `aws_iam_token` (short-lived IAM auth; requires TLS) |
 
----
 
 ## 8. Monitoring
 
@@ -370,7 +352,6 @@ mode = "plaintext"    # plaintext | tls
 | `rustcdc_runtime_checkpoint_age_ms` | gauge | Age of last durable checkpoint (milliseconds) |
 | `rustcdc_runtime_events_committed_total` | counter | Total events acknowledged and checkpointed |
 
----
 
 ## 9. Behavior when things go wrong
 
@@ -412,12 +393,3 @@ state backend, stop the pipeline and delete the `schema_history` file under
 `state.dir`; for `kafka_topic`, re-seed the state topic with
 `rustcdc init-state --config-file cdc.toml --force`. Then start with
 `snapshot_tables` configured so the affected tables are re-read.
-
----
-
-## See also
-
-- [Getting started](../getting-started.md)
-- [Core concepts](../concepts.md)
-- [Configuration reference](../configuration.md)
-- [Operations guide](../operations.md)

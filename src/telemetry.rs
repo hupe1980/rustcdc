@@ -1,9 +1,6 @@
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
-use opentelemetry_sdk::{
-    metrics::SdkMeterProvider, runtime::Tokio as TokioRuntime,
-    trace::TracerProvider as SdkTracerProvider,
-};
+use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::SdkTracerProvider};
 use std::time::Duration;
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -157,17 +154,13 @@ fn build_optional_tracer(
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
+        .with_timeout(OTLP_EXPORT_TIMEOUT)
         .build()
         .map_err(|e| AppError::Other(format!("OTLP exporter init error: {e}")))?;
 
-    let resource = opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
-        "service.name",
-        service_name.to_string(),
-    )]);
-
     let provider = SdkTracerProvider::builder()
-        .with_resource(resource)
-        .with_batch_exporter(exporter, TokioRuntime)
+        .with_resource(otel_resource(service_name))
+        .with_batch_exporter(exporter)
         .build();
 
     // `tracer()` borrows `&self`, so it's safe to call before the move below.
@@ -189,28 +182,39 @@ fn build_optional_meter(
 
     validate_otlp_endpoint(endpoint)?;
 
+    // The export timeout moved onto the exporter in opentelemetry 0.32 — the
+    // `PeriodicReader` builder now only owns the interval.
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
+        .with_timeout(OTLP_EXPORT_TIMEOUT)
         .build()
         .map_err(|e| AppError::Other(format!("OTLP metrics exporter init error: {e}")))?;
 
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter, TokioRuntime)
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
         .with_interval(Duration::from_secs(interval_secs.max(1)))
-        .with_timeout(Duration::from_secs(30))
         .build();
-
-    let resource = opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
-        "service.name",
-        service_name.to_string(),
-    )]);
 
     let provider = SdkMeterProvider::builder()
         .with_reader(reader)
-        .with_resource(resource)
+        .with_resource(otel_resource(service_name))
         .build();
 
     Ok(Some(provider))
+}
+
+/// Deadline for a single OTLP export attempt.
+const OTLP_EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resource identifying this process to the collector.
+///
+/// `Resource::builder()` seeds the SDK-detected attributes (telemetry SDK name,
+/// version, language) and honours `OTEL_RESOURCE_ATTRIBUTES`, so an operator can
+/// add `deployment.environment` or `service.instance.id` without a config field.
+fn otel_resource(service_name: &str) -> opentelemetry_sdk::Resource {
+    opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name.to_string())
+        .build()
 }
 
 /// Reject plaintext gRPC (`http://`) to non-loopback hosts unless the
@@ -221,9 +225,9 @@ fn build_optional_meter(
 fn validate_otlp_endpoint(endpoint: &str) -> Result<(), AppError> {
     // Allow the escape hatch for development / test environments, but emit a
     // prominent warning so this setting is never silently carried to production
-    // (CR-014 — security information-disclosure risk).
+    // (a security information-disclosure risk).
     if std::env::var("OTLP_ALLOW_INSECURE").as_deref() == Ok("1") {
-        // CR-018: emit a structured warning via tracing so the override is
+        // Emit a structured warning via tracing so the override is
         // visible in log aggregators and monitoring dashboards, not only on
         // stderr.  The warning fires at startup and on every re-validation so
         // operators cannot silently carry this setting to production.

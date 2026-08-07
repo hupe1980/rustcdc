@@ -1,0 +1,67 @@
+{#- Every SEO-relevant tag lives here, so there is exactly one place to audit them.
+
+    Callers set `title`, `description`, `current_url` and `og_type` before including.
+    Structured data is emitted by the calling template, because each page type needs a
+    different schema.org shape. -#}
+{%- if title -%}
+  {%- set full_title = title ~ " · " ~ config.title -%}
+{%- else -%}
+  {%- set full_title = config.title ~ " — Change Data Capture in Rust" -%}
+{%- endif -%}
+{%- set meta_description = description | default(value=config.description) -%}
+{%- set canonical = current_url | default(value=config.base_url) -%}
+{%- set og_kind = og_type | default(value="article") -%}
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ full_title }}</title>
+<meta name="description" content="{{ meta_description }}">
+
+{# Absolute and self-referential on every page. Without it the trailing-slash and
+   index.html variants of the same page compete with each other in search results. #}
+<link rel="canonical" href="{{ canonical | safe }}">
+
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<meta name="author" content="{{ config.extra.author }}">
+
+{# Open Graph — what Slack, LinkedIn, Discord and Facebook render. #}
+<meta property="og:type" content="{{ og_kind }}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ full_title }}">
+<meta property="og:description" content="{{ meta_description }}">
+<meta property="og:url" content="{{ canonical | safe }}">
+<meta property="og:image" content="{{ get_url(path=config.extra.og_image) }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="rustcdc — change data capture in Rust">
+<meta property="og:locale" content="en_GB">
+
+{# `summary_large_image` is what makes the X/Twitter card full-width. #}
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ full_title }}">
+<meta name="twitter:description" content="{{ meta_description }}">
+<meta name="twitter:image" content="{{ get_url(path=config.extra.og_image) }}">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+<link rel="alternate icon" href="{{ get_url(path='favicon.ico') }}">
+<link rel="sitemap" type="application/xml" href="{{ get_url(path='sitemap.xml') }}">
+
+{# One stylesheet, no webfont, no framework: a docs page should render before the reader
+   has finished deciding whether to read it. #}
+<link rel="stylesheet" href="{{ get_url(path='main.css', cachebust=true) }}">
+
+{# The theme must be applied before first paint or a dark-mode reader gets a white flash
+   on every navigation. This is the one script that cannot be deferred. #}
+<script>
+  (function () {
+    try {
+      var stored = localStorage.getItem("theme");
+      if (stored === "light" || stored === "dark") {
+        document.documentElement.dataset.theme = stored;
+      }
+    } catch (e) {}
+  })();
+</script>

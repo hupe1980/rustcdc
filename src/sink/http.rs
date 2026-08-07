@@ -1,8 +1,4 @@
-use std::{
-    io::Write,
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::Duration;
 
 use rustcdc::{
     core::{Error as RtError, Event},
@@ -58,8 +54,6 @@ pub struct HttpSink {
     backoff_multiplier: f64,
     headers: Vec<(String, String)>,
     bearer_token: Option<SecretString>,
-    dlq_path: Option<PathBuf>,
-    dlq_max_bytes: u64,
     /// Global time budget ceiling for retries within a single flush operation.
     /// Prevents unbounded retry storms during sustained failures.
     /// Default: configured via `sink.http.batch_retry_time_budget_ms`.
@@ -99,7 +93,7 @@ impl HttpSink {
 
         let is_https = config.url.starts_with("https://");
         let mut builder = reqwest::Client::builder()
-            // CR-005: explicit TLS hardening — do not rely on library defaults.
+            // Explicit TLS hardening — do not rely on library defaults.
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             // Allow http:// only for loopback (validated above by url_policy);
             // enforce https_only for all other endpoints as defence-in-depth.
@@ -137,8 +131,6 @@ impl HttpSink {
             backoff_multiplier: config.backoff_multiplier,
             headers,
             bearer_token: config.bearer_token.clone(),
-            dlq_path: config.dlq_path.clone(),
-            dlq_max_bytes: config.dlq_max_bytes,
             batch_retry_time_budget: Duration::from_millis(config.batch_retry_time_budget_ms),
             accounting: DeliveryAccounting::default(),
             pending: Vec::new(),
@@ -289,9 +281,14 @@ impl HttpSink {
             .accounting
             .terminal
             .saturating_add(payloads.len() as u64);
-        for payload in payloads {
-            self.append_dlq(payload, &message).await?;
-        }
+        // Quarantine is a pipeline concern now (`[dlq]`), not a per-sink one: every sink
+        // needs it, and whether an event is permanently undeliverable is decided by the
+        // error classification rather than by the transport. This sink reports the
+        // failure; the batch path decides whether to dead-letter or halt.
+        self.accounting.dropped = self
+            .accounting
+            .dropped
+            .saturating_add(payloads.len() as u64);
         Err(RtError::SourceError(format!(
             "HTTP sink delivery failed after retries: {message}"
         )))
@@ -546,7 +543,7 @@ impl HttpSink {
 
         let oldest_event_age_ms = self
             .pending_since
-            .map(|started| started.elapsed().as_millis() as u64)
+            .map(|started| started.elapsed().as_micros() as u64)
             .unwrap_or(0);
         self.accounting.http_batch_oldest_event_age_ms_last = oldest_event_age_ms;
 
@@ -590,64 +587,6 @@ impl HttpSink {
             self.flush_pending().await?;
         }
 
-        Ok(())
-    }
-
-    async fn append_dlq(&mut self, payload: &[u8], error: &str) -> rustcdc::core::Result<()> {
-        let Some(path) = &self.dlq_path else {
-            self.accounting.dropped += 1;
-            return Ok(());
-        };
-
-        let path = path.clone();
-        let dlq_max_bytes = self.dlq_max_bytes;
-        let payload = payload.to_vec();
-        let error = error.to_string();
-        let write_result = tokio::task::spawn_blocking(move || -> rustcdc::core::Result<()> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(RtError::IoError)?;
-            }
-
-            let ts_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-
-            let dlq_entry = serde_json::json!({
-                "ts_ms": ts_ms,
-                "error": error,
-                "event": serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_else(|_| {
-                    serde_json::json!({"raw": String::from_utf8_lossy(&payload)})
-                }),
-            });
-
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(RtError::IoError)?;
-            let line = serde_json::to_string(&dlq_entry)
-                .map_err(|e| RtError::SerializationError(e.to_string()))?;
-
-            let current_size = file.metadata().map_err(RtError::IoError)?.len();
-            let projected_size = current_size.saturating_add(line.len() as u64 + 1);
-            if projected_size > dlq_max_bytes {
-                return Err(RtError::StateError(format!(
-                    "DLQ size limit exceeded for {}: projected {} bytes > sink.http.dlq_max_bytes {}",
-                    path.display(),
-                    projected_size,
-                    dlq_max_bytes
-                )));
-            }
-
-            writeln!(file, "{line}").map_err(RtError::IoError)?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| RtError::SourceError(format!("dlq write task join error: {error}")))?;
-
-        write_result?;
-        self.accounting.dlq_written += 1;
         Ok(())
     }
 
@@ -757,7 +696,7 @@ impl SinkAdapter for HttpSink {
         let this: &Self = self;
         this.preflight_check()
             .await
-            .map_err(|e| rustcdc::core::Error::SourceError(e.to_string()))
+            .map_err(rustcdc::core::Error::from)
     }
 }
 
@@ -766,7 +705,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use rustcdc::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use rustcdc::core::{Event, Operation, SourceMetadata};
     use rustcdc::SecretString;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -788,26 +727,13 @@ mod tests {
     }
 
     fn sample_event() -> Event {
-        Event {
-            before: None,
-            after: Some(json!({"id": 1, "name": "alice"})),
-            op: Operation::Insert,
-            source: SourceMetadata {
-                source_name: "postgres".to_string(),
-                offset: "0/16B6A70".to_string(),
-                timestamp: 1,
-            },
-            ts: 1,
-            schema: Some("public".to_string()),
-            table: "users".to_string(),
-            primary_key: Some(vec!["id".to_string()]),
-            snapshot: None,
-            transaction: None,
-            envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
-            unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
-        }
+        Event::builder("users", Operation::Insert)
+            .after(json!({"id": 1, "name": "alice"}))
+            .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+            .ts(1)
+            .schema("public")
+            .primary_key(["id"])
+            .build()
     }
 
     async fn spawn_http_server(
@@ -871,8 +797,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -938,8 +862,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -989,8 +911,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -1047,8 +967,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -1088,8 +1006,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -1117,104 +1033,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_dlq_on_terminal_failure() {
-        let statuses = Arc::new(Mutex::new(vec![400]));
-        let captures = Arc::new(Mutex::new(Vec::new()));
-        let url = spawn_http_server(statuses, captures).await;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dlq = dir.path().join("failed.jsonl");
-
-        let cfg = HttpSinkConfig {
-            url,
-            timeout_ms: 1000,
-            batch_max_events: 64,
-            batch_max_delay_ms: 10,
-            max_pending_bytes: 1024 * 1024,
-            max_retries: 1,
-            batch_retry_time_budget_ms: 30_000,
-            backoff_initial_ms: 1,
-            backoff_max_ms: 1,
-            backoff_multiplier: 2.0,
-            headers: std::collections::HashMap::new(),
-            bearer_token: None,
-            verify_tls: true,
-            dlq_path: Some(dlq.clone()),
-            dlq_max_bytes: 128 * 1024 * 1024,
-            pool_max_idle_per_host: 10,
-            pool_idle_timeout_secs: None,
-            tcp_keepalive_secs: None,
-            codec: None,
-        };
-
-        let mut sink = HttpSink::new(&cfg).expect("sink");
-        sink.send(&sample_event())
-            .await
-            .expect("event should enqueue before flush");
-        let err = sink
-            .flush()
-            .await
-            .expect_err("flush must fail and write dlq");
-        assert!(err.to_string().contains("terminal HTTP status 400"));
-        assert_eq!(sink.accounting().terminal, 1);
-        assert_eq!(sink.accounting().terminal_status_4xx, 1);
-        assert_eq!(sink.accounting().terminal_status_other, 0);
-        assert_eq!(sink.accounting().terminal_error_timeout, 0);
-        assert_eq!(sink.accounting().terminal_error_other, 0);
-
-        let dlq_data = std::fs::read_to_string(dlq).expect("read dlq");
-        assert!(dlq_data.contains("terminal HTTP status 400"));
-        assert!(dlq_data.contains("\"table\":\"users\""));
-    }
-
-    #[tokio::test]
-    async fn fails_closed_when_dlq_size_limit_would_be_exceeded() {
-        let statuses = Arc::new(Mutex::new(vec![400]));
-        let captures = Arc::new(Mutex::new(Vec::new()));
-        let url = spawn_http_server(statuses, captures).await;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dlq = dir.path().join("failed.jsonl");
-
-        let cfg = HttpSinkConfig {
-            url,
-            timeout_ms: 1000,
-            batch_max_events: 64,
-            batch_max_delay_ms: 10,
-            max_pending_bytes: 1024 * 1024,
-            max_retries: 0,
-            batch_retry_time_budget_ms: 30_000,
-            backoff_initial_ms: 1,
-            backoff_max_ms: 1,
-            backoff_multiplier: 2.0,
-            headers: std::collections::HashMap::new(),
-            bearer_token: None,
-            verify_tls: true,
-            dlq_path: Some(dlq.clone()),
-            dlq_max_bytes: 1,
-            pool_max_idle_per_host: 10,
-            pool_idle_timeout_secs: None,
-            tcp_keepalive_secs: None,
-            codec: None,
-        };
-
-        let mut sink = HttpSink::new(&cfg).expect("sink");
-        sink.send(&sample_event())
-            .await
-            .expect("event should enqueue before flush");
-        let err = sink
-            .flush()
-            .await
-            .expect_err("flush must fail closed on dlq size limit");
-        assert!(
-            err.to_string().contains("DLQ size limit exceeded"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(sink.accounting().terminal, 1);
-        assert_eq!(sink.accounting().dlq_written, 0);
-    }
-
-    #[tokio::test]
     async fn sends_authorization_and_custom_headers() {
         let statuses = Arc::new(Mutex::new(vec![200]));
         let captures = Arc::new(Mutex::new(Vec::new()));
@@ -1238,8 +1056,6 @@ mod tests {
                 Ok("top-secret-token".to_string())
             })),
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -1275,8 +1091,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: false,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -1306,8 +1120,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -1337,8 +1149,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
@@ -1365,8 +1175,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             bearer_token: None,
             verify_tls: true,
-            dlq_path: None,
-            dlq_max_bytes: 128 * 1024 * 1024,
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,

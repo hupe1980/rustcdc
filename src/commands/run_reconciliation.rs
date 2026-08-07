@@ -84,7 +84,7 @@ impl CheckpointTxnReconciler {
         }))
     }
 
-    /// CR-012 fix: include a UUID v4 nonce to prevent filename collision on
+    /// Include a UUID v4 nonce to prevent filename collision on
     /// fast restart with PID reuse (same ms + same PID after container recycle).
     fn next_recovered_marker_path(state_dir: &Path) -> PathBuf {
         let now = current_unix_ms();

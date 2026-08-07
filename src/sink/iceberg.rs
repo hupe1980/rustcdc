@@ -56,6 +56,16 @@ pub struct IcebergSink {
     /// Iceberg catalog (orphaned by a terminal commit failure). Non-zero values
     /// indicate storage bloat that an operator should clean up manually.
     orphaned_data_files_total: Arc<AtomicU64>,
+    /// Epoch-millis of the last snapshot-expiry run; `0` means "never run".
+    last_snapshot_expiry_ms: Arc<AtomicU64>,
+}
+
+/// Wall-clock milliseconds since the Unix epoch.
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl IcebergSink {
@@ -65,7 +75,7 @@ impl IcebergSink {
         // Create the local table directory only for filesystem-backed warehouses.
         // Cloud-backed warehouses (S3, GCS, ADLS) do not use the local table_path
         // as actual storage; attempting fs::create_dir_all on an s3:// path would
-        // silently create a local directory with that literal name (CR-015).
+        // silently create a local directory with that literal name.
         let warehouse = cfg.catalog.rest.warehouse.trim();
         let is_local = warehouse.starts_with("file://")
             || warehouse.starts_with('/')
@@ -78,7 +88,7 @@ impl IcebergSink {
             // If the user left storage at the default (LocalFs) but the
             // warehouse URI indicates a cloud backend, auto-infer the factory.
             // This preserves backward compatibility while enabling cloud URIs
-            // without requiring explicit storage config (CR-015).
+            // without requiring explicit storage config.
             let effective_storage = match &cfg.storage {
                 IcebergStorageConfig::LocalFs if !is_local => infer_storage_config(warehouse),
                 other => other.clone(),
@@ -155,6 +165,7 @@ impl IcebergSink {
             flush_lock_contention_ms_total: Arc::new(AtomicU64::new(0)),
             flush_lock_contention_ms_max: Arc::new(AtomicU64::new(0)),
             orphaned_data_files_total: Arc::new(AtomicU64::new(0)),
+            last_snapshot_expiry_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -203,6 +214,13 @@ impl IcebergSink {
         Ok(())
     }
 
+    /// Decode a serialised event and buffer it through the guarded path.
+    ///
+    /// This used to push straight onto `pending` with no byte accounting and no
+    /// `max_pending_events` / `max_pending_bytes` check — a second entry point that
+    /// bypassed the backpressure guard entirely. The guard exists because this buffer
+    /// grows during catalog outages, which is exactly when an unbounded second door
+    /// gets used. It now delegates to [`Self::send_event_json_bytes`].
     pub async fn send_json_bytes(&mut self, event_json: &[u8]) -> rustcdc::core::Result<()> {
         if self.closed {
             return Err(RtError::StateError("sink is closed".to_string()));
@@ -211,8 +229,7 @@ impl IcebergSink {
         let event: Event = serde_json::from_slice(event_json).map_err(|e| {
             RtError::SerializationError(format!("failed to decode event json: {e}"))
         })?;
-        self.pending.push(event);
-        Ok(())
+        self.send_event_json_bytes(&event, event_json).await
     }
 
     async fn commit_pending_with_retry(&mut self) -> rustcdc::core::Result<()> {
@@ -228,7 +245,8 @@ impl IcebergSink {
             .await
             .map_err(map_iceberg_error)?;
         let batch = events_to_record_batch(&self.pending, self.cfg.schema_mode)?;
-        let data_files = write_data_files(&write_table, batch, &self.file_name_prefix).await?;
+        let data_files =
+            write_data_files(&write_table, batch, &self.file_name_prefix, &self.cfg).await?;
 
         let mut backoff_ms = self.cfg.retry_backoff_ms;
         for attempt in 1..=self.cfg.max_commit_retries {
@@ -251,11 +269,12 @@ impl IcebergSink {
                         snapshot_rows,
                         attempt,
                         retries = attempt - 1,
-                        latency_ms = started_at.elapsed().as_millis() as u64,
+                        latency_us = started_at.elapsed().as_micros() as u64,
                         "iceberg commit completed"
                     );
                     self.pending.clear();
                     self.pending_bytes = 0;
+                    self.maybe_expire_snapshots().await;
                     return Ok(());
                 }
                 Err(err) if attempt < self.cfg.max_commit_retries && should_retry_commit(&err) => {
@@ -288,7 +307,7 @@ impl IcebergSink {
                         snapshot_rows,
                         attempt,
                         retries = attempt - 1,
-                        latency_ms = started_at.elapsed().as_millis() as u64,
+                        latency_us = started_at.elapsed().as_micros() as u64,
                         retryable = err.retryable(),
                         error = %err,
                         orphaned_data_file_count = orphaned_count,
@@ -296,11 +315,17 @@ impl IcebergSink {
                         "iceberg commit failed; attempting best-effort orphan cleanup"
                     );
 
-                    // Best-effort cleanup: attempt to delete the orphaned Parquet
-                    // files so storage does not accumulate unboundedly.  Failure
-                    // to delete is logged but does not mask the original error.
+                    // Best-effort cleanup so storage does not accumulate unboundedly.
+                    // Failure to delete is logged but does not mask the original error.
+                    //
+                    // This goes through the table's own `FileIO`, not `tokio::fs`:
+                    // `DataFile::file_path()` is a warehouse URI, so on S3, GCS or ADLS
+                    // — where an orphaned file costs money for as long as it exists —
+                    // `remove_file("s3://bucket/…")` could only ever fail with
+                    // NotFound, and every cloud deployment leaked silently.
+                    let file_io = write_table.file_io();
                     for path in &orphaned_paths {
-                        match tokio::fs::remove_file(path).await {
+                        match file_io.delete(path).await {
                             Ok(()) => tracing::info!(
                                 orphaned_path = %path,
                                 "deleted orphaned iceberg data file"
@@ -326,6 +351,68 @@ impl IcebergSink {
         Err(RtError::StateError(
             "iceberg commit retry loop exhausted unexpectedly".to_string(),
         ))
+    }
+
+    /// Expire old snapshots, at most once per `snapshot_expiry.interval_ms`.
+    ///
+    /// A CDC sink commits on every flush, so the table gains a snapshot per flush and
+    /// its metadata is read in full on every planning pass. Nothing prunes that on its
+    /// own, so a long-running pipeline degrades read planning until someone runs
+    /// maintenance by hand.
+    ///
+    /// Failure is logged, never propagated: expiry is housekeeping, and the events it
+    /// runs after are already durably committed. Turning a maintenance hiccup into a
+    /// delivery error would fail a batch that succeeded.
+    async fn maybe_expire_snapshots(&self) {
+        let expiry = &self.cfg.snapshot_expiry;
+        if !expiry.enabled {
+            return;
+        }
+
+        let now_ms = now_epoch_ms();
+        let last = self.last_snapshot_expiry_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < expiry.interval_ms {
+            return;
+        }
+        // Claim the slot before doing the work so two concurrent flushes cannot both
+        // start an expiry against the same table.
+        if self
+            .last_snapshot_expiry_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let older_than_ms = now_ms.saturating_sub(expiry.older_than_ms) as i64;
+        let result = async {
+            let table = self.catalog.load_table(&self.table_ident).await?;
+            let tx = Transaction::new(&table);
+            let action = tx
+                .expire_snapshots()
+                .expire_older_than_ms(older_than_ms)
+                .retain_last(expiry.retain_last);
+            let tx = action.apply(tx)?;
+            tx.commit(self.catalog.as_ref()).await
+        }
+        .await;
+
+        match result {
+            Ok(_) => tracing::info!(
+                metric = "rustcdc_iceberg_snapshot_expiry",
+                outcome = "success",
+                retain_last = expiry.retain_last,
+                older_than_ms = expiry.older_than_ms,
+                "expired old iceberg snapshots"
+            ),
+            Err(e) => tracing::warn!(
+                metric = "rustcdc_iceberg_snapshot_expiry",
+                outcome = "failure",
+                error = %e,
+                "iceberg snapshot expiry failed; table metadata will keep growing \
+                 until the next attempt succeeds"
+            ),
+        }
     }
 
     fn observe_flush_lock_wait(&self, wait_ms: u64) {
@@ -394,7 +481,7 @@ impl SinkAdapter for IcebergSink {
         let lock_wait_started = Instant::now();
         let flush_lock = Arc::clone(&self.flush_lock);
         let _flush_guard = flush_lock.lock().await;
-        let lock_wait_ms = lock_wait_started.elapsed().as_millis() as u64;
+        let lock_wait_ms = lock_wait_started.elapsed().as_micros() as u64;
         self.observe_flush_lock_wait(lock_wait_ms);
         if lock_wait_ms > 0 {
             tracing::warn!(
@@ -609,15 +696,20 @@ async fn write_data_files(
     table: &Table,
     batch: RecordBatch,
     file_name_prefix: &str,
+    cfg: &IcebergSinkConfig,
 ) -> rustcdc::core::Result<Vec<iceberg::spec::DataFile>> {
     let location_generator =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(map_iceberg_error)?;
+        DefaultLocationGenerator::new(table.metadata()).map_err(map_iceberg_error)?;
     let file_name_generator =
         DefaultFileNameGenerator::new(file_name_prefix.to_string(), None, DataFileFormat::Parquet);
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::default(),
-        table.metadata().current_schema().clone(),
-    );
+    // parquet's own default is UNCOMPRESSED. CDC payloads are JSON-shaped and highly
+    // repetitive, so leaving it there stores several times the bytes for no gain.
+    let writer_properties = WriterProperties::builder()
+        .set_compression(cfg.parquet_compression.to_parquet())
+        .set_max_row_group_row_count(Some(cfg.parquet_row_group_rows))
+        .build();
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(writer_properties, table.metadata().current_schema().clone());
     let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer_builder,
         table.file_io().clone(),
@@ -713,7 +805,7 @@ fn to_file_uri(path: &Path) -> rustcdc::core::Result<String> {
 
 /// Build an `OpenDalStorageFactory` for the Iceberg catalog.
 ///
-/// CR-015: Selects the correct cloud storage backend based on the explicit
+/// Selects the correct cloud storage backend based on the explicit
 /// `storage` config field or auto-detects from the warehouse URI scheme.
 /// This replaces the previous hard-coded `OpenDalStorageFactory::Fs` which
 /// silently failed (or created spurious local directories) for cloud URIs.
@@ -730,14 +822,11 @@ fn build_storage_factory_from(
             // AWS_DEFAULT_REGION, AWS_ENDPOINT_URL), shared credential file,
             // and IMDSv2 — in that order.  Set those vars in the process
             // environment before startup or use IAM instance/task roles.
-            let warehouse = cfg.catalog.rest.warehouse.trim();
-            let scheme = if warehouse.starts_with("s3a://") {
-                "s3a"
-            } else {
-                "s3"
-            };
+            //
+            // iceberg-storage-opendal 0.10 dropped `configured_scheme`: the S3 storage
+            // now matches `s3://` and `s3a://` itself, so a warehouse URI written either
+            // way resolves without the sink having to sniff the prefix.
             Ok(OpenDalStorageFactory::S3 {
-                configured_scheme: scheme.to_string(),
                 customized_credential_load: None,
             })
         }
@@ -774,7 +863,7 @@ fn build_storage_factory_from(
 
 /// Auto-detect `IcebergStorageConfig` variant from a warehouse URI when
 /// the user left `storage` at the default `local_fs` but the warehouse
-/// indicates a cloud backend (CR-015).
+/// indicates a cloud backend.
 pub fn infer_storage_config(warehouse: &str) -> IcebergStorageConfig {
     if warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") {
         IcebergStorageConfig::S3
@@ -860,6 +949,9 @@ mod tests {
             max_commit_retries: 3,
             retry_backoff_ms: 5,
             retry_backoff_max_ms: 20,
+            parquet_compression: Default::default(),
+            parquet_row_group_rows: 1_048_576,
+            snapshot_expiry: Default::default(),
             max_pending_events: 100_000,
             max_pending_bytes: 256 * 1024 * 1024,
             storage: Default::default(),
@@ -1152,6 +1244,9 @@ mod tests {
             max_commit_retries: max_retries,
             retry_backoff_ms: 5,
             retry_backoff_max_ms: 40,
+            parquet_compression: Default::default(),
+            parquet_row_group_rows: 1_048_576,
+            snapshot_expiry: Default::default(),
             max_pending_events: 100_000,
             max_pending_bytes: 256 * 1024 * 1024,
             storage: Default::default(),

@@ -1,17 +1,164 @@
+use rustcdc::outbox::OutboxTransform;
+use rustcdc::transform::UnmatchedRule;
 use rustcdc::wasm::{TransformResult, WasmConfig as RustcdcWasmConfig, WasmRuntime};
-use rustcdc::{fingerprint_event_stable, Error, Event, Operation, Result};
+use rustcdc::{
+    fingerprint_event_stable, Error, Event, FieldMappingConfig, FieldMappingTransform,
+    MaskHashConfig, MaskHashTransform, MaskRule, Operation, Result,
+};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::config::pipeline::MaskRuleConfig;
 use crate::config::schema::{
     TransformActionConfig, TransformKeySource, TransformMetadataField, TransformRuleConfig,
     TransformRuntimeConfig, TransformRuntimeMode, TransformWhenConfig,
 };
 
 pub struct TransformPipeline {
-    rules: Vec<TransformRuleConfig>,
+    rules: Vec<CompiledRule>,
     runtime: TransformRuntime,
+}
+
+/// A transform rule with its actions built once, at startup.
+///
+/// The rustcdc stages are stateful — `MaskHashTransform` counts per-rule hits so an
+/// operator can find a rule that never fires — and building one per event would both
+/// allocate on the hot path and reset those counters every time.
+struct CompiledRule {
+    name: String,
+    when: TransformWhenConfig,
+    actions: Vec<CompiledAction>,
+}
+
+enum CompiledAction {
+    /// An action implemented directly against the event payload.
+    Inline(TransformActionConfig),
+    /// A prebuilt rustcdc stage (masking, field mapping, outbox).
+    ///
+    /// Kept rather than rebuilt per event: these are stateful — `MaskHashTransform`
+    /// counts per-rule hits so an operator can find a rule that never fires — and
+    /// rebuilding one per event would both allocate on the hot path and reset those
+    /// counters every time.
+    Native {
+        transform: Box<dyn rustcdc::transform::Transform>,
+        /// Report this stage's never-matched rules. rustcdc 0.9 put
+        /// `unmatched_rules()` on the `Transform` trait, so every stage answers it
+        /// uniformly instead of masking being a special case.
+        warn_on_unmatched: bool,
+    },
+}
+
+fn compile_rules(rules: Vec<TransformRuleConfig>) -> Result<Vec<CompiledRule>> {
+    rules
+        .into_iter()
+        .map(|rule| {
+            let actions = rule
+                .actions
+                .into_iter()
+                .map(|action| compile_action(&rule.name, action))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(CompiledRule {
+                name: rule.name,
+                when: rule.when,
+                actions,
+            })
+        })
+        .collect()
+}
+
+fn compile_action(rule_name: &str, action: TransformActionConfig) -> Result<CompiledAction> {
+    match action {
+        TransformActionConfig::Mask {
+            rules,
+            default_rule,
+            warn_on_unmatched,
+        } => {
+            let mut config = MaskHashConfig {
+                default_rule: mask_rule(rule_name, "default_rule", default_rule)?,
+                ..MaskHashConfig::default()
+            };
+            for (path, rule) in rules {
+                let compiled = mask_rule(rule_name, &path, rule)?;
+                config.mask_rules.insert(path, compiled);
+            }
+            // rustcdc 0.9 made this fallible: `Truncate(0)`, `Redact("")` and an empty
+            // rule path are rejected here. All three make the masking *invisible* rather
+            // than merely useless — an empty string is indistinguishable downstream from
+            // a genuinely empty column.
+            let transform = MaskHashTransform::new(config).map_err(|e| {
+                Error::ConfigError(format!(
+                    "transform rule '{rule_name}' mask action is invalid: {e}"
+                ))
+            })?;
+            Ok(CompiledAction::Native {
+                transform: Box::new(transform),
+                warn_on_unmatched,
+            })
+        }
+        TransformActionConfig::FieldMapping {
+            copy,
+            rename,
+            set,
+            remove,
+            strict,
+        } => {
+            let config = FieldMappingConfig {
+                copy: copy.into_iter().map(|[a, b]| (a, b)).collect(),
+                rename: rename.into_iter().map(|[a, b]| (a, b)).collect(),
+                set_literals: set.into_iter().collect(),
+                remove,
+                strict,
+            };
+            let transform = FieldMappingTransform::new(config).map_err(|e| {
+                Error::ConfigError(format!(
+                    "transform rule '{rule_name}' field_mapping action is invalid: {e}"
+                ))
+            })?;
+            Ok(CompiledAction::Native {
+                transform: Box::new(transform),
+                warn_on_unmatched: true,
+            })
+        }
+        TransformActionConfig::Outbox { table } => Ok(CompiledAction::Native {
+            transform: Box::new(OutboxTransform::new(table)),
+            warn_on_unmatched: true,
+        }),
+        other => Ok(CompiledAction::Inline(other)),
+    }
+}
+
+fn mask_rule(rule_name: &str, path: &str, rule: MaskRuleConfig) -> Result<MaskRule> {
+    // Resolve the secret at startup so an unset environment variable fails here rather
+    // than on the first event that happens to carry the field — a masking rule that
+    // fails late has already let unmasked events through.
+    let check_key = |secret: &rustcdc::SecretString| -> Result<()> {
+        secret.expose_secret().map(|_| ()).map_err(|e| {
+            Error::ConfigError(format!(
+                "transform rule '{rule_name}' mask path '{path}': key could not be \
+                 resolved: {e}"
+            ))
+        })
+    };
+    Ok(match rule {
+        MaskRuleConfig::Passthrough => MaskRule::Passthrough,
+        MaskRuleConfig::UnsaltedSha256 => MaskRule::UnsaltedSha256,
+        MaskRuleConfig::Redact { placeholder } => MaskRule::Redact(placeholder),
+        MaskRuleConfig::Null => MaskRule::Null,
+        MaskRuleConfig::Truncate { keep } => MaskRule::Truncate(keep),
+        MaskRuleConfig::HmacSha256 { key } => {
+            check_key(&key)?;
+            MaskRule::HmacSha256(key)
+        }
+        MaskRuleConfig::Encrypt { key } => {
+            check_key(&key)?;
+            MaskRule::Encrypt(key)
+        }
+        MaskRuleConfig::Decrypt { key } => {
+            check_key(&key)?;
+            MaskRule::Decrypt(key)
+        }
+    })
 }
 
 impl std::fmt::Debug for TransformPipeline {
@@ -29,8 +176,57 @@ impl std::fmt::Debug for TransformPipeline {
 
 enum TransformRuntime {
     Native,
-    /// rustcdc `WasmRuntime` behind a `Mutex` (auto-inits on first transform).
-    Wasm(Arc<Mutex<WasmRuntime>>),
+    /// A pool of independently-lockable rustcdc `WasmRuntime`s (each auto-inits on
+    /// first transform).
+    ///
+    /// This is a pool of *runtimes* rather than the single runtime it used to be,
+    /// because `WasmRuntime::transform` takes `&mut self`. That signature forces an
+    /// exclusive lock around every transform, which serialised the whole stage — so
+    /// both `wasm.instance_pool_size` and `runtime.prepare_parallelism` did nothing in
+    /// WASM mode. `instance_pool_size` allocated N wasmtime instances of which exactly
+    /// one could ever run.
+    ///
+    /// Upstream is built for concurrency one layer down: `WasmModule::transform_bytes`
+    /// takes `&self` and dispatches across a semaphore-guarded instance pool. Only the
+    /// public wrapper's `&mut self` — needed for a lazy `initialized` flag, since its
+    /// counters are already atomics — makes that unreachable. Holding N runtimes of one
+    /// instance each restores the intended concurrency with the same total instance
+    /// count; the cost is compiling the module once per runtime at startup.
+    ///
+    /// The real fix is upstream: `&self` on `transform` would make the existing pool
+    /// work for every embedder and let this collapse back to a single runtime.
+    Wasm(Arc<WasmPool>),
+}
+
+/// Round-robin over independently-lockable WASM runtimes.
+pub(crate) struct WasmPool {
+    runtimes: Vec<Mutex<WasmRuntime>>,
+    /// Dispatch cursor. `Relaxed` is right: this only has to spread load, and a missed
+    /// increment costs one extra contended lock, not correctness.
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl WasmPool {
+    /// Take the next runtime in rotation, waiting if it is busy.
+    ///
+    /// Deliberately not "scan for a free one": under saturation every slot is busy and
+    /// the scan degrades into a spin, while round-robin queues fairly behind the slot
+    /// whose turn it is. Under light load the cursor almost always lands on an idle
+    /// slot anyway.
+    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, WasmRuntime> {
+        let index =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.runtimes.len();
+        self.runtimes[index].lock().await
+    }
+
+    /// A runtime for read-only metric collection.
+    async fn any(&self) -> tokio::sync::MutexGuard<'_, WasmRuntime> {
+        self.runtimes[0].lock().await
+    }
+
+    fn len(&self) -> usize {
+        self.runtimes.len()
+    }
 }
 
 /// Snapshot of WASM runtime metrics sourced from `WasmRuntime::metrics()`.
@@ -82,12 +278,87 @@ impl TransformPipeline {
                     instance_pool_size: cfg.instance_pool_size,
                     fuel_async_yield_interval: cfg.fuel_yield_interval,
                 };
-                let runtime = WasmRuntime::new_with_config(wasm_config)?;
-                TransformRuntime::Wasm(Arc::new(Mutex::new(runtime)))
+                // One runtime per requested pool slot, each holding a single wasmtime
+                // instance, so the total instance count matches what the operator asked
+                // for and the slots are genuinely schedulable in parallel.
+                let pool_size = cfg.instance_pool_size.max(1);
+                let mut runtimes = Vec::with_capacity(pool_size);
+                for _ in 0..pool_size {
+                    let mut slot_config = wasm_config.clone();
+                    slot_config.instance_pool_size = 1;
+                    runtimes.push(Mutex::new(WasmRuntime::new_with_config(slot_config)?));
+                }
+
+                TransformRuntime::Wasm(Arc::new(WasmPool {
+                    runtimes,
+                    next: std::sync::atomic::AtomicUsize::new(0),
+                }))
             }
         };
 
-        Ok(Self { rules, runtime })
+        Ok(Self {
+            rules: compile_rules(rules)?,
+            runtime,
+        })
+    }
+
+    /// Every configured rule that has never matched, across every stage.
+    ///
+    /// Transform rules match by pattern against a permissive default, so a typo or a
+    /// renamed column disables one **silently** and nothing errors. The consequence
+    /// differs per stage and is carried on each entry: a mask rule that never fires
+    /// means a column is shipping in clear text; a route rule that never fires means
+    /// events are going to the default destination.
+    ///
+    /// Exported as `rustcdc_transform_rules_unmatched` — emitted only for rules that
+    /// are unmatched, so the metric's absence is the healthy state and `> 0` is a
+    /// complete alert rule.
+    pub fn unmatched_rules(&self) -> Vec<UnmatchedRule> {
+        self.rules
+            .iter()
+            .flat_map(|rule| {
+                rule.actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        CompiledAction::Native {
+                            transform,
+                            warn_on_unmatched: true,
+                        } => Some(transform.unmatched_rules()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .map(|mut unmatched| {
+                        // rustcdc names the *stage* (`mask_hash`); the operator wrote
+                        // `name = "redact_pii"` in the config and that is what they will
+                        // grep for. Qualify with both so the alert label points at the
+                        // rule they can actually go and fix.
+                        unmatched.transform = format!("{}/{}", rule.name, unmatched.transform);
+                        unmatched
+                    })
+            })
+            .collect()
+    }
+
+    /// Log a WARN naming every never-matched rule. Returns how many were reported.
+    ///
+    /// Call at shutdown, where the counters cover the whole run. Prefer the
+    /// `rustcdc_transform_rules_unmatched` metric for alerting — a log line at
+    /// shutdown is something an operator has to go looking for.
+    pub fn report_unmatched_rules(&self) -> usize {
+        let unmatched = self.unmatched_rules();
+        if unmatched.is_empty() {
+            return 0;
+        }
+        for rule in &unmatched {
+            tracing::warn!(
+                transform = %rule.transform,
+                kind = %rule.kind,
+                rule = %rule.rule,
+                consequence = %rule.consequence,
+                "transform rule never matched"
+            );
+        }
+        unmatched.len()
     }
 
     /// Returns a live metrics snapshot from the WASM runtime, or a zeroed
@@ -95,11 +366,14 @@ impl TransformPipeline {
     pub(crate) async fn wasm_metrics(&self) -> WasmRuntimeMetricsSnapshot {
         match &self.runtime {
             TransformRuntime::Native => WasmRuntimeMetricsSnapshot::default(),
-            TransformRuntime::Wasm(runtime) => {
-                let guard = runtime.lock().await;
+            TransformRuntime::Wasm(pool) => {
+                let guard = pool.any().await;
                 let m = guard.metrics();
                 WasmRuntimeMetricsSnapshot {
-                    instance_pool_size: m.instance_pool_size as u64,
+                    // The runtime reports its own (now always 1) pool size; the number
+                    // the operator configured and that actually bounds concurrency is
+                    // the number of runtimes.
+                    instance_pool_size: pool.len() as u64,
                     transform_total: m.transform_total,
                     transform_error_total: m.transform_error_total,
                     filtered_total: m.filtered_total,
@@ -126,12 +400,12 @@ impl TransformPipeline {
                     Ok(Some(event))
                 }
             }
-            TransformRuntime::Wasm(runtime) => {
+            TransformRuntime::Wasm(pool) => {
                 // WasmRuntime::transform() serializes the event exactly once
                 // and enforces memory_limit_mb (which we set to min(max_memory_bytes,
                 // max_event_bytes) at construction time).  No pre-serialization
                 // is needed here — doing so would allocate and serialize twice.
-                let mut guard = runtime.lock().await;
+                let mut guard = pool.acquire().await;
                 match guard.transform(&event).await? {
                     TransformResult::Ok(transformed) => {
                         Ok(Some(finalize_transformed(*transformed)?))
@@ -187,7 +461,7 @@ fn reconcile_availability_lists(event: &mut Event) {
     }
 }
 
-pub fn apply_rules(event: Event, rules: &[TransformRuleConfig]) -> Result<Option<Event>> {
+fn apply_rules(event: Event, rules: &[CompiledRule]) -> Result<Option<Event>> {
     let mut current = event;
 
     for rule in rules {
@@ -196,10 +470,19 @@ pub fn apply_rules(event: Event, rules: &[TransformRuleConfig]) -> Result<Option
         }
 
         for action in &rule.actions {
-            let Some(next) = apply_action(current, action)? else {
-                return Ok(None);
-            };
-            current = next;
+            match action {
+                CompiledAction::Inline(action) => {
+                    let Some(next) = apply_action(current, action)? else {
+                        return Ok(None);
+                    };
+                    current = next;
+                }
+                CompiledAction::Native { transform, .. } => {
+                    if !transform.apply(&mut current)? {
+                        return Ok(None);
+                    }
+                }
+            }
         }
     }
 
@@ -268,6 +551,28 @@ fn apply_action(event: Event, action: &TransformActionConfig) -> Result<Option<E
             target_field,
             source,
         } => shape_key(event, target_field, *source).map(Some),
+        // Built once by `compile_action` and dispatched through `CompiledAction`, so
+        // they never reach this per-event path.
+        TransformActionConfig::Mask { .. }
+        | TransformActionConfig::FieldMapping { .. }
+        | TransformActionConfig::Outbox { .. } => Err(Error::ConfigError(format!(
+            "internal: {} is a prebuilt stage and must not be dispatched per event",
+            action_label(action)
+        ))),
+    }
+}
+
+fn action_label(action: &TransformActionConfig) -> &'static str {
+    match action {
+        TransformActionConfig::Unwrap { .. } => "unwrap",
+        TransformActionConfig::Flatten { .. } => "flatten",
+        TransformActionConfig::Filter { .. } => "filter",
+        TransformActionConfig::Route { .. } => "route",
+        TransformActionConfig::MetadataProjection { .. } => "metadata_projection",
+        TransformActionConfig::KeyShaping { .. } => "key_shaping",
+        TransformActionConfig::Mask { .. } => "mask",
+        TransformActionConfig::FieldMapping { .. } => "field_mapping",
+        TransformActionConfig::Outbox { .. } => "outbox",
     }
 }
 
@@ -449,38 +754,31 @@ mod tests {
     use crate::config::schema::{
         TransformRuntimeConfig, TransformRuntimeMode, WasmTransformConfig,
     };
-    use rustcdc::core::{SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use rustcdc::core::SourceMetadata;
     use serde_json::json;
     use tempfile::TempDir;
 
+    /// Compile config rules and run one event through them.
+    fn apply_rules(event: Event, rules: &[TransformRuleConfig]) -> Result<Option<Event>> {
+        let compiled = compile_rules(rules.to_vec())?;
+        super::apply_rules(event, &compiled)
+    }
+
     fn sample_event() -> Event {
-        Event {
-            before: None,
-            after: Some(json!({
+        Event::builder("users", Operation::Insert)
+            .after(json!({
                 "id": 42,
                 "customer": {
                     "name": "alice",
                     "tier": "gold"
                 },
                 "region": "eu-west-1"
-            })),
-            op: Operation::Insert,
-            source: SourceMetadata {
-                source_name: "postgres".to_string(),
-                offset: "0/16B6A71".to_string(),
-                timestamp: 10,
-            },
-            ts: 11,
-            schema: Some("public".to_string()),
-            table: "users".to_string(),
-            primary_key: Some(vec!["id".to_string()]),
-            snapshot: None,
-            transaction: None,
-            envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
-            unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
-        }
+            }))
+            .source(SourceMetadata::new("postgres", "0/16B6A71", 10))
+            .ts(11)
+            .schema("public")
+            .primary_key(["id"])
+            .build()
     }
 
     #[test]
@@ -574,6 +872,218 @@ mod tests {
                 "table": "users"
             }))
         );
+    }
+
+    // ─── mask / field_mapping / outbox ───────────────────────────────────────
+
+    fn mask_rule_config(rules: Vec<(&str, MaskRuleConfig)>) -> TransformRuleConfig {
+        TransformRuleConfig {
+            name: "mask".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![TransformActionConfig::Mask {
+                rules: rules
+                    .into_iter()
+                    .map(|(path, rule)| (path.to_string(), rule))
+                    .collect(),
+                default_rule: MaskRuleConfig::Passthrough,
+                warn_on_unmatched: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn mask_redacts_and_truncates_by_path() {
+        let rules = vec![mask_rule_config(vec![
+            (
+                "region",
+                MaskRuleConfig::Redact {
+                    placeholder: "***".to_string(),
+                },
+            ),
+            ("customer.name", MaskRuleConfig::Truncate { keep: 2 }),
+        ])];
+
+        let masked = apply_rules(sample_event(), &rules)
+            .expect("apply")
+            .expect("kept");
+        let after = masked.after.expect("after");
+
+        assert_eq!(after.get("region"), Some(&json!("***")));
+        assert_eq!(after.pointer("/customer/name"), Some(&json!("al")));
+        assert_eq!(
+            after.pointer("/customer/tier"),
+            Some(&json!("gold")),
+            "unlisted fields must pass through untouched"
+        );
+    }
+
+    /// Hashing must be stable across events, or a downstream join on the masked
+    /// column silently stops matching.
+    #[test]
+    fn unsalted_sha256_is_deterministic() {
+        let rules = vec![mask_rule_config(vec![(
+            "region",
+            MaskRuleConfig::UnsaltedSha256,
+        )])];
+
+        let first = apply_rules(sample_event(), &rules)
+            .expect("apply")
+            .expect("kept");
+        let second = apply_rules(sample_event(), &rules)
+            .expect("apply")
+            .expect("kept");
+
+        let a = first.after.expect("after");
+        let b = second.after.expect("after");
+        assert_eq!(a.get("region"), b.get("region"));
+        assert_ne!(a.get("region"), Some(&json!("eu-west-1")));
+    }
+
+    /// A rule whose path does not exist is the dangerous case: the column ships in
+    /// clear text and nothing fails. The counter is what makes it visible.
+    #[test]
+    fn unmatched_mask_rules_are_reported() {
+        let rules = vec![mask_rule_config(vec![
+            (
+                "region",
+                MaskRuleConfig::Redact {
+                    placeholder: "***".to_string(),
+                },
+            ),
+            // Renamed or mistyped column.
+            (
+                "e_mail",
+                MaskRuleConfig::Redact {
+                    placeholder: "***".to_string(),
+                },
+            ),
+        ])];
+
+        let pipeline = TransformPipeline {
+            rules: compile_rules(rules).expect("compile"),
+            runtime: TransformRuntime::Native,
+        };
+        super::apply_rules(sample_event(), &pipeline.rules).expect("apply");
+
+        let unmatched = pipeline.unmatched_rules();
+        assert_eq!(
+            unmatched.len(),
+            1,
+            "only the rule that never matched must be reported: {unmatched:?}"
+        );
+        assert_eq!(unmatched[0].rule, "e_mail");
+        assert_eq!(unmatched[0].kind, "mask");
+        assert!(
+            unmatched[0].transform.starts_with("mask/"),
+            "the operator's own rule name must survive into the report: {}",
+            unmatched[0].transform
+        );
+        // The consequence is what makes the alert actionable — a mask rule that never
+        // fired means that column shipped in clear text.
+        assert!(
+            !unmatched[0].consequence.is_empty(),
+            "every unmatched rule must carry its consequence"
+        );
+        assert_eq!(pipeline.report_unmatched_rules(), 1);
+    }
+
+    #[test]
+    fn field_mapping_renames_sets_and_removes() {
+        let rules = vec![TransformRuleConfig {
+            name: "map".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![TransformActionConfig::FieldMapping {
+                copy: Vec::new(),
+                rename: vec![["region".to_string(), "location".to_string()]],
+                set: [("source_system".to_string(), json!("crm"))]
+                    .into_iter()
+                    .collect(),
+                remove: vec!["customer.tier".to_string()],
+                strict: true,
+            }],
+        }];
+
+        let mapped = apply_rules(sample_event(), &rules)
+            .expect("apply")
+            .expect("kept");
+        let after = mapped.after.expect("after");
+
+        assert_eq!(after.get("location"), Some(&json!("eu-west-1")));
+        assert_eq!(after.get("region"), None, "rename must move, not copy");
+        assert_eq!(after.get("source_system"), Some(&json!("crm")));
+        assert_eq!(after.pointer("/customer/tier"), None);
+    }
+
+    /// `strict = true` exists so a renamed-away column is an error rather than a
+    /// silently absent output field.
+    #[test]
+    fn strict_field_mapping_rejects_a_missing_source_path() {
+        let rules = vec![TransformRuleConfig {
+            name: "map".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![TransformActionConfig::FieldMapping {
+                copy: Vec::new(),
+                rename: vec![["does_not_exist".to_string(), "x".to_string()]],
+                set: Default::default(),
+                remove: Vec::new(),
+                strict: true,
+            }],
+        }];
+
+        apply_rules(sample_event(), &rules).expect_err("strict mapping must fail");
+    }
+
+    #[test]
+    fn outbox_unwraps_an_insert_into_its_domain_event() {
+        let rules = vec![TransformRuleConfig {
+            name: "outbox".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![TransformActionConfig::Outbox {
+                table: "outbox_events".to_string(),
+            }],
+        }];
+
+        let event = Event::builder("outbox_events", Operation::Insert)
+            .after(json!({
+                "aggregate_id": "order-42",
+                "event_type": "OrderPlaced",
+                "payload": {"order_id": 42, "total": 99.5}
+            }))
+            .source(SourceMetadata::new("postgres", "0/1", 1))
+            .ts(1)
+            .schema("public")
+            .build();
+
+        let routed = apply_rules(event, &rules).expect("apply").expect("kept");
+
+        assert_eq!(routed.table, "OrderPlaced");
+        assert_eq!(
+            routed.after.expect("after"),
+            json!({"order_id": 42, "total": 99.5})
+        );
+    }
+
+    /// An `UPDATE` against the outbox table is a cleanup job marking a row processed,
+    /// not a new domain event; rewriting it would fabricate a duplicate.
+    #[test]
+    fn outbox_passes_non_insert_operations_through() {
+        let rules = vec![TransformRuleConfig {
+            name: "outbox".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![TransformActionConfig::Outbox {
+                table: "outbox_events".to_string(),
+            }],
+        }];
+
+        let event = Event::builder("outbox_events", Operation::Update)
+            .after(json!({"id": 1, "processed_at": 1700000000}))
+            .source(SourceMetadata::new("postgres", "0/2", 2))
+            .ts(2)
+            .schema("public")
+            .build();
+
+        let passed = apply_rules(event, &rules).expect("apply").expect("kept");
+        assert_eq!(passed.table, "outbox_events");
     }
 
     #[test]

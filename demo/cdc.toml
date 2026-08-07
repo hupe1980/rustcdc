@@ -10,7 +10,7 @@ snapshot_tables = ["public.customers", "public.products", "public.orders"]
 host                  = "postgres"       # Docker Compose service name
 port                  = 5432
 user                  = "cdc_user"
-password              = "cdc_password"   # demo only — plain string; use env ref in production
+password              = { env = "RUSTCDC_DEMO_SOURCE_PASSWORD" }
 database              = "demo"
 replication_slot_name = "cdc_demo_slot"
 publication_name      = "cdc_demo_pub"
@@ -39,6 +39,26 @@ mode = "plaintext"   # no TLS needed for same-Docker-network connections
 
 [sink]
 type = "stdout"
+
+# ── Transforms ────────────────────────────────────────────────────────────────
+# Native masking: customer e-mail is redacted before it reaches any sink, and
+# the name is replaced by a keyed HMAC so rows stay joinable without being
+# re-identifiable. The key comes from the environment — a literal here would be
+# rejected at load, because a key in the config file makes every value it masked
+# re-identifiable for as long as that file exists.
+
+[[pipeline.transforms]]
+name = "redact_customer_pii"
+
+  [pipeline.transforms.when]
+  tables = ["customers"]
+
+  [[pipeline.transforms.actions]]
+  type = "mask"
+
+    [pipeline.transforms.actions.rules]
+    email = { type = "redact", placeholder = "***@redacted" }
+    name  = { type = "hmac_sha256", key = { env = "RUSTCDC_DEMO_PII_KEY" } }
 
 # ── State ─────────────────────────────────────────────────────────────────────
 # Stored on a Docker named volume — restarts resume from the saved checkpoint.
