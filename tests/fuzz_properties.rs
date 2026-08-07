@@ -287,7 +287,10 @@ fn the_config_loader_rejects_rather_than_panics() {
         let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
         let mut toml = String::new();
         for _ in 0..rng.below(16) {
-            toml.push_str(rng.pick(&fragments));
+            // Dereferenced explicitly: `pick` returns `&T`, and letting inference pick
+            // `T` from `push_str`'s `&str` parameter resolves to the unsized `str` on
+            // older compilers within the supported range.
+            toml.push_str(*rng.pick(&fragments));
         }
 
         let path = dir.path().join(format!("fuzz-{seed}.toml"));
