@@ -38,6 +38,10 @@ async fn main() -> rustcdc::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The harness points this worker at a throwaway container running `ssl = off`. A TLS
+        // transport implies `sslmode=require`, so it would be refused outright rather than
+        // silently downgraded to cleartext.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 

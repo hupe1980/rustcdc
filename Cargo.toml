@@ -94,7 +94,9 @@ apicurio = ["schemreg", "schemreg/apicurio"]
 glue = ["schemreg", "schemreg/glue"]
 
 [dependencies]
-async-trait = "0.1.89"
+# 0.1.92 minimum: 0.1.91 and earlier push `#[must_use]` onto every generated method, which
+# nightly clippy now rejects as `double_must_use` on the boxed-future return type.
+async-trait = "0.1.92"
 ahash = { version = "0.8.11", features = ["serde"] }
 futures-util = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
