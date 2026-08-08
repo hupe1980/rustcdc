@@ -583,6 +583,25 @@ events written **after** the change — existing binlog content keeps the old en
 > **MariaDB:** `binlog_row_metadata` and `binlog_row_value_options` do not exist. The connector
 > detects their absence and skips those two checks rather than failing.
 
+### Binlog transaction compression
+
+`binlog_transaction_compression = ON` (MySQL 8.0.20+) is **supported and needs no
+configuration change.** The server writes each transaction as a single zstd
+`Transaction_payload_event`; the connector reads it transparently and emits the same events
+it would for an uncompressed transaction.
+
+The one thing worth knowing is the resume coordinate. Events unpacked from a compressed
+payload carry no position of their own — they were never written to the binlog file
+individually — so the coordinate for every row inside a compressed transaction is the **end
+position of the payload event**, exactly as MySQL specifies for `START REPLICA … UNTIL` and
+`sql_replica_skip_counter`. Several rows therefore share one `source.offset`, which is
+already true of any multi-row transaction.
+
+Evidence: `tests/mysql_binlog_compression_integration.rs` runs against MySQL 8.0 with
+compression enabled and asserts both that every event carries a resumable position and that a
+stream restarted from a position captured inside a compressed transaction picks up the changes
+that follow it.
+
 ### GTID positioning
 
 When `gtid_mode_enabled` is set, the connector resumes by **GTID set** rather than by
@@ -711,7 +730,7 @@ MariaDB supports the same startup, snapshot, and streaming modes as MySQL, but e
 | `conn_timeout_secs` | `u64` | 30 | Range 1–300. |
 | `prereq_pool_size` | `usize` | 4 | Concurrent connections used by prerequisite checks. Range 1–64. |
 | `stream_poll_interval_ms` | `u64` | 5 000 | Range 1–60 000. **See the latency note below.** |
-| `max_events_per_poll` | `usize` | 10 000 | Range 1–100 000. |
+| `max_events_per_poll` | `usize` | 10 000 | Range 1–100 000. Per **capture instance**, not per poll; see below. |
 
 > **⚠️ SQL Server CDC is polling-based, not event-driven.** p99 latency is approximately
 > `stream_poll_interval_ms` plus the CDC capture agent's own delay. Reduce the interval to
@@ -732,6 +751,42 @@ Ordering is **best-effort**: the truncate lands after every DML change whose com
 or before the LSN captured when the trigger fired, which is as precise as SQL Server allows
 for an operation that bypasses row-level logging.
 
+### How the LSN window is read across capture instances
+
+The connector reads one LSN window at a time and queries **every** capture instance in that
+window with its own `TOP (max_events_per_poll)`. Two consequences are worth knowing when you
+tune it, because both are about not losing rows rather than about throughput:
+
+* **Instances truncate at different positions.** When any instance returns a full page, the
+  window still holds rows the connector has not read. The only globally safe stopping point is
+  the *minimum* last-row position across the truncated instances; rows beyond it are dropped
+  from the batch and re-read on the next poll. The window is not advanced until the whole
+  window has actually been read, so a crash mid-window costs at most one window of duplicate
+  delivery — never a gap.
+* **A window can therefore yield more events than one poll returns.** With *n* capture
+  instances a single fill can buffer up to *n × max_events_per_poll* events, delivered a page
+  at a time. Setting `max_events_per_poll` very low relative to your write rate makes this the
+  normal case rather than the exception, which costs extra round trips.
+
+Evidence: `tests/sqlserver_window_truncation_integration.rs` drives two capture instances with
+`max_events_per_poll = 5` and asserts every row arrives.
+
+### Adding a table to a running pipeline
+
+`sys.sp_cdc_enable_table` may be run at any time. Capture instances do not all begin at the
+same LSN, so a newly enabled one has a **capture floor** later than the stream's current
+position; the connector reads each instance from `max(window_start, its own floor)` and skips
+an instance entirely for windows that end before its floor. The next metadata refresh emits a
+`CREATE_TABLE` schema-change event for it.
+
+This is deliberately *not* the same as retention loss. Asking a capture instance for changes
+below its floor and asking for changes the cleanup job has already purged both raise SQL Server
+error 313 (*"An insufficient number of arguments were supplied for the procedure or
+function"* — a genuine SQL Server oddity, not a driver defect). The connector distinguishes
+them: the floor case is normal and handled silently, while a floor that has advanced past a
+window this connector had not yet read means changes were purged and is reported as an
+`Unrecoverable` error naming the affected capture instance. See
+[Troubleshooting](@/docs/troubleshooting.md).
 
 ### AWS IAM Auth Mode (MySQL/PostgreSQL)
 

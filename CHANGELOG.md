@@ -5,6 +5,108 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.10.0
+
+A correctness release. Four defects, three of them **silent data loss**, found by auditing the
+resume coordinate of each connector against what the source actually guarantees about it — and
+each one now has a regression test that fails without the fix, three of them against a live
+server. There is no new feature here and no API to migrate; the breaking part is that one class
+of corrupt checkpoint write is now refused instead of accepted.
+
+### MySQL: transaction compression corrupted the resume position
+
+`binlog_transaction_compression = ON` (MySQL 8.0.20+) writes each transaction as one zstd
+`Transaction_payload_event`. The driver decompresses it transparently and yields the inner
+`BEGIN` / `TABLE_MAP` / rows / `XID` events — whose headers carry **`log_pos = 0`**, because
+they were never written to the file individually and have no position of their own. MySQL's own
+rule is that the resume coordinate for anything inside a compressed transaction is the *end
+position of the payload event*.
+
+Taking the zero at face value made every commit inside a compressed transaction checkpoint at
+`<file>:0`. The server rejects a dump request below position 4 outright, so a restart after any
+compressed transaction **could not resume at all** — and the checkpoint's monotonicity guard did
+not object, because the committed-event count still advanced. GTID-positioned streams were
+shielded by their GTID set; the default file+position configuration was not.
+
+Verified against MySQL 8.0 with compression enabled: before the fix the captured offset is
+`mysql-bin.000003:0`, after it every event carries the payload's end position and a stream
+resumed from one picks up the changes that follow. `tests/mysql_binlog_compression_integration.rs`.
+
+### Incremental snapshot: a mid-chunk restart skipped the chunk
+
+The DBLog driver advanced its keyset cursor when a chunk was **read**, not when it was
+delivered. That cursor is embedded in the checkpoint record on *every* commit — including
+commits of the live stream events that flow past while the chunk sits in its collect phase — so
+the cursor became durable before its rows existed anywhere. A restart resumed *after* them: up
+to `chunk_size` rows missing from the snapshot, permanently, with no error and no counter to
+notice it by.
+
+The cursor and its row counters are now promoted together, once the chunk's emit queue drains.
+A restart re-reads at most one chunk, which is the at-least-once behaviour the pipeline already
+documents.
+
+### SQL Server: a truncated window across two capture instances dropped rows
+
+Every capture instance in an LSN window is queried with its own `TOP (max_events_per_poll)`, so
+instances truncate at different positions and the only safe stopping point is the minimum
+last-row position among them. That "truncation cursor" was a local variable, applied only if the
+buffer happened to drain in the same poll. With two or more capture instances a window routinely
+yields more events than one poll returns — so it did not drain there, the cursor was discarded,
+and the deferred window advance stepped straight over the unread remainder.
+
+Measured against SQL Server 2022 with two capture instances and `max_events_per_poll = 5`:
+**55 of 60 rows silently lost.** The cursor is now parked on the stream and applied at the drain
+point, which is also the only place it can be applied without making a position durable ahead of
+buffered rows. `tests/sqlserver_window_truncation_integration.rs`.
+
+### SQL Server: adding a table to CDC was reported as purged retention
+
+Capture instances do not all begin at the same LSN. An instance enabled after the stream started
+— or simply enabled second — has a floor *later* than the current window, and asking
+`cdc.fn_cdc_get_all_changes_*` below that floor makes SQL Server raise error 313, the same error
+it raises when the cleanup job has purged changes. The connector read that as data loss and
+stopped with `Unrecoverable`, telling the operator to re-snapshot and restart from a fresh
+checkpoint. **`sys.sp_cdc_enable_table` on a running pipeline took the pipeline down with a
+false data-loss alarm.**
+
+Each capture instance now carries its own capture floor and is read from
+`max(window_start, floor)`, skipping windows that end before it. The floor is deliberately *not*
+refreshed for an instance the stream already knows: if cleanup advances a known instance's floor
+past an unread window, that is real data loss and must still surface. Genuine retention loss is
+reported exactly as before.
+
+### Breaking: a checkpoint may no longer rewind the stream position
+
+`FileCheckpoint::save` now compares the connector-native coordinate against the record it is
+replacing and **refuses a regression**, naming both positions. The five existing safety
+invariants are all expressed in terms of the committed-event *count*, and a count keeps rising
+while a connector offers a position it cannot have reached — which is worse than forgetting
+progress, because the counters report health while the recorded resume point sits before data the
+sink has already committed. The MySQL defect above had exactly this shape and nothing objected.
+
+The guard is only as strict as each source allows, because "the position went backwards" is not
+universally a defect:
+
+- **MySQL/MariaDB file+position** — compared by binlog sequence then position, since every event
+  in a transaction carries the commit position and the binlog is written in commit order. A
+  rollover past `binlog.999999` is ordered numerically, not as text, so it is not a regression.
+- **MySQL/MariaDB with GTID** — not compared at all. Binlog coordinates are server-local and a
+  promoted replica's are routinely lower; the GTID set is what resumes the stream.
+- **SQL Server** — the commit LSN only. Both cursor encodings occur in one stream (`{lsn}` from
+  per-event checkpoints, `{lsn}:{seqval}:{op}` from an orderly shutdown) and the bare form is a
+  *prefix* of the other, so comparing whole strings would read the first commit after a graceful
+  restart as a rewind.
+- **PostgreSQL** — only a zero LSN. pgoutput emits changes in *commit* order while each keeps its
+  own WAL position, so two transactions interleaved in the WAL arrive out of LSN order and the
+  checkpoint legitimately moves backwards. A general comparison here would have wedged every
+  pipeline with concurrent writers.
+- **Anything else** — left alone rather than guessed at.
+
+**What breaks:** a deployment that was silently writing rewound positions now fails loudly at
+`save`. That is the intended outcome, but it is a new error where there was none.
+[Troubleshooting](site/content/docs/troubleshooting.md) covers how to tell a migration or
+failover apart from a defect.
+
 ## 0.9.0
 
 Breaking release, driven almost entirely by downstream feedback from rustcdc-server's 0.7 →

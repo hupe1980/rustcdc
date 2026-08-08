@@ -180,8 +180,14 @@ pub trait IncrementalSnapshotBackend: Send + Sync {
 
 struct TableProgress {
     spec: SnapshotTable,
-    /// Keyset cursor: primary-key values of the last row of the previous chunk.
-    /// `None` means the table has not started.
+    /// Keyset cursor: primary-key values of the last row of the last **fully
+    /// delivered** chunk. `None` means the table has not started.
+    ///
+    /// This is the durable cursor: it appears in every checkpoint written while the
+    /// snapshot is in flight (see [`super::super::StreamHandle::position_offset`]),
+    /// so it must never run ahead of what the consumer has actually been handed.
+    /// Advancing it at chunk *read* time silently lost the chunk on any restart
+    /// before the chunk was emitted — see [`Phase::ChunkEmit::next_cursor`].
     pk_cursor: Option<Vec<serde_json::Value>>,
     is_complete: bool,
     chunks_emitted: u32,
@@ -209,11 +215,29 @@ enum Phase<P> {
         /// Buffered chunk rows as `(pk_fingerprint, event)`.
         chunk_rows: Vec<(String, Event)>,
         override_pks: HashSet<String>,
+        /// Cursor this chunk ends at, held back until the chunk is delivered.
+        next_cursor: Vec<serde_json::Value>,
     },
     /// Merged snapshot events awaiting delivery.
     ChunkEmit {
         table_idx: usize,
         events: VecDeque<Event>,
+        /// Cursor to promote into [`TableProgress::pk_cursor`] once `events` is empty.
+        ///
+        /// The whole reason this travels with the queue instead of being written at
+        /// chunk-read time: the durable checkpoint embeds
+        /// [`TableProgress::pk_cursor`] on **every** commit, including commits of the
+        /// live stream events that flow past during `ChunkCollect`. A cursor written
+        /// before its rows were handed to the consumer therefore became durable
+        /// before those rows existed anywhere, and a restart resumed *after* them —
+        /// silently dropping up to `chunk_size` rows from the snapshot, with no error
+        /// and no counter to notice it by. Promoting it only once the queue drains
+        /// costs at most one re-read of one chunk after a crash, which is the
+        /// at-least-once behaviour the rest of the pipeline already documents.
+        next_cursor: Vec<serde_json::Value>,
+        /// Rows in this chunk, added to [`TableProgress::rows_emitted`] on promotion
+        /// so the persisted counters stay consistent with the persisted cursor.
+        row_count: u64,
     },
     /// Every table complete; the driver is a pure stream delegate.
     Done,
@@ -469,9 +493,13 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             return Ok(());
         }
 
-        if let Some(last) = rows.last() {
-            self.tables[table_idx].pk_cursor = Some(last.cursor.clone());
-        }
+        // Held back, not applied: see `Phase::ChunkEmit::next_cursor`. The fetch above
+        // still starts from `pk_cursor`, which stays pinned to the last fully delivered
+        // chunk until this one has been handed to the consumer.
+        let next_cursor = rows
+            .last()
+            .map(|row| row.cursor.clone())
+            .unwrap_or_default();
 
         let chunk_index = self.tables[table_idx].chunks_emitted;
         let table_name = self.tables[table_idx].spec.name.clone();
@@ -502,6 +530,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             high_watermark,
             chunk_rows,
             override_pks: HashSet::new(),
+            next_cursor,
         };
         Ok(())
     }
@@ -512,6 +541,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             table_idx,
             ref chunk_rows,
             ref override_pks,
+            ref next_cursor,
             ..
         } = self.phase
         else {
@@ -524,10 +554,9 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             .map(|(_, event)| event.clone())
             .collect();
         let suppressed = override_pks.len();
+        let next_cursor = next_cursor.clone();
 
         let emitted = merged.len() as u64;
-        self.tables[table_idx].chunks_emitted += 1;
-        self.tables[table_idx].rows_emitted += emitted;
 
         tracing::debug!(
             target: "rustcdc::source::incremental_snapshot",
@@ -541,7 +570,27 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         self.phase = Phase::ChunkEmit {
             table_idx,
             events: merged,
+            next_cursor,
+            row_count: emitted,
         };
+    }
+
+    /// Promote a fully delivered chunk's cursor and counters into durable progress.
+    ///
+    /// Called only once the emit queue is empty, so the cursor that becomes durable
+    /// always describes rows the consumer has already been handed.
+    fn commit_chunk_progress(
+        &mut self,
+        table_idx: usize,
+        next_cursor: Vec<serde_json::Value>,
+        row_count: u64,
+    ) {
+        let table = &mut self.tables[table_idx];
+        if !next_cursor.is_empty() {
+            table.pk_cursor = Some(next_cursor);
+        }
+        table.chunks_emitted = table.chunks_emitted.saturating_add(1);
+        table.rows_emitted = table.rows_emitted.saturating_add(row_count);
     }
 
     /// Advance the state machine by one step.
@@ -553,13 +602,19 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                 Phase::ChunkEmit {
                     table_idx,
                     ref mut events,
+                    ref mut next_cursor,
+                    row_count,
                 } => {
                     let batch_size = events.len().min(EMIT_BATCH_SIZE);
                     if batch_size > 0 {
                         return Ok(events.drain(..batch_size).collect());
                     }
-                    // Queue drained — try the next chunk of the same table.
-                    // `drive_chunk_prepare` detects completion via an empty read.
+                    // Queue drained: the whole chunk is now in the consumer's hands, so
+                    // its cursor may finally become durable.
+                    let next_cursor = std::mem::take(next_cursor);
+                    self.commit_chunk_progress(table_idx, next_cursor, row_count);
+                    // Try the next chunk of the same table. `drive_chunk_prepare`
+                    // detects completion via an empty read.
                     self.phase = Phase::ChunkPrepare { table_idx };
                 }
 
@@ -1032,6 +1087,114 @@ mod tests {
             vec![2, 4, 5],
             "each read must resume strictly after the previous chunk's last key"
         );
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_taken_mid_chunk_does_not_skip_the_undelivered_chunk() {
+        // The durable checkpoint embeds `incremental_snapshot_state()` on *every*
+        // commit, including commits of the live stream events that flow past while a
+        // chunk sits in the collect phase. So the cursor must not move when the chunk
+        // is *read* — only when it has been handed to the consumer. It used to move at
+        // read time, which made a restart resume after rows that were never emitted:
+        // up to `chunk_size` rows silently missing from the snapshot, with no error and
+        // no counter to notice it by.
+        let rows: Vec<serde_json::Value> = (1..=6).map(|id| json!({ "id": id })).collect();
+
+        // `advance_on_read = 10` opens a watermark bracket of (100, 110]; the stream
+        // event at 105 lands inside it, so the watermark is not passed and the driver
+        // stays in the collect phase holding the unemitted chunk.
+        let (mut driver, _) = driver_with(
+            rows.clone(),
+            vec![vec![stream_event_at("other", 99, 105)]],
+            10,
+            3,
+        )
+        .await;
+
+        let first = driver.next_events(10).await.expect("drive");
+        assert!(
+            first.iter().all(|event| event.snapshot.is_none()),
+            "the chunk must still be undelivered at this point, so only the live \
+             stream event may have been returned"
+        );
+
+        // This is the state a commit of that stream event makes durable.
+        let mid_chunk = driver
+            .incremental_snapshot_state()
+            .expect("driver reports snapshot state");
+        let table = mid_chunk.table("public.users").expect("table state");
+        assert_eq!(
+            table.pk_cursor, None,
+            "a chunk that has not been delivered must not have advanced the durable \
+             cursor: {:?}",
+            table.pk_cursor
+        );
+
+        // Now prove the end-to-end property: restarting from that checkpoint still
+        // yields every row.
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut resumed = IncrementalSnapshotDriver::new(
+            FakeBackend {
+                rows,
+                clock: Arc::new(Mutex::new(100)),
+                advance_on_read: 0,
+                reads,
+            },
+            Box::new(FakeStream {
+                batches: VecDeque::new(),
+            }),
+            IncrementalSnapshotConfig::new(vec!["public.users".to_string()])
+                .with_chunk_size(3),
+            "test".to_string(),
+            Some(mid_chunk),
+        )
+        .await
+        .expect("driver builds");
+
+        let mut ids: Vec<i64> = drain(&mut resumed)
+            .await
+            .iter()
+            .filter(|event| event.snapshot.is_some())
+            .map(|event| {
+                event.after.as_ref().expect("row")["id"]
+                    .as_i64()
+                    .expect("id")
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5, 6],
+            "a restart from a mid-chunk checkpoint must re-read the undelivered chunk \
+             rather than skip it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_chunk_advances_the_durable_cursor_and_its_counters() {
+        // The other half of the contract: holding the cursor back must not turn into
+        // never advancing it, which would re-read chunk one forever.
+        let rows: Vec<serde_json::Value> = (1..=4).map(|id| json!({ "id": id })).collect();
+        let (mut driver, _) = driver_with(rows, vec![], 0, 2).await;
+
+        // Drive until the first chunk has been fully handed over.
+        let first = driver.next_events(10).await.expect("drive");
+        assert_eq!(first.len(), 2, "the first chunk is delivered in one batch");
+
+        // The cursor is promoted when the emit queue drains, which happens on the next
+        // call as the driver moves on to chunk two.
+        let _ = driver.next_events(10).await.expect("drive");
+        let state = driver
+            .incremental_snapshot_state()
+            .expect("driver reports snapshot state");
+        let table = state.table("public.users").expect("table state");
+        assert_eq!(
+            table.pk_cursor,
+            Some(vec![json!(2)]),
+            "a delivered chunk must advance the durable cursor to its last key"
+        );
+        assert_eq!(table.chunks_emitted, 1);
+        assert_eq!(table.rows_emitted, 2);
     }
 
     #[tokio::test]

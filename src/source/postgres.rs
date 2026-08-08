@@ -29,6 +29,8 @@ mod snapshot_start;
 mod state;
 mod stream_messages;
 mod stream_start;
+mod streaming;
+mod wire;
 mod validation;
 
 // Import decoder types used directly in this module.
@@ -545,6 +547,50 @@ pub struct PostgresSourceConfig {
     /// Default: `false` (compatible with PostgreSQL 16 and earlier).
     #[serde(default)]
     pub failover_slot: bool,
+    /// How the WAL stream is read. Defaults to [`WalTransport::StreamingReplication`].
+    #[serde(default)]
+    pub wal_transport: WalTransport,
+}
+
+/// How the connector reads the WAL stream from PostgreSQL.
+///
+/// PostgreSQL offers two ways to consume a logical replication slot, and they are not
+/// equivalent: one is the protocol logical replication was designed around, the other is
+/// a SQL function that re-does work on every call. The default is the former.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WalTransport {
+    /// `START_REPLICATION ... LOGICAL` over the streaming replication protocol.
+    ///
+    /// The server pushes WAL as it is written, over a long-lived connection, and progress
+    /// is reported back with Standby Status Update messages. This is what PostgreSQL's own
+    /// subscribers, `pg_recvlogical` and every other mature CDC implementation use.
+    ///
+    /// Requires the connecting role to have the `REPLICATION` attribute (or be
+    /// `rds_replication` / superuser), and requires a **direct** connection: a connection
+    /// pooler in transaction-pooling mode cannot carry a replication stream.
+    #[default]
+    StreamingReplication,
+    /// `pg_logical_slot_peek_binary_changes` over an ordinary SQL connection.
+    ///
+    /// **Slower by construction, and the cost grows with the workload rather than being
+    /// constant.** The peek is non-consuming, and PostgreSQL begins decoding at the slot's
+    /// `restart_lsn` while only emitting past `confirmed_flush_lsn`. Any long-running
+    /// transaction pins `restart_lsn`, so *every* poll re-reads the WAL between the two —
+    /// work that the streaming protocol pays once per connection. Delivery latency is also
+    /// bounded by the poll interval rather than pushed by the server.
+    ///
+    /// It exists because it needs neither the `REPLICATION` attribute nor a direct
+    /// connection, which makes it the fallback for environments that cannot grant one:
+    ///
+    /// * a managed service that withholds `REPLICATION` from the application role;
+    /// * a connection routed through a pooler that cannot proxy replication;
+    /// * a [`TransportConfig::RustlsConfig`](crate::core::TransportConfig) transport,
+    ///   whose pre-built verifier the streaming client cannot consume.
+    ///
+    /// Prefer fixing the environment. Reach for this when you cannot.
+    SqlPeek,
 }
 
 /// PostgreSQL connector lifecycle manager.

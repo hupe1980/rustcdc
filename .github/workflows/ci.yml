@@ -363,6 +363,7 @@ jobs:
           - mysql_snapshot_integration
           - mysql_type_fidelity_integration
           - mysql_stream_integration
+          - mysql_binlog_compression_integration
           - mysql_handoff_integration
           - runtime_mysql_process_crash_integration
     steps:
@@ -448,6 +449,7 @@ jobs:
           - sqlserver_snapshot_integration
           - sqlserver_type_fidelity_integration
           - sqlserver_stream_integration
+          - sqlserver_window_truncation_integration
           - sqlserver_handoff_integration
           - runtime_sqlserver_process_crash_integration
     steps:

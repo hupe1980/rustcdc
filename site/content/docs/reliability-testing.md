@@ -22,6 +22,29 @@ The reliability stack is split into three complementary layers:
 
 Use all three layers together for high confidence before releases.
 
+### A fourth layer: resume-coordinate suites
+
+The three layers above all exercise the runtime against a *cooperative* source. They cannot see a
+defect in the source's own resume coordinate, because they supply that coordinate themselves. The
+0.10.0 audit found three separate silent-data-loss defects of exactly that shape — a checkpoint
+that recorded a position the source could not resume from, or that ran ahead of the rows it
+described — and none of the layers above could have caught any of them.
+
+The suites below therefore assert on the coordinate itself, against a real server, in the
+configuration where it goes wrong:
+
+| Suite | Configuration it needs | What it asserts |
+|---|---|---|
+| `mysql_binlog_compression_integration` | MySQL 8.0, `binlog_transaction_compression = ON`, file+position (not GTID) | Every event carries a resumable binlog position, and a stream resumed from one captured inside a compressed transaction receives what follows it |
+| `sqlserver_window_truncation_integration` | SQL Server 2022, **two** capture instances, `max_events_per_poll = 5` | No row is lost when an LSN window truncates at different positions per capture instance |
+| `postgres_snapshot_integration` (`…resumes_at_the_chunk_boundary_after_a_restart`) | PostgreSQL, incremental snapshot | A restart resumes at a chunk boundary rather than skipping or restarting the table |
+
+The shared lesson for writing new ones: **the configuration is the test.** Each of these defects
+was invisible under the default configuration of the existing suite — one capture instance,
+compression off, a chunk that happened to drain in the same poll — and appeared immediately under
+a configuration a real deployment would choose. When adding a connector or a resume path, ask
+which server option or cardinality your suite is holding at its most forgiving value.
+
 ## Deterministic Replay
 
 ### Purpose
@@ -118,6 +141,11 @@ cargo test runtime_mysql_process_crash_integration --features mysql --bins
 cargo test runtime_mariadb_process_crash_integration --features mariadb --bins
 cargo test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 cargo test data_loss_detection
+
+# Resume-coordinate suites (need Docker; see the table above for why each configuration matters)
+CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features mysql --test mysql_binlog_compression_integration
+CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features sqlserver --test sqlserver_window_truncation_integration
+CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features postgres --test postgres_snapshot_integration
 ```
 
 ## Best Practices

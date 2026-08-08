@@ -6,9 +6,10 @@ use crate::{
 };
 
 use super::decoder::LivePgOutputMessageProvider;
+use super::streaming::StreamingPgOutputProvider;
 use super::{
     decode_stream_resume_lsn, query_current_wal_lsn, reconcile_stream_resume_lsn_with_retry,
-    PostgresConnection, PostgresStream, PostgresStreamHandle, StreamState,
+    PostgresConnection, PostgresStream, PostgresStreamHandle, StreamState, WalTransport,
 };
 
 pub(super) async fn start_postgres_stream(
@@ -32,14 +33,29 @@ pub(super) async fn start_postgres_stream(
     if let Some(offset) = resume_from {
         stream.lsn_position =
             decode_stream_resume_lsn(connection.source_type(), &stream.slot_name, offset)?;
-        stream.lsn_position = reconcile_stream_resume_lsn_with_retry(
-            &client,
-            stream.lsn_position,
-            &stream.slot_name,
-            5,
-            Duration::from_millis(250),
-        )
-        .await?;
+
+        // Reconciling a checkpoint that sits ahead of the slot's `confirmed_flush_lsn` is a
+        // SQL-peek concern only, and doing it under streaming replication is both
+        // unnecessary and unsafe:
+        //
+        // * Unnecessary, because `START_REPLICATION ... <lsn>` takes the resume position
+        //   directly. The server begins there and the slot's `confirmed_flush_lsn` catches
+        //   up on the first Standby Status Update. Under SQL peek there is no such
+        //   parameter — the slot position *is* the resume position — so a checkpoint ahead
+        //   of it has to be repaired before the first poll or the same events replay.
+        // * Unsafe, because the repair is `pg_replication_slot_advance`, which PostgreSQL
+        //   refuses on a slot an active walsender holds. A reconnect that races the old
+        //   walsender's teardown would fail startup on a slot that is about to be free.
+        if matches!(connection.config.wal_transport, WalTransport::SqlPeek) {
+            stream.lsn_position = reconcile_stream_resume_lsn_with_retry(
+                &client,
+                stream.lsn_position,
+                &stream.slot_name,
+                5,
+                Duration::from_millis(250),
+            )
+            .await?;
+        }
     } else {
         stream.lsn_position = query_current_wal_lsn(&client).await?;
     }
@@ -63,12 +79,37 @@ pub(super) async fn start_postgres_stream(
     } else {
         0
     };
-    let provider = Box::new(LivePgOutputMessageProvider {
-        client,
-        slot_name: stream.slot_name.clone(),
-        publication_name: stream.publication_name.clone(),
-        confirmed_lsn: initial_confirmed_lsn,
-    });
+    let provider: Box<dyn super::decoder::PgOutputMessageProvider> =
+        match connection.config.wal_transport {
+            WalTransport::StreamingReplication => Box::new(
+                StreamingPgOutputProvider::connect(&connection.config, initial_confirmed_lsn)
+                    .await?,
+            ),
+            WalTransport::SqlPeek => {
+                // Loud on purpose: this transport re-reads WAL from the slot's
+                // `restart_lsn` on every poll, so its cost grows with the source's
+                // longest-running transaction rather than staying constant. It is the
+                // right answer only when the environment cannot grant a replication
+                // connection, and an operator who did not choose it deliberately should
+                // find out from the log rather than from a latency graph.
+                tracing::warn!(
+                    target: "rustcdc::source::postgres",
+                    slot = %stream.slot_name,
+                    "postgres WAL transport is SqlPeek (pg_logical_slot_peek_binary_changes). \
+                     Every poll re-decodes from the slot's restart_lsn, so one long-running \
+                     transaction on the source makes each poll re-read the WAL gap to \
+                     confirmed_flush_lsn. Prefer WalTransport::StreamingReplication unless \
+                     the role lacks the REPLICATION attribute or the connection cannot be \
+                     direct.",
+                );
+                Box::new(LivePgOutputMessageProvider {
+                    client,
+                    slot_name: stream.slot_name.clone(),
+                    publication_name: stream.publication_name.clone(),
+                    confirmed_lsn: initial_confirmed_lsn,
+                })
+            }
+        };
     Ok(Box::new(PostgresStreamHandle::new(
         connection.source_type().to_string(),
         stream,

@@ -223,6 +223,71 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
 
 ---
 
+### Symptom: "the stream position moved backwards"
+
+**Error Example:**
+```
+ERROR checkpoint error: refusing checkpoint write for source 'mysql': the stream position
+moved backwards (mysql binlog position 42:88371 → 42:0).
+```
+
+This is a **safety net firing, not a checkpoint corruption.** `FileCheckpoint` compares the
+connector-native coordinate against the record it is about to replace and refuses a write that
+would rewind it. Refusing costs you a stalled pipeline; accepting would have made the next
+restart resume before data your sink has already committed, with the committed-event counters
+still reporting a healthy pipeline. Read the two positions in the message — the second is the
+one being refused.
+
+What is compared differs per source, because a rewind is not universally a defect — a PostgreSQL
+checkpoint moves backwards routinely, since pgoutput emits interleaved transactions in commit
+order while each change keeps its own WAL position. See
+[safety invariants](@/docs/architecture.md#safety-invariants) for the table.
+
+| Root Cause | How to tell | Action |
+|------------|-------------|--------|
+| Source was reset or repointed at a different server | The position dropped to near the start of a fresh log (`binlog.000001:4`, a much lower LSN) and the server identity changed | Intended migration: stop rustcdc, clear the checkpoint directory, re-snapshot. There is no safe resume across unrelated servers. |
+| Restored the source from a backup | Same shape, and the source's own position is behind where it was | Treat as above — the log the checkpoint refers to no longer exists. |
+| MySQL failover without GTID | `gtid_mode_enabled` is `false` and you promoted a replica | Enable [GTID positioning](@/docs/config-reference.md#gtid-positioning). Binlog coordinates are server-local; nothing can make them survive a failover. |
+| A connector defect | None of the above applies — the source is the same server and moved forward | Please report it with the error text. This guard exists because exactly this class of defect is otherwise invisible. |
+
+---
+
+### Symptom: SQL Server reports CDC changes "no longer retained"
+
+**Error Example:**
+```
+ERROR sqlserver CDC change data for capture instance 'dbo_shipments' is no longer retained:
+the requested window [...] is outside the range currently available in the change tables
+```
+
+SQL Server signals both *"you asked below this capture instance's floor"* and *"the cleanup job
+purged what you asked for"* with the same error 313 — `An insufficient number of arguments were
+supplied for the procedure or function cdc.fn_cdc_get_all_changes_…`. That message is a genuine
+SQL Server oddity and not a driver defect, so seeing it in a server log is not itself diagnostic.
+
+The connector separates the two cases, so if you are seeing this error the benign one has
+already been ruled out: a capture instance enabled after the stream started is read from its own
+floor and never produces the error. Confirm and act:
+
+```sql
+-- Where each capture instance's data actually begins, and where CDC currently ends.
+SELECT ct.capture_instance,
+       sys.fn_varbintohexstr(sys.fn_cdc_get_min_lsn(ct.capture_instance)) AS min_lsn,
+       sys.fn_varbintohexstr(sys.fn_cdc_get_max_lsn())                   AS max_lsn
+FROM   cdc.change_tables ct;
+
+-- Is the cleanup job outrunning the connector?
+EXEC sys.sp_cdc_help_jobs;   -- inspect the 'cleanup' job's retention (minutes)
+```
+
+| Root Cause | Action |
+|------------|--------|
+| Connector downtime exceeded CDC retention | Re-snapshot the affected tables from a fresh checkpoint, then raise retention: `EXEC sys.sp_cdc_change_job @job_type = 'cleanup', @retention = <minutes>` so it comfortably exceeds your maximum expected downtime. |
+| Capture job stopped while cleanup kept running | Restart the capture job (`EXEC sys.sp_cdc_start_job @job_type = 'capture'`) and monitor both jobs; cleanup outrunning capture purges unread changes. |
+| Capture instance was disabled and re-enabled | The change table was recreated, so the old position is meaningless. Re-snapshot that table. |
+
+---
+
 ### Symptom: "buffer full" error or frequent checkpoint pauses
 
 **Error Examples:**

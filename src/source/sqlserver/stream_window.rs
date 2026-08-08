@@ -14,6 +14,38 @@ use super::{
 };
 
 impl SqlServerStreamHandle {
+    /// Decide what to do with the LSN window now that `window_buffer` is empty.
+    ///
+    /// Two outcomes, and picking the wrong one loses data in one direction or
+    /// re-reads the whole window in the other:
+    ///
+    /// * A parked truncation cursor means some capture instance had rows inside this
+    ///   window that `max_events_per_poll` cut off. The window must stay put and be
+    ///   re-queried from the cursor; advancing past it drops those rows.
+    /// * No parked cursor means the window was read to the end, so advance to a fresh
+    ///   one. Not advancing would re-deliver the same window forever.
+    ///
+    /// Deferring both to the drain point is what keeps `save_position` honest: while
+    /// events from this window are still buffered, neither the cursor nor the window
+    /// start may move ahead of what the consumer has been handed.
+    pub(super) async fn settle_drained_window(&mut self) -> Result<()> {
+        match self.stream.pending_cursor.take() {
+            Some(cursor) => {
+                tracing::debug!(
+                    target: "rustcdc::source::sqlserver",
+                    lsn = %cursor.lsn_hex,
+                    seqval = %cursor.seqval_hex,
+                    operation = cursor.operation,
+                    "sqlserver CDC window truncated by max_events_per_poll; \
+                     resuming mid-window at the recorded cursor",
+                );
+                self.stream.cursor = Some(cursor);
+                Ok(())
+            }
+            None => self.advance_window().await,
+        }
+    }
+
     pub(super) async fn advance_window(&mut self) -> Result<()> {
         let mut client = query::connect_client(&self.config).await?;
         let rows = client
@@ -53,20 +85,52 @@ impl SqlServerStreamHandle {
 
         self.stream.lsn_start = next_start;
         self.stream.lsn_end = next_end;
-        // Advancing to a fresh window invalidates any within-window resume point.
+        // Advancing to a fresh window invalidates any within-window resume point,
+        // parked or applied.
         self.stream.cursor = None;
+        self.stream.pending_cursor = None;
         Ok(())
     }
 
+    /// Read one page of changes for a single capture instance in the current window.
+    ///
+    /// The instance's own [`CaptureInstanceMeta::capture_floor`] raises the lower bound:
+    /// capture instances do not all start at the same LSN, and asking one for changes
+    /// below its floor makes SQL Server raise the same error 313 it raises for purged
+    /// retention. Clamping keeps the ordinary case — a table added to CDC after the
+    /// stream started, or simply enabled second — out of the error path entirely, so the
+    /// error that does reach [`Self::classify_cdc_window_error`] is the one that
+    /// genuinely means changes were cleaned up.
     pub(super) async fn fetch_changes_for_capture_instance(
         &self,
-        capture_instance: &str,
-        columns: &[String],
+        meta: &CaptureInstanceMeta,
         max_events_per_poll: usize,
     ) -> Result<Vec<SqlServerRawChange>> {
+        let capture_instance = meta.capture_instance.as_str();
+        let columns = meta.captured_columns.as_slice();
         validate_capture_instance_name(capture_instance)?;
+
+        let window_start = if compare_lsn(&meta.capture_floor, &self.stream.lsn_start).is_gt() {
+            // The instance begins after the window opens, so there is nothing for it
+            // before its floor. If the floor is also past the window's end it has no
+            // rows in this window at all.
+            if compare_lsn(&meta.capture_floor, &self.stream.lsn_end).is_gt() {
+                tracing::debug!(
+                    target: "rustcdc::source::sqlserver",
+                    capture_instance,
+                    capture_floor = %lsn_bytes_to_hex(&meta.capture_floor),
+                    window_end = %lsn_bytes_to_hex(&self.stream.lsn_end),
+                    "sqlserver capture instance starts after this window; skipping it",
+                );
+                return Ok(Vec::new());
+            }
+            meta.capture_floor
+        } else {
+            self.stream.lsn_start
+        };
+
         let mut client = query::connect_client(&self.config).await?;
-        let start_lsn_hex = lsn_bytes_to_hex(&self.stream.lsn_start);
+        let start_lsn_hex = lsn_bytes_to_hex(&window_start);
         let end_lsn_hex = lsn_bytes_to_hex(&self.stream.lsn_end);
 
         let sql = build_cdc_poll_sql(

@@ -182,6 +182,24 @@ struct CaptureInstanceMeta {
     table: String,
     primary_key: Vec<String>,
     captured_columns: Vec<String>,
+    /// Oldest LSN this capture instance can serve — `sys.fn_cdc_get_min_lsn`, read when
+    /// the instance was first observed by this stream.
+    ///
+    /// Capture instances do not all begin at the same LSN. Enabling CDC on a second
+    /// table, or adding a table to a pipeline that is already running, creates an
+    /// instance whose floor is *later* than the stream's current window. Asking
+    /// `cdc.fn_cdc_get_all_changes_*` for anything below that floor makes SQL Server
+    /// raise error 313 — "An insufficient number of arguments were supplied for the
+    /// procedure or function" — which is the same error it raises when the cleanup job
+    /// has purged changes. Reading the floor lets the poll start each instance at
+    /// `max(window_start, floor)` so the routine case never produces the error at all,
+    /// and the error that remains means what the classifier says it means.
+    ///
+    /// Deliberately **not** refreshed for an instance already known to the stream: if
+    /// cleanup advances an instance's real floor past a window this connector has not
+    /// read yet, that *is* data loss, and a stale floor here is what makes it surface
+    /// instead of being silently clamped away.
+    capture_floor: [u8; 10],
 }
 
 /// Snapshot progress for a single captured table.
@@ -236,6 +254,18 @@ pub struct SqlServerStream {
     /// While this is `Some`, the window is re-queried from the cursor rather than
     /// advanced — advancing would skip the unread remainder permanently.
     pub(crate) cursor: Option<parser::SqlServerCdcCursor>,
+    /// A truncation cursor discovered by a fill that produced **more events than one
+    /// poll can return**, parked until the buffer drains.
+    ///
+    /// It cannot be written straight to [`Self::cursor`]: `save_position` persists
+    /// `cursor` when it is set, and doing so while events from this window are still
+    /// sitting in `window_buffer` would make a position durable ahead of rows the
+    /// consumer has not seen. It also cannot be dropped, which is what used to
+    /// happen — it was a local variable, so a multi-page window forgot that some
+    /// capture instance had unread rows and the deferred `advance_window()` skipped
+    /// them permanently and silently. Parking it here and applying it at the drain
+    /// point satisfies both constraints.
+    pub(crate) pending_cursor: Option<parser::SqlServerCdcCursor>,
 }
 
 /// Total order over a CDC row position, matching the server-side
@@ -574,7 +604,8 @@ async fn load_capture_metas_for_config(
     let mut client = query::connect_client(config).await?;
     let rows = client
         .query(
-            "SELECT ct.capture_instance, sc.name AS source_schema, tb.name AS source_name \
+            "SELECT ct.capture_instance, sc.name AS source_schema, tb.name AS source_name, \
+             sys.fn_varbintohexstr(sys.fn_cdc_get_min_lsn(ct.capture_instance)) AS min_lsn_hex \
              FROM cdc.change_tables ct \
              JOIN sys.tables tb ON ct.source_object_id = tb.object_id \
              JOIN sys.schemas sc ON tb.schema_id = sc.schema_id \
@@ -621,12 +652,21 @@ async fn load_capture_metas_for_config(
             load_primary_key_columns_for_instance(&mut client, capture_instance, error_prefix)
                 .await?;
 
+        // `fn_cdc_get_min_lsn` returns NULL for an instance the capture job has not
+        // initialised yet. A zero floor is the right reading of that: it clamps nothing,
+        // so the poll behaves exactly as it did before the floor existed.
+        let capture_floor = row
+            .get::<&str, _>(3)
+            .filter(|value| !value.is_empty())
+            .map_or(Ok([0u8; 10]), lsn_hex_to_bytes)?;
+
         metas.push(CaptureInstanceMeta {
             capture_instance: capture_instance.to_string(),
             schema,
             table,
             primary_key,
             captured_columns,
+            capture_floor,
         });
     }
 
@@ -731,17 +771,20 @@ impl StreamHandle for SqlServerStreamHandle {
 
         // ── Priority 3: drain the window buffer if it already has events ────────
         //
-        // We advance the LSN window only after the buffer is fully drained so
-        // that `save_position` always records a window-start LSN that is ≤ all
-        // events delivered since the last checkpoint.  A crash mid-buffer causes
-        // at most one window of duplicate delivery (at-least-once guarantee).
+        // The window is settled only once the buffer is fully drained, so
+        // `save_position` always records a position that is ≤ every event delivered
+        // since the last checkpoint. A crash mid-buffer therefore costs at most one
+        // window of duplicate delivery — the at-least-once guarantee — and never a gap.
+        //
+        // `settle_drained_window` decides between advancing and resuming mid-window from
+        // the parked truncation cursor; this path must not call `advance_window`
+        // directly, because it cannot see whether the fill that produced this buffer left
+        // rows unread.
         if !self.window_buffer.is_empty() {
             let count = self.max_events_per_poll.min(self.window_buffer.len());
             let batch: Vec<Event> = self.window_buffer.drain(..count).collect();
-            // Advance the window once the buffer is empty so the next fill
-            // queries a fresh LSN range.
             if self.window_buffer.is_empty() {
-                self.advance_window().await?;
+                self.settle_drained_window().await?;
             }
             return Ok(batch);
         }
@@ -774,11 +817,7 @@ impl StreamHandle for SqlServerStreamHandle {
 
             for meta in &metas_snapshot {
                 let changes = self
-                    .fetch_changes_for_capture_instance(
-                        &meta.capture_instance,
-                        &meta.captured_columns,
-                        self.max_events_per_poll,
-                    )
+                    .fetch_changes_for_capture_instance(meta, self.max_events_per_poll)
                     .await?;
 
                 // A full page means `TOP` cut the result set — unread rows remain in
@@ -871,30 +910,18 @@ impl StreamHandle for SqlServerStreamHandle {
                     .events_polled
                     .saturating_add(self.window_buffer.len() as u64);
 
-                // Drain the first page and return.  If the buffer is now empty
-                // (all events fit in a single page) advance the window here so
-                // the next call queries a fresh LSN range instead of
-                // re-delivering this window indefinitely.  Multi-page batches
-                // defer the advance to priority 3 once the buffer fully drains,
-                // keeping the at-least-once guarantee intact.
+                // Park the truncation cursor — possibly `None`, which is equally
+                // load-bearing — so the drain point can settle the window whether that
+                // happens now or several polls from now. It used to be a local variable,
+                // read only on the single-page path; a multi-page window therefore forgot
+                // that a capture instance still had unread rows, and the deferred
+                // `advance_window()` stepped over them permanently and without a signal.
+                self.stream.pending_cursor = truncation_cursor;
+
                 let count = self.max_events_per_poll.min(self.window_buffer.len());
                 let batch: Vec<Event> = self.window_buffer.drain(..count).collect();
                 if self.window_buffer.is_empty() {
-                    if let Some(cursor) = truncation_cursor {
-                        // Unread rows remain inside this window. Record where we stopped
-                        // and re-query the SAME window from there — do not advance past it.
-                        tracing::debug!(
-                            target: "rustcdc::source::sqlserver",
-                            lsn = %cursor.lsn_hex,
-                            seqval = %cursor.seqval_hex,
-                            operation = cursor.operation,
-                            "sqlserver CDC window truncated by max_events_per_poll; \
-                             resuming mid-window at the recorded cursor",
-                        );
-                        self.stream.cursor = Some(cursor);
-                    } else {
-                        self.advance_window().await?;
-                    }
+                    self.settle_drained_window().await?;
                 }
                 return Ok(batch);
             }
@@ -1836,6 +1863,74 @@ mod tests {
         );
     }
 
+    /// A handle with no capture instances, for exercising window bookkeeping.
+    fn window_handle(lsn_start: [u8; 10], lsn_end: [u8; 10]) -> SqlServerStreamHandle {
+        SqlServerStreamHandle {
+            config: config(),
+            stream: SqlServerStream {
+                lsn_start,
+                lsn_end,
+                change_tables: vec!["dbo_users".into()],
+                poll_interval_ms: 5000,
+                cursor: None,
+                pending_cursor: None,
+            },
+            metas: vec![],
+            events_polled: 0,
+            requeued_events: Vec::new(),
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            pending_update_befores: AHashMap::new(),
+            window_buffer: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_truncated_window_survives_a_multi_page_drain_instead_of_being_advanced_past() {
+        // Regression: the truncation cursor used to be a local variable in the fill
+        // path, applied only when the buffer happened to drain in the same poll. With
+        // two or more capture instances a window routinely yields more events than one
+        // poll returns, so the buffer did *not* drain there — the cursor was dropped and
+        // the deferred `advance_window()` at the drain point moved past the unread
+        // remainder of the truncated instance. Those rows were gone, permanently, with
+        // `events_polled` still reporting a plausible count.
+        //
+        // Parking it on the stream is what makes the two poll paths agree. This asserts
+        // the drain-point decision directly; `tests/sqlserver_stream_integration.rs`
+        // covers it against a live server.
+        let start = lsn_hex_to_bytes("0x000000230000015a0002").expect("start lsn");
+        let end = lsn_hex_to_bytes("0x000000230000015a00ff").expect("end lsn");
+        let mut handle = window_handle(start, end);
+
+        let parked = SqlServerCdcCursor {
+            lsn_hex: "0x000000230000015a0010".into(),
+            seqval_hex: "0x000000230000015a0011".into(),
+            operation: 2,
+        };
+        handle.stream.pending_cursor = Some(parked.clone());
+
+        // No client is created: settling a truncated window is pure bookkeeping. If this
+        // ever tries to advance it will fail to connect, which is itself the assertion.
+        handle
+            .settle_drained_window()
+            .await
+            .expect("settling a truncated window must not touch the server");
+
+        assert_eq!(
+            handle.stream.cursor,
+            Some(parked),
+            "the parked cursor must become the active within-window resume point"
+        );
+        assert_eq!(
+            handle.stream.pending_cursor, None,
+            "the parked cursor must be consumed, not applied twice"
+        );
+        assert_eq!(
+            (handle.stream.lsn_start, handle.stream.lsn_end),
+            (start, end),
+            "the window must not move while it still holds unread rows"
+        );
+    }
+
     #[test]
     fn operation_mapping_produces_expected_events() {
         let mut handle = SqlServerStreamHandle {
@@ -1846,6 +1941,7 @@ mod tests {
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
                 cursor: None,
+                pending_cursor: None,
             },
             metas: vec![],
             events_polled: 0,
@@ -1861,6 +1957,7 @@ mod tests {
             table: "users".into(),
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
+            capture_floor: [0u8; 10],
         };
 
         // A realistic CDC window: INSERT, UPDATE (op=3 before-image then op=4 after-image), DELETE.
@@ -1951,6 +2048,7 @@ mod tests {
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
                 cursor: None,
+                pending_cursor: None,
             },
             metas: vec![],
             events_polled: 0,
@@ -1966,6 +2064,7 @@ mod tests {
             table: "users".into(),
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
+            capture_floor: [0u8; 10],
         };
 
         // Poll 1: only the op=3 before-image (OLD values) arrives.
@@ -2018,6 +2117,7 @@ mod tests {
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
                 cursor: None,
+                pending_cursor: None,
             },
             metas: vec![CaptureInstanceMeta {
                 capture_instance: "dbo_users".into(),
@@ -2025,6 +2125,7 @@ mod tests {
                 table: "users".into(),
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
+                capture_floor: [0u8; 10],
             }],
             events_polled: 0,
             requeued_events: Vec::new(),
@@ -2040,6 +2141,7 @@ mod tests {
                 table: "users".into(),
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into(), "email".into()],
+                capture_floor: [0u8; 10],
             },
             CaptureInstanceMeta {
                 capture_instance: "sales_orders".into(),
@@ -2047,6 +2149,7 @@ mod tests {
                 table: "orders".into(),
                 primary_key: vec!["order_id".into()],
                 captured_columns: vec!["order_id".into(), "total".into()],
+                capture_floor: [0u8; 10],
             },
         ];
 
@@ -2087,6 +2190,7 @@ mod tests {
                 change_tables: vec!["dbo_users".into()],
                 poll_interval_ms: 5000,
                 cursor: None,
+                pending_cursor: None,
             },
             metas: vec![CaptureInstanceMeta {
                 capture_instance: "dbo_users".into(),
@@ -2094,6 +2198,7 @@ mod tests {
                 table: "users".into(),
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
+                capture_floor: [0u8; 10],
             }],
             events_polled: 0,
             requeued_events: Vec::new(),
@@ -2566,6 +2671,7 @@ mod tests {
             table: "table_a".into(),
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
+            capture_floor: [0u8; 10],
         };
         let changes_a = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000000A0003".into(), // later LSN
@@ -2582,6 +2688,7 @@ mod tests {
             table: "table_b".into(),
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
+            capture_floor: [0u8; 10],
         };
         let changes_b = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000000A0001".into(), // earlier LSN
@@ -2601,6 +2708,7 @@ mod tests {
                 change_tables: vec!["dbo_table_a".into(), "dbo_table_b".into()],
                 poll_interval_ms: 5000,
                 cursor: None,
+                pending_cursor: None,
             },
             metas: vec![meta_a.clone(), meta_b.clone()],
             events_polled: 0,

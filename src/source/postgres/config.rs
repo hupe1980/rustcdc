@@ -7,6 +7,7 @@ use tokio_postgres::Config as PgConnectConfig;
 
 use crate::core::{Error, Result, SecretString, TransportConfig};
 
+use super::WalTransport;
 use super::{DatabaseAuthMode, PostgresSourceConfig, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS};
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
@@ -60,6 +61,9 @@ impl Default for PostgresSourceConfig {
             create_replication_slot_if_missing: false,
             // Off by default so the connector works against PostgreSQL 16 and earlier.
             failover_slot: false,
+            // The protocol logical replication was designed around. `SqlPeek` is the
+            // fallback for environments that cannot grant a replication connection.
+            wal_transport: WalTransport::StreamingReplication,
         }
     }
 }

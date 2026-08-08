@@ -88,6 +88,7 @@ pub(super) async fn start_sqlserver_stream(
         poll_interval_ms: connection.stream_poll_interval_ms,
         // A resumed mid-window position, when the checkpoint recorded one.
         cursor: resume_cursor,
+        pending_cursor: None,
     };
 
     Ok(Box::new(SqlServerStreamHandle {

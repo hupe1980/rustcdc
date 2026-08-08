@@ -207,6 +207,7 @@ mysql_suites=(
   "mysql connection|mysql_connection_integration|mysql"
   "mysql snapshot|mysql_snapshot_integration|mysql"
   "mysql stream|mysql_stream_integration|mysql"
+  "mysql binlog compression|mysql_binlog_compression_integration|mysql"
   "mysql handoff|mysql_handoff_integration|mysql"
   "mysql process crash|runtime_mysql_process_crash_integration|mysql"
 )
@@ -220,6 +221,7 @@ sqlserver_suites=(
   "sqlserver version matrix|sqlserver_version_matrix|sqlserver"
   "sqlserver snapshot|sqlserver_snapshot_integration|sqlserver"
   "sqlserver stream|sqlserver_stream_integration|sqlserver"
+  "sqlserver window truncation|sqlserver_window_truncation_integration|sqlserver"
   "sqlserver handoff|sqlserver_handoff_integration|sqlserver"
   "sqlserver process crash|runtime_sqlserver_process_crash_integration|sqlserver"
 )

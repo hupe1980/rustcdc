@@ -30,7 +30,7 @@ docker run --rm -d --name rustcdc-pg -p 5432:5432 \
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.7", features = ["postgres"] }
+rustcdc = { version = "0.10", features = ["postgres"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

@@ -260,6 +260,43 @@ struct LiveMysqlBinlogProvider {
     warned_event_types: std::collections::HashSet<u8>,
 }
 
+/// Fold one binlog event's `log_pos` into the tracked resume coordinate.
+///
+/// `log_pos` is the *end* position of the event in the binlog file, and is what a
+/// restart resumes from. It is **zero** for two classes of event, and both must leave
+/// the last real position in place rather than overwrite it with zero:
+///
+/// * **Events unpacked from a `Transaction_payload_event`.** With
+///   `binlog_transaction_compression = ON` (MySQL 8.0.20+) the server writes a whole
+///   transaction as one zstd-compressed payload event. `mysql_async` decompresses it
+///   transparently and yields the inner `BEGIN` / `TABLE_MAP` / rows / `XID` events —
+///   but those inner headers carry `log_pos = 0`, because they were never written to
+///   the file individually and so have no position of their own. MySQL's own rule is
+///   that the resume coordinate for anything inside a compressed transaction is the
+///   **end position of the payload event**, which is exactly what the caller still
+///   holds here: the payload event is yielded before its contents.
+/// * **Artificial events** the server synthesises at the head of a dump, notably the
+///   `FORMAT_DESCRIPTION_EVENT`.
+///
+/// Without the guard, every commit under transaction compression checkpointed at
+/// `<file>:0`. That is not a recoverable coordinate — the server rejects a dump
+/// request below position 4 outright (`Client requested master to start replication
+/// from position < 4`) — so a restart after any compressed transaction failed to
+/// resume at all, and `checkpoint`'s monotonicity check does not catch it because the
+/// committed-event count still advances. GTID-positioned streams were shielded by the
+/// GTID set; the default file+position configuration was not.
+///
+/// This mirrors the guard in the reference Java binlog connector
+/// (`BinaryLogClient::updateClientBinlogFilenameAndPosition`: `if (nextBinlogPosition
+/// > 0)`).
+const fn advance_binlog_pos(current: u32, event_log_pos: u32) -> u32 {
+    if event_log_pos > 0 {
+        event_log_pos
+    } else {
+        current
+    }
+}
+
 /// Parse a MySQL GTID set into the `Sid` list `COM_BINLOG_DUMP_GTID` expects.
 ///
 /// A GTID set is comma-separated `uuid_set`s, each `uuid:interval[:interval]...` with
@@ -699,7 +736,7 @@ impl MysqlBinlogProvider for LiveMysqlBinlogProvider {
             })?;
 
             let header = event.header();
-            self.next_pos = header.log_pos();
+            self.next_pos = advance_binlog_pos(self.next_pos, header.log_pos());
             // The binlog common header stores the timestamp in **whole seconds**, so this
             // is truncated down to the second — an event committed at T+0.999s reports
             // T+0.000s. Any lag figure derived from it is therefore over-reported by up
@@ -1749,6 +1786,8 @@ mod tests {
 
     use tokio::sync::Mutex;
 
+    use super::advance_binlog_pos;
+
     use crate::{
         checkpoint::{Checkpoint, InMemoryCheckpoint, MysqlOffset},
         core::{Event, StructuredLogger, TransportConfig},
@@ -2136,6 +2175,51 @@ mod tests {
             assert!(message.contains("binlog_row_image"), "{message}");
             assert!(message.contains(value), "{message}");
         }
+    }
+
+    #[test]
+    fn a_compressed_transaction_keeps_the_payload_events_end_position() {
+        // Regression: `binlog_transaction_compression = ON` (MySQL 8.0.20+) writes a
+        // whole transaction as one zstd `Transaction_payload_event`. `mysql_async`
+        // decompresses it transparently and hands back the inner events, whose headers
+        // carry `log_pos = 0` — they were never written to the file individually. The
+        // position tracker used to assign that zero, so every commit inside a compressed
+        // transaction checkpointed at `<file>:0`. The server rejects a dump request below
+        // position 4 outright, so a restart after any compressed transaction could not
+        // resume; the checkpoint's monotonicity check does not catch it because the
+        // committed-event count still advances.
+        //
+        // This walks the exact header sequence such a transaction produces.
+        const PAYLOAD_END: u32 = 4_242;
+
+        let mut pos = 1_000;
+        // GTID_EVENT — a real, positioned event.
+        pos = advance_binlog_pos(pos, 1_100);
+        // TRANSACTION_PAYLOAD_EVENT — yielded first, carries the real end position for
+        // everything inside it.
+        pos = advance_binlog_pos(pos, PAYLOAD_END);
+        // The decompressed contents: BEGIN, TABLE_MAP, WRITE_ROWS, XID — all `log_pos = 0`.
+        for _ in 0..4 {
+            pos = advance_binlog_pos(pos, 0);
+            assert_eq!(
+                pos, PAYLOAD_END,
+                "an event unpacked from a compressed payload must resume at the \
+                 payload's end position, never at 0"
+            );
+        }
+
+        // The next ordinary event resumes normal tracking.
+        assert_eq!(advance_binlog_pos(pos, 4_400), 4_400);
+    }
+
+    #[test]
+    fn an_artificial_event_does_not_reset_the_tracked_position() {
+        // The server synthesises a FORMAT_DESCRIPTION_EVENT at the head of every dump
+        // with `log_pos = 0`. Mid-stream — after a reconnect, for instance — that must
+        // not rewind the coordinate the checkpoint is about to record.
+        assert_eq!(advance_binlog_pos(9_999, 0), 9_999);
+        // And it must not invent a position before the first real event either.
+        assert_eq!(advance_binlog_pos(0, 0), 0);
     }
 
     #[tokio::test]

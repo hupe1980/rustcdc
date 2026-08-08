@@ -122,7 +122,7 @@ pub use crate::source::{
 #[cfg(feature = "mysql")]
 pub use crate::source::{MysqlConnection, MysqlSourceConfig, ServerFlavor};
 #[cfg(feature = "postgres")]
-pub use crate::source::{PostgresConnection, PostgresSourceConfig};
+pub use crate::source::{PostgresConnection, PostgresSourceConfig, WalTransport};
 #[cfg(feature = "sqlserver")]
 pub use crate::source::{SqlServerConnection, SqlServerSourceConfig};
 pub use crate::transform::{

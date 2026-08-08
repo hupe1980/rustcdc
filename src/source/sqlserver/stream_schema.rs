@@ -129,9 +129,84 @@ impl SqlServerStreamHandle {
     }
 
     pub(super) async fn refresh_metas_and_collect_schema_events(&mut self) -> Result<Vec<Event>> {
-        let refreshed = self.load_capture_metas().await?;
+        let mut refreshed = self.load_capture_metas().await?;
+        Self::retain_known_capture_floors(&self.metas, &mut refreshed);
         let events = self.compute_schema_events_for_meta_refresh(&refreshed);
         self.metas = refreshed;
         Ok(events)
+    }
+
+    /// Keep the floor this stream first observed for every instance it already knows.
+    ///
+    /// A refresh re-reads `sys.fn_cdc_get_min_lsn`, which the cleanup job moves forward
+    /// as it purges. Adopting the new value for a known instance would clamp the poll to
+    /// it and silently step over changes this connector had not read yet — the exact data
+    /// loss [`super::SqlServerStreamHandle::classify_cdc_window_error`] exists to refuse.
+    /// Only genuinely new instances take their floor from the refresh, which is what
+    /// makes adding a table to a running pipeline work.
+    fn retain_known_capture_floors(
+        known: &[CaptureInstanceMeta],
+        refreshed: &mut [CaptureInstanceMeta],
+    ) {
+        for meta in refreshed.iter_mut() {
+            if let Some(existing) = known
+                .iter()
+                .find(|candidate| candidate.capture_instance == meta.capture_instance)
+            {
+                meta.capture_floor = existing.capture_floor;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureInstanceMeta, SqlServerStreamHandle};
+
+    fn meta(capture_instance: &str, floor: u8) -> CaptureInstanceMeta {
+        let mut capture_floor = [0u8; 10];
+        capture_floor[9] = floor;
+        CaptureInstanceMeta {
+            capture_instance: capture_instance.to_string(),
+            schema: "dbo".into(),
+            table: capture_instance.trim_start_matches("dbo_").to_string(),
+            primary_key: vec!["id".into()],
+            captured_columns: vec!["id".into()],
+            capture_floor,
+        }
+    }
+
+    #[test]
+    fn a_known_instance_keeps_the_floor_it_was_first_seen_with() {
+        // Cleanup moves `fn_cdc_get_min_lsn` forward. Adopting the newer value here would
+        // clamp the poll to it and step over changes this connector had not read — which
+        // is the data loss the window classifier exists to refuse, arriving by a route
+        // that never reaches the classifier at all.
+        let known = vec![meta("dbo_orders", 0x10)];
+        let mut refreshed = vec![meta("dbo_orders", 0x90)];
+
+        SqlServerStreamHandle::retain_known_capture_floors(&known, &mut refreshed);
+
+        assert_eq!(
+            refreshed[0].capture_floor, known[0].capture_floor,
+            "a purge must stay visible, not be clamped away by a refresh"
+        );
+    }
+
+    #[test]
+    fn a_newly_added_instance_takes_the_floor_from_the_refresh() {
+        // This is what makes `sp_cdc_enable_table` on a running pipeline work: the new
+        // instance's floor is later than the current window, and it must be honoured so
+        // the poll starts there instead of asking for changes that never existed.
+        let known = vec![meta("dbo_orders", 0x10)];
+        let mut refreshed = vec![meta("dbo_orders", 0x10), meta("dbo_shipments", 0x90)];
+
+        SqlServerStreamHandle::retain_known_capture_floors(&known, &mut refreshed);
+
+        assert_eq!(refreshed[0].capture_floor[9], 0x10);
+        assert_eq!(
+            refreshed[1].capture_floor[9], 0x90,
+            "an instance the stream has never read must start at its own floor"
+        );
     }
 }

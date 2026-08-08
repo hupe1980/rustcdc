@@ -255,6 +255,44 @@ fn resolve_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
 /// When `client_cert_path` and `client_key_path` are both `Some`, mutual TLS
 /// authentication is configured using the supplied PEM-encoded certificate and
 /// private key. Otherwise, server-auth-only TLS is used.
+/// Resolve a [`TransportConfig`](crate::core::TransportConfig) to a rustls client config.
+///
+/// Used by the replication transport, which does its own TLS handshake rather than going
+/// through `tokio-postgres-rustls`. It shares this function so both transports trust
+/// exactly the same roots and present the same client certificate — two connections to the
+/// same server disagreeing about what they verify would be a security surprise, not a
+/// detail.
+///
+/// `allow_invalid_certificates` / `allow_invalid_hostnames` are not handled here because
+/// `PostgresConnection::connect` rejects them before any connection is opened; see the
+/// error it raises for the reasoning.
+#[cfg(feature = "tls")]
+pub(super) fn rustls_client_config(
+    transport: &crate::core::TransportConfig,
+) -> Result<rustls::ClientConfig> {
+    use crate::core::TransportConfig;
+
+    match transport {
+        TransportConfig::Tls {
+            ca_cert_path,
+            client_cert_path,
+            client_key_path,
+            ..
+        } => build_tls_client_config(
+            ca_cert_path.as_deref(),
+            client_cert_path.as_deref(),
+            client_key_path.as_deref(),
+        ),
+        // An injected config is used as-is, custom verifier and all. The replication
+        // transport builds its own connector, so unlike a third-party client it has no
+        // reason to refuse one.
+        TransportConfig::RustlsConfig { config } => Ok((*config.0).clone()),
+        TransportConfig::Plaintext => Err(Error::ConfigError(
+            "cannot build a TLS configuration for a plaintext transport".into(),
+        )),
+    }
+}
+
 #[cfg(feature = "tls")]
 pub(super) fn build_tls_client_config(
     ca_cert_path: Option<&str>,

@@ -60,6 +60,7 @@ Status values:
 | Built-in field mapping transform primitives (copy/rename/set/remove) | Covers common schema-alignment workloads without mandatory custom/WASM code | Implemented | src/transform/field_mapping.rs, src/transform/mod.rs, site/content/docs/config-reference.md |
 | Example/build matrix across sources | Prevents connector-specific integration drift | Implemented | .github/workflows/ci.yml, scripts/ci-policy-gate.sh, examples/ |
 | Connector version-compatibility test depth | Reduces production surprises on engine upgrades | Implemented (connector-specific depth varies) | tests/postgres_version_matrix.rs |
+| Resume-coordinate correctness under non-default server options | The coordinate a checkpoint records is only as good as the server option it was captured under, and the defaults hide the failures | Implemented | tests/mysql_binlog_compression_integration.rs (`binlog_transaction_compression = ON`), tests/sqlserver_window_truncation_integration.rs (two capture instances, truncated window), src/checkpoint/mod.rs (`stream_position_regression`) |
 
 ## Intentional Non-Goals (Do Not Gate Library Releases)
 
@@ -69,12 +70,26 @@ Status values:
 | Turnkey sink ecosystem with hundreds of connectors | Platform distribution concern; library exposes traits/APIs instead |
 | Full orchestration and fleet management | Application/platform responsibility |
 
+## Known Architectural Limits
+
+These are not gaps against the comparison set so much as consequences of the Rust ecosystem, and
+they belong in an honest matrix because they shape the operational envelope:
+
+| Limit | Consequence | Why it stands |
+|---|---|---|
+| PostgreSQL decoding goes through `pg_logical_slot_peek_binary_changes`, not the streaming replication protocol (`START_REPLICATION`) | Each poll re-reads WAL from the slot's `restart_lsn`, so a long-running transaction on the source that pins `restart_lsn` far behind `confirmed_flush_lsn` makes every poll re-scan that gap. Latency is also bounded by the poll interval rather than pushed. | `tokio-postgres` exposes no `CopyBoth` / replication-mode API, and no published crate supplies one for it. Comparators in other languages (Debezium via the PGJDBC replication API, pglogrepl, wal2json consumers) all use the streaming protocol. Mitigated, not solved: the poll window halves on each timeout so a saturated server still makes forward progress instead of stalling. |
+| SQL Server capture is polling-based | p99 latency ≈ `stream_poll_interval_ms` plus the capture agent's own delay | Inherent to SQL Server CDC; no log-reading interface exists. Do not compare its latency numbers against the log-based connectors. |
+| MySQL binlog timestamps have whole-second resolution | Any lag figure derived from `SourceMetadata::timestamp` over-reports by up to 1 000 ms (median ~480 ms) | The binlog common header carries seconds. PostgreSQL and SQL Server both carry microsecond commit timestamps and are exact. |
+
 ## Current Completeness Verdict
 
 For embedded-library scope, rustcdc is release-viable with conditions:
 - Must-have set is implemented for the primary connector paths, and each release
 	must confirm connector-specific restart evidence remains current.
 - Should-have set is broadly implemented; remaining risk is concentrated in deployment-specific policy tuning and continuous evidence rigor.
+- The architectural limits above are documented rather than closed, and a deployment whose
+	workload sits against one of them (a PostgreSQL source with long-running transactions, a
+	latency SLO below the SQL Server poll interval) should be evaluated against it explicitly.
 
 ## Release Decision Rules
 

@@ -58,6 +58,28 @@ The following invariants define correctness:
 3. restart begins from persisted checkpoint position
 4. unacknowledged deliveries are replayable
 5. runtime lifecycle transitions are explicit and validated
+6. a durable checkpoint never moves the **stream position** backwards
+
+Invariant 6 is enforced by `FileCheckpoint`, independently of any connector, and exists because
+the other five are all expressed in terms of the committed-event *count*. A count keeps rising
+while a connector hands the checkpoint a position it cannot have reached, which is strictly
+worse than forgetting progress: the counters say the pipeline is healthy while the recorded
+resume point now sits before data the sink has already accepted. `FileCheckpoint::save`
+therefore compares the connector-native coordinate against the record it is replacing and
+refuses a regression with an error naming both positions.
+
+**How strictly it can compare depends on what the source guarantees**, and the guard is only as
+strict as each one allows:
+
+| Source | Compared | Why not more |
+|---|---|---|
+| MySQL / MariaDB, file+position | binlog file sequence, then position | Every event in a transaction carries the *commit* position, and the binlog is written in commit order, so the sequence is monotonic |
+| MySQL / MariaDB, GTID | nothing | Binlog coordinates are server-local; a promoted replica's are routinely lower, and GTID is what actually resumes the stream |
+| SQL Server | the commit LSN only | Both cursor encodings (`{lsn}` and `{lsn}:{seqval}:{op}`) occur in one stream — the bare form is a prefix of the other, so comparing whole strings would read a graceful restart as a rewind |
+| PostgreSQL | **only a zero LSN** | pgoutput emits changes in *commit* order while each keeps its own WAL position, so two transactions interleaved in the WAL arrive out of LSN order. The checkpoint legitimately moves backwards; resuming from the lower LSN re-reads the later-positioned change, which is the documented at-least-once behaviour. Zero is not a position the stream can reach, so it can only come from a decode defect |
+| anything else | nothing | An unrecognised source type is left alone rather than guessed at |
+
+A renamed replication slot is never comparable to the old one, in any source.
 
 ## Snapshot And Stream Handoff
 
@@ -98,6 +120,14 @@ than re-reading the table. The coupling is deliberate: a chunk cursor is only me
 relative to the stream position it was captured against, and two separately written files
 could disagree after a crash between them.
 
+Because that record is written on **every** commit — including commits of the live stream
+events that flow past while a chunk is in its collect phase — the cursor advances only once a
+chunk has been fully handed to the consumer, never when it is read. A restart therefore re-reads
+at most one chunk, which is the at-least-once behaviour the rest of the pipeline already
+guarantees. Advancing at read time instead would make a cursor durable before its rows existed
+anywhere, and a restart would resume *after* rows that were never emitted — up to `chunk_size`
+rows missing from the snapshot, with no error and no counter to notice it by.
+
 This algorithm is implemented **once**, in `IncrementalSnapshotDriver`. A connector supplies
 only the database-specific half through `IncrementalSnapshotBackend`: the position type, the
 watermark query, the chunk read, event position extraction, and the offset encoding. The three
@@ -108,23 +138,46 @@ built-in connectors go through that interface, and so can yours — see
 
 ### PostgreSQL
 
-- stream decoding uses `pg_logical_slot_peek_binary_changes` with `pgoutput` format
+- stream decoding uses `pg_logical_slot_peek_binary_changes` with `pgoutput` format, over an
+  ordinary connection — **not** the streaming replication protocol. `tokio-postgres` exposes no
+  `CopyBoth` / replication-mode API and no published crate supplies one, so `START_REPLICATION`
+  is not reachable from here. The consequences are real and worth planning around:
+  - the peek is **non-consuming**, and PostgreSQL begins decoding at the slot's `restart_lsn`
+    while only *emitting* past `confirmed_flush_lsn`. A long-running transaction on the source
+    pins `restart_lsn`, so every poll re-scans the gap between the two. Keep an eye on
+    `pg_replication_slots.restart_lsn` versus `confirmed_flush_lsn`, not just on slot lag
+  - delivery latency is bounded by the poll interval rather than pushed by the server
+  - acknowledging promptly is what keeps the gap small: the slot advances on
+    `confirm_lsn`, and a consumer that defers acks makes each subsequent poll more expensive
 - each poll call is bounded by a per-call timeout; slow or stalled queries are
   cancelled server-side via `CancelRequest` so the connection is always returned
   to a ready state before the next poll
+- a poll that exceeds its budget **halves** the decode window rather than retrying the same
+  work, converging on a single change. A timed-out peek is explicitly *not* reported as an idle
+  slot — the opposite is true — so it can never be mistaken for permission to advance the slot
 - runtime tracks in-memory and persisted LSN progress
 - replication slot advancement follows durable commit progression
 - startup guards detect slot/checkpoint divergence
 
-### MySQL
+### MySQL / MariaDB
 
 - runtime tracks binlog or GTID progress through checkpoint offsets
 - resume behavior depends on retained binlog/GTID history
+- `binlog_transaction_compression` is read transparently; events unpacked from a
+  `Transaction_payload_event` resume at the payload's end position, since they have none of
+  their own — see [the config reference](@/docs/config-reference.md#binlog-transaction-compression)
+- MariaDB-specific event types (160–164) are handled explicitly rather than skipped: the GTID
+  event is decoded, and an encrypted binlog is a hard error rather than an apparently empty one
 
 ### SQL Server
 
 - runtime tracks CDC progression via source-specific offset surfaces
 - capture correctness depends on SQL Server CDC retention and job health
+- one LSN window is read across every capture instance, and the window advances only after the
+  whole window has been read — so `max_events_per_poll` truncating one instance costs a retry,
+  not a gap
+- each capture instance is read from its own capture floor, so enabling CDC on a new table
+  while the stream is running is a normal operation rather than a retention error
 
 ## Extension Points
 

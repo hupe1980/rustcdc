@@ -528,7 +528,7 @@ pub use postgres::incremental_snapshot::IncrementalSnapshotHandle;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresConnection;
 #[cfg(feature = "postgres")]
-pub use postgres::PostgresSourceConfig;
+pub use postgres::{PostgresSourceConfig, WalTransport};
 #[cfg(feature = "sqlserver")]
 pub use sqlserver::incremental_snapshot::SqlServerIncrementalSnapshotHandle;
 

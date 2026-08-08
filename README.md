@@ -24,13 +24,27 @@ all because it depends on a fork of a fork of `rust-postgres`.
 rustcdc writes its own pgoutput parser against stock `tokio-postgres`. That is why it ships as
 a normal dependency with no sidecar to supervise and no control plane to operate.
 
+The trade-off is stated up front: stock `tokio-postgres` exposes no replication-mode API, so
+PostgreSQL decoding goes through `pg_logical_slot_peek_binary_changes` rather than
+`START_REPLICATION`. Latency is bounded by the poll interval, and a long-running transaction that
+pins the slot's `restart_lsn` makes each poll re-scan the gap to `confirmed_flush_lsn`. See
+[known architectural limits](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/#known-architectural-limits)
+before choosing it for a latency-critical PostgreSQL workload.
+
 ## Status
 
-**Pre-1.0.** Latest published release is 0.7.0; 0.9.0 is in development and is a breaking
+**Pre-1.0.** Latest published release is 0.7.0; 0.10.0 is in development and is a breaking
 release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are implemented
-and validated by 915 unit tests, 109 documentation samples compiled as doctests, and 52
+and validated by 929 unit tests, 109 documentation samples compiled as doctests, and 54
 integration suites, the container-backed ones running against real PostgreSQL 16,
 MySQL 8.0/8.1, MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
+
+0.10.0 is a correctness release: an audit of each connector's **resume coordinate** found three
+silent-data-loss defects — MySQL transaction compression recording an unusable binlog position,
+an incremental snapshot cursor becoming durable before its rows were delivered, and a truncated
+SQL Server LSN window dropping 55 of 60 rows across two capture instances — plus a false
+data-loss alarm when a table was added to a running SQL Server pipeline. Each has a regression
+test that fails without its fix, three of them against a live server.
 
 The public API may still change. Delivery is **at-least-once**; see
 [Delivery guarantees](#delivery-guarantees).
@@ -39,7 +53,7 @@ The public API may still change. Delivery is **at-least-once**; see
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.7", features = ["postgres"] }
+rustcdc = { version = "0.10", features = ["postgres"] }
 ```
 
 The default profile is `postgres` + `tls`. WASM transforms and every non-PostgreSQL connector
@@ -126,7 +140,17 @@ them and fails loud. Check these before your first run:
   a slot that disappeared mid-life is a data-loss event, and recreating it silently restarts
   capture at the current WAL position. Provision it out of band, or set
   `create_replication_slot_if_missing = true` for first-time setup.
-- **SQL Server:** CDC enabled on the database and on each captured table.
+- **SQL Server:** CDC enabled on the database and on each captured table. Adding a table later
+  with `sys.sp_cdc_enable_table` is supported while the stream is running.
+
+Settings that need **no** change, but whose behaviour is worth knowing:
+
+- **MySQL `binlog_transaction_compression = ON`** is read transparently. Rows inside a compressed
+  transaction share one resume coordinate — the payload event's end position — because the
+  unpacked events carry none of their own.
+- **`max_events_per_poll` on SQL Server** is per *capture instance*, so one LSN window can buffer
+  more events than a single poll returns. The window is never advanced before it has been read in
+  full.
 
 Full matrix: [configuration reference](https://hupe1980.github.io/rustcdc/docs/config-reference/).
 
@@ -257,6 +281,13 @@ reason; an unmarked block that fails to compile is a defect.
 process-kill crash tests are part of the suite, and are available to *your* tests too via the
 `test-harnesses` feature. See
 [reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/).
+
+**Suites run against the configurations that break things, not the defaults.** Every
+silent-data-loss defect fixed in 0.10.0 was invisible under the existing suite's configuration —
+compression off, one capture instance, a chunk that happened to drain in the same poll — and
+appeared immediately under one a real deployment would choose. The resume-coordinate suites now
+pin those options explicitly, and each was confirmed to fail with its fix reverted before being
+committed.
 
 ## Development
 

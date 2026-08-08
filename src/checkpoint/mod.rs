@@ -769,6 +769,21 @@ impl FileCheckpoint {
             )));
         }
 
+        if let Some(detail) =
+            stream_position_regression(source_type, &existing.offset, &next.offset)
+        {
+            return Err(crate::core::Error::CheckpointError(format!(
+                "refusing checkpoint write for source '{source_type}': the stream position \
+                 moved backwards ({detail}). The committed-event count still advanced, so \
+                 this is not a replay — it means the connector handed the checkpoint a \
+                 position it cannot have reached, and writing it would make the next \
+                 restart resume before data that is already committed downstream. Either \
+                 the source was reset or repointed at a different server (clear the \
+                 checkpoint directory and re-snapshot), or this is a connector defect \
+                 worth reporting."
+            )));
+        }
+
         Ok(())
     }
 
@@ -875,6 +890,109 @@ impl FileCheckpoint {
         crate::core::durability::fsync_parent_directory(&final_path)?;
         Ok(())
     }
+}
+
+/// Describe how `next` moved *behind* `existing`, or `None` if it did not.
+///
+/// The committed-event count catches a checkpoint that forgets progress. It does not
+/// catch a checkpoint that keeps counting while the *position* rewinds — which is what
+/// a connector bug looks like from here, and is strictly worse: the count says the
+/// pipeline is healthy while the recorded resume point now sits before data the sink
+/// has already accepted. The MySQL transaction-compression defect had exactly this
+/// shape (every commit inside a compressed transaction recorded `<file>:0`), and
+/// nothing in the checkpoint layer objected.
+///
+/// Only the connector-native stream coordinate is compared. Incremental-snapshot chunk
+/// cursors travel in the same record but are not totally ordered across tables, and an
+/// unrecognised source type is left alone rather than guessed at.
+fn stream_position_regression(
+    source_type: &str,
+    existing: &serde_json::Value,
+    next: &serde_json::Value,
+) -> Option<String> {
+    match source_type {
+        "postgres" => {
+            // **Only a zero is checked, deliberately.** A PostgreSQL checkpoint offset is
+            // the individual change's own WAL LSN, and pgoutput emits changes in *commit*
+            // order while each keeps its original position. Two transactions that
+            // interleave in the WAL therefore arrive out of LSN order: if A writes at 100,
+            // B writes at 110 and commits at 120, and A only commits at 130, the stream
+            // yields B's change at 110 before A's at 100. The checkpoint legitimately goes
+            // backwards, and resuming from the lower LSN re-reads B — a duplicate, which
+            // is the documented at-least-once behaviour. A general comparison here would
+            // refuse that write and wedge any pipeline with concurrent writers.
+            //
+            // Zero is different: it is not a position the stream can reach, so it can only
+            // come from a decode or parse defect. That is the shape the MySQL
+            // transaction-compression defect took, and the reason this guard exists.
+            if existing.get("slot_name") != next.get("slot_name") {
+                return None;
+            }
+            let (before, after) = (existing.get("lsn")?.as_u64()?, next.get("lsn")?.as_u64()?);
+            (after == 0 && before > 0).then(|| format!("postgres LSN {before} → 0"))
+        }
+        "mysql" | "mariadb" => {
+            // GTID is the authoritative coordinate whenever the server provides one,
+            // and binlog file+position is server-local: after a failover the new
+            // primary's coordinates are unrelated to the old one's and routinely
+            // lower, which is a legitimate resume rather than a regression. Compare
+            // file+position only when there is no GTID to defer to — which is the
+            // default configuration, and the one the compression defect corrupted.
+            let gtid = next.get("gtid").and_then(serde_json::Value::as_str);
+            if gtid.is_some_and(|value| !value.is_empty()) {
+                return None;
+            }
+            if existing.get("source_flavor") != next.get("source_flavor") {
+                return None;
+            }
+            let before = binlog_coordinate(existing)?;
+            let after = binlog_coordinate(next)?;
+            (after < before).then(|| {
+                format!(
+                    "mysql binlog position {}:{} → {}:{}",
+                    before.0, before.1, after.0, after.1
+                )
+            })
+        }
+        "sqlserver" => {
+            // The cursor is `"{lsn}"` or `"{lsn}:{seqval}:{op}"`, and **both forms occur in
+            // the same stream**: per-event checkpoints carry a bare commit LSN, while an
+            // orderly shutdown records the three-part within-window position. Comparing
+            // the strings whole would make the bare form look *behind* the three-part form
+            // at the same LSN — it is a prefix of it — so the first commit after a
+            // graceful restart would be refused and the pipeline would wedge on a false
+            // positive.
+            //
+            // Only the LSN is compared. It is fixed-width lowercase hex with a `0x`
+            // prefix, so a string comparison of that field is the numeric one, and
+            // seqval-level regression detection within a single commit LSN would add
+            // nothing worth this hazard.
+            let before = cdc_cursor_lsn(existing)?;
+            let after = cdc_cursor_lsn(next)?;
+            (after < before).then(|| format!("sqlserver CDC commit LSN {before} → {after}"))
+        }
+        _ => None,
+    }
+}
+
+/// The commit-LSN field of a SQL Server CDC cursor, whichever encoding it is in.
+fn cdc_cursor_lsn(offset: &serde_json::Value) -> Option<&str> {
+    let cursor = offset.get("cursor")?.as_str()?;
+    Some(cursor.split_once(':').map_or(cursor, |(lsn, _)| lsn))
+}
+
+/// A binlog coordinate ordered the way the server orders it.
+///
+/// Binlog files are named `<base>.<6-digit sequence>` and roll over past `.999999`
+/// into seven digits, so the numeric suffix orders them and the textual name does not
+/// (`binlog.1000000` sorts before `binlog.999999` as text). A name that does not carry
+/// a numeric suffix is not comparable, so the caller skips the check rather than
+/// guessing.
+fn binlog_coordinate(offset: &serde_json::Value) -> Option<(u64, u32)> {
+    let file = offset.get("binlog_file")?.as_str()?;
+    let sequence = file.rsplit_once('.')?.1.parse::<u64>().ok()?;
+    let position = u32::try_from(offset.get("binlog_pos")?.as_u64()?).ok()?;
+    Some((sequence, position))
 }
 
 /// Apply the checkpoint file mode. No-op on non-unix platforms.
@@ -1023,8 +1141,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Checkpoint, FileCheckpoint, FileCheckpointRecord, InMemoryCheckpoint, MysqlOffset,
-        PostgresOffset, FILE_CHECKPOINT_FORMAT_VERSION,
+        stream_position_regression, Checkpoint, FileCheckpoint, FileCheckpointRecord,
+        InMemoryCheckpoint, MysqlOffset, PostgresOffset, FILE_CHECKPOINT_FORMAT_VERSION,
     };
 
     #[tokio::test]
@@ -1420,6 +1538,169 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, crate::core::Error::CheckpointError(_)));
+    }
+
+    #[tokio::test]
+    async fn file_checkpoint_rejects_a_rewound_stream_position_while_the_count_advances() {
+        // The count-based check cannot see this: the pipeline keeps committing events,
+        // so `committed_event_count` keeps rising while the recorded resume point moves
+        // *behind* data the sink has already accepted. That is what a connector defect
+        // looks like from the checkpoint layer, and it used to be written without
+        // complaint.
+        let dir = tempdir().unwrap();
+        let mut checkpoint = FileCheckpoint::new(dir.path());
+
+        checkpoint
+            .save(
+                &MysqlOffset::new("mysql", "binlog.000042", 88_371, String::new()),
+                10,
+            )
+            .await
+            .unwrap();
+
+        let error = checkpoint
+            .save(
+                &MysqlOffset::new("mysql", "binlog.000042", 0, String::new()),
+                20,
+            )
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("moved backwards") && rendered.contains("88371"),
+            "the error must name the regression so an operator can act on it: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_postgres_checkpoint_may_move_backwards_because_pgoutput_legitimately_does() {
+        // pgoutput emits changes in *commit* order while each keeps its own WAL position,
+        // so two transactions interleaved in the WAL arrive out of LSN order and the
+        // checkpoint genuinely goes backwards. Resuming from the lower LSN re-reads the
+        // later-positioned change, which is the documented at-least-once behaviour.
+        // Refusing it would wedge every pipeline that has concurrent writers.
+        let dir = tempdir().unwrap();
+        let mut checkpoint = FileCheckpoint::new(dir.path());
+
+        for (lsn, count) in [(110_u64, 10_u64), (100, 20)] {
+            checkpoint
+                .save(
+                    &PostgresOffset {
+                        lsn,
+                        slot_name: "slot-a".into(),
+                        incremental_snapshot: None,
+                    },
+                    count,
+                )
+                .await
+                .expect("an out-of-order pgoutput LSN is not a regression");
+        }
+    }
+
+    #[test]
+    fn a_postgres_lsn_of_zero_is_still_caught() {
+        // Zero is not a position the stream can reach, so it can only come from a decode
+        // or parse defect — the shape the MySQL compression defect took.
+        let before = json!({ "lsn": 5_000, "slot_name": "slot-a" });
+        let after = json!({ "lsn": 0, "slot_name": "slot-a" });
+        assert!(stream_position_regression("postgres", &before, &after).is_some());
+        assert!(
+            stream_position_regression("postgres", &after, &before).is_none(),
+            "recovering from zero must not itself be reported as a regression"
+        );
+    }
+
+    #[test]
+    fn a_binlog_position_of_zero_is_caught_as_a_regression() {
+        // The exact shape of the MySQL transaction-compression defect: events unpacked
+        // from a compressed payload carried `log_pos = 0`, so the connector offered the
+        // checkpoint `<file>:0` while the committed count kept climbing.
+        let existing = json!({
+            "gtid": "", "binlog_file": "binlog.000042", "binlog_pos": 88_371,
+            "source_flavor": "mysql"
+        });
+        let next = json!({
+            "gtid": "", "binlog_file": "binlog.000042", "binlog_pos": 0,
+            "source_flavor": "mysql"
+        });
+        assert!(stream_position_regression("mysql", &existing, &next).is_some());
+        assert!(
+            stream_position_regression("mysql", &next, &existing).is_none(),
+            "recovering from zero must not itself be reported as a regression"
+        );
+    }
+
+    #[test]
+    fn binlog_files_are_ordered_by_sequence_number_not_by_text() {
+        // `binlog.1000000` sorts before `binlog.999999` as text, so a rollover past six
+        // digits would look like a regression to a string comparison.
+        let older = json!({
+            "gtid": "", "binlog_file": "binlog.999999", "binlog_pos": 900,
+            "source_flavor": "mysql"
+        });
+        let newer = json!({
+            "gtid": "", "binlog_file": "binlog.1000000", "binlog_pos": 4,
+            "source_flavor": "mysql"
+        });
+        assert!(stream_position_regression("mysql", &older, &newer).is_none());
+        assert!(stream_position_regression("mysql", &newer, &older).is_some());
+    }
+
+    #[test]
+    fn a_gtid_positioned_stream_is_not_judged_on_server_local_coordinates() {
+        // After a failover the new primary's binlog coordinates are unrelated to the
+        // old primary's and are routinely lower. GTID is what actually resumes the
+        // stream there, so file+position must not veto a legitimate recovery.
+        let before = json!({
+            "gtid": "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-500",
+            "binlog_file": "binlog.000042", "binlog_pos": 88_371,
+            "source_flavor": "mysql"
+        });
+        let after = json!({
+            "gtid": "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-620",
+            "binlog_file": "binlog.000001", "binlog_pos": 4,
+            "source_flavor": "mysql"
+        });
+        assert!(stream_position_regression("mysql", &before, &after).is_none());
+    }
+
+    #[test]
+    fn a_renamed_replication_slot_is_not_comparable() {
+        // Two slots are two independent WAL positions; comparing them says nothing.
+        let before = json!({ "lsn": 5_000, "slot_name": "slot-a" });
+        let after = json!({ "lsn": 10, "slot_name": "slot-b" });
+        assert!(stream_position_regression("postgres", &before, &after).is_none());
+    }
+
+    #[test]
+    fn a_sqlserver_cursor_regression_is_caught_across_both_encodings() {
+        let later = json!({ "cursor": "0x000000230000015a0004:0x000000230000015a0005:2" });
+        let earlier = json!({ "cursor": "0x000000230000015a0002" });
+        assert!(stream_position_regression("sqlserver", &later, &earlier).is_some());
+        assert!(stream_position_regression("sqlserver", &earlier, &later).is_none());
+    }
+
+    #[test]
+    fn the_two_sqlserver_cursor_encodings_do_not_look_like_a_regression_at_one_lsn() {
+        // Both forms occur in the same stream: an orderly shutdown records the three-part
+        // within-window position, and the per-event checkpoints that follow a restart carry
+        // a bare commit LSN. The bare form is a *prefix* of the three-part one, so a whole
+        // string comparison would call the first commit after a graceful restart a
+        // regression and wedge the pipeline on a false positive.
+        let three_part = json!({ "cursor": "0x000000230000015a0004:0x000000230000015a0005:2" });
+        let bare = json!({ "cursor": "0x000000230000015a0004" });
+        assert!(
+            stream_position_regression("sqlserver", &three_part, &bare).is_none(),
+            "the same commit LSN in the other encoding must not be read as a rewind"
+        );
+        assert!(stream_position_regression("sqlserver", &bare, &three_part).is_none());
+    }
+
+    #[test]
+    fn an_unrecognised_source_type_is_left_alone() {
+        let before = json!({ "anything": 9 });
+        let after = json!({ "anything": 1 });
+        assert!(stream_position_regression("custom-source", &before, &after).is_none());
     }
 
     #[tokio::test]

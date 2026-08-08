@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "rustcdc"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -3923,6 +3923,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "jsonschema",
+ "md-5",
  "mysql_async",
  "mysql_common",
  "opentelemetry",
