@@ -123,17 +123,29 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
             .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
+    // The property under test is that a **partial** acknowledgement advances the durable
+    // position exactly as far as the consumer accepted — not that one poll happens to deliver
+    // all 100 rows. Batches are cut on `max_buffer_size`, `max_event_bytes` and free
+    // commit-barrier capacity, and a re-poll before acknowledgement redelivers the *same*
+    // in-flight batch rather than a larger one, so the split point has to come from what was
+    // actually delivered.
     let first_batch = poll_non_empty_batch(&mut runtime, 40).await?;
-    assert!(first_batch.len() >= 100);
+    let delivered = first_batch.len();
+    assert!(
+        delivered >= 2,
+        "a partial acknowledgement needs at least two delivered events; got {delivered} \
+         after writing 100 rows"
+    );
+    let accepted_count = delivered / 2;
 
     let AckMode::Required(token) = first_batch.ack_mode() else {
         panic!("non-empty batch should include ack token");
     };
-    let (accepted, _remaining) = token.split_at(50)?;
+    let (accepted, _remaining) = token.split_at(accepted_count)?;
     runtime.commit_ack(accepted).await?;
 
     let reader = FileCheckpoint::read_only(checkpoint_dir.path());
-    assert_eq!(reader.get_committed_count().await?, 50);
+    assert_eq!(reader.get_committed_count().await?, accepted_count as u64);
     let saved = reader
         .load()
         .await?
@@ -200,12 +212,29 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
             .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
-    let second_batch = poll_non_empty_batch(&mut resumed, 40).await?;
-    assert!(second_batch.len() >= 50);
+    // Drain across batches rather than expecting one poll to carry everything: the resumed
+    // stream owes the 50 events left unacknowledged above plus the 50 written since, and how
+    // those are grouped is not part of the contract.
+    let mut acknowledged_after_resume = 0usize;
+    for _ in 0..40 {
+        let batch = resumed.poll_event_batch().await?;
+        if batch.is_empty() {
+            continue;
+        }
+        acknowledged_after_resume += batch.len();
+        resumed.commit_ack(batch.ack_mode()).await?;
+        if acknowledged_after_resume >= 100 - accepted_count {
+            break;
+        }
+    }
 
-    resumed.commit_ack(second_batch.ack_mode()).await?;
     let reader_after = FileCheckpoint::read_only(checkpoint_dir.path());
-    assert!(reader_after.get_committed_count().await? >= 100);
+    assert!(
+        reader_after.get_committed_count().await? >= 100,
+        "the resume must redeliver everything left unacknowledged and then the new writes; \
+         durable count is {}",
+        reader_after.get_committed_count().await?
+    );
 
     Ok(())
 }
