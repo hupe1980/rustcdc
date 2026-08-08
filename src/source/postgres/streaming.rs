@@ -85,15 +85,23 @@ impl PgOutputMessageProvider for StreamingPgOutputProvider {
         let mut messages = Vec::new();
 
         while messages.len() < max_messages.max(1) {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+            // Block for the *first* record, then take only what is already buffered.
+            // Waiting the full budget once data has arrived would make every record wait for
+            // the last one, turning a push transport back into a polling one; draining with a
+            // zero budget keeps the batching without the wait.
+            let remaining = if messages.is_empty() {
+                deadline.saturating_duration_since(tokio::time::Instant::now())
+            } else {
+                Duration::ZERO
+            };
+            if remaining.is_zero() && messages.is_empty() {
                 break;
             }
 
             match self.stream.recv(remaining).await? {
-                // Budget spent. Unlike the SQL-peek transport this is never backlog
-                // pressure and carries no risk of being read as an idle slot: the stream is
-                // intact, and whatever already arrived is returned below.
+                // Nothing more without blocking. On an empty batch the budget is simply
+                // spent — unlike a peek timeout this is never backlog pressure, so it cannot
+                // be mistaken for an idle slot.
                 None => break,
                 Some(WalMessage::XLogData {
                     wal_start,
@@ -108,9 +116,8 @@ impl PgOutputMessageProvider for StreamingPgOutputProvider {
                 }
                 Some(WalMessage::Keepalive { wal_end }) => {
                     self.observe_wal_end(wal_end);
-                    // A keepalive is not data. Returning here on an empty batch would make
-                    // a busy-but-quiet server look like a completed poll on every heartbeat;
-                    // the loop simply continues until the budget runs out.
+                    // A keepalive is not data: returning on one would make every heartbeat
+                    // look like a completed poll. Keep waiting out the budget.
                 }
             }
         }
@@ -118,20 +125,16 @@ impl PgOutputMessageProvider for StreamingPgOutputProvider {
         Ok(PollOutcome::Data(messages))
     }
 
+    fn waits_for_data(&self) -> bool {
+        // Blocks on the socket, so the caller must pass its real budget. See the trait docs.
+        true
+    }
+
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
-        // Reported to the server immediately when it actually advances, rather than left
-        // for the next status interval. Two reasons, both operational:
-        //
-        // * The slot's `confirmed_flush_lsn` is what releases WAL. Deferring the report by
-        //   up to a status interval defers WAL release by the same amount, which is the one
-        //   thing a replication slot must not sit on.
-        // * A process that exits right after a commit would otherwise never report it, and
-        //   the next start would re-read that WAL. Correct under at-least-once, but
-        //   avoidable, and it removes any need for a shutdown hook on the hot path.
-        //
-        // A Standby Status Update is a 34-byte write on an open socket, sent once per
-        // committed batch rather than per event. The SQL-peek transport spent a full
-        // `pg_replication_slot_advance` query here.
+        // Reported immediately on advance rather than deferred to the status interval:
+        // `confirmed_flush_lsn` is what releases WAL, and a process exiting right after a
+        // commit would otherwise never report it. The cost is a 34-byte write per committed
+        // batch — the peek transport spent a whole `pg_replication_slot_advance` query here.
         let advanced = lsn > self.stream.applied_lsn();
         self.stream.set_applied_lsn(lsn);
         if advanced {

@@ -243,6 +243,25 @@ impl PostgresSourceConfig {
             .password(self.password.resolve()?)
             .dbname(&self.database)
             .connect_timeout(Duration::from_secs(self.conn_timeout_secs));
+
+        // `tokio-postgres` defaults to `SslMode::Prefer`, which **silently falls back to an
+        // unencrypted connection** when the server refuses the SSL request. Left unset, a
+        // connector configured for TLS would happily send credentials and change data in
+        // the clear against a server with `ssl = off`, with no error and no warning — the
+        // operator's only evidence would be a packet capture.
+        //
+        // `Require` makes the configuration mean what it says. It does not weaken anything:
+        // certificate verification is still governed by the rustls config built from
+        // `TransportConfig`, and this connector refuses to disable that (see the
+        // `allow_invalid_certificates` error in `PostgresConnection::connect`). The
+        // replication transport enforces the same rule in its own handshake, so the two
+        // connections a stream opens cannot disagree about whether they are encrypted.
+        config.ssl_mode(if self.transport.is_tls() {
+            tokio_postgres::config::SslMode::Require
+        } else {
+            tokio_postgres::config::SslMode::Disable
+        });
+
         Ok(config)
     }
 

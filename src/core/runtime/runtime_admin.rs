@@ -10,6 +10,75 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
 }
 
 impl CdcRuntime {
+    /// Snapshot additional tables on a **running** pipeline.
+    ///
+    /// The library equivalent of Debezium's `execute-snapshot` signal — and without its
+    /// prerequisite: rustcdc needs no signal table in the source, so this works against a
+    /// read-only role and a read replica. Returns the number of tables enqueued.
+    ///
+    /// Use it to backfill a table just added to the publication, to rebuild a downstream store,
+    /// or to re-run history through a corrected transform. The live stream is never paused; the
+    /// new tables are chunked into it exactly like the initially configured ones, under the same
+    /// DBLog watermark suppression.
+    ///
+    /// # Semantics
+    ///
+    /// * A table **not currently tracked** is added and read from the start.
+    /// * A table **already in progress** is a no-op, so retrying a request is safe.
+    /// * A table **already complete** is rewound and read again.
+    ///
+    /// Every name is resolved against the catalog before anything is mutated, so one bad
+    /// reference fails the whole call rather than half-applying it. Enqueued tables reach the
+    /// checkpoint with the next commit and are picked up again after a restart, even though they
+    /// are not in [`RuntimeConfig::with_incremental_snapshot`]'s static list.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::StateError`] if the runtime is not running.
+    /// * [`Error::NotImplemented`] if this runtime was not configured with
+    ///   [`RuntimeConfig::with_incremental_snapshot`] — there is no snapshot to add to, and
+    ///   pretending otherwise would report a backfill that never happens.
+    /// * [`Error::ConfigError`] if a table does not exist or has no primary key, which is
+    ///   required to chunk it resumably.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rustcdc::CdcRuntime;
+    /// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+    /// let enqueued = runtime
+    ///     .request_incremental_snapshot(vec!["public.orders".to_string()])
+    ///     .await?;
+    /// println!("{enqueued} table(s) queued for snapshotting");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn request_incremental_snapshot(&mut self, tables: Vec<String>) -> Result<usize> {
+        if self.state != RuntimeState::Running {
+            return Err(Error::StateError(format!(
+                "cannot request an incremental snapshot while the runtime is {}; start it first",
+                self.state
+            )));
+        }
+
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            Error::StateError(
+                "cannot request an incremental snapshot: the runtime has no active stream".into(),
+            )
+        })?;
+
+        let enqueued = stream.request_snapshot_tables(tables).await?;
+        if enqueued > 0 {
+            tracing::info!(
+                target: "rustcdc::core::runtime",
+                enqueued,
+                "incremental snapshot requested for {enqueued} table(s) on a running pipeline",
+            );
+        }
+        Ok(enqueued)
+    }
+
+
     /// Return the current lifecycle state.
     pub fn state(&self) -> RuntimeState {
         self.state

@@ -24,11 +24,10 @@ Use all three layers together for high confidence before releases.
 
 ### A fourth layer: resume-coordinate suites
 
-The three layers above all exercise the runtime against a *cooperative* source. They cannot see a
-defect in the source's own resume coordinate, because they supply that coordinate themselves. The
-0.10.0 audit found three separate silent-data-loss defects of exactly that shape — a checkpoint
-that recorded a position the source could not resume from, or that ran ahead of the rows it
-described — and none of the layers above could have caught any of them.
+The three layers above all exercise the runtime against a *cooperative* source, so none of them
+can see a defect in the source's own resume coordinate — they supply that coordinate themselves.
+That blind spot covers the worst failures a CDC library has: a checkpoint recording a position the
+source cannot resume from, or one running ahead of the rows it describes. Both are silent.
 
 The suites below therefore assert on the coordinate itself, against a real server, in the
 configuration where it goes wrong:
@@ -39,11 +38,19 @@ configuration where it goes wrong:
 | `sqlserver_window_truncation_integration` | SQL Server 2022, **two** capture instances, `max_events_per_poll = 5` | No row is lost when an LSN window truncates at different positions per capture instance |
 | `postgres_snapshot_integration` (`…resumes_at_the_chunk_boundary_after_a_restart`) | PostgreSQL, incremental snapshot | A restart resumes at a chunk boundary rather than skipping or restarting the table |
 
-The shared lesson for writing new ones: **the configuration is the test.** Each of these defects
-was invisible under the default configuration of the existing suite — one capture instance,
-compression off, a chunk that happened to drain in the same poll — and appeared immediately under
-a configuration a real deployment would choose. When adding a connector or a resume path, ask
-which server option or cardinality your suite is holding at its most forgiving value.
+Alongside them, `source::postgres::wire::tests` drives the replication client against an
+**in-process fake server** over loopback. That covers the cases a real server cannot be asked
+for: the TLS handshake (the containers run `ssl = off`), a message deliberately split across two
+TCP writes so a poll budget expires mid-frame, a server that declines the TLS upgrade, and a
+server that accepts the connection and then goes silent. Ten tests, no Docker, under half a
+second — which is the argument for reaching for a fake server whenever the interesting cases are
+*failures* rather than successes.
+
+The rule for writing new ones: **the configuration is the test.** Each row above needs a
+*non-default* server option or cardinality to fail at all — one capture instance instead of two,
+compression off, a chunk that drains inside a single poll — and is silent under the forgiving
+setting. When adding a connector or a resume path, ask which option your suite is holding at its
+most permissive value, and pin the other one.
 
 ## Deterministic Replay
 
@@ -146,6 +153,10 @@ cargo test data_loss_detection
 CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features mysql --test mysql_binlog_compression_integration
 CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features sqlserver --test sqlserver_window_truncation_integration
 CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features postgres --test postgres_snapshot_integration
+CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features postgres --test postgres_wal_transport_parity_integration
+
+# The fake replication server needs no Docker
+cargo test --features postgres --lib wire::tests
 ```
 
 ## Best Practices
@@ -176,7 +187,56 @@ compile_error!("...");
 > release artifact.  If your project uses custom profiles, audit them to ensure
 > `debug-assertions` is `false` before shipping.
 
-## Benchmark evidence
+## Measured performance
+
+From `tests/postgres_latency_evidence.rs` and `tests/postgres_wal_transport_backlog_evidence.rs`
+on one developer machine (PostgreSQL 16 in Docker, loopback). These are **relative** comparisons
+on identical hardware and workload, not absolute claims — take the ratio as the signal and
+re-measure before setting an SLO.
+
+### Latency and throughput
+
+| WAL transport | p50 | p95 | p99 | max | throughput |
+|---|---|---|---|---|---|
+| `StreamingReplication` (default) | 27.8 ms | 51.1 ms | 53.5 ms | 68.5 ms | **815 events/s** |
+| `SqlPeek` | **12.7 ms** | 19.1 ms | 31.2 ms | 42.5 ms | 434 events/s |
+
+Streaming carries roughly twice the throughput. **Peek shows a lower p50 on this workload** — it
+polls in tight, small batches — and that is not hidden here because it is real. The gap is not a
+batching artifact: re-running streaming with `max_events_per_poll = 50` made both metrics worse
+(p50 50.6 ms, 561 events/s).
+
+### Capture time with WAL behind the slot
+
+Same capture, measured with 146 MiB and 292 MiB of WAL between the slot's `restart_lsn` and the
+current end of WAL (the second achieved by holding a transaction open so `restart_lsn` cannot
+advance):
+
+| WAL transport | 146 MiB behind | 292 MiB behind |
+|---|---|---|
+| `StreamingReplication` | 58 ms | 39 ms |
+| `SqlPeek` | 218 ms | 209 ms |
+
+**`SqlPeek` is consistently 4–5× slower for identical work.** That is the measured, reproducible
+difference, and it is the honest basis for preferring the default.
+
+**What is *not* demonstrated:** that peek degrades further as the WAL behind the slot grows.
+Doubling the distance did not slow it measurably. The re-scan itself is real —
+`pg_logical_slot_get_changes_guts` calls `XLogBeginRead(reader, restart_lsn)` on every
+invocation, so each poll reads from the slot's restart point — but at these volumes the WAL had
+just been written and was served from page cache. Whether the mechanism becomes expensive on a
+server where that WAL is cold, or evicted by other load, is **not** established by this harness.
+Treat it as a mechanism to monitor (`pg_replication_slots.restart_lsn` against
+`pg_current_wal_lsn()`), not as a quantified cost.
+
+Reproduce:
+
+```bash
+CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features postgres \
+  --test postgres_latency_evidence --test postgres_wal_transport_backlog_evidence -- --nocapture
+```
+
+## Benchmark evidence## Benchmark evidence
 
 Benchmarks are produced by `scripts/ci-benchmark-gate.sh`. They are Criterion microbenchmarks
 over the transform and codec paths with **no connector I/O**, so they are a regression signal

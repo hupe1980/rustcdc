@@ -116,6 +116,11 @@ async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -298,6 +303,11 @@ async fn postgres_incremental_snapshot_reads_all_seed_rows_once() -> rustcdc::Re
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -457,6 +467,11 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -672,6 +687,11 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -918,6 +938,11 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -1148,6 +1173,11 @@ async fn postgres_snapshot_empty_table() -> rustcdc::Result<()> {
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -1271,6 +1301,11 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::R
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -1478,6 +1513,11 @@ async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_res
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 

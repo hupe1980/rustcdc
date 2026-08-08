@@ -4,7 +4,7 @@ description = "How rustcdc's Cargo features are scoped, and what the default pro
 weight = 140
 +++
 
-This document clarifies rustcdc feature intent by separating implemented capabilities, intentional non-goals, and roadmap candidates.
+This document separates what rustcdc implements from what it deliberately does not, so an evaluation can be made against current behaviour rather than intent.
 
 ## Scope Statement
 
@@ -33,7 +33,7 @@ Companion release-gating matrix:
 | Deterministic replay + fault-injection tests | Core reliability practice | Implemented |
 | Built-in sink catalog | Trait-based integration model preferred | Intentional non-goal |
 | Managed control plane / hosted UI | Outside library boundary | Intentional non-goal |
-| Additional non-relational connectors | Considered when maintainability and testability meet bar | Roadmap candidate |
+| Additional non-relational connectors | Considered when maintainability and testability meet bar | Not implemented |
 | Runtime-emitted schema-change events | Emitted by current relational connectors; parser coverage evolves per dialect | Implemented |
 
 ## Acceptance Criteria For New Connector Families

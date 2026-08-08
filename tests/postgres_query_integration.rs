@@ -77,6 +77,18 @@ fn source_config(
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
+        // Both tests in this file are about the **SQL-peek** transport's slot bookkeeping:
+        // `confirm_lsn` advancing the slot with `pg_replication_slot_advance`, and startup
+        // repairing a checkpoint that sits ahead of `confirmed_flush_lsn`. Neither exists
+        // under streaming replication, where the resume LSN is a `START_REPLICATION`
+        // parameter and progress is reported with Standby Status Updates — so pinning the
+        // transport is what keeps these covering the code they were written for.
+        wal_transport: rustcdc::WalTransport::SqlPeek,
         ..PostgresSourceConfig::default()
     }
 }

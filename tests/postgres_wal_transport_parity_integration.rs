@@ -154,27 +154,28 @@ fn capture(event: &Event) -> Captured {
     }
 }
 
-/// Drain a stream until it goes quiet twice or `want` events have arrived.
+/// Drain a stream until it has produced **exactly** `want` events, or the deadline passes.
+///
+/// Waiting for a known count rather than for the stream to go quiet is what makes the parity
+/// comparison deterministic. Two independently drained streams progress at different rates —
+/// especially with several container-backed suites competing for the machine — so a
+/// quiet-based drain can return 6 events from one transport and 4 from the other and report a
+/// divergence that is really just a slower reader.
 async fn drain(
     stream: &mut Box<dyn rustcdc::source::StreamHandle>,
     want: usize,
+    label: &str,
 ) -> rustcdc::Result<Vec<Event>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut collected = Vec::new();
-    let mut quiet = 0;
-    for _ in 0..80 {
-        let events = stream.next_events(500).await?;
-        if events.is_empty() {
-            quiet += 1;
-            if quiet == 2 {
-                break;
-            }
-            continue;
-        }
-        quiet = 0;
-        collected.extend(events);
-        if collected.len() >= want {
-            break;
-        }
+    while collected.len() < want && std::time::Instant::now() < deadline {
+        collected.extend(stream.next_events(500).await?);
+    }
+    if collected.len() < want {
+        return Err(rustcdc::Error::TimeoutError(format!(
+            "the {label} transport produced {} of {want} expected events within 60s",
+            collected.len()
+        )));
     }
     Ok(collected)
 }
@@ -243,8 +244,11 @@ async fn both_wal_transports_capture_byte_identical_event_streams() -> rustcdc::
 
     apply_workload(&admin).await?;
 
-    let streaming_events = drain(&mut streaming, 6).await?;
-    let peek_events = drain(&mut peek, 6).await?;
+    // The workload commits six changes: two inserts, an update, a delete, then an insert and
+    // an update in one transaction.
+    const EXPECTED_EVENTS: usize = 6;
+    let streaming_events = drain(&mut streaming, EXPECTED_EVENTS, "streaming").await?;
+    let peek_events = drain(&mut peek, EXPECTED_EVENTS, "peek").await?;
 
     let streaming_captured: Vec<Captured> = streaming_events.iter().map(capture).collect();
     let peek_captured: Vec<Captured> = peek_events.iter().map(capture).collect();
@@ -308,7 +312,7 @@ async fn the_streaming_transport_resumes_from_a_checkpoint_lsn() -> rustcdc::Res
         .await
         .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
-    let before_restart = drain(&mut first, 1).await?;
+    let before_restart = drain(&mut first, 1, "streaming").await?;
     assert!(
         !before_restart.is_empty(),
         "the first stream must capture the pre-restart change"
@@ -341,7 +345,7 @@ async fn the_streaming_transport_resumes_from_a_checkpoint_lsn() -> rustcdc::Res
     resumed_source.connect().await?;
     let mut resumed = resumed_source.start_stream(Some(resume.as_ref())).await?;
 
-    let after_restart = drain(&mut resumed, 1).await?;
+    let after_restart = drain(&mut resumed, 1, "resumed").await?;
     let names: Vec<String> = after_restart
         .iter()
         .filter_map(|event| {
@@ -401,7 +405,7 @@ async fn the_streaming_transport_authenticates_with_md5() -> rustcdc::Result<()>
         .await
         .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
-    let events = drain(&mut stream, 1).await?;
+    let events = drain(&mut stream, 1, "streaming/md5").await?;
     assert!(
         events.iter().any(|event| event.op == Operation::Insert),
         "the streaming transport must capture changes on an md5-authenticated server"

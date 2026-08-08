@@ -361,6 +361,54 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             });
         }
 
+        // Adopt in-flight tables the checkpoint knows about but the static config does not.
+        //
+        // Without this, a table added at runtime through
+        // [`StreamHandle::request_snapshot_tables`](crate::source::StreamHandle::request_snapshot_tables)
+        // would vanish on the next restart: `config.tables` is the *initial* set, while the
+        // checkpoint is the record of work actually in flight. Only **incomplete** entries are
+        // adopted — a finished table has nothing left to do, so re-adding it would restart a
+        // snapshot the operator never asked to repeat.
+        if let Some(state) = resume.as_ref() {
+            for persisted in &state.tables {
+                if persisted.is_complete {
+                    continue;
+                }
+                if tables.iter().any(|table| table.key() == persisted.table) {
+                    continue;
+                }
+                // A table that has since been dropped must not wedge startup: the snapshot it
+                // was running is moot, and failing here would make the pipeline unstartable
+                // until someone hand-edited a checkpoint.
+                match backend.describe_table(&persisted.table).await {
+                    Ok(spec) if !spec.pk_columns.is_empty() => {
+                        tracing::info!(
+                            target: "rustcdc::source::incremental_snapshot",
+                            table = %persisted.table,
+                            "adopting an in-flight incremental snapshot table from the \
+                             checkpoint; it was requested at runtime rather than configured",
+                        );
+                        tables.push(TableProgress {
+                            pk_cursor: persisted.pk_cursor.clone(),
+                            is_complete: false,
+                            chunks_emitted: persisted.chunks_emitted,
+                            rows_emitted: persisted.rows_emitted,
+                            spec,
+                        });
+                    }
+                    Ok(_) | Err(_) => {
+                        tracing::warn!(
+                            target: "rustcdc::source::incremental_snapshot",
+                            table = %persisted.table,
+                            "checkpoint records an unfinished incremental snapshot for a table \
+                             that can no longer be described (dropped, renamed, or its primary \
+                             key removed); dropping it from this run",
+                        );
+                    }
+                }
+            }
+        }
+
         let phase = match tables.iter().position(|table| !table.is_complete) {
             Some(table_idx) => Phase::ChunkPrepare { table_idx },
             None => Phase::Done,
@@ -395,6 +443,74 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             snapshot_id,
             events_emitted: 0,
         })
+    }
+
+    /// Enqueue tables for snapshotting on a running driver.
+    ///
+    /// See [`StreamHandle::request_snapshot_tables`](crate::source::StreamHandle::request_snapshot_tables)
+    /// for the semantics this implements.
+    async fn enqueue_tables(&mut self, table_refs: Vec<String>) -> Result<usize> {
+        // Resolve everything before mutating, so a typo in the third of four names does not
+        // leave the first two half-applied with no way to tell.
+        let mut resolved = Vec::with_capacity(table_refs.len());
+        for table_ref in &table_refs {
+            let spec = self.backend.describe_table(table_ref).await?;
+            if spec.pk_columns.is_empty() {
+                return Err(Error::ConfigError(format!(
+                    "incremental snapshot: table '{}.{}' must have a primary key",
+                    spec.schema, spec.name
+                )));
+            }
+            resolved.push(spec);
+        }
+
+        let mut enqueued = 0usize;
+        for spec in resolved {
+            let key = format!("{}.{}", spec.schema, spec.name);
+            match self.tables.iter_mut().find(|table| table.key() == key) {
+                // Already running: leave it alone. Resetting a table mid-flight would
+                // re-deliver every row already handed to the consumer.
+                Some(existing) if !existing.is_complete => {
+                    tracing::debug!(
+                        target: "rustcdc::source::incremental_snapshot",
+                        table = %key,
+                        "incremental snapshot already in progress for this table; request \
+                         ignored as a no-op",
+                    );
+                }
+                // Finished: this is a deliberate re-snapshot, so rewind it.
+                Some(existing) => {
+                    existing.pk_cursor = None;
+                    existing.is_complete = false;
+                    existing.chunks_emitted = 0;
+                    existing.rows_emitted = 0;
+                    enqueued += 1;
+                }
+                None => {
+                    self.tables.push(TableProgress {
+                        spec,
+                        pk_cursor: None,
+                        is_complete: false,
+                        chunks_emitted: 0,
+                        rows_emitted: 0,
+                    });
+                    enqueued += 1;
+                }
+            }
+        }
+
+        // A driver that had finished everything is parked in `Done` and delegates straight to
+        // the inner stream. Newly enqueued work has to move it back onto the state machine, or
+        // the tables would sit in the list untouched.
+        if enqueued > 0 {
+            if let Some(table_idx) = self.tables.iter().position(|table| !table.is_complete) {
+                if matches!(self.phase, Phase::Done) {
+                    self.phase = Phase::ChunkPrepare { table_idx };
+                }
+            }
+        }
+
+        Ok(enqueued)
     }
 
     /// Durable per-table progress for the checkpoint record.
@@ -730,6 +846,10 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
 
     async fn requeue_events(&mut self, events: Vec<Event>) -> Result<()> {
         self.inner.requeue_events(events).await
+    }
+
+    async fn request_snapshot_tables(&mut self, tables: Vec<String>) -> Result<usize> {
+        self.enqueue_tables(tables).await
     }
 
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
@@ -1195,6 +1315,213 @@ mod tests {
         );
         assert_eq!(table.chunks_emitted, 1);
         assert_eq!(table.rows_emitted, 2);
+    }
+
+    #[tokio::test]
+    async fn a_table_requested_at_runtime_is_snapshotted() {
+        // The on-demand case: the driver has finished everything and is parked in `Done`,
+        // delegating straight to the inner stream. A request must move it back onto the state
+        // machine, or the table sits in the list untouched.
+        let rows: Vec<serde_json::Value> = (1..=4).map(|id| json!({ "id": id })).collect();
+        let (mut driver, _) = driver_with(rows, vec![], 0, 10).await;
+
+        let first_pass = drain(&mut driver).await;
+        assert_eq!(first_pass.len(), 4, "the configured table snapshots first");
+        assert!(
+            matches!(driver.phase, Phase::Done),
+            "the driver must be parked once every table is complete"
+        );
+
+        // `FakeBackend::describe_table` always resolves to `public.users`, which is already
+        // tracked and complete — so this is the deliberate re-snapshot path.
+        let enqueued = driver
+            .enqueue_tables(vec!["public.users".to_string()])
+            .await
+            .expect("request accepted");
+        assert_eq!(enqueued, 1);
+        assert!(
+            !matches!(driver.phase, Phase::Done),
+            "an enqueued table must take the driver out of Done"
+        );
+
+        let second_pass = drain(&mut driver).await;
+        assert_eq!(
+            second_pass.len(),
+            4,
+            "a completed table requested again must be read from the start"
+        );
+    }
+
+    #[tokio::test]
+    async fn requesting_a_table_already_in_progress_is_a_no_op() {
+        // Idempotence matters because a request is an operator action that may be retried.
+        // Rewinding a table mid-flight would re-deliver rows the consumer already has.
+        let rows: Vec<serde_json::Value> = (1..=6).map(|id| json!({ "id": id })).collect();
+        let (mut driver, _) = driver_with(rows, vec![], 0, 2).await;
+
+        let first = driver.next_events(10).await.expect("drive");
+        assert_eq!(first.len(), 2, "one chunk is delivered, so the table is mid-flight");
+
+        let enqueued = driver
+            .enqueue_tables(vec!["public.users".to_string()])
+            .await
+            .expect("request accepted");
+        assert_eq!(
+            enqueued, 0,
+            "an in-progress table must not be re-enqueued: {:?}",
+            driver.tables.len()
+        );
+
+        // The remaining rows still arrive exactly once — no rewind, no duplicates.
+        let mut ids: Vec<i64> = first
+            .iter()
+            .chain(drain(&mut driver).await.iter())
+            .filter_map(|event| event.after.as_ref()?.get("id")?.as_i64())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn a_bad_table_reference_fails_the_whole_request() {
+        // Atomicity: resolving every name before mutating means a typo in one entry cannot
+        // leave the others half-applied with no way to tell which took effect.
+        struct RejectingBackend;
+
+        #[async_trait]
+        impl IncrementalSnapshotBackend for RejectingBackend {
+            type Position = u64;
+            async fn describe_table(&mut self, table_ref: &str) -> Result<SnapshotTable> {
+                Err(Error::ConfigError(format!("no such table '{table_ref}'")))
+            }
+            async fn current_position(&mut self) -> Result<u64> {
+                Ok(0)
+            }
+            async fn fetch_chunk(
+                &mut self,
+                _table: &SnapshotTable,
+                _cursor: Option<&[serde_json::Value]>,
+                _limit: usize,
+            ) -> Result<Vec<ChunkRow>> {
+                Ok(Vec::new())
+            }
+            fn position_of_event(&self, _event: &Event) -> Option<u64> {
+                None
+            }
+            fn offset_with_snapshot_state(
+                &self,
+                _inner: &dyn Offset,
+                _state: IncrementalSnapshotState,
+            ) -> Option<Box<dyn Offset>> {
+                None
+            }
+        }
+
+        let mut driver = IncrementalSnapshotDriver::new(
+            RejectingBackend,
+            Box::new(FakeStream {
+                batches: VecDeque::new(),
+            }),
+            IncrementalSnapshotConfig::new(Vec::<String>::new()),
+            "test".to_string(),
+            None,
+        )
+        .await
+        .expect("an empty table set builds");
+
+        let error = driver
+            .enqueue_tables(vec!["public.missing".to_string()])
+            .await
+            .expect_err("must reject");
+        assert!(error.to_string().contains("no such table"));
+        assert!(
+            driver.tables.is_empty(),
+            "a rejected request must leave no partial state"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_table_in_the_checkpoint_is_adopted_even_if_unconfigured() {
+        // A table requested at runtime is not in `config.tables`, so without adopting it from
+        // the checkpoint its snapshot would vanish on the next restart — the request would look
+        // honoured and then silently stop.
+        let rows: Vec<serde_json::Value> = (1..=4).map(|id| json!({ "id": id })).collect();
+        let resume = IncrementalSnapshotState {
+            snapshot_id: "incremental-earlier-run".to_string(),
+            tables: vec![IncrementalSnapshotTableState {
+                table: "public.users".to_string(),
+                pk_cursor: Some(vec![json!(2)]),
+                is_complete: false,
+                chunks_emitted: 1,
+                rows_emitted: 2,
+            }],
+        };
+
+        let mut driver = IncrementalSnapshotDriver::new(
+            FakeBackend {
+                rows,
+                clock: Arc::new(Mutex::new(100)),
+                advance_on_read: 0,
+                reads: Arc::new(Mutex::new(Vec::new())),
+            },
+            Box::new(FakeStream {
+                batches: VecDeque::new(),
+            }),
+            // Deliberately empty: the table exists only in the checkpoint.
+            IncrementalSnapshotConfig::new(Vec::<String>::new()),
+            "test".to_string(),
+            Some(resume),
+        )
+        .await
+        .expect("driver builds");
+
+        let ids: Vec<i64> = drain(&mut driver)
+            .await
+            .iter()
+            .filter_map(|event| event.after.as_ref()?.get("id")?.as_i64())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![3, 4],
+            "the adopted table must resume from its persisted cursor, not restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_table_in_the_checkpoint_is_not_adopted() {
+        // Adopting a finished table would restart a snapshot nobody asked to repeat.
+        let resume = IncrementalSnapshotState {
+            snapshot_id: "incremental-earlier-run".to_string(),
+            tables: vec![IncrementalSnapshotTableState {
+                table: "public.users".to_string(),
+                pk_cursor: Some(vec![json!(4)]),
+                is_complete: true,
+                chunks_emitted: 2,
+                rows_emitted: 4,
+            }],
+        };
+
+        let mut driver = IncrementalSnapshotDriver::new(
+            FakeBackend {
+                rows: (1..=4).map(|id| json!({ "id": id })).collect(),
+                clock: Arc::new(Mutex::new(100)),
+                advance_on_read: 0,
+                reads: Arc::new(Mutex::new(Vec::new())),
+            },
+            Box::new(FakeStream {
+                batches: VecDeque::new(),
+            }),
+            IncrementalSnapshotConfig::new(Vec::<String>::new()),
+            "test".to_string(),
+            Some(resume),
+        )
+        .await
+        .expect("driver builds");
+
+        assert!(
+            drain(&mut driver).await.is_empty(),
+            "a completed table must not be re-read on restart"
+        );
     }
 
     #[tokio::test]

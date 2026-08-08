@@ -175,6 +175,11 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -376,6 +381,11 @@ async fn run_postgres_process_kill_replay_scenario(
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 

@@ -262,6 +262,8 @@ jobs:
           - postgres_version_matrix
           - postgres_snapshot_integration
           - postgres_stream_integration
+          - postgres_wal_transport_parity_integration
+          - postgres_incremental_snapshot_reconnect_integration
           # Type fidelity + REPLICA IDENTITY DEFAULT. Every other integration schema is
           # BIGINT + TEXT, and that gap is what let a silent null-decoding defect survive
           # in the SQL Server connector.

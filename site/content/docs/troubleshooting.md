@@ -223,6 +223,35 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
 
 ---
 
+### Symptom: PostgreSQL replication fails to start
+
+**Error Examples:**
+```
+ERROR postgres did not enter CopyBoth mode for slot 'rustcdc_slot'; it replied with tag 'E'
+ERROR postgres replication connection rejected: FATAL: replication slot "rustcdc_slot" is
+      active for PID 4711 (SQLSTATE 55006)
+ERROR postgres at 'db.internal' refused TLS (the server replied 'N'), but the transport
+      requires it
+```
+
+The default WAL transport (`WalTransport::StreamingReplication`) opens a replication connection,
+which has requirements an ordinary SQL connection does not.
+
+| Root Cause | How to tell | Action |
+|------------|-------------|--------|
+| Role lacks the `REPLICATION` attribute | `SELECT rolreplication FROM pg_roles WHERE rolname = current_user;` returns `f` | `ALTER ROLE <user> REPLICATION`, or grant `rds_replication` on RDS. If your provider will not grant it, set `wal_transport = WalTransport::SqlPeek`. |
+| Connection routed through a pooler | The host is a PgBouncer/pgpool/RDS Proxy endpoint | A pooler in transaction-pooling mode cannot carry a replication stream. Point the connector at the database directly, or use `SqlPeek`. |
+| Slot already in use | `SQLSTATE 55006`, "active for PID N" | Another pipeline (or an old instance of this one) holds the slot. One consumer per slot: stop the other, or give this pipeline its own slot. `SELECT * FROM pg_replication_slots WHERE slot_name = '...';` shows the holder. |
+| Server has TLS disabled | "refused TLS (the server replied 'N')" | The transport says TLS and the server has `ssl = off`. Enable it, or state `TransportConfig::plaintext()` — which sends credentials in the clear and belongs only on a trusted network. |
+| Server requires SCRAM channel binding | "offered no SASL mechanism this client implements", listing only `SCRAM-SHA-256-PLUS` | The streaming transport does not implement channel binding. Use `SqlPeek`, which authenticates through `tokio-postgres`. |
+
+**Operating on a slot a pipeline is reading.** A walsender holds the slot for the life of the
+stream, so `pg_replication_slot_advance` and `pg_drop_replication_slot` fail while the pipeline
+runs. Stop the runtime first (`CdcRuntime::stop()` releases the connection), then operate; the
+server takes a moment to reap the walsender, so retry briefly on "is active".
+
+---
+
 ### Symptom: "the stream position moved backwards"
 
 **Error Example:**

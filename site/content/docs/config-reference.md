@@ -13,7 +13,8 @@ weight = 40
 
 1. [RuntimeConfig](#runtimeconfig)
 2. [Runtime Consumption Model](#runtime-consumption-model)
-3. [Transaction boundaries](#transaction-boundaries)
+3. [On-demand snapshots](#on-demand-snapshots)
+4. [Transaction boundaries](#transaction-boundaries)
 4. [Connector Capabilities](#connector-capabilities)
 5. [Column type mapping](#column-type-mapping)
 6. [PostgreSQL Source Configuration](#postgresql-source-configuration)
@@ -162,6 +163,43 @@ while let Some(batch) = batches.next().await {
 
 `poll_event_batch()` + `commit_ack(batch.ack_mode())` is now the canonical runtime acknowledgement API.
 
+## On-demand snapshots
+
+`CdcRuntime::request_incremental_snapshot(tables)` snapshots additional tables on a **running**
+pipeline — the equivalent of Debezium's `execute-snapshot` signal, without its prerequisite: there
+is no signal table, so it works against a read-only role and a read replica.
+
+```rust
+# use rustcdc::CdcRuntime;
+# async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+let enqueued = runtime
+    .request_incremental_snapshot(vec!["public.orders".to_string()])
+    .await?;
+# let _ = enqueued;
+# Ok(())
+# }
+```
+
+Use it to backfill a table just added to the publication, rebuild a downstream store, or re-run
+history through a corrected transform. The live stream is never paused: the new tables are chunked
+into it exactly like the configured ones, under the same watermark suppression.
+
+| Table state | Effect |
+|---|---|
+| Not tracked | Added, read from the start |
+| Already in progress | No-op, so retrying a request is safe |
+| Already complete | Rewound and read again |
+
+Every name is resolved against the catalog before anything is mutated, so one bad reference fails
+the whole call rather than half-applying it. Enqueued tables reach the checkpoint with the next
+commit and are picked up again after a restart, even though they are not in
+`with_incremental_snapshot`'s static list.
+
+Requires the runtime to have been built with `with_incremental_snapshot`; otherwise the call
+returns `NotImplemented` rather than reporting a backfill that never happens. Pause, resume and
+stop are **not** implemented — a snapshot runs to completion or is abandoned by clearing the
+checkpoint.
+
 ## Transaction boundaries
 
 By default a delivered batch may end in the middle of a source transaction. Batches are cut on
@@ -278,6 +316,7 @@ The runtime constructor enforces capability guards. For example, configuring `sn
 | `stream_poll_interval_ms` | `u64` | 50 | Range 1–60 000. |
 | `max_events_per_poll` | `usize` | 1 000 | Range 1–100 000. |
 | `slot_idle_advance_interval_ms` | `u64` | 30 000 | See "Idle slots retain WAL" below. `0` disables. |
+| `wal_transport` | `WalTransport` | `StreamingReplication` | How the WAL stream is read; see below. |
 
 **`create_replication_slot_if_missing` is not a convenience flag.** A slot that vanishes
 mid-life — dropped by an operator, lost to a failover onto a replica that never had it, or
@@ -293,9 +332,69 @@ SELECT pg_create_logical_replication_slot('rustcdc_slot', 'pgoutput');
 **Idle slots retain WAL.** When no committed events are delivered — an idle database, or a
 burst of rolled-back transactions — the slot's `confirmed_flush_lsn` stays pinned and
 PostgreSQL cannot recycle WAL segments. `slot_idle_advance_interval_ms` makes the connector
-periodically call `pg_replication_slot_advance(pg_current_wal_lsn())` after that much time
-without events. Disabling it on a long-lived stream is how a disk fills up.
+confirm the server's current WAL position after that much time without events. Disabling it on a
+long-lived stream is how a disk fills up.
 
+
+### `wal_transport`
+
+| Value | Mechanism | Choose it when |
+|---|---|---|
+| `StreamingReplication` (default) | `START_REPLICATION ... LOGICAL` | Always, unless the environment forbids it |
+| `SqlPeek` | `pg_logical_slot_peek_binary_changes` | A replication connection cannot be arranged |
+
+`StreamingReplication` requires two things `SqlPeek` does not:
+
+- the connecting role must have the **`REPLICATION`** attribute (`ALTER ROLE … REPLICATION`, or
+  `rds_replication` on RDS);
+- the connection must be **direct** — a pooler in transaction-pooling mode cannot carry a
+  replication stream.
+
+Reach for `SqlPeek` only when neither can be arranged. Both read the same slot and produce the
+same events, LSNs included, so switching is an access-and-performance decision rather than a
+correctness one — but `SqlPeek` measures **4–5× slower for identical capture work**, and it
+re-reads WAL from the slot's `restart_lsn` on every poll rather than once per connection.
+Selecting it logs a warning naming the trade-off, so nobody inherits it by accident.
+
+Why, and what each measures at: [WAL transport](@/docs/architecture.md#wal-transport) ·
+[measured performance](@/docs/reliability-testing.md#measured-performance).
+
+Authentication on the streaming transport: **SCRAM-SHA-256** (PostgreSQL 14+ default), **MD5**
+(deprecated by PostgreSQL; logs a warning), and **cleartext**, refused unless the transport is
+TLS. `SCRAM-SHA-256-PLUS` (channel binding) is not implemented — a server offering only `-PLUS`
+needs `SqlPeek`.
+
+> **TLS means TLS.** `sslmode=require` is set on both connections whenever the transport is TLS.
+> `tokio-postgres` defaults to `prefer`, which silently falls back to plaintext against a server
+> with `ssl = off` — a config that says TLS and delivers cleartext, visible only in a packet
+> capture. A server that refuses TLS now fails the connection instead.
+
+### Large transactions spill on the server
+
+The connector negotiates pgoutput **`proto_version '1'`**, so PostgreSQL buffers a transaction's
+decoded output **server-side** until it commits. Past `logical_decoding_work_mem` (default
+**64 MB**) the surplus is written under `pg_replslot/<slot>/`, and nothing is delivered until
+`COMMIT` — a bulk `UPDATE` over millions of rows means disk churn on the primary, then a burst.
+
+Bounded and observable:
+
+```sql
+SELECT slot_name, spill_txns, spill_count, spill_bytes
+FROM   pg_stat_replication_slots;   -- PostgreSQL 14+
+```
+
+Mitigations, in order of preference: keep source transactions small (the only one that removes
+the cost rather than moving it); raise `logical_decoding_work_mem` (it is per-walsender, so
+budget it against concurrent replication connections); alert on `spill_bytes` *growth* rather
+than its level.
+
+`proto_version '2'` (PostgreSQL 14+) would let the server stream an in-progress transaction
+instead of spilling it. rustcdc does not negotiate it, and the decoder **rejects** v2 and v3
+messages rather than skipping them: v2 moves the buffering to the client, which must then hold
+each transaction until `Stream Commit` and *discard* it on `Stream Abort`. Mishandling that abort
+emits changes the source rolled back. Debezium's pgoutput decoder negotiates `proto_version 1`
+too, so this is a shared frontier rather than a gap — and rejecting the tags means a plugin
+mismatch is loud instead of a silent misreading of transaction boundaries.
 
 ### Secret Loading Patterns
 
@@ -918,7 +1017,7 @@ use std::sync::Arc;
 let otel_config = OTelConfig::new(
     "http://otel-collector:4317",  // OTLP gRPC endpoint
     "rustcdc",                        // Service name
-    "0.9.0",                         // Service version
+    env!("CARGO_PKG_VERSION"),        // Service version
     "production",                    // Environment
 );
 

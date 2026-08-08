@@ -993,10 +993,25 @@ impl StreamHandle for PostgresStreamHandle {
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
-            // Always use the backstop as the per-query ceiling — it prevents indefinite
-            // hangs without shrinking to near-zero as the outer budget drains.
-            // The outer timeout_ms contract is enforced by the elapsed-time check below.
-            let poll_timeout = Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS);
+            // What this budget means depends on the transport; see
+            // `PgOutputMessageProvider::waits_for_data`.
+            //
+            // A query-based provider gets the backstop, because for it the value is a
+            // ceiling on server-side work and shrinking it as the outer budget drains just
+            // provokes spurious timeouts and a shrinking decode window.
+            //
+            // A provider that blocks on a socket gets the caller's **remaining** budget,
+            // because for it the value is dead time on an idle stream. Handing it the 30 s
+            // backstop made `next_events(250)` block for up to 30 s — the elapsed-time check
+            // below cannot help, since it only runs once the provider has already returned.
+            let poll_timeout = if self.provider.waits_for_data() {
+                timeout.saturating_sub(started.elapsed())
+            } else {
+                Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS)
+            };
+            // A zero budget still gets one attempt at whatever is already buffered, so a
+            // caller passing `timeout_ms = 0` polls without blocking rather than not at all.
+            let poll_timeout = poll_timeout.min(Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS));
 
             let requested_window = self.peek_window;
             let poll_outcome = self
@@ -1344,6 +1359,84 @@ mod tests {
     /// un-acked backlog on every call. So a peek that exceeds its `statement_timeout` is
     /// not a transient hiccup — the identical work is retried next poll and times out
     /// again. Asking for the same window forever is a livelock.
+    /// A provider that behaves like a push transport: it blocks for the whole budget and
+    /// then reports an empty, caught-up poll.
+    struct BlockingProvider {
+        /// Longest budget any single poll was handed.
+        longest_budget_ms: Arc<Mutex<u64>>,
+    }
+
+    #[async_trait]
+    impl PgOutputMessageProvider for BlockingProvider {
+        async fn poll_xlog_data(
+            &mut self,
+            _max: usize,
+            poll_timeout: std::time::Duration,
+        ) -> crate::core::Result<PollOutcome> {
+            {
+                let mut longest = self.longest_budget_ms.lock().await;
+                *longest = (*longest).max(poll_timeout.as_millis() as u64);
+            }
+            tokio::time::sleep(poll_timeout).await;
+            Ok(PollOutcome::Data(Vec::new()))
+        }
+
+        fn waits_for_data(&self) -> bool {
+            true
+        }
+
+        async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waiting_provider_is_never_handed_more_than_the_callers_budget() {
+        // Regression: the poll budget was always the 30 s backstop, on the reasoning that it
+        // is a *work ceiling* and the outer `timeout_ms` is enforced by an elapsed-time check
+        // afterwards. That holds for a query-based transport, which returns as soon as it has
+        // rows. It is badly wrong for a transport that blocks on a socket: the elapsed check
+        // only runs once the provider has returned, so `next_events(250)` blocked for up to
+        // 30 s per empty poll. Against a live server that turned a 4-second incremental
+        // snapshot into a 300-second one.
+        let longest_budget_ms = Arc::new(Mutex::new(0_u64));
+        let provider = BlockingProvider {
+            longest_budget_ms: Arc::clone(&longest_budget_ms),
+        };
+
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            1_000,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let started = std::time::Instant::now();
+        let events = handle.next_events(250).await.expect("poll completes");
+        let elapsed = started.elapsed();
+
+        assert!(events.is_empty());
+        let longest = *longest_budget_ms.lock().await;
+        assert!(
+            longest <= 250,
+            "a waiting provider must never be handed more than the caller asked for; got \
+             {longest}ms for a 250ms budget"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the call must respect its budget rather than the 30s backstop; took {elapsed:?}"
+        );
+    }
+
     struct SaturatedProvider {
         /// Largest window this server can decode inside the budget.
         max_decodable: usize,

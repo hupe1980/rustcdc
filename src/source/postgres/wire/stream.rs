@@ -12,8 +12,8 @@ use super::auth::{
     md5_password_response, parse_sasl_mechanisms, select_sasl_mechanism, ScramExchange,
 };
 use super::framing::{
-    read_message, render_error_response, render_tag, request_tls, startup_packet, take_i64,
-    take_u8, write_message, write_untagged, BackendMessage,
+    render_error_response, render_tag, request_tls, startup_packet, take_i64, take_u8,
+    write_message, write_untagged, BackendMessage, MessageReader,
 };
 use super::now_pg_timestamp;
 
@@ -152,6 +152,9 @@ pub(in crate::source::postgres) struct ReplicationParams<'a> {
 /// A live logical replication stream.
 pub(in crate::source::postgres) struct ReplicationStream {
     socket: Socket,
+    /// Buffered framing. Owning the buffer is what makes a timed-out poll safe: a
+    /// partially-arrived message stays here instead of being lost mid-frame.
+    reader: MessageReader,
     slot_name: String,
     /// Highest LSN the consumer has durably persisted.
     applied_lsn: u64,
@@ -166,21 +169,35 @@ pub(in crate::source::postgres) struct ReplicationStream {
 
 impl ReplicationStream {
     /// Connect, authenticate, and issue `START_REPLICATION`.
+    ///
+    /// The timeout covers the **whole** setup sequence, not just the TCP connect. Every step
+    /// after it waits on a server reply — the TLS handshake, each authentication round trip,
+    /// `ReadyForQuery`, `CopyBothResponse` — and a server that accepts the connection and then
+    /// says nothing would otherwise hang here forever. That is not hypothetical: a host
+    /// silently dropped by a firewall mid-handshake, an overloaded server that accepts into a
+    /// backlog it never services, or a TCP proxy pointed at a dead backend all produce exactly
+    /// that shape, and an indefinite hang at startup is indistinguishable from a slow
+    /// database.
     pub(in crate::source::postgres) async fn connect(params: ReplicationParams<'_>) -> Result<Self> {
-        let socket = tokio::time::timeout(
-            params.connect_timeout,
-            Self::open_socket(params.host, params.port, params.transport),
-        )
-        .await
-        .map_err(|_| {
-            Error::SourceError(format!(
-                "timed out after {:?} connecting a replication stream to {}:{}",
-                params.connect_timeout, params.host, params.port
-            ))
-        })??;
+        let connect_timeout = params.connect_timeout;
+        let endpoint = format!("{}:{}", params.host, params.port);
+
+        tokio::time::timeout(connect_timeout, Self::establish(params))
+            .await
+            .map_err(|_| {
+                Error::SourceError(format!(
+                    "timed out after {connect_timeout:?} establishing a replication stream to                      {endpoint}. The connection was not refused, so the server accepted it and                      then stopped responding — check for a firewall dropping the session                      mid-handshake, a saturated server, or a proxy pointed at a dead backend.                      Raise PostgresSourceConfig::conn_timeout_secs if the server is merely slow."
+                ))
+            })?
+    }
+
+    /// The setup sequence, wrapped by [`Self::connect`]'s timeout.
+    async fn establish(params: ReplicationParams<'_>) -> Result<Self> {
+        let socket = Self::open_socket(params.host, params.port, params.transport).await?;
 
         let mut stream = Self {
             socket,
+            reader: MessageReader::new(),
             slot_name: params.slot_name.to_string(),
             applied_lsn: params.start_lsn,
             last_status_sent: tokio::time::Instant::now(),
@@ -467,27 +484,51 @@ impl ReplicationStream {
 
     /// Read one WAL message, or `None` if `timeout` expired first.
     ///
+    /// A `timeout` of zero means "whatever is already buffered, without waiting", which is
+    /// how a caller drains a batch after the first record has arrived.
+    ///
     /// Keepalives that demand a reply are answered here rather than surfaced, so the caller
     /// never has to think about `wal_sender_timeout`.
-    pub(in crate::source::postgres) async fn recv(&mut self, timeout: Duration) -> Result<Option<WalMessage>> {
+    ///
+    /// # Cancellation
+    ///
+    /// The timeout wraps only the socket **fill**, never frame decoding. `read` consumes
+    /// nothing when cancelled and a partially-arrived frame stays in the buffer, so an
+    /// expired budget leaves the connection exactly where it was. Wrapping a field-by-field
+    /// read instead would discard bytes mid-frame and desynchronise the stream permanently.
+    pub(in crate::source::postgres) async fn recv(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<WalMessage>> {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            // Feedback must keep flowing even while no WAL arrives, or the server concludes
-            // the client is gone. This is checked before each read rather than only after
-            // one returns, because a quiet database produces no reads to hang the check on.
-            self.send_status_update_if_due(false).await?;
+            // Anything already buffered is returned before considering the budget, so a
+            // zero-timeout drain still makes progress.
+            let buffered = self.reader.try_decode()?;
 
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(None);
-            }
+            let message = match buffered {
+                Some(message) => message,
+                None => {
+                    // Feedback must keep flowing even while no WAL arrives, or the server
+                    // concludes the client is gone. Checked here rather than only after a
+                    // successful read, because a quiet database produces no reads to hang
+                    // the check on.
+                    self.send_status_update_if_due(false).await?;
 
-            let message =
-                match tokio::time::timeout(remaining, read_message(&mut self.socket)).await {
-                    Err(_) => return Ok(None),
-                    Ok(result) => result?,
-                };
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    match tokio::time::timeout(remaining, self.reader.fill(&mut self.socket)).await
+                    {
+                        Err(_) => return Ok(None),
+                        Ok(result) => result?,
+                    }
+                    continue;
+                }
+            };
 
             match message.tag {
                 tag::COPY_DATA => {
@@ -614,7 +655,7 @@ impl ReplicationStream {
     /// Read a backend message, turning `ErrorResponse` into an error and skipping notices.
     async fn read_backend_message(&mut self) -> Result<BackendMessage> {
         loop {
-            let message = read_message(&mut self.socket).await?;
+            let message = self.reader.read_message(&mut self.socket).await?;
             match message.tag {
                 tag::ERROR_RESPONSE => {
                     return Err(Error::SourceError(format!(

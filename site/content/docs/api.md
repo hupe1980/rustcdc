@@ -182,9 +182,10 @@ let event = Event::builder("users", Operation::Insert)
 assert!(event.validate().is_ok());
 ```
 
-This is not ceremony for its own sake. Every field added to the envelope used to be a breaking
-change for every construction site — it broke this crate's own published adapter SDK example in
-0.7.0. With `#[non_exhaustive]` plus a builder, adding a field is a minor-version change.
+This is not ceremony for its own sake. Without `#[non_exhaustive]` plus a builder, every field
+added to the envelope is a breaking change at every construction site — including the ones in
+your code and in this crate's own adapter SDK examples. With them, adding a field is a
+minor-version change.
 
 The builder also sets `envelope_version` for you. Writing that constant by hand is not a
 compile error but makes the event fail validation at the far end of the pipeline, which is a
@@ -505,6 +506,11 @@ runtime-driven incremental snapshot startup (when configured via
 If you want connector-managed non-blocking incremental snapshot behavior,
 you can also start it directly from a connector connection via
 `start_incremental_snapshot(...)`.
+
+Tables can be added to a snapshot **while the pipeline runs** with
+`CdcRuntime::request_incremental_snapshot(tables)` — no restart, and no signal table in the
+source, so it works against a read-only role. See
+[on-demand snapshots](@/docs/config-reference.md#on-demand-snapshots).
 
 ```rust
 # #[cfg(feature = "postgres")]
@@ -1212,10 +1218,10 @@ multiply.
 
 ### The schema you register must be the schema you write
 
-With `auto_register = false` — the safer-looking setting, and the one a careful operator
-picks in a managed Kafka environment — the encoder previously took the registry's schema
-**id** and then encoded the payload with rustcdc's own schema. If the two differed, every
-message said "decode me with schema X" while carrying bytes written under schema Y.
+With `auto_register = false` — the safer-looking setting, and the one a careful operator picks
+in a managed Kafka environment — the encoder takes the schema **id** from the registry. It must
+also encode the payload with *that* schema, not with its own: if the two differ, every message
+says "decode me with schema X" while carrying bytes written under schema Y.
 
 **Avro binary carries no field names or types.** It is positional and untagged, so a
 mismatch does not fail to decode. It silently yields shifted fields and plausible-looking
@@ -1350,9 +1356,9 @@ Registry errors carry the right retryability instead of all collapsing into one 
 | malformed Confluent framing | `Terminal` | **these exact bytes will never decode** |
 | Avro / JSON deserialisation failure | `Terminal` | same |
 
-The last two matter most: framing and deserialisation failures used to surface as
-`SourceError`, which classifies as `Transient` — "safe to retry with backoff" — so an
-embedder following the crate's own guidance retried a message that cannot ever succeed.
+The last two matter most. Classified as `Transient` — "safe to retry with backoff" — they would
+send an embedder following the crate's own guidance into retrying a message that can never
+succeed. Malformed bytes do not become well-formed on the next attempt.
 
 ### Protobuf
 

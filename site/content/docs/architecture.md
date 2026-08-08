@@ -128,6 +128,13 @@ guarantees. Advancing at read time instead would make a cursor durable before it
 anywhere, and a restart would resume *after* rows that were never emitted — up to `chunk_size`
 rows missing from the snapshot, with no error and no counter to notice it by.
 
+Tables can be added to a running snapshot with
+`CdcRuntime::request_incremental_snapshot` — see
+[on-demand snapshots](@/docs/config-reference.md#on-demand-snapshots). Because such a table is not
+in the static config, the driver also **adopts unfinished tables from the checkpoint** on startup:
+the config is the initial set, the checkpoint is the record of work actually in flight, and
+without that a runtime request would look honoured and then silently stop at the next restart.
+
 This algorithm is implemented **once**, in `IncrementalSnapshotDriver`. A connector supplies
 only the database-specific half through `IncrementalSnapshotBackend`: the position type, the
 watermark query, the chunk read, event position extraction, and the offset encoding. The three
@@ -138,23 +145,71 @@ built-in connectors go through that interface, and so can yours — see
 
 ### PostgreSQL
 
-- stream decoding uses `pg_logical_slot_peek_binary_changes` with `pgoutput` format, over an
-  ordinary connection — **not** the streaming replication protocol. `tokio-postgres` exposes no
-  `CopyBoth` / replication-mode API and no published crate supplies one, so `START_REPLICATION`
-  is not reachable from here. The consequences are real and worth planning around:
-  - the peek is **non-consuming**, and PostgreSQL begins decoding at the slot's `restart_lsn`
-    while only *emitting* past `confirmed_flush_lsn`. A long-running transaction on the source
-    pins `restart_lsn`, so every poll re-scans the gap between the two. Keep an eye on
-    `pg_replication_slots.restart_lsn` versus `confirmed_flush_lsn`, not just on slot lag
-  - delivery latency is bounded by the poll interval rather than pushed by the server
-  - acknowledging promptly is what keeps the gap small: the slot advances on
-    `confirm_lsn`, and a consumer that defers acks makes each subsequent poll more expensive
-- each poll call is bounded by a per-call timeout; slow or stalled queries are
-  cancelled server-side via `CancelRequest` so the connection is always returned
-  to a ready state before the next poll
-- a poll that exceeds its budget **halves** the decode window rather than retrying the same
-  work, converging on a single change. A timed-out peek is explicitly *not* reported as an idle
-  slot — the opposite is true — so it can never be mistaken for permission to advance the slot
+A PostgreSQL stream opens **two** connections, for two different jobs: `tokio-postgres` for
+ordinary SQL (slot and publication introspection, snapshot chunk reads, catalog lookups), and
+rustcdc's own replication client for the WAL stream. Both derive their TLS configuration from
+the same `TransportConfig`, so they cannot disagree about what they verify or whether they are
+encrypted.
+
+#### WAL transport
+
+`WalTransport::StreamingReplication` (the default) runs `START_REPLICATION ... LOGICAL` over the
+streaming replication protocol — the mechanism PostgreSQL's own subscribers and `pg_recvlogical`
+use. The server pushes WAL as it is written, and progress is reported back with Standby Status
+Updates.
+
+- rustcdc implements the wire protocol itself (`source::postgres::wire`): startup, the TLS
+  upgrade, SCRAM-SHA-256 / MD5 / cleartext authentication, the `CopyBoth` loop, and feedback.
+  `tokio-postgres` exposes no `CopyBoth` or replication-mode API, so the protocol is
+  unreachable through it; the published crate that does implement it declares `rustls` without
+  `default-features = false`, which would force rustls's `aws-lc-rs` provider across the whole
+  build beside the `ring` backend this crate standardises on — and Cargo unifies features, so a
+  dependent cannot opt out. Roughly 900 lines of stable, well-specified protocol was the cheaper
+  side of that trade.
+- `proto_version '1'` is negotiated, matching what the pgoutput decoder implements. Asking for
+  more would make the server send v2 streaming and v3 two-phase messages the decoder
+  deliberately rejects rather than silently mishandles.
+- Framing is **buffered**, and a poll's time budget wraps only the socket fill, never frame
+  decoding. Reading fields straight off the socket under a timeout is not cancel-safe: a budget
+  expiring between a message's tag and its payload discards bytes that have already left the
+  kernel, and every later read is then misaligned — a permanent, silent desynchronisation.
+- A poll blocks for the **first** record, then takes only what is already buffered. Waiting the
+  full budget once data has arrived would make every record wait for the last one, turning a
+  push transport back into a polling one.
+- `confirm_lsn` sends its Standby Status Update immediately when the position advances rather
+  than deferring to the status interval. `confirmed_flush_lsn` is what releases WAL, and that is
+  the one thing a replication slot must not sit on.
+
+`WalTransport::SqlPeek` reads the same slot with `pg_logical_slot_peek_binary_changes` over an
+ordinary connection. It needs neither the `REPLICATION` role attribute nor a direct connection,
+which makes it the fallback where those cannot be arranged — at a real cost:
+
+- the peek is **non-consuming**: `pg_logical_slot_get_changes_guts` begins reading at the slot's
+  `restart_lsn` on every call and only *emits* past `confirmed_flush_lsn`, so each poll re-reads
+  from the slot's restart point rather than continuing. A long-running transaction on the source
+  pins `restart_lsn` and widens that span, so it is worth watching against `pg_current_wal_lsn()`
+  — though how expensive the re-read becomes depends on whether that WAL is still cached, which
+  [measured performance](@/docs/reliability-testing.md#measured-performance) does not settle
+- delivery latency is bounded by the poll interval rather than pushed by the server. **Note
+  this does not make it slower in every case:** measured on a small backlog with no
+  long-running transaction, `SqlPeek` shows a *lower* p50 than streaming, because it polls in
+  tight, small batches. Its disadvantage is structural rather than constant — the re-scan cost
+  grows with the gap between `restart_lsn` and `confirmed_flush_lsn`, and that gap is set by
+  the source's workload, not by rustcdc. See
+  [measured performance](@/docs/reliability-testing.md#measured-performance)
+- each poll is bounded by a server-side `statement_timeout` so the connection is always returned
+  to a ready state, and a poll that exceeds its budget **halves** the decode window rather than
+  repeating identical work. A timed-out peek is explicitly *not* reported as an idle slot — the
+  opposite is true — so it can never be mistaken for permission to advance the slot
+- startup repairs a checkpoint sitting ahead of `confirmed_flush_lsn` with
+  `pg_replication_slot_advance`. Streaming replication needs no equivalent, because the resume
+  LSN is a `START_REPLICATION` parameter — and attempting it there would fail anyway, since
+  PostgreSQL refuses to advance a slot an active walsender holds
+
+The two transports share the decoder, event construction, table filtering and checkpointing;
+only the route the bytes take differs. `tests/postgres_wal_transport_parity_integration.rs`
+captures one workload through both and asserts the resulting events — including each change's
+LSN — are identical, so their checkpoints stay interchangeable.
 - runtime tracks in-memory and persisted LSN progress
 - replication slot advancement follows durable commit progression
 - startup guards detect slot/checkpoint divergence

@@ -37,23 +37,23 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
         ])
         .start()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -71,7 +71,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
             ",
         )
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
 
@@ -88,6 +88,11 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 
@@ -106,7 +111,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     admin_client
         .batch_execute("TRUNCATE TABLE public.runtime_users;")
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     for id in 1_i64..=100_i64 {
         admin_client
@@ -115,7 +120,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     let first_batch = poll_non_empty_batch(&mut runtime, 40).await?;
@@ -135,15 +140,43 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
         .ok_or_else(|| rustcdc::Error::StateError("checkpoint should exist after commit".into()))?;
     let saved_offset = PostgresOffset::from_bytes(&saved.encode()?)?;
     let target_lsn = format_pg_lsn(saved_offset.lsn);
+
+    // Release the runtime **before** touching the slot out of band. Under
+    // `WalTransport::StreamingReplication` — the default — a walsender holds the slot for
+    // the whole life of the stream, and PostgreSQL refuses
+    // `pg_replication_slot_advance` on an active slot ("replication slot is active for PID
+    // N"). Under the older SQL-peek transport nothing held it, so this ordering did not
+    // matter; it does now, and the same constraint applies to any operator script that
+    // advances or drops a slot a pipeline is reading.
+    drop(runtime);
+
     let advance_sql = format!(
         "SELECT end_lsn::text FROM pg_replication_slot_advance('rustcdc_runtime_slot', '{target_lsn}'::pg_lsn)"
     );
-    admin_client
-        .query_one(&advance_sql, &[])
-        .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-
-    drop(runtime);
+    // Closing the socket and the server reaping the walsender are not synchronous, so the
+    // first attempt can still land while the slot is marked active.
+    let mut advanced = None;
+    for _ in 0..40 {
+        match admin_client.query_one(&advance_sql, &[]).await {
+            Ok(row) => {
+                advanced = Some(row);
+                break;
+            }
+            Err(error) => {
+                if !error.to_string().contains("is active") {
+                    return Err(rustcdc::Error::SourceError(rustcdc::render_error_chain(
+                        &error,
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    }
+    advanced.ok_or_else(|| {
+        rustcdc::Error::StateError(
+            "the replication slot stayed active after the runtime was dropped".into(),
+        )
+    })?;
 
     let mut resumed = CdcRuntime::new(
         RuntimeConfig::new(
@@ -164,7 +197,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     let second_batch = poll_non_empty_batch(&mut resumed, 40).await?;

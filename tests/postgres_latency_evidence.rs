@@ -117,6 +117,11 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
+        // The test container runs with `ssl = off`, so the transport must say so.
+        // Left at the default (TLS), `build_connect_config` now sets `sslmode=require`
+        // and the connection is refused rather than silently downgraded — which is the
+        // point of that change, and the reason this line has to be explicit.
+        transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
 

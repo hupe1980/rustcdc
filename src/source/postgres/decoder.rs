@@ -467,6 +467,28 @@ pub(super) trait PgOutputMessageProvider: Send + Sync {
         max_messages: usize,
         poll_timeout: Duration,
     ) -> Result<PollOutcome>;
+
+    /// Whether `poll_timeout` is time spent **waiting for data to arrive**.
+    ///
+    /// The two transports mean different things by that argument, and conflating them costs
+    /// either throughput or latency:
+    ///
+    /// * For the SQL-peek provider it is a ceiling on **server-side work** — a
+    ///   `statement_timeout` on a query that returns the moment it has rows. A generous
+    ///   ceiling is therefore free, and a tight one is actively harmful: a peek that exceeds
+    ///   it is reported as `TimedOut` and halves the decode window, so passing a short
+    ///   caller budget would shrink the window toward one change per poll on any server
+    ///   that is momentarily slow. It returns `false`.
+    /// * For the streaming provider it is how long to **block on the socket**. The server
+    ///   pushes when it has WAL and says nothing when it does not, so a generous ceiling is
+    ///   not free at all — it is dead time. Given the 30 s backstop, a caller asking for
+    ///   250 ms would wait up to 30 s per empty poll, violating the `StreamHandle` contract
+    ///   that `timeout_ms` bounds the call. It returns `true`, and the caller passes the
+    ///   remaining budget instead.
+    fn waits_for_data(&self) -> bool {
+        false
+    }
+
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()>;
     /// Advance the replication slot to the current WAL LSN during idle periods.
     ///

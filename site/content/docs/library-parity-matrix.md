@@ -61,6 +61,9 @@ Status values:
 | Example/build matrix across sources | Prevents connector-specific integration drift | Implemented | .github/workflows/ci.yml, scripts/ci-policy-gate.sh, examples/ |
 | Connector version-compatibility test depth | Reduces production surprises on engine upgrades | Implemented (connector-specific depth varies) | tests/postgres_version_matrix.rs |
 | Resume-coordinate correctness under non-default server options | The coordinate a checkpoint records is only as good as the server option it was captured under, and the defaults hide the failures | Implemented | tests/mysql_binlog_compression_integration.rs (`binlog_transaction_compression = ON`), tests/sqlserver_window_truncation_integration.rs (two capture instances, truncated window), src/checkpoint/mod.rs (`stream_position_regression`) |
+| PostgreSQL streaming replication protocol (`START_REPLICATION ... LOGICAL`) | The mechanism logical replication was designed around; the SQL alternative re-reads WAL on every poll and cannot be pushed | Implemented | src/source/postgres/wire/, tests/postgres_wal_transport_parity_integration.rs (parity with `SqlPeek`, SCRAM-SHA-256, MD5, checkpoint resume) |
+| Incremental snapshot that never writes to the source | A snapshot needing write access to the captured database is refused outright in many environments (read replicas, least-privilege roles, regulated estates) | Implemented — read-only **by construction** on all three connectors. Watermarks come from the source's own log coordinate (`pg_current_wal_lsn`, `SHOW MASTER STATUS`/`SHOW BINARY LOG STATUS`, `sys.fn_cdc_get_max_lsn`), so nothing is inserted into the source. Debezium's default incremental snapshot writes markers to a signal table and needs a separate read-only variant (MySQL + GTID only) to avoid it. | src/source/incremental_snapshot/driver.rs, src/source/{postgres,mysql,sqlserver}/incremental_snapshot.rs |
+| Incremental snapshot survives a mid-flight reconnect | A snapshot of a large table spans a long window; any transient disconnect inside it must not lose progress | Implemented | tests/postgres_incremental_snapshot_reconnect_integration.rs (terminates the walsender mid-snapshot and asserts completion without duplicates) |
 
 ## Intentional Non-Goals (Do Not Gate Library Releases)
 
@@ -77,9 +80,12 @@ they belong in an honest matrix because they shape the operational envelope:
 
 | Limit | Consequence | Why it stands |
 |---|---|---|
-| PostgreSQL decoding goes through `pg_logical_slot_peek_binary_changes`, not the streaming replication protocol (`START_REPLICATION`) | Each poll re-reads WAL from the slot's `restart_lsn`, so a long-running transaction on the source that pins `restart_lsn` far behind `confirmed_flush_lsn` makes every poll re-scan that gap. Latency is also bounded by the poll interval rather than pushed. | `tokio-postgres` exposes no `CopyBoth` / replication-mode API, and no published crate supplies one for it. Comparators in other languages (Debezium via the PGJDBC replication API, pglogrepl, wal2json consumers) all use the streaming protocol. Mitigated, not solved: the poll window halves on each timeout so a saturated server still makes forward progress instead of stalling. |
 | SQL Server capture is polling-based | p99 latency ≈ `stream_poll_interval_ms` plus the capture agent's own delay | Inherent to SQL Server CDC; no log-reading interface exists. Do not compare its latency numbers against the log-based connectors. |
 | MySQL binlog timestamps have whole-second resolution | Any lag figure derived from `SourceMetadata::timestamp` over-reports by up to 1 000 ms (median ~480 ms) | The binlog common header carries seconds. PostgreSQL and SQL Server both carry microsecond commit timestamps and are exact. |
+| PostgreSQL streaming replication does not implement SCRAM channel binding (`SCRAM-SHA-256-PLUS`) | A server that offers *only* `-PLUS` cannot be authenticated by the streaming transport; use `WalTransport::SqlPeek`, which authenticates through `tokio-postgres` | Certificate verification is on by default (`verify_full`) and `sslmode=require` is enforced, so the MITM channel binding defends against already needs a certificate chaining to a trusted root for the right hostname. The residual risk is a downgrade, which is logged when the server advertises `-PLUS`. |
+| `SqlPeek` fallback is 4–5× slower than the default transport | Environments that cannot grant a replication connection pay a measured 4–5× on capture time, and each poll re-reads WAL from the slot's `restart_lsn` rather than continuing from the last position | Inherent to `pg_logical_slot_peek_binary_changes` being non-consuming. Numbers and method: [measured performance](@/docs/reliability-testing.md#measured-performance) |
+| No pgoutput `proto_version '2'` streaming of in-progress transactions | PostgreSQL buffers a transaction server-side until commit, spilling past `logical_decoding_work_mem` (64 MB default) to `pg_replslot/<slot>/`. A very large transaction causes disk churn on the primary and delivers as a burst. Bounded and observable via `pg_stat_replication_slots`. | v2 moves the buffering to the client, which must hold each transaction until `Stream Commit` and discard it on `Stream Abort`. Mishandling the abort emits changes the source rolled back. **Debezium's pgoutput decoder also negotiates `proto_version 1` and handles the same ten v1 message types**, so this is a shared frontier rather than a deficit. Mitigations: [config reference](@/docs/config-reference.md#large-transactions-spill-on-the-server). |
+| No two-phase-commit (`PREPARE TRANSACTION`) decoding on PostgreSQL | Prepared transactions are decoded at `COMMIT PREPARED`, not at `PREPARE` | Follows from `proto_version '1'`, and **Debezium does not decode them either**. rustcdc additionally *rejects* v3 messages rather than letting them fall through unhandled, so a plugin mismatch is loud instead of a silent misreading of transaction boundaries. Relevant only to workloads using explicit 2PC on the source. |
 
 ## Current Completeness Verdict
 
@@ -88,8 +94,9 @@ For embedded-library scope, rustcdc is release-viable with conditions:
 	must confirm connector-specific restart evidence remains current.
 - Should-have set is broadly implemented; remaining risk is concentrated in deployment-specific policy tuning and continuous evidence rigor.
 - The architectural limits above are documented rather than closed, and a deployment whose
-	workload sits against one of them (a PostgreSQL source with long-running transactions, a
-	latency SLO below the SQL Server poll interval) should be evaluated against it explicitly.
+	workload sits against one of them (a latency SLO below the SQL Server poll interval, a
+	PostgreSQL server that requires SCRAM channel binding) should be evaluated against it
+	explicitly.
 
 ## Release Decision Rules
 
@@ -97,7 +104,7 @@ Use these rules during audit and release gates:
 1. Block release if any Must-have is Missing.
 2. Block release if a Must-have is Partial and can cause incorrect runtime behavior or incorrect integration assumptions.
 3. Do not block release on Non-goals.
-4. Track Should-have items on roadmap unless they become reliability prerequisites.
+4. Do not block a release on a Should-have item unless it has become a reliability prerequisite.
 
 ## Governance And Update Cadence
 

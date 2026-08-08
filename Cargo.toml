@@ -24,21 +24,9 @@ resolver = "2"
 default = ["postgres", "tls"]
 # Enable PostgreSQL-specific source implementations.
 #
-# Two clients, for two different jobs:
-#
-# * `tokio-postgres` for ordinary SQL — slot and publication introspection, snapshot chunk
-#   reads, catalog lookups.
-# * rustcdc's own replication client (`source::postgres::wire`) for the WAL stream. It
-#   exists because `tokio-postgres` exposes no `CopyBoth`/replication-mode API, so
-#   `START_REPLICATION ... LOGICAL` is unreachable through it, and the published crate that
-#   does implement it declares `rustls` without `default-features = false` — which would
-#   force rustls's `aws-lc-rs` provider on across the whole build and pull in `aws-lc-sys`
-#   next to the `ring` backend this crate standardises on. Cargo unifies features, so that
-#   is not something a dependent can opt out of. Owning ~900 lines of well-specified wire
-#   protocol keeps one crypto backend and one TLS stack. See `WalTransport`.
-#
-# `hmac` and `base64` are shared with the `encryption` feature; SCRAM-SHA-256 needs both,
-# plus `sha2`, which is already unconditional.
+# Two clients: `tokio-postgres` for ordinary SQL, and rustcdc's own replication client
+# (`source::postgres::wire`) for the WAL stream, because `tokio-postgres` exposes no
+# replication-mode API. `hmac`/`base64` are for its SCRAM-SHA-256, `md-5` for MD5 auth.
 postgres = [
     "dep:tokio-postgres",
     "dep:tokio-postgres-rustls",
@@ -122,9 +110,7 @@ aes-gcm = { version = "0.11", optional = true }
 base64 = { version = "0.23", optional = true }
 hkdf = { version = "0.13", optional = true }
 hmac = { version = "0.13", optional = true }
-# MD5 password authentication. Deprecated by PostgreSQL but still the configured method on
-# plenty of existing servers, and a streaming transport that cannot authenticate where the
-# SQL transport can would be a silent downgrade.
+# MD5 password authentication: deprecated by PostgreSQL, still configured on many servers.
 md-5 = { version = "0.11", optional = true }
 opentelemetry = { version = "0.32", features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "rt-tokio"], optional = true }
@@ -165,6 +151,7 @@ tracing-subscriber = { version = "0.3.20", features = ["fmt", "std", "json"] }
 reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls"] }
 wasm-bindgen = "0.2.105"
 wat = "1.240.0"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 
 [[bench]]
 name = "quality_perf"

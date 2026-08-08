@@ -19,6 +19,41 @@ policy in CI on every pull request.
   SQL Server. `trust_cert()` disables the entire chain check, which is a strictly larger
   concession than relaxing hostname verification; conflating the two would silently
   discard the operator's configured CA.
+- **PostgreSQL sets `sslmode=require` whenever the transport is TLS.** `tokio-postgres`
+  defaults to `prefer`, which falls back to an unencrypted connection when the server
+  refuses the SSL request — a configuration that says TLS and delivers plaintext, visible
+  only in a packet capture. Both connections a PostgreSQL stream opens (SQL and
+  replication) enforce this and build their rustls configuration from the same
+  `TransportConfig`, so they cannot disagree about what they verify. A server that refuses TLS
+  fails the connection rather than being silently downgraded.
+
+## Authentication code this crate owns
+
+The PostgreSQL replication transport authenticates itself (`source::postgres::wire::auth`)
+rather than through a client library, because `tokio-postgres` cannot open a replication
+connection at all. That puts a **SCRAM-SHA-256 implementation inside this crate**, so it is
+called out here rather than left to be discovered:
+
+- **SCRAM-SHA-256** (RFC 5802 / RFC 7677) is the primary method. `Hi`, the client proof and
+  the server signature are each asserted against the published RFC 7677 test vectors, not
+  against themselves.
+- **The server signature is verified.** Skipping that check is the common shortcut, and it
+  leaves the exchange authenticating the client to the server but not the reverse. The
+  comparison is constant-time.
+- **The server nonce is checked to extend the client nonce**, which is what makes a
+  replayed or substituted server-first message fail. The client nonce is 24 bytes from
+  rustls's CSPRNG — no separate RNG dependency was added, so there is one secure random
+  source to audit rather than two.
+- **`SCRAM-SHA-256-PLUS` (TLS channel binding) is not implemented.** The residual risk is a
+  downgrade: an attacker positioned to intercept could advertise only `SCRAM-SHA-256`. That
+  position already requires a certificate chaining to a trusted root for the right hostname,
+  since verification is on by default and cannot be disabled on this connector. When a
+  server advertises `-PLUS` the connector logs that a stronger mechanism was available, so
+  the downgrade is not silent. A server that offers *only* `-PLUS` is refused with an error
+  naming `WalTransport::SqlPeek`, which authenticates through `tokio-postgres`.
+- **MD5** is supported because servers still run it, and logs a warning each time: the
+  stored digest is a password equivalent, and PostgreSQL has deprecated the method.
+- **Cleartext** is refused unless the transport is TLS.
 
 ## Secrets
 

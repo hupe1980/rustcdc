@@ -97,10 +97,10 @@ match runtime.poll_event_batch().await {
 }
 ```
 
-> **Match on `ErrorKind`, not on message text.** Backpressure previously surfaced as
-> `Error::StateError`, which maps to `ErrorKind::Terminal` — documented as *"a permanent
-> problem that retrying will not resolve"*. An embedder following that guidance would shut
-> the pipeline down on entirely routine buffer pressure. It now has its own kind so the
+> **Match on `ErrorKind`, not on message text.** Backpressure has its own kind,
+> `ErrorKind::Backpressure`, precisely so it is not confused with `Terminal` — *"a permanent
+> problem that retrying will not resolve"*. Treating routine buffer pressure as terminal shuts
+> a healthy pipeline down. Its own kind means the
 > two are distinguishable.
 
 ### Limiting batch size in bytes

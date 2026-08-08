@@ -1,6 +1,52 @@
 use super::*;
 
 impl CdcRuntime {
+    /// Re-open the source stream after a reconnect, preserving the capture mode.
+    ///
+    /// This exists because `start_stream` and `start_incremental_snapshot` return *different
+    /// shapes of stream*, and a reconnect must reproduce the one `start()` chose. An
+    /// incremental snapshot is delivered by a driver that **wraps** the log stream: it owns
+    /// the per-table chunk cursors and reports them through
+    /// [`StreamHandle::incremental_snapshot_state`], which is what puts them in every
+    /// checkpoint record.
+    ///
+    /// Reconnecting with a plain `start_stream` therefore did two damaging things at once, and
+    /// neither was visible:
+    ///
+    /// 1. The snapshot **stopped progressing**. The driver was gone, so no further chunk was
+    ///    ever read and the snapshot never completed.
+    /// 2. Worse, a plain stream reports no snapshot state, so every checkpoint written after
+    ///    the reconnect **erased the progress record**. A later restart then found no snapshot
+    ///    in flight at all — the un-read tables were neither resumed nor reported missing.
+    ///
+    /// Any transient network error during an incremental snapshot reached this path, and a
+    /// snapshot of a large table is a long window. Mirroring `start()`'s choice is the whole
+    /// fix; the resume offset already carries the cursors, so the rebuilt driver picks up
+    /// exactly where the old one left off.
+    async fn resume_stream_after_reconnect(
+        &mut self,
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn crate::source::StreamHandle>> {
+        // Both futures are boxed rather than awaited inline. `poll_event_batch`'s state
+        // machine already holds a lot across await points, and inlining
+        // `start_incremental_snapshot` — which builds a backend, describes every table and
+        // constructs the driver — pushed the composed future past the default 2 MiB test
+        // thread stack and aborted with a stack overflow. Boxing moves each branch's state to
+        // the heap, so the caller's future stays small.
+        //
+        // Cloned first so the `self.source` borrow below does not overlap `self.config`.
+        match self.config.incremental_snapshot.clone() {
+            Some(incremental) => {
+                Box::pin(
+                    self.source
+                        .start_incremental_snapshot(incremental, resume_from),
+                )
+                .await
+            }
+            None => Box::pin(self.source.start_stream(resume_from)).await,
+        }
+    }
+
     /// Poll the next batch of events.
     ///
     /// Returns an **empty batch** when nothing is available within the poll budget —
@@ -173,7 +219,7 @@ impl CdcRuntime {
                                  since the last durable checkpoint"
                                 ))
                             })?;
-                        match self.source.start_stream(resume_offset.as_deref()).await {
+                        match self.resume_stream_after_reconnect(resume_offset.as_deref()).await {
                             Ok(new_stream) => {
                                 self.stream = Some(new_stream);
                                 tracing::info!(
@@ -241,12 +287,20 @@ impl CdcRuntime {
                                 "recoverable source error; reconnecting and retrying stream poll",
                             );
                             metrics.record_error(&error, "runtime.poll.stream_retry");
-                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
 
-                            // Drop the dead stream handle and reconnect the source, resuming
-                            // from the last durable checkpoint offset to preserve at-least-once
-                            // delivery without data loss.
+                            // Drop the dead stream handle **before** backing off, not after.
+                            // For a source that holds a server-side resource for the life of
+                            // the stream — a PostgreSQL replication slot is held by its
+                            // walsender until the socket closes — the backoff is exactly the
+                            // window the server needs to release it. Sleeping first and then
+                            // closing means the reconnect races the server's own cleanup and
+                            // is refused ("replication slot is active for PID N"), burning an
+                            // attempt on every retry.
+                            //
+                            // Resuming afterwards uses the last durable checkpoint offset, so
+                            // at-least-once delivery is preserved with no data loss.
                             self.stream = None;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                             if let Err(_elapsed) = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(30),
                                 self.source.close(),
@@ -283,7 +337,10 @@ impl CdcRuntime {
                                              durable checkpoint"
                                         ))
                                     })?;
-                                match self.source.start_stream(resume_offset.as_deref()).await {
+                                match self
+                                    .resume_stream_after_reconnect(resume_offset.as_deref())
+                                    .await
+                                {
                                     Ok(new_stream) => {
                                         self.stream = Some(new_stream);
                                         tracing::info!(

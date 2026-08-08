@@ -7,11 +7,187 @@ what breaks and what to do about it.
 
 ## 0.10.0
 
-A correctness release. Four defects, three of them **silent data loss**, found by auditing the
-resume coordinate of each connector against what the source actually guarantees about it — and
-each one now has a regression test that fails without the fix, three of them against a live
-server. There is no new feature here and no API to migrate; the breaking part is that one class
-of corrupt checkpoint write is now refused instead of accepted.
+A correctness release, plus the one architectural gap the previous release documented rather
+than closed.
+
+Six defects, three of them **silent data loss** and one a **security downgrade**, found by
+auditing the resume coordinate of each connector against what the source actually guarantees
+about it. Every one has a regression test that fails without its fix, most of them against a
+live server.
+
+### New: on-demand snapshots — `CdcRuntime::request_incremental_snapshot`
+
+Snapshot additional tables on a **running** pipeline, without a restart:
+
+```rust
+runtime.request_incremental_snapshot(vec!["public.orders".to_string()]).await?;
+```
+
+This is the equivalent of Debezium's `execute-snapshot` signal, and it needs none of the
+machinery: no signal table in the source, so it works against a read-only role and a read replica.
+Use it to backfill a table just added to the publication, rebuild a downstream store, or re-run
+history through a corrected transform. The live stream is never paused — new tables are chunked
+into it exactly like the configured ones, under the same watermark suppression.
+
+A table not tracked is added and read from the start; one already in progress is a **no-op**, so
+retrying a request is safe; one already complete is rewound and read again. Every name is resolved
+against the catalog before anything is mutated, so a typo fails the whole call rather than
+half-applying it.
+
+Requests are **durable**. Because a requested table is not in `with_incremental_snapshot`'s static
+list, the driver now also adopts *unfinished* tables from the checkpoint on startup: the config is
+the initial set, the checkpoint is the record of work in flight. Without that the request would
+look honoured and then silently stop at the next restart. Finished tables are deliberately not
+adopted, so a completed snapshot is never repeated.
+
+Pause, resume and stop are not implemented; a snapshot runs to completion or is abandoned by
+clearing the checkpoint. New: `StreamHandle::request_snapshot_tables` (default returns
+`NotImplemented`).
+
+### `with_incremental_snapshot` never worked through `CdcRuntime`
+
+The first commit containing an incremental-snapshot row failed with
+`StateError("snapshot events are pending commit but snapshot handle is unavailable")`.
+
+`start()` deliberately leaves `self.snapshot` as `None` for an incremental snapshot, because the
+driver *is* the stream — there is no separate handle. But the commit path demanded one whenever a
+pending row carried snapshot metadata, so the very first acknowledgement failed. The feature was
+usable only by driving the `StreamHandle` directly, which is exactly what its tests did, so a
+green suite reported a working feature that no `CdcRuntime` embedder could use.
+
+The commit path now distinguishes the two kinds of snapshot. A **bulk** snapshot persists progress
+through connector-native state and still requires its handle — a missing one with rows pending is
+a real state error. An **incremental** snapshot needs no write here at all: its chunk cursors ride
+inside the stream's own offset, which the commit barrier already writes in the same atomic record
+as the stream position.
+
+### An incremental snapshot silently stopped after a reconnect
+
+The reconnect path rebuilt the stream with `start_stream`, ignoring
+`RuntimeConfig::incremental_snapshot`. Since an incremental snapshot is delivered by a driver that
+*wraps* the log stream, that dropped the driver and did two damaging things at once, neither
+visible:
+
+1. The snapshot **stopped progressing** — no further chunk was read, so it never completed.
+2. A plain stream reports no snapshot state, so every checkpoint written afterwards **erased the
+   progress record**. A later restart found no snapshot in flight at all, and the un-read tables
+   were neither resumed nor reported missing.
+
+Any transient network error during a snapshot reached this path, and a snapshot of a large table is
+a long window.
+
+*Measured with the fix reverted:* killing the walsender 25 rows into a 400-row snapshot left it
+stuck at 25 forever. `tests/postgres_incremental_snapshot_reconnect_integration.rs` provokes the
+disconnect the way production does — `pg_terminate_backend` on the walsender — and asserts the
+snapshot still completes with no duplicates.
+
+Boxing was required alongside the fix: inlining `start_incremental_snapshot` into
+`poll_event_batch`'s already-large future pushed it past the default 2 MiB thread stack and
+aborted with a stack overflow. Both branches of the resume helper are `Box::pin`ned.
+
+### PostgreSQL now uses the streaming replication protocol
+
+`WalTransport::StreamingReplication` is the new default: `START_REPLICATION ... LOGICAL` over
+the streaming replication protocol, the mechanism PostgreSQL's own subscribers and
+`pg_recvlogical` use. The server pushes WAL as it is written and progress is reported with
+Standby Status Updates.
+
+The previous transport, `pg_logical_slot_peek_binary_changes`, is **non-consuming**: PostgreSQL
+begins decoding at the slot's `restart_lsn` and only *emits* past `confirmed_flush_lsn`, so any
+long-running transaction on the source pinned `restart_lsn` and every poll re-read the WAL gap
+between the two. Latency was also bounded by the poll interval rather than pushed. It remains
+available as `WalTransport::SqlPeek`, because it needs neither the `REPLICATION` role attribute
+nor a direct connection — the fallback for a managed service that withholds one or a connection
+that must route through a pooler. Selecting it logs a warning naming the trade-off.
+
+**rustcdc implements the wire protocol itself** (`source::postgres::wire`, ~900 lines): startup,
+TLS upgrade, SCRAM-SHA-256 / MD5 / cleartext authentication, the `CopyBoth` loop, and feedback.
+`tokio-postgres` exposes no `CopyBoth` or replication-mode API, so the protocol is unreachable
+through it; the published crate that does implement it declares `rustls` without
+`default-features = false`, which would force rustls's `aws-lc-rs` provider across the whole
+build next to the `ring` backend this crate standardises on — and Cargo unifies features, so a
+dependent cannot opt out. One crypto backend was worth more than the saved lines.
+
+Two things caught while building it, both worth knowing if you are implementing this yourself:
+
+- **Framing has to be buffered.** A poll has a time budget, so the read must be cancellable, and
+  reading a message field by field under a timeout is not cancel-safe: a budget expiring between
+  a message's tag and its payload discards bytes that have already left the kernel, and every
+  later read is misaligned. The timeout now wraps only the socket fill; decoding consumes only
+  complete frames.
+- **A poll must block for the first record, then stop.** Waiting the full budget once data has
+  arrived makes every record wait for the last one. Against a live server that was the
+  difference between a 4-second and a 94-second parity run.
+
+New: `WalTransport`, `PostgresSourceConfig::wal_transport`. `tests/postgres_wal_transport_parity_integration.rs`
+captures one workload through both transports and asserts the resulting events — LSNs included —
+are identical, so their checkpoints stay interchangeable, and covers SCRAM-SHA-256, MD5 and
+checkpoint resume against live servers.
+
+### Breaking: `TransportConfig::Tls` now actually requires TLS on PostgreSQL
+
+`tokio-postgres` defaults to `sslmode=prefer`, which **silently falls back to an unencrypted
+connection** when the server refuses the SSL request, and rustcdc never overrode it. A connector
+configured for TLS against a server with `ssl = off` therefore sent credentials and change data
+in the clear, with no error and no warning — detectable only with a packet capture. Every
+PostgreSQL integration suite in this repository was running that way, which is how invisible it
+was.
+
+`sslmode=require` is now set on both connections whenever the transport is TLS, and the
+replication transport enforces the same rule in its own handshake.
+
+**What breaks:** a deployment pointing a TLS-configured connector at a server without TLS now
+fails to connect instead of quietly downgrading. Either enable TLS on the server or state
+`TransportConfig::plaintext()` explicitly.
+
+### PostgreSQL: connect could hang forever on a server that went silent
+
+`ReplicationStream::connect` wrapped only the TCP connect in `conn_timeout_secs`. Everything
+after it waits on a server reply — the TLS handshake, each authentication round trip,
+`ReadyForQuery`, `CopyBothResponse` — so a server that accepted the connection and then stopped
+responding hung startup indefinitely, with no diagnostic. A firewall dropping the session
+mid-handshake, a server accepting into a backlog it never services, and a TCP proxy pointed at a
+dead backend all produce exactly that shape, and an indefinite hang is indistinguishable from a
+slow database.
+
+The timeout now covers the whole setup sequence, and the error names the likely causes. Found by
+writing the test for it: `wire::tests::a_connect_timeout_is_reported_against_the_configured_budget`.
+
+### Reconnect: the dead stream is now dropped before the backoff, not after
+
+For a source that holds a server-side resource for the life of its stream — a PostgreSQL
+replication slot is held by its walsender until the socket closes — the backoff window is
+exactly the time the server needs to release it. Closing *after* sleeping made every reconnect
+race the server's own cleanup and get refused with *"replication slot is active for PID N"*,
+burning an attempt each time. Ordinary retry eventually succeeded, so this cost recovery time
+rather than correctness.
+
+### An in-process fake replication server
+
+`source::postgres::wire::tests` drives the real client against a scripted server over loopback,
+covering what neither the byte-level unit tests nor the container suites can:
+
+- **The TLS path end to end** — SSLRequest, the rustls handshake, and reading WAL back through
+  the TLS socket. The container suites run with `ssl = off`, because provisioning a server
+  certificate with the ownership PostgreSQL demands inside a throwaway image is awkward; a fake
+  server presents one in-process instead.
+- **Cancel safety under a split frame.** The server writes a message's tag and length, waits,
+  then writes the payload, while the client's poll budget expires in between. Provoking that
+  against a real server means winning a race.
+- **Protocol failures a healthy server will not produce on demand** — an `ErrorResponse` instead
+  of `CopyBothResponse`, a server declining the TLS upgrade, a cleartext password request over an
+  unencrypted connection (refused), and a silent server (the hang above).
+
+Ten tests, no Docker, 0.4 s. `rcgen` is a new **dev**-dependency for the certificate, pinned to
+`ring` with default features off so it cannot drag in a second crypto backend.
+
+### Breaking: an out-of-band slot operation needs the pipeline stopped first
+
+Under streaming replication a walsender holds the replication slot for the life of the stream,
+and PostgreSQL refuses `pg_replication_slot_advance` or `pg_drop_replication_slot` on an active
+slot. `CdcRuntime::stop()` releases it; an operator script that advances or drops a slot must
+run after that, not alongside a live pipeline. This did not apply to the SQL-peek transport,
+where nothing held the slot persistently.
 
 ### MySQL: transaction compression corrupted the resume position
 
@@ -622,8 +798,9 @@ itself. Passing the full path to the latter produced a doubled URL and a 404 —
 comment said only "registry base URL".
 
 **AWS Glue remains untested against a live service.** Its framing and identity are
-unit-tested, but there is no self-hostable implementation to point a container at, so it
-stays an explicit gap in FINDINGS.md rather than something the suite implies it covers.
+unit-tested, but there is no self-hostable implementation to point a container at, so the
+absence of live coverage is stated in `site/content/docs/api.md` rather than left for a reader
+to infer from a green suite.
 
 ### Evidence labelling
 

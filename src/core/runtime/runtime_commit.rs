@@ -204,7 +204,24 @@ impl CdcRuntime {
             return Ok(());
         }
 
+        // Two kinds of snapshot reach this point, and only one needs a write here.
+        //
+        // A **bulk** snapshot persists its progress through connector-native state, so its
+        // handle must checkpoint explicitly — and a missing handle with snapshot rows pending
+        // is a genuine state error worth refusing.
+        //
+        // An **incremental** snapshot has no handle at all: `start()` leaves `self.snapshot`
+        // as `None` because the driver *is* the stream. Its chunk cursors ride inside the
+        // stream's own offset (see `buffer_and_deliver`, which uses `add_boxed_event` for
+        // snapshot rows), so the commit barrier already writes them in the same atomic record
+        // as the stream position. Demanding a handle for both meant the **first commit of any
+        // incremental-snapshot row failed**, which made `with_incremental_snapshot`
+        // unusable through `CdcRuntime` — the feature worked only when driving the
+        // `StreamHandle` directly, which is what its tests did.
         let Some(snapshot) = self.snapshot.as_ref() else {
+            if self.config.incremental_snapshot.is_some() {
+                return Ok(());
+            }
             let error = Error::StateError(
                 "snapshot events are pending commit but snapshot handle is unavailable".into(),
             );

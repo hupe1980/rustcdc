@@ -43,37 +43,128 @@ pub(super) struct BackendMessage {
     pub(super) payload: Vec<u8>,
 }
 
-/// Read one tagged backend message.
-pub(super) async fn read_message<S>(stream: &mut S) -> Result<BackendMessage>
-where
-    S: AsyncRead + Unpin,
-{
-    let tag = stream.read_u8().await.map_err(io_error)?;
-    let declared = stream.read_i32().await.map_err(io_error)?;
+/// An incremental, cancel-safe reader for tagged backend messages.
+///
+/// # Why this is buffered rather than reading fields straight off the socket
+///
+/// A replication poll has a time budget, so the read has to be cancellable. Reading a
+/// message field by field directly from the socket is **not** cancel-safe: a timeout that
+/// fires between the tag and the payload discards bytes that have already left the kernel,
+/// and the next read then interprets payload bytes as a tag and length. That desynchronises
+/// the connection permanently, and it does so silently — the failure surfaces later as a
+/// nonsensical message length or a decode error with no relation to the real cause.
+///
+/// Buffering separates the two concerns. Filling the buffer is cancel-safe because
+/// `AsyncReadExt::read` consumes nothing when cancelled, and decoding only ever consumes a
+/// **complete** frame, so a partially-arrived message simply stays in the buffer until the
+/// next attempt.
+pub(super) struct MessageReader {
+    buffer: Vec<u8>,
+}
 
-    // The length includes its own four bytes. Anything below that is malformed, and
-    // trusting it would underflow the payload size.
-    let payload_len = usize::try_from(declared)
-        .ok()
-        .and_then(|len| len.checked_sub(4))
-        .ok_or_else(|| {
-            Error::SourceError(format!(
-                "postgres message with tag {} declared an impossible length {declared}",
-                render_tag(tag)
-            ))
-        })?;
+impl MessageReader {
+    /// Buffer capacity. Sized so a batch of WAL records is typically assembled from one
+    /// syscall rather than one per record.
+    const READ_CHUNK: usize = 64 * 1024;
 
-    if payload_len > MAX_MESSAGE_LEN {
-        return Err(Error::SourceError(format!(
-            "postgres message with tag {} declared {payload_len} bytes, beyond the \
-             {MAX_MESSAGE_LEN}-byte sanity limit; the connection is desynchronised",
-            render_tag(tag)
-        )));
+    pub(super) fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(Self::READ_CHUNK),
+        }
     }
 
-    let mut payload = vec![0u8; payload_len];
-    stream.read_exact(&mut payload).await.map_err(io_error)?;
-    Ok(BackendMessage { tag, payload })
+    /// Decode a complete message if one is buffered, without touching the socket.
+    ///
+    /// Returns `Ok(None)` when more bytes are needed — never a partial consume.
+    pub(super) fn try_decode(&mut self) -> Result<Option<BackendMessage>> {
+        // Tag plus a four-byte length is the minimum framing.
+        if self.buffer.len() < 5 {
+            return Ok(None);
+        }
+
+        let tag = self.buffer[0];
+        let declared = i32::from_be_bytes(
+            self.buffer[1..5]
+                .try_into()
+                .expect("slice of exactly four bytes"),
+        );
+
+        // The length includes its own four bytes. Anything below that is malformed, and
+        // trusting it would underflow the payload size into an enormous allocation.
+        let payload_len = usize::try_from(declared)
+            .ok()
+            .and_then(|len| len.checked_sub(4))
+            .ok_or_else(|| {
+                Error::SourceError(format!(
+                    "postgres message with tag {} declared an impossible length {declared}",
+                    render_tag(tag)
+                ))
+            })?;
+
+        if payload_len > MAX_MESSAGE_LEN {
+            return Err(Error::SourceError(format!(
+                "postgres message with tag {} declared {payload_len} bytes, beyond the \
+                 {MAX_MESSAGE_LEN}-byte sanity limit; the connection is desynchronised",
+                render_tag(tag)
+            )));
+        }
+
+        let frame_len = payload_len + 5;
+        if self.buffer.len() < frame_len {
+            return Ok(None);
+        }
+
+        let payload = self.buffer[5..frame_len].to_vec();
+        self.buffer.drain(..frame_len);
+        Ok(Some(BackendMessage { tag, payload }))
+    }
+
+    /// Read more bytes from the socket into the buffer.
+    ///
+    /// Cancel-safe: `read` consumes nothing if the caller drops this future, so a timeout
+    /// leaves the buffer exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SourceError`] on I/O failure, or when the peer closed the
+    /// connection with a partial frame buffered.
+    pub(super) async fn fill<S>(&mut self, stream: &mut S) -> Result<()>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut chunk = [0u8; Self::READ_CHUNK];
+        let read = stream.read(&mut chunk).await.map_err(io_error)?;
+        if read == 0 {
+            return Err(Error::SourceError(format!(
+                "postgres closed the replication connection{}",
+                if self.buffer.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with {} bytes of an incomplete message buffered", self.buffer.len())
+                }
+            )));
+        }
+        self.buffer.extend_from_slice(&chunk[..read]);
+        Ok(())
+    }
+
+    /// Read one complete message, filling the buffer as needed.
+    ///
+    /// **Not** cancel-safe as a whole — cancelling loses nothing from the socket, but the
+    /// caller must not rely on the message being re-readable. Use it only where a partial
+    /// wait cannot happen (connection setup); on the metered poll path, drive
+    /// [`Self::try_decode`] and [`Self::fill`] separately so the timeout wraps only the fill.
+    pub(super) async fn read_message<S>(&mut self, stream: &mut S) -> Result<BackendMessage>
+    where
+        S: AsyncRead + Unpin,
+    {
+        loop {
+            if let Some(message) = self.try_decode()? {
+                return Ok(message);
+            }
+            self.fill(stream).await?;
+        }
+    }
 }
 
 /// Write a tagged frontend message, computing the length prefix.
@@ -254,7 +345,10 @@ mod tests {
             .expect("writes");
 
         let mut cursor = std::io::Cursor::new(buffer);
-        let message = read_message(&mut cursor).await.expect("reads");
+        let message = MessageReader::new()
+            .read_message(&mut cursor)
+            .await
+            .expect("reads");
         assert_eq!(message.tag, b'Q');
         assert_eq!(message.payload, b"START_REPLICATION");
     }
@@ -266,7 +360,10 @@ mod tests {
         let mut buffer = Vec::new();
         write_message(&mut buffer, b'c', b"").await.expect("writes");
         let mut cursor = std::io::Cursor::new(buffer);
-        let message = read_message(&mut cursor).await.expect("reads");
+        let message = MessageReader::new()
+            .read_message(&mut cursor)
+            .await
+            .expect("reads");
         assert_eq!(message.tag, b'c');
         assert!(message.payload.is_empty());
     }
@@ -276,7 +373,10 @@ mod tests {
         // `len - 4` on a declared length of 0 underflows to a colossal allocation.
         let framed = [b'E', 0, 0, 0, 0];
         let mut cursor = std::io::Cursor::new(framed.to_vec());
-        let error = read_message(&mut cursor).await.expect_err("must reject");
+        let error = MessageReader::new()
+            .read_message(&mut cursor)
+            .await
+            .expect_err("must reject");
         assert!(error.to_string().contains("impossible length"));
     }
 
@@ -285,8 +385,81 @@ mod tests {
         let mut framed = vec![b'd'];
         framed.extend_from_slice(&i32::MAX.to_be_bytes());
         let mut cursor = std::io::Cursor::new(framed);
-        let error = read_message(&mut cursor).await.expect_err("must reject");
+        let error = MessageReader::new()
+            .read_message(&mut cursor)
+            .await
+            .expect_err("must reject");
         assert!(error.to_string().contains("desynchronised"));
+    }
+
+    #[test]
+    fn a_partially_arrived_frame_is_never_consumed() {
+        // The property the whole buffered design exists for. A poll budget can expire at any
+        // byte boundary; if `try_decode` consumed a partial frame the next decode would read
+        // payload bytes as a tag and length, and the connection would be silently
+        // desynchronised from then on.
+        let mut framed = Vec::new();
+        framed.push(b'd');
+        framed.extend_from_slice(&(4 + 10_i32).to_be_bytes());
+        framed.extend_from_slice(b"0123456789");
+
+        // Feed the frame one byte at a time; nothing may decode until the last byte.
+        let mut reader = MessageReader::new();
+        for (index, byte) in framed.iter().enumerate() {
+            reader.buffer.push(*byte);
+            let decoded = reader.try_decode().expect("no error on a partial frame");
+            if index + 1 < framed.len() {
+                assert!(
+                    decoded.is_none(),
+                    "a frame must not decode until all {} bytes have arrived (had {})",
+                    framed.len(),
+                    index + 1
+                );
+            } else {
+                let message = decoded.expect("the complete frame decodes");
+                assert_eq!(message.tag, b'd');
+                assert_eq!(message.payload, b"0123456789");
+            }
+        }
+        assert!(
+            reader.buffer.is_empty(),
+            "consuming a frame must leave no residue"
+        );
+    }
+
+    #[test]
+    fn back_to_back_frames_in_one_read_all_decode() {
+        // A single socket read commonly carries several WAL records. Decoding must drain
+        // them without another read, or throughput collapses to one record per syscall.
+        let mut reader = MessageReader::new();
+        for payload in [b"aaa".as_slice(), b"bb".as_slice(), b"c".as_slice()] {
+            reader.buffer.push(b'd');
+            reader
+                .buffer
+                .extend_from_slice(&(4 + payload.len() as i32).to_be_bytes());
+            reader.buffer.extend_from_slice(payload);
+        }
+
+        let mut decoded = Vec::new();
+        while let Some(message) = reader.try_decode().expect("decodes") {
+            decoded.push(message.payload);
+        }
+        assert_eq!(decoded, vec![b"aaa".to_vec(), b"bb".to_vec(), b"c".to_vec()]);
+        assert!(reader.buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_with_a_partial_frame_buffered_says_so() {
+        // Distinguishes an orderly close from a truncated message, which are very different
+        // things to see in a log during an incident.
+        let mut reader = MessageReader::new();
+        reader.buffer.extend_from_slice(&[b'd', 0, 0, 1]);
+        let mut empty = std::io::Cursor::new(Vec::new());
+        let error = reader.fill(&mut empty).await.expect_err("must error");
+        assert!(
+            error.to_string().contains("incomplete message"),
+            "the error must name the truncation: {error}"
+        );
     }
 
     #[test]
@@ -304,6 +477,58 @@ mod tests {
              than `true`: {rendered:?}"
         );
         assert!(packet.ends_with(&[0]), "the parameter list must be terminated");
+    }
+
+    /// A duplex stream: reads come from `reply`, writes accumulate for inspection.
+    ///
+    /// A single `Cursor` cannot stand in for a socket here — `request_tls` writes before it
+    /// reads, and a cursor's write would overwrite the very reply the test staged.
+    fn server_replying(reply: &[u8]) -> tokio::io::Join<std::io::Cursor<Vec<u8>>, Vec<u8>> {
+        tokio::io::join(std::io::Cursor::new(reply.to_vec()), Vec::new())
+    }
+
+    #[tokio::test]
+    async fn the_tls_request_reads_a_bare_reply_byte_not_a_framed_message() {
+        // The reply to an SSLRequest is the one place in the protocol where the server sends
+        // a single byte with no length prefix. Reading it as a framed message would consume
+        // three bytes of whatever follows, and the failure would surface as something
+        // unrelated to the actual mistake.
+        let mut agreed = server_replying(b"S");
+        assert!(request_tls(&mut agreed).await.expect("reads reply"));
+
+        let mut declined = server_replying(b"N");
+        assert!(!request_tls(&mut declined).await.expect("reads reply"));
+    }
+
+    #[tokio::test]
+    async fn a_non_postgres_reply_to_the_tls_request_is_refused() {
+        // 'E' means the server rejected the packet outright; anything else means the endpoint
+        // is not speaking the PostgreSQL protocol. Either way, continuing into a TLS
+        // handshake produces a misleading error.
+        let mut hostile = server_replying(b"E");
+        let error = request_tls(&mut hostile).await.expect_err("must refuse");
+        assert!(
+            error.to_string().contains("may not be a PostgreSQL server"),
+            "the error must point at the endpoint rather than at TLS: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tls_request_packet_carries_the_documented_magic_code() {
+        // The "version" is a magic number, not a protocol version. Sending 3.0 here asks for
+        // an ordinary startup instead of a TLS upgrade, and the connection proceeds
+        // unencrypted while the caller believes it negotiated TLS.
+        let mut stream = server_replying(b"N");
+        let _ = request_tls(&mut stream).await.expect("reads reply");
+
+        let (_, written) = stream.into_inner();
+        assert_eq!(written.len(), 8, "the SSLRequest packet is exactly 8 bytes");
+        assert_eq!(&written[..4], &8_i32.to_be_bytes(), "length includes itself");
+        assert_eq!(
+            &written[4..],
+            &80_877_103_i32.to_be_bytes(),
+            "the magic SSLRequest code, not a protocol version"
+        );
     }
 
     #[test]

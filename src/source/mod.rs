@@ -373,6 +373,39 @@ pub trait StreamHandle: Send + Sync {
     async fn requeue_events(&mut self, _events: Vec<Event>) -> Result<()> {
         Ok(())
     }
+    /// Add tables to an in-flight incremental snapshot.
+    ///
+    /// This is the library equivalent of Debezium's `execute-snapshot` signal: it backfills a
+    /// table on a **running** pipeline, without a restart and without a signal table in the
+    /// source. Reach for it when a table is added to the publication, when a downstream store
+    /// needs rebuilding, or when a bad transform has to be re-run over history.
+    ///
+    /// Returns the number of tables actually enqueued.
+    ///
+    /// # Semantics
+    ///
+    /// * A table **not currently tracked** is added and read from the start.
+    /// * A table **already in progress** is left alone, so the call is idempotent. Restarting
+    ///   it mid-flight would re-deliver rows the consumer already has.
+    /// * A table **already complete** is reset and read again — the re-snapshot case above.
+    ///
+    /// The call is atomic: every reference is resolved against the catalog first, so a bad
+    /// table name fails without half-applying the request.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`Error::NotImplemented`]: a handle that is not
+    /// driving an incremental snapshot has nothing to add tables to, and silently accepting
+    /// the request would report a backfill that never happens.
+    async fn request_snapshot_tables(&mut self, _tables: Vec<String>) -> Result<usize> {
+        Err(crate::core::Error::NotImplemented(
+            "this stream is not running an incremental snapshot, so tables cannot be added to \
+             one. Configure RuntimeConfig::with_incremental_snapshot to enable on-demand \
+             snapshots."
+                .into(),
+        ))
+    }
+
     /// Confirm that all messages up to `lsn` have been durably consumed.
     /// Prevents WAL retention bloat on replication slots.
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()>;

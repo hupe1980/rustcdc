@@ -29,6 +29,8 @@
 mod auth;
 mod framing;
 mod stream;
+#[cfg(test)]
+mod tests;
 
 pub(in crate::source::postgres) use stream::{ReplicationParams, ReplicationStream, WalMessage};
 
@@ -50,7 +52,7 @@ fn now_pg_timestamp() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod timestamp_tests {
     use super::*;
 
     #[test]

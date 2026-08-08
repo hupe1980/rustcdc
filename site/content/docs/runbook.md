@@ -56,6 +56,21 @@ If your deployment does not provide these wrappers, see [Deployment](@/docs/depl
 
 ## PostgreSQL Source Management
 
+> **The default WAL transport holds the replication slot.** `WalTransport::StreamingReplication`
+> keeps a walsender attached for the life of the stream, and PostgreSQL refuses
+> `pg_replication_slot_advance` and `pg_drop_replication_slot` on an active slot
+> (`SQLSTATE 55006`, *"replication slot is active for PID N"*). Every slot procedure below
+> therefore stops the pipeline first — that ordering is load-bearing, not tidiness. The server
+> reaps the walsender a moment after the socket closes, so retry briefly if the first attempt
+> still reports the slot active. `SELECT slot_name, active, active_pid FROM
+> pg_replication_slots;` shows the holder.
+>
+> The connecting role also needs the **`REPLICATION`** attribute and a direct connection; a
+> pooler in transaction-pooling mode cannot carry a replication stream. Where neither can be
+> arranged, `WalTransport::SqlPeek` reads the same slot over an ordinary connection — see
+> [`wal_transport`](@/docs/config-reference.md#wal-transport) for what that costs.
+
+
 ### Replication Slot Setup
 
 **Prerequisites:**

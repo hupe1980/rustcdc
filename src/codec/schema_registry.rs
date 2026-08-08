@@ -2585,8 +2585,9 @@ pub mod glue {
         /// In-memory stand-in for AWS Glue.
         ///
         /// Glue has no self-hostable implementation, so there is no container to point a
-        /// live suite at — the gap FINDINGS.md states explicitly. What *is* verifiable
-        /// without AWS is everything rustcdc owns: the Avro conversion, the 18-byte
+        /// live suite at; the absence of live coverage is stated in the API docs rather
+        /// than left to be inferred. What *is* verifiable without AWS is everything
+        /// rustcdc owns: the Avro conversion, the 18-byte
         /// framing, the compression byte, schema-version identity, and the round trip.
         /// Only the AWS transport itself stays unexercised, and that belongs to `schemreg`.
         #[derive(Default)]
