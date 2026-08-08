@@ -78,7 +78,6 @@ impl CdcRuntime {
         Ok(enqueued)
     }
 
-
     /// Return the current lifecycle state.
     pub fn state(&self) -> RuntimeState {
         self.state

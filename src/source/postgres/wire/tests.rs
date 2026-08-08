@@ -131,7 +131,10 @@ where
     let tag = stream.read_u8().await.expect("client message tag");
     let len = stream.read_i32().await.expect("client message length");
     let mut payload = vec![0u8; (len - 4) as usize];
-    stream.read_exact(&mut payload).await.expect("client payload");
+    stream
+        .read_exact(&mut payload)
+        .await
+        .expect("client payload");
     (tag, payload)
 }
 
@@ -252,7 +255,11 @@ async fn spawn_server(
     tls: Option<TestTls>,
     auth: Auth,
     behaviour: Behaviour,
-) -> (u16, Option<rustls::ClientConfig>, tokio::task::JoinHandle<Observed>) {
+) -> (
+    u16,
+    Option<rustls::ClientConfig>,
+    tokio::task::JoinHandle<Observed>,
+) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("binds a loopback port");
@@ -293,11 +300,7 @@ async fn spawn_server(
     (port, client_tls, handle)
 }
 
-fn params<'a>(
-    port: u16,
-    transport: &'a TransportConfig,
-    start_lsn: u64,
-) -> ReplicationParams<'a> {
+fn params<'a>(port: u16, transport: &'a TransportConfig, start_lsn: u64) -> ReplicationParams<'a> {
     ReplicationParams {
         // "localhost" rather than the literal address so the certificate's SAN matches.
         host: "localhost",
@@ -377,7 +380,9 @@ async fn the_startup_packet_and_replication_command_reach_the_server_intact() {
         observed.startup_params
     );
     assert!(observed.startup_params.contains(&"user=cdc".to_string()));
-    assert!(observed.startup_params.contains(&"database=app".to_string()));
+    assert!(observed
+        .startup_params
+        .contains(&"database=app".to_string()));
 
     let query = &observed.replication_query;
     assert!(
@@ -445,8 +450,7 @@ async fn a_keepalive_demanding_a_reply_is_answered_without_the_caller_noticing()
     // Not answering costs the connection: the server concludes the client is gone once
     // `wal_sender_timeout` elapses. The reply must also carry the applied LSN, not zero,
     // or the server never learns it may release WAL.
-    let (port, _, server) =
-        spawn_server(None, Auth::None, Behaviour::DemandKeepaliveReply).await;
+    let (port, _, server) = spawn_server(None, Auth::None, Behaviour::DemandKeepaliveReply).await;
     let transport = TransportConfig::plaintext();
 
     let mut stream = ReplicationStream::connect(params(port, &transport, 0))
@@ -532,8 +536,7 @@ async fn a_server_that_refuses_replication_surfaces_its_own_reason() {
     // "Slot is active" is the error an operator actually hits — a second pipeline on one
     // slot. The SQLSTATE and message must survive rather than be replaced by a guess about
     // missing privileges.
-    let (port, _, server) =
-        spawn_server(None, Auth::None, Behaviour::RefuseReplication).await;
+    let (port, _, server) = spawn_server(None, Auth::None, Behaviour::RefuseReplication).await;
     let transport = TransportConfig::plaintext();
 
     let rendered = match ReplicationStream::connect(params(port, &transport, 0)).await {
@@ -594,8 +597,11 @@ async fn a_connect_timeout_is_reported_against_the_configured_budget() {
     // The socket connects immediately; the hang is in the startup exchange that follows, so
     // this asserts the timeout covers more than `TcpStream::connect`.
     let started = std::time::Instant::now();
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), ReplicationStream::connect(parameters)).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        ReplicationStream::connect(parameters),
+    )
+    .await;
     assert!(
         result.is_ok(),
         "connect must give up on its own rather than hang for the outer timeout"

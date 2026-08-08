@@ -178,7 +178,9 @@ impl ReplicationStream {
     /// backlog it never services, or a TCP proxy pointed at a dead backend all produce exactly
     /// that shape, and an indefinite hang at startup is indistinguishable from a slow
     /// database.
-    pub(in crate::source::postgres) async fn connect(params: ReplicationParams<'_>) -> Result<Self> {
+    pub(in crate::source::postgres) async fn connect(
+        params: ReplicationParams<'_>,
+    ) -> Result<Self> {
         let connect_timeout = params.connect_timeout;
         let endpoint = format!("{}:{}", params.host, params.port);
 
@@ -255,8 +257,8 @@ impl ReplicationStream {
         }
 
         let client_config = super::super::query::rustls_client_config(transport)?;
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| {
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
                 Error::ConfigError(format!(
                     "postgres host '{host}' is not a valid TLS server name"
                 ))
@@ -315,14 +317,15 @@ impl ReplicationStream {
                 }
 
                 auth_kind::MD5_PASSWORD => {
-                    let salt: [u8; 4] = body.get(..4).and_then(|s| s.try_into().ok()).ok_or_else(
-                        || {
-                            Error::SourceError(
-                                "postgres MD5 authentication request carried no 4-byte salt"
-                                    .into(),
-                            )
-                        },
-                    )?;
+                    let salt: [u8; 4] =
+                        body.get(..4)
+                            .and_then(|s| s.try_into().ok())
+                            .ok_or_else(|| {
+                                Error::SourceError(
+                                    "postgres MD5 authentication request carried no 4-byte salt"
+                                        .into(),
+                                )
+                            })?;
                     tracing::warn!(
                         target: "rustcdc::source::postgres",
                         "postgres is configured for MD5 password authentication, which it has \
@@ -516,8 +519,7 @@ impl ReplicationStream {
                     // the check on.
                     self.send_status_update_if_due(false).await?;
 
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);
                     }
@@ -637,7 +639,10 @@ impl ReplicationStream {
     /// is the honest answer: the only position that matters is the one the consumer has
     /// durably persisted, and reporting a *higher* write position would let the server
     /// release WAL the consumer has not committed.
-    pub(in crate::source::postgres) async fn send_status_update(&mut self, request_reply: bool) -> Result<()> {
+    pub(in crate::source::postgres) async fn send_status_update(
+        &mut self,
+        request_reply: bool,
+    ) -> Result<()> {
         let lsn = self.applied_lsn as i64;
         let mut payload = Vec::with_capacity(34);
         payload.push(copy_tag::STANDBY_STATUS_UPDATE);
@@ -695,7 +700,9 @@ fn read_i32(bytes: &mut &[u8]) -> Result<i32> {
 /// character set is restricted to what PostgreSQL itself permits in an unquoted identifier.
 fn validate_identifier(value: &str, what: &str) -> Result<()> {
     if value.is_empty() {
-        return Err(Error::ConfigError(format!("postgres {what} must not be empty")));
+        return Err(Error::ConfigError(format!(
+            "postgres {what} must not be empty"
+        )));
     }
     if value.len() > 63 {
         return Err(Error::ConfigError(format!(

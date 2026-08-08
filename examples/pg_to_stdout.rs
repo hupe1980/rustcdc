@@ -36,6 +36,11 @@ async fn main() -> rustcdc::Result<()> {
         // capture at the current WAL position and skips everything written since the
         // last confirmed position.
         create_replication_slot_if_missing: args.create_slot,
+        transport: if args.plaintext {
+            rustcdc::TransportConfig::plaintext()
+        } else {
+            rustcdc::TransportConfig::tls()
+        },
         ..PostgresSourceConfig::default()
     };
 
@@ -112,6 +117,12 @@ struct ExampleArgs {
     max_buffer_size: usize,
     poll_wait_ms: u64,
     conn_timeout_secs: u64,
+    /// Opt out of TLS. Defaults to `false`, so the example demonstrates the secure setting.
+    ///
+    /// A TLS transport now implies `sslmode=require`, so a server with `ssl = off` refuses the
+    /// connection instead of silently downgrading to cleartext. Local throwaway containers
+    /// usually have TLS off, which is why this exists — set `CDC_RS_PLAINTEXT=true` for one.
+    plaintext: bool,
 }
 
 #[cfg(feature = "postgres")]
@@ -129,6 +140,7 @@ impl ExampleArgs {
             database: env_or_default("CDC_RS_DB", "postgres"),
             replication_slot: env_or_default("CDC_RS_SLOT", "rustcdc_example_slot"),
             create_slot: env_or_default("CDC_RS_CREATE_SLOT", "true") != "false",
+            plaintext: env_or_default("CDC_RS_PLAINTEXT", "false") == "true",
             publication: env_or_default("CDC_RS_PUBLICATION", "rustcdc_example_pub"),
             snapshot_tables: env_or_default("CDC_RS_SNAPSHOT_TABLES", "public.users")
                 .split(',')

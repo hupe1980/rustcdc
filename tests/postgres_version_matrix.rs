@@ -140,7 +140,13 @@ async fn run_postgres_version_connection_test(
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
-        transport: TransportConfig::tls(),
+        // This matrix checks connector behaviour across server *versions*; the containers run
+        // with `ssl = off` and present no certificate. It previously said `tls()` and connected
+        // anyway, because `sslmode=prefer` silently fell back to plaintext — so a line that read
+        // as TLS coverage was providing none. `sslmode=require` is now set whenever the transport
+        // is TLS, which makes that impossible; TLS itself is covered by the connection suites and
+        // by `wire::tests`.
+        transport: TransportConfig::plaintext(),
         ..Default::default()
     };
 

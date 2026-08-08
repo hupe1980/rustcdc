@@ -61,8 +61,7 @@ mod timestamp_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock is after the unix epoch")
             .as_millis() as i64;
-        let round_tripped =
-            POSTGRES_EPOCH_UNIX_SECONDS * 1_000 + now_pg_timestamp() / 1_000;
+        let round_tripped = POSTGRES_EPOCH_UNIX_SECONDS * 1_000 + now_pg_timestamp() / 1_000;
         assert!(
             (round_tripped - unix_now_ms).abs() < 5_000,
             "a timestamp written for the server and read back must agree with the clock: \

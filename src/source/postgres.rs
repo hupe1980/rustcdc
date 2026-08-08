@@ -30,8 +30,8 @@ mod state;
 mod stream_messages;
 mod stream_start;
 mod streaming;
-mod wire;
 mod validation;
+mod wire;
 
 // Import decoder types used directly in this module.
 use self::decoder::{PgOutputMessageProvider, PgRelation};

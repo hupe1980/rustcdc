@@ -219,7 +219,10 @@ impl CdcRuntime {
                                  since the last durable checkpoint"
                                 ))
                             })?;
-                        match self.resume_stream_after_reconnect(resume_offset.as_deref()).await {
+                        match self
+                            .resume_stream_after_reconnect(resume_offset.as_deref())
+                            .await
+                        {
                             Ok(new_stream) => {
                                 self.stream = Some(new_stream);
                                 tracing::info!(

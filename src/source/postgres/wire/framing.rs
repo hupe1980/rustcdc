@@ -140,7 +140,10 @@ impl MessageReader {
                 if self.buffer.is_empty() {
                     String::new()
                 } else {
-                    format!(" with {} bytes of an incomplete message buffered", self.buffer.len())
+                    format!(
+                        " with {} bytes of an incomplete message buffered",
+                        self.buffer.len()
+                    )
                 }
             )));
         }
@@ -266,7 +269,10 @@ pub(super) fn render_error_response(payload: &[u8]) -> String {
         if field == 0 {
             break;
         }
-        let end = tail.iter().position(|byte| *byte == 0).unwrap_or(tail.len());
+        let end = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(tail.len());
         let value = String::from_utf8_lossy(&tail[..end]).into_owned();
         rest = tail.get(end + 1..).unwrap_or(&[]);
         match field {
@@ -307,7 +313,9 @@ pub(super) fn render_tag(tag: u8) -> String {
 }
 
 fn io_error(error: io::Error) -> Error {
-    Error::SourceError(format!("postgres replication connection I/O failed: {error}"))
+    Error::SourceError(format!(
+        "postgres replication connection I/O failed: {error}"
+    ))
 }
 
 /// Read a big-endian `i64` from the front of `bytes`, advancing it.
@@ -444,7 +452,10 @@ mod tests {
         while let Some(message) = reader.try_decode().expect("decodes") {
             decoded.push(message.payload);
         }
-        assert_eq!(decoded, vec![b"aaa".to_vec(), b"bb".to_vec(), b"c".to_vec()]);
+        assert_eq!(
+            decoded,
+            vec![b"aaa".to_vec(), b"bb".to_vec(), b"c".to_vec()]
+        );
         assert!(reader.buffer.is_empty());
     }
 
@@ -476,7 +487,10 @@ mod tests {
             "logical decoding is per-database, so `replication` must be `database` rather \
              than `true`: {rendered:?}"
         );
-        assert!(packet.ends_with(&[0]), "the parameter list must be terminated");
+        assert!(
+            packet.ends_with(&[0]),
+            "the parameter list must be terminated"
+        );
     }
 
     /// A duplex stream: reads come from `reply`, writes accumulate for inspection.
@@ -523,7 +537,11 @@ mod tests {
 
         let (_, written) = stream.into_inner();
         assert_eq!(written.len(), 8, "the SSLRequest packet is exactly 8 bytes");
-        assert_eq!(&written[..4], &8_i32.to_be_bytes(), "length includes itself");
+        assert_eq!(
+            &written[..4],
+            &8_i32.to_be_bytes(),
+            "length includes itself"
+        );
         assert_eq!(
             &written[4..],
             &80_877_103_i32.to_be_bytes(),

@@ -358,7 +358,9 @@ mod tests {
         // RFC 7677 §3: password "pencil", salt W22ZaJ0SNY7soEsUEjb6gQ==, i=4096.
         // SaltedPassword is the root of every other value in the exchange, so a wrong `Hi`
         // fails authentication with no clue as to why.
-        let salt = BASE64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").expect("vector salt");
+        let salt = BASE64
+            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")
+            .expect("vector salt");
         let salted = hi(b"pencil", &salt, 4096).expect("derives");
         assert_eq!(
             BASE64.encode(&salted),
@@ -372,7 +374,9 @@ mod tests {
         // Drives the real code path with the RFC's fixed nonce, so client proof and server
         // signature are both checked against published values rather than against
         // themselves.
-        let salt = BASE64.decode("W22ZaJ0SNY7soEsUEjb6gQ==").expect("vector salt");
+        let salt = BASE64
+            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")
+            .expect("vector salt");
         let salted = hi(b"pencil", &salt, 4096).expect("derives");
 
         let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
@@ -418,8 +422,7 @@ mod tests {
             .strip_prefix("n,,n=,r=")
             .expect("nonce present")
             .to_string();
-        let server_first =
-            format!("r={nonce}serverpart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+        let server_first = format!("r={nonce}serverpart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
         let client_final = exchange.client_final(&server_first).expect("continues");
 
         assert!(
@@ -446,9 +449,7 @@ mod tests {
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         let nonce = client_first.strip_prefix("n,,n=,r=").expect("nonce");
         exchange
-            .client_final(&format!(
-                "r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
-            ))
+            .client_final(&format!("r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
             .expect("continues");
 
         let error = exchange
@@ -462,9 +463,7 @@ mod tests {
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         let nonce = client_first.strip_prefix("n,,n=,r=").expect("nonce");
         exchange
-            .client_final(&format!(
-                "r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
-            ))
+            .client_final(&format!("r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
             .expect("continues");
         let signature = exchange
             .server_signature
@@ -481,9 +480,7 @@ mod tests {
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         let nonce = client_first.strip_prefix("n,,n=,r=").expect("nonce");
         exchange
-            .client_final(&format!(
-                "r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
-            ))
+            .client_final(&format!("r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
             .expect("continues");
         let error = exchange
             .verify_server_final("e=invalid-proof")
@@ -532,11 +529,9 @@ mod tests {
 
     #[test]
     fn scram_is_selected_and_a_plus_offer_is_reported() {
-        let choice = select_sasl_mechanism(&[
-            SCRAM_SHA_256_PLUS.to_string(),
-            SCRAM_SHA_256.to_string(),
-        ])
-        .expect("selects");
+        let choice =
+            select_sasl_mechanism(&[SCRAM_SHA_256_PLUS.to_string(), SCRAM_SHA_256.to_string()])
+                .expect("selects");
         assert_eq!(choice.mechanism, SCRAM_SHA_256);
         assert!(
             choice.plus_offered,
@@ -546,8 +541,8 @@ mod tests {
 
     #[test]
     fn a_plus_only_server_produces_an_actionable_error() {
-        let error = select_sasl_mechanism(&[SCRAM_SHA_256_PLUS.to_string()])
-            .expect_err("cannot satisfy");
+        let error =
+            select_sasl_mechanism(&[SCRAM_SHA_256_PLUS.to_string()]).expect_err("cannot satisfy");
         let rendered = error.to_string();
         assert!(rendered.contains(SCRAM_SHA_256_PLUS));
         assert!(

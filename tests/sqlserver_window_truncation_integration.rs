@@ -69,11 +69,13 @@ async fn sql_exec_with_retry(client: &mut SqlClient, sql: &str) -> rustcdc::Resu
 async fn a_window_truncated_across_two_capture_instances_loses_no_rows() -> rustcdc::Result<()> {
     const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-    tokio::time::timeout(TEST_TIMEOUT, run()).await.map_err(|_| {
-        rustcdc::Error::TimeoutError(
-            "sqlserver window-truncation integration exceeded 300s timeout".to_string(),
-        )
-    })?
+    tokio::time::timeout(TEST_TIMEOUT, run())
+        .await
+        .map_err(|_| {
+            rustcdc::Error::TimeoutError(
+                "sqlserver window-truncation integration exceeded 300s timeout".to_string(),
+            )
+        })?
 }
 
 async fn run() -> rustcdc::Result<()> {
@@ -112,7 +114,11 @@ async fn run() -> rustcdc::Result<()> {
             ),
         )
         .await?;
-        sql_exec(&mut admin, &format!("USE {DATABASE}; DELETE FROM dbo.{table}")).await?;
+        sql_exec(
+            &mut admin,
+            &format!("USE {DATABASE}; DELETE FROM dbo.{table}"),
+        )
+        .await?;
     }
 
     sqlserver_testkit::enable_cdc(&host, port, DATABASE).await?;

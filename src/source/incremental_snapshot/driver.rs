@@ -1263,8 +1263,7 @@ mod tests {
             Box::new(FakeStream {
                 batches: VecDeque::new(),
             }),
-            IncrementalSnapshotConfig::new(vec!["public.users".to_string()])
-                .with_chunk_size(3),
+            IncrementalSnapshotConfig::new(vec!["public.users".to_string()]).with_chunk_size(3),
             "test".to_string(),
             Some(mid_chunk),
         )
@@ -1360,14 +1359,19 @@ mod tests {
         let (mut driver, _) = driver_with(rows, vec![], 0, 2).await;
 
         let first = driver.next_events(10).await.expect("drive");
-        assert_eq!(first.len(), 2, "one chunk is delivered, so the table is mid-flight");
+        assert_eq!(
+            first.len(),
+            2,
+            "one chunk is delivered, so the table is mid-flight"
+        );
 
         let enqueued = driver
             .enqueue_tables(vec!["public.users".to_string()])
             .await
             .expect("request accepted");
         assert_eq!(
-            enqueued, 0,
+            enqueued,
+            0,
             "an in-progress table must not be re-enqueued: {:?}",
             driver.tables.len()
         );

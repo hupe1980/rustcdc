@@ -394,7 +394,7 @@ pub trait StreamHandle: Send + Sync {
     ///
     /// # Errors
     ///
-    /// The default implementation returns [`Error::NotImplemented`]: a handle that is not
+    /// The default implementation returns [`Error::NotImplemented`](crate::core::Error::NotImplemented): a handle that is not
     /// driving an incremental snapshot has nothing to add tables to, and silently accepting
     /// the request would report a backfill that never happens.
     async fn request_snapshot_tables(&mut self, _tables: Vec<String>) -> Result<usize> {

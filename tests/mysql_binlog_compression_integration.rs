@@ -133,7 +133,8 @@ async fn compressed_transactions_keep_a_resumable_binlog_position() -> rustcdc::
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let admin_pool = connect_admin_pool(&format!("mysql://root:rootpass@{host}:{port}/cdc")).await?;
+    let admin_pool =
+        connect_admin_pool(&format!("mysql://root:rootpass@{host}:{port}/cdc")).await?;
 
     // Confirm the server really is compressing, so a silent failure to enable the option
     // cannot turn this into a test that passes for the wrong reason.
@@ -242,7 +243,9 @@ async fn compressed_transactions_keep_a_resumable_binlog_position() -> rustcdc::
         resume_position,
         String::new(),
     );
-    let mut resumed = resumed_connection.start_stream(Some(&resume_offset)).await?;
+    let mut resumed = resumed_connection
+        .start_stream(Some(&resume_offset))
+        .await?;
 
     let after_restart = drain(&mut resumed, 1).await?;
     let payloads: Vec<String> = after_restart

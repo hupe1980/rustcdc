@@ -108,6 +108,9 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> rustcdc
 
     let mut child: Child = Command::new(&example_bin)
         .env("CDC_RS_HOST", host.to_string())
+        // The container runs with `ssl = off`; a TLS transport would now be refused outright
+        // rather than silently downgraded.
+        .env("CDC_RS_PLAINTEXT", "true")
         .env("CDC_RS_PORT", port.to_string())
         .env("CDC_RS_USER", "postgres")
         .env("CDC_RS_PASSWORD", "postgres")

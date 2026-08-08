@@ -351,7 +351,10 @@ async fn a_pinned_restart_lsn_is_what_separates_the_two_wal_transports() -> rust
     // may legitimately fail to drain within the deadline; that *is* the finding, so it is
     // reported too. What must hold unconditionally is that the **default** transport captures
     // everything in both halves, which is the property an embedder relies on.
-    for row in results.iter().filter(|row| row.transport == "StreamingReplication") {
+    for row in results
+        .iter()
+        .filter(|row| row.transport == "StreamingReplication")
+    {
         assert!(
             row.events >= ROWS as usize,
             "the default transport must capture every row regardless of restart_lsn; \

@@ -32,7 +32,9 @@ use testcontainers::{
 };
 
 /// Start a logical-replication-capable PostgreSQL with a given password encryption.
-async fn start_postgres(password_encryption: &str) -> rustcdc::Result<ContainerAsync<GenericImage>> {
+async fn start_postgres(
+    password_encryption: &str,
+) -> rustcdc::Result<ContainerAsync<GenericImage>> {
     GenericImage::new("postgres", "16-alpine")
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
@@ -89,7 +91,12 @@ async fn admin_client(
     Ok((client, host, port))
 }
 
-fn source_config(host: &str, port: u16, slot: &str, transport: WalTransport) -> PostgresSourceConfig {
+fn source_config(
+    host: &str,
+    port: u16,
+    slot: &str,
+    transport: WalTransport,
+) -> PostgresSourceConfig {
     PostgresSourceConfig {
         host: host.to_string(),
         port,
@@ -237,8 +244,12 @@ async fn both_wal_transports_capture_byte_identical_event_streams() -> rustcdc::
     streaming_source.connect().await?;
     let mut streaming = streaming_source.start_stream(None).await?;
 
-    let mut peek_source =
-        PostgresConnection::new(source_config(&host, port, "slot_peek", WalTransport::SqlPeek));
+    let mut peek_source = PostgresConnection::new(source_config(
+        &host,
+        port,
+        "slot_peek",
+        WalTransport::SqlPeek,
+    ));
     peek_source.connect().await?;
     let mut peek = peek_source.start_stream(None).await?;
 
@@ -301,7 +312,12 @@ async fn the_streaming_transport_resumes_from_a_checkpoint_lsn() -> rustcdc::Res
         .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     create_slot(&admin, "slot_resume").await?;
 
-    let config = source_config(&host, port, "slot_resume", WalTransport::StreamingReplication);
+    let config = source_config(
+        &host,
+        port,
+        "slot_resume",
+        WalTransport::StreamingReplication,
+    );
 
     let mut first_source = PostgresConnection::new(config.clone());
     first_source.connect().await?;
