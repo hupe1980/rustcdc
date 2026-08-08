@@ -151,6 +151,11 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
             "CDC_RS_SQLSERVER_PASSWORD",
             sqlserver_testkit::SQLSERVER_SA_PASSWORD,
         )
+        // The container presents SQL Server's default self-signed certificate, which the
+        // pinned TLS stack rejects as `UnsupportedCertVersion` — it is X.509 v1 and the
+        // verifier requires v3. Every other SQL Server suite uses the plaintext transport
+        // for the same reason; the example needed a knob for it, and did not have one.
+        .env("CDC_RS_PLAINTEXT", "true")
         .env("CDC_RS_SQLSERVER_DB", "rustcdc_example")
         .env("CDC_RS_SNAPSHOT_TABLES", "dbo.orders")
         .env("CDC_RS_CHECKPOINT_DIR", checkpoint_dir.path())

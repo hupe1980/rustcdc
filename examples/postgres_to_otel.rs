@@ -59,7 +59,11 @@ async fn main() -> rustcdc::Result<()> {
         database: args.database.clone(),
         replication_slot_name: args.replication_slot_name.clone(),
         publication_name: args.publication_name.clone(),
-        transport: TransportConfig::tls(),
+        transport: if args.plaintext {
+            TransportConfig::plaintext()
+        } else {
+            TransportConfig::tls()
+        },
         conn_timeout_secs: args.conn_timeout_secs,
         stream_poll_interval_ms: 1_000,
         max_events_per_poll: 20_000,
@@ -288,6 +292,12 @@ struct ExampleArgs {
     service_name: String,
     service_version: String,
     environment: String,
+    /// Opt out of TLS. Defaults to `false`, so the example demonstrates the secure setting.
+    ///
+    /// A TLS transport implies `sslmode=require`, so a server with `ssl = off` refuses the
+    /// connection rather than silently downgrading. Local and containerised servers usually
+    /// have TLS off, which is why this exists — set `CDC_RS_PLAINTEXT=true` for one.
+    plaintext: bool,
 }
 
 #[cfg(all(feature = "postgres", feature = "metrics"))]
@@ -347,6 +357,7 @@ impl ExampleArgs {
             service_name: env_or_default("CDC_RS_SERVICE_NAME", "rustcdc-postgres-example"),
             service_version: env_or_default("CDC_RS_SERVICE_VERSION", env!("CARGO_PKG_VERSION")),
             environment: env_or_default("CDC_RS_ENVIRONMENT", "dev"),
+            plaintext: env_or_default("CDC_RS_PLAINTEXT", "false") == "true",
         };
 
         let mut args = env::args().skip(1);
@@ -403,6 +414,7 @@ impl ExampleArgs {
                     out.service_version = next_value(&mut args, "--service-version")?
                 }
                 "--environment" => out.environment = next_value(&mut args, "--environment")?,
+                "--plaintext" => out.plaintext = true,
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -471,6 +483,7 @@ Options:\n\
   --service-name <name>         OTel service name\n\
   --service-version <version>   OTel service version\n\
   --environment <name>          Deployment environment\n\
+  --plaintext                   Disable TLS (a TLS transport implies sslmode=require)\n\
   -h, --help                    Show help"
     );
 }

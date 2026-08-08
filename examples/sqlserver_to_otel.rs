@@ -56,7 +56,11 @@ async fn main() -> rustcdc::Result<()> {
         password: args.password.clone().into(),
         database: args.database.clone(),
         instance_name: None,
-        transport: TransportConfig::tls(),
+        transport: if args.plaintext {
+            TransportConfig::plaintext()
+        } else {
+            TransportConfig::tls()
+        },
         conn_timeout_secs: args.conn_timeout_secs,
         cdc_enabled: true,
         cdc_schema: "cdc".to_string(),
@@ -282,6 +286,14 @@ struct ExampleArgs {
     service_name: String,
     service_version: String,
     environment: String,
+    /// Opt out of TLS. Defaults to `false`, so the example demonstrates the secure setting.
+    ///
+    /// SQL Server presents a **self-signed** certificate out of the box, and the TLS stack
+    /// `tiberius` pins rejects it outright — `invalid peer certificate:
+    /// Other(UnsupportedCertVersion)`, because that certificate is X.509 v1 and the verifier
+    /// requires v3. That is every default install and every test container, so without this
+    /// knob the example cannot be run against one at all. Set `CDC_RS_PLAINTEXT=true`.
+    plaintext: bool,
 }
 
 #[cfg(all(feature = "sqlserver", feature = "metrics"))]
@@ -338,6 +350,7 @@ impl ExampleArgs {
             service_name: env_or_default("CDC_RS_SERVICE_NAME", "rustcdc-sqlserver-example"),
             service_version: env_or_default("CDC_RS_SERVICE_VERSION", "current"),
             environment: env_or_default("CDC_RS_ENVIRONMENT", "dev"),
+            plaintext: env_or_default("CDC_RS_PLAINTEXT", "false") == "true",
         };
 
         let mut args = env::args().skip(1);
@@ -387,6 +400,7 @@ impl ExampleArgs {
                     out.service_version = next_value(&mut args, "--service-version")?
                 }
                 "--environment" => out.environment = next_value(&mut args, "--environment")?,
+                "--plaintext" => out.plaintext = true,
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -452,6 +466,8 @@ Options:\n\
   --service-name <name>         OTel service name\n\
   --service-version <version>   OTel service version\n\
   --environment <name>          Deployment environment\n\
+  --plaintext                   Disable TLS (SQL Server's default self-signed certificate\n\
+                                is rejected by the pinned TLS stack)\n\
   -h, --help                    Show help"
     );
 }

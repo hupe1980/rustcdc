@@ -277,6 +277,23 @@ and both example smoke tests. All are now in the matrix and all pass.
 The guard is now complete-by-construction: every `tests/*.rs` must appear in the workflow, in a
 script CI runs, or in an explicit helper-module list with a reason.
 
+### Fixed: neither OpenTelemetry example could connect to a normal server
+
+Surfaced the moment the example smoke tests were added to CI — the first thing gating them
+did was fail.
+
+`sqlserver_to_otel` and `postgres_to_otel` hardcoded `TransportConfig::tls()` with no way to
+override it, while every other setting was already env-driven. SQL Server presents a
+**self-signed** certificate out of the box and the TLS stack `tiberius` pins rejects it
+outright — `invalid peer certificate: Other(UnsupportedCertVersion)`, because that
+certificate is X.509 v1 and the verifier requires v3. That is every default install and every
+test container, so the example could not be run against one at all. The PostgreSQL example
+had the same gap latent: a TLS transport implies `sslmode=require`, which a server with
+`ssl = off` refuses.
+
+Both now take `CDC_RS_PLAINTEXT` / `--plaintext`, matching `pg_to_stdout`. The default stays
+TLS, so the examples still demonstrate the secure setting.
+
 ### Fixed: CI pre-pulled images no test uses, and missed two it does
 
 The pre-pull exists to fetch from a mirror rather than from rate-limited Docker Hub. It warmed
