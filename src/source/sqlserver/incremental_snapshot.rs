@@ -135,6 +135,8 @@ impl IncrementalSnapshotBackend for SqlServerSnapshotBackend {
         let columns = load_all_columns(&mut self.client, &schema, &name).await?;
         let qualified = qualified_table_name(&schema, &name);
         Ok(SnapshotTable {
+            // Filled in by the driver from `IncrementalSnapshotConfig::table_conditions`.
+            condition: None,
             schema,
             name,
             qualified,
@@ -185,6 +187,7 @@ impl IncrementalSnapshotBackend for SqlServerSnapshotBackend {
             &table.columns,
             cursor_param_count + 1,
             cursor.is_some(),
+            table.condition.as_deref(),
         );
         let limit = i32::try_from(limit.min(i32::MAX as usize)).unwrap_or(i32::MAX);
 
@@ -238,13 +241,12 @@ impl IncrementalSnapshotBackend for SqlServerSnapshotBackend {
                         table.qualified
                     ))
                 })?;
-            let row_object: serde_json::Value =
-                serde_json::from_str(row_json).map_err(|error| {
-                    Error::SerializationError(format!(
-                        "incremental snapshot: row_json parse failed for '{}': {error}",
-                        table.qualified
-                    ))
-                })?;
+            let row_object = super::parser::decode_row_json_as_text(row_json).map_err(|error| {
+                Error::SerializationError(format!(
+                    "incremental snapshot: row_json parse failed for '{}': {error}",
+                    table.qualified
+                ))
+            })?;
 
             let cursor: Vec<serde_json::Value> = table
                 .pk_columns

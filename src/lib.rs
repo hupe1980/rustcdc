@@ -54,6 +54,24 @@ mod markdown_doctests {
 
     #[doc = include_str!("../site/content/docs/schema-evolution.md")]
     mod schema_evolution {}
+
+    // Every remaining page that carries a Rust block. The set used to be the five pages
+    // above, which meant a sample in the runbook or the deployment guide could rot
+    // silently — and those are the pages an operator copies from under pressure.
+    #[doc = include_str!("../site/content/docs/deployment.md")]
+    mod deployment {}
+
+    #[doc = include_str!("../site/content/docs/runbook.md")]
+    mod runbook {}
+
+    #[doc = include_str!("../site/content/docs/troubleshooting.md")]
+    mod troubleshooting {}
+
+    #[doc = include_str!("../site/content/docs/reliability-testing.md")]
+    mod reliability_testing {}
+
+    #[doc = include_str!("../site/content/docs/wasm-transform-sdk.md")]
+    mod wasm_transform_sdk {}
 }
 
 pub mod checkpoint;
@@ -76,19 +94,27 @@ pub mod transform;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-#[cfg(feature = "tls")]
-pub use crate::core::RustlsClientConfig;
+/// Cooperative shutdown signal for [`CdcRuntime::run_to_completion`] and
+/// [`CdcRuntime::event_batches_cancellable`].
+///
+/// Re-exported so embedders do not have to add `tokio-util` themselves and keep its
+/// version in step with this crate's — a mismatched copy compiles and then fails to
+/// cancel anything, because the two `CancellationToken` types are unrelated.
+pub use tokio_util::sync::CancellationToken;
+
 pub use crate::core::{
     fingerprint_event_stable, fingerprint_event_transient, render_error_chain, AckMode, AckToken,
     CdcRuntime, ConnectionRetryPolicy, Error, ErrorChain, ErrorKind, ErrorReport, Event,
     EventBatch, EventBuilder, EventIdempotencyGuard, EventTracer, FingerprintError, HealthVerdict,
     IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector, NoRowWrite,
     Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite, RuntimeAdminSnapshot,
-    RuntimeConfig, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
-    SecretProvider, SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata,
+    RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig,
+    RuntimeState, SecretProvider, SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata,
     StructuredLogger, TransactionBoundaryPolicy, TransactionMetadata, TransformErrorPolicy,
     TransportConfig, ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
+#[cfg(feature = "tls")]
+pub use crate::core::{rustls_client_config, RustlsClientConfig};
 #[cfg(feature = "metrics")]
 pub use crate::core::{
     MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord,

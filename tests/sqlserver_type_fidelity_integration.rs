@@ -209,17 +209,15 @@ async fn sqlserver_decodes_non_trivial_types_without_loss() -> rustcdc::Result<(
         assert_present(column);
     }
 
-    // Exact numerics must keep full precision — a float round trip loses the low digits.
-    let exact = field("exact_amount");
-    assert!(
-        exact.starts_with("12345678901234.56"),
-        "DECIMAL precision lost: {exact}"
-    );
-    let negative = field("negative_amount");
-    assert!(
-        negative.starts_with("-9876.54"),
-        "NUMERIC sign or precision lost: {negative}"
-    );
+    // Exact numerics keep full precision, asserted as equalities rather than prefixes.
+    //
+    // These were `starts_with` because the decoder parsed the `FOR JSON PATH` payload
+    // straight into `serde_json::Value`, which routes a JSON number through `f64` and
+    // silently rounded off the low digits. The row decoder now reads each value's original
+    // token text, so exact equality is assertable — and a regression to the lossy path
+    // fails here instead of hiding behind a prefix match.
+    assert_eq!(field("exact_amount"), "12345678901234.567890");
+    assert_eq!(field("negative_amount"), "-9876.5432");
 
     assert_eq!(field("big_int"), "9223372036854775807");
 

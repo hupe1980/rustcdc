@@ -40,6 +40,20 @@ impl CdcRuntime {
             return Err(error);
         }
 
+        // A token is spent by the commit that accepts it. Without this, committing the
+        // same token twice matched the delivery id both times and advanced the
+        // checkpoint over the *next* N events — events the caller had never been given.
+        if pending.ack_epoch != token.epoch {
+            let error = Error::CheckpointError(format!(
+                "this ack token has already been committed (token epoch {}, delivery is at \
+                 {}). Each token may be committed once; poll again for a fresh one covering \
+                 whatever remains uncommitted.",
+                token.epoch, pending.ack_epoch
+            ));
+            self.record_runtime_error("runtime.commit.token_replay", &error);
+            return Err(error);
+        }
+
         self.commit_prefix(token.event_count).await
     }
 
@@ -133,6 +147,7 @@ impl CdcRuntime {
         self.last_checkpoint_saved_at_ms = Some(now_ms);
         if let Some(pending) = self.pending_delivery.as_mut() {
             pending.committed_prefix += count;
+            pending.ack_epoch = pending.ack_epoch.saturating_add(1);
             if pending.committed_prefix >= pending.events.len() {
                 self.pending_delivery = None;
             }
@@ -278,7 +293,12 @@ impl CdcRuntime {
                 return Ok(None);
             }
 
-            Ok(Some(parse_postgres_lsn(&last_committed.source.offset)?))
+            // Confirm the transaction's end position, not the change's own LSN. Leaving the
+            // slot's `confirmed_flush_lsn` inside a transaction makes the server re-send
+            // that whole transaction — see `StreamHandle::resume_offset_for`.
+            Ok(Some(parse_postgres_lsn(
+                &self.resume_offset_for(last_committed),
+            )?))
         }
 
         #[cfg(not(feature = "postgres"))]

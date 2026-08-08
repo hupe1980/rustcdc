@@ -877,6 +877,15 @@ pub struct RuntimeAdminSnapshot {
     pub in_flight_events: usize,
     /// `true` while a snapshot phase is active (initial bulk copy in progress).
     pub snapshot_active: bool,
+    /// Live per-table incremental-snapshot progress, or `None` when none is in flight.
+    ///
+    /// Carries the snapshot id and, per table, the keyset cursor, completion flag and row
+    /// and chunk counters — which is what turns "the runtime accepted 3 tables" into an
+    /// answer to *how far along is it?* for a backfill that runs for hours.
+    ///
+    /// Read from the live driver, not from a persisted checkpoint, so it is current as of
+    /// this snapshot rather than as of the last commit.
+    pub incremental_snapshot: Option<crate::source::IncrementalSnapshotState>,
     /// `true` while a CDC change-stream connection is open.
     pub stream_active: bool,
     /// `true` once the snapshot-to-stream handoff has been completed at least once.
@@ -949,6 +958,9 @@ pub struct RuntimeAdminSnapshot {
 pub struct AckToken {
     delivery_id: u64,
     event_count: usize,
+    /// Bumped by every successful commit against this delivery, so a token can be
+    /// spent exactly once. See [`CdcRuntime::commit_ack`].
+    epoch: u64,
 }
 
 impl AckToken {
@@ -962,29 +974,38 @@ impl AckToken {
         self.event_count == 0
     }
 
-    /// Split a token into an accepted prefix and an optional remainder token.
-    pub fn split_at(self, accepted_count: usize) -> Result<(Self, Option<Self>)> {
+    /// Narrow this token to its first `accepted_count` events.
+    ///
+    /// Use this when a sink accepted part of a batch and not the rest: committing the
+    /// narrowed token advances the checkpoint exactly as far as the sink actually got.
+    ///
+    /// # There is no remainder token
+    ///
+    /// This used to return `(accepted, Option<remainder>)`, and the remainder was a
+    /// loaded gun: acknowledging it claimed events the caller had, by construction,
+    /// just declined to process, and the checkpoint advanced past them. Both callers
+    /// in this repository discarded it.
+    ///
+    /// The uncommitted tail is **redelivered** by the next
+    /// [`CdcRuntime::poll_event_batch`] with a fresh token, which is the only way to
+    /// get one. Nothing is lost by not holding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CheckpointError`] unless `1 <= accepted_count <= self.len()`.
+    pub fn accept_prefix(self, accepted_count: usize) -> Result<Self> {
         if accepted_count == 0 || accepted_count > self.event_count {
-            return Err(Error::CheckpointError(
-                "ack token split must accept between 1 and the token length".into(),
-            ));
+            return Err(Error::CheckpointError(format!(
+                "ack token prefix must be between 1 and the token length ({}), got {accepted_count}",
+                self.event_count
+            )));
         }
 
-        let accepted = Self {
+        Ok(Self {
             delivery_id: self.delivery_id,
             event_count: accepted_count,
-        };
-        let remaining = self.event_count - accepted_count;
-        let remainder = if remaining == 0 {
-            None
-        } else {
-            Some(Self {
-                delivery_id: self.delivery_id,
-                event_count: remaining,
-            })
-        };
-
-        Ok((accepted, remainder))
+            epoch: self.epoch,
+        })
     }
 }
 
@@ -1250,6 +1271,14 @@ struct PendingDelivery {
     events: Arc<Vec<Event>>,
     /// Number of events from the front of `events` that have already been committed.
     committed_prefix: usize,
+    /// Incremented by every successful commit against this delivery.
+    ///
+    /// `AckToken` is `Clone`, and `EventBatch::ack_mode(&self)` hands out a fresh copy
+    /// on every call, so nothing in the type system stopped a caller from committing
+    /// the same token twice. The second commit matched the delivery id, saw a shorter
+    /// remaining prefix, and advanced the checkpoint over the *next* N events — events
+    /// the caller had never seen. Silent data loss, from an ordinary double-ack.
+    ack_epoch: u64,
 }
 
 /// Behavior when a transform stage returns an error for an event.
@@ -1486,12 +1515,17 @@ impl RuntimeConfig {
 }
 
 enum RuntimeSource {
+    // Boxed, so `CdcRuntime` does not carry the largest connector's footprint regardless of
+    // which one is configured — inline, the MySQL variant alone put 632 bytes into every
+    // `CdcRuntime` and into every future that holds one across an await. This crate already
+    // boxes futures on the poll path to keep them off the stack; paying for a connector
+    // that is not even in use undoes that.
     #[cfg(feature = "postgres")]
-    Postgres(PostgresConnection),
+    Postgres(Box<PostgresConnection>),
     #[cfg(feature = "mysql")]
-    Mysql(MysqlConnection),
+    Mysql(Box<MysqlConnection>),
     #[cfg(feature = "sqlserver")]
-    SqlServer(SqlServerConnection),
+    SqlServer(Box<SqlServerConnection>),
     Disabled,
     /// A source supplied by the embedder via [`CdcRuntime::register_source`].
     Custom(Box<dyn crate::source::Source>),
@@ -1685,6 +1719,8 @@ pub struct CdcRuntime {
     /// Wrapped in `Mutex` so that `CdcRuntime` remains `Sync` (required by
     /// `BoxStream::boxed` used in the poll path).
     registered_sink: Option<std::sync::Mutex<BoxedSink>>,
+    /// Control-channel endpoint backing [`CdcRuntime::control_handle`].
+    control: control::ControlEndpoint,
     /// LSN that was durably checkpointed but which the source refused to confirm.
     ///
     /// A failed `confirm_lsn` leaves the source replaying events the runtime has
@@ -1850,6 +1886,7 @@ impl CdcRuntime {
             transform_pipeline: TransformPipeline::default(),
             idempotency_guard,
             registered_sink: None,
+            control: control::ControlEndpoint::new(),
         })
     }
 
@@ -1871,21 +1908,21 @@ impl CdcRuntime {
     fn build_source(config: &RuntimeConfig) -> Result<RuntimeSource> {
         match &config.source {
             #[cfg(feature = "postgres")]
-            RuntimeSourceConfig::Postgres(source) => Ok(RuntimeSource::Postgres(
+            RuntimeSourceConfig::Postgres(source) => Ok(RuntimeSource::Postgres(Box::new(
                 PostgresConnection::new(source.clone()),
-            )),
+            ))),
             #[cfg(feature = "mysql")]
-            RuntimeSourceConfig::Mysql(source) => {
-                Ok(RuntimeSource::Mysql(MysqlConnection::new(source.clone())))
-            }
+            RuntimeSourceConfig::Mysql(source) => Ok(RuntimeSource::Mysql(Box::new(
+                MysqlConnection::new(source.clone()),
+            ))),
             #[cfg(feature = "mariadb")]
-            RuntimeSourceConfig::MariaDb(source) => Ok(RuntimeSource::Mysql(MysqlConnection::new(
-                source.clone().into_inner(),
+            RuntimeSourceConfig::MariaDb(source) => Ok(RuntimeSource::Mysql(Box::new(
+                MysqlConnection::new(source.clone().into_inner()),
             ))),
             #[cfg(feature = "sqlserver")]
-            RuntimeSourceConfig::SqlServer(source) => Ok(RuntimeSource::SqlServer(
+            RuntimeSourceConfig::SqlServer(source) => Ok(RuntimeSource::SqlServer(Box::new(
                 SqlServerConnection::new(source.clone()),
-            )),
+            ))),
             RuntimeSourceConfig::Disabled => Ok(RuntimeSource::Disabled),
         }
     }
@@ -1906,25 +1943,34 @@ impl CdcRuntime {
         self.transform_pipeline.add_async_transform(transform);
     }
 
-    /// Register a sink to be closed (with the configured timeout) during
-    /// [`stop`](CdcRuntime::stop), [`force_stop`](CdcRuntime::force_stop), and
+    /// Give the runtime the sink it should deliver to.
+    ///
+    /// A registered sink is driven by [`run_to_completion`](CdcRuntime::run_to_completion)
+    /// and closed — with [`RuntimeOptions::sink_close_timeout_ms`] if one is configured
+    /// — by [`stop`](CdcRuntime::stop), [`force_stop`](CdcRuntime::force_stop) and
     /// [`drain_and_stop`](CdcRuntime::drain_and_stop).
     ///
-    /// The timeout is read from [`RuntimeOptions::sink_close_timeout_ms`] at
-    /// shutdown time. If no timeout is configured, [`SinkAdapter::close`] is
-    /// called without a deadline.
+    /// Registering is not required. Driving [`poll_event_batch`](CdcRuntime::poll_event_batch)
+    /// and [`commit_ack`](CdcRuntime::commit_ack) yourself stays fully supported, and is
+    /// the right choice when the write has to be coordinated with something the runtime
+    /// cannot see — your own transaction, a two-phase commit, a fan-out with per-branch
+    /// error handling.
     ///
     /// Replaces any previously registered sink. The replaced sink is **dropped**
     /// without being closed — call `close` on it first if graceful close matters.
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let mut sink = MyKafkaSink::new(config);
-    /// runtime.register_sink(sink);
+    /// ```no_run
+    /// # use rustcdc::{CdcRuntime, sink::StdoutSink};
+    /// # use rustcdc::CancellationToken;
+    /// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+    /// runtime.register_sink(StdoutSink::new());
     /// runtime.start().await?;
-    /// // …poll loop…
-    /// runtime.stop().await?; // closes the registered sink with configured timeout
+    /// runtime.run_to_completion(CancellationToken::new()).await?;
+    /// runtime.stop().await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn register_sink<S: crate::sink::SinkAdapter + 'static>(&mut self, sink: S) {
         self.registered_sink = Some(std::sync::Mutex::new(BoxedSink::new(sink)));
@@ -1959,9 +2005,12 @@ impl CdcRuntime {
     }
 }
 
+mod control;
 mod runtime_admin;
 mod runtime_lifecycle;
 mod runtime_poll;
+
+pub use control::RuntimeControl;
 
 #[cfg(test)]
 mod tests {
@@ -4315,6 +4364,300 @@ mod tests {
     /// but it also means `events()`, `len()` and `into_events()` must all respect the
     /// offset — getting any of them wrong would re-deliver already-committed events.
     #[tokio::test]
+    async fn run_to_completion_flushes_the_sink_before_acknowledging() {
+        // The ordering this method exists to own. Acknowledging before the flush
+        // advances the durable checkpoint past events the sink never accepted, and a
+        // crash in that gap loses them with no error anywhere.
+        use crate::sink::MemorySinkAdapter;
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.register_sink(MemorySinkAdapter::new("mem"));
+        runtime.start().await.unwrap();
+
+        for index in 0..3 {
+            let mut event = event();
+            event.source.offset = format!("offset-{index}");
+            runtime.enqueue_event(event).unwrap();
+        }
+
+        // The token cancels once the queue has drained, so the loop terminates.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stopper = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            stopper.cancel();
+        });
+
+        let delivered = runtime.run_to_completion(shutdown).await.unwrap();
+        assert_eq!(delivered, 3, "every enqueued event reaches the sink");
+
+        let admin = runtime.admin_snapshot();
+        assert_eq!(
+            admin.total_events_committed, 3,
+            "the checkpoint advanced only after the sink flushed"
+        );
+
+        let drained = runtime.stop().await.unwrap();
+        assert!(drained.is_empty(), "nothing may be left uncommitted");
+    }
+
+    #[tokio::test]
+    async fn run_to_completion_without_a_sink_says_so() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        let error = runtime
+            .run_to_completion(tokio_util::sync::CancellationToken::new())
+            .await
+            .expect_err("no sink registered");
+        assert!(
+            error.to_string().contains("register_sink"),
+            "the error must name the remedy, got: {error}"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn the_checkpoint_uses_the_connectors_resume_position_not_the_events_own() {
+        // An event's offset identifies the *change*; the resume position is the first
+        // position **not** consumed. For PostgreSQL those differ, because logical decoding
+        // filters at transaction granularity: resuming from a change LSN replays that whole
+        // transaction on every restart. This asserts the runtime asks the connector rather
+        // than reusing the event's offset.
+        use crate::checkpoint::PostgresOffset;
+
+        struct ResumeAwareStream;
+
+        #[async_trait::async_trait]
+        impl crate::source::StreamHandle for ResumeAwareStream {
+            async fn next_events(&mut self, _timeout_ms: u64) -> crate::core::Result<Vec<Event>> {
+                Ok(Vec::new())
+            }
+            async fn save_position(
+                &self,
+                _checkpoint: &mut dyn crate::checkpoint::Checkpoint,
+            ) -> crate::core::Result<()> {
+                Ok(())
+            }
+            async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+                Ok(())
+            }
+            fn resume_offset_for(&self, _event: &Event) -> Option<String> {
+                // Past the commit record, where the change's own LSN is not.
+                Some("0/200".to_string())
+            }
+        }
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let source = crate::source::PostgresSourceConfig {
+            replication_slot_name: "slot".into(),
+            ..Default::default()
+        };
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::Postgres(source),
+            checkpoint,
+            schema_history,
+        );
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.state = RuntimeState::Running;
+        runtime.stream = Some(Box::new(ResumeAwareStream));
+
+        let mut event = event();
+        event.source.source_name = "postgres".into();
+        event.source.offset = "0/100".into(); // the change's own LSN
+        runtime.enqueue_event(event).unwrap();
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(batch.len(), 1);
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+
+        let stored = runtime
+            .config
+            .checkpoint
+            .load()
+            .await
+            .unwrap()
+            .expect("a checkpoint was written");
+        let offset = PostgresOffset::from_bytes(&stored.encode().unwrap()).unwrap();
+        assert_eq!(
+            offset.lsn, 0x200,
+            "the checkpoint must record the connector's resume position (0/200), not the \
+             change's own LSN (0/100)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_handle_drives_the_runtime_from_another_task() {
+        // The problem this solves: an event loop holds `&mut CdcRuntime` for its lifetime,
+        // so an admin endpoint cannot reach the runtime at all without a channel. This
+        // asserts the command really is applied by the poll loop and the reply comes back.
+        use crate::source::{IncrementalSnapshotState, IncrementalSnapshotTableState};
+
+        struct SnapshotStream {
+            state: Arc<Mutex<IncrementalSnapshotState>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::source::StreamHandle for SnapshotStream {
+            async fn next_events(&mut self, _timeout_ms: u64) -> crate::core::Result<Vec<Event>> {
+                Ok(Vec::new())
+            }
+            async fn save_position(
+                &self,
+                _checkpoint: &mut dyn crate::checkpoint::Checkpoint,
+            ) -> crate::core::Result<()> {
+                Ok(())
+            }
+            async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+                Ok(())
+            }
+            fn incremental_snapshot_state(&self) -> Option<IncrementalSnapshotState> {
+                Some(self.state.lock().expect("state lock").clone())
+            }
+            async fn set_snapshot_paused(&mut self, paused: bool) -> crate::core::Result<bool> {
+                let mut state = self.state.lock().expect("state lock");
+                let previous = state.paused;
+                state.paused = paused;
+                Ok(previous)
+            }
+            async fn stop_snapshot(&mut self) -> crate::core::Result<usize> {
+                let mut state = self.state.lock().expect("state lock");
+                let abandoned = state.tables.iter().filter(|t| !t.is_complete).count();
+                state.tables.clear();
+                Ok(abandoned)
+            }
+        }
+
+        let shared = Arc::new(Mutex::new(IncrementalSnapshotState {
+            snapshot_id: "snap-1".into(),
+            paused: false,
+            tables: vec![IncrementalSnapshotTableState {
+                table: "public.orders".into(),
+                rows_emitted: 42,
+                ..Default::default()
+            }],
+        }));
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        let control = runtime.control_handle();
+        runtime.start().await.unwrap();
+        runtime.stream = Some(Box::new(SnapshotStream {
+            state: Arc::clone(&shared),
+        }));
+
+        // Nothing has been published until a poll completes.
+        assert!(control.incremental_snapshot_state().is_none());
+        assert!(control.is_connected());
+
+        // The command is queued from another task and applied by the poll loop.
+        let issuer = control.clone();
+        let pause = tokio::spawn(async move { issuer.pause_incremental_snapshot().await });
+
+        // Drive the loop until the command has been serviced.
+        let mut was_paused = None;
+        for _ in 0..50 {
+            let _ = runtime.poll_event_batch().await.unwrap();
+            if pause.is_finished() {
+                was_paused = Some(pause.await.expect("task joins").expect("command applied"));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            was_paused,
+            Some(false),
+            "pause must report the previous state and must have been applied"
+        );
+        assert!(shared.lock().unwrap().paused, "the driver really paused");
+
+        // Progress is readable through `&self`, without touching the runtime.
+        let progress = control
+            .incremental_snapshot_state()
+            .expect("published after a poll");
+        assert_eq!(progress.snapshot_id, "snap-1");
+        assert_eq!(progress.rows_emitted(), 42);
+        assert_eq!(progress.tables_remaining(), 1);
+        assert!(progress.paused);
+    }
+
+    #[tokio::test]
+    async fn a_control_command_fails_fast_once_the_runtime_is_gone() {
+        // Better than hanging forever: an admin endpoint gets an actionable error instead
+        // of a request that never returns.
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let runtime = CdcRuntime::new(config).unwrap();
+        let control = runtime.control_handle();
+        assert!(control.is_connected());
+
+        drop(runtime);
+
+        assert!(!control.is_connected());
+        let error = control
+            .pause_incremental_snapshot()
+            .await
+            .expect_err("no runtime to service the command");
+        assert!(
+            error.to_string().contains("dropped"),
+            "the error must name the cause, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_token_cannot_be_committed_twice() {
+        // `AckToken` is `Clone` and `EventBatch::ack_mode(&self)` mints a fresh copy on
+        // every call, so nothing stopped a caller from committing the same token twice.
+        // The second commit matched the delivery id, saw a shorter remaining prefix, and
+        // advanced the checkpoint over the *next* events — which the caller had never
+        // been handed. Silent, permanent data loss from an ordinary double-ack.
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+        for index in 0..4 {
+            let mut event = event();
+            event.source.offset = format!("offset-{index}");
+            runtime.enqueue_event(event).unwrap();
+        }
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        let AckMode::Required(token) = batch.ack_mode() else {
+            panic!("expected an ack token")
+        };
+        let prefix = token.accept_prefix(2).unwrap();
+        let replayed = prefix.clone();
+        runtime.commit_ack(prefix).await.unwrap();
+
+        let error = runtime
+            .commit_ack(replayed)
+            .await
+            .expect_err("a spent ack token must be refused");
+        assert!(
+            error.to_string().contains("already been committed"),
+            "the error must name the cause, got: {error}"
+        );
+
+        let redelivered = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(
+            redelivered.events()[0].source.offset,
+            "offset-2",
+            "the refused commit must not have advanced past the uncommitted tail"
+        );
+    }
+
+    #[tokio::test]
     async fn redelivered_batch_view_excludes_committed_prefix() {
         let checkpoint = InMemoryCheckpoint::default();
         let schema_history = InMemorySchemaHistory::default();
@@ -4335,7 +4678,7 @@ mod tests {
         let AckMode::Required(token) = batch.ack_mode() else {
             panic!("expected an ack token")
         };
-        let (first_two, _rest) = token.split_at(2).unwrap();
+        let first_two = token.accept_prefix(2).unwrap();
         runtime.commit_ack(first_two).await.unwrap();
 
         let redelivered = runtime.poll_event_batch().await.unwrap();
@@ -4677,7 +5020,7 @@ mod tests {
         let AckMode::Required(token) = batch.ack_mode() else {
             panic!("expected ack token")
         };
-        let (accepted, remainder) = token.split_at(2).unwrap();
+        let accepted = token.accept_prefix(2).unwrap();
 
         runtime.commit_ack(accepted).await.unwrap();
         assert_eq!(
@@ -4692,7 +5035,6 @@ mod tests {
 
         let retried = runtime.poll_event_batch().await.unwrap();
         assert_eq!(retried.len(), 1);
-        assert_eq!(AckMode::from(remainder), retried.ack_mode());
 
         runtime.commit_ack(retried.ack_mode()).await.unwrap();
         assert_eq!(

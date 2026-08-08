@@ -673,7 +673,9 @@ impl LiveMysqlBinlogProvider {
                 self.active_gtid = None;
             }
             EventData::RotateEvent(rotate) => {
-                self.binlog_file = rotate.name().into_owned();
+                // The name field can carry a trailing event checksum; see
+                // `sanitize_binlog_file_name` for what that costs if it reaches a checkpoint.
+                self.binlog_file = parser::sanitize_binlog_file_name(&rotate.name())?;
                 self.next_pos = u32::try_from(rotate.position()).map_err(|_| {
                     Error::SourceError(format!(
                         "mysql rotate position exceeds u32: {}",

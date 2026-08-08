@@ -510,6 +510,9 @@ fn build_snapshot_fetch_sql(
         column_names,
         limit_param_index,
         include_seek_where_clause,
+        // The bulk snapshot has no per-table filter; that is an incremental-snapshot
+        // configuration and reaches `parser::build_snapshot_fetch_sql` from there.
+        None,
     )
 }
 

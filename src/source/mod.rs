@@ -146,6 +146,28 @@ pub struct IncrementalSnapshotConfig {
     pub tables: Vec<String>,
     /// Number of rows to read per chunk. Defaults to `5_000`.
     pub chunk_size: usize,
+    /// Optional per-table row filter, keyed by `"schema.table"`.
+    ///
+    /// The value is a SQL boolean expression appended to that table's chunk `SELECT`,
+    /// which is Debezium's `additional-condition` in the equivalent signal. It restricts
+    /// *which rows are snapshotted* — backfill one tenant, or only rows newer than a
+    /// cutoff — without restricting the live stream, which continues to carry every change
+    /// to the table.
+    ///
+    /// Referenced columns must exist on the table and be usable in a `WHERE` clause. Alias
+    /// the table as `t` if you need to qualify a column; that is the alias every connector's
+    /// chunk read uses.
+    ///
+    /// # This is raw SQL and it is trusted input
+    ///
+    /// The expression is interpolated into the chunk `SELECT`, because a filter that could
+    /// only be a bound parameter would not be a filter — it has to express predicates the
+    /// connector cannot anticipate. **Never build one from untrusted input.** It carries the
+    /// same trust level as the connection string, and the same is true of Debezium's.
+    ///
+    /// A filter that fails to parse surfaces as a chunk-read error naming the table, at the
+    /// first chunk rather than silently returning nothing.
+    pub table_conditions: ahash::AHashMap<String, String>,
 }
 
 impl IncrementalSnapshotConfig {
@@ -154,6 +176,7 @@ impl IncrementalSnapshotConfig {
         Self {
             tables: tables.into(),
             chunk_size: 5_000,
+            table_conditions: ahash::AHashMap::new(),
         }
     }
 
@@ -161,6 +184,28 @@ impl IncrementalSnapshotConfig {
     #[must_use]
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.chunk_size = chunk_size;
+        self
+    }
+
+    /// Restrict which rows of `table` the snapshot reads.
+    ///
+    /// See [`table_conditions`](Self::table_conditions) for the semantics and the trust
+    /// boundary — `condition` is raw SQL and must never come from untrusted input.
+    ///
+    /// ```
+    /// use rustcdc::IncrementalSnapshotConfig;
+    ///
+    /// let config = IncrementalSnapshotConfig::new(vec!["public.orders".to_string()])
+    ///     .with_table_condition("public.orders", "created_at >= '2026-01-01'");
+    /// # let _ = config;
+    /// ```
+    #[must_use]
+    pub fn with_table_condition(
+        mut self,
+        table: impl Into<String>,
+        condition: impl Into<String>,
+    ) -> Self {
+        self.table_conditions.insert(table.into(), condition.into());
         self
     }
 }
@@ -404,6 +449,87 @@ pub trait StreamHandle: Send + Sync {
              snapshots."
                 .into(),
         ))
+    }
+
+    /// Suspend or resume chunk reading on an in-flight incremental snapshot.
+    ///
+    /// Returns the **previous** state, so a caller can distinguish a real change from a
+    /// repeated request. The live change stream is unaffected in both directions — only the
+    /// next chunk read is withheld — which is what makes this usable to take snapshot load
+    /// off a production primary during business hours without stopping capture.
+    ///
+    /// Pausing takes effect at a chunk boundary: a chunk already read is merged and
+    /// delivered first. Stopping mid-chunk would either discard a read the source has
+    /// already paid for or strand a merged chunk whose cursor can never be promoted.
+    ///
+    /// The paused flag rides in [`IncrementalSnapshotState`], so it is durable and a pause
+    /// survives a restart rather than silently lifting on the next deploy.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`Error::NotImplemented`](crate::core::Error::NotImplemented):
+    /// a handle not driving an incremental snapshot has nothing to pause, and quietly
+    /// accepting would report a pause that never happened.
+    async fn set_snapshot_paused(&mut self, _paused: bool) -> Result<bool> {
+        Err(crate::core::Error::NotImplemented(
+            "this stream is not running an incremental snapshot, so there is nothing to              pause or resume. Configure RuntimeConfig::with_incremental_snapshot to enable              on-demand snapshots."
+                .into(),
+        ))
+    }
+
+    /// Abandon the in-flight incremental snapshot, discarding its chunk cursors.
+    ///
+    /// Returns how many tables still had work outstanding.
+    ///
+    /// Undelivered rows of the in-flight chunk go with it — they are snapshot reads the
+    /// operator has just asked to stop producing. Held-back **log** events are kept and
+    /// drained: they belong to the live stream, and discarding them would lose change data.
+    ///
+    /// The persisted state is cleared by the next checkpoint write, so a restart does not
+    /// resume the snapshot. A crash in the window before that write resumes it — abandoning
+    /// is not itself a durable operation, and the alternative (an extra synchronous
+    /// checkpoint write from a control path) would let an operator action rewrite the
+    /// stream position.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`Error::NotImplemented`](crate::core::Error::NotImplemented).
+    async fn stop_snapshot(&mut self) -> Result<usize> {
+        Err(crate::core::Error::NotImplemented(
+            "this stream is not running an incremental snapshot, so there is nothing to              stop. Configure RuntimeConfig::with_incremental_snapshot to enable on-demand              snapshots."
+                .into(),
+        ))
+    }
+
+    /// Where a restart must resume from once `event` is durably committed.
+    ///
+    /// Returns an offset string in this connector's own format, or `None` (the default) to
+    /// mean "the event's own [`SourceMetadata::offset`](crate::core::SourceMetadata) is
+    /// already a resumable boundary".
+    ///
+    /// # Why an event's own position is often *not* resumable
+    ///
+    /// The two are different things, and conflating them costs a guaranteed duplicate on
+    /// every restart. An event's offset identifies **the change**; the resume position is
+    /// the first position **not** consumed.
+    ///
+    /// PostgreSQL is the clearest case. Each change keeps its own WAL position, but logical
+    /// decoding filters at **transaction** granularity: `START_REPLICATION ... X` re-sends
+    /// every transaction whose *commit record* sits at or after `X`. A change LSN always
+    /// precedes its own transaction's commit record, so resuming from one replays that
+    /// entire transaction — deterministically, on every restart, with no new writes on the
+    /// source at all.
+    ///
+    /// Nudging the LSN forward does not help: the commit record is still ahead of `X + 1`.
+    /// The only position that skips the transaction is the one **after** its commit record,
+    /// which pgoutput reports in the COMMIT message as `end_lsn`. That is what the
+    /// PostgreSQL handle returns here.
+    ///
+    /// The runtime uses this for both the durable checkpoint and the source-side
+    /// confirmation, so a connector implementing it fixes replication-slot retention and
+    /// restart duplicates together.
+    fn resume_offset_for(&self, _event: &Event) -> Option<String> {
+        None
     }
 
     /// Confirm that all messages up to `lsn` have been durably consumed.

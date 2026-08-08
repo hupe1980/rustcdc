@@ -334,44 +334,46 @@ impl<S: SinkAdapter> TableRouter<S> {
     }
 
     /// Flush all sinks (routes + default).
+    ///
+    /// Failures are aggregated under the most severe [`ErrorKind`](crate::core::ErrorKind)
+    /// observed rather than flattened. `send` already passes a sink's error through
+    /// untouched, and collapsing this path into one fixed variant made the two disagree:
+    /// a broker connection reset is `Transient` and retryable from `send`, and was
+    /// `Terminal` and fatal from `flush` — with which one you got decided by batch
+    /// boundaries rather than by anything an operator controls.
     pub async fn flush_all(&mut self) -> Result<()> {
-        let mut errors: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, Error)> = Vec::new();
         for route in &mut self.routes {
             if let Err(e) = route.sink.flush().await {
-                errors.push(format!("route '{}': {e}", route.pattern));
+                failures.push((format!("route '{}'", route.pattern), e));
             }
         }
         if let Some(ref mut d) = self.default {
             if let Err(e) = d.flush().await {
-                errors.push(format!("default: {e}"));
+                failures.push(("default".to_string(), e));
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::StateError(errors.join("; ")))
-        }
+        Error::aggregate(failures)
     }
 
     /// Close all sinks (routes + default).
+    ///
+    /// Failures are aggregated under the most severe kind observed — see
+    /// [`flush_all`](Self::flush_all).
     pub async fn close_all(&mut self) -> Result<()> {
-        let mut errors: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, Error)> = Vec::new();
         for route in &mut self.routes {
             if let Err(e) = route.sink.close().await {
-                errors.push(format!("route '{}': {e}", route.pattern));
+                failures.push((format!("route '{}'", route.pattern), e));
             }
         }
         if let Some(ref mut d) = self.default {
             if let Err(e) = d.close().await {
-                errors.push(format!("default: {e}"));
+                failures.push(("default".to_string(), e));
             }
         }
         self.closed = true;
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::StateError(errors.join("; ")))
-        }
+        Error::aggregate(failures)
     }
 }
 

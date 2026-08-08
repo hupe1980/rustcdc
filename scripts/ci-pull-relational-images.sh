@@ -10,11 +10,16 @@ set -euo pipefail
 # Non-postgres, non-sqlserver smoke images.
 # Postgres tags are passed explicitly as positional args.
 # SQL Server is handled separately via --sqlserver-soft (soft failure on MCR downtime).
+# Must match the versions the test matrices actually instantiate — see
+# `run_relational_image_drift_check` in scripts/ci-policy-gate.sh, which fails the build if
+# they diverge. They had: this list warmed mysql:8.1 and mariadb:10.11, which no test uses,
+# while mysql:8.4 and mariadb:10.5, which the matrices do use, were pulled from Docker Hub at
+# run time — the rate-limited path this script exists to avoid.
 NON_POSTGRES_RELATIONAL_SMOKE_IMAGES=(
   "mysql:8.0"
-  "mysql:8.1"
+  "mysql:8.4"
+  "mariadb:10.5"
   "mariadb:10.6"
-  "mariadb:10.11"
 )
 
 pull_with_retry() {

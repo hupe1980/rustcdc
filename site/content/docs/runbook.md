@@ -119,7 +119,7 @@ FROM pg_replication_slots WHERE slot_name = 'your_slot_name';
 ### Replication Slot Divergence Recovery
 
 **Symptom:** Error message similar to:
-```
+```text
 ERROR: source error: postgres checkpoint/slot divergence for slot '...'
 ```
 
@@ -948,6 +948,39 @@ curl -v http://localhost:9090/metrics
 - [ ] Test failover to secondary source (if applicable)
 - [ ] Review and update this runbook
 - [ ] Capacity planning based on data growth
+
+### Backfill load during business hours
+
+**Symptom:** an incremental snapshot of a large table is adding read load to a production
+primary at a bad time.
+
+**Do not** stop the pipeline and clear the checkpoint. That stops capture as well, and
+restarting rebuilds the snapshot from wherever the cursors were lost.
+
+**Instead**, pause chunk reading and leave capture running:
+
+```rust
+# use rustcdc::CdcRuntime;
+# async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+runtime.pause_incremental_snapshot().await?;   // idempotent
+# Ok(())
+# }
+```
+
+The change stream is unaffected — replication-slot lag keeps draining, and the checkpoint keeps
+advancing. Resume in the evening with `resume_incremental_snapshot()`, which continues from the
+chunk it stopped at rather than restarting the table.
+
+The pause is written into the checkpoint, so a deploy during the paused window does **not**
+silently restart the backfill. That also means a pause left in place is invisible unless you
+look: check `admin_snapshot().incremental_snapshot`, whose `paused` flag and per-table
+`rows_emitted` / `is_complete` are the progress readout. From an admin task that does not hold
+`&mut CdcRuntime`, use `control_handle()` — `RuntimeControl::incremental_snapshot_state()` is
+non-blocking and cannot hang behind a stalled pipeline.
+
+To abandon the backfill entirely, `stop_incremental_snapshot()` discards the cursors and
+returns how many tables still had work. Capture continues. Note that stop becomes durable only
+with the next checkpoint write, so a crash in that window resumes the snapshot — stop it again.
 
 ---
 

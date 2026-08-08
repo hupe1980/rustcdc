@@ -86,13 +86,19 @@ For a single-stream CDC pipeline this is not a bottleneck. However, **if you are
 Instantiate multiple `WasmRuntime` instances (one per logical shard or per available core) and dispatch events across them. Wasmtime module compilation is the expensive step; compile once and share the bytes.
 
 ```rust
-// Pseudo-code: pool of runtime instances
-let wasm_bytes = std::fs::read("transform.wasm")?;
-let pool: Vec<_> = (0..num_cpus::get())
+# #[cfg(feature = "wasm")]
+# fn example(config: rustcdc::WasmConfig, shards: usize) -> rustcdc::Result<()> {
+use rustcdc::WasmRuntime;
+
+// Compile once, share the bytes; one runtime instance per logical shard.
+let pool: Vec<WasmRuntime> = (0..shards)
     .map(|_| WasmRuntime::new_with_config(config.clone()))
-    .collect::<Result<Vec<_>, _>>()?;
+    .collect::<rustcdc::Result<Vec<_>>>()?;
 
 // Dispatch: pick an instance by thread-local index or round-robin.
+# let _ = pool;
+# Ok(())
+# }
 ```
 
 ### Key constraints
@@ -212,7 +218,7 @@ wasm-objdump -x your_transform.wasm | grep rustcdc_abi_version
 ```
 
 Or verify at runtime — the loader surfaces the detected version in the error message on rejection:
-```
+```text
 Error: ConfigError("WASM module ABI version mismatch: got 1, expected 2. \
                     Recompile against rustcdc >= 0.5.0 or use the abi_version = 2 skeleton.")
 ```

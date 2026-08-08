@@ -204,8 +204,111 @@ pub(super) fn parse_truncate_target(statement: &str) -> Option<(Option<String>, 
     split_table_reference(cleaned).ok()
 }
 
+/// Strip anything a binlog file name cannot contain from a ROTATE event's name field.
+///
+/// # Why this is needed
+///
+/// A binlog file name is `<base>.<sequence>` and nothing else. What arrives on the wire can
+/// be longer: the ROTATE event carries a trailing CRC32 when `binlog_checksum` is on, and the
+/// *fake* rotate the server sends before the FORMAT_DESCRIPTION_EVENT is emitted before the
+/// reader knows which checksum algorithm is in force. MariaDB appends it there; MySQL does
+/// not, so only MariaDB shows the damage — and rustcdc claims MariaDB's protocol differences
+/// are handled transparently, which makes this ours to absorb.
+///
+/// Measured against MariaDB 10.6, the name came through as
+/// `mysql-bin.000002\x57\x07\x03\x52` — the four checksum bytes appended raw, two of them
+/// printable. Two failures followed from that one string, and neither was loud:
+///
+/// * File+position resume failed outright — the server answers
+///   *"Could not find first log file name in binary log index file"* and the stream never
+///   starts. With GTID positioning enabled the resume still works, which is what kept this
+///   hidden.
+/// * The checkpoint rewind guard silently switched itself off.
+///   [`binlog_coordinate`](crate::checkpoint) parses the sequence suffix with
+///   `"000002WR".parse::<u64>()`, which fails, and a `None` there means "not comparable" —
+///   so a genuinely regressed MariaDB coordinate would have been written without objection.
+///
+/// Truncating at the first byte that is not a filename byte is not enough: `0x57` is `W`.
+/// The suffix after the final `.` must be digits, so that is what is enforced.
+pub(super) fn sanitize_binlog_file_name(raw: &str) -> Result<String> {
+    let (base, suffix) = raw.rsplit_once('.').ok_or_else(|| {
+        Error::SourceError(format!(
+            "mysql rotate event carried an unusable binlog file name {raw:?}: expected \
+             '<base>.<sequence>'"
+        ))
+    })?;
+
+    let digits: String = suffix.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return Err(Error::SourceError(format!(
+            "mysql rotate event carried an unusable binlog file name {raw:?}: the sequence \
+             suffix after the final '.' is not numeric"
+        )));
+    }
+    if base.is_empty() || base.chars().any(|c| c.is_control() || !c.is_ascii()) {
+        return Err(Error::SourceError(format!(
+            "mysql rotate event carried an unusable binlog file name {raw:?}: the base name \
+             is empty or contains bytes a binlog file name cannot hold"
+        )));
+    }
+
+    let sanitized = format!("{base}.{digits}");
+    if sanitized.len() != raw.len() {
+        tracing::debug!(
+            target: "rustcdc::source::mysql",
+            raw = ?raw,
+            sanitized = %sanitized,
+            dropped_bytes = raw.len() - sanitized.len(),
+            "trimmed trailing bytes from a rotate event's binlog file name; these are the \
+             event checksum, which the server appends before the reader has been told which \
+             checksum algorithm is in force",
+        );
+    }
+    Ok(sanitized)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_rotate_name_with_a_trailing_checksum_is_trimmed_to_the_file_name() {
+        // Measured against MariaDB 10.6: the four CRC32 bytes arrive appended to the name,
+        // and two of them are printable ASCII — so truncating at the first byte that "looks
+        // wrong" does not work. The sequence suffix must be digits, and that is the rule.
+        let raw = "mysql-bin.000002\u{57}\u{7}\u{3}\u{52}";
+        assert_eq!(
+            sanitize_binlog_file_name(raw).expect("trims to a usable name"),
+            "mysql-bin.000002",
+        );
+    }
+
+    #[test]
+    fn a_clean_rotate_name_is_returned_unchanged() {
+        assert_eq!(
+            sanitize_binlog_file_name("binlog.001234").expect("already clean"),
+            "binlog.001234",
+        );
+        assert_eq!(
+            sanitize_binlog_file_name("mysql-bin.1000000").expect("seven digits"),
+            "mysql-bin.1000000",
+        );
+    }
+
+    #[test]
+    fn a_name_with_no_numeric_suffix_is_rejected_rather_than_guessed_at() {
+        // Writing a guess into a durable checkpoint is how the original defect stayed
+        // invisible: a corrupted name disabled the rewind guard silently, because an
+        // unparseable sequence reads as "not comparable" rather than as an error.
+        for raw in ["mysql-bin", "mysql-bin.", "mysql-bin.abc"] {
+            let error = sanitize_binlog_file_name(raw)
+                .expect_err("an unusable binlog file name must not reach a checkpoint");
+            assert!(
+                error.to_string().contains("unusable binlog file name"),
+                "got: {error}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -264,6 +264,19 @@ jobs:
           - postgres_stream_integration
           - postgres_wal_transport_parity_integration
           - postgres_incremental_snapshot_reconnect_integration
+          # Per-table snapshot row filter: bounds the chunk reads, must not bound the stream.
+          - postgres_snapshot_filter_integration
+          # The same column must have the same JSON type whichever path it arrived by.
+          # Nothing asserted this before, so snapshot and stream disagreed silently.
+          - postgres_value_representation_integration
+          # A clean restart with no new writes must deliver nothing. Guards the resume
+          # coordinate: PostgreSQL logical decoding filters at transaction granularity, so
+          # checkpointing a change's own LSN replays its whole transaction on every restart.
+          - postgres_restart_resume_integration
+          - postgres_query_integration
+          # Smoke-tests the shipped example end to end. An example that no longer runs is a
+          # broken first impression, and nothing else compiles-and-runs it.
+          - example_pg_to_stdout
           # Type fidelity + REPLICA IDENTITY DEFAULT. Every other integration schema is
           # BIGINT + TEXT, and that gap is what let a silent null-decoding defect survive
           # in the SQL Server connector.
@@ -289,8 +302,12 @@ jobs:
           fi
           bash scripts/ci-pull-relational-images.sh ${tags}
       - name: cargo test --test ${{ matrix.suite }}
-        if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration'
+        if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration' && matrix.suite != 'example_pg_to_stdout'
         run: cargo test --test ${{ matrix.suite }} --features postgres
+      # Spawns the compiled example, so the example has to be built alongside the test.
+      - name: cargo test --test example_pg_to_stdout (with examples)
+        if: matrix.suite == 'example_pg_to_stdout'
+        run: cargo test --test example_pg_to_stdout --features postgres --examples --tests
       - name: cargo test --test ${{ matrix.suite }} (metrics)
         if: matrix.suite == 'otel_metrics_integration' || matrix.suite == 'otel_tracing_integration'
         run: cargo test --test ${{ matrix.suite }} --features postgres,metrics
@@ -324,6 +341,15 @@ jobs:
           - deterministic_replay_golden_fixtures
           - runtime_health_states
           - fault_injection_soak_matrix
+          # Model-level checks of the crash-recovery *validator*. The real process-kill
+          # tests live in the per-connector integration jobs; this is what makes the
+          # validator itself trustworthy when pointed at one.
+          - crash_recovery_model
+          # `register_source` is the crate's headline claim for third-party connectors.
+          # Driving it end to end is what stops that claim rotting.
+          - custom_source_end_to_end
+          - snapshot_validator_integration
+          - logging_structured
           - wasm_runtime_integration
           - wasm_conformance_contract
     steps:
@@ -367,6 +393,11 @@ jobs:
           - mysql_stream_integration
           - mysql_binlog_compression_integration
           - mysql_handoff_integration
+          # A clean restart with no new writes must deliver nothing. Also asserts the
+          # resume coordinate carries no raw checksum bytes — MariaDB appends a CRC32 to
+          # the ROTATE event's file name, which corrupted the checkpoint and both broke
+          # file+position resume and silently disabled the rewind guard.
+          - mysql_restart_resume_integration
           - runtime_mysql_process_crash_integration
     steps:
       - uses: actions/checkout@v4
@@ -377,8 +408,12 @@ jobs:
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: cargo test --test ${{ matrix.suite }}
-        if: matrix.suite != 'runtime_mysql_process_crash_integration'
+        if: matrix.suite != 'runtime_mysql_process_crash_integration' && matrix.suite != 'mysql_restart_resume_integration'
         run: cargo test --test ${{ matrix.suite }} --features mysql
+      # Covers MySQL and MariaDB in one suite, so it needs both features.
+      - name: cargo test --test mysql_restart_resume_integration (mysql + mariadb)
+        if: matrix.suite == 'mysql_restart_resume_integration'
+        run: cargo test --test mysql_restart_resume_integration --features mysql,mariadb -- --test-threads=1
       - name: cargo test --test runtime_mysql_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_mysql_process_crash_integration'
         run: cargo test --test runtime_mysql_process_crash_integration --features mysql --bins
@@ -454,6 +489,7 @@ jobs:
           - sqlserver_window_truncation_integration
           - sqlserver_handoff_integration
           - runtime_sqlserver_process_crash_integration
+          - sqlserver_to_otel_example_integration
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -463,8 +499,12 @@ jobs:
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
         run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
       - name: cargo test --test ${{ matrix.suite }}
-        if: matrix.suite != 'runtime_sqlserver_process_crash_integration'
+        if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
         run: cargo test --test ${{ matrix.suite }} --features sqlserver
+      # Spawns the compiled example, so the example has to be built alongside the test.
+      - name: cargo test --test sqlserver_to_otel_example_integration (with examples)
+        if: matrix.suite == 'sqlserver_to_otel_example_integration'
+        run: cargo test --test sqlserver_to_otel_example_integration --features sqlserver,metrics --examples --tests
       - name: cargo test --test runtime_sqlserver_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_sqlserver_process_crash_integration'
         run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins

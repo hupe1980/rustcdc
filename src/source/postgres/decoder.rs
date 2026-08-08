@@ -192,6 +192,11 @@ impl<'a> BytesCursor<'a> {
         Ok(s)
     }
 
+    /// Bytes left in the frame, for bounding allocations against wire-declared counts.
+    pub(super) fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
     pub(super) fn read_n_bytes(&mut self, n: usize) -> Result<&[u8]> {
         let end = self.pos + n;
         if end > self.data.len() {
@@ -357,7 +362,12 @@ fn decode_delete(cur: &mut BytesCursor) -> Result<PgDelete> {
 fn decode_truncate(cur: &mut BytesCursor) -> Result<PgTruncate> {
     let num_rels = usize::try_from(cur.read_u32_be()?).unwrap_or(0);
     let option_bits = cur.read_u8()?;
-    let mut relation_oids = Vec::with_capacity(num_rels);
+    // Reserve against what the frame can actually contain, not against the declared
+    // count. The count is a `u32` read off the wire, and every relation costs four
+    // bytes, so a desynchronised or corrupt frame declaring 4 billion relations asked
+    // for a 16 GB allocation — an abort rather than the decode error the loop below
+    // would have produced a moment later.
+    let mut relation_oids = Vec::with_capacity(num_rels.min(cur.remaining() / 4));
     for _ in 0..num_rels {
         relation_oids.push(cur.read_u32_be()?);
     }
@@ -504,6 +514,21 @@ pub(super) trait PgOutputMessageProvider: Send + Sync {
     async fn idle_advance(&mut self) -> Result<u64> {
         Ok(0)
     }
+
+    /// Current slot lag in bytes, **without** touching the slot.
+    ///
+    /// Split from [`idle_advance`](Self::idle_advance) because that one is only safe when
+    /// the slot is provably caught up — it jumps the slot to `pg_current_wal_lsn()` and
+    /// discards anything not yet consumed. Measuring has no such constraint, and gating the
+    /// measurement on the advance meant `rustcdc_replication_slot_lag_bytes` only refreshed
+    /// while the pipeline was **idle**, which is exactly when lag is uninteresting. While
+    /// the pipeline was behind — the one situation an operator watches this for — the metric
+    /// showed whatever it read the last time there was nothing to do.
+    ///
+    /// Returning `None` means "not measurable on this transport".
+    async fn measure_slot_lag(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 pub(super) struct LivePgOutputMessageProvider {
@@ -622,6 +647,28 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             })?;
         self.confirmed_lsn = lsn;
         Ok(())
+    }
+
+    async fn measure_slot_lag(&mut self) -> Result<Option<u64>> {
+        // Read-only: no `pg_replication_slot_advance`, so this is safe on the
+        // not-caught-up path where `idle_advance` is not.
+        let row = self
+            .client
+            .query_opt(
+                "SELECT (pg_current_wal_lsn() - confirmed_flush_lsn)::bigint \
+                 FROM pg_replication_slots WHERE slot_name = $1",
+                &[&self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync)],
+            )
+            .await
+            .map_err(|error| {
+                Error::SourceError(format!(
+                    "failed measuring replication slot lag for '{}': {error}",
+                    self.slot_name
+                ))
+            })?;
+        Ok(row
+            .and_then(|row| row.try_get::<_, Option<i64>>(0).ok().flatten())
+            .map(|lag| u64::try_from(lag).unwrap_or(0)))
     }
 
     async fn idle_advance(&mut self) -> Result<u64> {

@@ -60,6 +60,15 @@ const MAX_EVENTS_PER_POLL: usize = 1_000;
 /// Maximum time a single `poll_xlog_data` SQL query may run when `timeout_ms == 0`.
 /// Prevents indefinite blocking on the "single-shot, return immediately" code-path.
 const DEFAULT_POLL_BACKSTOP_MS: u64 = 30_000;
+/// Defensive cap on remembered `(tx_id, end_lsn)` pairs.
+///
+/// The queue drains as `confirm_lsn` advances, so in a healthy pipeline it holds only the
+/// transactions currently in flight. The cap bounds it if a consumer stops acknowledging
+/// entirely; past it the oldest entries are dropped and those events fall back to their own
+/// change LSN, which costs a replay of their transaction rather than losing anything.
+const MAX_TRACKED_TX_ENDS: usize = 100_000;
+/// Slot-lag sampling cadence when idle advance is disabled.
+const DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS: u64 = 15_000;
 /// Live pgoutput stream over a logical replication slot.
 ///
 /// Obtain via `PostgresConnection::start_stream`.
@@ -79,6 +88,15 @@ pub struct PostgresStreamHandle {
     current_xid: Option<u32>,
     current_commit_ts: u64,
     partial_tx_events: Vec<Event>,
+    /// `(tx_id, end_lsn)` for transactions released to the consumer but not yet confirmed.
+    ///
+    /// `end_lsn` is the pgoutput COMMIT message's end position — the LSN **after** the
+    /// commit record — and it is the only position a restart may resume from. See
+    /// [`PostgresStreamHandle::resume_offset_for`].
+    ///
+    /// Bounded by the in-flight window: entries are dropped as `confirm_lsn` moves past
+    /// them, and defensively capped at [`MAX_TRACKED_TX_ENDS`].
+    committed_tx_ends: std::collections::VecDeque<(u64, u64)>,
     events_polled: u64,
     max_events_per_poll: usize,
     /// Changes requested from the next peek.
@@ -94,6 +112,8 @@ pub struct PostgresStreamHandle {
     slot_idle_advance_interval_ms: u64,
     /// Tracks when `idle_advance` was last called to gate the advance interval.
     last_idle_advance_at: Option<std::time::Instant>,
+    /// Tracks when slot lag was last measured, to gate the sampling interval.
+    last_slot_lag_at: Option<std::time::Instant>,
     /// Most recently observed WAL lag in bytes from the last `idle_advance` call.
     ///
     /// `0` before the first idle advance is executed.
@@ -105,6 +125,24 @@ pub struct PostgresStreamHandle {
 }
 
 impl PostgresStreamHandle {
+    /// Whether enough time has passed to re-measure slot lag.
+    ///
+    /// Reuses `slot_idle_advance_interval_ms` as the cadence when it is configured, and
+    /// falls back to a fixed interval when idle advance is disabled — a deployment that
+    /// turns off idle advance still needs the lag metric, and gating the measurement on the
+    /// advance is what made it stale in the first place.
+    fn slot_lag_sample_due(&self) -> bool {
+        let interval_ms = if self.slot_idle_advance_interval_ms > 0 {
+            self.slot_idle_advance_interval_ms
+        } else {
+            DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS
+        };
+        let threshold = std::time::Duration::from_millis(interval_ms);
+        self.last_slot_lag_at
+            .map(|at| at.elapsed() >= threshold)
+            .unwrap_or(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         source_name: String,
@@ -126,12 +164,14 @@ impl PostgresStreamHandle {
             current_xid: None,
             current_commit_ts: 0,
             partial_tx_events: Vec::new(),
+            committed_tx_ends: std::collections::VecDeque::new(),
             events_polled: 0,
             max_events_per_poll: max_events_per_poll.max(1),
             peek_window: max_events_per_poll.max(1),
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
             slot_idle_advance_interval_ms,
             last_idle_advance_at: None,
+            last_slot_lag_at: None,
             last_slot_lag_bytes: 0,
             table_include_list,
             table_exclude_list,
@@ -367,6 +407,10 @@ impl PostgresSnapshotHandle {
             .map(|column| format!("t.{}::text", quote_pg_identifier(column)))
             .collect::<Vec<_>>()
             .join(", ");
+        // The row payload is built column by column so its text matches what pgoutput
+        // produces on the streaming path. See `query::row_as_text_json`.
+        let all_columns = query::query_all_columns(client, &schema, &table_name).await?;
+        let row_json = query::row_as_text_json(&all_columns);
 
         let rows = if let Some(last_pk_cursor) = cursor {
             let key_values =
@@ -387,12 +431,12 @@ impl PostgresSnapshotHandle {
                 .join(", ");
 
             let query = format!(
-                "SELECT ARRAY[{key_value_expr}], row_to_json(t)::text \
+                "SELECT ARRAY[{key_value_expr}], {row_json} \
                  FROM {table_ref} t \
                  WHERE ({order_expr}) > ({predicate_expr}) \
                  ORDER BY {order_expr} \
                  LIMIT ${}",
-                key_columns.len() + 1
+                key_columns.len() + 1,
             );
 
             let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -412,7 +456,7 @@ impl PostgresSnapshotHandle {
                 })?
         } else {
             let query = format!(
-                "SELECT ARRAY[{key_value_expr}], row_to_json(t)::text \
+                "SELECT ARRAY[{key_value_expr}], {row_json} \
                  FROM {table_ref} t \
                  ORDER BY {order_expr} \
                  LIMIT $1"
@@ -585,9 +629,12 @@ pub enum WalTransport {
     /// connection, which makes it the fallback for environments that cannot grant one:
     ///
     /// * a managed service that withholds `REPLICATION` from the application role;
-    /// * a connection routed through a pooler that cannot proxy replication;
-    /// * a [`TransportConfig::RustlsConfig`](crate::core::TransportConfig) transport,
-    ///   whose pre-built verifier the streaming client cannot consume.
+    /// * a connection routed through a pooler that cannot proxy replication.
+    ///
+    /// A [`TransportConfig::RustlsConfig`](crate::core::TransportConfig) is **not** a
+    /// reason. The streaming client builds its own connector, so an injected config is used
+    /// as-is, custom verifier and all — see
+    /// [`rustls_client_config`](crate::core::rustls_client_config).
     ///
     /// Prefer fixing the environment. Reach for this when you cannot.
     SqlPeek,
@@ -1056,7 +1103,8 @@ impl StreamHandle for PostgresStreamHandle {
             // could be decoded in the budget — so it must never reach the idle branch.
             let slot_is_caught_up = poll_outcome.is_caught_up();
             let xlog_data = poll_outcome.into_rows();
-            if !xlog_data.is_empty() {
+            let had_data = !xlog_data.is_empty();
+            if had_data {
                 // Got WAL data — reset the idle advance timer so the interval is
                 // measured from the last active period, not from the last call.
                 self.last_idle_advance_at = Some(std::time::Instant::now());
@@ -1081,7 +1129,23 @@ impl StreamHandle for PostgresStreamHandle {
                 if self.stream.lsn_position > lsn_before {
                     self.provider.confirm_lsn(self.stream.lsn_position).await?;
                 }
-            } else if slot_is_caught_up && self.slot_idle_advance_interval_ms > 0 {
+            }
+
+            // Sample lag on a timer, independent of whether the slot is caught up.
+            //
+            // `rustcdc_replication_slot_lag_bytes` is the early warning for WAL exhaustion
+            // and for slot invalidation via `max_slot_wal_keep_size` — both data-loss
+            // events — so it has to be current precisely when the pipeline is *behind*.
+            // Sampling it only from the idle-advance branch meant it refreshed only when
+            // the pipeline was caught up, and not at all when idle advance was disabled.
+            if self.slot_lag_sample_due() {
+                if let Some(lag_bytes) = self.provider.measure_slot_lag().await? {
+                    self.last_slot_lag_bytes = lag_bytes;
+                    self.last_slot_lag_at = Some(std::time::Instant::now());
+                }
+            }
+
+            if !had_data && slot_is_caught_up && self.slot_idle_advance_interval_ms > 0 {
                 // The slot is provably caught up: the poll completed and returned no
                 // rows. Periodically advance the replication slot to the current WAL
                 // write position so PostgreSQL can reclaim WAL segments that would
@@ -1136,14 +1200,32 @@ impl StreamHandle for PostgresStreamHandle {
         )))
     }
 
+    fn resume_offset_for(&self, event: &Event) -> Option<String> {
+        // Only a *transaction end* is resumable — `StreamHandle::resume_offset_for` explains
+        // why the event's own change LSN is not. Every event released by the decoder belongs
+        // to a transaction whose COMMIT has already been read, so the lookup always hits for
+        // an event this handle produced.
+        let tx_id = event.transaction.as_ref()?.tx_id;
+        let end_lsn = self
+            .committed_tx_ends
+            .iter()
+            .rev()
+            .find_map(|(id, end_lsn)| (*id == tx_id).then_some(*end_lsn))?;
+        Some(parser::format_pg_lsn(end_lsn))
+    }
+
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
-        self.provider.confirm_lsn(lsn).await
+        self.provider.confirm_lsn(lsn).await?;
+        // Everything at or below the confirmed position is settled; the consumer can never
+        // ask to resume before it again.
+        self.committed_tx_ends.retain(|(_, end_lsn)| *end_lsn > lsn);
+        Ok(())
     }
 
     fn replication_slot_lag_bytes(&self) -> Option<u64> {
-        // Return None before the first idle advance so callers can distinguish
+        // Return None before the first measurement so callers can distinguish
         // "not yet measured" from "measured and zero".
-        if self.last_slot_lag_bytes == 0 && self.last_idle_advance_at.is_none() {
+        if self.last_slot_lag_at.is_none() {
             None
         } else {
             Some(self.last_slot_lag_bytes)

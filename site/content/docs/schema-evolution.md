@@ -54,10 +54,34 @@ Schema evolution behavior spans two modules:
 
 `SchemaHistory` defines the storage contract:
 
-- `record_ddl` to append schema mutations and return version
+- `record_ddl(ddl_id, ddl)` to append a schema mutation and return its version
 - `get_schema_at_version` and `get_schema_at_timestamp` for point-in-time lookup
 - `latest_schema` for current view
 - `apply_retention` to prune old versions using explicit retention policy
+
+#### `record_ddl` is idempotent on `ddl_id`
+
+`ddl_id` is a stable identity for the statement; the runtime passes the source log position
+the DDL was captured at. A DDL redelivered under at-least-once replay returns the version it
+was already assigned rather than appending a second entry. Pass an empty string to opt out.
+
+This is load-bearing, not a nicety. The runtime records a schema change *before* it enqueues
+the event announcing it, so a crash between the record and the checkpoint commit replays the
+DDL on restart. Without the identity check, replaying an `AlterTableDiff` re-applied its
+operations to a schema that already had them — `ADD COLUMN` on a column that now exists —
+which returns `SchemaError`, failed the poll, and failed identically on every subsequent
+restart from the same checkpoint. The pipeline never started again.
+
+A custom `SchemaHistory` implementation must honour the same contract.
+
+#### A rejected entry does not stop capture
+
+If the history genuinely cannot accept a statement — an `ALTER TABLE` diff for a table the
+store has never seen, which is what an `InMemorySchemaHistory` looks like after any restart —
+the runtime logs at ERROR with the remedy and continues. Propagating it would fail the poll,
+and fail identically on every restart, for a gap in an auxiliary index; the event itself is
+self-describing and still reaches the consumer. A store that is *broken* rather than merely
+inconsistent — an I/O failure, a lost owner lease — still fails the poll.
 
 Runtime-managed retention is available through `RuntimeConfig::with_schema_history_retention(...)`.
 When configured, rustcdc applies the retention policy automatically after each persisted DDL mutation.
@@ -73,6 +97,8 @@ Runtime defaults now enable bounded retention (`keep_last(256)` per table) to pr
 - `FileSchemaHistory`
   - Durable local JSON backend for long-lived deployments
   - Uses write-rename persistence with file and directory fsync for crash-safe single-process durability
+  - Every filesystem call, including both `fsync`s, runs on a blocking worker rather than on the caller's async executor
+  - A recognised replay writes nothing, so a redelivered DDL costs no file rewrite
   - Writes with restrictive file permissions by default and uses unique temp-file creation with collision retries before atomic rename
   - Reloads schema versions on process restart from configured history file
   - Persists retention-pruned state after applying retention policy

@@ -428,22 +428,26 @@ impl InMemoryCheckpoint {
 /// and refuses to write.
 #[derive(Debug)]
 pub struct FileCheckpoint {
-    /// Directory containing checkpoint files.
-    pub checkpoint_dir: PathBuf,
-    /// Unix file mode used when creating checkpoint files.
-    pub file_mode: u32,
+    /// Shared with the blocking worker each call hands its filesystem work to.
+    inner: Arc<FileCheckpointInner>,
+}
+
+/// The filesystem half of [`FileCheckpoint`], held behind an `Arc` so a whole call can
+/// be moved onto a blocking worker thread.
+///
+/// Every method here is synchronous and performs real I/O — including `fsync`, which is
+/// unbounded on a slow or networked filesystem. None of them may be called from an async
+/// context directly; [`Checkpoint`] impl hands each to `spawn_blocking`.
+#[derive(Debug)]
+struct FileCheckpointInner {
+    checkpoint_dir: PathBuf,
+    file_mode: u32,
     lease: Mutex<Option<owner_lease::OwnerLease>>,
     /// When set, this handle never acquires the owner lease and refuses to write.
     read_only: bool,
 }
 
 impl FileCheckpoint {
-    const OWNER_LEASE_FILENAME: &str = ".rustcdc_checkpoint.owner";
-
-    fn source_family(source_type: &str) -> &str {
-        source_type.strip_suffix("_snapshot").unwrap_or(source_type)
-    }
-
     /// Create a writable checkpoint store, taking the directory's owner lease.
     ///
     /// The lease is acquired lazily on first use, and a second writable instance against
@@ -451,10 +455,12 @@ impl FileCheckpoint {
     /// running instance, use [`FileCheckpoint::read_only`].
     pub fn new(checkpoint_dir: impl Into<PathBuf>) -> Self {
         Self {
-            checkpoint_dir: checkpoint_dir.into(),
-            file_mode: FILE_CHECKPOINT_DEFAULT_FILE_MODE,
-            lease: Mutex::new(None),
-            read_only: false,
+            inner: Arc::new(FileCheckpointInner {
+                checkpoint_dir: checkpoint_dir.into(),
+                file_mode: FILE_CHECKPOINT_DEFAULT_FILE_MODE,
+                lease: Mutex::new(None),
+                read_only: false,
+            }),
         }
     }
 
@@ -481,16 +487,63 @@ impl FileCheckpoint {
     /// ```
     pub fn read_only(checkpoint_dir: impl Into<PathBuf>) -> Self {
         Self {
-            checkpoint_dir: checkpoint_dir.into(),
-            file_mode: FILE_CHECKPOINT_DEFAULT_FILE_MODE,
-            lease: Mutex::new(None),
-            read_only: true,
+            inner: Arc::new(FileCheckpointInner {
+                checkpoint_dir: checkpoint_dir.into(),
+                file_mode: FILE_CHECKPOINT_DEFAULT_FILE_MODE,
+                lease: Mutex::new(None),
+                read_only: true,
+            }),
         }
+    }
+
+    /// Directory this store reads and writes checkpoint files in.
+    pub fn checkpoint_dir(&self) -> &Path {
+        &self.inner.checkpoint_dir
+    }
+
+    /// Unix file mode applied to checkpoint files as they are created.
+    pub fn file_mode(&self) -> u32 {
+        self.inner.file_mode
     }
 
     /// Whether this handle refuses to write.
     pub fn is_read_only(&self) -> bool {
-        self.read_only
+        self.inner.read_only
+    }
+
+    /// Override the Unix mode checkpoint files are created with.
+    ///
+    /// The default is `0o600`, and [`Checkpoint::load`] **rejects** any file readable or
+    /// writable by group or other — a checkpoint names the database and the exact log
+    /// position a reader could resume from. Widen it only if the deployment genuinely
+    /// requires it, and pass the same mode to
+    /// [`FileCheckpoint::restore_from_record_with_mode`] when seeding.
+    ///
+    /// Must be called before the first read or write: files already on disk keep the
+    /// mode they were created with.
+    pub fn with_file_mode(mut self, file_mode: u32) -> Self {
+        // Sole owner at construction time, so this cannot fail in practice; falling back
+        // to a rebuild keeps the builder infallible if a caller cloned the handle.
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.file_mode = file_mode,
+            None => {
+                self.inner = Arc::new(FileCheckpointInner {
+                    checkpoint_dir: self.inner.checkpoint_dir.clone(),
+                    file_mode,
+                    lease: Mutex::new(None),
+                    read_only: self.inner.read_only,
+                })
+            }
+        }
+        self
+    }
+}
+
+impl FileCheckpointInner {
+    const OWNER_LEASE_FILENAME: &str = ".rustcdc_checkpoint.owner";
+
+    fn source_family(source_type: &str) -> &str {
+        source_type.strip_suffix("_snapshot").unwrap_or(source_type)
     }
 
     fn lease_path(&self) -> PathBuf {
@@ -741,6 +794,11 @@ impl FileCheckpoint {
         crate::core::durability::fsync_parent_directory(file_path)
     }
 
+    /// Apply the shared progress rules before writing.
+    ///
+    /// The rules themselves live in [`validate_checkpoint_progress`] so a custom
+    /// [`Checkpoint`] backend enforces exactly what this does, rather than a copy that
+    /// drifts — the per-source reasoning is the part that gets reimplemented wrong.
     fn validate_monotonic_progress(
         &self,
         source_type: &str,
@@ -752,41 +810,22 @@ impl FileCheckpoint {
         }
 
         let existing = Self::read_record(&checkpoint_path)?;
-
-        if existing.committed_event_count > next.committed_event_count {
-            return Err(crate::core::Error::CheckpointError(format!(
-                "refusing non-monotonic checkpoint write for source '{}': existing committed_event_count={} is greater than next committed_event_count={}",
-                source_type, existing.committed_event_count, next.committed_event_count
-            )));
-        }
-
-        if existing.committed_event_count == next.committed_event_count
-            && existing.offset != next.offset
-        {
-            return Err(crate::core::Error::CheckpointError(format!(
-                "refusing conflicting checkpoint write for source '{}': committed_event_count={} matches existing record but offset payload differs",
-                source_type, next.committed_event_count
-            )));
-        }
-
-        if let Some(detail) =
-            stream_position_regression(source_type, &existing.offset, &next.offset)
-        {
-            return Err(crate::core::Error::CheckpointError(format!(
-                "refusing checkpoint write for source '{source_type}': the stream position \
-                 moved backwards ({detail}). The committed-event count still advanced, so \
-                 this is not a replay — it means the connector handed the checkpoint a \
-                 position it cannot have reached, and writing it would make the next \
-                 restart resume before data that is already committed downstream. Either \
-                 the source was reset or repointed at a different server (clear the \
-                 checkpoint directory and re-snapshot), or this is a connector defect \
-                 worth reporting."
-            )));
-        }
-
-        Ok(())
+        validate_checkpoint_progress(
+            Some(&StoredCheckpointRecord::new(
+                existing.source_type,
+                existing.committed_event_count,
+                existing.offset,
+            )),
+            &StoredCheckpointRecord::new(
+                next.source_type.clone(),
+                next.committed_event_count,
+                next.offset.clone(),
+            ),
+        )
     }
+}
 
+impl FileCheckpoint {
     /// Seed a checkpoint file directly from raw offset bytes and an event count.
     ///
     /// This is useful for migrations, disaster recovery, and integration testing
@@ -892,6 +931,121 @@ impl FileCheckpoint {
     }
 }
 
+/// The full progress check [`FileCheckpoint::save`] performs before writing.
+///
+/// Call this from a custom [`Checkpoint`] implementation **before** the durable write, so a
+/// rewound or conflicting position is refused instead of persisted. Running it afterwards
+/// reports damage that has already reached the authoritative store — which is the mistake
+/// worth designing against, because a mirror-then-validate ordering looks correct until a
+/// real regression arrives.
+///
+/// `existing` is the record currently stored for this source (`None` on the first write).
+///
+/// Three rules, in the order they matter:
+///
+/// 1. The committed-event count must not go backwards — that is a checkpoint forgetting
+///    progress.
+/// 2. Two records with the same count must carry the same offset, or one of them is wrong
+///    about what that count covers.
+/// 3. The connector-native stream coordinate must not regress while the count advances —
+///    see [`stream_position_regression`] for why that is checked per source rather than
+///    generically.
+///
+/// # Errors
+///
+/// Returns [`crate::core::Error::CheckpointError`] naming which rule failed and what to do
+/// about it.
+///
+/// ```
+/// use rustcdc::checkpoint::{validate_checkpoint_progress, StoredCheckpointRecord};
+///
+/// # fn main() -> rustcdc::Result<()> {
+/// let existing = StoredCheckpointRecord::new("postgres", 10, serde_json::json!({
+///     "lsn": 100_u64, "slot_name": "app"
+/// }));
+/// let next = StoredCheckpointRecord::new("postgres", 20, serde_json::json!({
+///     "lsn": 200_u64, "slot_name": "app"
+/// }));
+/// validate_checkpoint_progress(Some(&existing), &next)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_checkpoint_progress(
+    existing: Option<&StoredCheckpointRecord>,
+    next: &StoredCheckpointRecord,
+) -> Result<()> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let source_type = &next.source_type;
+
+    if existing.committed_event_count > next.committed_event_count {
+        return Err(crate::core::Error::CheckpointError(format!(
+            "refusing non-monotonic checkpoint write for source '{source_type}': existing              committed_event_count={} is greater than next committed_event_count={}",
+            existing.committed_event_count, next.committed_event_count
+        )));
+    }
+
+    if existing.committed_event_count == next.committed_event_count
+        && existing.offset != next.offset
+    {
+        return Err(crate::core::Error::CheckpointError(format!(
+            "refusing conflicting checkpoint write for source '{source_type}':              committed_event_count={} matches existing record but offset payload differs",
+            next.committed_event_count
+        )));
+    }
+
+    if let Some(detail) = stream_position_regression(source_type, &existing.offset, &next.offset) {
+        return Err(crate::core::Error::CheckpointError(format!(
+            "refusing checkpoint write for source '{source_type}': the stream position              moved backwards ({detail}). The committed-event count still advanced, so              this is not a replay — it means the connector handed the checkpoint a              position it cannot have reached, and writing it would make the next              restart resume before data that is already committed downstream. Either              the source was reset or repointed at a different server (clear the              checkpoint directory and re-snapshot), or this is a connector defect              worth reporting."
+        )));
+    }
+
+    Ok(())
+}
+
+/// A checkpoint record as a custom [`Checkpoint`] backend sees it.
+///
+/// The three fields [`validate_checkpoint_progress`] compares. Build one from whatever your
+/// store holds and from the [`Offset`] you are about to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCheckpointRecord {
+    /// Connector namespace, from [`Offset::source_type`].
+    pub source_type: String,
+    /// Events durably committed as of this record.
+    pub committed_event_count: u64,
+    /// Offset payload — whatever [`Offset::encode`] produced, parsed as JSON.
+    pub offset: serde_json::Value,
+}
+
+impl StoredCheckpointRecord {
+    /// Assemble a record from its three fields.
+    pub fn new(
+        source_type: impl Into<String>,
+        committed_event_count: u64,
+        offset: serde_json::Value,
+    ) -> Self {
+        Self {
+            source_type: source_type.into(),
+            committed_event_count,
+            offset,
+        }
+    }
+
+    /// Build a record from an [`Offset`] about to be written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::core::Error::SerializationError`] if the encoded offset is not JSON.
+    pub fn from_offset(offset: &dyn Offset, committed_event_count: u64) -> Result<Self> {
+        Ok(Self {
+            source_type: offset.source_type().to_string(),
+            committed_event_count,
+            offset: serde_json::from_slice(&offset.encode()?)?,
+        })
+    }
+}
+
 /// Describe how `next` moved *behind* `existing`, or `None` if it did not.
 ///
 /// The committed-event count catches a checkpoint that forgets progress. It does not
@@ -905,7 +1059,23 @@ impl FileCheckpoint {
 /// Only the connector-native stream coordinate is compared. Incremental-snapshot chunk
 /// cursors travel in the same record but are not totally ordered across tables, and an
 /// unrecognised source type is left alone rather than guessed at.
-fn stream_position_regression(
+///
+/// # Using this from a custom `Checkpoint`
+///
+/// [`FileCheckpoint`] applies this itself. Any other backend — DynamoDB, Redis, a Kafka
+/// topic — gets no guard unless it calls this, and the per-source reasoning is exactly the
+/// part that gets reimplemented wrong: PostgreSQL LSNs legitimately go backwards under
+/// concurrent writers, and MySQL binlog coordinates must not be compared at all when a GTID
+/// is present because they are server-local and a failover resets them.
+///
+/// **Call it before the durable write, not after.** A guard that runs after the authoritative
+/// store has accepted a rewound position reports damage that is already persisted. Prefer
+/// [`validate_checkpoint_progress`], which applies this plus the event-count rules in the
+/// same order [`FileCheckpoint::save`] does.
+///
+/// `existing` and `next` are the offset payloads — whatever [`Offset::encode`] produced,
+/// parsed as JSON.
+pub fn stream_position_regression(
     source_type: &str,
     existing: &serde_json::Value,
     next: &serde_json::Value,
@@ -1009,21 +1179,13 @@ fn set_checkpoint_file_mode(file: &File, mode: u32) -> Result<()> {
     Ok(())
 }
 
-#[async_trait]
-impl Checkpoint for FileCheckpoint {
-    async fn save(&mut self, offset: &dyn Offset, committed_event_count: u64) -> Result<()> {
+impl FileCheckpointInner {
+    fn save_blocking(&self, source_type: String, record: FileCheckpointRecord) -> Result<()> {
         self.ensure_owner_lease()?;
         // Fence the write: ownership acquired at startup is not ownership now. This also
         // rejects a read-only handle, which by construction never took the lease.
         self.verify_lease_still_held()?;
         self.ensure_directory()?;
-
-        let source_type = offset.source_type().to_string();
-        let record = FileCheckpointRecord::new(
-            source_type.clone(),
-            committed_event_count,
-            serde_json::from_slice(&offset.encode()?)?,
-        );
         self.validate_monotonic_progress(&source_type, &record)?;
 
         let temp_path = self.temp_path(&source_type);
@@ -1045,7 +1207,7 @@ impl Checkpoint for FileCheckpoint {
         Ok(())
     }
 
-    async fn load(&self) -> Result<Option<Box<dyn Offset>>> {
+    fn load_blocking(&self) -> Result<Option<Box<dyn Offset>>> {
         self.ensure_owner_lease()?;
         let Some(record) = self.load_latest_record()? else {
             return Ok(None);
@@ -1067,7 +1229,7 @@ impl Checkpoint for FileCheckpoint {
         Ok(Some(offset))
     }
 
-    async fn get_committed_count(&self) -> Result<u64> {
+    fn committed_count_blocking(&self) -> Result<u64> {
         self.ensure_owner_lease()?;
         let Some(record) = self.load_latest_record()? else {
             return Ok(0);
@@ -1077,7 +1239,57 @@ impl Checkpoint for FileCheckpoint {
     }
 }
 
-impl Drop for FileCheckpoint {
+/// Run `work` on a blocking worker so `fsync` never stalls an async executor thread.
+///
+/// Every filesystem call in this store is synchronous, and `sync_all` in particular is
+/// unbounded: on a networked or contended filesystem a single commit can hold a Tokio
+/// worker thread for tens of milliseconds, stalling every other task scheduled on it —
+/// and wedging a current-thread runtime entirely. This crate is embedded into the
+/// caller's runtime, so that cost is not ours to impose.
+async fn on_blocking_worker<T, F>(inner: Arc<FileCheckpointInner>, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&FileCheckpointInner) -> Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || work(&inner)).await {
+        Ok(result) => result,
+        Err(error) => Err(crate::core::Error::CheckpointError(format!(
+            "checkpoint filesystem task failed to run to completion: {error}"
+        ))),
+    }
+}
+
+#[async_trait]
+impl Checkpoint for FileCheckpoint {
+    async fn save(&mut self, offset: &dyn Offset, committed_event_count: u64) -> Result<()> {
+        // Encoding is pure CPU work on data the caller already owns, so it stays here —
+        // only the filesystem half is worth a thread hop.
+        let source_type = offset.source_type().to_string();
+        let record = FileCheckpointRecord::new(
+            source_type.clone(),
+            committed_event_count,
+            serde_json::from_slice(&offset.encode()?)?,
+        );
+        on_blocking_worker(Arc::clone(&self.inner), move |inner| {
+            inner.save_blocking(source_type, record)
+        })
+        .await
+    }
+
+    async fn load(&self) -> Result<Option<Box<dyn Offset>>> {
+        on_blocking_worker(Arc::clone(&self.inner), FileCheckpointInner::load_blocking).await
+    }
+
+    async fn get_committed_count(&self) -> Result<u64> {
+        on_blocking_worker(
+            Arc::clone(&self.inner),
+            FileCheckpointInner::committed_count_blocking,
+        )
+        .await
+    }
+}
+
+impl Drop for FileCheckpointInner {
     fn drop(&mut self) {
         // OwnerLease::drop handles ref-count decrement and lease file removal.
         // Take while holding the Mutex to prevent a concurrent ensure_owner_lease
@@ -1741,7 +1953,9 @@ mod tests {
     #[cfg(unix)]
     async fn file_checkpoint_rejects_owner_lease_conflict_from_live_pid() {
         let dir = tempdir().unwrap();
-        let lock_path = dir.path().join(FileCheckpoint::OWNER_LEASE_FILENAME);
+        let lock_path = dir
+            .path()
+            .join(super::FileCheckpointInner::OWNER_LEASE_FILENAME);
         // PID 1 (init/launchd) is always alive. Use HOSTNAME:PID format.
         let lease = crate::checkpoint::owner_lease::format_lease(
             crate::checkpoint::owner_lease::current_hostname(),
@@ -1760,7 +1974,9 @@ mod tests {
     #[cfg(unix)]
     async fn file_checkpoint_recovers_from_stale_owner_lease_of_dead_process() {
         let dir = tempdir().unwrap();
-        let lock_path = dir.path().join(FileCheckpoint::OWNER_LEASE_FILENAME);
+        let lock_path = dir
+            .path()
+            .join(super::FileCheckpointInner::OWNER_LEASE_FILENAME);
         // PID u32::MAX is extremely unlikely to be alive. Use HOSTNAME:PID format.
         let stale_lease = crate::checkpoint::owner_lease::format_lease(
             crate::checkpoint::owner_lease::current_hostname(),
@@ -1843,6 +2059,7 @@ mod sqlserver_offset_compat_tests {
             crate::source::IncrementalSnapshotState {
                 snapshot_id: "snap-1".into(),
                 tables: Vec::new(),
+                paused: false,
             },
         ));
         let decoded =

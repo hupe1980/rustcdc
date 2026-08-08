@@ -351,7 +351,108 @@ run_workflow_drift_check() {
   require_absent "docker pull mcr.microsoft.com/mssql/server:2019-latest" "$CI_WORKFLOW" "inline sqlserver pull"
   require_absent "if: github.event_name == 'workflow_dispatch'" "$CI_WORKFLOW" "workflow-dispatch-only CI lanes"
 
+  run_test_suite_coverage_check
+  run_relational_image_drift_check
+
   echo "Workflow drift guard passed."
+}
+
+# The pre-pull list must cover every version the test matrices instantiate.
+#
+# The pre-pull exists to fetch images from a mirror rather than from rate-limited Docker Hub.
+# When it drifts from the matrices it fails silently in the worst direction: the warmed
+# images go unused and the images the tests actually need are fetched at run time, from
+# exactly the registry the script was written to avoid. It had drifted by two of four.
+run_relational_image_drift_check() {
+  local pull_script="scripts/ci-pull-relational-images.sh"
+  local missing=()
+
+  local mysql_versions mariadb_versions
+  mysql_versions="$(grep -oE '"[0-9]+\.[0-9]+"' tests/mysql_version_matrix.rs | tr -d '"' | sort -u)"
+  mariadb_versions="$(grep -oE '"1[0-9]\.[0-9]+"' tests/mariadb_e2e_integration.rs | tr -d '"' | sort -u)"
+
+  local version
+  for version in $mysql_versions; do
+    grep -q "\"mysql:${version}\"" "$pull_script" || missing+=("mysql:${version}")
+  done
+  for version in $mariadb_versions; do
+    grep -q "\"mariadb:${version}\"" "$pull_script" || missing+=("mariadb:${version}")
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    echo "FAIL: test matrices instantiate images the pre-pull list does not warm:" >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    echo "Add them to NON_POSTGRES_RELATIONAL_SMOKE_IMAGES in ${pull_script}, or drop the" >&2
+    echo "version from the matrix. Leaving them out sends those pulls to Docker Hub." >&2
+    exit 1
+  fi
+
+  echo "Relational image drift check passed (pre-pull covers every matrix version)."
+}
+
+# Every integration suite under tests/ must actually be run by something.
+#
+# The checks above are an *allow-list*: they assert that named suites appear in the
+# workflow. That is silent about suites nobody added — and a test that never runs is
+# indistinguishable from a test that does not exist, while looking like evidence in a
+# review. Sixteen suites had accumulated outside CI when this check was written, including
+# the end-to-end coverage of `register_source` (the crate's headline extension-point claim)
+# and the structured-log schema.
+#
+# A suite counts as covered when its name appears in the CI workflow, in a script the
+# workflow runs, or as a `#[path]`-included helper module of another suite. Anything else
+# must be added to one of those, or listed in HELPER_SUITES with a reason.
+run_test_suite_coverage_check() {
+  # Helper modules included by other suites via `#[path = "..."] mod ...;`. Cargo also
+  # builds each as its own (empty) test binary, so they appear in tests/ without being
+  # suites in their own right.
+  local helper_suites=(
+    latency_evidence_common
+    process_crash_marker
+    process_crash_worker
+    sqlserver_testkit
+  )
+
+  local uncovered=()
+  local suite
+  for path in tests/*.rs; do
+    suite="$(basename "$path" .rs)"
+
+    local is_helper=0
+    for helper in "${helper_suites[@]}"; do
+      if [[ "$suite" == "$helper" ]]; then
+        is_helper=1
+        break
+      fi
+    done
+    if [[ "$is_helper" == "1" ]]; then
+      continue
+    fi
+
+    if grep -q -- "$suite" "$CI_WORKFLOW"; then
+      continue
+    fi
+    if grep -rq --include='*.sh' -- "$suite" scripts/; then
+      continue
+    fi
+    if grep -rq "path = \"${suite}.rs\"" tests/; then
+      continue
+    fi
+
+    uncovered+=("$suite")
+  done
+
+  if (( ${#uncovered[@]} > 0 )); then
+    echo "FAIL: integration suites are never run by CI or any script:" >&2
+    for suite in "${uncovered[@]}"; do
+      echo "  - tests/${suite}.rs" >&2
+    done
+    echo "Add each to a matrix in ${CI_WORKFLOW}, to a script CI runs, or to" >&2
+    echo "helper_suites in scripts/ci-policy-gate.sh with a reason." >&2
+    exit 1
+  fi
+
+  echo "Test suite coverage check passed (every tests/*.rs is run by CI or a script)."
 }
 
 # Every public field of a user-facing config struct must appear in the configuration

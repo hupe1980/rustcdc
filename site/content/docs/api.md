@@ -207,6 +207,50 @@ let event = Event::builder("users", Operation::Insert)
 # }
 ```
 
+### Column values are text, on every connector and every path
+
+**Every scalar column value is a JSON string. SQL `NULL` is JSON `null`.** One rule, with no
+exceptions for connector or capture path.
+
+```json
+{"id": "42", "amount": "12345678901234.5678", "active": "t", "notes": null}
+```
+
+Read them accordingly:
+
+```rust
+# use serde_json::Value;
+fn as_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_str).and_then(|text| text.parse().ok())
+}
+# let _ = as_i64(None);
+```
+
+#### Why text rather than typed JSON
+
+**It is the lossless form.** A JSON number is an IEEE-754 double by the time most consumers
+see it. `numeric(38,4)` loses its low digits and `bigint` above 2^53 is corrupted outright —
+silently, in the value rather than in the type, which is the hardest kind of corruption to
+notice. The text form carries `9223372036854775807` and `12345678901234.5678` exactly.
+
+**It is the form the source itself produces.** Every value here is rendered by the column
+type's own output function — the same function PostgreSQL's `pgoutput` calls, which is why a
+`boolean` is `"t"` and not `"true"`. A snapshot and the live stream therefore agree character
+for character, not merely on the JSON type.
+
+**It used to differ by path, and that was a defect.** A row backfilled by a PostgreSQL
+snapshot arrived as `{"id": 1}` while the same row updated a moment later arrived as
+`{"id": "1"}`, because the chunk read went through `row_to_json` and the stream did not. A
+sink reaching for `as_i64()` read one and silently saw `None` for the other. MySQL emitted
+JSON numbers from both paths, and SQL Server's `FOR JSON PATH` payload was parsed through
+`f64` — which is why its type-fidelity assertions had to be written as prefix matches rather
+than equalities. All three are now the same rule, and
+`tests/postgres_value_representation_integration.rs` asserts it end to end.
+
+Structured columns are the one carve-out: a `json`/`jsonb` column keeps its object or array
+structure rather than being flattened to a string, because flattening would destroy
+information a sink can use.
+
 ### Partial payloads — read this before writing a sink
 
 Some events do not carry a complete row. Applying one as if it were complete is the classic
@@ -320,6 +364,114 @@ Correct processing sequence:
 3. call `commit_ack(batch.ack_mode())`
 
 `commit_ack` accepts `impl Into<AckMode>` — passing `AckMode::NotRequired` is a documented zero-cost no-op. Raw `AckToken` values are also accepted (via `From<AckToken>`).
+
+### Let the runtime drive the loop
+
+If the sink is an `impl SinkAdapter` and the write does not have to be coordinated with
+anything the runtime cannot see, register it and hand over the loop:
+
+```rust
+use rustcdc::{CdcRuntime, RuntimeConfig, sink::StdoutSink};
+use rustcdc::CancellationToken;
+
+# async fn example(config: RuntimeConfig, shutdown: CancellationToken) -> rustcdc::Result<()> {
+let mut runtime = CdcRuntime::new(config)?;
+runtime.register_sink(StdoutSink::new());
+runtime.start().await?;
+
+let delivered = runtime.run_to_completion(shutdown).await?;
+println!("delivered {delivered} events");
+
+runtime.stop().await?;   // closes the registered sink
+# Ok(())
+# }
+```
+
+`run_to_completion` is exactly `poll → send → flush → acknowledge`, and the value of having
+it in the library is the *order*. Acknowledging before the flush advances the durable
+checkpoint past events the sink never accepted; a crash in that gap loses them, with no error
+raised anywhere and no way to recover them. It is one line to get wrong and it fails months
+later as rows that are simply missing.
+
+It returns when the token is cancelled, and on the first source, transform, sink or
+checkpoint error. A batch that failed mid-delivery is not acknowledged, so it is redelivered
+by the next poll — retrying is calling `run_to_completion` again.
+
+Every batch is flushed, and that is not tunable: the acknowledgement cannot outrun the flush
+without giving up the guarantee, so a rarer flush would mean a rarer acknowledgement and a
+growing redelivery window. Batch *inside* the sink instead, and raise `max_buffer_size` to
+hand it more events per call.
+
+Keep the manual loop when the write must be coordinated with something the runtime cannot see
+— your own transaction, a two-phase commit, per-branch error handling across a fan-out.
+
+### Cancellation: never race the poll
+
+`poll_event_batch` is **not cancel-safe**. Between the source handing over a batch and the
+runtime staging it, the events exist only inside the future — it awaits the durable
+schema-history write and the transform pipeline first — so dropping it there discards events
+that have already left the source. Nothing acknowledges them, so a *restart* replays them, but
+a runtime that keeps polling never sees them again; events added by `enqueue_event` have no
+source to replay from at all.
+
+`tokio::select!` is the obvious way to add a shutdown signal or a control channel, which is
+what makes this worth stating: the hazard is invisible at the call site.
+
+```rust,ignore
+// WRONG — drops a batch whenever the token fires mid-poll.
+tokio::select! {
+    _ = shutdown.cancelled() => break,
+    batch = runtime.poll_event_batch() => { /* … */ }
+}
+
+// RIGHT — the poll runs to completion; shutdown costs at most `max_poll_wait_ms`.
+while !shutdown.is_cancelled() {
+    let batch = runtime.poll_event_batch().await?;
+    // …
+}
+```
+
+`run_to_completion` and `event_batches_cancellable` both check the token between polls, so a
+cancellation token handed to either is already safe.
+
+### Committing part of a batch
+
+When a sink accepted some of a batch and not the rest, narrow the token:
+
+```rust,ignore
+let accepted = token.accept_prefix(written)?;
+runtime.commit_ack(accepted).await?;
+```
+
+The checkpoint advances exactly `written` events. The tail is **redelivered** by the next
+`poll_event_batch` with a fresh token, which is the only way to obtain one.
+
+Each token may be committed **once**. `AckToken` is `Clone` and `EventBatch::ack_mode()`
+returns a fresh copy on every call, so a second commit of the same token used to match the
+delivery id, see a shorter remaining prefix, and advance the checkpoint over the *next* events
+— which the caller had never been handed. That is now refused with an error naming the cause.
+
+### The checkpoint records a boundary, not the last event's position
+
+An event's `source.offset` identifies **the change**. The position a restart resumes from is
+the first position **not** consumed. For a log whose decoder filters at transaction
+granularity those are different, and conflating them costs a guaranteed duplicate on every
+restart rather than a possible one.
+
+PostgreSQL is the case in point. Each change keeps its own WAL position, but
+`START_REPLICATION ... X` re-sends every transaction whose *commit record* sits at or after
+`X` — and a change's LSN always precedes its own transaction's commit record. Resuming from
+one therefore replays that whole transaction, deterministically, with no writes on the source
+at all. Nudging the LSN forward does not help; the commit record is still ahead of `X + 1`.
+
+The connector answers this through `StreamHandle::resume_offset_for`, which for PostgreSQL
+returns the COMMIT message's `end_lsn` — the position *after* the commit record. The runtime
+uses it for the durable checkpoint and for the source-side confirmation, so slot retention and
+restart duplicates move together. MySQL and SQL Server need no override: binlog `log_pos` is
+already the next event's position, and the SQL Server window query already increments the LSN.
+
+A custom source whose per-event offset is itself a resumable boundary can leave the default
+alone.
 
 Important semantics:
 - not acknowledging after sink durability may replay already-delivered events
@@ -483,7 +635,7 @@ loop {
 For cooperative cancellation, use `event_batches_cancellable(token)` with a `CancellationToken`:
 
 ```rust
-use tokio_util::sync::CancellationToken;
+use rustcdc::CancellationToken;
 use futures_util::StreamExt;
 # use rustcdc::{CdcRuntime, Result};
 # async fn example(runtime: &mut CdcRuntime) -> Result<()> {
@@ -509,8 +661,34 @@ you can also start it directly from a connector connection via
 
 Tables can be added to a snapshot **while the pipeline runs** with
 `CdcRuntime::request_incremental_snapshot(tables)` — no restart, and no signal table in the
-source, so it works against a read-only role. See
+source, so it works against a read-only role. It can also be paused, resumed and stopped while
+it runs, and driven from another task through `CdcRuntime::control_handle()`. See
 [on-demand snapshots](@/docs/config-reference.md#on-demand-snapshots).
+
+### Observing progress
+
+`CdcRuntime::incremental_snapshot_state()` takes `&self` and returns the live driver state —
+snapshot id, and per table the keyset cursor, completion flag, chunk and row counters, plus
+whether it is paused. It is also on `RuntimeAdminSnapshot::incremental_snapshot`.
+
+```rust
+# use rustcdc::CdcRuntime;
+# fn example(runtime: &CdcRuntime) {
+if let Some(state) = runtime.incremental_snapshot_state() {
+    println!(
+        "snapshot {}: {} rows, {} table(s) remaining{}",
+        state.snapshot_id,
+        state.rows_emitted(),
+        state.tables_remaining(),
+        if state.paused { " (paused)" } else { "" },
+    );
+}
+# }
+```
+
+The same reading is available without `&mut` access at all through
+`RuntimeControl::incremental_snapshot_state()`, which is what an admin endpoint running
+alongside the poll loop needs.
 
 ```rust
 # #[cfg(feature = "postgres")]
@@ -539,6 +717,30 @@ pub async fn start_incremental_stream(config: PostgresSourceConfig) -> Result<()
 This connector-level API is also available for MySQL and SQL Server via
 `MysqlConnection::start_incremental_snapshot(...)` and
 `SqlServerConnection::start_incremental_snapshot(...)`.
+
+### Ordering: the chunk lands at the high watermark
+
+The override window suppresses a chunk row whose key was modified between the two
+watermarks, so the newer stream value wins. Events *past* the high watermark are
+deliberately not suppressed — they committed after the `SELECT` finished, so they describe a
+state the chunk cannot contain and the chunk row is still needed as the row's base state.
+
+What that requires is that the chunk is emitted **at** the high watermark, ahead of any later
+log event. DBLog gets this for free by emitting the buffered chunk the moment it reads the
+high-watermark marker out of the log. rustcdc reads the log in batches, and one batch
+routinely straddles the high watermark — it can carry an event at LSN 900 (inside the window)
+and one at 1200 (past it) together.
+
+So a straddling batch is split at the first event past the high watermark: the head is
+delivered, the chunk follows, and the tail is delivered after it. Log order is preserved and
+the chunk lands exactly where DBLog puts it. While the tail is held back the driver reports
+**no** durable position, so those events cannot be marked consumed before they are delivered;
+the snapshot rows in between become non-persistent barrier entries and the held-back events
+carry the position forward with their own offsets a moment later.
+
+Delivering the batch whole and the chunk afterwards would hand the consumer the 1200 value
+first and the chunk's older value second — the exact stale-row resurrection the override
+window exists to prevent, moved one step later.
 
 ### Resume across restarts
 

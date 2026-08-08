@@ -496,7 +496,11 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
             assert!(seen_ids.insert(id), "duplicate id in first phase: {id}");
         }
@@ -549,7 +553,11 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| {
                     rustcdc::Error::SourceError("resumed snapshot row missing id".into())
                 })?;
@@ -713,7 +721,11 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
             assert!(phase1_ids.insert(id), "duplicate id in phase1: {id}");
         }
@@ -777,7 +789,11 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| {
                     rustcdc::Error::SourceError("resumed snapshot row missing id".into())
                 })?;
@@ -971,7 +987,11 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
 
             let table_name = event.table.as_str();
@@ -1038,7 +1058,11 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| {
                     rustcdc::Error::SourceError("resumed snapshot row missing id".into())
                 })?;
@@ -1365,7 +1389,11 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::R
             })?;
             let id = after
                 .get("id")
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| rustcdc::Error::SourceError("snapshot row missing id".into()))?;
 
             if id <= baseline_rows && !seen_baseline.insert(id) {

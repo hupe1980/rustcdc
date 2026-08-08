@@ -86,6 +86,19 @@ pub struct MysqlSnapshotBackend {
     default_database: String,
 }
 
+/// Render a table's row filter as a SQL fragment, or nothing when it has none.
+///
+/// Parenthesised so an `OR` inside the operator's expression cannot escape and widen the
+/// keyset seek — `a > b AND x = 1 OR y = 2` would otherwise return rows before the cursor
+/// and re-read them on every chunk.
+fn condition_clause(table: &SnapshotTable, lead_in: &str) -> String {
+    table
+        .condition
+        .as_deref()
+        .map(|condition| format!("{lead_in}({condition})"))
+        .unwrap_or_default()
+}
+
 #[async_trait]
 impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
     type Position = BinlogPos;
@@ -120,6 +133,8 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
             quoted_mysql_identifier(&name)
         );
         Ok(SnapshotTable {
+            // Filled in by the driver from `IncrementalSnapshotConfig::table_conditions`.
+            condition: None,
             schema,
             name,
             qualified,
@@ -196,8 +211,9 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
             // composite key needs no manual expansion into an OR-chain.
             let placeholders = cursor.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!(
-                "SELECT * FROM {table_ref} WHERE ({order_expr}) > ({placeholders}) \
-                 ORDER BY {order_expr} LIMIT {limit}"
+                "SELECT * FROM {table_ref} AS t WHERE ({order_expr}) > ({placeholders}){filter} \
+                 ORDER BY {order_expr} LIMIT {limit}",
+                filter = condition_clause(table, " AND "),
             );
             let params: Vec<mysql_async::Value> = cursor
                 .iter()
@@ -205,7 +221,10 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
                 .collect::<Result<Vec<_>>>()?;
             conn.exec(sql, params).await
         } else {
-            let sql = format!("SELECT * FROM {table_ref} ORDER BY {order_expr} LIMIT {limit}");
+            let sql = format!(
+                "SELECT * FROM {table_ref} AS t{filter} ORDER BY {order_expr} LIMIT {limit}",
+                filter = condition_clause(table, " WHERE "),
+            );
             conn.exec(sql, ()).await
         }
         .map_err(|error| {
@@ -273,40 +292,11 @@ fn mysql_row_to_json(row: &mysql_async::Row) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-fn mysql_value_to_json(value: &mysql_common::value::Value) -> serde_json::Value {
-    use mysql_common::value::Value as MysqlValue;
-    match value {
-        MysqlValue::NULL => serde_json::Value::Null,
-        // Non-UTF-8 column data (a BLOB, or a non-UTF-8 collation) is rendered as
-        // hex rather than lossily transcoded: a replacement character would be
-        // delivered as though it were the stored value.
-        MysqlValue::Bytes(bytes) => String::from_utf8(bytes.clone())
-            .map(serde_json::Value::String)
-            .unwrap_or_else(|_| {
-                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-                serde_json::Value::String(hex)
-            }),
-        MysqlValue::Int(v) => serde_json::Value::Number((*v).into()),
-        MysqlValue::UInt(v) => serde_json::Value::Number((*v).into()),
-        MysqlValue::Float(v) => serde_json::Number::from_f64(f64::from(*v))
-            .map(serde_json::Value::Number)
-            .unwrap_or_else(|| serde_json::Value::String(v.to_string())),
-        MysqlValue::Double(v) => serde_json::Number::from_f64(*v)
-            .map(serde_json::Value::Number)
-            .unwrap_or_else(|| serde_json::Value::String(v.to_string())),
-        MysqlValue::Date(year, month, day, hour, minute, second, micros) => {
-            serde_json::Value::String(format!(
-                "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}"
-            ))
-        }
-        MysqlValue::Time(neg, days, hours, minutes, seconds, micros) => {
-            let sign = if *neg { "-" } else { "" };
-            serde_json::Value::String(format!(
-                "{sign}{days}:{hours:02}:{minutes:02}:{seconds:02}.{micros:06}"
-            ))
-        }
-    }
-}
+/// Convert a chunk-read value using the connector's single shared rule.
+///
+/// This module used to carry its own near-identical copy, which is how two paths of the
+/// same connector can drift on something as load-bearing as the JSON type of a column.
+use super::query::mysql_value_to_json;
 
 #[cfg(test)]
 mod tests {

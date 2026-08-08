@@ -38,6 +38,25 @@
 //! order would be harmless; emitting them in the order they are *produced* would
 //! resurrect the stale value. Suppressing the chunk copy makes the outcome
 //! independent of interleaving.
+//!
+//! # Why events past the high watermark are held back
+//!
+//! The override window closes at the high watermark, so an event *past* it is not
+//! suppressed — correctly, because such an event committed after the `SELECT`
+//! finished and therefore describes a row state the chunk cannot contain. What the
+//! algorithm additionally requires is that the chunk is emitted **at** the high
+//! watermark, before any later log event. DBLog gets this for free by emitting the
+//! buffered chunk the moment the high-watermark marker is read from the log.
+//!
+//! Here the log is read in batches, and one batch routinely straddles the high
+//! watermark: it can carry events at LSN 900 (inside the window) and 1200 (past it)
+//! together. Returning the whole batch and *then* the chunk hands the consumer the
+//! newer value first and the chunk's older value second — the exact stale-value
+//! resurrection the override window exists to prevent, just moved one step later.
+//!
+//! So a straddling batch is split at the first event past the high watermark: the
+//! head is delivered, the chunk follows, and the tail is delivered after it. Order
+//! within the log is preserved, and the chunk lands exactly where DBLog puts it.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -91,6 +110,13 @@ pub struct SnapshotTable {
     /// them. SQL Server uses these to build an explicit `FOR JSON PATH` projection,
     /// because `SELECT *` there yields no column names to key the JSON object by.
     pub columns: Vec<String>,
+    /// Operator-supplied SQL boolean expression restricting which rows this snapshot
+    /// reads, from [`IncrementalSnapshotConfig::table_conditions`].
+    ///
+    /// A backend must `AND` it into its chunk `SELECT`'s `WHERE` clause. It is raw SQL and
+    /// trusted input — see the config field for the trust boundary. The table is aliased
+    /// `t` in every backend's chunk read, so a qualified column reference works.
+    pub condition: Option<String>,
 }
 
 /// One row returned by a chunk read.
@@ -174,6 +200,27 @@ pub trait IncrementalSnapshotBackend: Send + Sync {
         inner: &dyn Offset,
         state: IncrementalSnapshotState,
     ) -> Option<Box<dyn Offset>>;
+}
+
+/// Resolve a table's row filter, matching on either the reference the operator wrote or the
+/// canonical `"schema.table"` the catalog resolved it to.
+///
+/// Both, because they legitimately differ: an operator may configure `orders` against a
+/// default schema and the catalog resolves it to `public.orders`. Matching only one form
+/// would silently drop the filter — and a silently dropped filter snapshots the whole table,
+/// which is exactly the load the filter was written to avoid.
+fn lookup_condition(
+    conditions: &ahash::AHashMap<String, String>,
+    table_ref: &str,
+    spec: &SnapshotTable,
+) -> Option<String> {
+    let canonical = format!("{}.{}", spec.schema, spec.name);
+    conditions
+        .iter()
+        .find(|(key, _)| {
+            key.eq_ignore_ascii_case(table_ref) || key.eq_ignore_ascii_case(&canonical)
+        })
+        .map(|(_, condition)| condition.clone())
 }
 
 // ─── Per-table progress ───────────────────────────────────────────────────────
@@ -307,6 +354,21 @@ pub struct IncrementalSnapshotDriver<B: IncrementalSnapshotBackend> {
     snapshot_id: String,
     /// Events handed to the caller, for `save_position` accounting.
     events_emitted: u64,
+    /// Chunk reading is suspended; the live stream continues untouched.
+    ///
+    /// Checked only where the next chunk would be *started*, so a chunk already read stays
+    /// consistent: an in-flight collect finishes and its rows are emitted before the driver
+    /// parks. Pausing mid-chunk instead would either discard a read the source has already
+    /// paid for, or leave a merged-but-undelivered chunk whose cursor can never be promoted.
+    paused: bool,
+    /// Log events read past the current chunk's high watermark, held back until the
+    /// chunk has been delivered. See the module header.
+    ///
+    /// While this is non-empty the driver reports **no** durable position
+    /// ([`Self::position_offset`] returns `None`), because the inner stream has
+    /// already advanced past events the consumer has not been given. Persisting that
+    /// position would skip them on restart.
+    deferred: VecDeque<Event>,
 }
 
 impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
@@ -325,7 +387,8 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
     ) -> Result<Self> {
         let mut tables = Vec::with_capacity(config.tables.len());
         for table_ref in &config.tables {
-            let spec = backend.describe_table(table_ref).await?;
+            let mut spec = backend.describe_table(table_ref).await?;
+            spec.condition = lookup_condition(&config.table_conditions, table_ref, &spec);
             if spec.pk_columns.is_empty() {
                 return Err(Error::ConfigError(format!(
                     "incremental snapshot: table '{}.{}' must have a primary key",
@@ -381,7 +444,9 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                 // was running is moot, and failing here would make the pipeline unstartable
                 // until someone hand-edited a checkpoint.
                 match backend.describe_table(&persisted.table).await {
-                    Ok(spec) if !spec.pk_columns.is_empty() => {
+                    Ok(mut spec) if !spec.pk_columns.is_empty() => {
+                        spec.condition =
+                            lookup_condition(&config.table_conditions, &persisted.table, &spec);
                         tracing::info!(
                             target: "rustcdc::source::incremental_snapshot",
                             table = %persisted.table,
@@ -442,6 +507,8 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             source_name,
             snapshot_id,
             events_emitted: 0,
+            paused: resume.as_ref().is_some_and(|state| state.paused),
+            deferred: VecDeque::new(),
         })
     }
 
@@ -503,7 +570,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         // the inner stream. Newly enqueued work has to move it back onto the state machine, or
         // the tables would sit in the list untouched.
         if enqueued > 0 {
-            if let Some(table_idx) = self.tables.iter().position(|table| !table.is_complete) {
+            if let Some(table_idx) = self.next_incomplete_table() {
                 if matches!(self.phase, Phase::Done) {
                     self.phase = Phase::ChunkPrepare { table_idx };
                 }
@@ -513,10 +580,77 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         Ok(enqueued)
     }
 
+    /// Index of the next table with snapshot work outstanding, scanning from the start.
+    ///
+    /// Scanning from the *current* index instead would strand a table that
+    /// [`Self::enqueue_tables`] rewound behind the cursor: a re-snapshot requested for
+    /// an already-finished table while a later table is mid-flight was silently never
+    /// read, and the driver parked in [`Phase::Done`] reporting the snapshot complete.
+    fn next_incomplete_table(&self) -> Option<usize> {
+        self.tables.iter().position(|table| !table.is_complete)
+    }
+
+    /// Suspend or resume chunk reading.
+    ///
+    /// Returns the previous state, so a caller can tell a no-op from a real change.
+    fn set_paused(&mut self, paused: bool) -> bool {
+        let previous = self.paused;
+        self.paused = paused;
+        if previous != paused {
+            tracing::info!(
+                target: "rustcdc::source::incremental_snapshot",
+                snapshot_id = %self.snapshot_id,
+                paused,
+                tables_remaining = self.tables.iter().filter(|t| !t.is_complete).count(),
+                "incremental snapshot chunk reading {}",
+                if paused { "paused" } else { "resumed" },
+            );
+        }
+        // Resuming from `Done` has to put the state machine back on a table, exactly as
+        // `enqueue_tables` does — the driver parks in `Done` whenever it has no work, and
+        // a paused driver reaches `ChunkPrepare` and stops there rather than parking, so
+        // this is only needed when everything genuinely finished while paused.
+        if !paused && matches!(self.phase, Phase::Done) {
+            if let Some(table_idx) = self.next_incomplete_table() {
+                self.phase = Phase::ChunkPrepare { table_idx };
+            }
+        }
+        previous
+    }
+
+    /// Abandon the snapshot: drop every table, cursor and undelivered chunk row.
+    ///
+    /// Returns the number of tables that still had work outstanding.
+    ///
+    /// The undelivered rows of an in-flight chunk go with it. They are snapshot reads the
+    /// operator has just asked to stop producing, and keeping them would deliver part of a
+    /// chunk whose cursor is then discarded — a partial chunk with no record that it
+    /// happened.
+    ///
+    /// Held-back log events are **not** dropped: they belong to the live stream, not to the
+    /// snapshot, and discarding them would lose change data. They drain before the driver
+    /// becomes a pass-through.
+    fn stop_snapshot(&mut self) -> usize {
+        let abandoned = self.tables.iter().filter(|t| !t.is_complete).count();
+        self.tables.clear();
+        self.phase = Phase::Done;
+        self.paused = false;
+        tracing::warn!(
+            target: "rustcdc::source::incremental_snapshot",
+            snapshot_id = %self.snapshot_id,
+            abandoned_tables = abandoned,
+            "incremental snapshot stopped; chunk cursors discarded. The next checkpoint \
+             clears the persisted state, so a restart will not resume it — re-request the \
+             tables to start over.",
+        );
+        abandoned
+    }
+
     /// Durable per-table progress for the checkpoint record.
     fn snapshot_state(&self) -> IncrementalSnapshotState {
         IncrementalSnapshotState {
             snapshot_id: self.snapshot_id.clone(),
+            paused: self.paused,
             tables: self
                 .tables
                 .iter()
@@ -569,15 +703,28 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
     }
 
     /// Fetch the next chunk and enter `ChunkCollect`, or complete the table.
+    ///
+    /// A no-op while paused: the phase stays on `ChunkPrepare` so `drive` falls through to
+    /// the live stream, and resuming picks up exactly here.
     async fn drive_chunk_prepare(&mut self) -> Result<()> {
         let Phase::ChunkPrepare { table_idx } = self.phase else {
             return Ok(());
         };
-
-        let Some(table_idx) = (table_idx..self.tables.len()).find(|&i| !self.tables[i].is_complete)
-        else {
-            self.phase = Phase::Done;
+        if self.paused {
             return Ok(());
+        }
+
+        // Prefer the table the phase names — chunking one table to completion keeps its
+        // keyset scan sequential — but fall back to a global scan so nothing is stranded.
+        let table_idx = match self.tables.get(table_idx) {
+            Some(table) if !table.is_complete => table_idx,
+            _ => match self.next_incomplete_table() {
+                Some(idx) => idx,
+                None => {
+                    self.phase = Phase::Done;
+                    return Ok(());
+                }
+            },
         };
 
         // Watermarks bracket the read: any event between them may have superseded a
@@ -601,8 +748,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                 rows = self.tables[table_idx].rows_emitted,
                 "incremental snapshot: table complete",
             );
-            let next = (table_idx + 1..self.tables.len()).find(|&i| !self.tables[i].is_complete);
-            self.phase = match next {
+            self.phase = match self.next_incomplete_table() {
                 Some(idx) => Phase::ChunkPrepare { table_idx: idx },
                 None => Phase::Done,
             };
@@ -709,11 +855,25 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         table.rows_emitted = table.rows_emitted.saturating_add(row_count);
     }
 
+    /// Drain up to one batch of held-back post-high-watermark log events.
+    fn drain_deferred(&mut self) -> Vec<Event> {
+        let batch_size = self.deferred.len().min(EMIT_BATCH_SIZE);
+        self.deferred.drain(..batch_size).collect()
+    }
+
     /// Advance the state machine by one step.
     async fn drive(&mut self, timeout_ms: u64) -> Result<Vec<Event>> {
         loop {
             match self.phase {
-                Phase::Done => return self.inner.next_events(timeout_ms).await,
+                Phase::Done => {
+                    // A final chunk can straddle its high watermark and leave held-back
+                    // events behind; they must go out before the stream is delegated to,
+                    // or they would be delivered out of log order.
+                    if !self.deferred.is_empty() {
+                        return Ok(self.drain_deferred());
+                    }
+                    return self.inner.next_events(timeout_ms).await;
+                }
 
                 Phase::ChunkEmit {
                     table_idx,
@@ -729,12 +889,30 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                     // its cursor may finally become durable.
                     let next_cursor = std::mem::take(next_cursor);
                     self.commit_chunk_progress(table_idx, next_cursor, row_count);
+                    // The chunk is out; anything held back behind it goes next, before
+                    // the driver reads another chunk.
+                    if !self.deferred.is_empty() {
+                        self.phase = Phase::ChunkPrepare { table_idx };
+                        return Ok(self.drain_deferred());
+                    }
                     // Try the next chunk of the same table. `drive_chunk_prepare`
                     // detects completion via an empty read.
                     self.phase = Phase::ChunkPrepare { table_idx };
                 }
 
-                Phase::ChunkPrepare { .. } => self.drive_chunk_prepare().await?,
+                Phase::ChunkPrepare { .. } => {
+                    // Paused: hold the phase and behave as a pass-through, so the live
+                    // stream keeps flowing and resuming picks up at exactly this chunk.
+                    // Falling through to `drive_chunk_prepare` would spin, because it
+                    // returns without changing phase.
+                    if self.paused {
+                        if !self.deferred.is_empty() {
+                            return Ok(self.drain_deferred());
+                        }
+                        return self.inner.next_events(timeout_ms).await;
+                    }
+                    self.drive_chunk_prepare().await?
+                }
 
                 Phase::ChunkCollect { .. } => {
                     // Bounded so a quiet database still lets us re-check the
@@ -759,7 +937,11 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                     let target_schema = self.tables[table_idx].spec.schema.clone();
 
                     let mut max_batch_position: Option<B::Position> = None;
-                    for event in &stream_events {
+                    // Index of the first event past the high watermark. Everything from
+                    // there on is held back until the chunk has been delivered — see the
+                    // module header.
+                    let mut split_at: Option<usize> = None;
+                    for (index, event) in stream_events.iter().enumerate() {
                         let Some(position) = self.backend.position_of_event(event) else {
                             continue;
                         };
@@ -768,6 +950,10 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                             .is_none_or(|current| position > *current)
                         {
                             max_batch_position = Some(position.clone());
+                        }
+
+                        if position > high_watermark && split_at.is_none() {
+                            split_at = Some(index);
                         }
 
                         // An event supersedes a chunk row only if it targets the same
@@ -797,12 +983,18 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                         _ => false,
                     };
 
+                    let mut stream_events = stream_events;
+                    if let Some(index) = split_at {
+                        // Preserves log order: head now, chunk next, tail after it.
+                        self.deferred.extend(stream_events.drain(index..));
+                    }
+
                     if watermark_passed {
                         self.finalize_collect();
                     }
 
-                    // Stream events go out first so the consumer stays current;
-                    // snapshot rows follow on the next call.
+                    // Stream events up to the high watermark go out first so the consumer
+                    // stays current; snapshot rows follow on the next call.
                     if !stream_events.is_empty() {
                         return Ok(stream_events);
                     }
@@ -825,6 +1017,21 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
     }
 
     async fn save_position(&self, checkpoint: &mut dyn Checkpoint) -> Result<()> {
+        // Events read past the high watermark but not yet handed over are already
+        // behind the inner stream's position. Writing that position would mark them
+        // consumed and skip them on the next start, so the previous durable record is
+        // left standing instead: the restart replays from there, which is the
+        // at-least-once behaviour the rest of the pipeline documents.
+        if !self.deferred.is_empty() {
+            tracing::info!(
+                target: "rustcdc::source::incremental_snapshot",
+                held_back = self.deferred.len(),
+                "skipping the position write: log events read past the chunk's high \
+                 watermark have not been delivered yet, so the last durable checkpoint \
+                 stands and they will be replayed",
+            );
+            return Ok(());
+        }
         // Delegating to the inner stream would persist the log position while
         // dropping every chunk cursor, so an orderly shutdown would forfeit exactly
         // the progress this method exists to preserve.
@@ -835,6 +1042,16 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
     }
 
     fn position_offset(&self) -> Option<Box<dyn Offset>> {
+        // While events are held back the inner stream's position covers events the
+        // consumer has not been given. The runtime uses this offset to checkpoint
+        // snapshot rows — which carry no position of their own — so reporting the
+        // inner position here would make the held-back events durable-as-consumed and
+        // lose them. `None` makes those rows non-persistent barrier entries instead:
+        // the committed count advances, the durable source position does not, and the
+        // held-back events carry it forward with their own offsets a moment later.
+        if !self.deferred.is_empty() {
+            return None;
+        }
         let inner = self.inner.position_offset()?;
         self.backend
             .offset_with_snapshot_state(inner.as_ref(), self.snapshot_state())
@@ -850,6 +1067,14 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
 
     async fn request_snapshot_tables(&mut self, tables: Vec<String>) -> Result<usize> {
         self.enqueue_tables(tables).await
+    }
+
+    async fn set_snapshot_paused(&mut self, paused: bool) -> Result<bool> {
+        Ok(self.set_paused(paused))
+    }
+
+    async fn stop_snapshot(&mut self) -> Result<usize> {
+        Ok(IncrementalSnapshotDriver::stop_snapshot(self))
     }
 
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
@@ -974,7 +1199,10 @@ mod tests {
             Ok(())
         }
         fn position_offset(&self) -> Option<Box<dyn Offset>> {
-            None
+            Some(Box::new(crate::checkpoint::GenericOffset::new(
+                "fake",
+                b"pos".to_vec(),
+            )))
         }
         async fn confirm_lsn(&mut self, _lsn: u64) -> Result<()> {
             Ok(())
@@ -1002,6 +1230,7 @@ mod tests {
 
         async fn describe_table(&mut self, _table_ref: &str) -> Result<SnapshotTable> {
             Ok(SnapshotTable {
+                condition: None,
                 schema: "public".into(),
                 name: "users".into(),
                 qualified: "\"public\".\"users\"".into(),
@@ -1048,10 +1277,10 @@ mod tests {
 
         fn offset_with_snapshot_state(
             &self,
-            _inner: &dyn Offset,
+            inner: &dyn Offset,
             _state: IncrementalSnapshotState,
         ) -> Option<Box<dyn Offset>> {
-            None
+            Some(inner.clone_box())
         }
     }
 
@@ -1119,6 +1348,80 @@ mod tests {
         let emitted = drain(&mut driver).await;
         assert_eq!(emitted.len(), 3, "every row must be emitted");
         assert!(emitted.iter().all(|event| event.op == Operation::Read));
+    }
+
+    #[tokio::test]
+    async fn a_batch_straddling_the_high_watermark_delivers_the_chunk_before_the_tail() {
+        // The load-bearing ordering property of the algorithm, and the one a batched log
+        // reader breaks by default.
+        //
+        // The read advances the clock 100 -> 200, so the bracket is (100, 200]. One
+        // batch carries an event at 150 (inside the window, suppresses its chunk row)
+        // and one at 250 (past the high watermark, so it is *not* suppressed — it
+        // describes a row state committed after the SELECT finished).
+        //
+        // Returning both and only then the chunk hands the consumer the 250 value first
+        // and the chunk's older value second, which resurrects the stale row. The event
+        // past the watermark has to wait behind the chunk.
+        let rows = vec![json!({ "id": 1 }), json!({ "id": 2 })];
+        let batches = vec![vec![
+            stream_event_at("users", 2, 150),
+            stream_event_at("users", 1, 250),
+        ]];
+        let (mut driver, _) = driver_with(rows, batches, 100, 10).await;
+
+        let emitted = drain(&mut driver).await;
+        let shape: Vec<String> = emitted
+            .iter()
+            .map(|event| {
+                let id = event
+                    .after
+                    .as_ref()
+                    .or(event.before.as_ref())
+                    .and_then(|row| row["id"].as_i64())
+                    .unwrap_or_default();
+                format!("{}:{id}", event.op)
+            })
+            .collect();
+
+        assert_eq!(
+            shape,
+            vec!["update:2", "read:1", "update:1"],
+            "expected head event, then the chunk, then the held-back event past the \
+             high watermark; got {shape:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_row_is_non_persistent_while_later_log_events_are_held_back() {
+        // The runtime checkpoints a snapshot row using `position_offset()`, because the
+        // row has no log position of its own. While events read past the high watermark
+        // are still queued, the inner stream's position already covers them — persisting
+        // it would mark them consumed and skip them after a crash.
+        let rows = vec![json!({ "id": 1 })];
+        let batches = vec![vec![stream_event_at("users", 9, 250)]];
+        let (mut driver, _) = driver_with(rows, batches, 100, 10).await;
+
+        // The batch's only event is past the high watermark, so it is held back and the
+        // chunk comes out first.
+        let first = driver.next_events(10).await.expect("drive");
+        assert!(
+            !first.is_empty() && first.iter().all(|event| event.snapshot.is_some()),
+            "the chunk goes out before the held-back event, got {first:?}",
+        );
+        assert!(
+            driver.position_offset().is_none(),
+            "no durable position may be reported while log events are held back — the \
+             inner stream has already consumed them",
+        );
+
+        let second = driver.next_events(10).await.expect("drive");
+        assert_eq!(second.len(), 1, "the held-back event follows the chunk");
+        assert!(second[0].snapshot.is_none());
+        assert!(
+            driver.position_offset().is_some(),
+            "the position becomes reportable again once nothing is held back",
+        );
     }
 
     #[tokio::test]
@@ -1351,6 +1654,179 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_row_filter_matches_either_the_configured_reference_or_the_resolved_name() {
+        // Both forms, because they legitimately differ: an operator writes `orders` against
+        // a default schema and the catalog resolves it to `public.orders`. Matching only one
+        // would silently drop the filter — and a dropped filter snapshots the whole table,
+        // which is precisely the load it was written to avoid.
+        let spec = SnapshotTable {
+            schema: "public".into(),
+            name: "orders".into(),
+            qualified: "\"public\".\"orders\"".into(),
+            pk_columns: vec!["id".into()],
+            pk_types: Vec::new(),
+            columns: Vec::new(),
+            condition: None,
+        };
+
+        let mut by_short = ahash::AHashMap::new();
+        by_short.insert("orders".to_string(), "tenant = 7".to_string());
+        assert_eq!(
+            lookup_condition(&by_short, "orders", &spec).as_deref(),
+            Some("tenant = 7"),
+        );
+
+        let mut by_qualified = ahash::AHashMap::new();
+        by_qualified.insert("PUBLIC.Orders".to_string(), "tenant = 7".to_string());
+        assert_eq!(
+            lookup_condition(&by_qualified, "orders", &spec).as_deref(),
+            Some("tenant = 7"),
+            "the match is case-insensitive, like every other table reference here",
+        );
+
+        let mut unrelated = ahash::AHashMap::new();
+        unrelated.insert("public.customers".to_string(), "tenant = 7".to_string());
+        assert!(lookup_condition(&unrelated, "orders", &spec).is_none());
+    }
+
+    #[tokio::test]
+    async fn pausing_stops_chunk_reads_while_the_live_stream_keeps_flowing() {
+        // The whole point of pause: take snapshot load off a production primary without
+        // stopping capture. Chunk reads must stop; the stream must not.
+        let rows: Vec<serde_json::Value> = (1..=6).map(|id| json!({ "id": id })).collect();
+        let (mut driver, reads) =
+            driver_with(rows, vec![vec![stream_event_at("other", 99, 50)]; 6], 0, 2).await;
+
+        driver.next_events(10).await.expect("drive");
+        assert!(!driver.set_paused(true), "was not paused before");
+        let reads_at_pause = reads.lock().expect("reads").len();
+
+        // The chunk already read is merged and delivered first — pausing takes effect at a
+        // chunk *boundary*, so no read is wasted and no cursor is stranded. What must not
+        // happen is a further read.
+        let mut live = 0;
+        for _ in 0..10 {
+            for event in driver.next_events(10).await.expect("drive") {
+                if event.snapshot.is_none() {
+                    live += 1;
+                }
+            }
+        }
+        assert!(live > 0, "the live stream must keep flowing while paused");
+        assert_eq!(
+            reads.lock().expect("reads").len(),
+            reads_at_pause,
+            "no further chunk may be read while paused"
+        );
+
+        // Resuming finishes the table.
+        assert!(driver.set_paused(false), "was paused before");
+        let after = drain(&mut driver).await;
+        assert!(
+            after.iter().any(|event| event.snapshot.is_some()),
+            "resuming must continue the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_paused_flag_is_durable_across_a_restart() {
+        // Without this a pause silently lifts on the next deploy — the opposite of what an
+        // operator asked for when they paused a backfill to protect a primary.
+        let rows: Vec<serde_json::Value> = (1..=6).map(|id| json!({ "id": id })).collect();
+        let (mut driver, _) = driver_with(rows.clone(), vec![], 0, 2).await;
+        driver.next_events(10).await.expect("drive");
+        driver.set_paused(true);
+
+        let state = driver
+            .incremental_snapshot_state()
+            .expect("driver reports state");
+        assert!(state.paused, "the checkpoint must record the pause");
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut resumed = IncrementalSnapshotDriver::new(
+            FakeBackend {
+                rows,
+                clock: Arc::new(Mutex::new(100)),
+                advance_on_read: 0,
+                reads: Arc::clone(&reads),
+            },
+            Box::new(FakeStream {
+                batches: VecDeque::new(),
+            }),
+            IncrementalSnapshotConfig::new(vec!["public.users".to_string()]).with_chunk_size(2),
+            "test".to_string(),
+            Some(state),
+        )
+        .await
+        .expect("driver builds");
+
+        let emitted = drain(&mut resumed).await;
+        assert!(
+            emitted.is_empty(),
+            "a snapshot paused before the restart must stay paused after it, got {emitted:?}"
+        );
+        assert!(reads.lock().expect("reads").is_empty(), "no chunk was read");
+    }
+
+    #[tokio::test]
+    async fn stopping_abandons_the_snapshot_but_keeps_the_stream() {
+        let rows: Vec<serde_json::Value> = (1..=6).map(|id| json!({ "id": id })).collect();
+        let (mut driver, _) =
+            driver_with(rows, vec![vec![stream_event_at("other", 99, 50)]; 4], 0, 2).await;
+        driver.next_events(10).await.expect("drive");
+
+        let abandoned = IncrementalSnapshotDriver::stop_snapshot(&mut driver);
+        assert_eq!(abandoned, 1, "one table still had work outstanding");
+
+        let state = driver
+            .incremental_snapshot_state()
+            .expect("driver still reports state");
+        assert!(
+            state.tables.is_empty(),
+            "the next checkpoint must clear the persisted snapshot, got {:?}",
+            state.tables
+        );
+
+        // Capture continues: live events still arrive, no snapshot rows do.
+        let mut live = 0;
+        for _ in 0..6 {
+            for event in driver.next_events(10).await.expect("drive") {
+                assert!(event.snapshot.is_none(), "the snapshot was abandoned");
+                live += 1;
+            }
+        }
+        assert!(live > 0, "the live stream must survive a stopped snapshot");
+    }
+
+    #[tokio::test]
+    async fn a_table_behind_the_current_index_is_still_picked_up() {
+        // `enqueue_tables` can rewind a table that sits *before* the one being read —
+        // the operator asks to re-snapshot the first table while the second is still in
+        // flight. Scanning forward from the current index skipped it: the driver parked
+        // in `Done` reporting the snapshot finished, with a table that was never read.
+        let rows: Vec<serde_json::Value> = (1..=3).map(|id| json!({ "id": id })).collect();
+        let (mut driver, _) = driver_with(rows, vec![], 0, 10).await;
+
+        // Second entry, already complete, with the phase pointing at it.
+        let stranded = TableProgress {
+            spec: driver.tables[0].spec.clone(),
+            pk_cursor: None,
+            is_complete: true,
+            chunks_emitted: 0,
+            rows_emitted: 0,
+        };
+        driver.tables.push(stranded);
+        driver.phase = Phase::ChunkPrepare { table_idx: 1 };
+
+        let emitted = drain(&mut driver).await;
+        assert_eq!(
+            emitted.len(),
+            3,
+            "the incomplete table before the phase index must still be read",
+        );
+    }
+
     #[tokio::test]
     async fn requesting_a_table_already_in_progress_is_a_no_op() {
         // Idempotence matters because a request is an operator action that may be retried.
@@ -1451,6 +1927,7 @@ mod tests {
         // honoured and then silently stop.
         let rows: Vec<serde_json::Value> = (1..=4).map(|id| json!({ "id": id })).collect();
         let resume = IncrementalSnapshotState {
+            paused: false,
             snapshot_id: "incremental-earlier-run".to_string(),
             tables: vec![IncrementalSnapshotTableState {
                 table: "public.users".to_string(),
@@ -1495,6 +1972,7 @@ mod tests {
     async fn a_completed_table_in_the_checkpoint_is_not_adopted() {
         // Adopting a finished table would restart a snapshot nobody asked to repeat.
         let resume = IncrementalSnapshotState {
+            paused: false,
             snapshot_id: "incremental-earlier-run".to_string(),
             tables: vec![IncrementalSnapshotTableState {
                 table: "public.users".to_string(),
@@ -1540,6 +2018,7 @@ mod tests {
             reads: Arc::clone(&reads),
         };
         let resume = IncrementalSnapshotState {
+            paused: false,
             snapshot_id: "incremental-earlier-run".to_string(),
             tables: vec![IncrementalSnapshotTableState {
                 table: "public.users".to_string(),
@@ -1591,6 +2070,7 @@ mod tests {
             reads: Arc::clone(&reads),
         };
         let resume = IncrementalSnapshotState {
+            paused: false,
             snapshot_id: "done".to_string(),
             tables: vec![IncrementalSnapshotTableState {
                 table: "public.users".to_string(),
@@ -1628,6 +2108,7 @@ mod tests {
             type Position = u64;
             async fn describe_table(&mut self, _table_ref: &str) -> Result<SnapshotTable> {
                 Ok(SnapshotTable {
+                    condition: None,
                     schema: "public".into(),
                     name: "logs".into(),
                     qualified: "public.logs".into(),
@@ -1683,6 +2164,7 @@ mod tests {
         // a primary-key change silently resumed from a truncated cursor and skipped
         // every row in between.
         let resume = IncrementalSnapshotState {
+            paused: false,
             snapshot_id: "x".to_string(),
             tables: vec![IncrementalSnapshotTableState {
                 table: "public.users".to_string(),

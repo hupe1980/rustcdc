@@ -13,6 +13,8 @@ mod runtime_offsets;
 mod runtime_utils;
 mod secret;
 mod transport;
+#[cfg(feature = "tls")]
+pub(crate) mod transport_tls;
 
 pub use error::{
     render_error_chain, Error, ErrorChain, ErrorKind, ErrorReport, FingerprintError, Result,
@@ -32,13 +34,15 @@ pub use otel::{MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector,
 pub use runtime::{
     AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, HealthVerdict,
     IdempotencyOptions, PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig,
-    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
+    RuntimeControl, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
     TransactionBoundaryPolicy, TransformErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
 #[cfg(feature = "tls")]
 pub use transport::RustlsClientConfig;
 pub use transport::TransportConfig;
+#[cfg(feature = "tls")]
+pub use transport_tls::rustls_client_config;
 
 use std::fmt::Debug;
 

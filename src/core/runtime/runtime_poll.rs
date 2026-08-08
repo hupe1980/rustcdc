@@ -57,6 +57,41 @@ impl CdcRuntime {
     /// An unacknowledged batch is **redelivered** by the next call rather than skipped,
     /// so a consumer that drops one loses nothing.
     ///
+    /// # Cancel safety
+    ///
+    /// **This future is not cancel-safe. Do not race it in [`tokio::select!`].**
+    ///
+    /// Between the source handing over a batch and the runtime staging it, the events
+    /// exist only inside this future: it awaits the durable schema-history write and the
+    /// transform pipeline before anything reaches the commit barrier. Dropping the future
+    /// in that window discards events that have already left the source's buffer.
+    ///
+    /// Nothing acknowledges them, so the durable checkpoint does not advance and a
+    /// *restart* replays them — but a runtime that keeps polling never sees them again.
+    /// Events added by [`enqueue_event`](CdcRuntime::enqueue_event) have no source to
+    /// replay from at all and are simply lost. The hazard is invisible at the call site,
+    /// because `select!` is the obvious way to add a shutdown signal or a control channel.
+    ///
+    /// Poll it to completion and do other work between polls. It returns within
+    /// `max_poll_wait_ms`, so a shutdown flag checked at the top of the loop costs at most
+    /// that much latency:
+    ///
+    /// ```no_run
+    /// # use rustcdc::{CdcRuntime, CancellationToken};
+    /// # async fn example(runtime: &mut CdcRuntime, shutdown: CancellationToken) -> rustcdc::Result<()> {
+    /// while !shutdown.is_cancelled() {
+    ///     let batch = runtime.poll_event_batch().await?;   // never inside select!
+    ///     // …apply and flush…
+    ///     runtime.commit_ack(batch.ack_mode()).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`run_to_completion`](CdcRuntime::run_to_completion) and
+    /// [`event_batches_cancellable`](CdcRuntime::event_batches_cancellable) both do exactly
+    /// this, so a cancellation token handed to either is already safe.
+    ///
     /// # Errors
     ///
     /// - [`Error::Backpressure`] when the commit barrier is full. This is flow control,
@@ -74,6 +109,12 @@ impl CdcRuntime {
         if let Some(batch) = self.current_pending_batch() {
             return Ok(batch);
         }
+
+        // Apply anything an admin task queued through `control_handle()`, and republish
+        // live progress for its `&self` readers. Between polls is the only safe point:
+        // servicing control operations as a `select!` arm alongside the source poll would
+        // drop events, because this future is not cancel-safe.
+        self.service_control_commands().await?;
 
         let metrics = Arc::clone(&self.observability().metrics);
 
@@ -788,6 +829,20 @@ impl CdcRuntime {
         Ok(self.deliver_buffered_batch())
     }
 
+    /// The offset string this event must be checkpointed at.
+    ///
+    /// An event's own [`SourceMetadata::offset`](crate::core::SourceMetadata) identifies the
+    /// *change*; the position a restart resumes from is the first position **not** consumed,
+    /// and for a log whose decoder filters at transaction granularity those are different.
+    /// [`StreamHandle::resume_offset_for`] lets the connector say so; connectors that do not
+    /// override it get their own offset, which is what the trait's default means.
+    pub(super) fn resume_offset_for(&self, event: &Event) -> String {
+        self.stream
+            .as_ref()
+            .and_then(|stream| stream.resume_offset_for(event))
+            .unwrap_or_else(|| event.source.offset.clone())
+    }
+
     fn build_checkpoint_offset(&self, event: &Event) -> Result<GenericOffset> {
         let source_type = self
             .config
@@ -805,7 +860,10 @@ impl CdcRuntime {
 
         #[cfg(feature = "postgres")]
         if let RuntimeSourceConfig::Postgres(config) = &self.config.source {
-            let lsn = parse_postgres_lsn(&event.source.offset)?;
+            // The transaction's end position, not the change's own LSN — see
+            // `Self::resume_offset_for`. Checkpointing the change LSN made
+            // `START_REPLICATION` replay that whole transaction on every restart.
+            let lsn = parse_postgres_lsn(&self.resume_offset_for(event))?;
             let slot_name = config.replication_slot_name.clone();
             let offset =
                 PostgresOffset::new(lsn, slot_name).with_incremental_snapshot(incremental_snapshot);
@@ -886,6 +944,7 @@ impl CdcRuntime {
             ack_token: Some(AckToken {
                 delivery_id: pending.delivery_id,
                 event_count: uncommitted_len,
+                epoch: pending.ack_epoch,
             }),
         })
     }
@@ -956,6 +1015,7 @@ impl CdcRuntime {
             delivery_id,
             events: Arc::clone(&events),
             committed_prefix: 0,
+            ack_epoch: 0,
         });
 
         EventBatch {
@@ -965,6 +1025,7 @@ impl CdcRuntime {
             ack_token: Some(AckToken {
                 delivery_id,
                 event_count,
+                epoch: 0,
             }),
         }
     }
@@ -1006,7 +1067,11 @@ impl CdcRuntime {
 
         let schema_version = match captured.to_schema_event() {
             Some(schema_event) => {
-                let version = self.config.schema_history.record_ddl(schema_event).await?;
+                let version = self
+                    .config
+                    .schema_history
+                    .record_ddl(&offset, schema_event)
+                    .await?;
                 if let Some(retention) = self.config.options.schema_history_retention {
                     self.config
                         .schema_history
@@ -1044,6 +1109,24 @@ impl CdcRuntime {
     /// is preserved: the DDL is durably recorded *before* the event that announces it
     /// is enqueued for delivery, so a consumer can never observe a schema change the
     /// history does not already contain.
+    ///
+    /// # Why a rejected entry does not stop the pipeline
+    ///
+    /// The event's source offset is passed as the DDL identity, which makes recording
+    /// idempotent under replay — the common case after a crash between the record and
+    /// the checkpoint commit. What remains is a history that genuinely cannot accept
+    /// the statement: an `ALTER TABLE` diff for a table the store has never seen,
+    /// which is what an `InMemorySchemaHistory` looks like after any restart.
+    ///
+    /// Propagating that fails the poll, and it fails identically on every subsequent
+    /// restart because the same event is replayed from the same checkpoint — a
+    /// permanently dead pipeline, recoverable only by hand-editing state. The event
+    /// itself is self-describing and still reaches the consumer, so the loss is a gap
+    /// in an auxiliary index. It is logged at ERROR with the remedy and capture
+    /// continues.
+    ///
+    /// A store that is *broken* rather than merely inconsistent — an I/O failure, a
+    /// lost owner lease — still propagates.
     async fn record_schema_change_events(&mut self, events: &[Event]) -> Result<()> {
         for event in events.iter().filter(|event| event.op.is_schema_change()) {
             let Some(after) = event.after.as_ref() else {
@@ -1059,7 +1142,30 @@ impl CdcRuntime {
                 continue;
             };
 
-            self.config.schema_history.record_ddl(schema_event).await?;
+            match self
+                .config
+                .schema_history
+                .record_ddl(&event.source.offset, schema_event)
+                .await
+            {
+                Ok(_) => {}
+                Err(error @ Error::SchemaError(_)) => {
+                    self.record_runtime_error("runtime.schema_history.rejected", &error);
+                    tracing::error!(
+                        target: "rustcdc::core::runtime",
+                        table = %event.table,
+                        offset = %event.source.offset,
+                        error = %error.report(),
+                        "schema history rejected a captured DDL statement; capture continues \
+                         and the event still reaches the consumer, but the history now has a \
+                         gap. A durable SchemaHistory (FileSchemaHistory) that survived the \
+                         restart is the usual fix — an in-memory store cannot apply an ALTER \
+                         diff to a table it no longer remembers.",
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             if let Some(retention) = self.config.options.schema_history_retention {
                 self.config
                     .schema_history
@@ -1078,16 +1184,25 @@ impl CdcRuntime {
     /// The stream terminates with the cancellation signal; no error is emitted for normal
     /// cancellation. The runtime remains in `Running` state after the stream ends — call
     /// [`CdcRuntime::stop`] or [`CdcRuntime::drain_and_stop`] to shut down cleanly.
+    ///
+    /// # Cancellation is observed between polls
+    ///
+    /// The token is checked before each poll rather than raced against one. This used to be
+    /// a `select!`, which silently discarded a batch the source had already handed over
+    /// whenever the token fired mid-poll — see
+    /// [`poll_event_batch`](CdcRuntime::poll_event_batch)'s cancel-safety note. Termination
+    /// therefore takes up to `max_poll_wait_ms`, which is the budget a poll already returns
+    /// within.
     pub fn event_batches_cancellable(
         &mut self,
         token: tokio_util::sync::CancellationToken,
     ) -> impl futures_util::Stream<Item = Result<EventBatch>> + '_ {
         futures_util::stream::unfold((self, token), |(runtime, token)| async move {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => None,
-                result = runtime.poll_event_batch() => Some((result, (runtime, token))),
+            if token.is_cancelled() {
+                return None;
             }
+            let result = runtime.poll_event_batch().await;
+            Some((result, (runtime, token)))
         })
     }
 }

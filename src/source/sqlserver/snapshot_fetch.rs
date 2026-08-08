@@ -157,8 +157,8 @@ impl SqlServerSnapshotRowFetcher for LiveSqlServerSnapshotRowFetcher {
                         table.schema, table.table
                     ))
                 })?;
-            let parsed_row: serde_json::Value =
-                serde_json::from_str(&row_json).map_err(|error| {
+            let parsed_row =
+                super::parser::decode_row_json_as_text(&row_json).map_err(|error| {
                     Error::SerializationError(format!(
                         "sqlserver snapshot JSON parse failed for table '{}.{}': {error}",
                         table.schema, table.table

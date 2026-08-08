@@ -10,6 +10,45 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
 }
 
 impl CdcRuntime {
+    /// Live incremental-snapshot progress, or `None` when no snapshot is in flight.
+    ///
+    /// Takes `&self`, which is the point: an embedder's event loop holds `&mut CdcRuntime`
+    /// for its whole lifetime, so anything needing `&mut` has to be marshalled through a
+    /// channel before an admin endpoint can answer with it.
+    ///
+    /// Returns the snapshot id and, per table, the keyset cursor, completion flag and row
+    /// and chunk counters — read from the live driver rather than from a persisted
+    /// checkpoint, so it is current rather than as of the last commit.
+    ///
+    /// Before this existed, an operator who triggered
+    /// [`request_incremental_snapshot`](Self::request_incremental_snapshot) could learn how
+    /// many tables the runtime *accepted* and nothing after that; for a multi-hour backfill
+    /// that was the entire operational experience.
+    ///
+    /// Also reported as [`RuntimeAdminSnapshot::incremental_snapshot`], so anything already
+    /// rendering that struct gets it without a second call.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rustcdc::CdcRuntime;
+    /// # fn example(runtime: &CdcRuntime) {
+    /// if let Some(state) = runtime.incremental_snapshot_state() {
+    ///     for table in &state.tables {
+    ///         println!(
+    ///             "{}: {} rows, {} chunks, complete={}",
+    ///             table.table, table.rows_emitted, table.chunks_emitted, table.is_complete,
+    ///         );
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub fn incremental_snapshot_state(&self) -> Option<crate::source::IncrementalSnapshotState> {
+        self.stream
+            .as_ref()
+            .and_then(|stream| stream.incremental_snapshot_state())
+    }
+
     /// Snapshot additional tables on a **running** pipeline.
     ///
     /// The library equivalent of Debezium's `execute-snapshot` signal — and without its
@@ -78,6 +117,101 @@ impl CdcRuntime {
         Ok(enqueued)
     }
 
+    /// Suspend chunk reading on the in-flight incremental snapshot.
+    ///
+    /// The live change stream keeps running: only the next chunk read is withheld. This is
+    /// the answer to "a large backfill is loading the production primary during business
+    /// hours" — before it existed, the only option was stopping the pipeline and clearing
+    /// the checkpoint, which also stops capture.
+    ///
+    /// Idempotent: returns `true` if the snapshot was **already** paused.
+    ///
+    /// Takes effect at a chunk boundary. A chunk already read is merged and delivered
+    /// first, so no read is wasted and no cursor is stranded.
+    ///
+    /// The paused flag is written into the checkpoint with the chunk cursors, so it
+    /// survives a restart rather than silently lifting on the next deploy.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::StateError`] if the runtime is not running or has no active stream.
+    /// * [`Error::NotImplemented`] if no incremental snapshot is configured.
+    pub async fn pause_incremental_snapshot(&mut self) -> Result<bool> {
+        self.set_incremental_snapshot_paused(true).await
+    }
+
+    /// Resume a paused incremental snapshot, continuing from the chunk it stopped at.
+    ///
+    /// Idempotent: returns `false` if the snapshot was **not** paused.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`pause_incremental_snapshot`](Self::pause_incremental_snapshot).
+    pub async fn resume_incremental_snapshot(&mut self) -> Result<bool> {
+        self.set_incremental_snapshot_paused(false).await
+    }
+
+    pub(super) async fn set_incremental_snapshot_paused(&mut self, paused: bool) -> Result<bool> {
+        let stream = self.running_stream_mut(if paused { "pause" } else { "resume" })?;
+        let previous = stream.set_snapshot_paused(paused).await?;
+        tracing::info!(
+            target: "rustcdc::core::runtime",
+            paused,
+            changed = previous != paused,
+            "incremental snapshot {} on a running pipeline",
+            if paused { "paused" } else { "resumed" },
+        );
+        Ok(previous)
+    }
+
+    /// Abandon the in-flight incremental snapshot, discarding its chunk cursors.
+    ///
+    /// Returns how many tables still had work outstanding. Capture is unaffected — the
+    /// live stream keeps running and the checkpoint keeps advancing.
+    ///
+    /// Undelivered rows of the in-flight chunk are dropped with it. Held-back **log**
+    /// events are not: they belong to the live stream, and discarding them would lose
+    /// change data.
+    ///
+    /// # Durability
+    ///
+    /// The persisted state is cleared by the next checkpoint write. A crash in that window
+    /// resumes the snapshot. Forcing a synchronous checkpoint here would let an operator
+    /// action rewrite the stream position, which is a worse trade than a rare resume of a
+    /// snapshot that can be stopped again.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`pause_incremental_snapshot`](Self::pause_incremental_snapshot).
+    pub async fn stop_incremental_snapshot(&mut self) -> Result<usize> {
+        let stream = self.running_stream_mut("stop")?;
+        let abandoned = stream.stop_snapshot().await?;
+        tracing::warn!(
+            target: "rustcdc::core::runtime",
+            abandoned_tables = abandoned,
+            "incremental snapshot stopped on a running pipeline; capture continues",
+        );
+        Ok(abandoned)
+    }
+
+    fn running_stream_mut(
+        &mut self,
+        action: &str,
+    ) -> Result<&mut Box<dyn crate::source::StreamHandle>> {
+        if self.state != RuntimeState::Running {
+            return Err(Error::StateError(format!(
+                "cannot {action} the incremental snapshot while the runtime is {}; start it \
+                 first",
+                self.state
+            )));
+        }
+        self.stream.as_mut().ok_or_else(|| {
+            Error::StateError(format!(
+                "cannot {action} the incremental snapshot: the runtime has no active stream"
+            ))
+        })
+    }
+
     /// Return the current lifecycle state.
     pub fn state(&self) -> RuntimeState {
         self.state
@@ -119,6 +253,7 @@ impl CdcRuntime {
                     .saturating_sub(pending.committed_prefix)
             }),
             snapshot_active: self.snapshot.is_some(),
+            incremental_snapshot: self.incremental_snapshot_state(),
             stream_active: self.stream.is_some(),
             handoff_complete: self.handoff_complete,
             total_events_polled: self.total_events_polled,

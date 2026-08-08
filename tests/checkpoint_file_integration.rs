@@ -52,6 +52,7 @@ async fn incremental_snapshot_cursors_survive_a_checkpoint_round_trip() {
     let directory = temp.path().to_path_buf();
 
     let state = IncrementalSnapshotState {
+        paused: false,
         snapshot_id: "incremental-1754300000000".to_string(),
         tables: vec![
             IncrementalSnapshotTableState {

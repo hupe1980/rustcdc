@@ -143,6 +143,16 @@ impl PgOutputMessageProvider for StreamingPgOutputProvider {
         Ok(())
     }
 
+    async fn measure_slot_lag(&mut self) -> Result<Option<u64>> {
+        // Free: the server's write position arrives on every keepalive and XLogData
+        // header, so lag is the gap to what we have confirmed. No query, no slot mutation,
+        // and therefore safe to sample while the pipeline is behind.
+        Ok(Some(
+            self.server_wal_end
+                .saturating_sub(self.stream.applied_lsn()),
+        ))
+    }
+
     async fn idle_advance(&mut self) -> Result<u64> {
         // Called only when nothing has been delivered for the idle interval, so there is no
         // unacknowledged work and the server's own write position is safe to confirm.

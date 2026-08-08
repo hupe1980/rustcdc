@@ -224,12 +224,18 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
             continue;
         }
         if batch.iter().any(|event| {
+            // Compare the decoded value, not its JSON rendering: `to_string()` on a JSON
+            // string yields `"\"3\""`, quotes included. Column values are text under the
+            // envelope contract, so read the string and fall back to a number for safety.
             event
                 .after
                 .as_ref()
                 .and_then(|after| after.get("id"))
-                .map(|value| value.to_string())
-                == Some("3".into())
+                .map(|value| match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                == Some("3".to_string())
         }) {
             found_id3 = true;
             break;

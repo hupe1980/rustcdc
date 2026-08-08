@@ -114,6 +114,21 @@ Step 5 is what makes the result independent of interleaving. A row modified betw
 watermarks appears in the chunk at its old value and in the stream at its new one; suppressing
 the chunk copy means the stream value wins regardless of the order they were produced in.
 
+An event **past** the high watermark is deliberately not suppressed: it committed after the
+`SELECT` finished, so the chunk row is still needed as that row's base state. What the
+algorithm requires instead is that the chunk goes out **at** the high watermark, ahead of any
+later event. DBLog gets that for free by emitting the buffered chunk the moment it reads the
+high-watermark marker out of the log; rustcdc reads the log in batches, and one batch
+routinely straddles the watermark — an event at LSN 900 and one at 1200 arrive together. Such
+a batch is split at the first event past the watermark: head, chunk, tail. Returning it whole
+and the chunk afterwards would apply the 1200 value and then the chunk's older value on top,
+which is the stale-row resurrection step 5 exists to prevent, moved one step later.
+
+While the tail is held back the driver reports **no** durable position, because the inner
+stream has already consumed events the consumer has not been given; the snapshot rows in
+between become non-persistent barrier entries and the held-back events carry the position
+forward with their own offsets a moment later.
+
 The keyset cursor is persisted **inside the checkpoint offset** — the same atomic, fsynced,
 checksummed record as the stream position — so a restart resumes at the chunk boundary rather
 than re-reading the table. The coupling is deliberate: a chunk cursor is only meaningful

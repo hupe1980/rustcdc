@@ -211,7 +211,11 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
                 .after
                 .as_ref()
                 .and_then(|after| after.get("id"))
-                .and_then(|value| value.as_i64())
+                .and_then(|value| match value {
+                    serde_json::Value::Number(n) => n.as_i64(),
+                    serde_json::Value::String(s) => s.parse::<i64>().ok(),
+                    _ => None,
+                })
                 .ok_or_else(|| rustcdc::Error::StateError("snapshot event id missing".into()))?;
             resumed_snapshot_ids.insert(id.to_string());
         }

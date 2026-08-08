@@ -330,6 +330,7 @@ pub(super) fn build_snapshot_fetch_sql(
     column_names: &[String],
     limit_param_index: usize,
     include_seek_where_clause: bool,
+    condition: Option<&str>,
 ) -> String {
     let order_by = primary_key_columns
         .iter()
@@ -338,10 +339,17 @@ pub(super) fn build_snapshot_fetch_sql(
         .join(", ");
     let cursor_projection = build_prefixed_column_projection(primary_key_columns, "t");
     let row_projection = build_prefixed_column_projection(column_names, "t");
-    let where_clause = if include_seek_where_clause {
-        build_seek_where_clause(primary_key_columns)
-    } else {
-        String::new()
+    // The operator's filter is parenthesised so an `OR` inside it cannot escape and widen
+    // the keyset seek — `a > b AND x = 1 OR y = 2` would otherwise return rows before the
+    // cursor and re-read them on every chunk.
+    let where_clause = match (include_seek_where_clause, condition) {
+        (true, Some(condition)) => format!(
+            "{} AND ({condition})",
+            build_seek_where_clause(primary_key_columns)
+        ),
+        (true, None) => build_seek_where_clause(primary_key_columns),
+        (false, Some(condition)) => format!("WHERE ({condition})"),
+        (false, None) => String::new(),
     };
 
     format!(
@@ -477,4 +485,151 @@ pub(super) fn is_sqlserver_cdc_window_error(message: &str) -> bool {
     let mentions_arg_shape =
         lower.contains("insufficient number of arguments") || lower.contains("expects parameter");
     mentions_cdc_fn && mentions_arg_shape
+}
+
+/// Decode a `FOR JSON PATH` row payload with every scalar rendered as its source text.
+///
+/// # Why not just `serde_json::from_str::<Value>`
+///
+/// Two reasons, and the first is a live precision bug rather than a style preference.
+///
+/// `serde_json` parses a JSON number into `i64`/`u64`/`f64`. SQL Server serializes
+/// `DECIMAL(38,4)` and `FLOAT` into JSON as numbers, so parsing straight to `Value` routes
+/// them through `f64` and **silently rounds off the low digits** — which is why this
+/// connector's type-fidelity assertions had to be written as `starts_with` prefixes rather
+/// than equalities.
+///
+/// Second, it made the JSON type of a column depend on the connector it came from: a
+/// PostgreSQL `bigint` arrives as `"42"` and a SQL Server one as `42`, so a sink reading a
+/// heterogeneous pipeline had to branch per source.
+///
+/// `RawValue` hands back each value's **original token text**, untouched by any numeric
+/// type, so re-emitting it as a JSON string is exact. Objects and arrays (a `json`-typed
+/// column, say) keep their structure; `null` stays `null`; strings keep their decoded value.
+pub(super) fn decode_row_json_as_text(row_json: &str) -> Result<serde_json::Value> {
+    use serde_json::value::RawValue;
+
+    let raw: ahash::AHashMap<String, &RawValue> =
+        serde_json::from_str(row_json).map_err(|error| {
+            Error::SerializationError(format!("sqlserver row JSON decode failed: {error}"))
+        })?;
+
+    let mut object = serde_json::Map::with_capacity(raw.len());
+    for (name, value) in raw {
+        let text = value.get().trim();
+        let converted = match text.as_bytes().first() {
+            // `null` — a genuine SQL NULL, and it must stay distinguishable from the
+            // four-character string "null".
+            Some(b'n') => serde_json::Value::Null,
+            // Already a JSON string: decode the escapes and keep the value.
+            Some(b'"') => serde_json::from_str(text).map_err(|error| {
+                Error::SerializationError(format!(
+                    "sqlserver row JSON decode failed for column '{name}': {error}"
+                ))
+            })?,
+            // Structured value (a `json`-typed column) — keep the structure.
+            Some(b'{') | Some(b'[') => serde_json::from_str(text).map_err(|error| {
+                Error::SerializationError(format!(
+                    "sqlserver row JSON decode failed for column '{name}': {error}"
+                ))
+            })?,
+            // Number or boolean: re-emit the source text verbatim.
+            _ => serde_json::Value::String(text.to_string()),
+        };
+        object.insert(name, converted);
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_high_precision_decimal_survives_the_row_decode_exactly() {
+        // The bug this replaced: parsing straight into `Value` routes a JSON number through
+        // `f64`, so `DECIMAL(38,4)` lost its low digits. That is why this connector's
+        // type-fidelity assertions were written as `starts_with` prefixes — they could not
+        // assert equality against a value the decoder was quietly rounding.
+        let decoded = decode_row_json_as_text(
+            r#"{"exact":12345678901234.5678,"big":9223372036854775807,"dbl":0.30000000000000004}"#,
+        )
+        .expect("decodes");
+        assert_eq!(decoded["exact"], serde_json::json!("12345678901234.5678"));
+        assert_eq!(decoded["big"], serde_json::json!("9223372036854775807"));
+        assert_eq!(decoded["dbl"], serde_json::json!("0.30000000000000004"));
+    }
+
+    #[test]
+    fn null_stays_null_and_strings_keep_their_decoded_value() {
+        // A SQL NULL must stay distinguishable from the four-character string "null", and a
+        // string column must not gain a layer of quoting on the way through.
+        let decoded = decode_row_json_as_text(
+            r#"{"missing":null,"literal":"null","text":"café","flag":true}"#,
+        )
+        .expect("decodes");
+        assert_eq!(decoded["missing"], serde_json::Value::Null);
+        assert_eq!(decoded["literal"], serde_json::json!("null"));
+        assert_eq!(decoded["text"], serde_json::json!("café"));
+        assert_eq!(
+            decoded["flag"],
+            serde_json::json!("true"),
+            "booleans render as text like every other scalar",
+        );
+    }
+
+    #[test]
+    fn a_structured_column_keeps_its_structure() {
+        // A `json`-typed column is not a scalar, so flattening it to text would destroy
+        // information a sink can use.
+        let decoded =
+            decode_row_json_as_text(r#"{"doc":{"a":[1,2]},"arr":[1,2]}"#).expect("decodes");
+        assert_eq!(decoded["doc"], serde_json::json!({"a": [1, 2]}));
+        assert_eq!(decoded["arr"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn a_row_filter_is_parenthesised_so_an_or_cannot_widen_the_keyset_seek() {
+        // `a > b AND x = 1 OR y = 2` binds as `(a > b AND x = 1) OR y = 2`, which returns
+        // rows *before* the cursor — so every chunk re-reads them and the snapshot never
+        // advances. Parentheses are what stop an operator's filter doing that.
+        let sql = build_snapshot_fetch_sql(
+            "[dbo].[orders]",
+            &["id".to_string()],
+            &["id".to_string()],
+            2,
+            true,
+            Some("tenant = 1 OR legacy = 1"),
+        );
+        assert!(
+            sql.contains("AND (tenant = 1 OR legacy = 1)"),
+            "the filter must be parenthesised and ANDed onto the seek: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_row_filter_becomes_the_where_clause_on_the_first_chunk() {
+        let sql = build_snapshot_fetch_sql(
+            "[dbo].[orders]",
+            &["id".to_string()],
+            &["id".to_string()],
+            1,
+            false,
+            Some("tenant = 1"),
+        );
+        assert!(sql.contains("WHERE (tenant = 1)"), "{sql}");
+    }
+
+    #[test]
+    fn no_filter_leaves_the_chunk_sql_unfiltered() {
+        let sql = build_snapshot_fetch_sql(
+            "[dbo].[orders]",
+            &["id".to_string()],
+            &["id".to_string()],
+            1,
+            false,
+            None,
+        );
+        assert!(!sql.contains("WHERE"), "{sql}");
+    }
 }

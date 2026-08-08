@@ -3,9 +3,13 @@ use std::time::Duration;
 use tokio_postgres::Client;
 
 #[cfg(feature = "tls")]
-use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
+pub(super) use crate::core::rustls_client_config;
+#[cfg(feature = "tls")]
+pub(super) use crate::core::transport_tls::build_tls_client_config;
 
 use crate::core::{Error, Result};
+
+use super::parser::quote_pg_identifier;
 
 use super::parser::{format_pg_lsn, parse_pg_lsn};
 
@@ -181,190 +185,79 @@ async fn query_slot_confirmed_lsn(client: &Client, slot_name: &str) -> Result<u6
     parse_pg_lsn(&lsn_text)
 }
 
-#[cfg(feature = "tls")]
-pub(super) fn build_tls_root_store(ca_cert_path: Option<&str>) -> Result<rustls::RootCertStore> {
-    let mut root_store = rustls::RootCertStore::empty();
-
-    if let Some(path) = ca_cert_path {
-        let pem_bytes = std::fs::read(path).map_err(|error| {
-            Error::ConfigError(format!(
-                "failed to read TLS CA certificate file '{path}': {error}"
+/// Every column of `schema.table`, in ordinal order.
+///
+/// Needed because the row payload is built column by column: see [`row_as_text_json`] for
+/// why a whole-row conversion cannot produce the same text the live stream does.
+pub(super) async fn query_all_columns(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT attname \
+             FROM pg_attribute \
+             WHERE attrelid = format('%I.%I', $1::text, $2::text)::regclass \
+               AND attnum > 0 AND NOT attisdropped \
+             ORDER BY attnum",
+            &[&schema, &table],
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed reading columns for '{schema}.{table}': {error}"
             ))
         })?;
-        // `rustls_pki_types::pem`, not the archived `rustls-pemfile`: the latter has
-        // been unmaintained since August 2025 (RUSTSEC-2025-0134) and its last release is
-        // a thin wrapper over exactly this code.
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem_bytes)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| {
-                Error::ConfigError(format!(
-                    "failed to parse TLS CA certificate PEM in '{path}': {error}"
-                ))
-            })?;
-
-        if certs.is_empty() {
-            return Err(Error::ConfigError(format!(
-                "TLS CA certificate file '{path}' contains no valid PEM certificates"
-            )));
-        }
-
-        for cert in certs {
-            root_store.add(cert).map_err(|error| {
-                Error::ConfigError(format!(
-                    "TLS CA certificate in '{path}' is invalid: {error}"
-                ))
-            })?;
-        }
-    } else {
-        let native_certs = rustls_native_certs::load_native_certs();
-        for err in &native_certs.errors {
-            tracing::warn!(
-                target: "rustcdc::source::postgres",
-                "failed to load a native root certificate: {err}"
-            );
-        }
-        for cert in native_certs.certs {
-            if let Err(err) = root_store.add(cert) {
-                tracing::debug!(
-                    target: "rustcdc::source::postgres",
-                    "skipping invalid native root certificate: {err}"
-                );
-            }
-        }
-    }
-
-    Ok(root_store)
+    Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
 }
 
-/// Return the process-level `CryptoProvider` if the embedder has registered one
-/// via [`rustls::crypto::CryptoProvider::install_default`], otherwise fall back
-/// to `ring`. Using a registered default lets embedders choose `aws-lc-rs` (e.g.
-/// for FIPS) without requiring source-level changes in rustcdc.
+/// Build the row-payload projection: every column cast with its own type output function.
 ///
-/// This function must never call `install_default()` — that is process-global
-/// mutation that belongs solely to the embedder / binary entry point.
-#[cfg(feature = "tls")]
-fn resolve_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
-    rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| rustls::crypto::ring::default_provider().into())
+/// # Why not `row_to_json(t)`
+///
+/// Two reasons, and the second is the subtle one.
+///
+/// 1. **It disagrees with the live stream on type.** `row_to_json` preserves SQL types, so a
+///    row backfilled by a snapshot gave `{"id": 1}` while the same row updated a moment later
+///    gave `{"id": "1"}` — pgoutput delivers values in text format. A sink reaching for
+///    `as_i64()` read one and silently saw `None` for the other. It is also lossy:
+///    `numeric(38,4)` and `int8` above 2^53 do not survive a JSON number, which is an
+///    IEEE-754 double by the time most consumers see it.
+/// 2. **Getting to text is not one conversion but two, and only one of them matches.**
+///    Routing through `json_each_text(row_to_json(t))` fixes the type and not the value:
+///    `row_to_json` turns a `boolean` into JSON `true`, whose text is `"true"`. Nor does
+///    `::text` — that is a *cast*, and PostgreSQL's `bool`→`text` cast also yields `true`.
+///    pgoutput emits `t`, because it calls the type's **output function**. `format('%s', …)`
+///    is what invokes that same function, so the two paths agree character for character.
+///
+/// `format` renders SQL NULL as the empty string, which would erase the distinction between
+/// a NULL column and an empty one — so each column is guarded by a `CASE`, leaving NULL as
+/// SQL NULL for `json_build_object` to render as JSON `null`.
+///
+/// Verified against PostgreSQL 16:
+/// `{"b": "t", "n": null, "e": "", "x": "9223372036854775807"}`.
+pub(super) fn row_as_text_json(columns: &[String]) -> String {
+    if columns.is_empty() {
+        return "'{}'::json::text".to_string();
+    }
+    let pairs = columns
+        .iter()
+        .map(|column| {
+            let quoted = quote_pg_identifier(column);
+            format!(
+                "{}, CASE WHEN t.{quoted} IS NULL THEN NULL ELSE format('%s', t.{quoted}) END",
+                quote_pg_literal(column)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("json_build_object({pairs})::text")
 }
 
-/// Build a `rustls::ClientConfig` with optional mTLS client certificate.
-///
-/// When `client_cert_path` and `client_key_path` are both `Some`, mutual TLS
-/// authentication is configured using the supplied PEM-encoded certificate and
-/// private key. Otherwise, server-auth-only TLS is used.
-/// Resolve a [`TransportConfig`](crate::core::TransportConfig) to a rustls client config.
-///
-/// Used by the replication transport, which does its own TLS handshake rather than going
-/// through `tokio-postgres-rustls`. It shares this function so both transports trust
-/// exactly the same roots and present the same client certificate — two connections to the
-/// same server disagreeing about what they verify would be a security surprise, not a
-/// detail.
-///
-/// `allow_invalid_certificates` / `allow_invalid_hostnames` are not handled here because
-/// `PostgresConnection::connect` rejects them before any connection is opened; see the
-/// error it raises for the reasoning.
-#[cfg(feature = "tls")]
-pub(super) fn rustls_client_config(
-    transport: &crate::core::TransportConfig,
-) -> Result<rustls::ClientConfig> {
-    use crate::core::TransportConfig;
-
-    match transport {
-        TransportConfig::Tls {
-            ca_cert_path,
-            client_cert_path,
-            client_key_path,
-            ..
-        } => build_tls_client_config(
-            ca_cert_path.as_deref(),
-            client_cert_path.as_deref(),
-            client_key_path.as_deref(),
-        ),
-        // An injected config is used as-is, custom verifier and all. The replication
-        // transport builds its own connector, so unlike a third-party client it has no
-        // reason to refuse one.
-        TransportConfig::RustlsConfig { config } => Ok((*config.0).clone()),
-        TransportConfig::Plaintext => Err(Error::ConfigError(
-            "cannot build a TLS configuration for a plaintext transport".into(),
-        )),
-    }
-}
-
-#[cfg(feature = "tls")]
-pub(super) fn build_tls_client_config(
-    ca_cert_path: Option<&str>,
-    client_cert_path: Option<&str>,
-    client_key_path: Option<&str>,
-) -> Result<rustls::ClientConfig> {
-    let root_store = build_tls_root_store(ca_cert_path)?;
-
-    match (client_cert_path, client_key_path) {
-        (Some(cert_path), Some(key_path)) => {
-            let cert_pem = std::fs::read(cert_path).map_err(|error| {
-                Error::ConfigError(format!(
-                    "failed to read mTLS client certificate '{cert_path}': {error}"
-                ))
-            })?;
-            let key_pem = std::fs::read(key_path).map_err(|error| {
-                Error::ConfigError(format!(
-                    "failed to read mTLS client private key '{key_path}': {error}"
-                ))
-            })?;
-
-            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    Error::ConfigError(format!(
-                        "failed to parse mTLS client certificate PEM '{cert_path}': {error}"
-                    ))
-                })?;
-
-            if certs.is_empty() {
-                return Err(Error::ConfigError(format!(
-                    "mTLS client certificate file '{cert_path}' contains no valid certificates"
-                )));
-            }
-
-            let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|error| {
-                Error::ConfigError(format!(
-                    "failed to parse mTLS private key PEM '{key_path}': {error}. The file \
-                     must contain exactly one PKCS#8, PKCS#1 or SEC1 private key."
-                ))
-            })?;
-
-            rustls::ClientConfig::builder_with_provider(resolve_crypto_provider())
-                .with_safe_default_protocol_versions()
-                .map_err(|error| {
-                    Error::ConfigError(format!("TLS protocol configuration failed: {error}"))
-                })?
-                .with_root_certificates(root_store)
-                .with_client_auth_cert(certs, key)
-                .map_err(|error| {
-                    Error::ConfigError(format!(
-                        "mTLS client certificate configuration failed: {error}"
-                    ))
-                })
-        }
-        (Some(_), None) => Err(Error::ConfigError(
-            "mTLS requires both client_cert_path and client_key_path".into(),
-        )),
-        (None, Some(_)) => Err(Error::ConfigError(
-            "mTLS requires both client_cert_path and client_key_path".into(),
-        )),
-        (None, None) => {
-            let config = rustls::ClientConfig::builder_with_provider(resolve_crypto_provider())
-                .with_safe_default_protocol_versions()
-                .map_err(|error| {
-                    Error::ConfigError(format!("TLS protocol configuration failed: {error}"))
-                })?
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            Ok(config)
-        }
-    }
+/// Quote a string as a SQL literal, doubling any embedded quote.
+fn quote_pg_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]

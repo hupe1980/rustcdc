@@ -48,6 +48,7 @@ impl CdcRuntime {
         if matches!(self.source, RuntimeSource::Disabled) {
             self.state = RuntimeState::Running;
             self.observability().tracer.trace_checkpoint_barrier("open");
+            self.reset_run_counters();
             return Ok(());
         }
 
@@ -101,13 +102,7 @@ impl CdcRuntime {
 
             self.state = RuntimeState::Running;
             self.observability().tracer.trace_checkpoint_barrier("open");
-            self.started_at_ms = Some(now_millis());
-            self.last_poll_at_ms = None;
-            self.last_source_event_ts_ms = None;
-            self.last_commit_at_ms = None;
-            self.total_events_polled = 0;
-            self.total_events_committed = 0;
-            self.total_events_deduplicated = 0;
+            self.reset_run_counters();
             return Ok(());
         }
 
@@ -159,6 +154,18 @@ impl CdcRuntime {
 
         self.state = RuntimeState::Running;
         self.observability().tracer.trace_checkpoint_barrier("open");
+        self.reset_run_counters();
+        Ok(())
+    }
+
+    /// Zero the per-run counters and timestamps `start()` reports against.
+    ///
+    /// One function rather than three copies: the copies had drifted, and the drift was
+    /// silent. `total_events_skipped` was reset by none of them, so a restarted runtime
+    /// reported skips from a previous run, and the `Disabled` source path set no
+    /// `started_at_ms` at all — leaving `uptime_ms` at zero forever on the one
+    /// configuration used by every embedder testing against a custom source.
+    fn reset_run_counters(&mut self) {
         self.started_at_ms = Some(now_millis());
         self.last_poll_at_ms = None;
         self.last_source_event_ts_ms = None;
@@ -166,7 +173,7 @@ impl CdcRuntime {
         self.total_events_polled = 0;
         self.total_events_committed = 0;
         self.total_events_deduplicated = 0;
-        Ok(())
+        self.total_events_skipped = 0;
     }
 
     fn is_snapshot_checkpoint(&self, offset: &dyn Offset) -> bool {
@@ -359,6 +366,149 @@ impl CdcRuntime {
         ))
     }
 
+    /// Drive the whole pipeline into the registered sink until `shutdown` is cancelled.
+    ///
+    /// This is the loop every embedder writes, written once:
+    ///
+    /// ```text
+    /// poll a batch → send each event → flush the sink → acknowledge
+    /// ```
+    ///
+    /// The ordering is the part worth having in the library. Flushing **before**
+    /// acknowledging is what makes at-least-once hold: acknowledge first and a crash in
+    /// the gap advances the durable checkpoint past events the sink never accepted, and
+    /// nothing replays them. It is one line to get wrong and it fails silently, months
+    /// later, as rows that are simply missing downstream.
+    ///
+    /// Register the sink with [`CdcRuntime::register_sink`] and
+    /// [`start`](CdcRuntime::start) the runtime first.
+    ///
+    /// # Returns
+    ///
+    /// The number of events delivered and acknowledged, once `shutdown` is cancelled.
+    /// The runtime is still `Running` and the sink still registered — call
+    /// [`stop`](CdcRuntime::stop) to shut down and close the sink.
+    ///
+    /// Cancellation is observed **between** polls, never in the middle of one, because
+    /// [`poll_event_batch`](CdcRuntime::poll_event_batch) is not cancel-safe. Shutdown
+    /// therefore takes up to `max_poll_wait_ms` — the budget the poll already returns
+    /// within.
+    ///
+    /// # Errors
+    ///
+    /// Returns on the first error from the source, a transform, the sink, or the
+    /// checkpoint. A batch that failed mid-delivery is **not** acknowledged, so it is
+    /// redelivered by the next poll — retrying is calling this again. Because that
+    /// batch is left in flight, [`stop`](CdcRuntime::stop) refuses until it is
+    /// acknowledged; [`force_stop`](CdcRuntime::force_stop) hands it back instead.
+    ///
+    /// # When to write the loop yourself
+    ///
+    /// When the write has to be coordinated with something the runtime cannot see — your
+    /// own database transaction, a two-phase commit, per-branch error handling across a
+    /// fan-out. [`poll_event_batch`](CdcRuntime::poll_event_batch) and
+    /// [`commit_ack`](CdcRuntime::commit_ack) remain the supported way to do that.
+    ///
+    /// # Flush frequency
+    ///
+    /// Every batch is flushed, including for a sink that would rather batch across
+    /// several. That is not tunable here, and deliberately so: the acknowledgement
+    /// cannot outrun the flush without giving up the guarantee, so a rarer flush means a
+    /// rarer acknowledgement and a growing redelivery window. Batch inside the sink
+    /// (raise [`RuntimeOptions::max_buffer_size`] to hand it more per call) rather than
+    /// by acknowledging late.
+    pub async fn run_to_completion(
+        &mut self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<u64> {
+        // Moved out for the duration of the run so the loop can hold `&mut sink` and
+        // `&mut self` at once, and put back afterwards so `stop()` still closes it.
+        let slot = self.registered_sink.take().ok_or_else(|| {
+            Error::ConfigError(
+                "run_to_completion needs a sink to deliver to; call \
+                 CdcRuntime::register_sink(...) before start(), or drive \
+                 poll_event_batch/commit_ack yourself"
+                    .into(),
+            )
+        })?;
+        let mut sink = slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let result = self.run_sink_loop(&mut sink, shutdown).await;
+        self.registered_sink = Some(std::sync::Mutex::new(sink));
+        result
+    }
+
+    async fn run_sink_loop(
+        &mut self,
+        sink: &mut BoxedSink,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<u64> {
+        use crate::sink::SinkAdapter as _;
+
+        let sink_name = sink.name().to_string();
+        let mut delivered = 0u64;
+
+        loop {
+            // Checked between polls, never raced against one. `poll_event_batch` is not
+            // cancel-safe: dropping it after the source has handed over a batch but before
+            // the runtime has staged it discards events that have left the source's buffer
+            // and never reached the commit barrier. Nothing acknowledges them, so a restart
+            // replays them — but a runtime that keeps polling skips them permanently.
+            //
+            // Shutdown latency is therefore bounded by `max_poll_wait_ms`, which is the
+            // budget the poll already promises to return within.
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let batch = self.poll_event_batch().await?;
+
+            if batch.is_empty() {
+                // `poll_event_batch` already waited out `max_poll_wait_ms`, so this is
+                // not a spin — but a source that returns empty synchronously would make
+                // it one, and `event_batches()` has the same guard for the same reason.
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let count = batch.len();
+            for event in batch.events() {
+                sink.send(event).await.inspect_err(|error| {
+                    self.record_runtime_error("runtime.run.sink_send", error);
+                    tracing::error!(
+                        target: "rustcdc::core::runtime",
+                        sink = %sink_name,
+                        table = %event.table,
+                        offset = %event.source.offset,
+                        error = %error.report(),
+                        "sink rejected an event; the batch is not acknowledged and will be \
+                         redelivered",
+                    );
+                })?;
+            }
+
+            // Durable at the sink *before* the checkpoint moves. Reversing these two is
+            // the silent data-loss bug this method exists to stop embedders writing.
+            sink.flush().await.inspect_err(|error| {
+                self.record_runtime_error("runtime.run.sink_flush", error);
+                tracing::error!(
+                    target: "rustcdc::core::runtime",
+                    sink = %sink_name,
+                    events = count,
+                    error = %error.report(),
+                    "sink flush failed; the batch is not acknowledged and will be redelivered",
+                );
+            })?;
+
+            self.commit_ack(batch.ack_mode()).await?;
+            delivered = delivered.saturating_add(count as u64);
+        }
+
+        Ok(delivered)
+    }
+
     /// Stop the runtime.
     ///
     /// This is safe-by-default and will fail if there are uncommitted in-memory
@@ -444,15 +594,20 @@ impl CdcRuntime {
         }
 
         self.state = RuntimeState::Stopping;
-        let mut drained = std::mem::take(&mut self.injected_events)
-            .into_iter()
-            .collect::<Vec<_>>();
+        // Drained in **delivery order**, which is the order `poll_event_batch` would have
+        // produced them in: the in-flight delivery first, then what is buffered behind
+        // it, then what has been read from the source but not cut into a batch, and the
+        // injected queue last — `poll_event_batch` only reaches it once the source queues
+        // are empty. Returning them in any other order hands the embedder a stream it
+        // cannot apply, which for CDC means the older value of a row landing last.
+        let mut drained: Vec<Event> = Vec::new();
         if let Some(pending) = self.pending_delivery.take() {
             // Only re-drain events that were not yet committed.
             drained.extend(pending.events[pending.committed_prefix..].iter().cloned());
         }
         drained.extend(self.buffered_events.drain(..));
         drained.extend(self.pending_source_events.drain(..));
+        drained.extend(std::mem::take(&mut self.injected_events));
         self.commit_barrier.clear_pending();
         let drained_event_count = drained.len();
         for event in &drained {

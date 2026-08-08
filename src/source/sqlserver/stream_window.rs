@@ -217,7 +217,7 @@ impl SqlServerStreamHandle {
             // *absent* rather than `null`, which downstream cannot distinguish from a
             // column that was never captured.
             let row_json = row.get::<&str, _>(4).unwrap_or("{}");
-            let parsed: serde_json::Value = serde_json::from_str(row_json).map_err(|error| {
+            let parsed = super::parser::decode_row_json_as_text(row_json).map_err(|error| {
                 Error::SourceError(format!(
                     "sqlserver CDC row_json is not valid JSON for capture instance \
                      '{capture_instance}': {error}"

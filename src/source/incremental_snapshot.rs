@@ -44,6 +44,18 @@ pub struct IncrementalSnapshotState {
     pub snapshot_id: String,
     /// Per-table progress, one entry per configured table.
     pub tables: Vec<IncrementalSnapshotTableState>,
+    /// Whether chunk reading is suspended.
+    ///
+    /// Set by [`CdcRuntime::pause_incremental_snapshot`](crate::CdcRuntime::pause_incremental_snapshot).
+    /// The live stream is unaffected — only the next chunk read is withheld — and the flag
+    /// travels in the checkpoint alongside the cursors, so a pause survives a restart.
+    /// Without that it would silently un-pause on the next deploy, which for a backfill
+    /// paused to protect a production primary is the opposite of what was asked for.
+    ///
+    /// `#[serde(default)]`, so a checkpoint written before this field existed loads as
+    /// "not paused".
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// Per-table progress within an [`IncrementalSnapshotState`].
@@ -81,6 +93,19 @@ impl IncrementalSnapshotState {
     pub fn is_complete(&self) -> bool {
         !self.tables.is_empty() && self.tables.iter().all(|table| table.is_complete)
     }
+
+    /// Rows emitted across every table, for a single progress number.
+    pub fn rows_emitted(&self) -> u64 {
+        self.tables.iter().map(|table| table.rows_emitted).sum()
+    }
+
+    /// Tables still to finish, for a single progress number.
+    pub fn tables_remaining(&self) -> usize {
+        self.tables
+            .iter()
+            .filter(|table| !table.is_complete)
+            .count()
+    }
 }
 
 /// Recover the persisted incremental-snapshot state from a checkpoint offset.
@@ -112,6 +137,7 @@ mod tests {
 
     fn state() -> IncrementalSnapshotState {
         IncrementalSnapshotState {
+            paused: false,
             snapshot_id: "incremental-42".into(),
             tables: vec![
                 IncrementalSnapshotTableState {

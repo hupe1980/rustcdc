@@ -39,7 +39,7 @@ server without TLS now fails rather than silently downgrading.
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.10", features = ["postgres"] }
+rustcdc = { version = "0.11", features = ["postgres"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -108,6 +108,17 @@ lose everything on restart — which means a restart re-reads from the beginning
 nothing at all. Use the file-backed pair, or your own durable backend, for anything you care
 about.
 
+> **Create the checkpoint directory yourself.** `FileCheckpoint` refuses to run against a
+> directory that does not exist rather than creating one. A directory it created would be an
+> empty directory, and an empty checkpoint means "start from the log head" — which silently
+> skips everything written before now. A typo in the path would look exactly like a first
+> run. `std::fs::create_dir_all(...)` at startup makes that a deliberate choice.
+
+Both file-backed stores take an exclusive **owner lease** on their path, so a second writable
+instance against the same directory is refused instead of silently interleaving writes. Both
+also run every filesystem call — including `fsync` — on a blocking worker, so a commit never
+holds one of your executor threads.
+
 ## 4. Run the loop
 
 The delivery contract is: poll a batch, apply it, then acknowledge it. The acknowledgement is
@@ -138,10 +149,35 @@ async fn run(config: RuntimeConfig) -> rustcdc::Result<()> {
 `batch.ack_mode()` returns an `AckToken` that `commit_ack` consumes. There is no other way to
 advance the checkpoint, so a pipeline that forgets to acknowledge stalls visibly instead of
 losing data quietly. An empty batch yields `AckMode::NotRequired` and `commit_ack` is a no-op,
-so the loop above is correct as written.
+so the loop above is correct as written. Each token may be committed once — a second commit
+of the same token is refused rather than advancing the checkpoint over events you never saw.
 
 Order matters: flush the sink **before** acknowledging. Acknowledge first and a crash in the
 gap drops every event in the batch.
+
+### Or let the runtime drive it
+
+If your sink implements `SinkAdapter`, that whole loop — in the right order — is one call:
+
+```rust
+use rustcdc::{CdcRuntime, RuntimeConfig, sink::StdoutSink};
+use rustcdc::CancellationToken;
+
+async fn run(config: RuntimeConfig, shutdown: CancellationToken) -> rustcdc::Result<()> {
+    let mut runtime = CdcRuntime::new(config)?;
+    runtime.register_sink(StdoutSink::new());
+    runtime.start().await?;
+
+    runtime.run_to_completion(shutdown).await?;
+
+    runtime.stop().await?;   // closes the sink too
+    Ok(())
+}
+```
+
+Write the loop yourself when the sink write has to be coordinated with something the runtime
+cannot see — your own transaction, a two-phase commit, a fan-out with per-branch error
+handling. Otherwise `run_to_completion` is the same thing with the ordering already right.
 
 ## 5. Apply events correctly
 

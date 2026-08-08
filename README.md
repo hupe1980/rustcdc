@@ -33,11 +33,11 @@ live server.
 
 ## Status
 
-**Pre-1.0.** Latest published release is 0.7.0; 0.10.0 is in development and is a breaking
+**Pre-1.0.** Latest published release is 0.7.0; 0.11.0 is in development and is a breaking
 release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are validated by
-977 unit tests, 109 documentation samples compiled as doctests, and 56 integration suites, the
-container-backed ones running against real PostgreSQL 16, MySQL 8.0/8.1, MariaDB 10.5/10.6,
-SQL Server 2022 and Apicurio Registry 3.
+1011 unit tests, 130 documentation samples compiled as doctests, and 61 integration suites, the
+container-backed ones running against real PostgreSQL 12/14/15/16, MySQL 8.0/8.4,
+MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
 
 The public API may still change. Delivery is **at-least-once**; see
 [Delivery guarantees](#delivery-guarantees).
@@ -46,7 +46,7 @@ The public API may still change. Delivery is **at-least-once**; see
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.10", features = ["postgres"] }
+rustcdc = { version = "0.11", features = ["postgres"] }
 ```
 
 The default profile is `postgres` + `tls`. WASM transforms and every non-PostgreSQL connector
@@ -79,9 +79,32 @@ let config = RuntimeConfig::new(
 # let _ = config;
 ```
 
-Then drive the runtime: consume a batch, apply it, and acknowledge. The full loop — including
-why the acknowledgement is a separate step — is in the
-**[getting started guide](https://hupe1980.github.io/rustcdc/docs/getting-started/)**.
+Then drive the runtime. If your sink implements `SinkAdapter`, hand it the loop:
+
+```rust,no_run
+# use rustcdc::{CdcRuntime, RuntimeConfig, sink::StdoutSink};
+# use rustcdc::CancellationToken;
+# async fn run(config: RuntimeConfig, shutdown: CancellationToken) -> rustcdc::Result<()> {
+let mut runtime = CdcRuntime::new(config)?;
+runtime.register_sink(StdoutSink::new());
+runtime.start().await?;
+
+runtime.run_to_completion(shutdown).await?;   // poll → send → flush → acknowledge
+
+runtime.stop().await?;
+# Ok(())
+# }
+```
+
+The value of that being in the library is the *order*. Acknowledging before the flush advances
+the durable checkpoint past events the sink never accepted; a crash in that gap loses them with
+no error anywhere. It is one line to get wrong and it fails months later as rows that are
+simply missing.
+
+Drive `poll_event_batch` and `commit_ack` yourself when the write has to be coordinated with
+something the runtime cannot see — your own transaction, a two-phase commit, a fan-out with
+per-branch error handling. The full loop, and why the acknowledgement is a separate step, is in
+the **[getting started guide](https://hupe1980.github.io/rustcdc/docs/getting-started/)**.
 
 ## Read this before writing a sink
 
@@ -111,6 +134,11 @@ match event.row_write() {
 }
 # }
 ```
+
+Column values are **text**: every scalar is a JSON string, SQL `NULL` is JSON `null`, and a
+`json` column keeps its structure. One rule on every connector and every capture path, because
+a JSON number is an IEEE-754 double by the time most consumers see it — `numeric(38,4)` and
+`bigint` past 2^53 do not survive one. Read with `value.as_str()` and parse.
 
 `Merge` hands you only the columns the source actually supplied, so there is no placeholder
 left to write by accident. It arises from PostgreSQL unchanged-TOAST: a large value not
@@ -158,6 +186,11 @@ Full matrix: [configuration reference](https://hupe1980.github.io/rustcdc/docs/c
 - Ordering is preserved within committed ack prefixes.
 - Deduplicate sink-side on a stable key — source + table + primary key + source offset — and
   validate that dedup in staging before production rollout.
+- A **clean** restart with no new writes delivers nothing. That is not free: the checkpoint
+  records the first position *not* consumed rather than the last event's own position, because
+  PostgreSQL logical decoding filters at transaction granularity and resuming from a change's
+  LSN replays its whole transaction. See
+  [the checkpoint records a boundary](https://hupe1980.github.io/rustcdc/docs/api/#the-checkpoint-records-a-boundary-not-the-last-events-position).
 
 By default a delivered batch may end mid-transaction, because batches are cut on
 `max_buffer_size`, `max_event_bytes` and commit-barrier capacity, none of which know anything
@@ -174,14 +207,21 @@ permanent silent stall would be worse.
 | | |
 |---|---|
 | **Connectors** | PostgreSQL (logical replication / pgoutput), MySQL and MariaDB (binlog, GTID), SQL Server (CDC capture tables) |
-| **Snapshots** | DBLog-style resumable incremental snapshot, implemented once and shared by every connector — including yours. Never writes to the source, so it works on a read replica. Chunk cursors persist inside the checkpoint offset, so a restart resumes at the chunk boundary; `request_incremental_snapshot` adds tables to a running pipeline |
-| **Checkpoints** | In-memory and file-backed; file writes are atomic, fsynced and SHA-256 checksummed, with a single-writer lease |
+| **Snapshots** | DBLog-style resumable incremental snapshot, pausable and stoppable in flight, implemented once and shared by every connector — including yours. Never writes to the source, so it works on a read replica. Chunk cursors persist inside the checkpoint offset, so a restart resumes at the chunk boundary; `request_incremental_snapshot` adds tables to a running pipeline |
+| **Checkpoints** | In-memory and file-backed; file writes are atomic, fsynced and SHA-256 checksummed, with a single-writer lease, and every filesystem call runs on a blocking worker rather than on your executor |
 | **Transforms** | Masking, filtering, projection, field mapping, routing, unwrapping, outbox — plus a sandboxed WASM stage |
 | **Codecs** | JSON, Avro, Protobuf; Confluent, Apicurio and AWS Glue schema registries |
 | **Observability** | Prometheus text exposition, OpenTelemetry metrics and tracing, structured logs, `HealthVerdict` |
 | **Testing** | Deterministic replay, fault injection, adapter conformance harness |
 
 Three details worth knowing up front:
+
+**Snapshots you can steer while they run.** `request_incremental_snapshot` adds tables to a
+running pipeline, and `pause` / `resume` / `stop` do what an operator expects when a multi-hour
+backfill is loading a production primary during business hours — without stopping capture. A
+pause takes effect at a chunk boundary and is written into the checkpoint, so it survives a
+deploy instead of silently lifting. `control_handle()` hands all of it, plus live per-table
+progress, to a task that is not the one holding `&mut CdcRuntime`.
 
 **Bring your own source.** `CdcRuntime::register_source` drives the runtime from any
 `impl Source`, including one this crate does not ship. The commit barrier, checkpointing,
@@ -248,7 +288,7 @@ deployments — configure `TransportConfig::tls_with_ca_cert_path(...)` or
 cargo run --example pg_to_stdout --features postgres -- \
   --host localhost --port 5432 --database testdb --snapshot-tables public.users
 
-# MariaDB → stdout (same runtime loop, MariaDB source identity)
+# MariaDB → stdout (same pipeline, driven by the runtime via run_to_completion)
 cargo run --example mariadb_to_stdout --features mariadb -- \
   --host localhost --port 3306 --database testdb --snapshot-tables app.users
 
@@ -256,6 +296,10 @@ cargo run --example mariadb_to_stdout --features mariadb -- \
 docker compose up --build
 docker compose down -v
 ```
+
+The two stdout examples deliberately show the two shapes: `pg_to_stdout` drives
+`poll_event_batch` and `commit_ack` by hand, `mariadb_to_stdout` registers a `StdoutSink` and
+hands the loop to `run_to_completion`.
 
 The examples also read `CDC_RS_HOST`, `CDC_RS_PORT`, `CDC_RS_DB`, `CDC_RS_SNAPSHOT_TABLES` and
 related variables, and commit every 100 events by default.
@@ -269,9 +313,11 @@ checkpoint or connector type is a reader guessing at a correctness contract.
 **The documentation compiles.** Every Rust block in this README and under `site/content/docs/`
 is compiled and run by `cargo test --doc --all-features`, gated in CI. Wiring the Markdown into
 the doctest run immediately surfaced 36 broken samples out of 96, including wrong field names
-and methods that had moved between types. Blocks that cannot run in a doctest — they need a
-live database, or they document the shape of a type — are marked `ignore` with a one-line
-reason; an unmarked block that fails to compile is a defect.
+and methods that had moved between types; extending it to the last five pages surfaced four
+more, among them an unterminated raw string in the deployment guide's health-endpoint example.
+Blocks that cannot run in a doctest — they need a live database, or a dependency this crate
+does not have — are marked `ignore` with a one-line reason; an unmarked block that fails to
+compile is a defect.
 
 **Failure paths are exercised, not assumed.** Deterministic replay, fault injection and
 process-kill crash tests are part of the suite, and are available to *your* tests too via the
@@ -334,6 +380,9 @@ zola --root site serve
 | [Security](https://hupe1980.github.io/rustcdc/docs/security/) | Transport defaults, secret handling, known exposure |
 | [Reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/) | Replay, fault injection, conformance |
 | [Library parity matrix](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) | Scope-aware comparison against alternatives |
+
+The most recent correctness audit, its findings and the open conditions on a 1.0 release are in
+[FINDINGS.md](FINDINGS.md).
 
 ## MSRV
 

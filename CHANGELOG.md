@@ -5,6 +5,487 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.11.0
+
+A correctness release. Six blockers found and closed — four distinct failure modes: silent
+loss of events the caller never saw, guaranteed duplication on every restart, stale rows
+written over newer values, and two states a pipeline could not recover from without
+hand-editing files. Every one carries a regression test that fails without its fix, most of
+them against a live database.
+
+It is also a **breaking** release for anyone reading column values: they are now text on every
+connector and every capture path. See the entry below for why, and for the one-line migration.
+
+The audit that produced this release, its remaining conditions, and a library-first competitor
+comparison are in [FINDINGS.md](FINDINGS.md).
+
+Some of these came from the `rustcdc-server` maintainers reporting against 0.10.0. Every
+report was checked against the source before acting on it; one had a diagnosis that was right
+about the symptom and wrong about the mechanism, and its suggested fix would not have worked.
+
+### Fixed: a clean restart re-delivered the last transaction, every time
+
+Reproduced against PostgreSQL 16 and now covered by
+`tests/postgres_restart_resume_integration.rs`: start, insert one row, idle, shut down
+cleanly, restart with **no new writes** — and the row arrives again.
+
+The report diagnosed `START_REPLICATION` as inclusive and suggested resuming from
+`checkpoint_lsn + 1`. The symptom was right and the mechanism was not, which matters because
+the suggested fix does not work. PostgreSQL logical decoding filters at **transaction**
+granularity (`SnapBuildXactNeedsSkip`: skip iff the transaction's *commit record* LSN is
+below the requested start). A change's own LSN always precedes its transaction's commit
+record, so resuming from `X` — or from `X + 1` — still satisfies `commit_lsn >= start` and
+replays the entire transaction, not just the record at `X`.
+
+Under `SqlPeek` it was not a bounded duplicate at all. The peek is non-consuming and has no
+client-side position filter, so the transaction was re-emitted on **every poll**: the
+reproduction saw 20 copies in 20 polls. The report measured "the whole last batch", which
+undercounted it.
+
+The only position that skips the transaction is the one *after* its commit record, which
+pgoutput reports as the COMMIT message's `end_lsn`. New on the trait:
+
+```rust
+fn resume_offset_for(&self, event: &Event) -> Option<String>
+```
+
+`StreamHandle::resume_offset_for` translates a delivered event into the position a restart
+must resume from once it is committed. The runtime uses it for **both** the durable
+checkpoint and the source-side confirmation, so replication-slot retention and restart
+duplicates are fixed together. The default returns `None`, meaning "the event's own offset is
+already a boundary" — which is correct for MySQL (binlog `log_pos` is the *next* event's
+position) and SQL Server (the window query already calls `sys.fn_cdc_increment_lsn`), and
+both were verified rather than assumed.
+
+The PostgreSQL checkpoint offset is now a transaction boundary, which also makes it
+monotonic — the previous non-monotonicity that `stream_position_regression` had to tolerate
+was a consequence of storing per-change LSNs.
+
+### Fixed: `poll_event_batch` was raced inside `select!` by the crate's own APIs
+
+The report is correct that the future is not cancel-safe: between the source handing over a
+batch and the runtime staging it, the events exist only inside the future, which awaits the
+durable schema-history write and the transform pipeline first. Dropping it there discards
+events that have left the source's buffer, and events added by `enqueue_event` have no source
+to replay from at all.
+
+It is now documented under a `# Cancel safety` heading — and, more to the point, **the crate
+was doing exactly this itself**. `event_batches_cancellable` raced the token against the poll
+in a `select!`, and `run_to_completion` (added earlier in this cycle) copied the pattern. Both
+now check the token *between* polls, so cancellation costs up to `max_poll_wait_ms` — the
+budget a poll already returns within — instead of silently dropping a batch.
+
+### Fixed: `flush_all` / `close_all` flattened every sink error to Terminal
+
+`TableRouter::send` passes a sink's error through untouched, so a broker connection reset is
+`ErrorKind::Transient` and retried. The flush and close paths collapsed everything into
+`StateError`, i.e. `Terminal`. The same failure was therefore retried or fatal depending on
+*where* it surfaced — decided by batch boundaries rather than by anything an operator
+controls.
+
+New `Error::Aggregate { kind, detail }` reports several failures under the most severe kind
+present, with `Error::kind()` returning it so `match error.kind()` keeps working. Severity is
+ordered by `ErrorKind::severity()` — `Transient` < `Backpressure` < `Configuration` <
+`Terminal`, the order of how much a caller must change before retrying — exposed as a method
+rather than an `Ord` impl so the ranking cannot drift with declaration order.
+
+`Error` is `#[non_exhaustive]`, so the new variant is additive.
+
+### Fixed: the `SqlPeek` rustdoc named a reason that is not one
+
+It listed `TransportConfig::RustlsConfig` among the reasons to fall back to `SqlPeek`,
+"whose pre-built verifier the streaming client cannot consume". The streaming client builds
+its own connector and uses an injected config as-is. The bullet was pushing embedders toward
+the transport whose cost grows with the source's longest-running transaction, for no reason.
+
+### New: `CdcRuntime::incremental_snapshot_state()`
+
+```rust
+pub fn incremental_snapshot_state(&self) -> Option<IncrementalSnapshotState>
+```
+
+Live per-table progress — snapshot id, keyset cursor, completion flag, row and chunk counters
+— read from the driver rather than from a persisted checkpoint. Also on
+`RuntimeAdminSnapshot::incremental_snapshot`, so anything already rendering that struct gets
+it for free.
+
+`&self` is the point: an embedder's event loop holds `&mut CdcRuntime` for its lifetime, so
+`&mut` would force the answer through a channel. Before this, an operator who triggered
+`request_incremental_snapshot` could learn how many tables were accepted and nothing after
+that, which for a multi-hour backfill was the whole operational experience.
+
+### New: the checkpoint rewind guard is public
+
+`stream_position_regression` is now `pub`, and `validate_checkpoint_progress` applies it plus
+the event-count rules in the same order `FileCheckpoint::save` does — over a new
+`StoredCheckpointRecord`. `FileCheckpoint` now calls the shared helper rather than its own
+copy, so the two cannot drift.
+
+The documentation says to call it **before** the durable write. That is the mistake the
+report describes making: a mirror-then-validate ordering let a rewound position reach the
+authoritative store and reported the error afterwards.
+
+### Fixed: replication-slot lag was only sampled while the pipeline was idle
+
+`last_slot_lag_bytes` was assigned only inside the idle-advance branch, which is gated on the
+slot being caught up *and* on `slot_idle_advance_interval_ms > 0`. So the metric refreshed
+only when lag was uninteresting, went stale exactly while the pipeline was behind, and was
+never sampled at all when idle advance was disabled.
+
+New `measure_slot_lag` on the provider is read-only — a `pg_current_wal_lsn() -
+confirmed_flush_lsn` read for `SqlPeek`, and free for streaming replication, which already
+receives the server's write position on every keepalive. It is sampled on a timer regardless
+of the caught-up state; `idle_advance` keeps its guard, because that one jumps the slot to
+the current WAL position and would discard an unconsumed backlog.
+
+`replication_slot_lag_bytes()` now returns `None` until the first *measurement* rather than
+until the first idle advance.
+
+### New: `rustcdc::rustls_client_config`
+
+The `TransportConfig` → `rustls::ClientConfig` mapping moved from `source::postgres::query`
+into `core`, gated on `tls` alone, and is public. An embedder opening one extra connection to
+the same source — a lag sampler, a schema probe, an operator tool — no longer reimplements
+which root store is used when `ca_cert_path` is absent, the refusal of
+`allow_invalid_certificates`, or requiring `client_cert_path` and `client_key_path` together.
+
+It also installs the crypto provider explicitly. `rustls::ClientConfig::builder()` **panics**
+rather than erroring when no process-wide provider is installed, which happens as soon as a
+dependency graph links more than one — and on a background task that panic takes out a
+worker thread. That trap is now behind the export instead of ahead of every embedder.
+
+### New: snapshot pause / resume / stop
+
+```rust
+runtime.pause_incremental_snapshot().await?;    // idempotent, returns the previous state
+runtime.resume_incremental_snapshot().await?;
+runtime.stop_incremental_snapshot().await?;     // returns tables abandoned
+```
+
+The live change stream is untouched in every case: only chunk reading is affected, so a
+backfill loading a production primary during business hours can be held until the evening
+without stopping capture. Before this the only answer was stopping the pipeline and clearing
+the checkpoint, which also stopped capture.
+
+Three decisions worth stating, because they are the ones that make it usable rather than
+merely present:
+
+* **Pause takes effect at a chunk boundary.** A chunk already read is merged and delivered
+  first. Stopping mid-chunk would either discard a read the source has already paid for, or
+  strand a merged chunk whose cursor can never be promoted — and the cursor is what makes the
+  snapshot resumable at all.
+* **The paused flag is durable.** It rides in `IncrementalSnapshotState` next to the chunk
+  cursors, so the same atomic checkpoint record carries both. Without that, a pause taken to
+  protect a primary would silently lift on the next deploy — the opposite of what was asked
+  for. The field is `#[serde(default)]`, so an older checkpoint loads as "not paused".
+* **Stop drops undelivered *snapshot* rows but keeps held-back *log* events.** The snapshot
+  rows are reads the operator has just asked to stop producing; the log events belong to the
+  live stream and discarding them would lose change data.
+
+Stop is deliberately not durable in the same way: the persisted state is cleared by the next
+checkpoint write, so a crash in that window resumes the snapshot. Forcing a synchronous
+checkpoint from a control path would let an operator action rewrite the stream position, which
+is a worse trade than a rare resume of something that can simply be stopped again.
+
+`StreamHandle` gains `set_snapshot_paused` and `stop_snapshot`, both defaulting to
+`NotImplemented` so a handle that drives no snapshot says so rather than silently accepting.
+
+### New: `CdcRuntime::control_handle()` — control operations from another task
+
+```rust
+let control = runtime.control_handle();     // cloneable, `&self`
+tokio::spawn(async move {
+    control.pause_incremental_snapshot().await
+});
+runtime.run_to_completion(shutdown).await?;
+```
+
+An event loop holds `&mut CdcRuntime` for its whole lifetime, so every control operation was
+otherwise unreachable from an admin endpoint without the embedder hand-building an
+mpsc/oneshot bridge and a drain point. `RuntimeControl` is that bridge, written once in the
+place that owns the invariants — and the next control operation lands for free.
+
+Reads and writes are handled differently on purpose:
+
+* **Commands** go through the queue and are applied between polls. Not as a `select!` arm —
+  `poll_event_batch` is not cancel-safe, so racing it would drop events. Latency is therefore
+  bounded by the poll interval, and a loop that has stopped turning leaves a command waiting;
+  wrap in `tokio::time::timeout` if the caller has an SLO. Dropping the runtime resolves
+  outstanding commands with an error rather than hanging, and `is_connected()` reports it.
+* **Progress** is read from a snapshot the runtime republishes every poll, so
+  `RuntimeControl::incremental_snapshot_state()` is a plain non-blocking `fn` that cannot be
+  starved by a busy pipeline or hang behind a stalled one. It is stale by at most one poll,
+  which is the right trade for a number an operator refreshes in a dashboard.
+
+`IncrementalSnapshotState` also gains `rows_emitted()` and `tables_remaining()`, so the common
+progress readout is one call rather than a fold.
+
+### Fixed: MariaDB wrote a corrupted binlog file name into the checkpoint
+
+Found by writing the restart-resume suite the docs' claims had never been measured against.
+Against MariaDB 10.6 the ROTATE event's name field arrives as
+`mysql-bin.000002\x57\x07\x03\x52` — the four CRC32 bytes appended raw, two of them
+printable ASCII. The server appends the checksum to the *fake* rotate it sends before the
+FORMAT_DESCRIPTION_EVENT, which is before the reader has been told which checksum algorithm
+is in force. MySQL does not; only MariaDB showed the damage.
+
+Two failures followed from that one string, and neither was loud:
+
+* **File+position resume failed outright.** The server answers *"Could not find first log file
+  name in binary log index file"* and the stream never starts. GTID positioning still worked,
+  which is what kept this hidden.
+* **The checkpoint rewind guard silently switched itself off.** `binlog_coordinate` parses the
+  sequence suffix with `"000002WR".parse::<u64>()`; the `None` that produces reads as "not
+  comparable", so a genuinely regressed MariaDB coordinate would have been written without
+  objection.
+
+Truncating at the first byte that looks wrong is not enough — `0x57` is `W`. The suffix after
+the final `.` must be digits, and that is now enforced; a name that cannot be made valid is an
+error rather than a guess written into a durable checkpoint.
+
+Covered live on MySQL 8.0 and MariaDB 10.6 by `tests/mysql_restart_resume_integration.rs`,
+which also confirms what the docs previously only asserted: both engines already resume
+exclusively, so `resume_offset_for` keeps its default there.
+
+### New: per-table snapshot row filters
+
+```rust
+IncrementalSnapshotConfig::new(vec!["public.orders".into()])
+    .with_table_condition("public.orders", "created_at >= '2026-01-01'")
+```
+
+Debezium's `additional-condition`, on all three connectors: backfill one tenant or one time
+range instead of the whole table. It bounds the **chunk reads only** — the live stream keeps
+carrying every change to the table, because a filter that reached the stream would quietly
+become a capture filter and drop change data.
+
+The expression is parenthesised into the keyset seek, which is load-bearing:
+`a > b AND x = 1 OR y = 2` binds as `(a > b AND x = 1) OR y = 2`, returning rows *before* the
+cursor so every chunk re-reads them and the snapshot never advances. It is raw SQL and trusted
+input, at the same level as the connection string.
+
+### Fixed: sixteen integration suites were never run by CI
+
+The workflow drift guard asserted that *named* suites appeared in the workflow — an allow-list,
+silent about suites nobody added. A test that never runs is indistinguishable from one that
+does not exist, while still looking like evidence in a review.
+
+Among the uncovered: `custom_source_end_to_end` (the crate's headline extension-point claim),
+`logging_structured` (the documented log schema), `crash_recovery_model`, `postgres_query_integration`,
+and both example smoke tests. All are now in the matrix and all pass.
+
+The guard is now complete-by-construction: every `tests/*.rs` must appear in the workflow, in a
+script CI runs, or in an explicit helper-module list with a reason.
+
+### Fixed: CI pre-pulled images no test uses, and missed two it does
+
+The pre-pull exists to fetch from a mirror rather than from rate-limited Docker Hub. It warmed
+`mysql:8.1` and `mariadb:10.11`, which no test instantiates, while `mysql:8.4` and
+`mariadb:10.5` — which the matrices do use — were fetched at run time from exactly the
+registry the script was written to avoid. Fixed, and guarded by a check that fails when the
+list and the matrices drift.
+
+The README's version claim was corrected to match: PostgreSQL 12/14/15/16, MySQL 8.0/8.4,
+MariaDB 10.5/10.6.
+
+### Breaking: column values are now text on every connector and every capture path
+
+**The contract:** every scalar column value is a JSON string; SQL `NULL` is JSON `null`; a
+`json`-typed column keeps its structure.
+
+```json
+{"id": "42", "amount": "12345678901234.5678", "active": "t", "notes": null}
+```
+
+Uncovered while adding the snapshot-filter test. The same column arrived as `{"id": 1}` from a
+PostgreSQL incremental snapshot (`row_to_json`, typed) and `{"id": "1"}` from the live stream
+(pgoutput text). A sink reaching for `as_i64()` read one and silently saw `None` for the other.
+MySQL emitted JSON numbers from both paths; SQL Server parsed its `FOR JSON PATH` payload
+straight into `Value`, which routes a `DECIMAL(38,4)` through `f64`.
+
+Nothing asserted cross-path consistency, so nothing objected — each per-path type-fidelity
+suite checked its own path and agreed with itself.
+
+**Why text and not typed JSON.** A JSON number is an IEEE-754 double by the time most
+consumers see it: `numeric(38,4)` loses its low digits and `bigint` above 2^53 is corrupted
+outright, silently and in the value rather than the type. Text carries both exactly.
+
+**Getting to text is two conversions, and only one of them matches.** `row_to_json` then
+`json_each_text` fixes the type but not the value — a `boolean` becomes JSON `true`, whose
+text is `"true"`. Nor does `::text`: PostgreSQL's `bool`→`text` *cast* also yields `true`.
+pgoutput emits `t`, because it calls the type's **output function**, and `format('%s', …)` is
+what invokes that same function. The snapshot now builds its payload column by column with
+`format`, guarded by a `CASE` so SQL NULL stays NULL rather than collapsing to the empty
+string that `format` would produce. Snapshot and stream now agree character for character.
+
+MySQL's two near-identical value converters — one in the query path, one copied into the
+incremental snapshot — were deduplicated onto a single one that renders numerics as text.
+SQL Server decodes through `serde_json::value::RawValue`, which preserves each value's
+original token text.
+
+**This fixed a live precision bug.** SQL Server's `DECIMAL(20,6)` and `NUMERIC(10,4)`
+assertions were written as `starts_with` prefixes because the decoder was quietly rounding
+them. They are exact equalities now.
+
+**Migration:** read values with `value.as_str()` and parse. `serde_json`'s `raw_value` feature
+is now enabled.
+
+### Fixed: five documentation pages were never compiled, and four had rotted
+
+`markdown_doctests` covered the README and five pages; `deployment.md`, `runbook.md`,
+`troubleshooting.md`, `reliability-testing.md` and `wasm-transform-sdk.md` were outside it —
+including the two pages an operator copies from under pressure.
+
+They were outside it because rustdoc compiles an *unannotated* ` ``` ` block as Rust, and
+those pages are full of log output, SQL and shell. Fourteen bare fences are now annotated
+(which also fixes their syntax highlighting on the site), and wiring the pages in immediately
+surfaced four broken samples:
+
+* `deployment.md` had a `match runtime.poll_event_batch()` fragment that referenced an
+  undeclared `ErrorKind` and returned from a non-`Result` scope, and an axum handler with an
+  **unterminated raw string** — `r#"…")` instead of `r#"…"#)`.
+* `troubleshooting.md`'s SQL Server latency-tuning snippet used `SqlServerSourceConfig`
+  without importing it.
+* `wasm-transform-sdk.md`'s pooling example referenced an undefined `config` and used `?` in a
+  non-`Result` scope.
+
+All four now compile. The axum one stays `ignore` with a stated reason (axum is not a
+dependency), but its raw-string bug is fixed either way.
+
+The `admin_snapshot()` JSON sample in `deployment.md` also gained the new
+`incremental_snapshot` field, so it matches what the runtime actually emits.
+
+### Other
+
+- `RuntimeSource`'s connector variants are boxed. Inline, the MySQL variant put 632 bytes into
+  every `CdcRuntime` regardless of which connector was configured — and into every future
+  holding one across an await, which is the cost this crate already boxes futures to avoid.
+
+---
+
+Also in this cycle: a correctness pass over the parts that only fail after a crash. Five
+defects, three of them silent data loss and one a **permanent pipeline wedge**, plus the DX
+gap that made everyone hand-write the one loop where getting the order wrong loses data.
+
+### Fixed: an incremental-snapshot batch straddling the high watermark resurrected stale rows
+
+The DBLog override window suppresses a chunk row whose key was modified *between* the two
+watermarks. An event **past** the high watermark is correctly not suppressed — it committed
+after the `SELECT` finished, so the chunk row is still needed as the row's base state — but
+the algorithm then requires the chunk to be emitted **at** the high watermark, ahead of that
+event. DBLog gets this for free by emitting the buffered chunk the moment it reads the
+high-watermark marker out of the log.
+
+rustcdc reads the log in batches, and one batch routinely straddles the high watermark: an
+event at LSN 900 (inside the window) and one at 1200 (past it) arrive together. The whole
+batch was returned and the chunk followed, so the consumer applied the 1200 value and then
+the chunk's older value on top — the exact stale-row resurrection the override window exists
+to prevent, moved one step later.
+
+A straddling batch is now split at the first event past the high watermark: head, then chunk,
+then tail. While the tail is held back the driver reports no durable position, so the
+held-back events cannot be marked consumed before they are delivered.
+
+### Fixed: an ack token could be committed twice, skipping events the caller never saw
+
+`AckToken` is `Clone` and `EventBatch::ack_mode()` mints a fresh copy on every call, so
+nothing stopped a second `commit_ack` with the same token. It matched the delivery id, saw a
+shorter remaining prefix, and advanced the checkpoint over the **next** N events — which the
+caller had never been handed. Ordinary double-ack, silent permanent loss.
+
+Tokens now carry an epoch that the accepting commit spends. A replayed token is refused with
+an error naming the cause.
+
+**Breaking:** `AckToken::split_at(n) -> (Self, Option<Self>)` is replaced by
+`AckToken::accept_prefix(n) -> Self`. The remainder token was a loaded gun — acknowledging it
+claimed events the caller had just declined to process — and both callers in this repository
+discarded it. The uncommitted tail is redelivered by the next poll with a fresh token, which
+is now the only way to get one.
+
+### Fixed: a replayed DDL wedged the pipeline permanently
+
+Delivery is at-least-once, so a crash between recording a schema change and committing the
+checkpoint replays the DDL on restart. Re-applying an `AlterTableDiff` to a schema that
+already has its columns — `ADD COLUMN` on a column that now exists — returned `SchemaError`,
+failed the poll, and failed identically on **every** subsequent restart from the same
+checkpoint. The pipeline never started again, and the only exit was hand-editing state.
+
+`SchemaHistory::record_ddl` now takes a `ddl_id` and is idempotent on it; the runtime passes
+the source log position. A recognised replay returns the version already assigned and writes
+nothing.
+
+A history that genuinely cannot accept a statement — an `ALTER TABLE` diff for a table an
+`InMemorySchemaHistory` no longer remembers after a restart — is now logged at ERROR with the
+remedy instead of failing the poll. A gap in an auxiliary index does not justify a dead
+pipeline; the event itself is self-describing and still reaches the consumer. A store that is
+*broken* rather than inconsistent still fails the poll.
+
+**Breaking:** `record_ddl(ddl)` → `record_ddl(ddl_id, ddl)`. Pass `""` to opt out of replay
+suppression.
+
+### Fixed: `fsync` ran on the caller's executor thread
+
+`FileCheckpoint` and `FileSchemaHistory` did every filesystem call — `open`, `write_all`,
+`sync_all`, `rename`, and the parent-directory `fsync` — inline in an `async fn`. `fsync` is
+unbounded on a contended or networked filesystem, and this crate runs inside the caller's
+Tokio runtime: a commit held one of their worker threads, stalling every other task scheduled
+on it, and wedging a current-thread runtime outright. The file sink already got this right.
+
+Both now run their filesystem work on `spawn_blocking`.
+
+**Breaking:** `FileCheckpoint::checkpoint_dir` and `::file_mode` are no longer public fields.
+Use `checkpoint_dir()`, `file_mode()` and `with_file_mode(mode)`.
+
+### Fixed: `force_stop` returned drained events out of delivery order
+
+Injected events came first, though `poll_event_batch` reaches that queue **last**. An embedder
+applying the returned events in order wrote the older value of a row after the newer one. They
+are now returned in the order they would have been delivered.
+
+### Fixed: a table rewound behind the snapshot cursor was never read
+
+`request_incremental_snapshot` on an already-finished table that sits *before* the one being
+read rewound it, and then the forward-only scan skipped it: the driver parked reporting the
+snapshot complete with a table it never touched.
+
+### Fixed: a corrupt pgoutput `TRUNCATE` frame could abort the process
+
+The relation count is a `u32` read off the wire and was used directly as a `Vec` capacity, so
+a desynchronised frame asked for a 16 GB allocation instead of producing the decode error the
+next read would have raised. It is now bounded by what the frame can actually contain.
+
+### New: `CdcRuntime::run_to_completion` — the delivery loop, in the library
+
+```rust
+runtime.register_sink(StdoutSink::new());
+runtime.start().await?;
+let delivered = runtime.run_to_completion(shutdown).await?;
+runtime.stop().await?;
+```
+
+`poll → send → flush → acknowledge`, until the token is cancelled. The value of having it here
+is the *order*: acknowledging before the flush advances the durable checkpoint past events the
+sink never accepted, and a crash in that gap loses them with no error anywhere. One line to get
+wrong, failing months later as rows that are simply missing.
+
+This also makes `register_sink` honest. It previously did nothing but close the sink at
+shutdown, while its name promised delivery — and the sink had moved into the runtime, so it
+could not be used for delivery either.
+
+`poll_event_batch` + `commit_ack` remain fully supported, and are still the right choice when
+the write must be coordinated with something the runtime cannot see.
+
+### Other
+
+- `CancellationToken` is re-exported at the crate root. Embedders no longer add `tokio-util`
+  themselves and keep its version in step with this crate's — a mismatched copy compiles and
+  then cancels nothing, because the two token types are unrelated.
+- `examples/mariadb_to_stdout` now demonstrates the runtime-driven loop; `examples/pg_to_stdout`
+  stays on the manual one, so both shapes are compiled.
+- `start()` resets the per-run counters through one function instead of three drifted copies.
+  `total_events_skipped` was reset by none of them, and the `Disabled` source path set no
+  `started_at_ms`, so `uptime_ms` stayed at zero for every embedder testing a custom source.
+
 ## 0.10.0
 
 A correctness release, plus the one architectural gap the previous release documented rather

@@ -581,6 +581,7 @@ fn error_metric_class(error: &Error) -> &'static str {
         Error::NotImplemented(_) => "not_implemented",
         Error::PostCommitConfirmFailed { .. } => "post_commit_confirm_failed",
         Error::Backpressure(_) => "backpressure",
+        Error::Aggregate { .. } => "aggregate",
     }
 }
 

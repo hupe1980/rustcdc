@@ -86,8 +86,14 @@ rustcdc uses **cooperative flow control**: the internal event buffer grows until
 ### Backpressure is not a failure — handle it accordingly
 
 ```rust
+use rustcdc::{CdcRuntime, ErrorKind};
+
+# async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
 match runtime.poll_event_batch().await {
-    Ok(batch) => { /* process, then commit_ack */ }
+    Ok(batch) => {
+        // …process, then acknowledge…
+        runtime.commit_ack(batch.ack_mode()).await?;
+    }
     Err(error) if error.kind() == ErrorKind::Backpressure => {
         // Normal flow control. Acknowledge the outstanding batch, then retry the
         // same call — it will succeed. Do NOT treat this as fatal.
@@ -95,6 +101,8 @@ match runtime.poll_event_batch().await {
     Err(error) if error.is_recoverable() => { /* transient source issue: retry with backoff */ }
     Err(error) => return Err(error), // genuinely terminal
 }
+# Ok(())
+# }
 ```
 
 > **Match on `ErrorKind`, not on message text.** Backpressure has its own kind,
@@ -169,7 +177,8 @@ Wire it to any HTTP server of your choice.
 
 **Minimal axum example** (add `axum = "0.7"` and `tokio` to your Cargo.toml):
 
-```rust
+```rust,ignore
+// `ignore`: axum is not a dependency of this crate, so this block cannot be compiled here.
 use std::sync::Arc;
 use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use rustcdc::{CdcRuntime, RuntimeConfig, RuntimeSourceConfig};
@@ -185,7 +194,7 @@ async fn health(State(rt): State<SharedRuntime>) -> impl IntoResponse {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 [("content-type", "application/json")],
-                format!(r#"{{"error":"{error}"}}"),
+                format!(r#"{{"error":"{error}"}}"#),
             );
         }
     };
@@ -244,6 +253,19 @@ The `/health` endpoint returns a JSON object such as:
     "buffer_depth": 0,
     "in_flight_events": 0,
     "snapshot_active": false,
+    "incremental_snapshot": {
+        "snapshot_id": "incremental-1716399000000",
+        "paused": false,
+        "tables": [
+            {
+                "table": "public.orders",
+                "pk_cursor": ["918433"],
+                "is_complete": false,
+                "chunks_emitted": 184,
+                "rows_emitted": 918433
+            }
+        ]
+    },
     "stream_active": true,
     "handoff_complete": true,
     "total_events_polled": 42817,

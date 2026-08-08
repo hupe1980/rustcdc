@@ -305,14 +305,14 @@ pub(super) fn mysql_value_to_json_typed(
                 }
                 serde_json::Value::String(hex)
             }),
-        MysqlValue::Int(value) => serde_json::Value::Number((*value).into()),
-        MysqlValue::UInt(value) => serde_json::Value::Number((*value).into()),
-        MysqlValue::Float(value) => serde_json::Number::from_f64(f64::from(*value))
-            .map(serde_json::Value::Number)
-            .unwrap_or_else(|| serde_json::Value::String(value.to_string())),
-        MysqlValue::Double(value) => serde_json::Number::from_f64(*value)
-            .map(serde_json::Value::Number)
-            .unwrap_or_else(|| serde_json::Value::String(value.to_string())),
+        // Numerics render as text like every other value. A JSON number is an IEEE-754
+        // double once it reaches most consumers, which rounds `BIGINT` past 2^53 and
+        // `DOUBLE` at the last digits — and it disagreed with the connectors whose values
+        // are text, so the same column changed JSON type depending on the capture path.
+        MysqlValue::Int(value) => serde_json::Value::String(value.to_string()),
+        MysqlValue::UInt(value) => serde_json::Value::String(value.to_string()),
+        MysqlValue::Float(value) => serde_json::Value::String(value.to_string()),
+        MysqlValue::Double(value) => serde_json::Value::String(value.to_string()),
         MysqlValue::Date(year, month, day, hour, minute, second, micros) => {
             serde_json::Value::String(format!(
                 "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{:06}",
@@ -423,7 +423,33 @@ mod temporal_tests {
     fn non_temporal_values_are_unaffected_by_the_column_type() {
         assert_eq!(
             mysql_value_to_json_typed(&MysqlValue::Int(-7), Some(ColumnType::MYSQL_TYPE_DATE)),
-            serde_json::json!(-7)
+            serde_json::json!("-7")
+        );
+    }
+
+    #[test]
+    fn every_value_is_rendered_as_text_so_no_precision_is_lost() {
+        // The envelope contract: one JSON type for every column, on every connector and
+        // every capture path. Numbers are the interesting case, because a JSON number is an
+        // IEEE-754 double once it reaches most consumers — `BIGINT` past 2^53 and the low
+        // digits of a `DOUBLE` do not survive it.
+        assert_eq!(
+            mysql_value_to_json(&MysqlValue::Int(i64::MAX)),
+            serde_json::json!("9223372036854775807"),
+        );
+        assert_eq!(
+            mysql_value_to_json(&MysqlValue::UInt(u64::MAX)),
+            serde_json::json!("18446744073709551615"),
+        );
+        assert_eq!(
+            mysql_value_to_json(&MysqlValue::Double(0.1 + 0.2)),
+            serde_json::json!("0.30000000000000004"),
+            "the exact double is preserved rather than re-rounded on the way out",
+        );
+        // NULL stays distinguishable from the string "NULL".
+        assert_eq!(
+            mysql_value_to_json(&MysqlValue::NULL),
+            serde_json::Value::Null,
         );
     }
 }

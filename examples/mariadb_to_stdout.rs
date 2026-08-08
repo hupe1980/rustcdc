@@ -1,18 +1,23 @@
 #![cfg_attr(not(feature = "mariadb"), allow(dead_code, unused_imports))]
 
-// Phase 1 embedding example:
+// Embedding example, runtime-driven variant:
 // - Config can be supplied via CLI flags or CDC_RS_* environment variables.
-// - Events are printed as JSON lines to stdout.
-// - Every delivered batch is acknowledged with an opaque runtime token.
-// - Ctrl+C triggers graceful shutdown and final commit.
+// - Events are printed as JSON lines to stdout by `StdoutSink`.
+// - The runtime owns the delivery loop via `run_to_completion`, so the
+//   poll → send → flush → acknowledge order is the library's problem, not this file's.
+// - Ctrl+C cancels the token, which returns from the loop and shuts down cleanly.
+//
+// `pg_to_stdout` shows the other shape: `poll_event_batch` + `commit_ack` driven by hand,
+// which is what you want when the write has to be coordinated with something the runtime
+// cannot see.
 
 #[cfg(feature = "mariadb")]
-use std::{env, io::Write, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 
 #[cfg(feature = "mariadb")]
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
-    MariaDbSourceConfig, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
+    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, sink::StdoutSink,
+    CdcRuntime, MariaDbSourceConfig, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
     StructuredLogger,
 };
 
@@ -46,34 +51,26 @@ async fn main() -> rustcdc::Result<()> {
         ),
     )?;
 
+    runtime.register_sink(StdoutSink::new());
     runtime.start().await?;
 
     let logger = StructuredLogger::new("mariadb");
     logger.stream_started("example");
 
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                let _ = runtime.stop().await?;
-                logger.source_disconnected();
-                break;
-            }
-            polled = runtime.poll_event_batch() => {
-                let batch = polled?;
-                if batch.is_empty() {
-                    continue;
-                }
-                let mode = batch.ack_mode();
-
-                for event in batch.events() {
-                    println!("{}", event.to_json()?);
-                    std::io::stdout().flush().map_err(rustcdc::Error::IoError)?;
-                }
-
-                runtime.commit_ack(mode).await?;
-            }
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let on_signal = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            on_signal.cancel();
         }
-    }
+    });
+
+    let delivered = runtime.run_to_completion(shutdown).await?;
+
+    // `stop()` closes the registered sink too, with `sink_close_timeout_ms` if configured.
+    let _ = runtime.stop().await?;
+    logger.source_disconnected();
+    eprintln!("delivered {delivered} events");
 
     Ok(())
 }

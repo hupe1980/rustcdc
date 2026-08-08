@@ -139,7 +139,7 @@ use rustcdc::AckMode;
 # async fn example(runtime: &mut CdcRuntime) -> Result<()> {
 let batch = runtime.poll_event_batch().await?;
 if let AckMode::Required(token) = batch.ack_mode() {
-  let (accepted, _retry_later) = token.split_at(10)?;
+  let accepted = token.accept_prefix(10)?;
   runtime.commit_ack(accepted).await?;
 }
 # Ok(())
@@ -196,9 +196,81 @@ commit and are picked up again after a restart, even though they are not in
 `with_incremental_snapshot`'s static list.
 
 Requires the runtime to have been built with `with_incremental_snapshot`; otherwise the call
-returns `NotImplemented` rather than reporting a backfill that never happens. Pause, resume and
-stop are **not** implemented — a snapshot runs to completion or is abandoned by clearing the
-checkpoint.
+returns `NotImplemented` rather than reporting a backfill that never happens.
+
+### Pause, resume, stop
+
+A backfill of a large table adds read load to the source. When that load lands during business
+hours the operator wants it paused until the evening, not cancelled — and certainly not at the
+cost of stopping capture.
+
+```rust
+# use rustcdc::CdcRuntime;
+# async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+let was_paused = runtime.pause_incremental_snapshot().await?;   // idempotent
+// …later…
+runtime.resume_incremental_snapshot().await?;
+
+// Or abandon it entirely; capture keeps running.
+let abandoned_tables = runtime.stop_incremental_snapshot().await?;
+# let _ = (was_paused, abandoned_tables);
+# Ok(())
+# }
+```
+
+| Operation | Effect on chunk reads | Effect on the live stream |
+|---|---|---|
+| `pause_incremental_snapshot` | Stops at the next chunk boundary | None — capture continues |
+| `resume_incremental_snapshot` | Continues from the chunk it stopped at | None |
+| `stop_incremental_snapshot` | Abandoned; cursors discarded | None — capture continues |
+
+Both pause and resume are idempotent and return the **previous** state, so a retried operator
+action is safe and a caller can still tell whether it changed anything.
+
+**Pause takes effect at a chunk boundary.** A chunk already read is merged and delivered
+first. Stopping mid-chunk would either throw away a read the source has already paid for, or
+strand a merged chunk whose cursor can never be promoted — and the cursor is what makes the
+snapshot resumable.
+
+**The paused flag is durable.** It rides in `IncrementalSnapshotState` alongside the chunk
+cursors, so it is written by the same atomic checkpoint record. Without that, a pause taken to
+protect a production primary would silently lift on the next deploy.
+
+**Stop is not durable in the same way.** The persisted state is cleared by the next checkpoint
+write, so a crash in that window resumes the snapshot. Forcing a synchronous checkpoint from a
+control path would let an operator action rewrite the stream position, which is a worse trade
+than a rare resume of something that can simply be stopped again.
+
+### Driving all of this from another task
+
+`request_incremental_snapshot`, `pause_*`, `resume_*` and `stop_*` all take `&mut self`, and an
+event loop holds `&mut CdcRuntime` for its whole lifetime. `CdcRuntime::control_handle()`
+returns a cloneable `RuntimeControl` that closes that gap:
+
+```rust
+# use rustcdc::{CdcRuntime, CancellationToken};
+# async fn example(mut runtime: CdcRuntime, shutdown: CancellationToken) -> rustcdc::Result<()> {
+let control = runtime.control_handle();
+
+tokio::spawn(async move {
+    // An admin endpoint, a signal handler, a scheduler.
+    let _ = control.pause_incremental_snapshot().await;
+});
+
+runtime.run_to_completion(shutdown).await?;
+# Ok(())
+# }
+```
+
+Commands are applied **between** polls, never raced against one — `poll_event_batch` is not
+cancel-safe, so servicing them as a `select!` arm would discard events. Latency is therefore
+bounded by how often you poll, and a loop that has stopped turning leaves a command waiting;
+wrap the call in `tokio::time::timeout` if the caller has an SLO. Dropping the runtime
+resolves outstanding commands with an error rather than hanging.
+
+`RuntimeControl::incremental_snapshot_state()` is different: it is a plain non-blocking `fn`
+reading a snapshot the runtime republishes every poll, so a progress readout can never be
+starved by a busy pipeline or hang behind a stalled one. It is stale by at most one poll.
 
 ## Transaction boundaries
 
@@ -1050,7 +1122,7 @@ let config = RuntimeConfig::new(...)
 | `rustcdc_runtime_health` | Gauge | Derived health verdict, one series per `verdict` label. **`rustcdc_runtime_health{verdict="stalled"} == 1` is the alert rule** — `state` alone cannot distinguish healthy-idle from stalled. |
 | `rustcdc_runtime_checkpoint_age_ms` | Gauge | Age of last durable checkpoint |
 | `rustcdc_runtime_replication_lag_ms` | Gauge | Estimated source lag in milliseconds |
-| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. |
+| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. Sampled on a timer that does **not** depend on the pipeline being caught up — it used to refresh only from the idle-advance path, so it went stale exactly while the pipeline was behind, and never sampled at all when `slot_idle_advance_interval_ms = 0`. The cadence follows `slot_idle_advance_interval_ms`, or 15 s when idle advance is disabled. |
 | `rustcdc_runtime_source_capability` | Gauge | Connector capability flags, one series per `capability` label |
 
 ### OpenTelemetry Exported Metrics (`OTelMetricsCollector`)

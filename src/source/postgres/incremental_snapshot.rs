@@ -20,6 +20,7 @@ use crate::{
     },
 };
 
+use super::query::{query_all_columns, row_as_text_json};
 use super::{
     parse_pg_lsn, parse_table_reference, qualified_table_name, query_current_wal_lsn,
     query_primary_key_columns_and_types, quote_pg_identifier,
@@ -84,6 +85,20 @@ fn decode_pk_cursor(
         .collect()
 }
 
+/// Render a table's row filter as a SQL fragment, or nothing when it has none.
+///
+/// `lead_in` is `" WHERE "` when the filter is the only predicate and `" AND "` when it
+/// joins the keyset seek. Parenthesised so an `OR` inside the operator's expression cannot
+/// escape and widen the seek — `a > b AND x = 1 OR y = 2` would otherwise return rows
+/// before the cursor and re-read them on every chunk.
+fn condition_clause(table: &SnapshotTable, lead_in: &str) -> String {
+    table
+        .condition
+        .as_deref()
+        .map(|condition| format!("{lead_in}({condition})"))
+        .unwrap_or_default()
+}
+
 /// PostgreSQL half of the incremental snapshot.
 pub struct PostgresSnapshotBackend {
     /// Regular (non-replication) connection used for chunk SELECTs and LSN checks.
@@ -100,13 +115,18 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
         let (pk_columns, pk_types) =
             query_primary_key_columns_and_types(&self.query_client, &schema, &name).await?;
         let qualified = qualified_table_name(&schema, &name);
+        // Needed for the row projection: the payload is built column by column so its text
+        // matches what pgoutput produces. See `query::row_as_text_json`.
+        let columns = query_all_columns(&self.query_client, &schema, &name).await?;
         Ok(SnapshotTable {
+            // Filled in by the driver from `IncrementalSnapshotConfig::table_conditions`.
+            condition: None,
             schema,
             name,
             qualified,
             pk_columns,
             pk_types,
-            columns: Vec::new(),
+            columns,
         })
     }
 
@@ -148,12 +168,14 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT ARRAY[{key_value_expr}], row_to_json(t)::text \
+                "SELECT ARRAY[{key_value_expr}], {row_json} \
                  FROM {table_ref} t \
-                 WHERE ({order_expr}) > ({predicate_expr}) \
+                 WHERE ({order_expr}) > ({predicate_expr}){filter} \
                  ORDER BY {order_expr} \
                  LIMIT ${}",
-                table.pk_columns.len() + 1
+                table.pk_columns.len() + 1,
+                filter = condition_clause(table, " AND "),
+                row_json = row_as_text_json(&table.columns),
             );
             let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 Vec::with_capacity(cursor.len() + 1);
@@ -164,10 +186,12 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
             self.query_client.query(&query, &params).await
         } else {
             let query = format!(
-                "SELECT ARRAY[{key_value_expr}], row_to_json(t)::text \
-                 FROM {table_ref} t \
+                "SELECT ARRAY[{key_value_expr}], {row_json} \
+                 FROM {table_ref} t{filter} \
                  ORDER BY {order_expr} \
-                 LIMIT $1"
+                 LIMIT $1",
+                filter = condition_clause(table, " WHERE "),
+                row_json = row_as_text_json(&table.columns),
             );
             self.query_client.query(&query, &[&limit]).await
         }

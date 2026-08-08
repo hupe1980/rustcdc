@@ -53,7 +53,7 @@ establish them first using the deployment guidance in [Deployment](@/docs/deploy
 ### Symptom: "connection refused" or timeout on startup
 
 **Error Examples:**
-```
+```text
 ERROR source error: failed to connect to postgres: connection refused
 ERROR source error: failed to connect to mysql: timeout
 ERROR source error: connection to sqlserver closed unexpectedly
@@ -130,7 +130,7 @@ ERROR source error: connection to sqlserver closed unexpectedly
 ### Symptom: "TLS handshake failed" or certificate validation error
 
 **Error Examples:**
-```
+```text
 ERROR source error: tls error: certificate verify failed
 ERROR source error: tls error: x509: certificate signed by unknown authority
 ```
@@ -171,7 +171,7 @@ mysql -h <host> --ssl-mode=REQUIRED --ssl-ca=/path/to/ca.pem -u <user> -p<pass>
 ### Symptom: "checkpoint error" or "replication slot diverged"
 
 **Error Examples:**
-```
+```text
 ERROR: source error: postgres checkpoint/slot divergence for slot '...'
 ERROR checkpoint error: checkpoint file does not exist
 ERROR checkpoint error: failed to read checkpoint: invalid JSON
@@ -226,7 +226,7 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
 ### Symptom: PostgreSQL replication fails to start
 
 **Error Examples:**
-```
+```text
 ERROR postgres did not enter CopyBoth mode for slot 'rustcdc_slot'; it replied with tag 'E'
 ERROR postgres replication connection rejected: FATAL: replication slot "rustcdc_slot" is
       active for PID 4711 (SQLSTATE 55006)
@@ -255,7 +255,7 @@ server takes a moment to reap the walsender, so retry briefly on "is active".
 ### Symptom: "the stream position moved backwards"
 
 **Error Example:**
-```
+```text
 ERROR checkpoint error: refusing checkpoint write for source 'mysql': the stream position
 moved backwards (mysql binlog position 42:88371 → 42:0).
 ```
@@ -284,7 +284,7 @@ order while each change keeps its own WAL position. See
 ### Symptom: SQL Server reports CDC changes "no longer retained"
 
 **Error Example:**
-```
+```text
 ERROR sqlserver CDC change data for capture instance 'dbo_shipments' is no longer retained:
 the requested window [...] is outside the range currently available in the change tables
 ```
@@ -320,7 +320,7 @@ EXEC sys.sp_cdc_help_jobs;   -- inspect the 'cleanup' job's retention (minutes)
 ### Symptom: "buffer full" error or frequent checkpoint pauses
 
 **Error Examples:**
-```
+```text
 ERROR checkpoint error: commit barrier buffer is full
 WARNING checkpoint latency exceeding 1s
 ```
@@ -391,10 +391,16 @@ window, p99 = 318 ms = one poll cycle).
 **Tuning for lower latency:**
 
 ```rust
-SqlServerSourceConfig {
-    stream_poll_interval_ms: 500,  // default 5000; 500–1000 ms for latency-sensitive
+# #[cfg(feature = "sqlserver")]
+# fn example() {
+use rustcdc::SqlServerSourceConfig;
+
+let config = SqlServerSourceConfig {
+    stream_poll_interval_ms: 500, // default 5000; 500–1000 ms for latency-sensitive
     ..SqlServerSourceConfig::default()
-}
+};
+# let _ = config;
+# }
 ```
 
 Lower values increase SQL Server query load.  500 ms is the practical lower bound
@@ -405,7 +411,7 @@ for most production SQL Server deployments.
 ### Symptom: Low event throughput or high latency
 
 **Error Examples:**
-```
+```text
 WARNING events processed per second dropping below baseline (was 10K/sec, now 5K/sec)
 WARNING snapshot progress stalled (no new chunks for 30s)
 ```
@@ -485,7 +491,7 @@ WARNING snapshot progress stalled (no new chunks for 30s)
 ### Symptom: Snapshot taking too long
 
 **Error Examples:**
-```
+```text
 WARNING snapshot progress: 5% complete (10 hours in, estimated 200 hours remaining)
 ```
 
@@ -537,7 +543,7 @@ WARNING snapshot progress: 5% complete (10 hours in, estimated 200 hours remaini
 ### Symptom: Missing events or duplicate events in output
 
 **Error Examples:**
-```
+```text
 WARNING event_id=12345 received duplicate after checkpoint restart
 ERROR detected missing event (event_id=12346 skipped)
 ```
@@ -590,7 +596,7 @@ ERROR detected missing event (event_id=12346 skipped)
 ### Symptom: Events with incorrect data or wrong schema
 
 **Error Examples:**
-```
+```text
 ERROR validation error: field 'before' is None but operation is Update
 ERROR schema error: table schema not found for public.users
 ```
@@ -640,7 +646,7 @@ ERROR schema error: table schema not found for public.users
 ### Symptom: Transform errors or events filtered unexpectedly
 
 **Error Examples:**
-```
+```text
 ERROR transform error: route: no matching output for table public.unknown_table
 ERROR transform error: mask: regex compilation failed for pattern '(?P<invalid>)'
 WARNING events filtered by transform (count=50)

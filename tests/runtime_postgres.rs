@@ -141,7 +141,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
     let AckMode::Required(token) = first_batch.ack_mode() else {
         panic!("non-empty batch should include ack token");
     };
-    let (accepted, _remaining) = token.split_at(accepted_count)?;
+    let accepted = token.accept_prefix(accepted_count)?;
     runtime.commit_ack(accepted).await?;
 
     let reader = FileCheckpoint::read_only(checkpoint_dir.path());

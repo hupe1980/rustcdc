@@ -107,6 +107,30 @@ pub enum ErrorKind {
     Backpressure,
 }
 
+impl ErrorKind {
+    /// Rank for "which of these failures should decide what the caller does".
+    ///
+    /// Higher wins. The order is `Transient` < `Backpressure` < `Configuration` <
+    /// `Terminal`, which is the order of how much a caller has to change before retrying:
+    /// nothing, acknowledge what you have, fix the config, stop.
+    ///
+    /// Used when several operations fail at once — a fan-out sink flushing every branch —
+    /// so the aggregate reports the most severe kind rather than flattening everything to
+    /// the worst possible one. Exposed because an embedder aggregating rustcdc errors
+    /// alongside its own needs the same rule.
+    ///
+    /// This is a method rather than an `Ord` impl so the ranking cannot drift with the
+    /// enum's declaration order.
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::Transient => 0,
+            Self::Backpressure => 1,
+            Self::Configuration => 2,
+            Self::Terminal => 3,
+        }
+    }
+}
+
 /// Dedicated error type for event fingerprint failures.
 ///
 /// Returned by [`fingerprint_event_stable`] and [`fingerprint_event_transient`]
@@ -210,6 +234,25 @@ pub enum Error {
     /// Normal flow control, not a failure — see [`ErrorKind::Backpressure`].
     #[error("backpressure: {0}")]
     Backpressure(String),
+    /// Several operations failed together, reported under the most severe kind observed.
+    ///
+    /// Produced where one call drives many fallible things — flushing or closing every
+    /// branch of a fan-out sink. Collapsing those into a single fixed variant destroys the
+    /// classification the caller retries on: a broker connection reset surfacing from
+    /// `flush()` is [`ErrorKind::Transient`] and should be retried, and reporting it as
+    /// `StateError` made it [`ErrorKind::Terminal`] and halted the pipeline. Worse, it made
+    /// the outcome depend on *where* the failure surfaced — the same reset was retried from
+    /// `send()` and fatal from `flush()`, decided by batch boundaries rather than by
+    /// anything an operator controls.
+    ///
+    /// [`Error::kind`] returns `kind`, so the usual `match error.kind()` keeps working.
+    #[error("{detail}")]
+    Aggregate {
+        /// The most severe [`ErrorKind`] among the failures, by [`ErrorKind::severity`].
+        kind: ErrorKind,
+        /// Rendered per-operation failures, in the order they were attempted.
+        detail: String,
+    },
     /// Invalid runtime state or illegal transition.
     #[error("state error: {0}")]
     StateError(String),
@@ -383,6 +426,7 @@ impl Error {
                 }
             }
             Self::Backpressure(_) => ErrorKind::Backpressure,
+            Self::Aggregate { kind, .. } => *kind,
             Self::ConfigError(_) | Self::NotImplemented(_) => ErrorKind::Configuration,
             Self::Unrecoverable(_)
             | Self::CheckpointError(_)
@@ -394,6 +438,30 @@ impl Error {
             | Self::ValidationError(_)
             | Self::PostCommitConfirmFailed { .. } => ErrorKind::Terminal,
         }
+    }
+
+    /// Combine several failures into one, classified by the most severe kind present.
+    ///
+    /// Returns `Ok(())` when `failures` is empty, so a caller can collect unconditionally
+    /// and finish with `Error::aggregate(label, failures)`.
+    ///
+    /// Each entry is rendered as `"{label}: {error}"`, in the order given.
+    pub fn aggregate(failures: Vec<(String, Error)>) -> Result<()> {
+        let Some(kind) = failures
+            .iter()
+            .map(|(_, error)| error.kind())
+            .max_by_key(|kind| kind.severity())
+        else {
+            return Ok(());
+        };
+
+        let detail = failures
+            .iter()
+            .map(|(label, error)| format!("{label}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        Err(Self::Aggregate { kind, detail })
     }
 
     /// Returns whether the error represents a transient source condition worth retrying.
@@ -448,6 +516,49 @@ mod tests {
         let display = err.to_string();
         assert!(display.contains("checkpoint is safe"));
         assert!(display.contains("replay is safe"));
+    }
+
+    #[test]
+    fn an_aggregate_reports_the_most_severe_kind_not_the_last_one() {
+        // The failure this fixes: a fan-out flush collapsed every branch's error into
+        // `StateError`, so a broker reset — `Transient`, and retryable when it surfaces
+        // from `send` — came back `Terminal` and halted the pipeline. Which one an
+        // operator got depended on batch boundaries.
+        let error = Error::aggregate(vec![
+            ("route 'a'".into(), Error::SourceError("reset".into())),
+            ("route 'b'".into(), Error::TimeoutError("slow".into())),
+        ])
+        .expect_err("failures aggregate into an error");
+        assert_eq!(
+            error.kind(),
+            ErrorKind::Transient,
+            "two transient failures must stay retryable"
+        );
+        assert!(error.to_string().contains("route 'a': "), "{error}");
+        assert!(error.to_string().contains("route 'b': "), "{error}");
+
+        let escalated = Error::aggregate(vec![
+            ("route 'a'".into(), Error::SourceError("reset".into())),
+            ("route 'b'".into(), Error::StateError("closed".into())),
+        ])
+        .expect_err("failures aggregate into an error");
+        assert_eq!(
+            escalated.kind(),
+            ErrorKind::Terminal,
+            "one genuinely terminal branch must dominate"
+        );
+    }
+
+    #[test]
+    fn aggregating_nothing_is_success() {
+        assert!(Error::aggregate(Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn severity_orders_kinds_by_how_much_the_caller_must_change() {
+        assert!(ErrorKind::Transient.severity() < ErrorKind::Backpressure.severity());
+        assert!(ErrorKind::Backpressure.severity() < ErrorKind::Configuration.severity());
+        assert!(ErrorKind::Configuration.severity() < ErrorKind::Terminal.severity());
     }
 
     #[test]
