@@ -381,9 +381,6 @@ zola --root site serve
 | [Reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/) | Replay, fault injection, conformance |
 | [Library parity matrix](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) | Scope-aware comparison against alternatives |
 
-The most recent correctness audit, its findings and the open conditions on a 1.0 release are in
-[FINDINGS.md](FINDINGS.md).
-
 ## MSRV
 
 Rust 1.94 or newer, matching the `rust-version` in `Cargo.toml`. Raising it is a

@@ -16,8 +16,11 @@ them against a live database.
 It is also a **breaking** release for anyone reading column values: they are now text on every
 connector and every capture path. See the entry below for why, and for the one-line migration.
 
-The audit that produced this release, its remaining conditions, and a library-first competitor
-comparison are in [FINDINGS.md](FINDINGS.md).
+Four conditions remain open on a 1.0 release, none of them a correctness gate: there is no
+end-to-end throughput measurement (stated as an evidence gap rather than inferred from the
+microbenchmarks); the `sqlserver` feature's advisory set needs re-checking on each `tiberius`
+release; `stop_incremental_snapshot` is durable only from the next checkpoint write; and
+`core/runtime.rs` remains large enough to be worth splitting further.
 
 Some of these came from the `rustcdc-server` maintainers reporting against 0.10.0. Every
 report was checked against the source before acting on it; one had a diagnosis that was right
