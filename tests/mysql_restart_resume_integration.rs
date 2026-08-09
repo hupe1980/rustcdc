@@ -19,7 +19,12 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     for _ in 0..40 {
         if let Ok(pool) = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(1)
@@ -37,6 +42,7 @@ async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
 
 /// Returns how many events a second session receives after a clean shutdown with no DML.
 async fn replayed_after_clean_restart(image: &str, tag: &str) -> rustcdc::Result<usize> {
+    install_rustls_provider();
     let container = GenericImage::new(image, tag)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -146,6 +152,7 @@ async fn replayed_after_clean_restart(image: &str, tag: &str) -> rustcdc::Result
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_restart_delivers_nothing_new() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql restart resume test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -161,6 +168,7 @@ async fn mysql_restart_delivers_nothing_new() -> rustcdc::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mariadb_restart_delivers_nothing_new() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mariadb restart resume test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());

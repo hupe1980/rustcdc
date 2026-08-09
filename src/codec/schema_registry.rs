@@ -974,13 +974,27 @@ impl EventEncoder for ConfluentAvroEncoder {
 
     /// Encode the primary key as Confluent-framed Avro bytes (key channel).
     ///
-    /// Always returns `Some(bytes)` — a framed `EventKey` record.  Keyless
-    /// events (TRUNCATE, SCHEMA_CHANGE) produce `EventKey { key: null }`,
-    /// matching Debezium\'s behaviour for tables without a primary key.
-    fn encode_key(&self, event: &Event) -> Option<Vec<u8>> {
-        let key_json = event
-            .primary_key_values()
-            .and_then(|v| serde_json::to_string(&v).ok());
+    /// Always returns `Ok(Some(bytes))` — a framed `EventKey` record. Keyless events
+    /// (TRUNCATE, SCHEMA_CHANGE, tables with no primary key) produce
+    /// `EventKey { key: null }`, matching Debezium's behaviour, rather than no key at all:
+    /// the framing is uniform so a consumer decodes every record the same way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SerializationError`] if the key cannot be rendered.
+    ///
+    /// Both failure paths used to be swallowed with `.ok()`, which turned an encoding failure
+    /// into `None` — indistinguishable from "this event has no key" — and a keyed sink then
+    /// published the record **unkeyed**: round-robin partitioning, ordering for that row lost,
+    /// log compaction no longer collapsing it, and nothing to see. Neither path is reachable
+    /// today (the key schema is fixed and single-field, and `serde_json` cannot fail on a
+    /// `Map<String, Value>`), which is exactly why swallowing them was cheap to do and would
+    /// have stayed invisible if it ever became reachable.
+    fn encode_key(&self, event: &Event) -> Result<Option<Vec<u8>>> {
+        let key_json = match event.primary_key_values() {
+            Some(value) => Some(serde_json::to_string(&value)?),
+            None => None,
+        };
 
         let avro_value = apache_avro::types::Value::Record(vec![(
             "key".to_string(),
@@ -995,9 +1009,15 @@ impl EventEncoder for ConfluentAvroEncoder {
             },
         )]);
 
-        apache_avro::to_avro_datum(&self.key_schema, avro_value)
-            .ok()
-            .map(|avro_bytes| encode_wire_format(self.key_schema_id, &avro_bytes).to_vec())
+        let avro_bytes =
+            apache_avro::to_avro_datum(&self.key_schema, avro_value).map_err(|error| {
+                Error::SerializationError(format!(
+                    "confluent avro key encode failed against KEY_AVRO_SCHEMA: {error}"
+                ))
+            })?;
+        Ok(Some(
+            encode_wire_format(self.key_schema_id, &avro_bytes).to_vec(),
+        ))
     }
 }
 

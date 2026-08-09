@@ -886,7 +886,8 @@ impl CdcRuntime {
 
         #[cfg(feature = "mysql")]
         if mysql_family {
-            let (binlog_file, binlog_pos, gtid) = parse_mysql_stream_offset(&event.source.offset)?;
+            let (binlog_file, binlog_pos, gtid) =
+                parse_mysql_stream_offset(&self.resume_offset_for(event))?;
             // Carry the flavor so the checkpoint lands in the right file — a MariaDB
             // stream writing checkpoint_mysql.json finds nothing on restart and
             // silently resumes from the current binlog position.
@@ -908,7 +909,7 @@ impl CdcRuntime {
 
         #[cfg(feature = "sqlserver")]
         if matches!(&self.config.source, RuntimeSourceConfig::SqlServer(_)) {
-            let offset = crate::checkpoint::SqlServerOffset::new(event.source.offset.clone())
+            let offset = crate::checkpoint::SqlServerOffset::new(self.resume_offset_for(event))
                 .with_incremental_snapshot(incremental_snapshot);
             return Ok(GenericOffset::new(
                 "sqlserver",
@@ -919,17 +920,25 @@ impl CdcRuntime {
         }
 
         let _ = incremental_snapshot;
-        // A source this runtime does not know: persist `source.offset` **verbatim**, which
-        // is what the `Source` docs promise and what `Offset::encode` requires ("whatever
-        // `encode` produces has to be decodable back into a resumable position by the
-        // connector that wrote it").
+        // A source this runtime does not know: persist the handle's resume position
+        // **verbatim**, which is what the `Source` docs promise and what `Offset::encode`
+        // requires ("whatever `encode` produces has to be decodable back into a resumable
+        // position by the connector that wrote it").
         //
-        // This used to JSON-encode the string, so a connector whose offset was `42` got
-        // `"42"` back on restart — quotes and all. Anything parsing its own offset format
-        // either failed or, worse, parsed the quoted form into a different position.
+        // Two things this must not do. It used to JSON-encode the string, so a connector
+        // whose offset was `42` got `"42"` back on restart — quotes and all. And it used to
+        // read `event.source.offset` directly, which silently ignored
+        // `StreamHandle::resume_offset_for` on every source but PostgreSQL, even though the
+        // trait documents it as what the runtime checkpoints. A custom connector whose log
+        // filters at transaction granularity — the situation that override exists for — got
+        // the guaranteed duplicate-per-restart the PostgreSQL connector was fixed for, with
+        // its own correct implementation right there being discarded.
+        //
+        // The default returns `None` and falls back to the event's own offset, so a
+        // connector that does not override it is unaffected.
         Ok(GenericOffset::new(
             source_type.to_string(),
-            event.source.offset.clone().into_bytes(),
+            self.resume_offset_for(event).into_bytes(),
         ))
     }
 

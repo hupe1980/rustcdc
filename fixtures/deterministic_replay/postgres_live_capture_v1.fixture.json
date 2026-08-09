@@ -6,8 +6,13 @@
     "source_version": "postgres>=12,<17",
     "fixture_version": 1,
     "description": "Live-capture representative PostgreSQL transaction with begin/insert/update/delete/commit.",
-    "tags": ["live_capture", "postgres", "transaction", "dml"],
-    "expected_event_count": 5,
+    "tags": [
+      "live_capture",
+      "postgres",
+      "transaction",
+      "dml"
+    ],
+    "message_count": 5,
     "captured_at": "2026-05-16T00:00:00Z"
   },
   "messages": [
@@ -15,31 +20,41 @@
       "seq": 0,
       "message_type": "Begin",
       "payload": "{}",
-      "tags": ["transactional"]
+      "tags": [
+        "transactional"
+      ]
     },
     {
       "seq": 1,
       "message_type": "Insert",
       "payload": "{\"schema\":\"public\",\"table\":\"users\",\"after\":{\"id\":1,\"name\":\"alice\"},\"primary_key\":[\"id\"]}",
-      "tags": ["dml"]
+      "tags": [
+        "dml"
+      ]
     },
     {
       "seq": 2,
       "message_type": "Update",
       "payload": "{\"schema\":\"public\",\"table\":\"users\",\"before\":{\"id\":1,\"name\":\"alice\"},\"after\":{\"id\":1,\"name\":\"alice_2\"},\"primary_key\":[\"id\"]}",
-      "tags": ["dml"]
+      "tags": [
+        "dml"
+      ]
     },
     {
       "seq": 3,
       "message_type": "Delete",
       "payload": "{\"schema\":\"public\",\"table\":\"users\",\"before\":{\"id\":1,\"name\":\"alice_2\"},\"after\":null,\"primary_key\":[\"id\"]}",
-      "tags": ["dml"]
+      "tags": [
+        "dml"
+      ]
     },
     {
       "seq": 4,
       "message_type": "Commit",
       "payload": "{}",
-      "tags": ["transactional"]
+      "tags": [
+        "transactional"
+      ]
     }
   ]
 }

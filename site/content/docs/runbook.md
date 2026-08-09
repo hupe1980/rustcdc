@@ -555,6 +555,36 @@ All connector events emitted by `StructuredLogger` use the `tracing` framework a
 
 ## Metric Alerting and Monitoring
 
+### Two surfaces, one set of names
+
+Metrics reach you two ways, and the names below work for both:
+
+- the **text exposition** from `runtime.admin_snapshot()` / the Prometheus endpoint — always
+  available, no feature flag;
+- **OpenTelemetry**, under the `metrics` feature, exported through a collector.
+
+Every OTel instrument is named so the standard OTel → Prometheus translation (dots to underscores,
+`_total` appended to counters) produces **the same series name** as the text exposition. So a
+threshold below applies whichever path you scrape.
+
+That was not true before 0.12.0: OTel emitted `rustcdc.replication_lag_ms` and
+`rustcdc.buffer_size` where the exposition emitted `rustcdc_runtime_replication_lag_ms` and
+`rustcdc_runtime_buffer_depth`, and only the latter were documented — so every threshold on this
+page silently matched nothing for anyone on the OTel path. If you built alerts against the old OTel
+names, they need updating; if you built them from this page, they now work on both.
+
+**The two surfaces still carry different quantities**, which is a separate matter from naming.
+Only the text exposition has `rustcdc_runtime_health`, `_liveness`, `_readiness`, the idempotency
+counters and `_events_skipped_total`. Only OTel has replication lag in events, the checkpoint
+offset, snapshot progress and the event-processing and checkpoint-commit duration histograms. For
+the alerts on this page, scrape the text exposition; add OTel when you want the latency
+distributions.
+
+`rustcdc.runtime.events_filtered` is an embedder-facing hook rather than a pipeline metric — the
+runtime never feeds it, so it reads zero unless your code calls `record_events_filtered`. Do not
+alert on it expecting the runtime's own filtering, which is `_events_skipped_total` and
+`_events_deduplicated_total` in the text exposition.
+
 ### Recommended Alert Thresholds
 
 **Critical (Page On-Call):**
@@ -979,8 +1009,15 @@ look: check `admin_snapshot().incremental_snapshot`, whose `paused` flag and per
 non-blocking and cannot hang behind a stalled pipeline.
 
 To abandon the backfill entirely, `stop_incremental_snapshot()` discards the cursors and
-returns how many tables still had work. Capture continues. Note that stop becomes durable only
-with the next checkpoint write, so a crash in that window resumes the snapshot — stop it again.
+returns how many tables still had work. Capture continues, and the stop **survives a restart** —
+including for tables named in the static config, which is the case that used to silently restart
+the whole backfill on the next deploy. Re-request the tables with
+`request_incremental_snapshot()` to start over.
+
+The stop is recorded as an explicit flag in the snapshot state and becomes durable with the next
+checkpoint write, so a crash in that narrow window resumes the snapshot — stop it again. A
+synchronous checkpoint is deliberately not forced here: it would let an operator action rewrite
+the stream position, which is the worse trade.
 
 ---
 

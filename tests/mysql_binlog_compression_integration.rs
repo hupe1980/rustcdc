@@ -32,7 +32,12 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -75,6 +80,7 @@ async fn drain(
     stream: &mut Box<dyn rustcdc::source::StreamHandle>,
     want: usize,
 ) -> rustcdc::Result<Vec<rustcdc::Event>> {
+    install_rustls_provider();
     let mut collected = Vec::new();
     let mut quiet = 0;
     for _ in 0..60 {
@@ -98,6 +104,7 @@ async fn drain(
 
 #[tokio::test]
 async fn compressed_transactions_keep_a_resumable_binlog_position() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping mysql binlog-compression integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"

@@ -19,7 +19,8 @@ pub use incremental_snapshot::{
     IncrementalSnapshotTableState,
 };
 pub use incremental_snapshot::{
-    ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable,
+    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver,
+    SnapshotTable,
 };
 pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TableProgress};
 pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
@@ -40,15 +41,101 @@ pub enum DatabaseAuthMode {
     AwsIamToken,
 }
 
+/// One on-demand incremental-snapshot request: which tables, and which rows of them.
+///
+/// # Why the filter belongs to the request
+///
+/// [`IncrementalSnapshotConfig::table_conditions`] scopes a snapshot the *deployment*
+/// declares. An on-demand backfill is not that shape: "backfill tenant 42's orders" is a
+/// one-off, and expressing it through static configuration means editing a config file and
+/// restarting the process to run something that was supposed to be a signal. Debezium's
+/// `execute-snapshot` carries `data-collections` and `additional-conditions` together for the
+/// same reason.
+///
+/// Conditions set here **override** the configured ones for the same table; a table with no
+/// override falls back to its configured condition, so static configuration keeps working.
+///
+/// # This is raw SQL and it is trusted input
+///
+/// Same trust level as [`IncrementalSnapshotConfig::table_conditions`] — the expression is
+/// interpolated into the chunk `SELECT`, because a filter restricted to bound parameters
+/// could not express the predicates a filter exists for. **Never build one from untrusted
+/// input**, and do not treat it as a tenancy boundary.
+///
+/// ```
+/// use rustcdc::source::SnapshotRequest;
+///
+/// let request = SnapshotRequest::new(["public.orders", "public.order_items"])
+///     .with_condition("public.orders", "tenant_id = 42")
+///     .with_condition("public.order_items", "tenant_id = 42");
+/// assert_eq!(request.tables.len(), 2);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SnapshotRequest {
+    /// Tables to snapshot, in `"schema.table"` form. Processed in order.
+    pub tables: Vec<String>,
+    /// Per-table row filter for **this request**, keyed the same way as
+    /// [`IncrementalSnapshotConfig::table_conditions`], which it overrides.
+    pub conditions: ahash::AHashMap<String, String>,
+}
+
+impl SnapshotRequest {
+    /// A request for `tables`, with no row filter.
+    pub fn new<I, S>(tables: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            tables: tables.into_iter().map(Into::into).collect(),
+            conditions: ahash::AHashMap::new(),
+        }
+    }
+
+    /// Restrict `table` to rows matching `condition` for this request only.
+    ///
+    /// `table` is matched against both the reference as written and the catalog's canonical
+    /// `"schema.table"`, so `orders` and `public.orders` both work — a filter that silently
+    /// failed to match its table would snapshot the whole table, which is the load the filter
+    /// was written to avoid.
+    #[must_use]
+    pub fn with_condition(mut self, table: impl Into<String>, condition: impl Into<String>) -> Self {
+        self.conditions.insert(table.into(), condition.into());
+        self
+    }
+}
+
+impl<S: Into<String>> From<Vec<S>> for SnapshotRequest {
+    fn from(tables: Vec<S>) -> Self {
+        Self::new(tables)
+    }
+}
+
 // ─── Table filtering ─────────────────────────────────────────────────────────
 
 /// Returns `true` if an event for `schema.table` should be forwarded to the caller.
 ///
-/// * When `include_list` is non-empty, only listed tables pass through.
-/// * When `include_list` is empty and `exclude_list` is non-empty, listed tables are dropped.
+/// * When `include_list` is non-empty, only matching tables pass through.
+/// * When `include_list` is empty and `exclude_list` is non-empty, matching tables are dropped.
 /// * When both lists are empty, all events pass through.
 ///
-/// Table names are matched case-insensitively against `"schema.table"` tokens.
+/// # Entries are case-insensitive glob patterns
+///
+/// An entry is matched against `"schema.table"` (or the bare table name when the source
+/// reports no schema) using the same glob semantics as
+/// [`table_matches`](crate::pipeline::table_matches): `*` and `?` inside a segment,
+/// `"schema.*"` for a whole schema, `"*.name"` for a name in any schema.
+///
+/// These lists used to match **exact strings only**, while the sink router matched globs
+/// and nothing documented the difference. `table_exclude_list = ["public.tmp_*"]`
+/// therefore excluded nothing, which looks identical to a set of tables that never
+/// changed — and on the include side an allowlist matching nothing looks identical to an
+/// idle database. One semantics now, in one implementation.
+///
+/// An **unqualified** entry such as `"orders"` matches that table in *every* schema; see
+/// [`crate::core::glob::table_matches`] for why, and
+/// [`warn_on_schema_agnostic_include_entries`] for the startup warning that says so.
 #[cfg_attr(
     not(any(feature = "postgres", feature = "mysql", feature = "sqlserver")),
     allow(dead_code)
@@ -64,9 +151,21 @@ pub(crate) fn table_is_allowed(
         return true;
     }
 
+    // Glob matching is case-sensitive, and every supported server treats at least some
+    // identifiers case-insensitively, so both sides are lowered once here.
+    let key = match schema {
+        Some(schema) if !schema.is_empty() => {
+            format!("{}.{}", schema.to_ascii_lowercase(), table.to_ascii_lowercase())
+        }
+        _ => table.to_ascii_lowercase(),
+    };
+
     let matches = |list: &[String]| {
-        list.iter()
-            .any(|entry| table_entry_matches(entry, schema, table))
+        list.iter().any(|entry| {
+            let pattern = entry.trim();
+            !pattern.is_empty()
+                && crate::core::glob::table_matches(&pattern.to_ascii_lowercase(), &key)
+        })
     };
 
     if !include_list.is_empty() {
@@ -75,25 +174,31 @@ pub(crate) fn table_is_allowed(
     !matches(exclude_list)
 }
 
+/// Log a warning for every allowlist entry that names no schema.
+///
+/// An unqualified entry is schema-agnostic, so `table_include_list = ["users"]` captures
+/// `public.users` *and* `tenant_private.users`. That is a widening of an allowlist, which
+/// is the direction that matters: the operator wrote the list to bound what leaves the
+/// database. Rejecting it outright would break MySQL, where tables are habitually named
+/// bare, so this states the consequence once at startup instead.
 #[cfg_attr(
     not(any(feature = "postgres", feature = "mysql", feature = "sqlserver")),
     allow(dead_code)
 )]
-fn table_entry_matches(entry: &str, schema: Option<&str>, table: &str) -> bool {
-    let token = entry.trim();
-    if token.is_empty() {
-        return false;
+pub(crate) fn warn_on_schema_agnostic_include_entries(connector: &str, include_list: &[String]) {
+    for entry in include_list {
+        let pattern = entry.trim();
+        if crate::core::glob::is_schema_agnostic(pattern) {
+            tracing::warn!(
+                target: "rustcdc::source",
+                connector,
+                entry = %pattern,
+                "table_include_list entry names no schema, so it matches this table in \
+                 every schema the connector can see — including ones the allowlist was \
+                 written to keep out. Qualify it as \"schema.{pattern}\" to bound it.",
+            );
+        }
     }
-
-    if let Some((entry_schema, entry_table)) = token.split_once('.') {
-        return schema
-            .map(|s| {
-                s.eq_ignore_ascii_case(entry_schema) && table.eq_ignore_ascii_case(entry_table)
-            })
-            .unwrap_or(false);
-    }
-
-    table.eq_ignore_ascii_case(token)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,7 +547,7 @@ pub trait StreamHandle: Send + Sync {
     /// The default implementation returns [`Error::NotImplemented`](crate::core::Error::NotImplemented): a handle that is not
     /// driving an incremental snapshot has nothing to add tables to, and silently accepting
     /// the request would report a backfill that never happens.
-    async fn request_snapshot_tables(&mut self, _tables: Vec<String>) -> Result<usize> {
+    async fn request_snapshot_tables(&mut self, _request: SnapshotRequest) -> Result<usize> {
         Err(crate::core::Error::NotImplemented(
             "this stream is not running an incremental snapshot, so tables cannot be added to \
              one. Configure RuntimeConfig::with_incremental_snapshot to enable on-demand \
@@ -913,5 +1018,74 @@ mod tests {
             &include,
             &exclude
         ));
+    }
+
+    /// These lists used to match exact strings only, so a pattern excluded nothing —
+    /// indistinguishable from a set of tables that never changed.
+    #[test]
+    fn table_filter_entries_are_glob_patterns() {
+        let none = Vec::new();
+
+        let exclude = vec!["public.tmp_*".to_string()];
+        assert!(!table_is_allowed(
+            Some("public"),
+            "tmp_import",
+            &none,
+            &exclude
+        ));
+        assert!(table_is_allowed(
+            Some("public"),
+            "orders",
+            &none,
+            &exclude
+        ));
+        assert!(
+            table_is_allowed(Some("staging"), "tmp_import", &none, &exclude),
+            "the pattern names a schema, so it must not reach another one"
+        );
+
+        let include = vec!["public.*".to_string()];
+        assert!(table_is_allowed(Some("public"), "orders", &include, &none));
+        assert!(!table_is_allowed(Some("staging"), "orders", &include, &none));
+
+        let include = vec!["*.audit_?".to_string()];
+        assert!(table_is_allowed(Some("any"), "audit_1", &include, &none));
+        assert!(!table_is_allowed(Some("any"), "audit_10", &include, &none));
+    }
+
+    /// The documented widening: an unqualified entry is schema-agnostic. `connect()`
+    /// warns about it on the include side, where it loosens an allowlist.
+    #[test]
+    fn an_unqualified_filter_entry_matches_every_schema() {
+        let none = Vec::new();
+        let include = vec!["users".to_string()];
+
+        assert!(table_is_allowed(Some("public"), "users", &include, &none));
+        assert!(table_is_allowed(
+            Some("tenant_private"),
+            "users",
+            &include,
+            &none
+        ));
+        assert!(table_is_allowed(None, "users", &include, &none));
+        assert!(!table_is_allowed(Some("public"), "orders", &include, &none));
+    }
+
+    /// A qualified entry must not match an event the source reports without a schema:
+    /// there is nothing to match the schema half against.
+    #[test]
+    fn a_qualified_filter_entry_does_not_match_a_schemaless_event() {
+        let none = Vec::new();
+        let include = vec!["public.users".to_string()];
+        assert!(!table_is_allowed(None, "users", &include, &none));
+        assert!(!table_is_allowed(Some(""), "users", &include, &none));
+    }
+
+    #[test]
+    fn a_blank_filter_entry_is_ignored_rather_than_matching_everything() {
+        let none = Vec::new();
+        let exclude = vec!["   ".to_string(), "public.tmp".to_string()];
+        assert!(table_is_allowed(Some("public"), "orders", &none, &exclude));
+        assert!(!table_is_allowed(Some("public"), "tmp", &none, &exclude));
     }
 }

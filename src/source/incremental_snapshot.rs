@@ -26,7 +26,10 @@
 
 mod driver;
 
-pub use driver::{ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable};
+pub use driver::{
+    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver,
+    SnapshotTable,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +59,50 @@ pub struct IncrementalSnapshotState {
     /// "not paused".
     #[serde(default)]
     pub paused: bool,
+    /// Whether the snapshot was **abandoned** by
+    /// [`CdcRuntime::stop_incremental_snapshot`](crate::CdcRuntime::stop_incremental_snapshot).
+    ///
+    /// This has to be recorded explicitly rather than inferred from an empty `tables`,
+    /// and getting that wrong made `stop` silently ineffective across a restart. A stop
+    /// clears the per-table entries, and the driver seeds one entry per **configured**
+    /// table on startup: a table absent from the persisted state looks like a table that
+    /// has not started, so every statically configured table restarted from row zero on
+    /// the next deploy — re-running the whole backfill an operator had just stopped,
+    /// typically to take load off a production primary.
+    ///
+    /// With the flag, absence and abandonment are distinguishable. A stopped snapshot
+    /// stays stopped until tables are re-requested through
+    /// [`CdcRuntime::request_incremental_snapshot`](crate::CdcRuntime::request_incremental_snapshot),
+    /// which clears it.
+    ///
+    /// `#[serde(default)]`, so a checkpoint written before this field existed loads as
+    /// "not stopped" — the previous behaviour, which is the right default for a state
+    /// written by a build that had no way to express a stop.
+    #[serde(default)]
+    pub stopped: bool,
+    /// How many times snapshot work has been (re)requested on this driver.
+    ///
+    /// Included in every snapshot `Read` event's synthetic
+    /// [`SourceMetadata::offset`](crate::core::SourceMetadata::offset), which is what makes a
+    /// **deliberate re-snapshot distinguishable from a replay**.
+    ///
+    /// Without it the two are identical. A snapshot read's offset identifies the row rather
+    /// than a log position, so re-reading an unchanged row produces a byte-identical event —
+    /// and the runtime's idempotency guard, which is on by default, correctly classified it as
+    /// a duplicate and dropped it. An operator who re-requested a table got `enqueued: 1` and
+    /// no rows: the guard whose job is to protect delivery silently discarded the delivery
+    /// that was asked for.
+    ///
+    /// Bumping it per request keeps both behaviours: a chunk re-read after a mid-snapshot
+    /// reconnect stays in the same generation and is still deduplicated, while a new request
+    /// starts a generation whose rows cannot collide with the previous one's.
+    ///
+    /// Persisted, so the offsets stay stable across a restart as their documentation promises.
+    ///
+    /// `#[serde(default)]`, so a checkpoint written before this field existed loads as
+    /// generation 0.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 /// Per-table progress within an [`IncrementalSnapshotState`].
@@ -76,6 +123,23 @@ pub struct IncrementalSnapshotTableState {
     pub chunks_emitted: u32,
     /// Number of rows emitted so far, for progress reporting.
     pub rows_emitted: u64,
+    /// The row filter actually in effect for this table, if any.
+    ///
+    /// Reported so the answer to "did my filter take effect?" is **observable rather than
+    /// inferable**. Without it, an operator looking at `orders: 3,000,000 rows emitted` has
+    /// no way to tell a filter that applied from one that was silently ignored — and one that
+    /// was silently ignored is exactly the defect this crate shipped for on-demand snapshots
+    /// before 0.12.0. A gauge or a status field built on this makes the same class of defect
+    /// visible the next time rather than discoverable only by volume.
+    ///
+    /// Reflects the merged result: a per-request condition from
+    /// [`SnapshotRequest`](crate::source::SnapshotRequest) where one was given, otherwise the
+    /// configured [`IncrementalSnapshotConfig::table_conditions`] entry, otherwise `None`.
+    ///
+    /// `#[serde(default)]`, so a checkpoint written before this field existed loads as "no
+    /// filter" — which is what it means for a state that could not record one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
 }
 
 impl IncrementalSnapshotState {
@@ -138,6 +202,8 @@ mod tests {
     fn state() -> IncrementalSnapshotState {
         IncrementalSnapshotState {
             paused: false,
+            stopped: false,
+            generation: 0,
             snapshot_id: "incremental-42".into(),
             tables: vec![
                 IncrementalSnapshotTableState {
@@ -146,6 +212,7 @@ mod tests {
                     is_complete: false,
                     chunks_emitted: 3,
                     rows_emitted: 1500,
+                    condition: None,
                 },
                 IncrementalSnapshotTableState {
                     table: "public.orders".into(),
@@ -153,6 +220,7 @@ mod tests {
                     is_complete: true,
                     chunks_emitted: 9,
                     rows_emitted: 40_000,
+                    condition: None,
                 },
             ],
         }

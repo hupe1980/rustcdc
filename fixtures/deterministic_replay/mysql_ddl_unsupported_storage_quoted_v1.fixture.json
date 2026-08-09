@@ -6,8 +6,15 @@
     "source_version": "mysql=8.0",
     "fixture_version": 1,
     "description": "MySQL DDL replay fixture for unsupported storage/option ALTER clauses with quoted values and escaped quotes.",
-    "tags": ["mysql", "ddl", "schema_change", "unsupported_alter", "storage", "quoted"],
-    "expected_event_count": 2,
+    "tags": [
+      "mysql",
+      "ddl",
+      "schema_change",
+      "unsupported_alter",
+      "storage",
+      "quoted"
+    ],
+    "message_count": 2,
     "captured_at": "2026-05-17T00:00:00Z"
   },
   "messages": [
@@ -15,13 +22,18 @@
       "seq": 0,
       "message_type": "QueryEvent",
       "payload": "{\"query\":\"alter table inventory.products comment='alpha, beta'' gamma', algorithm = inplace;\"}",
-      "tags": ["ddl", "schema_change"]
+      "tags": [
+        "ddl",
+        "schema_change"
+      ]
     },
     {
       "seq": 1,
       "message_type": "XidEvent",
       "payload": "{\"xid\":2103}",
-      "tags": ["transactional"]
+      "tags": [
+        "transactional"
+      ]
     }
   ]
 }

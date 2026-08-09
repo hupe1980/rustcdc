@@ -134,11 +134,12 @@ pub use crate::source::MysqlIncrementalSnapshotHandle;
 #[cfg(feature = "sqlserver")]
 pub use crate::source::SqlServerIncrementalSnapshotHandle;
 pub use crate::source::{
-    incremental_snapshot_state_from_offset, ChunkRow, ConnectorCapabilities, DatabaseAuthMode,
+    incremental_snapshot_state_from_offset, BracketPosition, ChunkRow, ConnectorCapabilities,
+    DatabaseAuthMode,
     HandoffResult, IncrementalSnapshotBackend, IncrementalSnapshotDriver, IncrementalSnapshotState,
     IncrementalSnapshotTableState, SnapshotCheckpointHelper, SnapshotEnd, SnapshotProgress,
-    SnapshotProgressTracker, SnapshotTable, SnapshotTrackerConfig, SnapshotTrackerReport,
-    SnapshotValidationResult, SnapshotValidator, TableProgress,
+    SnapshotProgressTracker, SnapshotRequest, SnapshotTable, SnapshotTrackerConfig,
+    SnapshotTrackerReport, SnapshotValidationResult, SnapshotValidator, TableProgress,
 };
 #[cfg(feature = "mariadb")]
 pub use crate::source::{

@@ -53,6 +53,8 @@ async fn incremental_snapshot_cursors_survive_a_checkpoint_round_trip() {
 
     let state = IncrementalSnapshotState {
         paused: false,
+        stopped: false,
+        generation: 0,
         snapshot_id: "incremental-1754300000000".to_string(),
         tables: vec![
             IncrementalSnapshotTableState {
@@ -61,6 +63,7 @@ async fn incremental_snapshot_cursors_survive_a_checkpoint_round_trip() {
                 is_complete: false,
                 chunks_emitted: 10,
                 rows_emitted: 50_000,
+                condition: None,
             },
             IncrementalSnapshotTableState {
                 table: "public.orders".to_string(),
@@ -68,6 +71,7 @@ async fn incremental_snapshot_cursors_survive_a_checkpoint_round_trip() {
                 is_complete: true,
                 chunks_emitted: 3,
                 rows_emitted: 12_000,
+                condition: None,
             },
         ],
     };

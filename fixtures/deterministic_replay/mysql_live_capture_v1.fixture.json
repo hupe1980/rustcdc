@@ -6,8 +6,13 @@
     "source_version": "mysql=8.0",
     "fixture_version": 1,
     "description": "Live-capture representative MySQL binlog flow with query/write/update/xid.",
-    "tags": ["live_capture", "mysql", "transaction", "dml"],
-    "expected_event_count": 4,
+    "tags": [
+      "live_capture",
+      "mysql",
+      "transaction",
+      "dml"
+    ],
+    "message_count": 4,
     "captured_at": "2026-05-16T00:00:00Z"
   },
   "messages": [
@@ -15,25 +20,33 @@
       "seq": 0,
       "message_type": "QueryEvent",
       "payload": "{\"sql\":\"BEGIN\"}",
-      "tags": ["transactional"]
+      "tags": [
+        "transactional"
+      ]
     },
     {
       "seq": 1,
       "message_type": "WriteRowsEvent",
       "payload": "{\"schema\":\"inventory\",\"table\":\"products\",\"after\":{\"id\":10,\"sku\":\"sku-10\"},\"primary_key\":[\"id\"]}",
-      "tags": ["dml"]
+      "tags": [
+        "dml"
+      ]
     },
     {
       "seq": 2,
       "message_type": "UpdateRowsEvent",
       "payload": "{\"schema\":\"inventory\",\"table\":\"products\",\"before\":{\"id\":10,\"sku\":\"sku-10\"},\"after\":{\"id\":10,\"sku\":\"sku-10b\"},\"primary_key\":[\"id\"]}",
-      "tags": ["dml"]
+      "tags": [
+        "dml"
+      ]
     },
     {
       "seq": 3,
       "message_type": "XidEvent",
       "payload": "{\"xid\":1001}",
-      "tags": ["transactional"]
+      "tags": [
+        "transactional"
+      ]
     }
   ]
 }

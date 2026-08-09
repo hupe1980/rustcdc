@@ -6,8 +6,13 @@
     "source_version": "sqlserver>=2019",
     "fixture_version": 1,
     "description": "SQL Server DDL replay fixture with three-part names (catalog.schema.table). Canonical relation metadata should contain only final schema/table pair.",
-    "tags": ["sqlserver", "ddl", "schema_change", "three_part_name"],
-    "expected_event_count": 1,
+    "tags": [
+      "sqlserver",
+      "ddl",
+      "schema_change",
+      "three_part_name"
+    ],
+    "message_count": 1,
     "captured_at": "2026-05-17T00:00:00Z"
   },
   "messages": [
@@ -15,7 +20,10 @@
       "seq": 0,
       "message_type": "Ddl",
       "payload": "{\"statement\":\"ALTER TABLE [master].[dbo].[users] ADD [id] INT, DROP COLUMN IF EXISTS [deleted_at];\"}",
-      "tags": ["ddl", "schema_change"]
+      "tags": [
+        "ddl",
+        "schema_change"
+      ]
     }
   ]
 }

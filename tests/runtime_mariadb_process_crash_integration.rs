@@ -30,7 +30,12 @@ mod process_crash_worker;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
 use process_crash_worker::resolve_xtask_worker_bin;
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -56,12 +61,14 @@ async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
 
 #[tokio::test]
 async fn runtime_mariadb_process_kill_replays_uncommitted_batch() -> rustcdc::Result<()> {
+    install_rustls_provider();
     run_mariadb_process_kill_replay_scenario(false).await
 }
 
 #[tokio::test]
 async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -> rustcdc::Result<()>
 {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping mariadb snapshot crash-resume integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"
@@ -234,12 +241,14 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
 #[tokio::test]
 async fn runtime_mariadb_process_kill_replays_uncommitted_batch_with_encryption_transform(
 ) -> rustcdc::Result<()> {
+    install_rustls_provider();
     run_mariadb_process_kill_replay_scenario(true).await
 }
 
 async fn run_mariadb_process_kill_replay_scenario(
     _enable_encryption_transform: bool,
 ) -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping mariadb process crash integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"

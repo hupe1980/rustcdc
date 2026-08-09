@@ -153,18 +153,42 @@ pub trait EventEncoder: Send + Sync {
     /// Encode the primary-key columns of an event as a compact JSON key.
     ///
     /// The default implementation serialises the object returned by
-    /// [`Event::primary_key_values`] as compact JSON. Returns `None` when the
-    /// event has no `primary_key` defined, when none of the key columns appear in
-    /// the row image, or when serialisation fails.
+    /// [`Event::primary_key_values`] as compact JSON.
     ///
     /// Override this method to produce a different key format (e.g. Avro-encoded
     /// keys, string-formatted composite keys, or opaque binary keys).
+    ///
+    /// # `Ok(None)` and `Err` are different things
+    ///
+    /// This returns `Result<Option<Vec<u8>>>` because those two outcomes must not be
+    /// confused, and a bare `Option` confused them:
+    ///
+    /// - **`Ok(None)`** — the event genuinely has no key. A `TRUNCATE`, a `SCHEMA_CHANGE`, a
+    ///   table with no primary key, or a payload missing a key column (see
+    ///   [`Event::primary_key_values`], which is all-or-nothing). Publishing it unkeyed is
+    ///   correct: a Kafka producer round-robins it rather than collapsing every keyless event
+    ///   onto one partition.
+    /// - **`Err`** — encoding failed. The event *does* have a key and the encoder could not
+    ///   render it.
+    ///
+    /// Collapsing the second into the first is a silent correctness failure, not a lost error
+    /// message. A keyed sink treats `None` as "unkeyed", so the record is produced without a
+    /// key: partition routing becomes round-robin, **ordering for that row is lost**, and log
+    /// compaction stops collapsing it. The record still arrives, so nothing looks wrong. This
+    /// is the same failure the transform pipeline refuses to allow a transform to cause — see
+    /// [`TransformPipeline::apply`](crate::transform::TransformPipeline::apply), which errors
+    /// rather than emit an event whose key it destroyed — and it would have been inconsistent
+    /// to let an encoder cause it quietly.
     ///
     /// # Use case
     ///
     /// Kafka / Pulsar producers need a separate key payload for message routing and
     /// log-compaction. Passing the result of `encode_key()` as the Kafka message key
     /// ensures that all events for the same row land on the same partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SerializationError`] when the key cannot be encoded.
     ///
     /// # Example
     ///
@@ -179,12 +203,18 @@ pub trait EventEncoder: Send + Sync {
     ///     .build();
     ///
     /// let encoder = JsonEncoder;
-    /// let key = encoder.encode_key(&event).unwrap();
+    /// let key = encoder.encode_key(&event).unwrap().unwrap();
     /// assert_eq!(key, br#"{"id":5}"#);
+    ///
+    /// // A keyless event is `Ok(None)`, not an error: publishing it unkeyed is correct.
+    /// let truncate = Event::builder("t", Operation::Truncate).build();
+    /// assert!(encoder.encode_key(&truncate).unwrap().is_none());
     /// ```
-    fn encode_key(&self, event: &Event) -> Option<Vec<u8>> {
-        let value = event.primary_key_values()?;
-        serde_json::to_vec(&value).ok()
+    fn encode_key(&self, event: &Event) -> Result<Option<Vec<u8>>> {
+        let Some(value) = event.primary_key_values() else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::to_vec(&value)?))
     }
 }
 
@@ -312,7 +342,9 @@ impl<E: EventEncoder> EncoderCodec<E> {
 
 impl<E: EventEncoder> Codec for EncoderCodec<E> {
     fn encode(&self, event: &Event) -> Result<CodecOutput> {
-        let key = self.encoder.encode_key(event);
+        // `?` rather than swallowing: an encoder that could not render a key must not be
+        // read as "this event has no key", which would publish the record unkeyed.
+        let key = self.encoder.encode_key(event)?;
         let value_output = self.encoder.encode(event)?;
         Ok(CodecOutput::new(
             key,
@@ -653,5 +685,91 @@ mod tests {
         // reach for a mutex.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<BoxedAsyncCodec>();
+    }
+}
+
+#[cfg(test)]
+mod key_encoding_contract_tests {
+    use super::{EventEncoder, JsonEncoder};
+    use crate::core::{Event, Operation, SourceMetadata};
+
+    /// `Ok(None)` and `Err` mean different things, and conflating them is a silent
+    /// correctness failure rather than a lost error message.
+    ///
+    /// A keyed sink reads `None` as "unkeyed" and publishes the record without a key:
+    /// partition routing becomes round-robin, ordering for that row is lost, and log
+    /// compaction stops collapsing it. The record still arrives, so nothing looks wrong. The
+    /// transform pipeline already refuses to let a *transform* cause that; an encoder must not
+    /// be able to cause it quietly either.
+    #[test]
+    fn a_keyless_event_is_ok_none_and_never_an_error() {
+        let encoder = JsonEncoder;
+
+        // No `primary_key` declared at all.
+        let keyless = Event::builder("t", Operation::Insert)
+            .after(serde_json::json!({ "a": "1" }))
+            .build();
+        assert!(matches!(encoder.encode_key(&keyless), Ok(None)));
+
+        // TRUNCATE and SCHEMA_CHANGE carry no row to take a key from.
+        for op in [Operation::Truncate, Operation::SchemaChange] {
+            let event = Event::builder("t", op).build();
+            assert!(
+                matches!(encoder.encode_key(&event), Ok(None)),
+                "a {op} event has no key, which is not an error"
+            );
+        }
+
+        // A composite key with a column missing is `None` too — `primary_key_values` is
+        // all-or-nothing, because a truncated key addresses more rows than the event describes.
+        let partial = Event::builder("t", Operation::Insert)
+            .after(serde_json::json!({ "tenant_id": "7" }))
+            .primary_key(["tenant_id", "id"])
+            .build();
+        assert!(matches!(encoder.encode_key(&partial), Ok(None)));
+    }
+
+    #[test]
+    fn a_resolvable_key_is_encoded() {
+        let event = Event::builder("t", Operation::Insert)
+            .after(serde_json::json!({ "id": "5", "name": "alice" }))
+            .primary_key(["id"])
+            .source(SourceMetadata::new("pg", "0/1", 1))
+            .ts(1)
+            .build();
+        let key = JsonEncoder
+            .encode_key(&event)
+            .expect("encoding succeeds")
+            .expect("the event has a resolvable key");
+        assert_eq!(key, br#"{"id":"5"}"#);
+    }
+
+    /// The combined codec must propagate a key-encoding failure rather than reporting the
+    /// event as keyless, which is what `CodecOutput { key: None, .. }` means downstream.
+    #[test]
+    fn the_combined_codec_propagates_a_key_failure_rather_than_reporting_no_key() {
+        use crate::codec::{Codec, EncodedOutput, EncoderCodec};
+
+        struct BrokenKeyEncoder;
+        impl EventEncoder for BrokenKeyEncoder {
+            fn encode(&self, _event: &Event) -> crate::core::Result<EncodedOutput> {
+                Ok(EncodedOutput::new(b"{}".to_vec(), "application/json"))
+            }
+            fn content_type(&self) -> &'static str {
+                "application/json"
+            }
+            fn encode_key(&self, _event: &Event) -> crate::core::Result<Option<Vec<u8>>> {
+                Err(crate::core::Error::SerializationError("key broke".into()))
+            }
+        }
+
+        let event = Event::builder("t", Operation::Insert)
+            .after(serde_json::json!({ "id": "1" }))
+            .primary_key(["id"])
+            .build();
+        let error = EncoderCodec::new(BrokenKeyEncoder)
+            .encode(&event)
+            .expect_err("a key-encoding failure must surface");
+        assert!(error.to_string().contains("key broke"), "{error}");
     }
 }

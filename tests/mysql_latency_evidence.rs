@@ -13,6 +13,10 @@ use testcontainers::{
 };
 use tokio::time::sleep;
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 #[path = "latency_evidence_common.rs"]
 mod latency_evidence_common;
 
@@ -22,6 +26,7 @@ use latency_evidence_common::{
 };
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -47,6 +52,7 @@ async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
 
 #[tokio::test]
 async fn mysql_connector_latency_evidence_stream_commit_percentiles() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql latency evidence test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());

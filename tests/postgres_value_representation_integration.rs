@@ -175,6 +175,25 @@ async fn snapshot_and_stream_agree_on_the_json_type_of_every_column() -> rustcdc
     let snapshot = from_snapshot.expect("the snapshot delivered row 1");
     let stream = from_stream.expect("the stream delivered row 2");
 
+    // ── The contract: every scalar is a JSON string ───────────────────────────
+    //
+    // Asserted separately from the agreement check below, because two paths that *agree* on
+    // emitting JSON numbers would satisfy that check while breaking the rule the whole
+    // envelope rests on: a JSON number is an IEEE-754 double downstream, so `numeric(38,4)`
+    // and `bigint` past 2^53 do not survive one. Nothing pinned this before, so a regression
+    // to numbers would have passed.
+    for column in ["id", "huge", "exact", "ratio", "flag", "label"] {
+        for (path, row) in [("snapshot", &snapshot), ("stream", &stream)] {
+            let kind = json_kind(&row[column]);
+            assert_eq!(
+                kind, "string",
+                "column '{column}' arrived from the {path} as a JSON {kind}. Every scalar must                  be a string: a JSON number is a double by the time a consumer sees it.
+                   value: {:?}",
+                row[column],
+            );
+        }
+    }
+
     // ── The property: same JSON type, column by column ───────────────────────
     for column in ["id", "huge", "exact", "ratio", "flag", "label", "absent"] {
         let snapshot_kind = json_kind(&snapshot[column]);

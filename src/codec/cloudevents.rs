@@ -163,14 +163,30 @@ impl EventEncoder for CloudEventsEncoder {
         if let Some(tx) = &event.transaction {
             data.insert("transaction".into(), serde_json::to_value(tx)?);
         }
+        // The partial-payload contract, in full. All three fields or none of them: a consumer
+        // that receives `unavailable_columns` but not `before_unavailable_columns` cannot tell
+        // a before-image column that is absent *because it was TOASTed* from one that was
+        // genuinely NULL — which is exactly the distinction
+        // [`Event::before_unavailable_columns`] exists to make, and the one a diff or a
+        // compensating write depends on.
+        //
+        // `before_unavailable_columns` was omitted here when it was added to the envelope, so
+        // CloudEvents consumers silently had a weaker contract than JSON, Avro and Protobuf
+        // consumers of the same stream. Only the emptiness check is conditional — the three
+        // fields are written by one loop so a fourth cannot be forgotten the same way.
         if event.before_is_key_only {
             data.insert("before_is_key_only".into(), json!(true));
         }
-        if !event.unavailable_columns.is_empty() {
-            data.insert(
-                "unavailable_columns".into(),
-                json!(event.unavailable_columns),
-            );
+        for (field, columns) in [
+            ("unavailable_columns", &event.unavailable_columns),
+            (
+                "before_unavailable_columns",
+                &event.before_unavailable_columns,
+            ),
+        ] {
+            if !columns.is_empty() {
+                data.insert(field.into(), json!(columns));
+            }
         }
         // Carry the envelope version so consumers can detect a version bump.
         data.insert("envelope_version".into(), json!(event.envelope_version));
@@ -498,5 +514,125 @@ mod tests {
         let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
         assert_eq!(ce["type"], "io.rustcdc.change.update");
         assert_eq!(ce["cdcop"], "update");
+    }
+}
+
+#[cfg(test)]
+mod partial_payload_contract_tests {
+    use super::*;
+    use crate::core::{Event, Operation, SourceMetadata};
+
+    /// An UPDATE with a hole in **each** image, which is the shape that separates the two
+    /// unavailable-column lists: a TOASTed column that was modified is present in `after` and
+    /// absent from `before`, and one that was not is the reverse.
+    fn event_with_holes() -> Event {
+        Event::builder("documents", Operation::Update)
+            .schema("public")
+            .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+            .ts(1_716_595_200_000)
+            .before(serde_json::json!({ "id": "1", "title": "draft" }))
+            .after(serde_json::json!({ "id": "1", "title": "final" }))
+            .primary_key(["id"])
+            .unavailable_columns(["body"])
+            .before_unavailable_columns(["summary"])
+            .build()
+    }
+
+    /// The bug this closes: `before_unavailable_columns` was never written, so a CloudEvents
+    /// consumer got a **weaker contract than a JSON, Avro or Protobuf consumer of the same
+    /// stream** — and could not tell a before-image column absent because it was TOASTed from
+    /// one that was genuinely NULL. That is the distinction the field exists to make, and the
+    /// one a row diff or a compensating write depends on.
+    #[test]
+    fn the_cloudevents_data_carries_every_partial_payload_field() {
+        let event = event_with_holes();
+        let encoded = CloudEventsEncoder::default().encode(&event).expect("encode");
+        let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
+        let data = ce.get("data").expect("data payload");
+
+        assert_eq!(
+            data.get("unavailable_columns"),
+            Some(&json!(["body"])),
+            "the after-image hole must be reported"
+        );
+        assert_eq!(
+            data.get("before_unavailable_columns"),
+            Some(&json!(["summary"])),
+            "the before-image hole must be reported too. Reporting only one of the two lets a \
+             consumer read a TOASTed column's absence as NULL, which is the corruption the \
+             lists exist to prevent"
+        );
+    }
+
+    /// Every field of the envelope that a consumer needs must be discoverable in the output.
+    /// Asserted as a set rather than one field at a time, because the failure mode here is a
+    /// field added to `Event` and not to this encoder — which is exactly what happened.
+    #[test]
+    fn no_envelope_field_is_silently_dropped() {
+        let mut event = event_with_holes();
+        event.before_is_key_only = false;
+        event.transaction = Some(crate::core::TransactionMetadata::new(42, 1, Some(2)));
+        event.snapshot = Some(crate::core::SnapshotMetadata::new("snap-1", 0, false));
+
+        let encoded = CloudEventsEncoder::default().encode(&event).expect("encode");
+        let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
+        let data = ce.get("data").expect("data payload");
+
+        // In `data`, because they are CDC payload rather than CloudEvents context.
+        for field in [
+            "before",
+            "after",
+            "primary_key",
+            "snapshot",
+            "transaction",
+            "envelope_version",
+            "unavailable_columns",
+            "before_unavailable_columns",
+        ] {
+            assert!(
+                data.get(field).is_some(),
+                "`{field}` is missing from the CloudEvents data payload, so a consumer of this \
+                 stream has a weaker contract than one reading JSON, Avro or Protobuf"
+            );
+        }
+
+        // As CloudEvents context attributes or extensions.
+        for field in [
+            "specversion",
+            "id",
+            "type",
+            "source",
+            "time",
+            "subject",
+            "cdcop",
+            "cdctable",
+            "cdcschema",
+            "cdcsource",
+            "cdcoffset",
+        ] {
+            assert!(
+                ce.get(field).is_some(),
+                "`{field}` is missing from the CloudEvents envelope"
+            );
+        }
+    }
+
+    /// `before_is_key_only` is written only when true, so its false case must not be mistaken
+    /// for an omission by the test above.
+    #[test]
+    fn before_is_key_only_appears_when_set() {
+        let mut event = event_with_holes();
+        event.before_unavailable_columns.clear(); // validation forbids both together
+        event.before_is_key_only = true;
+        event.before = Some(serde_json::json!({ "id": "1" }));
+        event.validate().expect("a well-formed key-only before-image");
+
+        let encoded = CloudEventsEncoder::default().encode(&event).expect("encode");
+        let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
+        assert_eq!(
+            ce["data"].get("before_is_key_only"),
+            Some(&json!(true)),
+            "a key-only before-image must be flagged, or a consumer treats it as a full row"
+        );
     }
 }

@@ -81,10 +81,47 @@ impl EventDiff {
 
 /// Compare two events semantically.
 ///
-/// Returns a list of semantic differences, sorted by severity.
-/// Ignores inconsequential fields like timestamps and internal IDs.
+/// Returns a list of differences, most severe first.
+///
+/// # What is compared, and what is deliberately not
+///
+/// This function is the **sole** comparison the golden-fixture suite performs, so a field it
+/// ignores is invisible to every fixture. That is worth stating explicitly, because it was
+/// once true of fields whose regressions are exactly what the fixtures exist to catch:
+/// `primary_key`, `unavailable_columns`, `before_unavailable_columns`, `envelope_version` and
+/// `source.offset` were all unchecked, so a change to any of them left 60-odd goldens green.
+///
+/// **Compared** — every field whose value is a deterministic function of the replayed input:
+/// `op`, `table`, `schema`, `source.source_name`, `source.offset`, `before`, `after`,
+/// `before_is_key_only`, `unavailable_columns`, `before_unavailable_columns`, `primary_key`,
+/// `envelope_version`, `transaction`, and the deterministic half of `snapshot`.
+///
+/// **Not compared**, each for a reason rather than by omission:
+///
+/// | Field | Why |
+/// |---|---|
+/// | `ts`, `source.timestamp` | Wall-clock at capture. Differs every run by construction |
+/// | `snapshot.snapshot_id` | Contains the millisecond the snapshot started (`incremental-<ms>`), so it differs per run while carrying no correctness meaning of its own |
+///
+/// Anything added to [`Event`] in future belongs in one of those two lists. A new field that
+/// silently lands in neither is a field the fixtures cannot see.
 pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
     let mut diffs = Vec::new();
+
+    // A different envelope version is a different contract, not a changed value.
+    if old.envelope_version != new.envelope_version {
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Critical,
+                format!(
+                    "Envelope version changed from {} to {}",
+                    old.envelope_version, new.envelope_version
+                ),
+                vec![],
+            )
+            .with_path("envelope_version"),
+        );
+    }
 
     // Critical structural diffs
     if old.op != new.op {
@@ -160,6 +197,104 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
                 vec![],
             )
             .with_path("before_is_key_only"),
+        );
+    }
+
+    // The declared key columns. A change here breaks message keys, log compaction and
+    // upsert consumers — and `Event::primary_key_values` is all-or-nothing over this list,
+    // so dropping one column stops the event resolving a key at all.
+    if old.primary_key != new.primary_key {
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Semantic,
+                format!(
+                    "primary_key changed from {:?} to {:?}",
+                    old.primary_key, new.primary_key
+                ),
+                vec![],
+            )
+            .with_path("primary_key"),
+        );
+    }
+
+    // The partial-payload contract. A regression that stopped reporting an unchanged-TOAST
+    // column would make a sink write NULL over live data, which is the loudest failure this
+    // crate is built to prevent and was the quietest one in this comparison.
+    for (field, old_columns, new_columns) in [
+        (
+            "unavailable_columns",
+            &old.unavailable_columns,
+            &new.unavailable_columns,
+        ),
+        (
+            "before_unavailable_columns",
+            &old.before_unavailable_columns,
+            &new.before_unavailable_columns,
+        ),
+    ] {
+        if old_columns != new_columns {
+            diffs.push(
+                EventDiff::new(
+                    DiffLevel::Semantic,
+                    format!("{field} changed from {old_columns:?} to {new_columns:?}"),
+                    vec![],
+                )
+                .with_path(field),
+            );
+        }
+    }
+
+    // The resume coordinate. A checkpoint is only as good as this string, and getting it
+    // wrong costs a guaranteed duplicate — or a gap — on every restart.
+    if old.source.offset != new.source.offset {
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Semantic,
+                format!(
+                    "source.offset changed from '{}' to '{}'",
+                    old.source.offset, new.source.offset
+                ),
+                vec![],
+            )
+            .with_path("source.offset"),
+        );
+    }
+
+    if old.transaction != new.transaction {
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Semantic,
+                format!(
+                    "transaction metadata changed from {:?} to {:?}",
+                    old.transaction, new.transaction
+                ),
+                vec![],
+            )
+            .with_path("transaction"),
+        );
+    }
+
+    // `snapshot_id` embeds the millisecond the snapshot began, so only the rest is
+    // deterministic. Comparing presence as well catches a row that stopped being a snapshot
+    // read, or started being one.
+    let snapshot_shape = |event: &Event| {
+        event
+            .snapshot
+            .as_ref()
+            .map(|snapshot| (snapshot.chunk_index, snapshot.is_last_chunk))
+    };
+    if snapshot_shape(old) != snapshot_shape(new) {
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Semantic,
+                format!(
+                    "snapshot chunk position changed from {:?} to {:?}",
+                    snapshot_shape(old),
+                    snapshot_shape(new)
+                ),
+                vec![],
+            )
+            .with_path("snapshot"),
         );
     }
 
@@ -325,5 +460,134 @@ mod tests {
         let new_json = serde_json::json!({"b": 2, "a": 1});
 
         assert!(is_equivalent_json(&old_json, &new_json));
+    }
+}
+
+#[cfg(test)]
+mod field_coverage_tests {
+    use super::{semantic_diff, DiffLevel};
+    use crate::core::{
+        Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
+        EVENT_ENVELOPE_VERSION,
+    };
+
+    fn baseline() -> Event {
+        Event::builder("orders", Operation::Update)
+            .schema("public")
+            .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+            .ts(1)
+            .before(serde_json::json!({ "id": "1" }))
+            .after(serde_json::json!({ "id": "1", "total": "10" }))
+            .before_is_key_only(true)
+            .primary_key(["id"])
+            .transaction(TransactionMetadata::new(42, 0, None))
+            .snapshot(SnapshotMetadata::new("incremental-1", 3, false))
+            .build()
+    }
+
+    fn diff_paths(mutate: impl FnOnce(&mut Event)) -> Vec<String> {
+        let expected = baseline();
+        let mut actual = baseline();
+        mutate(&mut actual);
+        semantic_diff(&expected, &actual)
+            .into_iter()
+            .filter(|diff| diff.level != DiffLevel::Identical)
+            .flat_map(|diff| diff.paths)
+            .collect()
+    }
+
+    /// `semantic_diff` is the **only** comparison the golden-fixture suite performs, so a
+    /// field it ignores is invisible to every fixture. Each of these was ignored, and each is
+    /// a field whose regression this crate's own history shows matters.
+    #[test]
+    fn every_deterministic_field_is_actually_compared() {
+        for (label, mutate) in [
+            (
+                "primary_key",
+                Box::new(|event: &mut Event| event.primary_key = Some(vec!["tenant".into()]))
+                    as Box<dyn FnOnce(&mut Event)>,
+            ),
+            (
+                "unavailable_columns",
+                Box::new(|event: &mut Event| event.unavailable_columns = vec!["body".into()]),
+            ),
+            (
+                "before_unavailable_columns",
+                Box::new(|event: &mut Event| {
+                    event.before_is_key_only = true;
+                    event.before_unavailable_columns = vec!["body".into()];
+                }),
+            ),
+            (
+                "envelope_version",
+                Box::new(|event: &mut Event| {
+                    event.envelope_version = EVENT_ENVELOPE_VERSION + 1
+                }),
+            ),
+            (
+                "source.offset",
+                Box::new(|event: &mut Event| event.source.offset = "0/DEADBEEF".into()),
+            ),
+            (
+                "transaction",
+                Box::new(|event: &mut Event| {
+                    event.transaction = Some(TransactionMetadata::new(42, 7, None))
+                }),
+            ),
+            (
+                "snapshot",
+                Box::new(|event: &mut Event| {
+                    event.snapshot = Some(SnapshotMetadata::new("incremental-1", 9, false))
+                }),
+            ),
+        ] {
+            let paths = diff_paths(mutate);
+            assert!(
+                paths.iter().any(|path| path.starts_with(label)),
+                "a change to '{label}' produced no diff, so every golden fixture is blind to \
+                 it. Paths reported: {paths:?}"
+            );
+        }
+    }
+
+    /// The other half: fields that legitimately differ every run must stay ignored, or every
+    /// fixture fails on wall-clock noise and the suite gets disabled.
+    #[test]
+    fn per_run_varying_fields_stay_ignored() {
+        assert!(
+            diff_paths(|event| event.ts = 999_999).is_empty(),
+            "`ts` is wall-clock at capture and differs every run"
+        );
+        assert!(
+            diff_paths(|event| event.source.timestamp = 999_999).is_empty(),
+            "`source.timestamp` is the source's commit clock and differs every run"
+        );
+        assert!(
+            diff_paths(|event| {
+                event.snapshot = Some(SnapshotMetadata::new("incremental-999", 3, false));
+            })
+            .is_empty(),
+            "`snapshot_id` embeds the millisecond the snapshot began, so it differs per run \
+             while carrying no correctness meaning of its own"
+        );
+    }
+
+    #[test]
+    fn an_identical_event_produces_no_diff() {
+        assert!(semantic_diff(&baseline(), &baseline()).is_empty());
+    }
+
+    #[test]
+    fn an_envelope_version_change_is_critical_not_merely_semantic() {
+        let expected = baseline();
+        let mut actual = baseline();
+        actual.envelope_version = EVENT_ENVELOPE_VERSION + 1;
+        let diffs = semantic_diff(&expected, &actual);
+        assert_eq!(
+            diffs.first().map(|diff| diff.level),
+            Some(DiffLevel::Critical),
+            "a different envelope version is a different contract, and results sort most \
+             severe first"
+        );
     }
 }

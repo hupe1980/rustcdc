@@ -30,6 +30,26 @@ use crate::core::{Error, Event, FingerprintError, Result};
 /// [`EventIdempotencyGuard::unidentifiable_passthrough_count`]. Passing a duplicate
 /// through is at-least-once — the guarantee the pipeline already documents — while
 /// dropping a distinct row is not recoverable by any downstream consumer.
+///
+/// # A deliberate re-read is not a duplicate, and the fingerprint has to say so
+///
+/// The same reasoning has a second edge, and it is subtler because the event really is
+/// byte-identical. A snapshot `Read` event's offset identifies the **row**, not a log
+/// position, so re-reading an unchanged row produces the same fingerprint — and an
+/// operator who re-requests a snapshot then gets `enqueued: 1` and no rows, because this
+/// guard drops every one of them as a replay. The guard whose job is to protect delivery
+/// discards the delivery that was asked for, silently.
+///
+/// What distinguishes the two cases is *which snapshot attempt* produced the row, so
+/// [`IncrementalSnapshotState::generation`](crate::source::IncrementalSnapshotState::generation)
+/// is part of the synthetic offset. A chunk re-read after a mid-snapshot reconnect keeps its
+/// generation and is still deduplicated; a new request starts a generation whose rows cannot
+/// collide with the previous one's.
+///
+/// The dependency runs the other way from how it looks: this guard does not know about
+/// snapshots, and the driver is responsible for making distinct reads distinguishable. Anything
+/// that changes the snapshot offset format has to preserve that, which is what
+/// `a_re_snapshotted_row_survives_the_idempotency_guard` pins.
 #[derive(Debug, Clone)]
 pub struct EventIdempotencyGuard {
     capacity: usize,
@@ -285,8 +305,14 @@ pub fn fingerprint_event_stable(event: &Event) -> std::result::Result<String, Fi
 
     if let Some(before) = &event.before {
         digest.update(1u8.to_le_bytes());
-        // Canonical JSON serialisation is deterministic for serde_json's Map
-        // (preserves insertion order), which matches source row order.
+        // Deterministic because `serde_json::Map` is a `BTreeMap` here — the
+        // `preserve_order` feature is deliberately **not** enabled — so keys serialise in
+        // sorted order regardless of the order the connector inserted them. Sorted is what a
+        // cross-process fingerprint needs: insertion order would make the digest depend on a
+        // connector's column ordering, and two capture paths for the same row would hash
+        // apart. Enabling `preserve_order` anywhere in the dependency graph would silently
+        // change every stable fingerprint, which is why this says which property is relied
+        // on rather than just asserting determinism.
         let bytes = serde_json::to_vec(before).map_err(FingerprintError::SerializationFailed)?;
         digest.update((bytes.len() as u64).to_le_bytes());
         digest.update(&bytes);
@@ -318,8 +344,9 @@ pub fn fingerprint_event_stable(event: &Event) -> std::result::Result<String, Fi
 ///
 /// Walks the JSON tree recursively, tagging each variant with a discriminant byte
 /// so `null` ≠ `""` ≠ `false` etc.  For composite values (Array, Object) the
-/// structural traversal is canonical (Object keys are iterated in insertion order
-/// as stored by serde_json's `Map`, which is ordered for reproducible iteration).
+/// structural traversal is canonical: `serde_json::Map` is a `BTreeMap` here, so object
+/// keys are visited in **sorted** order rather than insertion order, and two rows with the
+/// same columns hash the same however the connector ordered them.
 fn hash_json_value(value: &serde_json::Value, hasher: &mut AHasher) {
     match value {
         serde_json::Value::Null => 0_u8.hash(hasher),
@@ -535,5 +562,56 @@ mod tests {
 
         thread::sleep(Duration::from_millis(30));
         assert!(guard.should_process(&event).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod canonical_ordering_tests {
+    use super::{fingerprint_event_stable, fingerprint_event_transient};
+    use crate::core::{Event, Operation, SourceMetadata};
+
+    fn event_with(after: serde_json::Value) -> Event {
+        Event::builder("t", Operation::Insert)
+            .after(after)
+            .primary_key(["id"])
+            .source(SourceMetadata::new("pg", "0/1", 1))
+            .ts(1)
+            .build()
+    }
+
+    /// Both fingerprints must be independent of the order a connector inserted columns in.
+    ///
+    /// This rests on `serde_json::Map` being a `BTreeMap` — the `preserve_order` feature is
+    /// deliberately not enabled. If anything in the dependency graph turned it on, object keys
+    /// would serialise in insertion order and every stable fingerprint would change silently,
+    /// so the property is pinned rather than assumed.
+    #[test]
+    fn a_fingerprint_does_not_depend_on_column_insertion_order() {
+        let one = event_with(serde_json::json!({ "id": "1", "a": "x", "z": "y" }));
+        let other = event_with(serde_json::json!({ "z": "y", "id": "1", "a": "x" }));
+
+        assert_eq!(
+            fingerprint_event_stable(&one).expect("digest"),
+            fingerprint_event_stable(&other).expect("digest"),
+            "the stable digest is persisted and compared across processes, so it must not \
+             depend on a connector's column ordering"
+        );
+        assert_eq!(
+            fingerprint_event_transient(&one).expect("hash"),
+            fingerprint_event_transient(&other).expect("hash"),
+        );
+    }
+
+    /// The stable digest is persisted by consumers, so a change to it is a breaking change to
+    /// their dedup state. Pinned against a literal so a refactor cannot move it quietly.
+    #[test]
+    fn the_stable_digest_is_a_fixed_value_for_a_fixed_event() {
+        let digest = fingerprint_event_stable(&event_with(serde_json::json!({ "id": "1" })))
+            .expect("digest");
+        assert_eq!(
+            digest, "f76b872c487aa0b8f7cad0bcc6ccb0e3b337f02f24043c82eb8c1e35fcf43cd7",
+            "the stable fingerprint is persisted in consumers' dedup stores; changing it \
+             invalidates theirs, so it may only move as a documented breaking change"
+        );
     }
 }

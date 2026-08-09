@@ -6,8 +6,13 @@
     "source_version": "sqlserver>=2019",
     "fixture_version": 1,
     "description": "SQL Server DDL replay fixture with dotted bracket identifiers.",
-    "tags": ["sqlserver", "ddl", "schema_change", "dotted_identifier"],
-    "expected_event_count": 1,
+    "tags": [
+      "sqlserver",
+      "ddl",
+      "schema_change",
+      "dotted_identifier"
+    ],
+    "message_count": 1,
     "captured_at": "2026-05-17T00:00:00Z"
   },
   "messages": [
@@ -15,7 +20,10 @@
       "seq": 0,
       "message_type": "Ddl",
       "payload": "{\"statement\":\"ALTER TABLE [dbo.legacy].[snapshot.v2] ADD [event.time] DATETIME, DROP COLUMN IF EXISTS [audit.ts];\"}",
-      "tags": ["ddl", "schema_change"]
+      "tags": [
+        "ddl",
+        "schema_change"
+      ]
     }
   ]
 }

@@ -41,7 +41,7 @@ const CONTROL_QUEUE_DEPTH: usize = 64;
 /// A control operation to be applied by the runtime between polls.
 enum ControlCommand {
     RequestSnapshot {
-        tables: Vec<String>,
+        request: crate::source::SnapshotRequest,
         reply: oneshot::Sender<Result<usize>>,
     },
     SetSnapshotPaused {
@@ -182,7 +182,20 @@ impl RuntimeControl {
     /// See [`CdcRuntime::request_incremental_snapshot`] for the semantics; this is the
     /// same operation applied from another task.
     pub async fn request_incremental_snapshot(&self, tables: Vec<String>) -> Result<usize> {
-        self.dispatch(|reply| ControlCommand::RequestSnapshot { tables, reply })
+        self.request_incremental_snapshot_filtered(crate::source::SnapshotRequest::new(tables))
+            .await
+    }
+
+    /// Add tables to the in-flight incremental snapshot, restricted to a subset of rows.
+    ///
+    /// See [`CdcRuntime::request_incremental_snapshot_filtered`] for the semantics and the
+    /// trust note; this is the same operation applied from another task, which is the shape
+    /// an admin endpoint servicing an `execute-snapshot`-style request actually has.
+    pub async fn request_incremental_snapshot_filtered(
+        &self,
+        request: crate::source::SnapshotRequest,
+    ) -> Result<usize> {
+        self.dispatch(|reply| ControlCommand::RequestSnapshot { request, reply })
             .await
     }
 
@@ -254,8 +267,8 @@ impl CdcRuntime {
     pub(super) async fn service_control_commands(&mut self) -> Result<()> {
         while let Ok(command) = self.control.receiver.try_recv() {
             match command {
-                ControlCommand::RequestSnapshot { tables, reply } => {
-                    let result = self.request_incremental_snapshot(tables).await;
+                ControlCommand::RequestSnapshot { request, reply } => {
+                    let result = self.request_incremental_snapshot_filtered(request).await;
                     // A dropped receiver means the caller gave up (its timeout fired).
                     // The operation still happened, so this is not an error — but it is
                     // worth a log, because the caller now has no idea it took effect.

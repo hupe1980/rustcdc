@@ -3,6 +3,7 @@
 pub(crate) mod durability;
 mod error;
 mod event;
+pub(crate) mod glob;
 mod idempotency;
 mod logging;
 mod observability;
@@ -74,6 +75,22 @@ pub trait Offset: Debug + OffsetClone + Send + Sync {
     ///
     /// Must round-trip: whatever `encode` produces has to be decodable back into a
     /// resumable position by the connector that wrote it.
+    ///
+    /// # A JSON encoding buys position-level rewind detection
+    ///
+    /// Any byte encoding is allowed, and an opaque one costs nothing that this crate would
+    /// otherwise have given you: `stream_position_regression` reads named fields, and it only
+    /// knows how to compare the source types it ships — see
+    /// [`compares_stream_position`](crate::checkpoint::compares_stream_position). For anything
+    /// else it declines to guess, so a JSON encoding on a custom offset gains nothing on its
+    /// own.
+    ///
+    /// What a JSON encoding *does* enable is writing that comparison yourself:
+    /// [`StoredCheckpointRecord`](crate::checkpoint::StoredCheckpointRecord) hands your
+    /// `Checkpoint` implementation the decoded offset, so a backend that knows its own
+    /// coordinate semantics can add the check the shipped guard cannot. With an opaque
+    /// encoding the record carries `null` there and you keep only the
+    /// committed-event-count check — which is a real check, just a weaker one.
     fn encode(&self) -> Result<Vec<u8>>;
 }
 

@@ -9,6 +9,10 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const CONNECT_RETRY_BUDGET: Duration = Duration::from_secs(75);
@@ -30,6 +34,7 @@ fn skip_mariadb_connection_case(case_label: &str) -> bool {
 async fn start_mariadb_container(
     version: &str,
 ) -> rustcdc::Result<testcontainers::ContainerAsync<GenericImage>> {
+    install_rustls_provider();
     GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -52,6 +57,7 @@ async fn start_mariadb_container(
 }
 
 async fn wait_for_mariadb_admin_ready(host: &str, port: u16) -> rustcdc::Result<()> {
+    install_rustls_provider();
     let dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     let mut backoff = Duration::from_millis(250);
@@ -92,6 +98,7 @@ async fn wait_for_mariadb_admin_ready(host: &str, port: u16) -> rustcdc::Result<
 }
 
 async fn mariadb_base_config(version: &str, server_id: u32) -> rustcdc::Result<MariadbTestTarget> {
+    install_rustls_provider();
     let container = start_mariadb_container(version).await?;
     let host = container
         .get_host()
@@ -126,6 +133,7 @@ async fn mariadb_base_config(version: &str, server_id: u32) -> rustcdc::Result<M
 }
 
 async fn run_mariadb_connection_lifecycle(version: &str, server_id: u32) -> rustcdc::Result<()> {
+    install_rustls_provider();
     let target = mariadb_base_config(version, server_id).await?;
     let connection = MariaDbConnection::new(target.config.into_inner());
     connect_with_retry(&connection).await?;
@@ -147,6 +155,7 @@ macro_rules! mariadb_connection_test {
 }
 
 async fn connect_with_retry(connection: &MariaDbConnection) -> rustcdc::Result<()> {
+    install_rustls_provider();
     let deadline = std::time::Instant::now() + CONNECT_RETRY_BUDGET;
     let mut backoff = Duration::from_millis(250);
     let mut last_error = None;
@@ -183,6 +192,7 @@ mariadb_connection_test!(
 /// Test MariaDB GTID mode support
 #[tokio::test]
 async fn mariadb_gtid_mode_support() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if skip_mariadb_connection_case("mariadb gtid mode support test") {
         return Ok(());
     }

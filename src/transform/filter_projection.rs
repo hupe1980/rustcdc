@@ -9,6 +9,11 @@
 //! - [`FilterMode::All`] (default) — **AND** semantics: every rule must match.
 //! - [`FilterMode::Any`] — **OR** semantics: at least one rule must match.
 //!
+//! The ordering operators compare **exact decimals**, not `f64` — see
+//! [`FilterOperator::Lt`]. Column values reach a filter as text precisely because a JSON
+//! number is an IEEE-754 double by the time most consumers see it, and a filter that
+//! narrowed them back to `f64` would decide row membership at 53 bits of precision.
+//!
 //! # Column projection
 //!
 //! Either `include_columns` **or** `exclude_columns` may be set (not both).
@@ -108,13 +113,22 @@ pub enum FilterOperator {
     ///
     /// The pattern is pre-compiled at [`FilterProjectionTransform::new`] time.
     Regex,
-    /// Numeric less-than: field value parsed as `f64` < rule value parsed as `f64`.
+    /// Numeric less-than, compared as an **exact decimal**.
+    ///
+    /// Both sides are read as `[+|-]digits[.digits]` and compared digit by digit, so there
+    /// is no mantissa ceiling: `bigint` past 2^53 and `numeric(38,4)` order correctly.
+    /// This matches the crate's text-first value contract — routing the comparison through
+    /// `f64` would reintroduce the precision loss that contract exists to avoid, at the
+    /// point where it decides whether a row is kept.
+    ///
+    /// Exponent notation (`1e3`) is **not** accepted, and a side that is not a plain
+    /// decimal numeral makes the rule evaluate to `false` rather than guess an order.
     Lt,
-    /// Numeric less-than-or-equal.
+    /// Numeric less-than-or-equal. Exact decimal comparison; see [`FilterOperator::Lt`].
     LtEq,
-    /// Numeric greater-than.
+    /// Numeric greater-than. Exact decimal comparison; see [`FilterOperator::Lt`].
     Gt,
-    /// Numeric greater-than-or-equal.
+    /// Numeric greater-than-or-equal. Exact decimal comparison; see [`FilterOperator::Lt`].
     GtEq,
 }
 
@@ -394,8 +408,10 @@ impl FilterProjectionTransform {
 
 /// Apply a [`FilterOperator`] to a resolved string left-hand side.
 ///
-/// For numeric comparisons (`Lt`, `LtEq`, `Gt`, `GtEq`) both `left` and `rule_value`
-/// are parsed as `f64`; if either fails to parse the comparison returns `false`.
+/// For the ordering operators (`Lt`, `LtEq`, `Gt`, `GtEq`) both sides are compared as
+/// **exact decimals** — see [`compare_decimal`]. When either side is not a plain decimal
+/// numeral the comparison returns `false`, because there is no defined order between a
+/// number and arbitrary text and guessing one silently changes which rows a filter keeps.
 #[inline]
 fn apply_operator(
     left: &str,
@@ -403,23 +419,22 @@ fn apply_operator(
     rule_value: &str,
     regex: Option<&Regex>,
 ) -> bool {
+    use std::cmp::Ordering;
+
     match op {
         FilterOperator::Eq => left == rule_value,
         FilterOperator::Ne => left != rule_value,
         FilterOperator::Contains => left.contains(rule_value),
         FilterOperator::Regex => regex.is_some_and(|re| re.is_match(left)),
         FilterOperator::Lt | FilterOperator::LtEq | FilterOperator::Gt | FilterOperator::GtEq => {
-            let Ok(lv) = left.parse::<f64>() else {
-                return false;
-            };
-            let Ok(rv) = rule_value.parse::<f64>() else {
+            let Some(ordering) = compare_decimal(left, rule_value) else {
                 return false;
             };
             match op {
-                FilterOperator::Lt => lv < rv,
-                FilterOperator::LtEq => lv <= rv,
-                FilterOperator::Gt => lv > rv,
-                FilterOperator::GtEq => lv >= rv,
+                FilterOperator::Lt => ordering == Ordering::Less,
+                FilterOperator::LtEq => ordering != Ordering::Greater,
+                FilterOperator::Gt => ordering == Ordering::Greater,
+                FilterOperator::GtEq => ordering != Ordering::Less,
                 // SAFETY: outer match arm already restricts to the four numeric variants above.
                 _ => unreachable!(
                     "numeric comparison arm is exhausted by the outer Lt|LtEq|Gt|GtEq restriction"
@@ -427,6 +442,101 @@ fn apply_operator(
             }
         }
     }
+}
+
+/// A decimal numeral split into sign and digit strings, with no precision loss.
+struct Decimal<'a> {
+    negative: bool,
+    /// Integer digits with leading zeros stripped. Empty means zero.
+    integer: &'a str,
+    /// Fraction digits with trailing zeros stripped. Empty means none.
+    fraction: &'a str,
+}
+
+impl Decimal<'_> {
+    fn is_zero(&self) -> bool {
+        self.integer.is_empty() && self.fraction.is_empty()
+    }
+}
+
+/// Parse `[+|-]digits[.digits]`, rejecting anything else.
+///
+/// Deliberately does **not** accept exponent notation. `1e3` and `1000` would then have to
+/// compare equal, which needs normalisation this function has nowhere to put; a filter
+/// silently returning `false` for an exponent literal is easier to notice and fix than one
+/// that quietly mis-orders it.
+fn parse_decimal(input: &str) -> Option<Decimal<'_>> {
+    let (negative, digits) = match input.as_bytes().first()? {
+        b'-' => (true, &input[1..]),
+        b'+' => (false, &input[1..]),
+        _ => (false, input),
+    };
+
+    let (integer, fraction) = match digits.split_once('.') {
+        Some((integer, fraction)) => (integer, fraction),
+        None => (digits, ""),
+    };
+
+    // At least one digit overall, and nothing but digits in either part.
+    if integer.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some(Decimal {
+        negative,
+        integer: integer.trim_start_matches('0'),
+        fraction: fraction.trim_end_matches('0'),
+    })
+}
+
+/// Order two decimal numerals **exactly**, or `None` when either side is not one.
+///
+/// # Why not `f64`
+///
+/// This crate emits every column value as text precisely because a JSON number is an
+/// IEEE-754 double by the time most consumers see it, and `numeric(38,4)` and `bigint`
+/// past 2^53 do not survive one. Routing a filter comparison through `f64` reintroduces
+/// exactly that loss at the point where it decides whether a row is kept: with `f64`,
+/// `9007199254740993 > 9007199254740992` is **false**, so a threshold filter on a
+/// snowflake id or a high-precision amount silently drops or keeps the wrong rows.
+///
+/// Comparing digit strings has no such ceiling and needs no dependency: compare signs,
+/// then integer magnitude by length and lexicographically, then fraction digits
+/// lexicographically (which is correct once trailing zeros are stripped, because both
+/// sides are then aligned at the decimal point).
+fn compare_decimal(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+
+    let left = parse_decimal(left.trim())?;
+    let right = parse_decimal(right.trim())?;
+
+    // `-0` and `0` are the same number, so sign is only meaningful for non-zero values.
+    let left_negative = left.negative && !left.is_zero();
+    let right_negative = right.negative && !right.is_zero();
+    match (left_negative, right_negative) {
+        (false, true) => return Some(Ordering::Greater),
+        (true, false) => return Some(Ordering::Less),
+        _ => {}
+    }
+
+    let magnitude = left
+        .integer
+        .len()
+        .cmp(&right.integer.len())
+        .then_with(|| left.integer.cmp(right.integer))
+        .then_with(|| left.fraction.cmp(right.fraction));
+
+    // Both negative: the larger magnitude is the smaller number.
+    Some(if left_negative {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
 }
 
 /// Traverse a dot-separated path into a serde_json Value.
@@ -1002,5 +1112,98 @@ mod tests {
         );
         assert_eq!(rule.describe(), r#"after.user.country eq "DE""#);
         assert_eq!(rule.describe(), rule.clone().describe());
+    }
+}
+
+#[cfg(test)]
+mod decimal_comparison_tests {
+    use std::cmp::Ordering;
+
+    use super::{apply_operator, compare_decimal, FilterOperator};
+
+    /// The whole reason this crate emits column values as text: `f64` cannot tell these
+    /// two integers apart, so an `f64`-based filter answered `9007199254740993 >
+    /// 9007199254740992` with `false` and silently dropped the row.
+    #[test]
+    fn comparison_is_exact_past_the_f64_mantissa() {
+        assert_eq!(
+            compare_decimal("9007199254740993", "9007199254740992"),
+            Some(Ordering::Greater)
+        );
+        assert!(apply_operator(
+            "9007199254740993",
+            &FilterOperator::Gt,
+            "9007199254740992",
+            None
+        ));
+        // Both round to the same f64, so the old implementation reported them equal.
+        assert!(!apply_operator(
+            "9007199254740992",
+            &FilterOperator::Gt,
+            "9007199254740993",
+            None
+        ));
+    }
+
+    /// `numeric(38,4)` exceeds `f64`'s 15–17 significant digits by a wide margin.
+    #[test]
+    fn comparison_is_exact_for_high_precision_decimals() {
+        assert_eq!(
+            compare_decimal("12345678901234567890.0001", "12345678901234567890.0002"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_decimal("0.30000000000000004", "0.3"),
+            Some(Ordering::Greater),
+            "the classic float artefact must not compare equal to 0.3"
+        );
+    }
+
+    #[test]
+    fn magnitude_is_ordered_by_digit_count_then_lexicographically() {
+        assert_eq!(compare_decimal("100", "99"), Some(Ordering::Greater));
+        assert_eq!(compare_decimal("0007", "7"), Some(Ordering::Equal));
+        assert_eq!(compare_decimal("7.50", "7.5"), Some(Ordering::Equal));
+        assert_eq!(compare_decimal("0.5", "0.25"), Some(Ordering::Greater));
+        assert_eq!(compare_decimal("0.5", "0.55"), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn signs_are_ordered_and_negative_zero_equals_zero() {
+        assert_eq!(compare_decimal("-1", "1"), Some(Ordering::Less));
+        assert_eq!(compare_decimal("-100", "-99"), Some(Ordering::Less));
+        assert_eq!(compare_decimal("-0", "0"), Some(Ordering::Equal));
+        assert_eq!(compare_decimal("-0.0", "0"), Some(Ordering::Equal));
+        assert_eq!(compare_decimal("+5", "5"), Some(Ordering::Equal));
+    }
+
+    /// A non-numeric side has no defined order, so the rule simply does not match.
+    /// Guessing one would silently change which rows a filter keeps.
+    #[test]
+    fn non_numeric_and_exponent_operands_do_not_match() {
+        assert_eq!(compare_decimal("abc", "1"), None);
+        assert_eq!(compare_decimal("1", ""), None);
+        assert_eq!(compare_decimal("1.2.3", "1"), None);
+        assert_eq!(compare_decimal("1e3", "1000"), None);
+        assert_eq!(compare_decimal("NaN", "0"), None);
+        for op in [
+            FilterOperator::Lt,
+            FilterOperator::LtEq,
+            FilterOperator::Gt,
+            FilterOperator::GtEq,
+        ] {
+            assert!(
+                !apply_operator("abc", &op, "1", None),
+                "a non-numeric operand must never satisfy an ordering rule"
+            );
+        }
+    }
+
+    #[test]
+    fn inclusive_and_exclusive_bounds_agree_on_equality() {
+        assert!(apply_operator("5", &FilterOperator::LtEq, "5", None));
+        assert!(apply_operator("5", &FilterOperator::GtEq, "5", None));
+        assert!(!apply_operator("5", &FilterOperator::Lt, "5", None));
+        assert!(!apply_operator("5", &FilterOperator::Gt, "5", None));
     }
 }

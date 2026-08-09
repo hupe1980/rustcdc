@@ -299,6 +299,28 @@ append-only file, a whole-document replace).
 
 The enum is `#[non_exhaustive]`; match with a wildcard arm.
 
+#### A partial key is never offered as a key
+
+`Event::primary_key_values()` — the function `row_write()` derives `key` from, and the one that
+produces message keys and idempotency fingerprints — is **all-or-nothing**. If any column named
+in `primary_key` is missing from the row image, it returns `None` rather than a key built from
+the columns that are present.
+
+That matters most for composite keys. Given `primary_key = ["tenant_id", "id"]` and a payload
+carrying only `tenant_id`, a truncated key of `{"tenant_id": 7}` looks entirely valid and
+addresses **every row of that tenant**. A sink turning it into `DELETE FROM t WHERE tenant_id =
+7` deletes the whole tenant; an upsert collapses the tenant onto one row. Both are silent, and
+neither is recoverable from the event stream. As a message key it silently merges distinct rows
+into one log-compaction group.
+
+So instead you get `RowWrite::None { reason: NoRowWrite::MissingPrimaryKey }`, which your sink
+has to handle explicitly. A visible gap beats an invisible over-write.
+
+The transform pipeline enforces the same thing from the other side: a stage that removes,
+renames, or rewrites *any* key column — an `include_columns` projection that omits one, a field
+rename, `MaskRule::Encrypt` on a key — is rejected with an error naming the stage, rather than
+emitting the record unkeyed.
+
 #### The underlying fields
 
 `row_write()` is derived from these. Read them directly only if you need finer control.
@@ -314,6 +336,14 @@ The concrete case is **PostgreSQL unchanged-TOAST**: when a large value (roughly
 entirely and pgoutput sends a `'u'` placeholder. The value is unrecoverable; reading it back
 out-of-band would race concurrent writes and return a value from a different point in time.
 
+> **One exception, and it is not an out-of-band read.** During an incremental snapshot, an event
+> inside a chunk's watermark bracket is repaired from *that chunk's own image* of the row and
+> arrives with this list empty — see
+> [a complete chunk row suppressed by an incomplete event](@/docs/architecture.md#a-complete-chunk-row-suppressed-by-an-incomplete-event).
+> The driver knows the position its read was taken at and knows every write between that read
+> and the event, which is precisely what a fresh read does not. Outside that window the
+> paragraph above stands, so a sink must still handle `RowWrite::Merge`.
+
 > ⚠️ **`REPLICA IDENTITY FULL` does not avoid this.** Replica identity governs the *old*
 > tuple only. The after-image still omits unmodified TOASTed values under every replica
 > identity setting. `FULL` gives you a complete before-image (see `before_is_key_only`
@@ -328,6 +358,13 @@ The same thing for the `before` image, tracked **separately**, because the two s
 the same. A TOASTed column that *was* modified arrives present in `after` and absent from
 `before`. Merging the lists would mark a column that genuinely changed as unwritable and
 silently drop the update — so they are never merged.
+
+**Every codec carries all three fields.** JSON, Avro, Protobuf and CloudEvents each emit
+`before_is_key_only`, `unavailable_columns` and `before_unavailable_columns`, and the Avro and
+Protobuf decoders read them back, so a consumer's contract does not depend on which output format
+it reads. Until 0.12.0 the CloudEvents encoder omitted `before_unavailable_columns`, which left its
+consumers unable to tell a TOASTed before-image column from a genuine `NULL` while consumers of the
+same stream in another format could.
 
 Only relevant if you consume the before-image (computing diffs, building compensating
 writes). A column listed here had *some* prior value; the source could not report it. Do not
@@ -471,7 +508,11 @@ restart duplicates move together. MySQL and SQL Server need no override: binlog 
 already the next event's position, and the SQL Server window query already increments the LSN.
 
 A custom source whose per-event offset is itself a resumable boundary can leave the default
-alone.
+alone. One that overrides it gets the same treatment as the built-in connectors: the runtime
+checkpoints whatever it returns, **verbatim**, on every source path rather than only the
+PostgreSQL one. That last part was a bug until 0.12.0 — the generic branch read
+`event.source.offset` directly, so a third-party connector implementing this correctly had its
+answer discarded and took the duplicate-per-restart anyway, with nothing to see it by.
 
 Important semantics:
 - not acknowledging after sink durability may replay already-delivered events
@@ -836,8 +877,10 @@ differ — so it lives in one place, `IncrementalSnapshotDriver`, and connectors
 through `IncrementalSnapshotBackend`. The three built-in connectors use exactly this interface;
 there is no private path they take that yours cannot.
 
-Implement six methods and you inherit the state machine, the override window, cursor
-persistence and the `StreamHandle` contract:
+Implement five required methods and you inherit the state machine, the override window, cursor
+persistence and the `StreamHandle` contract. A sixth,
+[`event_in_bracket`](#classifying-an-event-against-the-bracket), has a
+default — read the next section before accepting it:
 
 ```rust
 use rustcdc::source::{
@@ -845,6 +888,7 @@ use rustcdc::source::{
 };
 use rustcdc::{Event, Offset, Result};
 use async_trait::async_trait;
+use std::collections::HashSet;
 
 # struct MyBackend;
 #[async_trait]
@@ -862,6 +906,7 @@ impl IncrementalSnapshotBackend for MyBackend {
         # unimplemented!()
         // Read the log's current head. Called twice per chunk, so keep it cheap.
     }
+
 
     async fn fetch_chunk(
         &mut self,
@@ -890,53 +935,59 @@ impl IncrementalSnapshotBackend for MyBackend {
 }
 ```
 
-Then build the driver in your `Source::start_incremental_snapshot` and return it as the
-`StreamHandle`.
+#### Classifying an event against the bracket
 
-**Three contract points decide whether this is correct or silently wrong:**
+The driver does not compare positions itself. It asks the backend:
 
-1. `current_position` and `position_of_event` must be on the **same scale**. If they are not,
-   the override window never matches, and stale chunk rows are emitted over newer stream
-   values — with no error, no metric, and no log line.
-2. `fetch_chunk` must not hold a transaction open. Holding one across chunks reintroduces
-   exactly the transaction-ID backlog the incremental snapshot exists to avoid.
-3. `offset_with_snapshot_state` returning `None` falls back to the inner stream's own
-   `save_position`, which **discards every chunk cursor** — every restart then re-reads each
-   table from row zero. Return `None` only if your source genuinely has no typed offset.
+```rust,ignore
+fn event_in_bracket(
+    &self,
+    event: &Event,
+    position: &Self::Position,
+    low: &Self::Position,
+    high: &Self::Position,
+) -> BracketPosition   // Before | Inside | After
+```
 
-The keyset cursor is persisted inside your offset, so it is written by the same atomic, fsynced,
-checksummed record as the log position. `snapshot_tables` remains available for a blocking
-initial snapshot if you do not want to implement the backend.
+The default is the ordinal test — `Inside` when the position is past `low` and at or below
+`high` — and that is correct when your watermark is a single ordered coordinate. Accepting it is a
+real decision, not a formality, and here is why.
 
-## EventBatch Inspection
+**Reaching the log is not the same as becoming visible.** Every engine commits in stages, and the
+log position usually advances before the row is visible to a new snapshot:
 
-`EventBatch` provides several inspection methods:
+| Source | Position advances at | Visible at | Consequence |
+|---|---|---|---|
+| PostgreSQL | WAL commit-record write | proc-array clear, after the flush | A transaction can sit *below* the low watermark and still be invisible to the chunk read |
+| MySQL | binlog flush stage | InnoDB engine commit | Same shape |
+| SQL Server | capture-job harvest into `cdc.*` | before the harvest | Watermark **lags** visibility — the safe direction, nothing to do |
 
-- `batch.len()` / `batch.is_empty()` — event count
-- `batch.ack_mode()` — `AckMode::Required(token)` or `AckMode::NotRequired`
-- `batch.oldest_event_source_timestamp_ms()` — millisecond timestamp of the oldest event in the batch (for lag monitoring)
-- `batch.events()` — iterator over contained `Event` values
+Where the position leads visibility, the ordinal test answers `Before` for a transaction the chunk
+read could not see. The chunk row is not suppressed, and its pre-image is emitted over the newer
+value — silently.
 
-## Checkpoint Backends
+**Each shipped connector answers it differently, which is the point of the hook:**
 
-Checkpoint implementations persist source offsets and determine restart position.
+- **PostgreSQL** overrides it with the engine's own visibility rule. A snapshot is
+  `(xmin, xmax, xip)`, and a transaction is invisible exactly when `xid >= xmax || xip.contains(xid)`.
+  Both halves matter: `xmax` is `latestCompletedXid + 1`, so a lone in-flight transaction sits *at*
+  `xmax` and never appears in `xip`. An earlier version tested `xip` alone and therefore missed
+  precisely the transactions it was added to catch — `pg_current_snapshot()` on a single-writer
+  database reports `733:733:` with 733 in flight.
+- **MySQL** overrides it with executed-GTID **set difference**, because `Executed_Gtid_Set` is
+  updated after the engine commit while the binlog coordinate advances before it. A GTID set is
+  only *partially* ordered, so no `>` comparison could express this. Requires `gtid_mode = ON`;
+  without it, the ordinal test and its documented residual window apply.
+- **SQL Server** takes the default, because its watermark already lags visibility.
 
-Built-in options include:
+**Both bounds must come from the same notion of order.** Mixing them — a set-based lower bound with
+an ordinal upper bound — is unsound in a way that is easy to reach: an event inside the ordinal
+high bound but absent from the high watermark's set committed *after* that read, so suppressing it
+would discard the newer value.
 
-- `InMemoryCheckpoint` — zero-config, suitable for tests and short-lived processes. State is lost on restart.
-- `FileCheckpoint` — file-backed persistence; recommended for production.
-
-Custom checkpoint backends can be implemented through the `Checkpoint` trait.
-
-## Runtime Introspection
-
-The runtime exposes embeddable control-plane state and metrics surfaces:
-
-- `admin_snapshot()`
-- `admin_snapshot_json()`
-- `admin_metrics_prometheus()`
-
-Use these methods for health endpoints, diagnostics views, and lightweight observability bridges.
+If you cannot classify a particular event, fall back to the default rather than guess. MySQL does
+exactly that for an event with no GTID: treating a missing GTID as "not in `high`" would defer the
+event past the chunk on no evidence.
 
 ### Health verdict
 
@@ -1599,6 +1650,28 @@ registry-framed value with `ProtobufEncoder`'s unframed compact-JSON key, with n
 API signalling the mismatch. Keyless events (TRUNCATE, SCHEMA_CHANGE, tables with no declared
 primary key) produce a message with the `key` field **absent**, not empty, matching the
 `{"key": null}` the JSON Schema encoder emits and Debezium's behaviour.
+
+#### `Ok(None)` and `Err` are different outcomes
+
+`EventEncoder::encode_key` returns `Result<Option<Vec<u8>>>`, and the two negative outcomes are
+kept apart deliberately:
+
+| Outcome | Meaning | What a keyed sink should do |
+|---|---|---|
+| `Ok(Some(bytes))` | The event has a key | Publish with it |
+| `Ok(None)` | The event genuinely has **no** key — TRUNCATE, SCHEMA_CHANGE, no declared primary key, or a payload missing a key column | Publish unkeyed. Round-robin is correct; collapsing every keyless event onto one partition is not |
+| `Err(..)` | Encoding **failed**, for an event that does have a key | Do not publish. Retry or dead-letter it |
+
+Collapsing the third into the second is a silent correctness failure rather than a lost error
+message: a keyed sink reads `None` as "unkeyed", so the record is produced without a key,
+**ordering for that row is lost**, log compaction stops collapsing it — and the record still
+arrives, so nothing looks wrong. Through 0.11 the method returned a bare `Option` and
+`ConfluentAvroEncoder::encode_key` swallowed both of its failure paths with `.ok()`, so that
+outcome was expressible. It no longer is.
+
+This mirrors what the transform pipeline already does from the other side: a stage that destroys
+an event's key is rejected with an error naming the stage, rather than emitting the record
+unkeyed. It would have been inconsistent to let an encoder cause the same thing quietly.
 
 ### Cache warming
 

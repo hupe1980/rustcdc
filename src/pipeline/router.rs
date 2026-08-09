@@ -9,81 +9,17 @@ use crate::sink::{BoxedSink, SinkAdapter, SinkDeliveryGuarantee, SinkDeliveryMet
 
 // ─── Glob helpers ─────────────────────────────────────────────────────────────
 
-/// Returns `true` if `s` matches the glob `pattern`.
+/// Match a glob `pattern` against a `"schema.table"` or bare `"table"` key.
 ///
-/// Supported wildcards:
-/// - `*`  — zero or more of any character *within a single segment*.
-/// - `?`  — exactly one character.
+/// Re-exported from the crate's single glob implementation so routing and the connectors'
+/// `table_include_list` / `table_exclude_list` cannot drift apart — they used to, with the
+/// connectors matching exact strings only while nothing said so.
 ///
-/// To match across the schema/table boundary, use `*.*`.  A bare `*` pattern
-/// matches any event regardless of whether it carries a schema qualifier
-/// (`"*"` is a true catch-all and is the recommended default route pattern).
-fn glob_segment_matches(pattern: &str, s: &str) -> bool {
-    // Fast paths.
-    if pattern == "*" {
-        return true;
-    }
-    if !pattern.contains(['*', '?']) {
-        return pattern == s;
-    }
-    glob_match(pattern.as_bytes(), s.as_bytes())
-}
-
-/// Recursive glob match: `*` = zero-or-more of any byte, `?` = any single byte.
-fn glob_match(pat: &[u8], s: &[u8]) -> bool {
-    match (pat.split_first(), s.split_first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some((&b'*', rest_pat)), _) => {
-            // Try skip (consume nothing from s) or consume one byte from s.
-            glob_match(rest_pat, s) || (!s.is_empty() && glob_match(pat, &s[1..]))
-        }
-        (Some((&b'?', rest_pat)), Some((_, rest_s))) => glob_match(rest_pat, rest_s),
-        (Some((p, rest_pat)), Some((c, rest_s))) => p == c && glob_match(rest_pat, rest_s),
-        _ => false,
-    }
-}
-
-/// Match `pattern` against `table_key`, where `table_key` is either `"schema.table"`
-/// or a bare `"table"` string (no dot).
-///
-/// Matching semantics:
-///
-/// | Pattern          | Matches                                          |
-/// |------------------|--------------------------------------------------|
-/// | `"*"`            | anything (bare or qualified)                     |
-/// | `"*.*"`          | any qualified `schema.table`                     |
-/// | `"schema.*"`     | any table in the given schema                    |
-/// | `"*.table"`      | `table` in any schema                            |
-/// | `"schema.table"` | exact qualified match                            |
-/// | `"table"`        | exact bare-table match (no schema)               |
-/// | `"pre*"`         | tables starting with `pre` (bare or right-side)  |
+/// See [`crate::core`]'s glob module documentation for the full pattern table. In short:
+/// `"*"` is a catch-all, `"schema.*"` scopes to a schema, `"*.table"` scopes to a name,
+/// and an **unqualified** pattern such as `"orders"` matches that table in *every* schema.
 pub fn table_matches(pattern: &str, table_key: &str) -> bool {
-    // A bare "*" is a true catch-all.
-    if pattern == "*" {
-        return true;
-    }
-
-    let pat_dot = pattern.find('.');
-    let tbl_dot = table_key.find('.');
-
-    match (pat_dot, tbl_dot) {
-        // Both qualified: "schema.table" vs "schema.table"
-        (Some(pi), Some(ti)) => {
-            let (ps, pt) = pattern.split_at(pi);
-            let (ts, tt) = table_key.split_at(ti);
-            glob_segment_matches(ps, ts) && glob_segment_matches(&pt[1..], &tt[1..])
-        }
-        // Pattern qualified, table bare: never matches (schema required but missing).
-        (Some(_), None) => false,
-        // Pattern bare, table qualified: match pattern against the table-name part only.
-        (None, Some(ti)) => {
-            let (_, tt) = table_key.split_at(ti);
-            glob_segment_matches(pattern, &tt[1..])
-        }
-        // Both bare.
-        (None, None) => glob_segment_matches(pattern, table_key),
-    }
+    crate::core::glob::table_matches(pattern, table_key)
 }
 
 /// A type alias for a [`TableRouter`] that accepts heterogeneous sink types.
@@ -595,6 +531,7 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::glob::glob_segment_matches;
     use super::*;
     use crate::core::{Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     use crate::sink::MemorySinkAdapter;

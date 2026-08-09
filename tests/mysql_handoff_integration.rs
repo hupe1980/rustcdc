@@ -10,6 +10,10 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 fn json_object_get<'a>(
     value: &'a serde_json::Value,
     keys: &[&str],
@@ -19,6 +23,7 @@ fn json_object_get<'a>(
 }
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -46,6 +51,7 @@ async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
 /// Validates: snapshot completion → stream start → no gaps or duplicates
 #[tokio::test]
 async fn mysql_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql handoff test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());

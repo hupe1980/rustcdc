@@ -264,6 +264,13 @@ jobs:
           - postgres_stream_integration
           - postgres_wal_transport_parity_integration
           - postgres_incremental_snapshot_reconnect_integration
+          # The two transaction-id scales in the snapshot watermark bracket must agree.
+          # pg_snapshot_xip yields epoch-extended xid8; pgoutput's BEGIN carries a bare
+          # 32-bit xid. If the reduction between them is wrong the in-flight set silently
+          # never matches, the bracket degrades to the position-only test it replaced, and
+          # the commit-visibility race is back with every driver-level test still green —
+          # those use a fake backend that defines both scales itself.
+          - postgres_snapshot_visibility_integration
           # Per-table snapshot row filter: bounds the chunk reads, must not bound the stream.
           - postgres_snapshot_filter_integration
           # The same column must have the same JSON type whichever path it arrived by.
@@ -390,6 +397,10 @@ jobs:
           - mysql_connection_integration
           - mysql_snapshot_integration
           - mysql_type_fidelity_integration
+          # The MySQL GTID watermark: the event's GTID and Executed_Gtid_Set must be
+          # the same identifiers, or set membership silently never matches and the
+          # bracket degrades to the ordinal test with every unit test still green.
+          - mysql_gtid_watermark_integration
           - mysql_stream_integration
           - mysql_binlog_compression_integration
           - mysql_handoff_integration
@@ -487,6 +498,10 @@ jobs:
           - sqlserver_type_fidelity_integration
           - sqlserver_stream_integration
           - sqlserver_window_truncation_integration
+          # A change committed after a long idle period must still be captured. The idle
+          # phase deliberately withholds sp_cdc_scan so the harvested maximum stands
+          # still — forcing a scan would keep it advancing and mask the creep entirely.
+          - sqlserver_idle_window_integration
           - sqlserver_handoff_integration
           - runtime_sqlserver_process_crash_integration
           - sqlserver_to_otel_example_integration

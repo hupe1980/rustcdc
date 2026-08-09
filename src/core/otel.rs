@@ -178,30 +178,48 @@ impl OTelMetricsCollector {
             .with_reader(reader)
             .build();
 
+        // ── Instrument naming ────────────────────────────────────────────────────
+        //
+        // Every name is chosen so that the standard OpenTelemetry → Prometheus translation
+        // (dots to underscores, `_total` appended to monotonic counters) produces **the same
+        // series name** as this crate's own `/metrics` text exposition. That is not cosmetic.
+        //
+        // The two surfaces used to name overlapping quantities differently — OTel emitted
+        // `rustcdc.replication_lag_ms` and `rustcdc.buffer_size`, the text exposition emitted
+        // `rustcdc_runtime_replication_lag_ms` and `rustcdc_runtime_buffer_depth` — and the
+        // runbook documents only the latter. So every alert threshold in the runbook, applied
+        // by an operator on the OTel path, matched **nothing and never fired**. An alert that
+        // silently does not fire is worse than no alert: it looks like coverage.
+        //
+        // Units are deliberately in the name rather than declared via `with_unit`. A declared
+        // unit makes the Prometheus exporter append a unit suffix, which would break the
+        // correspondence this comment exists to preserve — and the unit-in-name form is the
+        // Prometheus convention anyway. `metric_names_match_the_prometheus_exposition` pins
+        // the mapping so it cannot drift again.
         let meter = meter_provider.meter("rustcdc");
         let instruments = MetricsInstruments {
             events_processed: meter
-                .u64_counter("rustcdc.events.processed")
+                .u64_counter("rustcdc.runtime.events_polled")
                 .with_description("Processed CDC events")
                 .build(),
             events_filtered: meter
-                .u64_counter("rustcdc.events.filtered")
+                .u64_counter("rustcdc.runtime.events_filtered")
                 .with_description("Filtered CDC events")
                 .build(),
             errors: meter
-                .u64_counter("rustcdc.errors")
+                .u64_counter("rustcdc.runtime.errors")
                 .with_description("CDC processing errors")
                 .build(),
             checkpoint_committed: meter
-                .u64_counter("rustcdc.checkpoint.committed_count")
+                .u64_counter("rustcdc.runtime.events_committed")
                 .with_description("Committed checkpoint event count")
                 .build(),
             replication_lag_ms: meter
-                .u64_gauge("rustcdc.replication_lag_ms")
+                .u64_gauge("rustcdc.runtime.replication_lag_ms")
                 .with_description("Replication lag in milliseconds")
                 .build(),
             replication_lag_events: meter
-                .u64_gauge("rustcdc.replication_lag_events")
+                .u64_gauge("rustcdc.runtime.replication_lag_events")
                 .with_description("Replication lag in events")
                 .build(),
             replication_slot_lag_bytes: meter
@@ -213,23 +231,23 @@ impl OTelMetricsCollector {
                 )
                 .build(),
             checkpoint_offset: meter
-                .u64_gauge("rustcdc.checkpoint_offset")
+                .u64_gauge("rustcdc.runtime.checkpoint_offset")
                 .with_description("Checkpoint offset surrogate value")
                 .build(),
             buffer_size: meter
-                .u64_gauge("rustcdc.buffer_size")
+                .u64_gauge("rustcdc.runtime.buffer_depth")
                 .with_description("In-flight event buffer size")
                 .build(),
             snapshot_progress: meter
-                .u64_gauge("rustcdc.snapshot_progress_percent")
+                .u64_gauge("rustcdc.runtime.snapshot_progress_percent")
                 .with_description("Snapshot progress percentage")
                 .build(),
             event_processing_duration: meter
-                .u64_histogram("rustcdc.event_processing_duration_ms")
+                .u64_histogram("rustcdc.runtime.event_processing_duration_ms")
                 .with_description("End-to-end event processing duration")
                 .build(),
             checkpoint_commit_duration: meter
-                .u64_histogram("rustcdc.checkpoint_commit_duration_ms")
+                .u64_histogram("rustcdc.runtime.checkpoint_commit_duration_ms")
                 .with_description("Checkpoint commit duration")
                 .build(),
         };
@@ -287,12 +305,12 @@ impl OTelMetricsCollector {
             // not doing.
             let op_name = op.to_str();
             let metric_key = match op {
-                Operation::Insert => "rustcdc.events.processed[op=insert]",
-                Operation::Update => "rustcdc.events.processed[op=update]",
-                Operation::Delete => "rustcdc.events.processed[op=delete]",
-                Operation::Read => "rustcdc.events.processed[op=read]",
-                Operation::SchemaChange => "rustcdc.events.processed[op=schema_change]",
-                Operation::Truncate => "rustcdc.events.processed[op=truncate]",
+                Operation::Insert => "rustcdc.runtime.events_polled[op=insert]",
+                Operation::Update => "rustcdc.runtime.events_polled[op=update]",
+                Operation::Delete => "rustcdc.runtime.events_polled[op=delete]",
+                Operation::Read => "rustcdc.runtime.events_polled[op=read]",
+                Operation::SchemaChange => "rustcdc.runtime.events_polled[op=schema_change]",
+                Operation::Truncate => "rustcdc.runtime.events_polled[op=truncate]",
                 // Deliberately exhaustive: `Operation` is `#[non_exhaustive]` only for
                 // downstream crates, so a new variant added here is a compile error
                 // until it gets a metric key — which is what we want.
@@ -322,7 +340,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             let entry = state
                 .counters
-                .entry("rustcdc.events.filtered".to_string())
+                .entry("rustcdc.runtime.events_filtered".to_string())
                 .or_insert((0, HashMap::new()));
             entry.0 = entry.0.saturating_add(count);
 
@@ -341,7 +359,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             state
                 .gauges
-                .insert("rustcdc.replication_lag_ms".to_string(), lag_ms as f64);
+                .insert("rustcdc.runtime.replication_lag_ms".to_string(), lag_ms as f64);
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.replication_lag_ms.record(lag_ms, &[]);
@@ -377,7 +395,7 @@ impl OTelMetricsCollector {
             let surrogate = offset.len() as u64;
             state
                 .gauges
-                .insert("rustcdc.checkpoint_offset".to_string(), surrogate as f64);
+                .insert("rustcdc.runtime.checkpoint_offset".to_string(), surrogate as f64);
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.checkpoint_offset.record(surrogate, &[]);
@@ -391,7 +409,7 @@ impl OTelMetricsCollector {
             push_bounded(
                 state
                     .histograms
-                    .entry("rustcdc.event_processing_duration_ms".to_string())
+                    .entry("rustcdc.runtime.event_processing_duration_ms".to_string())
                     .or_default(),
                 duration_ms,
             );
@@ -410,7 +428,7 @@ impl OTelMetricsCollector {
             push_bounded(
                 state
                     .histograms
-                    .entry("rustcdc.checkpoint_commit_duration_ms".to_string())
+                    .entry("rustcdc.runtime.checkpoint_commit_duration_ms".to_string())
                     .or_default(),
                 duration_ms,
             );
@@ -428,7 +446,7 @@ impl OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             state
                 .gauges
-                .insert("rustcdc.buffer_size".to_string(), size as f64);
+                .insert("rustcdc.runtime.buffer_depth".to_string(), size as f64);
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.buffer_size.record(size, &[]);
@@ -440,7 +458,7 @@ impl OTelMetricsCollector {
     pub fn record_snapshot_progress(&self, percent: u64) {
         if let Ok(mut state) = self.state.lock() {
             state.gauges.insert(
-                "rustcdc.snapshot_progress_percent".to_string(),
+                "rustcdc.runtime.snapshot_progress_percent".to_string(),
                 percent as f64,
             );
 
@@ -504,7 +522,7 @@ impl MetricsCollector for OTelMetricsCollector {
         if let Ok(mut state) = self.state.lock() {
             let entry = state
                 .counters
-                .entry("rustcdc.checkpoint.committed_count".to_string())
+                .entry("rustcdc.runtime.events_committed".to_string())
                 .or_insert((0, HashMap::new()));
             entry.0 = entry.0.saturating_add(event_count);
 
@@ -519,7 +537,7 @@ impl MetricsCollector for OTelMetricsCollector {
         self.record_replication_lag_gauge_ms(lag_ms);
         if let Ok(mut state) = self.state.lock() {
             state.gauges.insert(
-                "rustcdc.replication_lag_events".to_string(),
+                "rustcdc.runtime.replication_lag_events".to_string(),
                 lag_events as f64,
             );
 
@@ -538,7 +556,7 @@ impl MetricsCollector for OTelMetricsCollector {
     fn record_error(&self, error: &Error, context: &str) {
         let error_class = error_metric_class(error);
         if let Ok(mut state) = self.state.lock() {
-            let metric_key = format!("rustcdc.errors[context={context}]");
+            let metric_key = format!("rustcdc.runtime.errors[context={context}]");
             let entry = state
                 .counters
                 .entry(metric_key)
@@ -658,11 +676,11 @@ impl MetricsReport {
         })
     }
 
-    /// Sum of every `rustcdc.events.processed` counter across all operation labels.
+    /// Sum of every `rustcdc.runtime.events_polled` counter across all operation labels.
     pub fn total_events_processed(&self) -> u64 {
         self.counters
             .iter()
-            .filter(|(name, _)| name.starts_with("rustcdc.events.processed"))
+            .filter(|(name, _)| name.starts_with("rustcdc.runtime.events_polled"))
             .map(|(_, (count, _))| count)
             .sum()
     }
@@ -673,7 +691,7 @@ impl MetricsReport {
     /// [`MetricsReport::get_histogram_percentile`] for tail behaviour.
     pub fn avg_event_processing_latency(&self) -> Option<f64> {
         self.histograms
-            .get("rustcdc.event_processing_duration_ms")
+            .get("rustcdc.runtime.event_processing_duration_ms")
             .and_then(|values| {
                 if values.is_empty() {
                     None
@@ -1130,7 +1148,7 @@ mod tests {
         collector.record_events_filtered(2);
         let report = collector.export_metrics().unwrap();
         assert_eq!(report.total_events_processed(), 15);
-        assert_eq!(report.get_counter("rustcdc.events.filtered"), Some(2));
+        assert_eq!(report.get_counter("rustcdc.runtime.events_filtered"), Some(2));
     }
 
     #[test]
@@ -1153,12 +1171,12 @@ mod tests {
         collector.record_snapshot_progress(75);
         let report = collector.export_metrics().unwrap();
         assert_eq!(
-            report.get_gauge("rustcdc.replication_lag_ms"),
+            report.get_gauge("rustcdc.runtime.replication_lag_ms"),
             Some(1_000.0)
         );
-        assert_eq!(report.get_gauge("rustcdc.buffer_size"), Some(500.0));
+        assert_eq!(report.get_gauge("rustcdc.runtime.buffer_depth"), Some(500.0));
         assert_eq!(
-            report.get_gauge("rustcdc.snapshot_progress_percent"),
+            report.get_gauge("rustcdc.runtime.snapshot_progress_percent"),
             Some(75.0)
         );
     }
@@ -1262,20 +1280,20 @@ mod tests {
 
         let report = collector.export_metrics().unwrap();
         assert_eq!(
-            report.get_counter("rustcdc.checkpoint.committed_count"),
+            report.get_counter("rustcdc.runtime.events_committed"),
             Some(7)
         );
         assert_eq!(
-            report.get_gauge("rustcdc.replication_lag_events"),
+            report.get_gauge("rustcdc.runtime.replication_lag_events"),
             Some(3.0)
         );
         assert_eq!(
-            report.get_histogram_percentile("rustcdc.event_processing_duration_ms", 50.0),
+            report.get_histogram_percentile("rustcdc.runtime.event_processing_duration_ms", 50.0),
             Some(29)
         );
         assert!(report
             .counters
-            .contains_key("rustcdc.errors[context=runtime.poll]"));
+            .contains_key("rustcdc.runtime.errors[context=runtime.poll]"));
     }
 
     #[test]
@@ -1287,13 +1305,13 @@ mod tests {
             counters: HashMap::new(),
             gauges: HashMap::new(),
             histograms: HashMap::from([(
-                "rustcdc.event_processing_duration_ms".to_string(),
+                "rustcdc.runtime.event_processing_duration_ms".to_string(),
                 Vec::new(),
             )]),
         };
 
         assert_eq!(
-            report.get_histogram_percentile("rustcdc.event_processing_duration_ms", 95.0),
+            report.get_histogram_percentile("rustcdc.runtime.event_processing_duration_ms", 95.0),
             None
         );
         assert_eq!(report.avg_event_processing_latency(), None);

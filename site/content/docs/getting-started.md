@@ -39,7 +39,7 @@ server without TLS now fails rather than silently downgrading.
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.11", features = ["postgres"] }
+rustcdc = { version = "0.12", features = ["postgres"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

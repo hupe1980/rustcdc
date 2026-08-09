@@ -1034,17 +1034,62 @@ impl StoredCheckpointRecord {
 
     /// Build a record from an [`Offset`] about to be written.
     ///
+    /// # A non-JSON offset still gets the count check
+    ///
+    /// The position half of the guard reads named fields out of the offset, so it needs the
+    /// encoding to be JSON. Every built-in offset is, and for those a non-JSON encoding is a
+    /// defect worth failing on. A **custom** `Offset` is different: the trait invites any byte
+    /// encoding, and [`stream_position_regression`] cannot compare an unrecognised source type
+    /// anyway — it returns `None` rather than guessing.
+    ///
+    /// So refusing here would have made the rewind guard *unavailable* to exactly the
+    /// backends it was made public for, and unavailable at runtime, with a
+    /// `SerializationError` that names nothing useful. Instead a non-JSON offset from a source
+    /// type the guard does not compare positions for records `null` and keeps the
+    /// committed-event-count check, which is the half that does apply. Nothing is lost, because
+    /// the position comparison would have been skipped either way.
+    ///
     /// # Errors
     ///
-    /// Returns [`crate::core::Error::SerializationError`] if the encoded offset is not JSON.
+    /// Returns [`crate::core::Error::SerializationError`] if the encoded offset is not JSON
+    /// **and** the source type is one whose stream position this crate does compare — where a
+    /// non-JSON encoding is a bug rather than a design choice. The error names the source type
+    /// and says why the encoding matters.
     pub fn from_offset(offset: &dyn Offset, committed_event_count: u64) -> Result<Self> {
+        let source_type = offset.source_type().to_string();
+        let encoded = offset.encode()?;
+        let offset = match serde_json::from_slice(&encoded) {
+            Ok(value) => value,
+            Err(error) if compares_stream_position(&source_type) => {
+                return Err(crate::core::Error::SerializationError(format!(
+                    "checkpoint offset for source type '{source_type}' is not JSON ({error}),                      but this crate compares that source's stream position for rewind                      detection and needs the named fields to do it. This is a defect in the                      offset's `encode`, not a configuration problem."
+                )));
+            }
+            Err(_) => serde_json::Value::Null,
+        };
         Ok(Self {
-            source_type: offset.source_type().to_string(),
+            source_type,
             committed_event_count,
-            offset: serde_json::from_slice(&offset.encode()?)?,
+            offset,
         })
     }
 }
+
+/// Whether [`stream_position_regression`] compares stream positions for `source_type`.
+///
+/// Exported because it is the difference between "the rewind guard checks your position" and
+/// "the guard only checks your event count", and a custom [`Offset`] implementation has no
+/// other way to find out. It is also what lets [`StoredCheckpointRecord::from_offset`] accept
+/// a non-JSON encoding without silently dropping a check it would otherwise have performed.
+pub fn compares_stream_position(source_type: &str) -> bool {
+    POSITION_COMPARED_SOURCE_TYPES.contains(&source_type)
+}
+
+/// The source types [`stream_position_regression`] knows how to compare.
+///
+/// Kept as one list so this and the match in [`stream_position_regression`] cannot drift; a
+/// test asserts every entry is handled and that an unlisted type is left alone.
+const POSITION_COMPARED_SOURCE_TYPES: [&str; 4] = ["postgres", "mysql", "mariadb", "sqlserver"];
 
 /// Describe how `next` moved *behind* `existing`, or `None` if it did not.
 ///
@@ -1344,6 +1389,82 @@ impl Checkpoint for InMemoryCheckpoint {
             .back()
             .map(|entry| entry.committed_event_count)
             .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod rewind_guard_scope_tests {
+    use super::{compares_stream_position, stream_position_regression, StoredCheckpointRecord};
+    use crate::core::{Offset, Result};
+
+    /// An `Offset` whose encoding is deliberately not JSON — what the trait allows and a
+    /// custom connector may well do.
+    #[derive(Debug, Clone)]
+    struct OpaqueOffset(&'static str);
+
+    impl Offset for OpaqueOffset {
+        fn source_type(&self) -> &str {
+            self.0
+        }
+        fn encode(&self) -> Result<Vec<u8>> {
+            Ok(b"\x00not-json\xff".to_vec())
+        }
+    }
+
+    /// The rewind guard was made public so third-party checkpoint backends could use it.
+    /// Refusing a non-JSON offset made it unavailable to exactly those backends, at runtime,
+    /// with an error naming nothing useful — while the position comparison it needed the JSON
+    /// for would have been skipped for an unrecognised source type anyway.
+    #[test]
+    fn a_custom_sources_non_json_offset_still_yields_a_usable_record() {
+        let record = StoredCheckpointRecord::from_offset(&OpaqueOffset("my-connector"), 42)
+            .expect("a custom source's opaque offset must not make the guard unavailable");
+        assert_eq!(record.source_type, "my-connector");
+        assert_eq!(
+            record.committed_event_count, 42,
+            "the count check is the half that does apply, and it must survive"
+        );
+        assert!(record.offset.is_null());
+    }
+
+    /// For a source whose position this crate *does* compare, a non-JSON encoding is a defect
+    /// in that offset rather than a design choice, and must fail loudly.
+    #[test]
+    fn a_built_in_sources_non_json_offset_is_refused_with_a_named_reason() {
+        let error = StoredCheckpointRecord::from_offset(&OpaqueOffset("postgres"), 1)
+            .expect_err("a built-in source must not silently lose position checking");
+        let message = error.to_string();
+        assert!(message.contains("postgres"), "{message}");
+        assert!(message.contains("not JSON"), "{message}");
+    }
+
+    /// `compares_stream_position` and the match in `stream_position_regression` must not
+    /// drift: every listed type has to be handled, and an unlisted one left alone.
+    #[test]
+    fn the_advertised_scope_matches_what_the_guard_actually_compares() {
+        for source_type in ["postgres", "mysql", "mariadb", "sqlserver"] {
+            assert!(
+                compares_stream_position(source_type),
+                "{source_type} must be advertised as compared"
+            );
+        }
+        assert!(!compares_stream_position("my-connector"));
+        assert!(
+            stream_position_regression(
+                "my-connector",
+                &serde_json::json!({ "lsn": 100 }),
+                &serde_json::json!({ "lsn": 0 }),
+            )
+            .is_none(),
+            "an unadvertised source type must be left alone rather than guessed at"
+        );
+        // And a listed one is genuinely compared, so the advertisement is not empty.
+        assert!(stream_position_regression(
+            "postgres",
+            &serde_json::json!({ "lsn": 100, "slot_name": "s" }),
+            &serde_json::json!({ "lsn": 0, "slot_name": "s" }),
+        )
+        .is_some());
     }
 }
 
@@ -2060,6 +2181,8 @@ mod sqlserver_offset_compat_tests {
                 snapshot_id: "snap-1".into(),
                 tables: Vec::new(),
                 paused: false,
+                stopped: false,
+                generation: 0,
             },
         ));
         let decoded =

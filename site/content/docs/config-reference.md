@@ -15,15 +15,16 @@ weight = 40
 2. [Runtime Consumption Model](#runtime-consumption-model)
 3. [On-demand snapshots](#on-demand-snapshots)
 4. [Transaction boundaries](#transaction-boundaries)
-4. [Connector Capabilities](#connector-capabilities)
-5. [Column type mapping](#column-type-mapping)
-6. [PostgreSQL Source Configuration](#postgresql-source-configuration)
-7. [MySQL Source Configuration](#mysql-source-configuration)
-8. [MariaDB Source Configuration](#mariadb-source-configuration)
-9. [SQL Server Source Configuration](#sql-server-source-configuration)
-10. [Checkpoint Configuration](#checkpoint-configuration)
-11. [Observability Configuration](#observability-configuration)
-12. [Production Recommendations](#production-recommendations)
+5. [Connector Capabilities](#connector-capabilities)
+6. [Table filter patterns](#table-filter-patterns)
+7. [PostgreSQL Source Configuration](#postgresql-source-configuration)
+8. [Column type mapping](#column-type-mapping)
+9. [MySQL Source Configuration](#mysql-source-configuration)
+10. [MariaDB Source Configuration](#mariadb-source-configuration)
+11. [SQL Server Source Configuration](#sql-server-source-configuration)
+12. [Checkpoint Configuration](#checkpoint-configuration)
+13. [Observability Configuration](#observability-configuration)
+14. [Production Recommendations](#production-recommendations)
 
 ---
 
@@ -218,14 +219,56 @@ let abandoned_tables = runtime.stop_incremental_snapshot().await?;
 # }
 ```
 
+**A request may carry its own row filter**, which is usually what you want: "backfill tenant 42's
+orders" is a one-off, and expressing it through `table_conditions` means editing configuration
+and restarting to run something that was meant to be a signal. This is the shape Debezium's
+`execute-snapshot` has, with `data-collections` and `additional-conditions` together.
+
+```rust,no_run
+# use rustcdc::CdcRuntime;
+use rustcdc::source::SnapshotRequest;
+# async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+runtime
+    .request_incremental_snapshot_filtered(
+        SnapshotRequest::new(["public.orders"])
+            .with_condition("public.orders", "tenant_id = 42"),
+    )
+    .await?;
+# Ok(())
+# }
+```
+
+Re-requesting a table that already finished is a **deliberate re-snapshot**: it rewinds the
+cursor, adopts the new request's filter, and re-reads the table. The rows are delivered again
+rather than being suppressed as duplicates — before 0.12.0 the idempotency guard dropped every one
+of them, so the request reported success and delivered nothing.
+
+A request condition **overrides** the configured `table_conditions` entry for the same table; a
+table with no override keeps its configured filter. Both carry the same trust level — raw SQL,
+never built from untrusted input, and not a tenancy boundary.
+
+> **Before 0.12.0, `table_conditions` was silently ignored for on-demand requests.** The filter
+> was applied when resolving startup tables and tables adopted from a checkpoint, but not on the
+> request path — so a request read the whole table, and the only symptom was volume. Worse, the
+> two paths disagreed: a runtime-requested table ran unfiltered and then a restart adopted it
+> *with* the filter, so the emitted rows matched no single predicate. Both are fixed, and
+> `IncrementalSnapshotState` now reports the filter actually in effect per table so the question
+> is answerable from outside.
+
 | Operation | Effect on chunk reads | Effect on the live stream |
 |---|---|---|
 | `pause_incremental_snapshot` | Stops at the next chunk boundary | None — capture continues |
 | `resume_incremental_snapshot` | Continues from the chunk it stopped at | None |
-| `stop_incremental_snapshot` | Abandoned; cursors discarded | None — capture continues |
+| `stop_incremental_snapshot` | Abandoned; cursors discarded, and the stop survives a restart | None — capture continues |
 
 Both pause and resume are idempotent and return the **previous** state, so a retried operator
 action is safe and a caller can still tell whether it changed anything.
+
+**A stop survives a restart, including for configured tables.** It is recorded as an explicit
+flag rather than inferred from the absence of cursors — which is what made it silently
+ineffective, because a configured table with no cursor looks exactly like one that has not
+started, so the next deploy re-ran the whole backfill. Re-request the tables to start over; that
+clears the flag.
 
 **Pause takes effect at a chunk boundary.** A chunk already read is merged and delivered
 first. Stopping mid-chunk would either throw away a read the source has already paid for, or
@@ -367,6 +410,42 @@ The runtime constructor enforces capability guards. For example, configuring `sn
 
 ---
 
+## Table filter patterns
+
+Every connector's `table_include_list` and `table_exclude_list` take the same **case-insensitive
+glob patterns**, matched against `"schema.table"` — or against the bare table name when the
+source reports no schema. The sink router's `table_matches` uses the identical implementation,
+so a pattern that routes an event also selects it.
+
+| Pattern | Matches |
+|---|---|
+| `*` | everything, qualified or bare — a true catch-all |
+| `*.*` | any **qualified** `schema.table`, never a bare name |
+| `public.*` | every table in `public` |
+| `*.audit_log` | `audit_log` in any schema |
+| `public.orders` | that table in that schema, and nothing bare |
+| `public.tmp_*` | every `public` table whose name starts with `tmp_` |
+| `audit_?` | `audit_1`, not `audit_10` — `?` is exactly one character |
+
+`*` and `?` do not cross the `.` boundary; use `*.*` to span it. A qualified pattern never
+matches an event the source reports without a schema, because there is nothing to match the
+schema half against. Blank entries are ignored rather than treated as catch-alls.
+
+> **An unqualified pattern is schema-agnostic, and on an allowlist that is a widening.**
+> `table_include_list = ["users"]` captures `public.users` **and** `tenant_private.users`.
+> The behaviour is deliberate — MySQL callers name tables bare, and demanding a schema there
+> would make every pattern database-specific — but an allowlist exists to bound what leaves the
+> database, so `connect()` logs a WARN naming each unqualified include entry. Write
+> `"public.users"` when the schema matters.
+
+**These lists used to match exact strings only.** The globs are new in 0.12.0. Before that,
+`table_exclude_list = ["public.tmp_*"]` excluded nothing at all, which is indistinguishable from
+a set of tables that never changed; on the include side an allowlist matching nothing is
+indistinguishable from an idle database. If you carried a literal `*` in a list as a
+no-op placeholder, it is now a catch-all — check your lists before upgrading.
+
+---
+
 ## PostgreSQL Source Configuration
 
 | Field | Type | Default | Purpose |
@@ -381,8 +460,8 @@ The runtime constructor enforces capability guards. For example, configuring `sn
 | `publication_name` | `String` | — | Publication used by pgoutput. |
 | `create_replication_slot_if_missing` | `bool` | `false` | **Read the note below before setting this.** |
 | `failover_slot` | `bool` | `false` | Create the slot with `failover = true` (PostgreSQL 17+) so it survives a promotion. Only applies when this connector creates the slot. |
-| `table_include_list` | `Vec<String>` | `[]` | Allowlist in `"schema.table"` form. Non-empty means *only* these tables; takes precedence over the exclude list. Empty means all tables the publication carries. |
-| `table_exclude_list` | `Vec<String>` | `[]` | Blocklist in `"schema.table"` form. Ignored when the include list is non-empty. |
+| `table_include_list` | `Vec<String>` | `[]` | Allowlist of `"schema.table"` [glob patterns](#table-filter-patterns). Non-empty means *only* matching tables; takes precedence over the exclude list. Empty means all tables the publication carries. |
+| `table_exclude_list` | `Vec<String>` | `[]` | Blocklist of `"schema.table"` [glob patterns](#table-filter-patterns). Ignored when the include list is non-empty. |
 | `transport` | `TransportConfig` | TLS | TLS by default when the `tls` feature is on. |
 | `conn_timeout_secs` | `u64` | 30 | Range 1–300. |
 | `stream_poll_interval_ms` | `u64` | 50 | Range 1–60 000. |
@@ -685,15 +764,40 @@ values against real databases.
 
 | Source shape | JSON | Note |
 |---|---|---|
-| Integers within `i64`/`u64` | number | |
-| Exact numerics (`DECIMAL`, `NUMERIC`, `MONEY`) | string | Rendering as a JSON number would round-trip through a float and lose the low digits. |
-| Floating point | number | |
-| Booleans | boolean or number | PostgreSQL sends `t`/`f`; MySQL `TINYINT(1)` is a number. |
+| Integers, of any width | string | Including values inside `i64`. One rule beats a width-dependent one: a consumer must not have to know whether a column crossed 2^53 to know how to read it. |
+| Exact numerics (`DECIMAL`, `NUMERIC`, `MONEY`) | string | A JSON number round-trips through a float and loses the low digits. |
+| Floating point | string | The source's own shortest round-trip rendering. |
+| Booleans | string | PostgreSQL sends `"t"`/`"f"`; MySQL `TINYINT(1)` sends `"1"`/`"0"`. The source's form is preserved rather than normalised, because normalising would discard the distinction between a real `BOOLEAN` and a `TINYINT` used as one. |
 | Text | string | |
-| Binary (`BYTEA`, `VARBINARY`, `BLOB`) | string | Hex-encoded. Lossy UTF-8 transcoding would deliver a replacement character as though it were the stored value. |
-| JSON / JSONB | string | The source's own serialization, preserved verbatim. |
+| Binary (`BYTEA`, `VARBINARY`, `BLOB`) | string | Encoded, never transcoded — lossy UTF-8 transcoding would deliver a replacement character as though it were the stored value. **The encoding differs per connector**; see below. |
+| JSON / JSONB | string | The source's own serialization, verbatim, as a string containing JSON — not a nested object. Parse it if you need the structure. |
 | `NULL` | `null` | Present as a key with a null value — **not** an absent key. |
 | Value the source could not supply | *key absent* | Listed in `unavailable_columns`; see [partial payloads](@/docs/api.md#partial-payloads-read-this-before-writing-a-sink). |
+
+> **Every scalar is a JSON string.** That is the whole rule, and it is why the table has no
+> `number` or `boolean` row. A JSON number is an IEEE-754 double by the time most consumers see
+> it, so `numeric(38,4)` and `bigint` past 2^53 do not survive one — and a representation that
+> depended on the value's magnitude would be undecodable without inspecting each value first.
+> Read with `value.as_str()` and parse. This table described JSON numbers before 0.11.0; if you
+> built against that, integers and floats now arrive quoted.
+
+### Binary column encoding, per connector
+
+There is no single form, because each connector's lossless path produces a different one. The
+encoding is a property of the **connector**, not of the value, so a consumer picks one decoder
+per source and never inspects a value to decide:
+
+| Connector | Form | Example for the bytes `DE AD BE EF` |
+|---|---|---|
+| PostgreSQL | PostgreSQL's own hex output, `\x`-prefixed | `"\\xdeadbeef"` |
+| MySQL / MariaDB | lowercase hex, no prefix | `"deadbeef"` |
+| SQL Server | whatever `FOR JSON PATH` emits for `varbinary`, which the connector passes through unaltered | asserted by `tests/sqlserver_type_fidelity_integration.rs` rather than restated here |
+
+**MySQL's form used to depend on the value.** A binary column whose bytes happened to be valid
+UTF-8 arrived as text, and the same column's other rows arrived as hex — so no single decoder was
+correct for the column. The binlog's charset metadata (collation `63` is `binary`) now decides,
+and a column type alone cannot: `BLOB` and `TEXT` share one type, `VARBINARY` and `VARCHAR`
+share another. Fixed in 0.12.0.
 
 The last two rows are the distinction that matters most: a missing key means "no information",
 a `null` means "the value is NULL". Collapsing them is the classic CDC corruption.
@@ -816,8 +920,8 @@ raises an error at startup.)
 | `server_flavor` | `ServerFlavor` | `Mysql` | Set `MariaDb` when connecting to MariaDB: `source_type()` then returns `"mariadb"` and checkpoints use a separate `checkpoint_mariadb.json`. |
 | `gtid_mode_enabled` | `bool` | `false` | Whether GTID mode is enabled on the server. |
 | `binlog_format_check` | `bool` | `true` | Validate `binlog_format = ROW` before streaming. |
-| `table_include_list` | `Vec<String>` | `[]` | Allowlist in `"schema.table"` form; takes precedence over the exclude list. |
-| `table_exclude_list` | `Vec<String>` | `[]` | Blocklist in `"schema.table"` form. |
+| `table_include_list` | `Vec<String>` | `[]` | Allowlist of `"schema.table"` [glob patterns](#table-filter-patterns); takes precedence over the exclude list. |
+| `table_exclude_list` | `Vec<String>` | `[]` | Blocklist of `"schema.table"` [glob patterns](#table-filter-patterns). |
 | `transport` | `TransportConfig` | TLS | |
 | `conn_timeout_secs` | `u64` | 30 | Range 1–300. |
 | `stream_poll_interval_ms` | `u64` | 50 | Range 1–60 000. |
@@ -895,8 +999,8 @@ MariaDB supports the same startup, snapshot, and streaming modes as MySQL, but e
 | `cdc_enabled` | `bool` | `true` | Require CDC to be enabled on the database, and fail connect if it is not. |
 | `cdc_schema` | `String` | `"cdc"` | Schema holding the CDC capture tables. |
 | `capture_truncate_events` | `bool` | `false` | Capture `TRUNCATE TABLE` via a DDL trigger; see below. |
-| `table_include_list` | `Vec<String>` | `[]` | Allowlist in `"schema.table"` form; takes precedence over the exclude list. |
-| `table_exclude_list` | `Vec<String>` | `[]` | Blocklist in `"schema.table"` form. |
+| `table_include_list` | `Vec<String>` | `[]` | Allowlist of `"schema.table"` [glob patterns](#table-filter-patterns); takes precedence over the exclude list. |
+| `table_exclude_list` | `Vec<String>` | `[]` | Blocklist of `"schema.table"` [glob patterns](#table-filter-patterns). |
 | `transport` | `TransportConfig` | TLS | |
 | `conn_timeout_secs` | `u64` | 30 | Range 1–300. |
 | `prereq_pool_size` | `usize` | 4 | Concurrent connections used by prerequisite checks. Range 1–64. |

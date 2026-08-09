@@ -196,6 +196,7 @@ postgres_suites=(
   "postgres stream|postgres_stream_integration|postgres"
   "postgres wal transport parity|postgres_wal_transport_parity_integration|postgres"
   "postgres incremental snapshot reconnect|postgres_incremental_snapshot_reconnect_integration|postgres"
+  "postgres snapshot watermark visibility|postgres_snapshot_visibility_integration|postgres"
   "postgres wal transport backlog evidence|postgres_wal_transport_backlog_evidence|postgres"
   "postgres handoff|postgres_handoff_integration|postgres"
   "postgres checkpoint|checkpoint_file_integration|postgres"
@@ -208,6 +209,7 @@ postgres_suites=(
 
 mysql_suites=(
   "mysql connection|mysql_connection_integration|mysql"
+  "mysql gtid watermark|mysql_gtid_watermark_integration|mysql"
   "mysql snapshot|mysql_snapshot_integration|mysql"
   "mysql stream|mysql_stream_integration|mysql"
   "mysql binlog compression|mysql_binlog_compression_integration|mysql"
@@ -225,6 +227,7 @@ sqlserver_suites=(
   "sqlserver snapshot|sqlserver_snapshot_integration|sqlserver"
   "sqlserver stream|sqlserver_stream_integration|sqlserver"
   "sqlserver window truncation|sqlserver_window_truncation_integration|sqlserver"
+  "sqlserver idle window|sqlserver_idle_window_integration|sqlserver"
   "sqlserver handoff|sqlserver_handoff_integration|sqlserver"
   "sqlserver process crash|runtime_sqlserver_process_crash_integration|sqlserver"
 )

@@ -22,7 +22,7 @@ use crate::{
 
 use super::query::{query_all_columns, row_as_text_json};
 use super::{
-    parse_pg_lsn, parse_table_reference, qualified_table_name, query_current_wal_lsn,
+    parse_pg_lsn, parse_table_reference, qualified_table_name,
     query_primary_key_columns_and_types, quote_pg_identifier,
 };
 
@@ -99,6 +99,104 @@ fn condition_clause(table: &SnapshotTable, lead_in: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A PostgreSQL snapshot's visibility fence: `xmax` plus the in-progress xid list.
+///
+/// Parsed from `pg_current_snapshot()::text`, whose format is `xmin:xmax:xip1,xip2,…`. Read as
+/// one value in one round trip so the two halves cannot disagree.
+///
+/// Values are truncated to 32 bits, because pgoutput's `BEGIN` carries a bare 32-bit `xid` while
+/// this function reports epoch-extended `xid8`. Comparing them unreduced would never match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PgSnapshotFence {
+    /// `xmax`, reduced to 32 bits. A transaction at or above this is invisible.
+    xmax: u64,
+    /// In-progress xids below `xmax`, reduced to 32 bits.
+    xip: std::collections::HashSet<u64>,
+    /// `false` when no snapshot was recorded, which disables the visibility half of the test.
+    present: bool,
+}
+
+impl PgSnapshotFence {
+    /// Parse `pg_current_snapshot()::text` — `xmin:xmax:xip1,xip2,…`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error rather than an empty fence for a malformed value. An empty fence silently
+    /// disables the visibility test and reopens the race, so guessing is worse than failing.
+    fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        let mut parts = raw.split(':');
+        let (Some(_xmin), Some(xmax_raw)) = (parts.next(), parts.next()) else {
+            return Err(Error::SourceError(format!(
+                "could not parse pg_current_snapshot() '{raw}': expected xmin:xmax:xip"
+            )));
+        };
+
+        let reduce = |value: &str| -> Result<u64> {
+            value
+                .trim()
+                .parse::<u64>()
+                .map(|xid| xid & u64::from(u32::MAX))
+                .map_err(|error| {
+                    Error::SourceError(format!(
+                        "could not parse xid '{value}' in pg_current_snapshot() '{raw}': {error}"
+                    ))
+                })
+        };
+
+        let xmax = reduce(xmax_raw)?;
+        let mut xip = std::collections::HashSet::new();
+        for entry in parts.flat_map(|list| list.split(',')) {
+            if entry.trim().is_empty() {
+                continue;
+            }
+            xip.insert(reduce(entry)?);
+        }
+
+        Ok(Self {
+            xmax,
+            xip,
+            present: true,
+        })
+    }
+
+    /// Whether `xid` was invisible to the snapshot this fence came from.
+    ///
+    /// PostgreSQL's own rule: `xid >= xmax || xip.contains(xid)`. Both halves matter — `xmax` is
+    /// `latestCompletedXid + 1`, so a lone in-flight transaction sits *at* `xmax` and never
+    /// appears in `xip`.
+    fn was_invisible(&self, xid: u64) -> bool {
+        self.present && (xid >= self.xmax || self.xip.contains(&xid))
+    }
+}
+
+/// A PostgreSQL watermark: a WAL position, and the visibility fence read alongside it.
+///
+/// `Ord` compares the **LSN only**. Ordering answers "has the stream reached the high watermark?",
+/// which is a question about log position. The fence answers a different one — "could the chunk
+/// read have seen this?" — and no LSN comparison can express it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgWatermark {
+    /// WAL position.
+    pub lsn: u64,
+    /// Visibility fence, empty for an event's position (an event is one transaction, not a
+    /// snapshot).
+    snapshot: PgSnapshotFence,
+}
+
+impl Ord for PgWatermark {
+    /// Compares the LSN only; see the type documentation.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.lsn.cmp(&other.lsn)
+    }
+}
+
+impl PartialOrd for PgWatermark {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// PostgreSQL half of the incremental snapshot.
 pub struct PostgresSnapshotBackend {
     /// Regular (non-replication) connection used for chunk SELECTs and LSN checks.
@@ -108,7 +206,7 @@ pub struct PostgresSnapshotBackend {
 
 #[async_trait]
 impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
-    type Position = u64;
+    type Position = PgWatermark;
 
     async fn describe_table(&mut self, table_ref: &str) -> Result<SnapshotTable> {
         let (schema, name) = parse_table_reference(table_ref)?;
@@ -130,8 +228,98 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
         })
     }
 
-    async fn current_position(&mut self) -> Result<u64> {
-        query_current_wal_lsn(&self.query_client).await
+    /// The current WAL position **and** the snapshot visibility fence, in one round trip.
+    ///
+    /// Both come from a single `SELECT` so they describe the same instant. The fence is what
+    /// closes the commit-visibility race — see
+    /// [`event_in_bracket`](Self::event_in_bracket).
+    async fn current_position(&mut self) -> Result<PgWatermark> {
+        let row = self
+            .query_client
+            .query_one(
+                "SELECT pg_current_wal_lsn()::text, pg_current_snapshot()::text",
+                &[],
+            )
+            .await
+            .map_err(|error| {
+                Error::SourceError(format!(
+                    "failed reading WAL LSN and snapshot fence: {error}. The incremental \
+                     snapshot needs both to bracket a chunk read correctly"
+                ))
+            })?;
+
+        let lsn: String = row.get(0);
+        let snapshot: String = row.get(1);
+        Ok(PgWatermark {
+            lsn: parse_pg_lsn(&lsn)?,
+            snapshot: PgSnapshotFence::parse(&snapshot)?,
+        })
+    }
+
+    /// Classify a live event against the bracket, using PostgreSQL's own visibility rule.
+    ///
+    /// # Why the position test alone is wrong
+    ///
+    /// Committing is not atomic with respect to the WAL. PostgreSQL writes the commit record
+    /// (advancing `pg_current_wal_lsn()`), flushes it, and only *then* clears the transaction
+    /// from the proc array — which is what makes it visible to new snapshots. So a transaction
+    /// can sit at commit LSN 500 with a low watermark of 600 and still be invisible to the chunk
+    /// `SELECT`: the chunk holds its pre-image, `position > low` is false, nothing is suppressed,
+    /// and the stale value is emitted over the newer one.
+    ///
+    /// # The rule, which is PostgreSQL's own
+    ///
+    /// A snapshot is `(xmin, xmax, xip)`, and a transaction is **invisible** to it exactly when
+    ///
+    /// ```text
+    /// xid >= xmax  ||  xip.contains(xid)
+    /// ```
+    ///
+    /// Both halves are needed, and getting that wrong is not academic: `xmax` is
+    /// `latestCompletedXid + 1`, so an in-flight transaction whose xid is the highest assigned —
+    /// which is the common case for one mid-commit — sits **at or above `xmax` and is therefore
+    /// absent from `xip`**. An earlier version of this connector tested `xip` alone and so missed
+    /// precisely the transactions the bracket exists to catch. `pg_current_snapshot()` on a
+    /// single-writer database reports `733:733:` with 733 in flight: empty `xip`, and the whole
+    /// answer in `xmax`.
+    ///
+    /// # Why this closes the window
+    ///
+    /// The snapshot is read **after** the low watermark and **before** the chunk read. Let `S` be
+    /// the chunk read's snapshot and `S₀` the one recorded here. Any transaction invisible to `S`
+    /// is invisible to `S₀` — `S₀` is earlier — so by the rule above it is either at/above
+    /// `S₀.xmax` or in `S₀.xip`, and either way this test flags it. Nothing that the chunk could
+    /// not see escapes.
+    ///
+    /// Over-suppression in the other direction is harmless: the chunk row is dropped and the
+    /// stream event carries the same or a newer value.
+    ///
+    /// The upper bound stays the LSN, because "did this commit after the chunk read finished?" is
+    /// a question about log position and the high watermark is one.
+    fn event_in_bracket(
+        &self,
+        event: &Event,
+        position: &PgWatermark,
+        low: &PgWatermark,
+        high: &PgWatermark,
+    ) -> crate::source::BracketPosition {
+        use crate::source::BracketPosition;
+
+        if position.lsn > high.lsn {
+            return BracketPosition::After;
+        }
+
+        let invisible_to_chunk = position.lsn > low.lsn
+            || event
+                .transaction
+                .as_ref()
+                .is_some_and(|tx| low.snapshot.was_invisible(tx.tx_id));
+
+        if invisible_to_chunk {
+            BracketPosition::Inside
+        } else {
+            BracketPosition::Before
+        }
     }
 
     async fn fetch_chunk(
@@ -228,12 +416,17 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
         Ok(decoded)
     }
 
-    fn position_of_event(&self, event: &Event) -> Option<u64> {
-        parse_pg_lsn(&event.source.offset).ok()
+    fn position_of_event(&self, event: &Event) -> Option<PgWatermark> {
+        Some(PgWatermark {
+            lsn: parse_pg_lsn(&event.source.offset).ok()?,
+            // An event is one transaction, not a snapshot; membership is answered against the
+            // *watermarks'* fences.
+            snapshot: PgSnapshotFence::default(),
+        })
     }
 
-    fn render_position(&self, position: &u64) -> String {
-        super::format_pg_lsn(*position)
+    fn render_position(&self, position: &PgWatermark) -> String {
+        super::format_pg_lsn(position.lsn)
     }
 
     fn offset_with_snapshot_state(

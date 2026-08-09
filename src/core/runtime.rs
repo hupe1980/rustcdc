@@ -4493,6 +4493,70 @@ mod tests {
         );
     }
 
+    /// The PostgreSQL case above proved the override is honoured for the connector the
+    /// runtime knows. This proves it for the one it does not — which is where the trait
+    /// documentation's promise actually had to be taken on faith.
+    #[tokio::test]
+    async fn a_custom_sources_resume_position_reaches_the_checkpoint() {
+        // `build_checkpoint_offset` used to read `event.source.offset` directly on the
+        // generic path, so a custom connector implementing `resume_offset_for` — the one
+        // hook that exists for a log filtering at transaction granularity — had its
+        // correct answer discarded. It then took the guaranteed duplicate-per-restart the
+        // PostgreSQL connector was fixed for, with no way to tell from the outside.
+        struct CustomResumeStream;
+
+        #[async_trait::async_trait]
+        impl crate::source::StreamHandle for CustomResumeStream {
+            async fn next_events(&mut self, _timeout_ms: u64) -> crate::core::Result<Vec<Event>> {
+                Ok(Vec::new())
+            }
+            async fn save_position(
+                &self,
+                _checkpoint: &mut dyn crate::checkpoint::Checkpoint,
+            ) -> crate::core::Result<()> {
+                Ok(())
+            }
+            async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+                Ok(())
+            }
+            fn resume_offset_for(&self, _event: &Event) -> Option<String> {
+                Some("boundary-200".to_string())
+            }
+        }
+
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::Disabled,
+            InMemoryCheckpoint::default(),
+            InMemorySchemaHistory::default(),
+        );
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.state = RuntimeState::Running;
+        runtime.stream = Some(Box::new(CustomResumeStream));
+
+        let mut event = event();
+        event.source.source_name = "my-connector".into();
+        event.source.offset = "change-100".into();
+        runtime.enqueue_event(event).unwrap();
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(batch.len(), 1);
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+
+        let stored = runtime
+            .config
+            .checkpoint
+            .load()
+            .await
+            .unwrap()
+            .expect("a checkpoint was written");
+        assert_eq!(
+            String::from_utf8(stored.encode().unwrap()).unwrap(),
+            "boundary-200",
+            "the checkpoint must record the handle's resume position verbatim, not the \
+             change's own offset"
+        );
+    }
+
     #[tokio::test]
     async fn a_control_handle_drives_the_runtime_from_another_task() {
         // The problem this solves: an event loop holds `&mut CdcRuntime` for its lifetime,
@@ -4538,6 +4602,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(IncrementalSnapshotState {
             snapshot_id: "snap-1".into(),
             paused: false,
+            stopped: false,
+            generation: 0,
             tables: vec![IncrementalSnapshotTableState {
                 table: "public.orders".into(),
                 rows_emitted: 42,

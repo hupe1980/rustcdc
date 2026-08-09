@@ -240,7 +240,13 @@ pub(super) fn mysql_row_to_json(row: &MysqlRow) -> serde_json::Value {
         let name = column.name_str().to_string();
         let value = row
             .as_ref(index)
-            .map(|value| mysql_value_to_json_typed(value, Some(column.column_type())))
+            .map(|value| {
+                mysql_value_to_json_for_column(
+                    value,
+                    column.column_type(),
+                    column.character_set(),
+                )
+            })
             .unwrap_or(serde_json::Value::Null);
         object.insert(name, value);
     }
@@ -249,6 +255,74 @@ pub(super) fn mysql_row_to_json(row: &MysqlRow) -> serde_json::Value {
 
 pub(super) fn mysql_value_to_json(value: &MysqlValue) -> serde_json::Value {
     mysql_value_to_json_typed(value, None)
+}
+
+/// MySQL's collation id for the `binary` character set.
+///
+/// A column is binary — `BINARY`, `VARBINARY`, `TINYBLOB`…`LONGBLOB` — exactly when it is a
+/// character-typed column carrying this charset. The *column type* cannot tell you: `BLOB`
+/// and `TEXT` share `MYSQL_TYPE_BLOB`, `VARBINARY` and `VARCHAR` share
+/// `MYSQL_TYPE_VAR_STRING`, `BINARY` and `CHAR` share `MYSQL_TYPE_STRING`. Only the charset
+/// separates them.
+const MYSQL_BINARY_CHARSET: u16 = 63;
+
+/// Whether a column holds bytes rather than text.
+///
+/// `mysql_common` resolves each binlog column's charset from the table-map's optional
+/// metadata — `DEFAULT_CHARSET` or `COLUMN_CHARSET`, whichever the server sent — and pairs it
+/// with the column, using the same character-column indexing its own value parser uses. The
+/// result-set path gets the collation id straight from the column-definition packet. So this
+/// is a lookup, not arithmetic, and it cannot drift from the library's own reading.
+///
+/// A charset of `0` means the metadata was absent, which is treated as text — the behaviour
+/// before this existed. `binlog_row_metadata = FULL` is already required for column names and
+/// key flags, so present is the normal case.
+fn is_binary_column(column_type: ColumnType, charset: u16) -> bool {
+    column_type.is_character_type() && charset == MYSQL_BINARY_CHARSET
+}
+
+/// Convert a value, using the column's type **and charset**.
+///
+/// # Why the charset is load-bearing
+///
+/// `MysqlValue::Bytes` carries almost everything MySQL sends as a string: `VARCHAR`, `TEXT`,
+/// `JSON`, `DECIMAL`, and also `VARBINARY` and `BLOB`. Deciding how to render it from the
+/// bytes alone — text when they are valid UTF-8, hex when they are not — makes the
+/// representation depend on the **value** rather than the column, and that is not a
+/// representation a consumer can decode:
+///
+/// - A `BLOB` holding `hello` arrives as `"hello"`; the same column holding `0xDEADBEEF`
+///   arrives as `"deadbeef"`. Nothing in the event says which happened.
+/// - A consumer that hex-decodes corrupts the first row (or fails, if the text is not all hex
+///   digits). One that reads text corrupts the second, silently.
+/// - A `VARCHAR` containing the literal text `deadbeef` is indistinguishable from a
+///   `VARBINARY` containing those four bytes.
+///
+/// The configuration reference promised "hex-encoded" for binary columns, which was true only
+/// for values that happened not to be valid UTF-8. With the charset, a binary column is
+/// **always** hex and a text column is **always** text, so the promise holds per column.
+pub(super) fn mysql_value_to_json_for_column(
+    value: &MysqlValue,
+    column_type: ColumnType,
+    charset: u16,
+) -> serde_json::Value {
+    if let MysqlValue::Bytes(bytes) = value {
+        if is_binary_column(column_type, charset) {
+            return serde_json::Value::String(hex_encode(bytes));
+        }
+    }
+    mysql_value_to_json_typed(value, Some(column_type))
+}
+
+/// Lowercase hex, no prefix — the form the configuration reference documents for MySQL.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // Writing into a String cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Convert a binlog value, using the column's declared type where the value alone is
@@ -296,15 +370,13 @@ pub(super) fn mysql_value_to_json_typed(
     }
     match value {
         MysqlValue::NULL => serde_json::Value::Null,
+        // Reached only when the column's charset is unknown or the column is not binary.
+        // A binary column is hex-encoded by `mysql_value_to_json_for_column` before it gets
+        // here; this fallback exists for paths with no column metadata at all, where
+        // guessing from the bytes is the only option left.
         MysqlValue::Bytes(bytes) => String::from_utf8(bytes.clone())
             .map(serde_json::Value::String)
-            .unwrap_or_else(|_| {
-                let mut hex = String::with_capacity(bytes.len() * 2);
-                for byte in bytes {
-                    hex.push_str(&format!("{byte:02x}"));
-                }
-                serde_json::Value::String(hex)
-            }),
+            .unwrap_or_else(|_| serde_json::Value::String(hex_encode(bytes))),
         // Numerics render as text like every other value. A JSON number is an IEEE-754
         // double once it reaches most consumers, which rounds `BIGINT` past 2^53 and
         // `DOUBLE` at the last digits — and it disagreed with the connectors whose values
@@ -587,7 +659,9 @@ pub(super) fn mysql_row_to_json_with_labels(
                     raw.map(|value| mysql_value_to_json_typed(value, Some(column_type)))
                 })
             }
-            _ => raw.map(|value| mysql_value_to_json_typed(value, Some(column_type))),
+            _ => raw.map(|value| {
+                mysql_value_to_json_for_column(value, column_type, column.character_set())
+            }),
         }
         .unwrap_or(serde_json::Value::Null);
 
@@ -712,5 +786,129 @@ mod enum_set_tests {
         assert_eq!(numeric_value(&MysqlValue::Int(2)), Some(2));
         assert_eq!(numeric_value(&MysqlValue::UInt(2)), Some(2));
         assert_eq!(numeric_value(&MysqlValue::Bytes(b"happy".to_vec())), None);
+    }
+}
+
+#[cfg(test)]
+mod binary_column_tests {
+    use super::*;
+
+    fn bytes(raw: &[u8]) -> MysqlValue {
+        MysqlValue::Bytes(raw.to_vec())
+    }
+
+    /// The bug this closes: rendering depended on the **value**, not the column.
+    ///
+    /// A `BLOB` holding `hello` came out as `"hello"` and the same column holding
+    /// `0xDEADBEEF` came out as `"deadbeef"`, with nothing in the event saying which. No
+    /// consumer can decode that: hex-decoding corrupts the first row, reading text corrupts
+    /// the second, and a `VARCHAR` containing the literal text `deadbeef` is
+    /// indistinguishable from a `VARBINARY` holding those four bytes.
+    #[test]
+    fn a_binary_column_is_hex_encoded_whatever_its_bytes_happen_to_be() {
+        // Valid UTF-8 in a binary column: used to arrive as text.
+        assert_eq!(
+            mysql_value_to_json_for_column(
+                &bytes(b"hello"),
+                ColumnType::MYSQL_TYPE_BLOB,
+                MYSQL_BINARY_CHARSET
+            ),
+            serde_json::json!("68656c6c6f")
+        );
+        // Not valid UTF-8: already hex before, and still is.
+        assert_eq!(
+            mysql_value_to_json_for_column(
+                &bytes(&[0xDE, 0xAD, 0xBE, 0xEF]),
+                ColumnType::MYSQL_TYPE_BLOB,
+                MYSQL_BINARY_CHARSET
+            ),
+            serde_json::json!("deadbeef")
+        );
+    }
+
+    /// `VARBINARY` and `VARCHAR` share a column type, and `BINARY`/`CHAR` share another.
+    /// Only the charset separates them, which is why the type alone was never enough.
+    #[test]
+    fn the_charset_and_not_the_type_decides() {
+        for column_type in [
+            ColumnType::MYSQL_TYPE_BLOB,
+            ColumnType::MYSQL_TYPE_VAR_STRING,
+            ColumnType::MYSQL_TYPE_STRING,
+            ColumnType::MYSQL_TYPE_VARCHAR,
+        ] {
+            assert_eq!(
+                mysql_value_to_json_for_column(&bytes(b"ab"), column_type, MYSQL_BINARY_CHARSET),
+                serde_json::json!("6162"),
+                "charset 63 on {column_type:?} is a binary column"
+            );
+            // utf8mb4_general_ci
+            assert_eq!(
+                mysql_value_to_json_for_column(&bytes(b"ab"), column_type, 45),
+                serde_json::json!("ab"),
+                "a text charset on {column_type:?} must stay text"
+            );
+        }
+    }
+
+    /// Types that are not character columns carry no meaningful charset, and hex-encoding
+    /// them would be catastrophic: `DECIMAL` and `JSON` both arrive as `Bytes`.
+    #[test]
+    fn non_character_columns_are_never_hex_encoded() {
+        assert_eq!(
+            mysql_value_to_json_for_column(
+                &bytes(b"12345.6789"),
+                ColumnType::MYSQL_TYPE_NEWDECIMAL,
+                MYSQL_BINARY_CHARSET
+            ),
+            serde_json::json!("12345.6789"),
+            "a DECIMAL rendered as hex would be unrecoverable garbage"
+        );
+        assert_eq!(
+            mysql_value_to_json_for_column(
+                &bytes(br#"{"a":1}"#),
+                ColumnType::MYSQL_TYPE_JSON,
+                MYSQL_BINARY_CHARSET
+            ),
+            serde_json::json!(r#"{"a":1}"#),
+        );
+    }
+
+    /// Absent charset metadata means charset 0, which must behave as it did before rather
+    /// than silently reclassifying every string column as binary.
+    #[test]
+    fn a_missing_charset_falls_back_to_the_previous_behaviour() {
+        assert_eq!(
+            mysql_value_to_json_for_column(&bytes(b"hello"), ColumnType::MYSQL_TYPE_BLOB, 0),
+            serde_json::json!("hello")
+        );
+        assert_eq!(
+            mysql_value_to_json_for_column(
+                &bytes(&[0xDE, 0xAD, 0xBE, 0xEF]),
+                ColumnType::MYSQL_TYPE_BLOB,
+                0
+            ),
+            serde_json::json!("deadbeef"),
+            "with no metadata, guessing from the bytes is the only option left"
+        );
+    }
+
+    #[test]
+    fn temporal_and_numeric_rendering_is_unchanged_by_the_charset_path() {
+        assert_eq!(
+            mysql_value_to_json_for_column(
+                &MysqlValue::Int(-7),
+                ColumnType::MYSQL_TYPE_LONG,
+                MYSQL_BINARY_CHARSET
+            ),
+            serde_json::json!("-7")
+        );
+        assert_eq!(
+            mysql_value_to_json_for_column(
+                &MysqlValue::Date(2026, 7, 20, 0, 0, 0, 0),
+                ColumnType::MYSQL_TYPE_NEWDATE,
+                0
+            ),
+            serde_json::json!("2026-07-20")
+        );
     }
 }

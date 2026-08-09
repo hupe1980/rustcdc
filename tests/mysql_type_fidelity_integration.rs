@@ -29,6 +29,10 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 fn skip() -> bool {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql type-fidelity test (set CDC_RS_RUN_DOCKER_TESTS=1)");
@@ -38,6 +42,7 @@ fn skip() -> bool {
 }
 
 async fn start_mysql() -> rustcdc::Result<(ContainerAsync<GenericImage>, String, u16)> {
+    install_rustls_provider();
     let container = GenericImage::new("mysql", "8.0")
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -69,6 +74,7 @@ async fn start_mysql() -> rustcdc::Result<(ContainerAsync<GenericImage>, String,
 }
 
 async fn admin_pool(host: &str, port: u16) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let mut last_error = None;
     for _ in 0..30 {
@@ -112,6 +118,7 @@ async fn drain(
     handle: &mut Box<dyn rustcdc::source::StreamHandle>,
     want: usize,
 ) -> rustcdc::Result<Vec<rustcdc::Event>> {
+    install_rustls_provider();
     let mut collected = Vec::new();
     for _ in 0..80 {
         let events = handle.next_events(200).await?;
@@ -129,6 +136,7 @@ async fn drain(
 /// Values of non-trivial MySQL types must survive the binlog round trip intact.
 #[tokio::test]
 async fn mysql_decodes_non_trivial_types_without_loss() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if skip() {
         return Ok(());
     }
@@ -152,6 +160,10 @@ async fn mysql_decodes_non_trivial_types_without_loss() -> rustcdc::Result<()> {
             year_only YEAR NOT NULL,
             raw_bytes VARBINARY(16) NOT NULL,
             blob_value BLOB NOT NULL,
+            -- Binary bytes that are *also* valid UTF-8. This is the case that used to
+            -- arrive as text while the column's other rows arrived as hex, leaving no
+            -- decoding a consumer could apply to both.
+            ascii_bytes VARBINARY(16) NOT NULL,
             payload JSON NOT NULL,
             feeling ENUM('happy', 'sad') NOT NULL,
             perms SET('read', 'write') NOT NULL,
@@ -185,6 +197,7 @@ async fn mysql_decodes_non_trivial_types_without_loss() -> rustcdc::Result<()> {
             2026,
             X'DEADBEEF',
             X'0001FF',
+            X'68656C6C6F',
             '{\"nested\": {\"array\": [1, 2, 3]}}',
             'happy',
             'read,write',
@@ -259,11 +272,27 @@ async fn mysql_decodes_non_trivial_types_without_loss() -> rustcdc::Result<()> {
 
     // Binary columns must not be lossily transcoded — a replacement character would be
     // delivered as though it were the stored value.
+    // Exact, not "hex or base64": a binary column's representation must be a property of
+    // the column, so a consumer can decode it without inspecting the value first.
     let raw = field("raw_bytes");
-    assert!(
-        raw.to_lowercase().contains("deadbeef") || raw.contains("3q2+7w"),
-        "VARBINARY not preserved (expected hex or base64): {raw}"
+    assert_eq!(
+        raw, "deadbeef",
+        "VARBINARY must be lowercase hex with no prefix, as documented: {raw}"
     );
+    let blob = field("blob_value");
+    assert_eq!(blob, "0001ff", "BLOB must be hex: {blob}");
+
+    // The regression: these bytes are valid UTF-8, so a value-derived rule rendered them as
+    // the text "hello" while `raw_bytes` in the same row rendered as hex. Whichever decoding
+    // a consumer chose, one of the two columns was corrupted.
+    let ascii = field("ascii_bytes");
+    assert_eq!(
+        ascii, "68656c6c6f",
+        "a binary column holding valid UTF-8 must still be hex, or its representation \
+         depends on the value rather than the column: {ascii}"
+    );
+    // The text columns asserted further down are the other half of this: a genuine text
+    // column must not be hex-encoded by the same rule.
 
     let payload = field("payload");
     assert!(
@@ -305,6 +334,7 @@ async fn mysql_decodes_non_trivial_types_without_loss() -> rustcdc::Result<()> {
 /// cannot tell them apart writes `NULL` over a value that never changed.
 #[tokio::test]
 async fn mysql_null_and_absent_columns_stay_distinguishable() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if skip() {
         return Ok(());
     }
@@ -360,6 +390,7 @@ async fn mysql_null_and_absent_columns_stay_distinguishable() -> rustcdc::Result
 /// enforcement is only worth having if the decoder then uses what it asked for.
 #[tokio::test]
 async fn mysql_update_and_delete_carry_full_row_images() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if skip() {
         return Ok(());
     }

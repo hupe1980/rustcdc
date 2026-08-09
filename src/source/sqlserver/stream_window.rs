@@ -77,12 +77,15 @@ impl SqlServerStreamHandle {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| ZERO_LSN_HEX.to_string());
 
-        let next_start = lsn_hex_to_bytes(&start_hex)?;
-        let mut next_end = lsn_hex_to_bytes(&end_hex)?;
-        if compare_lsn(&next_end, &next_start).is_lt() {
-            next_end = next_start;
-        }
+        let incremented = lsn_hex_to_bytes(&start_hex)?;
+        let harvested_max = lsn_hex_to_bytes(&end_hex)?;
 
+        let (next_start, next_end) = Self::next_window(
+            self.stream.lsn_start,
+            self.stream.lsn_end,
+            incremented,
+            harvested_max,
+        );
         self.stream.lsn_start = next_start;
         self.stream.lsn_end = next_end;
         // Advancing to a fresh window invalidates any within-window resume point,
@@ -92,7 +95,69 @@ impl SqlServerStreamHandle {
         Ok(())
     }
 
-    /// Read one page of changes for a single capture instance in the current window.
+    /// Where the next LSN window sits, given the window just finished, `fn_cdc_increment_lsn(lsn_end)`
+/// and `fn_cdc_get_max_lsn()`.
+///
+/// Extracted as a pure function so the decision is testable — the SQL that feeds it needs a server.
+///
+/// # `lsn_end` never exceeds what the capture job has harvested
+///
+/// That is the whole rule, and it is what stops the read point walking forward on a quiet
+/// database. `fn_cdc_get_max_lsn()` reports what the capture job has harvested into `cdc.*`, so
+/// while nothing changes it does not move. Clamping the end *up* to the incremented start — to keep
+/// the window non-inverted — made the next advance increment from that clamped end, pushing the
+/// read point one minimal LSN step above the harvested maximum on every empty poll, indefinitely.
+///
+/// So an **empty window is represented, not avoided**: `lsn_start > lsn_end` means "nothing to
+/// read yet", and the poll skips querying rather than issuing a round trip per capture instance
+/// for a range that cannot contain anything.
+///
+/// # Why the lower bound only moves when something was consumed
+///
+/// The naive repair — park one step past the maximum and stop — **skips an LSN**, and it is worth
+/// being precise about which. Parked at `[M+1, M+1]` with nothing harvested at `M+1`, a later
+/// advance sees the maximum has moved and increments from the parked *end* to `M+2`. But `M+1` was
+/// never readable when that window was set, so it is never read at all.
+///
+/// The fix is to distinguish the two cases by whether the window was empty:
+///
+/// - **consumed** (`start <= end`): everything through `end` was read, so the next lower bound is
+///   `increment(end)`;
+/// - **empty** (`start > end`): nothing was read, so the lower bound **stays** and only the upper
+///   bound is refreshed from the harvested maximum.
+///
+/// An empty window whose maximum later jumps therefore reopens as `[start, new_max]` — with the
+/// original `start` intact, so nothing between it and the new maximum is skipped.
+/// # End-to-end validation
+///
+/// The transitions are pinned by `window_advance_tests`, including the skip that made the naive
+/// repair worse than the creep. The rule is validated against a live SQL Server 2022 by
+/// `sqlserver_idle_window_integration`, which polls repeatedly against a **standing** harvested
+/// maximum and then requires a subsequent write to arrive — plus
+/// `sqlserver_stream_integration`, `sqlserver_window_truncation_integration` and
+/// `sqlserver_snapshot_integration`, which advance real windows throughout.
+///
+/// The idle test deliberately does **not** call `sys.sp_cdc_scan` during its idle phase, unlike the
+/// other SQL Server suites. A scan harvests whatever is in the log, so `fn_cdc_get_max_lsn()` would
+/// keep advancing and the read point would never be left behind a standing maximum — masking the
+/// exact condition the creep needed. Getting that wrong is what made a first version of the test
+/// report zero events and look like a connector fault.
+fn next_window(
+    current_start: [u8; 10],
+    current_end: [u8; 10],
+    incremented_end: [u8; 10],
+    harvested_max: [u8; 10],
+) -> ([u8; 10], [u8; 10]) {
+    if compare_lsn(&current_start, &current_end).is_gt() {
+        // The window was empty: nothing was consumed, so the lower bound must not move.
+        (current_start, harvested_max)
+    } else {
+        // The window was read through `current_end`.
+        (incremented_end, harvested_max)
+    }
+}
+
+/// Read one page of changes for a single capture instance in the current window.
     ///
     /// The instance's own [`CaptureInstanceMeta::capture_floor`] raises the lower bound:
     /// capture instances do not all start at the same LSN, and asking one for changes
@@ -106,6 +171,14 @@ impl SqlServerStreamHandle {
         meta: &CaptureInstanceMeta,
         max_events_per_poll: usize,
     ) -> Result<Vec<SqlServerRawChange>> {
+        // An empty window — `lsn_start > lsn_end` — is how "the capture job has not harvested
+        // anything at or above the read point yet" is represented, now that the end is never
+        // clamped up past the harvested maximum. It cannot contain a change, so querying it would
+        // be one wasted round trip per capture instance per poll.
+        if compare_lsn(&self.stream.lsn_start, &self.stream.lsn_end).is_gt() {
+            return Ok(Vec::new());
+        }
+
         let capture_instance = meta.capture_instance.as_str();
         let columns = meta.captured_columns.as_slice();
         validate_capture_instance_name(capture_instance)?;
@@ -587,5 +660,100 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
         before_is_key_only: false,
         unavailable_columns: Vec::new(),
         before_unavailable_columns: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod window_advance_tests {
+    use super::{compare_lsn, SqlServerStreamHandle};
+
+    /// LSNs are 10 bytes, compared big-endian. Only the tail matters for these cases.
+    fn lsn(tail: u8) -> [u8; 10] {
+        let mut bytes = [0u8; 10];
+        bytes[9] = tail;
+        bytes
+    }
+
+    /// `(next_start, next_end)` for a window `[start, end]`, given the harvested maximum.
+    fn advance(start: u8, end: u8, max: u8) -> (u8, u8) {
+        let (next_start, next_end) = SqlServerStreamHandle::next_window(
+            lsn(start),
+            lsn(end),
+            lsn(end.saturating_add(1)), // fn_cdc_increment_lsn(end)
+            lsn(max),
+        );
+        (next_start[9], next_end[9])
+    }
+
+    fn is_empty(window: (u8, u8)) -> bool {
+        compare_lsn(&lsn(window.0), &lsn(window.1)).is_gt()
+    }
+
+    /// The ordinary case: the capture job harvested past the window just read.
+    #[test]
+    fn a_consumed_window_advances_to_the_new_harvested_maximum() {
+        assert_eq!(advance(5, 10, 20), (11, 20));
+        assert!(!is_empty((11, 20)));
+    }
+
+    /// A consumed window whose end is the maximum becomes **empty**, not clamped. Clamping the end
+    /// up to the start is what made the next advance step again, walking the read point forward on
+    /// every empty poll.
+    #[test]
+    fn a_consumed_window_at_the_maximum_becomes_empty_rather_than_clamped() {
+        let window = advance(5, 10, 10);
+        assert_eq!(window, (11, 10));
+        assert!(
+            is_empty(window),
+            "an empty window is represented, not avoided — that is what stops the creep"
+        );
+    }
+
+    /// The creep this closes. The maximum stands still; the read point must not move.
+    #[test]
+    fn a_quiet_database_does_not_walk_the_read_point_forward() {
+        let mut window = advance(5, 10, 10); // (11, 10), empty
+        for _ in 0..100 {
+            let next = advance(window.0, window.1, 10);
+            assert_eq!(
+                next,
+                (11, 10),
+                "while the harvested maximum stands still the read point must stay at 11"
+            );
+            window = next;
+        }
+    }
+
+    /// The trap the earlier attempt fell into, now asserted as fixed: an empty window whose
+    /// maximum later jumps must reopen **from its original start**, so the LSN it was parked at is
+    /// still read. Advancing from the parked end instead would skip it.
+    #[test]
+    fn an_empty_window_reopens_without_skipping_the_lsn_it_was_parked_at() {
+        let empty = advance(5, 10, 10);
+        assert_eq!(empty, (11, 10));
+
+        let reopened = advance(empty.0, empty.1, 40);
+        assert_eq!(
+            reopened,
+            (11, 40),
+            "LSN 11 was never readable while the maximum was 10, so it must be inside the \
+             reopened window — advancing to 12 here is the skip that made the naive repair worse \
+             than the creep"
+        );
+        assert!(!is_empty(reopened));
+    }
+
+    /// And once that reopened window is consumed, the lower bound moves again.
+    #[test]
+    fn a_reopened_window_advances_normally_once_consumed() {
+        assert_eq!(advance(11, 40, 40), (41, 40));
+        assert!(is_empty((41, 40)));
+    }
+
+    /// A first window that is already empty (nothing harvested at startup) stays put.
+    #[test]
+    fn an_initially_empty_window_holds_its_lower_bound() {
+        assert_eq!(advance(1, 0, 0), (1, 0));
+        assert_eq!(advance(1, 0, 7), (1, 7), "and opens from 1 when the maximum arrives");
     }
 }

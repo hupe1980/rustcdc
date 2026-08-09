@@ -28,6 +28,11 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 mod config;
+/// GTID sets, which the incremental snapshot brackets chunk reads with.
+///
+/// A binlog file-and-position advances at the binlog *flush* stage, before the engine commit
+/// that makes rows visible; `Executed_Gtid_Set` is updated after it. See the module docs.
+mod gtid;
 mod handoff;
 pub mod incremental_snapshot;
 mod parser;
@@ -1053,6 +1058,10 @@ impl MysqlConnection {
     /// validation failures.
     pub async fn connect(&self) -> Result<()> {
         self.config.validate()?;
+        crate::source::warn_on_schema_agnostic_include_entries(
+            self.config.server_flavor.source_name(),
+            &self.config.table_include_list,
+        );
         {
             let state = self.state.lock().await;
             if state.pool.is_some() {

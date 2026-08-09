@@ -73,6 +73,20 @@ fn assert_matches_golden_with_expected_error(
         fixture_name
     );
 
+    // A replayed event must satisfy the envelope contract, not merely match a recorded golden.
+    // Matching alone would let a fixture pin a *malformed* envelope in place: record the golden
+    // once, and the suite then defends the malformation forever. The partial-payload rules are
+    // the ones that matter here — a column may not be both listed as unavailable and present in
+    // the payload, and a key-only before-image may not also carry unavailable columns.
+    for (index, event) in actual_events.iter().enumerate() {
+        if let Err(errors) = event.validate() {
+            panic!(
+                "replayed event #{index} of {fixture_name} violates the envelope contract: \
+                 {errors}\n  event: {event:?}"
+            );
+        }
+    }
+
     for (index, (actual, expected)) in actual_events.iter().zip(golden_events.iter()).enumerate() {
         let diffs = semantic_diff(expected, actual);
         let meaningful: Vec<_> = diffs
@@ -97,6 +111,19 @@ fn assert_matches_golden_with_expected_error(
 
 fn assert_matches_golden(fixture_name: &str, golden_name: &str) {
     assert_matches_golden_with_expected_error(fixture_name, golden_name, None)
+}
+
+/// The partial-payload contract, which no fixture could express before 0.12.0: the replay
+/// engine hardcoded `before_is_key_only` and both unavailable-column lists to their empty
+/// defaults, so `semantic_diff` compared fields that were structurally always equal. A
+/// regression that stopped reporting an unchanged-TOAST column — making a sink write `NULL`
+/// over live data — was invisible to every golden.
+#[test]
+fn postgres_unchanged_toast_fixture_matches_golden() {
+    assert_matches_golden(
+        "postgres_unchanged_toast_v1.fixture.json",
+        "postgres_unchanged_toast_v1.golden.json",
+    );
 }
 
 #[test]

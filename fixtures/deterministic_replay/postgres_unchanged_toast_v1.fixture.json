@@ -1,0 +1,61 @@
+{
+  "metadata": {
+    "id": "postgres_unchanged_toast_v1",
+    "source_type": "postgres",
+    "protocol_version": "pgoutput_v2",
+    "source_version": "postgres>=12,<17",
+    "fixture_version": 1,
+    "description": "PostgreSQL UPDATE with an unchanged-TOAST column: the large value is absent from the after-image and reported in unavailable_columns, and the before-image is key-only under REPLICA IDENTITY DEFAULT. Exercises the partial-payload contract, which no fixture could express before 0.12.0 because the replay engine hardcoded these fields to their empty defaults.",
+    "tags": [
+      "live_capture",
+      "partial_payload",
+      "unchanged_toast"
+    ],
+    "message_count": 5,
+    "captured_at": "2026-05-16T00:00:00Z"
+  },
+  "messages": [
+    {
+      "seq": 0,
+      "message_type": "Begin",
+      "payload": "{}",
+      "tags": [
+        "transactional"
+      ]
+    },
+    {
+      "seq": 1,
+      "message_type": "Insert",
+      "payload": "{\"schema\":\"public\",\"table\":\"documents\",\"after\":{\"id\":\"1\",\"title\":\"draft\",\"body\":\"a very large value\"},\"primary_key\":[\"id\"]}",
+      "tags": [
+        "dml"
+      ]
+    },
+    {
+      "seq": 2,
+      "message_type": "Update",
+      "payload": "{\"schema\":\"public\",\"table\":\"documents\",\"before\":{\"id\":\"1\"},\"before_is_key_only\":true,\"after\":{\"id\":\"1\",\"title\":\"final\"},\"unavailable_columns\":[\"body\"],\"primary_key\":[\"id\"]}",
+      "tags": [
+        "dml",
+        "partial_payload"
+      ]
+    },
+    {
+      "seq": 3,
+      "message_type": "Update",
+      "payload": "{\"schema\":\"public\",\"table\":\"documents\",\"before\":{\"id\":\"1\",\"title\":\"final\"},\"after\":{\"id\":\"1\",\"title\":\"final\",\"body\":\"a different large value\"},\"before_unavailable_columns\":[\"body\"],\"primary_key\":[\"id\"]}",
+      "tags": [
+        "dml",
+        "partial_payload"
+      ]
+    },
+    {
+      "seq": 4,
+      "message_type": "Commit",
+      "payload": "{}",
+      "tags": [
+        "transactional"
+      ]
+    }
+  ]
+}

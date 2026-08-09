@@ -694,6 +694,10 @@ impl PostgresConnection {
     /// replication slot is missing and auto-creation is not enabled.
     pub async fn connect(&self) -> Result<()> {
         self.config.validate()?;
+        crate::source::warn_on_schema_agnostic_include_entries(
+            "postgres",
+            &self.config.table_include_list,
+        );
         {
             let state = self.state.lock().await;
             if state.client.is_some() {

@@ -146,6 +146,24 @@ impl IncrementalSnapshotBackend for SqlServerSnapshotBackend {
         })
     }
 
+    /// The highest LSN the CDC **capture tables** hold.
+    ///
+    /// # This connector is not exposed to the commit-visibility race
+    ///
+    /// [`IncrementalSnapshotBackend::in_flight_transactions`] exists because on a
+    /// log-tailing connector the watermark can run *ahead* of what a chunk `SELECT` can
+    /// see. SQL Server inverts that: `fn_cdc_get_max_lsn()` reports what the capture job
+    /// has already harvested into `cdc.*`, and the capture job reads the log
+    /// asynchronously *after* transactions commit. The watermark therefore lags
+    /// visibility rather than leading it.
+    ///
+    /// Lagging is the safe direction. A transaction the chunk read could not see has, by
+    /// definition, not been harvested yet, so its position is above the low watermark and
+    /// the position test already catches it. The only cost is over-suppression — a chunk
+    /// row dropped in favour of a stream event carrying the same or a newer value — which
+    /// changes nothing downstream. So this backend leaves
+    /// `in_flight_transactions` at its empty default deliberately, not for lack of a way
+    /// to implement it.
     async fn current_position(&mut self) -> Result<CdcLsn> {
         let rows = self
             .client

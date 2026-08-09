@@ -51,6 +51,17 @@ called out here rather than left to be discovered:
   server advertises `-PLUS` the connector logs that a stronger mechanism was available, so
   the downgrade is not silent. A server that offers *only* `-PLUS` is refused with an error
   naming `WalTransport::SqlPeek`, which authenticates through `tokio-postgres`.
+- **The iteration count is capped, and the derivation runs off the caller's executor.** The
+  count is chosen by the *server* and is the loop bound of a PBKDF2 derivation the *client*
+  performs. `scram_iterations` accepts anything up to `INT_MAX`, and neither the RFC nor libpq
+  imposes a ceiling, so `i=4294967295` asks this client for roughly four billion HMAC-SHA256
+  rounds — minutes to hours of CPU per connection attempt, free for the server to trigger and
+  indistinguishable on the wire from a slow handshake. Counts above **1,000,000** are refused
+  with an error naming the setting to change (~250× PostgreSQL's default of 4096, and past
+  OWASP's 600k guidance, so no legitimate server reaches it). The derivation itself runs on a
+  blocking worker: it is CPU work of remote-chosen duration, and this crate runs inside the
+  embedder's Tokio runtime, where deriving inline would stall a worker thread — every task in
+  the process, on a current-thread runtime.
 - **MD5** is supported because servers still run it, and logs a warning each time: the
   stored digest is a password equivalent, and PostgreSQL has deprecated the method.
 - **Cleartext** is refused unless the transport is TLS.

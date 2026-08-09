@@ -1058,6 +1058,10 @@ impl SqlServerConnection {
     /// the login cannot read the capture tables — both are configuration errors that
     /// otherwise surface much later as an empty stream.
     pub async fn connect(&self) -> Result<()> {
+        crate::source::warn_on_schema_agnostic_include_entries(
+            "sqlserver",
+            &self.config.table_include_list,
+        );
         connect_sqlserver_with_probe(self).await
     }
 

@@ -383,7 +383,7 @@ impl ReplicationStream {
                             "postgres SCRAM server-first is not valid UTF-8: {error}"
                         ))
                     })?;
-                    let client_final = exchange.client_final(server_first)?;
+                    let client_final = exchange.client_final(server_first).await?;
                     write_message(
                         &mut self.socket,
                         frontend_tag::PASSWORD,

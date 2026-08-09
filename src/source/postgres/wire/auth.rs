@@ -39,6 +39,21 @@ pub(super) const SCRAM_SHA_256_PLUS: &str = "SCRAM-SHA-256-PLUS";
 /// libpq uses and is comfortably beyond the 128-bit floor for a nonce.
 const CLIENT_NONCE_BYTES: usize = 24;
 
+/// Largest SCRAM iteration count this client will honour.
+///
+/// The count is chosen by the **server** and is the loop bound of a PBKDF2 derivation the
+/// client then performs. PostgreSQL's `scram_iterations` accepts anything up to `INT_MAX`,
+/// and neither the RFC nor libpq imposes a ceiling, so an `i=4294967295` — from a
+/// misconfiguration or a hostile server — asks this client for roughly four billion
+/// HMAC-SHA256 rounds. That is minutes to hours of pure CPU per connection attempt: a
+/// denial of service the server can trigger for free, with nothing on the wire to
+/// distinguish it from a slow handshake.
+///
+/// One million is ~250× PostgreSQL's default of 4096 and well past any deliberate
+/// hardening (OWASP's PBKDF2-SHA256 guidance is 600k), so a legitimate server never
+/// reaches it, while the worst case stays under about a second of work.
+const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
+
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
@@ -148,7 +163,16 @@ impl ScramExchange {
     }
 
     /// Consume the server-first message and produce the client-final message.
-    pub(super) fn client_final(&mut self, server_first: &str) -> Result<String> {
+    ///
+    /// # Runs the key derivation on a blocking worker
+    ///
+    /// PBKDF2 is CPU work whose duration a **remote** value chooses, and this crate runs
+    /// inside the embedder's Tokio runtime. Deriving inline stalls the worker thread for the
+    /// whole derivation — up to [`MAX_SCRAM_ITERATIONS`] rounds — which on a current-thread
+    /// runtime stalls every other task in the process. The same reasoning already puts
+    /// `FileCheckpoint`'s `fsync` on `spawn_blocking`; a handshake happens once per
+    /// connection, so the spawn costs nothing measurable.
+    pub(super) async fn client_final(&mut self, server_first: &str) -> Result<String> {
         let parsed = ServerFirst::parse(server_first)?;
 
         // The server must echo the client nonce as a prefix of its own. Skipping this check
@@ -165,7 +189,18 @@ impl ScramExchange {
             ));
         }
 
-        let salted_password = hi(self.password.as_bytes(), &parsed.salt, parsed.iterations)?;
+        let salted_password = {
+            let password = self.password.clone();
+            let salt = parsed.salt.clone();
+            let iterations = parsed.iterations;
+            tokio::task::spawn_blocking(move || hi(password.as_bytes(), &salt, iterations))
+                .await
+                .map_err(|error| {
+                    Error::SourceError(format!(
+                        "the SCRAM key derivation task failed to complete: {error}"
+                    ))
+                })??
+        };
         let client_key = hmac_sha256(&salted_password, b"Client Key")?;
         let stored_key = Sha256::digest(&client_key);
 
@@ -282,6 +317,15 @@ impl ServerFirst {
                  entirely"
                     .into(),
             ));
+        }
+        if iterations > MAX_SCRAM_ITERATIONS {
+            return Err(Error::SourceError(format!(
+                "postgres asked for {iterations} SCRAM iterations, above the {MAX_SCRAM_ITERATIONS} \
+                 this client will perform. The count is the server's choice and the work is the \
+                 client's, so an unbounded value is a denial of service the server triggers for \
+                 free. PostgreSQL's default is 4096; if this is deliberate hardening, lower \
+                 `scram_iterations` below the cap."
+            )));
         }
 
         Ok(Self {
@@ -410,8 +454,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_client_final_message_is_shaped_as_the_protocol_requires() {
+    #[tokio::test]
+    async fn the_client_final_message_is_shaped_as_the_protocol_requires() {
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         assert!(
             client_first.starts_with("n,,n=,r="),
@@ -423,7 +467,7 @@ mod tests {
             .expect("nonce present")
             .to_string();
         let server_first = format!("r={nonce}serverpart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
-        let client_final = exchange.client_final(&server_first).expect("continues");
+        let client_final = exchange.client_final(&server_first).await.expect("continues");
 
         assert!(
             client_final.starts_with("c=biws,"),
@@ -433,23 +477,25 @@ mod tests {
         assert!(client_final.contains(",p="));
     }
 
-    #[test]
-    fn a_server_nonce_that_does_not_extend_the_client_nonce_is_refused() {
+    #[tokio::test]
+    async fn a_server_nonce_that_does_not_extend_the_client_nonce_is_refused() {
         // Without this check a replayed or substituted server-first is accepted.
         let (mut exchange, _) = ScramExchange::start("pencil").expect("starts");
         let error = exchange
             .client_final("r=totally-unrelated,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+            .await
             .expect_err("must refuse");
         assert!(error.to_string().contains("does not extend"));
     }
 
-    #[test]
-    fn a_wrong_server_signature_fails_verification() {
+    #[tokio::test]
+    async fn a_wrong_server_signature_fails_verification() {
         // Mutual authentication: the server must prove it knows the password too.
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         let nonce = client_first.strip_prefix("n,,n=,r=").expect("nonce");
         exchange
             .client_final(&format!("r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
+            .await
             .expect("continues");
 
         let error = exchange
@@ -458,12 +504,13 @@ mod tests {
         assert!(error.to_string().contains("did not verify"));
     }
 
-    #[test]
-    fn a_correct_server_signature_verifies() {
+    #[tokio::test]
+    async fn a_correct_server_signature_verifies() {
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         let nonce = client_first.strip_prefix("n,,n=,r=").expect("nonce");
         exchange
             .client_final(&format!("r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
+            .await
             .expect("continues");
         let signature = exchange
             .server_signature
@@ -475,12 +522,13 @@ mod tests {
             .expect("verifies");
     }
 
-    #[test]
-    fn a_server_error_in_the_final_message_is_surfaced_verbatim() {
+    #[tokio::test]
+    async fn a_server_error_in_the_final_message_is_surfaced_verbatim() {
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         let nonce = client_first.strip_prefix("n,,n=,r=").expect("nonce");
         exchange
             .client_final(&format!("r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
+            .await
             .expect("continues");
         let error = exchange
             .verify_server_final("e=invalid-proof")
@@ -488,15 +536,70 @@ mod tests {
         assert!(error.to_string().contains("invalid-proof"));
     }
 
-    #[test]
-    fn a_zero_iteration_count_is_refused() {
+    #[tokio::test]
+    async fn a_zero_iteration_count_is_refused() {
         // i=0 would return the first HMAC unchanged, skipping key stretching entirely.
         let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
         let nonce = client_first.strip_prefix("n,,n=,r=").expect("nonce");
         let error = exchange
             .client_final(&format!("r={nonce}x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0"))
+            .await
             .expect_err("must refuse");
         assert!(error.to_string().contains("iteration count is zero"));
+    }
+
+    /// The iteration count is the server's choice and the work is the client's, so an
+    /// unbounded value is a denial of service the server triggers for free.
+    #[tokio::test]
+    async fn an_absurd_iteration_count_is_refused_before_the_derivation_runs() {
+        let (mut exchange, client_first) = ScramExchange::start("pencil").expect("starts");
+        let nonce = client_first
+            .strip_prefix("n,,n=,r=")
+            .expect("nonce present")
+            .to_string();
+        let server_first = format!(
+            "r={nonce}serverpart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={}",
+            u32::MAX
+        );
+
+        // Must return promptly rather than performing four billion HMAC rounds.
+        let error = exchange
+            .client_final(&server_first)
+            .await
+            .expect_err("an unbounded iteration count must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("SCRAM iterations"),
+            "the error must name the count as the problem: {message}"
+        );
+        assert!(
+            message.contains("scram_iterations"),
+            "the error must name the server setting to change: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_iteration_count_at_the_cap_is_still_honoured() {
+        // The cap must be a ceiling on abuse, not a limit that breaks deliberate hardening
+        // below it. PostgreSQL's default is 4096; this is the boundary case.
+        let salt = BASE64
+            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")
+            .expect("vector salt");
+        let parsed = ServerFirst::parse(&format!(
+            "r=abc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={MAX_SCRAM_ITERATIONS}"
+        ))
+        .expect("the cap itself is acceptable");
+        assert_eq!(parsed.iterations, MAX_SCRAM_ITERATIONS);
+        assert_eq!(parsed.salt, salt);
+
+        assert!(
+            ServerFirst::parse(&format!(
+                "r=abc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i={}",
+                MAX_SCRAM_ITERATIONS + 1
+            ))
+            .is_err(),
+            "one above the cap must be refused"
+        );
     }
 
     #[test]

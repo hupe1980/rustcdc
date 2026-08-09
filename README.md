@@ -18,24 +18,31 @@ crate that links into your binary and runs on your Tokio runtime.
 
 Embedding multi-database CDC today means embedding a JVM: Debezium's engine is a Java library,
 and Materialize and RisingWave are platforms rather than crates. The Rust alternatives are
-single-database primitives, and the most complete of them cannot be published to crates.io at
-all because it depends on a fork of a fork of `rust-postgres`.
+single-database primitives, and the most complete of them — Supabase's `etl` — is a Git
+dependency rather than a published crate, because it takes `tokio-postgres` and
+`postgres-replication` from a fork of `rust-postgres` and a crates.io release may not depend on
+a Git revision.
 
-rustcdc writes its own pgoutput parser against stock `tokio-postgres`. That is why it ships as
-a normal dependency with no sidecar to supervise and no control plane to operate.
+That is not a mistake on their part; it is the consequence of a real constraint. Stock
+`tokio-postgres` exposes no replication-mode API, so a project that needs one either patches the
+client or implements the wire protocol. rustcdc implements it — `START_REPLICATION ... LOGICAL`
+and its own pgoutput parser against stock `tokio-postgres` — which is why it installs as an
+ordinary dependency, with no sidecar to supervise and no control plane to operate. The
+[comparison page](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) has the
+side-by-side, including where `etl` is the better pick.
 
-PostgreSQL capture runs `START_REPLICATION ... LOGICAL` over the streaming replication protocol —
-the same mechanism PostgreSQL's own subscribers use — because stock `tokio-postgres` exposes no
-replication-mode API and rustcdc implements the wire protocol itself rather than take on a second
-TLS stack. A SQL-based fallback (`WalTransport::SqlPeek`) remains for environments that cannot
-grant a replication connection; the two are asserted to decode identical event streams against a
-live server.
+That replication client speaks the streaming replication protocol PostgreSQL's own subscribers
+use, on the same `rustls` stack as the rest of the crate rather than a second TLS dependency. A
+SQL-based fallback (`WalTransport::SqlPeek`) remains for environments that cannot grant a
+replication connection; the two are asserted to decode identical event streams against a live
+server.
 
 ## Status
 
-**Pre-1.0.** Latest published release is 0.7.0; 0.11.0 is in development and is a breaking
+**Pre-1.0.** Latest published release is 0.11.0; 0.12.0 is in development and is a breaking
 release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are validated by
-1011 unit tests, 130 documentation samples compiled as doctests, and 61 integration suites, the
+1099 unit tests, 133 documentation samples compiled as doctests, 41 deterministic-replay golden
+fixtures, and 64 integration suites, the
 container-backed ones running against real PostgreSQL 12/14/15/16, MySQL 8.0/8.4,
 MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
 
@@ -46,7 +53,7 @@ The public API may still change. Delivery is **at-least-once**; see
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.11", features = ["postgres"] }
+rustcdc = { version = "0.12", features = ["postgres"] }
 ```
 
 The default profile is `postgres` + `tls`. WASM transforms and every non-PostgreSQL connector
@@ -136,14 +143,26 @@ match event.row_write() {
 ```
 
 Column values are **text**: every scalar is a JSON string, SQL `NULL` is JSON `null`, and a
-`json` column keeps its structure. One rule on every connector and every capture path, because
-a JSON number is an IEEE-754 double by the time most consumers see it — `numeric(38,4)` and
-`bigint` past 2^53 do not survive one. Read with `value.as_str()` and parse.
+`json` column arrives as a string holding the source's own serialization. One rule on every
+connector and every capture path, because a JSON number is an IEEE-754 double by the time most
+consumers see it — `numeric(38,4)` and `bigint` past 2^53 do not survive one. Read with
+`value.as_str()` and parse.
+
+Binary columns are encoded rather than transcoded, and the encoding is a property of the
+**connector**, not of the value — so you pick one decoder per source and never inspect a value to
+decide. The three forms are tabulated in the
+[configuration reference](https://hupe1980.github.io/rustcdc/docs/config-reference/#binary-column-encoding-per-connector).
 
 `Merge` hands you only the columns the source actually supplied, so there is no placeholder
 left to write by accident. It arises from PostgreSQL unchanged-TOAST: a large value not
 modified by an `UPDATE` is omitted from the WAL and is unrecoverable. `REPLICA IDENTITY FULL`
 does **not** fix it — replica identity governs the before-image only.
+
+The same refusal covers keys. A composite key missing one column is not a narrower key, it is a
+**wider** one: `{"tenant_id": 7}` from a `(tenant_id, id)` key addresses every row of that
+tenant, so a sink turning it into a `DELETE` removes the tenant. `primary_key_values()` is
+therefore all-or-nothing, and a truncated key yields `RowWrite::None { MissingPrimaryKey }`
+rather than something that looks writable.
 
 The underlying fields (`unavailable_columns`, `before_unavailable_columns`,
 `before_is_key_only`) are documented in the
@@ -321,7 +340,12 @@ compile is a defect.
 
 **Failure paths are exercised, not assumed.** Deterministic replay, fault injection and
 process-kill crash tests are part of the suite, and are available to *your* tests too via the
-`test-harnesses` feature. See
+`test-harnesses` feature. The replay comparison names every field it checks **and every field it
+skips, with the reason** — a golden suite is only as strong as its diff, and a field the diff
+ignores is invisible to every fixture in it. Comparing a field is also not enough on its own: if
+the fixture format cannot produce a differing value, the comparison is vacuous, so the fixtures
+carry the partial-payload shape explicitly and every replayed event is validated rather than only
+matched. See
 [reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/).
 
 **Suites run against the configurations that break things, not the defaults.** A resume

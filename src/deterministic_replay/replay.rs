@@ -367,9 +367,9 @@ impl ReplaySession {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
-            unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
+            before_is_key_only: payload.before_is_key_only,
+            unavailable_columns: payload.unavailable_columns,
+            before_unavailable_columns: payload.before_unavailable_columns,
         })
     }
 
@@ -424,12 +424,26 @@ impl ReplaySession {
             .map(parse_primary_key)
             .transpose()?;
 
+        // Absent means "complete payload", which is what the vast majority of fixtures record
+        // and what every fixture written before these fields existed means.
+        let before_is_key_only = match payload.get("before_is_key_only") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                "data payload field 'before_is_key_only' must be a boolean".to_string()
+            })?,
+        };
+        let unavailable_columns = parse_column_list(&payload, "unavailable_columns")?;
+        let before_unavailable_columns = parse_column_list(&payload, "before_unavailable_columns")?;
+
         Ok(ReplayDataPayload {
             before,
             after,
             schema,
             table,
             primary_key,
+            before_is_key_only,
+            unavailable_columns,
+            before_unavailable_columns,
         })
     }
 
@@ -519,12 +533,51 @@ impl ReplaySession {
     }
 }
 
+/// A fixture's DML payload, including the partial-payload fields.
+///
+/// # Why these fields are here at all
+///
+/// `before_is_key_only`, `unavailable_columns` and `before_unavailable_columns` used to be
+/// hardcoded to their empty defaults in [`ReplaySession::create_data_event`], and
+/// `parse_data_payload` did not read them. The fixture format therefore **could not express an
+/// incomplete payload**, so no golden fixture could exercise the PostgreSQL unchanged-TOAST
+/// contract — the case where a sink writing whole rows puts `NULL` over live data.
+///
+/// That mattered more than a missing field usually does. `semantic_diff` compares
+/// `before_is_key_only`, and now compares both unavailable lists — but a comparison is vacuous
+/// when both sides are structurally always empty. The diff and the fixture format had never been
+/// reconciled, so the highest-risk field in the envelope had the appearance of replay coverage
+/// and none of the substance.
 struct ReplayDataPayload {
     before: Option<serde_json::Value>,
     after: Option<serde_json::Value>,
     schema: Option<String>,
     table: String,
     primary_key: Option<Vec<String>>,
+    before_is_key_only: bool,
+    unavailable_columns: Vec<String>,
+    before_unavailable_columns: Vec<String>,
+}
+
+/// Read an optional array-of-strings field, rejecting a wrong shape rather than ignoring it.
+///
+/// A silently-ignored `unavailable_columns` in a fixture would produce a golden asserting the
+/// opposite of what the fixture author wrote, which is worse than no fixture.
+fn parse_column_list(payload: &serde_json::Value, field: &str) -> Result<Vec<String>, String> {
+    let Some(value) = payload.get(field) else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("data payload field '{field}' must be an array of strings"))?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("data payload field '{field}' must contain only strings"))
+        })
+        .collect()
 }
 
 fn parse_primary_key(value: &serde_json::Value) -> Result<Vec<String>, String> {
@@ -601,7 +654,7 @@ mod tests {
             fixture_version: 1,
             description: "Test".to_string(),
             tags: vec![],
-            expected_event_count: 3,
+            message_count: 3,
             captured_at: "2026-05-16T00:00:00Z".to_string(),
         };
 
@@ -626,7 +679,7 @@ mod tests {
             },
         ];
 
-        let fixture = Fixture::new(metadata, messages);
+        let fixture = Fixture::new(metadata, messages).expect("fixture is valid");
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
 
@@ -645,7 +698,7 @@ mod tests {
             fixture_version: 1,
             description: "Test repeatability".to_string(),
             tags: vec![],
-            expected_event_count: 1,
+            message_count: 1,
             captured_at: "2026-05-16T00:00:00Z".to_string(),
         };
 
@@ -657,7 +710,7 @@ mod tests {
                 payload: r#"{"schema":"public","table":"users","after":{"id":1}}"#.to_string(),
                 tags: vec![],
             }],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let first = session.replay();
@@ -678,7 +731,7 @@ mod tests {
             fixture_version: 1,
             description: "Test DML parsing".to_string(),
             tags: vec![],
-            expected_event_count: 1,
+            message_count: 1,
             captured_at: "2026-05-16T00:00:00Z".to_string(),
         };
 
@@ -689,7 +742,7 @@ mod tests {
             tags: vec![],
         }];
 
-        let fixture = Fixture::new(metadata, messages);
+        let fixture = Fixture::new(metadata, messages).expect("fixture is valid");
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
 
@@ -712,7 +765,7 @@ mod tests {
             fixture_version: 1,
             description: "Test DDL parsing".to_string(),
             tags: vec![],
-            expected_event_count: 1,
+            message_count: 1,
             captured_at: "2026-05-16T00:00:00Z".to_string(),
         };
 
@@ -724,7 +777,7 @@ mod tests {
             tags: vec![],
         }];
 
-        let fixture = Fixture::new(metadata, messages);
+        let fixture = Fixture::new(metadata, messages).expect("fixture is valid");
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
 
@@ -746,7 +799,7 @@ mod tests {
             fixture_version: 1,
             description: "Test marker provenance".to_string(),
             tags: vec![],
-            expected_event_count: 2,
+            message_count: 2,
             captured_at: "2026-05-21T00:00:00Z".to_string(),
         };
 
@@ -766,7 +819,7 @@ mod tests {
                     tags: vec![],
                 },
             ],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -792,7 +845,7 @@ mod tests {
             fixture_version: 1,
             description: "Test MySQL BEGIN interpretation".to_string(),
             tags: vec![],
-            expected_event_count: 1,
+            message_count: 1,
             captured_at: "2026-05-21T00:00:00Z".to_string(),
         };
 
@@ -804,7 +857,7 @@ mod tests {
                 payload: r#"{"sql":"BEGIN"}"#.to_string(),
                 tags: vec![],
             }],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -828,7 +881,7 @@ mod tests {
             fixture_version: 1,
             description: "Test MySQL sql-field DDL parsing".to_string(),
             tags: vec![],
-            expected_event_count: 1,
+            message_count: 1,
             captured_at: "2026-05-21T00:00:00Z".to_string(),
         };
 
@@ -841,7 +894,7 @@ mod tests {
                     .to_string(),
                 tags: vec![],
             }],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -863,7 +916,7 @@ mod tests {
             fixture_version: 1,
             description: "Test MySQL rollback interpretation".to_string(),
             tags: vec![],
-            expected_event_count: 4,
+            message_count: 4,
             captured_at: "2026-05-21T00:00:00Z".to_string(),
         };
 
@@ -895,7 +948,7 @@ mod tests {
                     tags: vec![],
                 },
             ],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -928,7 +981,7 @@ mod tests {
             fixture_version: 1,
             description: "Test SQL Server control transaction metadata".to_string(),
             tags: vec![],
-            expected_event_count: 4,
+            message_count: 4,
             captured_at: "2026-05-21T00:00:00Z".to_string(),
         };
 
@@ -960,7 +1013,7 @@ mod tests {
                     tags: vec![],
                 },
             ],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -1002,7 +1055,7 @@ mod tests {
             fixture_version: 1,
             description: "Test committed transaction metadata".to_string(),
             tags: vec![],
-            expected_event_count: 4,
+            message_count: 4,
             captured_at: "2026-05-21T00:00:00Z".to_string(),
         };
 
@@ -1034,7 +1087,7 @@ mod tests {
                     tags: vec![],
                 },
             ],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -1061,7 +1114,7 @@ mod tests {
             fixture_version: 1,
             description: "Test incomplete transaction handling".to_string(),
             tags: vec![],
-            expected_event_count: 2,
+            message_count: 2,
             captured_at: "2026-05-21T00:00:00Z".to_string(),
         };
 
@@ -1081,7 +1134,7 @@ mod tests {
                     tags: vec![],
                 },
             ],
-        );
+        ).expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();

@@ -93,6 +93,48 @@ impl CdcRuntime {
     /// # }
     /// ```
     pub async fn request_incremental_snapshot(&mut self, tables: Vec<String>) -> Result<usize> {
+        self.request_incremental_snapshot_filtered(crate::source::SnapshotRequest::new(tables))
+            .await
+    }
+
+    /// Request an on-demand incremental snapshot, restricted to a subset of rows.
+    ///
+    /// The filter belongs to the **request**, not the deployment: "backfill tenant 42's
+    /// orders" is a one-off, and routing it through
+    /// [`IncrementalSnapshotConfig::table_conditions`](crate::source::IncrementalSnapshotConfig::table_conditions)
+    /// means editing a config file and restarting the process to run something that was
+    /// meant to be a signal. Debezium's `execute-snapshot` carries `data-collections` and
+    /// `additional-conditions` together for the same reason, so a consumer exposing that
+    /// shape over an API has somewhere to put the condition.
+    ///
+    /// A condition here overrides the configured one for the same table; a table with no
+    /// override keeps its configured filter.
+    ///
+    /// ```no_run
+    /// # use rustcdc::CdcRuntime;
+    /// use rustcdc::source::SnapshotRequest;
+    /// # async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
+    /// runtime
+    ///     .request_incremental_snapshot_filtered(
+    ///         SnapshotRequest::new(["public.orders"]).with_condition("public.orders", "tenant_id = 42"),
+    ///     )
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # This is raw SQL and it is trusted input
+    ///
+    /// See [`SnapshotRequest`](crate::source::SnapshotRequest). Never build a condition from
+    /// untrusted input, and do not treat it as a tenancy boundary.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`request_incremental_snapshot`](Self::request_incremental_snapshot).
+    pub async fn request_incremental_snapshot_filtered(
+        &mut self,
+        request: crate::source::SnapshotRequest,
+    ) -> Result<usize> {
         if self.state != RuntimeState::Running {
             return Err(Error::StateError(format!(
                 "cannot request an incremental snapshot while the runtime is {}; start it first",
@@ -106,7 +148,7 @@ impl CdcRuntime {
             )
         })?;
 
-        let enqueued = stream.request_snapshot_tables(tables).await?;
+        let enqueued = stream.request_snapshot_tables(request).await?;
         if enqueued > 0 {
             tracing::info!(
                 target: "rustcdc::core::runtime",
@@ -175,10 +217,26 @@ impl CdcRuntime {
     ///
     /// # Durability
     ///
-    /// The persisted state is cleared by the next checkpoint write. A crash in that window
-    /// resumes the snapshot. Forcing a synchronous checkpoint here would let an operator
-    /// action rewrite the stream position, which is a worse trade than a rare resume of a
-    /// snapshot that can be stopped again.
+    /// The stop is recorded as an explicit flag in the snapshot state
+    /// ([`IncrementalSnapshotState::stopped`](crate::source::IncrementalSnapshotState::stopped)),
+    /// which becomes durable with the next checkpoint write. A crash before that write
+    /// resumes the snapshot; it can simply be stopped again.
+    ///
+    /// The flag has to be explicit, and inferring it from an empty table list is what made
+    /// this method **silently ineffective across a restart**. A stop clears the per-table
+    /// entries, and the driver seeds one entry per *configured* table on startup — so a
+    /// configured table with no entry looked exactly like a table that had not started, and
+    /// the next deploy re-ran the whole backfill. For a snapshot stopped to take load off a
+    /// production primary that is the opposite of what was asked for, and nothing surfaced
+    /// it.
+    ///
+    /// A stopped snapshot stays stopped until
+    /// [`request_incremental_snapshot`](Self::request_incremental_snapshot) asks for tables
+    /// again, which clears the flag.
+    ///
+    /// Forcing a synchronous checkpoint here is still deliberately avoided: it would let an
+    /// operator action rewrite the stream position, which is a worse trade than a rare
+    /// resume of a snapshot that can be stopped again.
     ///
     /// # Errors
     ///

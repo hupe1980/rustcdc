@@ -9,7 +9,12 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -36,6 +41,7 @@ async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
 /// Test INSERT/UPDATE/DELETE event capture
 #[tokio::test]
 async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql stream integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -206,6 +212,7 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
 /// Test stream resume from checkpoint
 #[tokio::test]
 async fn mysql_stream_resume_from_checkpoint() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql stream resumption test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -331,6 +338,7 @@ async fn mysql_stream_resume_from_checkpoint() -> rustcdc::Result<()> {
 /// their `source.offset` must reflect the new filename.
 #[tokio::test]
 async fn mysql_stream_binlog_rotation() -> rustcdc::Result<()> {
+    install_rustls_provider();
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql binlog rotation test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());

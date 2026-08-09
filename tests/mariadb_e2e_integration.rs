@@ -13,7 +13,12 @@ use testcontainers::{
 };
 use tokio::time::{sleep, Duration};
 
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
+
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -81,6 +86,7 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
     version: &str,
     server_id: u32,
 ) -> rustcdc::Result<()> {
+    install_rustls_provider();
     let container = GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -225,6 +231,7 @@ async fn run_mariadb_stream_capture_insert_update_delete(
     version: &str,
     server_id: u32,
 ) -> rustcdc::Result<()> {
+    install_rustls_provider();
     let container = GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
@@ -363,6 +370,7 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
     version: &str,
     server_id: u32,
 ) -> rustcdc::Result<()> {
+    install_rustls_provider();
     let container = GenericImage::new("mariadb", version)
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))

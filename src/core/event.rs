@@ -392,6 +392,16 @@ pub struct Event {
     /// would race concurrent writes and yield a value from a different point in time,
     /// so there is no safe way to fill it in.
     ///
+    /// **One exception, and it is not an out-of-band read.** During an incremental
+    /// snapshot, an event inside a chunk's watermark bracket is repaired from *that
+    /// chunk's own image* of the row, and arrives with this list empty. That is sound
+    /// where a fresh read is not: the value comes from a `SELECT` at a snapshot whose
+    /// position the driver knows, `unavailable_columns` means the UPDATE did not modify
+    /// those columns, and every write between the read and the event is itself inside the
+    /// bracket and already folded in. See
+    /// [`IncrementalSnapshotDriver`](crate::source::IncrementalSnapshotDriver). Outside
+    /// that window the paragraph above stands.
+    ///
     /// **A consumer that writes whole rows must exclude these columns from the write**
     /// (e.g. omit them from the `SET` clause of an upsert) rather than writing NULL.
     ///
@@ -884,9 +894,26 @@ impl Event {
     ///
     /// - `primary_key` is `None` or empty.
     /// - The relevant row image (`after` or `before`) is absent or not a JSON object.
+    /// - **Any** declared key column is missing from that row image.
     ///
-    /// This is the canonical source for Kafka message keys and idempotency
-    /// fingerprints derived from primary-key values alone.
+    /// # A partial composite key is never returned
+    ///
+    /// The last condition is all-or-nothing on purpose, and it is the difference
+    /// between a missing write and a catastrophic one. Given `primary_key =
+    /// ["tenant_id", "id"]` and a payload carrying only `tenant_id`, returning
+    /// `{"tenant_id": 7}` produces a key that *looks* valid and addresses **every row
+    /// of that tenant**. A sink turning it into `DELETE FROM t WHERE tenant_id = 7`
+    /// deletes the whole tenant; an upsert collapses the tenant onto one row. Both are
+    /// silent, and neither is recoverable from the event stream.
+    ///
+    /// Returning `None` routes the event to
+    /// [`RowWrite::None { reason: MissingPrimaryKey }`](RowWrite::None) instead, which a
+    /// sink must handle explicitly. A visible gap beats an invisible over-write.
+    ///
+    /// This is also the canonical source for message keys and idempotency
+    /// fingerprints derived from primary-key values alone, and both need the same
+    /// guarantee: a truncated key silently merges distinct rows into one compaction
+    /// group.
     ///
     /// # Example
     ///
@@ -902,6 +929,14 @@ impl Event {
     /// let key = event.primary_key_values().unwrap();
     /// assert_eq!(key["id"], json!(42));
     /// assert!(key.get("name").is_none());
+    ///
+    /// // A composite key with one column missing from the payload yields no key at all,
+    /// // rather than one that addresses every row sharing the column that is present.
+    /// let partial = Event::builder("", Operation::Insert)
+    ///     .after(json!({"tenant_id": 7}))
+    ///     .primary_key(["tenant_id", "id"])
+    ///     .build();
+    /// assert!(partial.primary_key_values().is_none());
     /// ```
     pub fn primary_key_values(&self) -> Option<serde_json::Value> {
         let keys = self.primary_key.as_deref()?;
@@ -917,16 +952,11 @@ impl Event {
         let obj = row?.as_object()?;
         let mut result = serde_json::Map::with_capacity(keys.len());
         for key in keys {
-            if let Some(value) = obj.get(key) {
-                result.insert(key.clone(), value.clone());
-            }
+            // `?` on the lookup, not a skip: a key missing even one column is not a key.
+            result.insert(key.clone(), obj.get(key)?.clone());
         }
 
-        if result.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(result))
-        }
+        Some(serde_json::Value::Object(result))
     }
 }
 
@@ -1392,6 +1422,58 @@ mod tests {
         };
         // "id" not present in `after`, so result should be None
         assert!(event.primary_key_values().is_none());
+    }
+
+    /// A composite key missing one column addresses every row sharing the rest of it.
+    #[test]
+    fn primary_key_values_refuses_a_partial_composite_key() {
+        // `tenant_id` alone selects the whole tenant. Returning it as "the key" turns a
+        // single-row delete into a tenant wipe, with nothing in the event stream to
+        // show it happened.
+        let event = Event {
+            after: Some(json!({"tenant_id": 7, "name": "charlie"})),
+            op: Operation::Insert,
+            primary_key: Some(vec!["tenant_id".into(), "user_id".into()]),
+            ..Event::default()
+        };
+        assert!(
+            event.primary_key_values().is_none(),
+            "a partial composite key must not be returned"
+        );
+    }
+
+    #[test]
+    fn a_partial_composite_key_yields_no_row_write_rather_than_a_wide_delete() {
+        let delete = Event {
+            before: Some(json!({"tenant_id": 7})),
+            after: None,
+            op: Operation::Delete,
+            primary_key: Some(vec!["tenant_id".into(), "user_id".into()]),
+            ..Event::default()
+        };
+        assert_eq!(
+            delete.row_write(),
+            RowWrite::None {
+                reason: NoRowWrite::MissingPrimaryKey
+            },
+            "a delete with a truncated key must be refused, not widened"
+        );
+
+        // The same holds for the upsert direction: a partial key would collapse every
+        // row of the tenant onto one.
+        let insert = Event {
+            after: Some(json!({"tenant_id": 7, "name": "charlie"})),
+            op: Operation::Insert,
+            primary_key: Some(vec!["tenant_id".into(), "user_id".into()]),
+            ..Event::default()
+        };
+        match insert.row_write() {
+            RowWrite::Replace { key, .. } => assert!(
+                key.is_none(),
+                "a truncated composite key must not be offered as a write key"
+            ),
+            other => panic!("expected Replace with no key, got {other:?}"),
+        }
     }
 
     #[test]

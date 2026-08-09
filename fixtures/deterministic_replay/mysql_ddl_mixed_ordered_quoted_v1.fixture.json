@@ -6,8 +6,14 @@
     "source_version": "mysql=8.0",
     "fixture_version": 1,
     "description": "MySQL DDL replay fixture with mixed supported/unsupported ALTER clauses and quoted literals for order stability.",
-    "tags": ["mysql", "ddl", "schema_change", "mixed_alter", "quoted"],
-    "expected_event_count": 2,
+    "tags": [
+      "mysql",
+      "ddl",
+      "schema_change",
+      "mixed_alter",
+      "quoted"
+    ],
+    "message_count": 2,
     "captured_at": "2026-05-17T00:00:00Z"
   },
   "messages": [
@@ -15,13 +21,18 @@
       "seq": 0,
       "message_type": "QueryEvent",
       "payload": "{\"query\":\"alter table inventory.products add column status varchar(32), comment='alpha, beta'' gamma', drop column if exists legacy_status;\"}",
-      "tags": ["ddl", "schema_change"]
+      "tags": [
+        "ddl",
+        "schema_change"
+      ]
     },
     {
       "seq": 1,
       "message_type": "XidEvent",
       "payload": "{\"xid\":2104}",
-      "tags": ["transactional"]
+      "tags": [
+        "transactional"
+      ]
     }
   ]
 }

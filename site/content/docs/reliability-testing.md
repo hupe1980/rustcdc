@@ -73,7 +73,84 @@ Deterministic replay verifies that canonical event interpretation stays stable a
 
 ### Why Semantic Diff
 
-Semantic diff intentionally ignores noisy changes (for example field ordering) and highlights behavior regressions (for example operation/type/key changes).
+Semantic diff intentionally ignores changes that differ every run and highlights behaviour
+regressions. Comparing raw JSON instead would fail every fixture on wall-clock timestamps, and a
+suite that fails for uninteresting reasons gets disabled.
+
+### What it compares — and why the list matters more than it looks
+
+`semantic_diff` is the **sole** comparison the golden-fixture suite performs. A field it does not
+compare is therefore invisible to every fixture, however many fixtures there are. That is worth
+stating plainly, because until 0.12.0 it was true of fields whose regressions are exactly what the
+fixtures exist to catch: `primary_key`, `unavailable_columns`, `before_unavailable_columns`,
+`envelope_version`, `source.offset`, `transaction` and `snapshot` were all unchecked. A change to
+any of them left every golden green — including a regression that stopped reporting an
+unchanged-TOAST column, which makes a sink write `NULL` over live data.
+
+**Compared** — every field that is a deterministic function of the replayed input: `op`, `table`,
+`schema`, `source.source_name`, `source.offset`, `before`, `after`, `before_is_key_only`,
+`unavailable_columns`, `before_unavailable_columns`, `primary_key`, `envelope_version`,
+`transaction`, and the chunk position within `snapshot`.
+
+**Not compared**, each for a stated reason rather than by omission:
+
+| Field | Why |
+|---|---|
+| `ts`, `source.timestamp` | Wall-clock at capture; differs every run by construction |
+| `snapshot.snapshot_id` | Embeds the millisecond the snapshot began, so it differs per run while carrying no correctness meaning of its own |
+
+A field added to `Event` in future belongs in one of those two lists. One that lands in neither is
+a field the fixtures cannot see, so `every_deterministic_field_is_actually_compared` asserts each
+compared field produces a diff when mutated, and `per_run_varying_fields_stay_ignored` asserts the
+other two do not. All recorded goldens pass unchanged under the stricter comparison, which is what
+shows the additions describe real behaviour rather than being tightened arbitrarily.
+
+### A comparison is only as good as what the fixtures can express
+
+Comparing a field is necessary but not sufficient. Until 0.12.0 the replay engine hardcoded
+`before_is_key_only`, `unavailable_columns` and `before_unavailable_columns` to their empty
+defaults, so **both sides of those comparisons were structurally always equal** — the fields had
+the appearance of coverage and none of the substance, and an unchanged-TOAST regression was still
+invisible.
+
+The fixture payload now carries all three, and `postgres_unchanged_toast_v1` exercises them with
+both cases in one file: a TOASTed column that was *not* modified (absent from `after`, named in
+`unavailable_columns`, key-only before-image) and one that *was* (present in `after`, absent from
+`before`, named in `before_unavailable_columns`). The second is why the two lists are never
+merged — merging them marks a genuinely changed column as unwritable and silently drops the
+update.
+
+Absent fields mean "complete payload", so fixtures written before this are unaffected. A wrong
+*shape* is rejected rather than ignored, because a silently-dropped `unavailable_columns` would
+record a golden asserting the opposite of what its author wrote.
+
+### Fixture integrity is checked on the path that loads files
+
+`Fixture::validate` checks that a fixture has messages, that their sequence numbers are contiguous
+from zero, that `message_count` agrees with the array, and that every payload has the shape its
+message type requires. `ReplaySession::new` runs it, so nothing replays unvalidated.
+
+The `message_count` check exists because these fixtures are hand-maintained JSON and a lost message
+is otherwise invisible: replay produces fewer events, the golden is re-recorded to match, and the
+scenario retires without a word. It is a checksum against truncation, not a restatement of
+`messages.len()`.
+
+It was previously named `expected_event_count` and checked only in `Fixture::new` — which
+`from_path` and `from_json` do not call — so every fixture on disk carried an unverified number. The
+name was also wrong: the count of *events* is not the count of *messages*, since an aborted
+transaction discards its buffered events, and it was compared against the message count regardless.
+
+`Fixture::new` returns `Result` rather than asserting, so a fixture-building tool reports a problem
+instead of aborting.
+
+### Every replayed event is validated, not just compared
+
+Matching a golden is not the same as being correct: a golden recorded once from a malformed
+envelope would be defended by the suite forever, because both sides share the malformation. Each
+replayed event is run through `Event::validate()` before comparison, which enforces the
+partial-payload rules — a column may not be both listed as unavailable and present in the payload,
+and a key-only before-image may not also carry unavailable columns. All fixtures pass, so none was
+pinning a contract violation.
 
 ## Fault Injection
 

@@ -103,16 +103,151 @@ The default for anything large. Chunk reads interleave with the live stream, so 
 never pauses and no long-held transaction accumulates transaction IDs. Per chunk:
 
 1. capture a **low watermark** position before the `SELECT`
-2. read `chunk_size` rows by keyset pagination, outside any transaction
-3. capture a **high watermark** position after the `SELECT`
-4. keep polling the stream, recording the primary key of every event for that table whose
-   position falls in `(low, high]`
-5. once the stream passes the high watermark, emit snapshot rows **except** those whose key
+2. capture the set of **transactions still in flight** — see
+   [the low watermark is not the whole bracket](#the-low-watermark-is-not-the-whole-bracket)
+3. read `chunk_size` rows by keyset pagination, outside any transaction
+4. capture a **high watermark** position after the `SELECT`
+5. keep polling the stream, recording the primary key of every event for that table that the
+   `SELECT` could not have seen — its position falls in `(low, high]`, or it belongs to one of
+   the in-flight transactions
+6. once the stream passes the high watermark, emit snapshot rows **except** those whose key
    was in that override set
 
-Step 5 is what makes the result independent of interleaving. A row modified between the two
+Step 6 is what makes the result independent of interleaving. A row modified between the two
 watermarks appears in the chunk at its old value and in the stream at its new one; suppressing
 the chunk copy means the stream value wins regardless of the order they were produced in.
+
+#### The low watermark is not the whole bracket
+
+The textbook bracket — "log position in `(low, high]`" — is **unsound on every database this
+crate supports**, and the failure is silent data corruption rather than an error.
+
+Reaching the log and becoming visible are two separate steps. PostgreSQL writes a
+transaction's commit record to WAL, which advances `pg_current_wal_lsn()`, flushes it, and only
+*then* clears the transaction from the proc array — which is what makes it visible to new
+snapshots. MySQL's ordered commit has the same shape: the binlog position advances at the flush
+stage, before the InnoDB engine commit.
+
+So a transaction can sit at commit LSN 500 with a low watermark of 600 and still be invisible
+to a chunk `SELECT` that starts in between. The chunk then holds that row's **pre-image**,
+while the transaction's own event — at LSN 500, *below* the low watermark — never enters
+`(low, high]` and is never suppressed. The chunk row is emitted after the stream event and the
+stale value wins. The window is one commit's flush-to-visibility gap, which with
+`synchronous_commit = on` is an fsync long; over a multi-hour snapshot of a hot table it is not
+a theoretical concern.
+
+Step 2 closes it, and the rule is PostgreSQL's own. A snapshot is `(xmin, xmax, xip)`, and a
+transaction is invisible to it exactly when
+
+```text
+xid >= xmax  ||  xip.contains(xid)
+```
+
+**Both halves are needed.** `xmax` is `latestCompletedXid + 1`, so an in-flight transaction whose
+xid is the highest assigned — the common case for one mid-commit — sits at or above `xmax` and is
+therefore *absent* from `xip`. An earlier version of this connector tested `xip` alone and so missed
+precisely the transactions the bracket exists to catch; running it against a real server reported
+`Expected 733 in []`, with `pg_current_snapshot()` returning `733:733:`.
+
+The fence is read after the low watermark and before the chunk read, so any transaction invisible to
+the chunk's snapshot `S` is also invisible to the earlier fence `S₀` — and by the rule above `S₀`
+flags it.
+
+The ordering of steps 1–3 is what makes the pair exhaustive, which is why it is a documented
+contract rather than an implementation detail. Over-suppression in the other direction — a
+transaction the chunk *did* see being flagged — is harmless: the chunk row is dropped and the
+stream event carries the same or a newer value.
+
+Per-connector posture:
+
+| Connector | In-flight set | Why |
+|---|---|---|
+| PostgreSQL | `pg_current_snapshot()` | Applies the engine's own visibility rule, `xid >= xmax \|\| xip.contains(xid)` — **both** halves, since a lone in-flight transaction sits *at* `xmax` and never appears in `xip` |
+| SQL Server | not needed | `fn_cdc_get_max_lsn()` reports what the capture job has *already harvested*, so the watermark lags visibility instead of leading it — the safe direction |
+| MySQL / MariaDB | **closed, with `gtid_mode = ON`** | No in-flight *transaction id* exists on a common scale, so a different mechanism is used: the executed-GTID set. See [closing the MySQL window](#closing-the-mysql-window-with-gtid-sets) |
+
+For MySQL, enable `gtid_mode` — see below. Failing that, snapshot from a quiesced replica or scope
+the snapshot with `table_conditions` to rows that are not being written.
+
+#### Closing the MySQL window with GTID sets
+
+The in-flight transaction id is one way to identify what a chunk read could not see. It is not the
+only one, and MySQL supports a different one — which is what this connector uses.
+
+`SHOW MASTER STATUS`'s file-and-position advances at the binlog **flush** stage, before the InnoDB
+engine commit that makes rows visible, and that is what opens the race. `Executed_Gtid_Set` is
+updated **after** the engine commit, so a GTID present in it belongs to a transaction whose rows
+are already visible. The bracket is therefore a set difference:
+
+- low watermark = `Executed_Gtid_Set` before the chunk read;
+- high watermark = the set after it;
+- **inside** = the event's GTID is in `high` and not in `low`;
+- **after** = its GTID is not in `high`, so it committed once the chunk read had finished.
+
+Both bounds come from the set, deliberately. Mixing them — a set-based lower bound with an ordinal
+upper bound — is unsound in a way that is easy to reach: an event inside the ordinal high bound but
+absent from `high`'s set committed *after* that read, and suppressing it would discard the newer
+value.
+
+This is the mechanism Debezium's read-only incremental snapshot uses, and it requires
+`gtid_mode = ON`. The set is the last column of `SHOW MASTER STATUS`, so it costs no extra round
+trip.
+
+**How the driver accommodates it.** The bracket decision belongs to the backend rather than to the
+driver, because only the backend knows whether its watermark is an ordered coordinate or a set —
+and `>` cannot express membership in a GTID set, which is only *partially* ordered.
+`IncrementalSnapshotBackend::event_in_bracket` returns `Before`, `Inside` or `After`, defaulting to
+the ordinal test so PostgreSQL and SQL Server are unchanged and a third-party backend keeps
+compiling.
+
+The binlog coordinate is still carried in the watermark and still orders it, but only to answer a
+different question: *has the stream caught up to the high watermark yet, so the chunk can be
+emitted?* That is safe on the coordinate, because every GTID in a watermark's set was written to
+the binlog before that watermark was read — so a stream past the coordinate has decoded them all.
+The GTID set takes no part in ordering.
+
+**Without `gtid_mode`** the watermark's set is empty and the ordinal test applies, with the
+residual window described above. An event with no GTID while the watermarks *do* have sets — a
+non-transactional or synthetic event — also falls back, rather than being treated as absent from
+`high` and deferred past the chunk on no evidence.
+
+#### A complete chunk row suppressed by an incomplete event
+
+Suppression would otherwise trade one gap for another. A PostgreSQL unchanged-TOAST `UPDATE`
+omits the large column entirely, so its event is a partial payload (`RowWrite::Merge`) — and a
+merge into a row the consumer does not have yet, which is the normal case during a first
+snapshot, applies nothing. The chunk row that *did* carry the column has just been suppressed,
+so nothing would contain it.
+
+Emitting the chunk row anyway is not the answer: placing its pre-image after a newer event
+resurrects every *other* column's stale value, which is strictly worse. Instead the **event is
+repaired from the chunk's own image of that row**, arriving as a complete `RowWrite::Replace`,
+so the suppression costs nothing.
+
+That is sound where reading the column back out of the table is not, and the difference is the
+whole reason it is safe:
+
+- The value does not come from a fresh read. It comes from **this chunk's** `SELECT`, at a
+  snapshot whose position the driver knows.
+- `unavailable_columns` means the `UPDATE` **did not modify** those columns, so their
+  post-event value equals their value at the start of the event.
+- The only thing that could have changed a column between the chunk snapshot and the event is
+  another transaction — and any such transaction is *also* inside the bracket, so its event has
+  already passed through and folded its values into the chunk's image. If it modified the
+  column it carried it; if it did not, the chunk value still stands.
+
+So the driver knows every write between the read and the event, which is exactly what an
+out-of-band read does not. The chunk row doubles as a shadow image for this purpose, updated by
+each in-bracket event, so a later event that omits a column an earlier one wrote is filled with
+the *new* value rather than the pre-snapshot one.
+
+Only columns the chunk actually read are filled, and only for that key's own row. An event for a
+key outside the current chunk passes through untouched — no chunk row is being suppressed for
+it, so nothing is lost and nothing may be invented. An event *past* the high watermark is
+likewise left alone: the chunk is delivered before it, so the consumer has the row and a merge
+is the correct thing to apply. If a column genuinely cannot be filled — a schema change inside
+the chunk window naming a column the table no longer has — the driver logs a WARN with the table,
+key and columns rather than staying silent.
 
 An event **past** the high watermark is deliberately not suppressed: it committed after the
 `SELECT` finished, so the chunk row is still needed as that row's base state. What the
@@ -143,6 +278,23 @@ guarantees. Advancing at read time instead would make a cursor durable before it
 anywhere, and a restart would resume *after* rows that were never emitted — up to `chunk_size`
 rows missing from the snapshot, with no error and no counter to notice it by.
 
+#### A re-snapshot must not look like a replay
+
+A snapshot row's offset identifies the **row**, not a log position — it has none. So re-reading an
+unchanged row produces a byte-identical event, and the runtime's idempotency guard (on by default)
+classified it as a replay and dropped it. An operator who re-requested a table got a success
+response and no rows.
+
+Neither half was wrong alone: the fingerprint excludes wall-clock time so that replays *are*
+recognised, and the offset is row-derived and stable across restarts by design. What was missing is
+that nothing recorded which snapshot **attempt** produced a row.
+
+`IncrementalSnapshotState::generation` now does, and it is part of the offset. It advances on every
+request and across a stop — a stop discards the table list, so a later request would otherwise
+restart at generation 0 and collide with the run it abandoned. A chunk re-read after a
+mid-snapshot reconnect keeps its generation and is still deduplicated, so the guard keeps doing
+what it exists for. The generation is persisted, so the offsets stay stable across a restart.
+
 Tables can be added to a running snapshot with
 `CdcRuntime::request_incremental_snapshot` — see
 [on-demand snapshots](@/docs/config-reference.md#on-demand-snapshots). Because such a table is not
@@ -152,7 +304,8 @@ without that a runtime request would look honoured and then silently stop at the
 
 This algorithm is implemented **once**, in `IncrementalSnapshotDriver`. A connector supplies
 only the database-specific half through `IncrementalSnapshotBackend`: the position type, the
-watermark query, the chunk read, event position extraction, and the offset encoding. The three
+watermark query, the in-flight transaction set, the chunk read, event position extraction, and
+the offset encoding. The three
 built-in connectors go through that interface, and so can yours — see
 [Incremental snapshot for a custom source](@/docs/api.md#incremental-snapshot-for-a-custom-source).
 

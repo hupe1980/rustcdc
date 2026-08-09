@@ -6,6 +6,10 @@ use rustcdc::{
     MysqlConnection, MysqlSourceConfig, TransportConfig,
 };
 use std::sync::OnceLock;
+
+#[path = "rustls_provider_common.rs"]
+mod rustls_provider_common;
+use rustls_provider_common::install_rustls_provider;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -22,6 +26,7 @@ fn mysql_snapshot_test_lock() -> &'static Mutex<()> {
 }
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {
+    install_rustls_provider();
     let mut last_error = None;
     for _ in 0..30 {
         match sqlx::mysql::MySqlPoolOptions::new()
@@ -75,6 +80,7 @@ fn extract_mysql_row_id(row: &serde_json::Value) -> rustcdc::Result<u64> {
 /// Validates: keyset pagination, resumable snapshots, no duplicates, checkpoint persistence
 #[tokio::test]
 async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
+    install_rustls_provider();
     let _guard = mysql_snapshot_test_lock().lock().await;
 
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
@@ -229,6 +235,7 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
 /// Test snapshot resumption from checkpoint
 #[tokio::test]
 async fn mysql_snapshot_resumption_from_checkpoint() -> rustcdc::Result<()> {
+    install_rustls_provider();
     let _guard = mysql_snapshot_test_lock().lock().await;
 
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
@@ -395,6 +402,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> rustcdc::Result<()> {
 /// Test empty table handling
 #[tokio::test]
 async fn mysql_snapshot_empty_table() -> rustcdc::Result<()> {
+    install_rustls_provider();
     let _guard = mysql_snapshot_test_lock().lock().await;
 
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {

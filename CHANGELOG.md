@@ -5,6 +5,855 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.12.0
+
+A second correctness pass over the whole tree, plus round-2 feedback from the `rustcdc-server`
+maintainers against the released 0.11.0. Thirty findings, all closed here, and the shape of them differs from last time:
+none was visible by reading a function in isolation, and half required reasoning about what a
+database actually guarantees rather than about what this code says.
+
+Four were silent-corruption class, one was a server-triggered denial of service, and one was an
+operator action that quietly undid itself on the next deploy. Two are flaws in the DBLog
+incremental snapshot as commonly implemented rather than in the code implementing it — the
+watermark bracket ignoring commit visibility, and the override window discarding
+unchanged-TOAST columns it could have recovered. Both are present in every read-only watermark
+CDC implementation available to check, Debezium's included.
+
+Every fix carries a regression test that was **confirmed to fail with the fix reverted**, by
+reverting it, rather than asserted to.
+
+It is a **breaking** release in five ways: a truncated composite primary key no longer resolves
+to a key at all; `table_include_list` / `table_exclude_list` entries are glob patterns rather
+than exact strings; `EventEncoder::encode_key` returns `Result<Option<_>>`;
+`StreamHandle::request_snapshot_tables` takes a `SnapshotRequest`; and the replay fixture format
+renames `expected_event_count` to `message_count`. `IncrementalSnapshotBackend` gains a method and
+`IncrementalSnapshotState` two fields, but both are defaulted so existing implementations compile
+and existing checkpoints load unchanged — though accepting the backend default is a correctness
+decision, and the trait says so. Each has its own entry below with the migration.
+
+Two conditions remain open on a 1.0 release, one of them new and a database limitation rather
+than a defect. [FINDINGS.md](FINDINGS.md) has the full audit.
+
+Four of the fifteen came from `rustcdc-server`'s round-2 report (B-4, F-8, F-9, F-10). Every
+claim in it was verified against the source before acting; all four held, and B-4's mechanism
+was diagnosed exactly right. One consequence of B-4 was worse than reported — see its entry.
+
+### Fixed: MySQL's incremental-snapshot commit-visibility window, via GTID sets
+
+The `rustcdc-server` maintainers asked why this needed our own wire protocol, as PostgreSQL's WAL
+stream did. It does not — and answering that properly showed the gap was never a MySQL limitation
+at all, only a limitation of how this crate bracketed a chunk read. An earlier entry in this
+release called it a database limitation; that was wrong and is corrected here.
+
+`SHOW MASTER STATUS`'s file-and-position advances at the binlog **flush** stage, before the InnoDB
+engine commit that makes rows visible. So a transaction can sit *below* the low watermark and still
+have been invisible to the chunk `SELECT` — the chunk holds its pre-image, the ordinal test finds
+nothing to suppress, and the stale value is emitted over the newer one.
+
+`Executed_Gtid_Set` is updated **after** the engine commit, so a GTID present in it belongs to a
+transaction whose rows are already visible. The bracket becomes a set difference: inside iff the
+event's GTID is in `high` and not in `low`, after iff it is not in `high`. This is the mechanism
+Debezium's read-only incremental snapshot uses, and it requires `gtid_mode = ON`. The set is the
+last column of `SHOW MASTER STATUS`, so it costs no extra round trip.
+
+**Both bounds come from the set, deliberately.** Mixing a set-based lower bound with an ordinal
+upper bound is unsound and easy to reach: an event inside the ordinal high bound but absent from
+`high`'s set committed *after* that read, so suppressing it would discard the newer value. Two
+tests assert exactly this pair of divergences from the ordinal test — one where ordinal says
+`Before` and membership says `Inside`, one where ordinal says `Inside` and membership says `After`.
+
+**New on the trait, defaulted:**
+
+```rust
+fn event_in_bracket(&self, event, position, low, high, in_flight) -> BracketPosition
+```
+
+The bracket decision belongs to the backend, because only it knows whether its watermark is an
+ordered coordinate or a set — and `>` cannot express membership in a GTID set, which is only
+*partially* ordered. The default is the ordinal test the driver used to inline, so PostgreSQL and
+SQL Server are unchanged and a third-party backend keeps compiling. `BracketPosition` is exported.
+
+The binlog coordinate still orders the watermark, but only to answer a different question: has the
+stream caught up to the high watermark, so the chunk can be emitted? That is safe on the
+coordinate, since every GTID in a watermark's set was written to the binlog before that watermark
+was read. The set takes no part in ordering, and a test pins that.
+
+**Two documented fallbacks**, both to the ordinal test rather than a guess: `gtid_mode = OFF`,
+where there is no set to use; and an event with no GTID while the watermarks do have sets — a
+non-transactional or synthetic event, which must not be read as "absent from `high`" and deferred
+past the chunk on no evidence.
+
+A malformed `Executed_Gtid_Set` is an error, not an empty set. Silently shrinking a watermark is
+the failure this mechanism exists to prevent: a shrunken low watermark suppresses chunk rows it
+should not, and a shrunken high watermark fails to suppress rows it must.
+
+**Still needs a live server to confirm end to end.** The GTID logic, the bracket, the fallbacks and
+the ordering property are covered by 20 unit tests; what no test here can establish is that a real
+MySQL's `Executed_Gtid_Set` and its binlog GTIDs line up as expected. That belongs in the
+container-backed matrix.
+
+### Fixed: the OpenTelemetry and Prometheus metric names were two disjoint namespaces
+
+Every runbook alert threshold silently never fired for anyone on the OTel path.
+
+The crate exposes metrics two ways — its own `/metrics` text exposition, and OpenTelemetry under
+the `metrics` feature — and they named overlapping quantities differently. OTel emitted
+`rustcdc.replication_lag_ms`, `rustcdc.buffer_size`, `rustcdc.checkpoint.committed_count`; the text
+exposition emitted `rustcdc_runtime_replication_lag_ms`, `rustcdc_runtime_buffer_depth`,
+`rustcdc_runtime_events_committed_total`. The runbook documents **only** the latter.
+
+So an operator enabling `metrics`, exporting through a collector to Prometheus, and copying the
+runbook's thresholds got alerts matching nothing. An alert that silently does not fire is worse
+than no alert: it looks like coverage.
+
+Every OTel instrument is now named so that the standard OTel → Prometheus translation — dots to
+underscores, `_total` appended to monotonic counters — produces exactly the documented series
+name. Nothing documented changed name, so existing alerts keep working; the undocumented namespace
+was the one that moved.
+
+Units stay in the metric name rather than declared via `with_unit`, because a declared unit makes
+the exporter append a unit suffix and break that correspondence — and unit-in-name is the
+Prometheus convention regardless. The reasoning is recorded at the instrument definitions, where
+the next person to add one will see it.
+
+Two caveats worth stating rather than leaving to be discovered. The two surfaces still expose
+**different quantities**, not merely different names: the text exposition has health, liveness,
+readiness, and the idempotency and skip counters; OTel has lag-in-events, checkpoint offset,
+snapshot progress and the duration histograms. And `rustcdc.runtime.events_filtered` has no
+runtime caller — it is an embedder-facing hook on `OTelMetricsCollector`, not something the
+pipeline feeds, so it reads zero unless you call it.
+
+### Fixed: SQL Server's LSN read point crept forward on a quiet database
+
+`fn_cdc_get_max_lsn()` reports what the capture job has harvested, so it stands still while nothing
+changes. The window was clamped to stay non-inverted — after reading `[S, M]` the next window became
+`[M+1, M+1]` — and the next advance incremented from that clamped end. Every empty poll therefore
+pushed the read point one minimal LSN step above the harvested maximum, indefinitely, and a change
+committed later was captured only if its LSN was still above wherever the point had crept to.
+
+**Two attempts; the first was worse than the bug.** Parking one step past the maximum and stopping
+means that when the maximum later moves, the advance increments from the parked *end* and skips the
+parked LSN — one that was never readable while the window sat there. That was caught by a test
+written for the attempt and withdrawn rather than shipped.
+
+The rule now is that `lsn_end` never exceeds the harvested maximum, so an **empty window is
+represented** (`lsn_start > lsn_end`) rather than clamped, and the lower bound moves only when
+something was consumed. An empty window whose maximum later jumps reopens from its original
+`start`, so nothing between them is skipped. The per-instance fetch short-circuits on an empty
+window rather than issuing a round trip per capture instance for a range that cannot contain
+anything.
+
+Six unit tests on the pure `next_window`, including the exact skip that broke the first attempt, and
+validated against a live SQL Server 2022 through `sqlserver_stream_integration`,
+`sqlserver_window_truncation_integration` and `sqlserver_snapshot_integration`.
+
+`sqlserver_idle_window_integration` validates it behaviourally: poll repeatedly against a
+**standing** harvested maximum, then write, and require the change to arrive. Its idle phase
+deliberately withholds `sys.sp_cdc_scan`, which the other SQL Server suites call on empty polls —
+forcing a scan there would keep the maximum advancing and mask the exact condition the creep needs.
+A first version of the test omitted that reasoning, reported zero events, and looked like a
+connector fault.
+
+### Changed: `EventEncoder::encode_key` distinguishes "no key" from "encoding failed"
+
+**Breaking**: the signature is now `Result<Option<Vec<u8>>>` rather than `Option<Vec<u8>>`.
+A call site becomes `encoder.encode_key(&event)?`; there is one non-default implementor in the
+crate.
+
+A bare `Option` conflated two outcomes that must not be:
+
+| Outcome | Meaning |
+|---|---|
+| `Ok(None)` | The event genuinely has no key — TRUNCATE, SCHEMA_CHANGE, no declared primary key, or a payload missing a key column |
+| `Err(..)` | Encoding **failed**, for an event that does have a key |
+
+Collapsing the second into the first is a silent correctness failure, not a lost error message. A
+keyed sink reads `None` as "unkeyed" and publishes the record without a key: partition routing
+becomes round-robin, **ordering for that row is lost**, log compaction stops collapsing it — and
+the record still arrives, so nothing looks wrong.
+
+`ConfluentAvroEncoder::encode_key` made that outcome reachable, swallowing both of its failure
+paths with `.ok()` while its own documentation said it "always returns `Some(bytes)`". Neither path
+is reachable today — the key schema is fixed and single-field, and `serde_json` cannot fail on a
+`Map<String, Value>` — which is precisely why swallowing them was cheap to write and would have
+stayed invisible if either ever became reachable. `EncoderCodec` was propagating the same `Option`
+into `CodecOutput { key: None, .. }`, so a failure would have reached a sink as "this event has no
+key".
+
+The crate already refuses this from the other direction: a transform that destroys an event's key
+is rejected with an error naming the stage rather than emitting the record unkeyed. Letting an
+encoder cause the same thing quietly was the inconsistency.
+
+Covered by `a_keyless_event_is_ok_none_and_never_an_error`, which pins every legitimate `Ok(None)`
+case including the truncated-composite-key one, and
+`the_combined_codec_propagates_a_key_failure_rather_than_reporting_no_key`.
+
+### Fixed: the CloudEvents encoder dropped `before_unavailable_columns`
+
+Found by asking the same question of the codecs that F21 asked of the fixtures: the schemas
+declare these fields, but does every encoder actually write them?
+
+Avro and Protobuf do, and both decoders read them back. The **CloudEvents** encoder wrote
+`before_is_key_only` and `unavailable_columns` and not `before_unavailable_columns` — omitted when
+the field was added to the envelope, with nothing to notice.
+
+The consequence is narrow and sharp: a CloudEvents consumer had a **weaker contract than a JSON,
+Avro or Protobuf consumer of the same stream**, and could not tell a before-image column absent
+*because it was TOASTed* from one that was genuinely `NULL`. That is precisely the distinction the
+field exists to make, and the one a row diff or a compensating write depends on — the crate's own
+documentation says "do not read its absence as 'was NULL'", which a CloudEvents consumer had no
+way to honour.
+
+The three fields are now written by one loop rather than three independent branches, so a fourth
+cannot be forgotten the same way.
+
+Two tests: one asserting both unavailable-column lists appear with their values, and
+`no_envelope_field_is_silently_dropped`, which checks the whole envelope as a **set** rather than
+field by field — because the failure mode is a field added to `Event` and not to this encoder,
+which is exactly what happened. Both fail with the fix reverted.
+
+`ts` and `source.timestamp` are equal on every connector path, so CloudEvents carrying only `time`
+loses nothing today. Recorded here because they are separate fields with separate contracts, and
+the equality is a property of the connectors rather than a guarantee of the envelope.
+
+### Fixed: a truncated replay fixture loaded and replayed silently
+
+**Breaking** (fixture format): `FixtureMetadata::expected_event_count` is now `message_count`,
+and all 41 fixtures are migrated.
+
+The field was documented "Expected event count for validation" and was checked in exactly one
+place — `Fixture::new` — which the loading path never calls. Fixtures are read with
+`from_path` → `from_json`, and `Fixture::validate` did not look at it at all. So every fixture on
+disk carried an unverified number that a reader could reasonably trust.
+
+The failure that matters is a fixture losing a message to an edit. Replay produces fewer events,
+the golden is re-recorded to match, and whatever scenario the missing messages covered quietly
+stops being covered — the same shape as the three findings below, where a green harness meant less
+than it looked.
+
+The name was also wrong in a way that mattered. It said *event* count and was compared against
+`messages.len()`, and those genuinely differ: an aborted transaction discards its buffered events,
+so replay can legitimately produce fewer events than messages. Renaming it to `message_count`
+makes it mean what it checks, so the check can now live in `validate` without ambiguity.
+
+`Fixture::new` also stopped panicking. It used `assert_eq!` on caller-supplied data inside a
+library; every other constructor in the crate returns a `Result`, and a fixture builder is exactly
+the caller that wants to report a problem rather than abort. It now runs the full `validate` and
+returns `Result<Fixture, String>`.
+
+**Making the constructor validate immediately found three tests that depended on it not doing
+so** — two deliberately built invalid fixtures to exercise `validate` (now constructed directly,
+which is what they meant), and a serialization round-trip whose `Insert` payload was
+`{"table":..,"columns":[..]}`: a shape no message type accepts. That test had been round-tripping
+an invalid fixture since it was written.
+
+Covered by `a_miscounted_fixture_is_refused_on_the_path_that_actually_loads_files`, which goes
+through `from_json` and `ReplaySession::new` rather than the constructor, plus assertions that the
+constructor and `validate` agree. Dropping a message from a real fixture on disk now fails by
+name, reporting `declares message_count 5 but carries 4 messages`.
+
+### Fixed: the replay fixture format could not express an incomplete payload
+
+The other half of the diff finding below, and the half that actually mattered.
+
+Extending `semantic_diff` to compare `unavailable_columns` and `before_unavailable_columns` made
+the comparison correct. It did not make it *effective*: `ReplaySession::create_data_event`
+hardcoded those two fields — and `before_is_key_only`, which the diff had always compared — to
+their empty defaults, and `parse_data_payload` never read them. The fixture format could not
+express an incomplete payload at all.
+
+So both sides of every comparison were structurally always equal, and the fields had the
+appearance of replay coverage with none of the substance. A regression that stopped reporting an
+unchanged-TOAST column — making a sink write `NULL` over live data — still could not have been
+caught by any golden. The diff's field list and the fixture format had simply never been
+reconciled.
+
+The replay engine now reads all three from the fixture payload, rejecting a wrong shape rather
+than ignoring it: a silently-dropped `unavailable_columns` would produce a golden asserting the
+opposite of what its author wrote, which is worse than no fixture. Absent means "complete
+payload", so every fixture written before this is unaffected.
+
+New fixture `postgres_unchanged_toast_v1` exercises the contract end to end, and deliberately
+carries both cases in one file:
+
+- an `UPDATE` whose TOASTed `body` was **not** modified — absent from `after`, named in
+  `unavailable_columns`, with a key-only before-image under `REPLICA IDENTITY DEFAULT`;
+- an `UPDATE` whose `body` **was** modified — present in `after`, absent from `before`, named in
+  `before_unavailable_columns`.
+
+The second is why the two lists are tracked separately and must never be merged: merging them
+would mark a column that genuinely changed as unwritable and silently drop the update. Reverting
+the engine fix now fails that fixture by name, reporting
+`unavailable_columns changed from ["body"] to []`.
+
+### Added: every replayed event is validated, not just compared
+
+Matching a recorded golden is not the same as being correct. A golden recorded once from a
+malformed envelope would be defended by the suite forever — the comparison would pass precisely
+because both sides share the malformation.
+
+`assert_matches_golden` now runs `Event::validate()` on every replayed event before comparing.
+That covers the partial-payload rules specifically: a column may not be both listed as unavailable
+and present in the payload, and a key-only before-image may not also carry unavailable columns.
+All 41 fixtures pass, so no existing golden was pinning a contract violation — which is worth
+knowing rather than assuming.
+
+### Fixed: the deterministic-replay diff was blind to the fields that matter most
+
+`semantic_diff` is the **sole** comparison the golden-fixture suite performs — 40 fixtures across
+three connectors, and the evidence behind the crate's deterministic-replay claim. It compared
+`op`, `table`, `schema`, `source.source_name`, `before`, `after` and `before_is_key_only`.
+
+It did **not** compare `primary_key`, `unavailable_columns`, `before_unavailable_columns`,
+`envelope_version`, `source.offset`, `transaction`, or `snapshot`. Every one of those is a
+deterministic function of the replayed input, and every one is a field whose regression this
+release's own findings show matters:
+
+- a change to `unavailable_columns` makes a sink write `NULL` over live data;
+- a change to `primary_key` stops the event resolving a key at all, since
+  `primary_key_values` is all-or-nothing over that list;
+- a change to `source.offset` costs a guaranteed duplicate — or a gap — on every restart.
+
+Any of those could have landed with all 40 goldens green. The harness reported success on
+precisely the regressions it exists to catch.
+
+All seven are now compared, and the two fields that legitimately vary per run — `ts` /
+`source.timestamp`, and `snapshot_id`, which embeds the millisecond the snapshot began — are
+documented as excluded with the reason, rather than being absent by omission. `snapshot` is
+compared on its chunk position only, for that reason.
+
+**All 40 recorded goldens pass unchanged under the stricter comparison**, which is what shows the
+additions describe real behaviour rather than tightening arbitrarily.
+
+Two tests keep the list honest in both directions:
+`every_deterministic_field_is_actually_compared` mutates each compared field and asserts a diff
+appears — it fails with the additions reverted, naming the field the fixtures would be blind to —
+and `per_run_varying_fields_stay_ignored` asserts the excluded ones stay excluded, so nobody
+"fixes" the suite into failing on wall-clock noise.
+
+### Changed: the fingerprint documentation named the wrong ordering property
+
+`fingerprint_event_stable` and `hash_json_value` both documented their determinism as
+`serde_json::Map` "preserving insertion order". It does not: `preserve_order` is deliberately not
+enabled, so `Map` is a `BTreeMap` and keys serialise **sorted**.
+
+The conclusion held — sorted is deterministic, and better than insertion order here, because
+insertion order would make a persisted digest depend on a connector's column ordering and two
+capture paths for one row would hash apart. But the stated reason was wrong, and it is
+load-bearing: a reader checking whether the digest is safe to persist was checking the wrong
+property, and enabling `preserve_order` anywhere in the dependency graph would silently change
+every stable fingerprint.
+
+Both comments now name the property actually relied on. Two tests pin it:
+`a_fingerprint_does_not_depend_on_column_insertion_order`, and one asserting the digest for a
+fixed event against a literal — consumers persist these in dedup stores, so the value may only
+move as a documented breaking change.
+
+### Fixed: a MySQL binary column's representation depended on its value
+
+`MysqlValue::Bytes` carries almost everything MySQL sends as a string — `VARCHAR`, `TEXT`,
+`JSON`, `DECIMAL`, and also `VARBINARY` and `BLOB` — and the connector decided how to render it
+from the **bytes**: text when they were valid UTF-8, hex when they were not.
+
+That is not a representation a consumer can decode. A `BLOB` holding `hello` arrived as
+`"hello"`; the same column holding `0xDEADBEEF` arrived as `"deadbeef"`, with nothing in the
+event saying which happened. A consumer that hex-decodes corrupts the first row (or fails, if the
+text is not all hex digits); one that reads text corrupts the second, silently. And a `VARCHAR`
+containing the literal text `deadbeef` is indistinguishable from a `VARBINARY` holding those four
+bytes.
+
+The configuration reference promised binary columns were "hex-encoded", which was true only for
+values that happened not to be valid UTF-8. The type-fidelity test used `X'DEADBEEF'` and
+`X'0001FF'` — both invalid UTF-8 — so it passed through the hex branch and never exercised the
+other one.
+
+The column's **charset** now decides: collation `63` is MySQL's `binary`, and a character-typed
+column carrying it is a binary column. The column *type* cannot tell you — `BLOB` and `TEXT`
+share `MYSQL_TYPE_BLOB`, `VARBINARY` and `VARCHAR` share `MYSQL_TYPE_VAR_STRING`, `BINARY` and
+`CHAR` share `MYSQL_TYPE_STRING` — which is why only the charset works.
+
+No index arithmetic was written for this: `mysql_common` already resolves each binlog column's
+charset from the table-map's `DEFAULT_CHARSET`/`COLUMN_CHARSET` metadata using the same
+character-column indexing its own value parser uses, and exposes it as
+`Column::character_set()`. The result-set path gets the collation id from the column-definition
+packet. Getting that indexing wrong would hex-encode real text, which is worse than the bug, so
+it matters that it is the library's and already exercised by its own parsing.
+
+A charset of `0` — metadata absent — keeps the previous byte-derived behaviour rather than
+reclassifying every string column as binary. `binlog_row_metadata = FULL` is already required for
+column names and key flags, so present is the normal case.
+
+The integration fixture gains `ascii_bytes VARBINARY(16)` holding `X'68656C6C6F'` — valid UTF-8 in
+a binary column, the case that was never covered — and the `VARBINARY` assertion is now exact
+equality with `"deadbeef"` rather than "hex or base64", which accepted anything.
+
+Covered by `a_binary_column_is_hex_encoded_whatever_its_bytes_happen_to_be` and
+`the_charset_and_not_the_type_decides`, both confirmed to fail with the charset check disabled,
+plus `non_character_columns_are_never_hex_encoded` — hex-encoding a `DECIMAL` or `JSON` value
+would be unrecoverable garbage, and both arrive as `Bytes`.
+
+### Fixed: the column type mapping table still described pre-0.11 JSON numbers
+
+Documentation, and it contradicted both the implementation and the README.
+
+0.11.0 made every column value text. The configuration reference's mapping table was not updated
+with it, and still listed integers and floating point as JSON `number` and booleans as
+`boolean or number`. An integrator reading it would build a consumer expecting `after.id` to be a
+JSON number and find a quoted string — the exact confusion the text contract exists to prevent.
+
+The table now says what happens, with the rule stated once rather than implied per row, and a
+note that it described numbers before 0.11.0 so a reader upgrading knows what changed.
+
+The binary row also claimed a single "hex-encoded" form for all three connectors, which was never
+true: PostgreSQL emits its own `\x`-prefixed hex, MySQL bare lowercase hex, and SQL Server
+whatever `FOR JSON PATH` produces for `varbinary`. There is now a per-connector table. SQL
+Server's exact form is deferred to its integration test rather than asserted here, because it is
+`FOR JSON PATH`'s behaviour rather than something this crate chooses.
+
+**Nothing pinned the text contract in a test.** `postgres_value_representation_integration` asserted
+that the snapshot and stream paths *agree* on each column's JSON type — which two paths both
+emitting numbers would satisfy. It now also asserts every scalar is a string, on both paths.
+
+### Fixed: a deliberate re-snapshot was silently dropped by the idempotency guard
+
+Found while adding the on-demand row filter below, which makes re-snapshotting a table a
+first-class operation and so made this reachable in a way it had not been.
+
+A snapshot `Read` event's offset identifies the **row**, not a log position — it has no log
+position — so re-reading an unchanged row produced a byte-identical event. The runtime's
+idempotency guard is **on by default**, and it correctly classified that event as a replay and
+dropped it.
+
+So an operator who re-requested a snapshot got `enqueued: 1` back and **no rows**. The component
+whose entire purpose is protecting delivery discarded the delivery that was asked for, with
+nothing logged. Same failure for a re-snapshot with a narrower filter, which is the shape the new
+`SnapshotRequest` makes easy to ask for.
+
+Neither half was wrong on its own, which is why it survived: the guard's fingerprint deliberately
+covers content and position rather than wall-clock time, and the snapshot offset is deliberately
+row-derived and stable across restarts. What was missing is that nothing recorded *which snapshot
+attempt* produced a row.
+
+`IncrementalSnapshotState` gains `generation: u32`, included in the synthetic offset. It advances
+on every request and across a stop — a stop discards the table list, so a later request would
+otherwise restart at generation 0 and collide with the run it abandoned. A chunk re-read after a
+mid-snapshot reconnect stays in its generation and is still deduplicated, so the guard keeps doing
+its job. Persisted, so the offsets remain stable across a restart as documented.
+
+`#[serde(default)]`, so existing checkpoints load as generation 0.
+
+The guard's own documentation now carries this, because the dependency runs the opposite way from
+how it looks: the guard knows nothing about snapshots, and the driver is responsible for making
+distinct reads distinguishable. `a_re_snapshotted_row_survives_the_idempotency_guard` drives the
+real driver twice through the real guard and fails if either half regresses;
+`a_replay_within_one_generation_is_still_suppressed` pins the behaviour that must **not** change.
+
+### Fixed: `table_conditions` was silently ignored for on-demand snapshots
+
+**Reported by the `rustcdc-server` maintainers (B-4), reproduced against a live PostgreSQL, and
+confirmed here.** Their diagnosis was exactly right, including the mechanism.
+
+The row filter was applied at two of the three places a table gets resolved — the startup
+tables and the tables adopted from a checkpoint — and **not** at `enqueue_tables`, which
+services `StreamHandle::request_snapshot_tables` and therefore every on-demand request. The
+driver did not retain the config at all: it was a by-value parameter to `new`, dropped once the
+startup tables were resolved, so honouring the filter there was *structurally impossible*.
+
+An operator scoping a backfill to one tenant and firing the request got the entire table.
+Nothing reported it; the only symptom is volume, indistinguishable from "that table is big".
+
+**One thing the report understated.** The two paths did not merely disagree about whether to
+filter — they disagreed with each other. A runtime-requested table ran unfiltered, and then a
+restart adopted it from the checkpoint **with** the filter applied. The rows delivered for that
+table therefore corresponded to no single predicate, and where the split fell depended on when
+the process happened to restart. That is worse than being unfiltered throughout, because the
+result is not reproducible.
+
+Fixed by resolving the condition in **one** function, `describe_with_condition`, called from all
+three sites, with the configured conditions retained on the driver for the lifetime of the
+snapshot. `describe_table` still leaves `condition` unset, so a backend cannot get it wrong
+either.
+
+Also fixed on the same path: re-requesting a **finished** table rewound it but kept its old
+spec, so a new request ran under the *previous* request's filter. It now adopts the freshly
+resolved spec.
+
+Consumers that guarded against this by rejecting `table_conditions` keys absent from `tables`
+can drop the guard.
+
+Covered by `a_runtime_requested_table_gets_the_configured_condition`,
+`the_runtime_and_restart_paths_resolve_the_same_condition`,
+`re_requesting_a_finished_table_adopts_the_new_condition` — all confirmed to fail with the fix
+reverted.
+
+### Added: an on-demand snapshot request carries its own row filter
+
+**Requested as F-8**, and the clean fix for B-4 above.
+
+The filter is a property of the *request*, not the deployment. "Backfill tenant 42's orders" is
+a one-off, and routing it through static configuration means editing a config file and
+restarting the process to run something that was meant to be a signal. Debezium's
+`execute-snapshot` carries `data-collections` and `additional-conditions` together for the same
+reason, so a consumer exposing that shape over an API now has somewhere to put the condition.
+
+New `SnapshotRequest`, and the request path takes it:
+
+```rust
+use rustcdc::source::SnapshotRequest;
+
+runtime
+    .request_incremental_snapshot_filtered(
+        SnapshotRequest::new(["public.orders"]).with_condition("public.orders", "tenant_id = 42"),
+    )
+    .await?;
+```
+
+`RuntimeControl::request_incremental_snapshot_filtered` is the same operation from a `&self`
+handle, which is the shape an admin endpoint actually has.
+
+A request condition **overrides** the configured one for the same table; a table with no
+override keeps its configured filter, so static configuration stays meaningful. Same trust note
+as the config field: raw SQL, trusted input, not a tenancy boundary.
+
+**Breaking:** `StreamHandle::request_snapshot_tables` now takes `SnapshotRequest` instead of
+`Vec<String>`. `SnapshotRequest: From<Vec<S>>`, so a call site passing a vector needs `.into()`.
+`CdcRuntime::request_incremental_snapshot` and `RuntimeControl::request_incremental_snapshot`
+keep their signatures and delegate with an empty condition map.
+
+### Added: `IncrementalSnapshotState` reports the effective row filter
+
+**Requested as F-9**, and it is the cheapest possible defence against B-4 recurring.
+
+`IncrementalSnapshotTableState` gains `condition: Option<String>`, holding the filter actually
+in effect after merging the request over the configuration. Without it, an operator looking at
+`orders: 3,000,000 rows emitted` has no way to tell a filter that applied from one that was
+silently ignored — which is precisely the question B-4 makes people ask, and it was
+unanswerable from outside.
+
+`#[serde(default)]` and `skip_serializing_if`, so existing checkpoints load unchanged and
+unfiltered tables add nothing to the record.
+
+### Changed: the rewind guard no longer refuses a custom source's opaque offset
+
+**Reported as F-10.** Filed as documentation; it was slightly more than that.
+
+`StoredCheckpointRecord::from_offset` did `serde_json::from_slice(&offset.encode()?)`, so it
+returned `SerializationError` for any `Offset` whose encoding is not JSON. The rewind guard was
+made public *for* third-party checkpoint backends, and this made it unavailable to exactly those
+backends — at runtime, with an error naming nothing useful.
+
+The refusal also bought nothing. `stream_position_regression` reads named fields and only knows
+the source types this crate ships; for anything else it declines to guess and returns `None`. So
+the position comparison the JSON was needed for would have been skipped either way.
+
+A non-JSON offset from a source type the guard does not compare now records `null` and keeps the
+committed-event-count check, which is the half that does apply. For a **built-in** source type a
+non-JSON encoding is a defect rather than a design choice, and still fails — with an error that
+names the source type and says why the encoding matters.
+
+New `checkpoint::compares_stream_position(source_type)` makes the distinction inspectable rather
+than something to infer, and `Offset::encode`'s documentation now states what a JSON encoding
+does and does not buy: not the shipped comparison, but the ability to write your own on top of
+the decoded record.
+
+Covered by `a_custom_sources_non_json_offset_still_yields_a_usable_record`,
+`a_built_in_sources_non_json_offset_is_refused_with_a_named_reason`, and
+`the_advertised_scope_matches_what_the_guard_actually_compares`, which pins the advertised scope
+against the match arms so the two cannot drift.
+
+### Fixed: `stop_incremental_snapshot` was silently undone by the next restart
+
+**Breaking** (state format; `#[serde(default)]`, so old checkpoints load unchanged).
+
+A stop cleared the per-table cursors, and the driver seeds one entry per **configured** table
+on startup — so a configured table with no persisted entry looked exactly like a table that had
+not started yet. The next deploy re-ran the whole backfill from row zero.
+
+That is the opposite of what the call is for. An operator stops a multi-hour snapshot to take
+load off a production primary; the load comes back on the next restart, larger, because it
+starts over. And the driver's own log line claimed the opposite would happen: *"the next
+checkpoint clears the persisted state, so a restart will not resume it"* — true only for tables
+requested at runtime, which are the ones absence *does* correctly describe.
+
+`IncrementalSnapshotState` gains an explicit `stopped: bool`. Absence of entries and
+abandonment are now different things: a stopped snapshot seeds no configured tables and stays
+stopped until `request_incremental_snapshot` asks for them again, which clears the flag — the
+flag must not become a one-way latch, or a re-request would vanish on the next restart for the
+same reason.
+
+`#[serde(default)]`, so a checkpoint written before the field existed loads as "not stopped",
+which is the previous behaviour and the right reading of a state written by a build with no way
+to express a stop.
+
+The remaining durability note is unchanged and deliberate: the flag becomes durable with the
+next checkpoint write, and a crash before it resumes a snapshot that can simply be stopped
+again. Forcing a synchronous checkpoint would let an operator action rewrite the stream
+position, which is the worse trade.
+
+Covered by `a_stopped_snapshot_stays_stopped_across_a_restart` (fails with the fix reverted),
+`requesting_a_table_clears_the_stopped_flag`, `a_state_without_the_flag_is_not_read_as_stopped`.
+
+### Fixed: an unbounded SCRAM iteration count was a server-triggered CPU denial of service
+
+The SCRAM-SHA-256 iteration count is chosen by the **server** and is the loop bound of a PBKDF2
+derivation the **client** then performs. PostgreSQL's `scram_iterations` accepts anything up to
+`INT_MAX`, and neither RFC 5802 nor libpq imposes a ceiling, so an `i=4294967295` — from a
+misconfiguration or a hostile server — asked this client for roughly four billion HMAC-SHA256
+rounds. That is minutes to hours of pure CPU per connection attempt, free for the server to
+trigger and indistinguishable on the wire from a slow handshake.
+
+Two changes:
+
+- **A cap.** Counts above 1,000,000 are refused with an error naming the server setting to
+  change. That is ~250× PostgreSQL's default of 4096 and past any deliberate hardening (OWASP's
+  PBKDF2-SHA256 guidance is 600k), so a legitimate server never reaches it while the worst case
+  stays under about a second.
+- **Off the caller's executor.** The derivation now runs on `spawn_blocking`. It is CPU work of
+  remote-chosen duration, and this crate runs inside the embedder's Tokio runtime — deriving
+  inline stalls a worker thread for the whole derivation, and on a current-thread runtime stalls
+  every other task in the process. The same reasoning already puts `FileCheckpoint`'s `fsync` on
+  a blocking worker. A handshake happens once per connection, so the spawn costs nothing
+  measurable.
+
+`ScramExchange::client_final` is therefore `async` now. It is `pub(super)`, so this is not a
+public API change.
+
+Covered by `an_absurd_iteration_count_is_refused_before_the_derivation_runs` and
+`an_iteration_count_at_the_cap_is_still_honoured`; the RFC 7677 vectors still pass unchanged.
+
+### Fixed: the in-flight transaction query could error instead of working
+
+Follow-up to the watermark fix below, found while hardening code that has no local test server.
+The id reduction was written as `pg_snapshot_xip(...)::text::bigint` and masked in Rust —
+but that cast **errors** once an `xid8` exceeds `i64::MAX`, which would turn a
+wraparound-epoch database into a hard failure of every chunk read rather than a working
+snapshot. The reduction now happens in SQL via `numeric`, which cannot overflow, and the modulo
+guarantees the result fits `bigint` before it is read.
+
+### Added: a live test for the one thing that could silently break the watermark fix
+
+The watermark bracket rests on the in-flight transaction ids being on the **same scale** as the
+`tx_id` the connector reports. They are different types at source — `pg_snapshot_xip` yields
+epoch-extended `xid8`, pgoutput's `BEGIN` carries a bare 32-bit `xid` — so the connector strips
+the epoch.
+
+If that reduction is ever wrong, nothing fails loudly: the set simply never matches, the bracket
+degrades to the position-only test it replaced, and the race returns with every driver-level
+test still green, because those use a fake backend that defines both scales itself. Only a live
+server can check the two real ones line up.
+
+`tests/postgres_snapshot_visibility_integration.rs` does it deterministically, without racing an
+fsync: open a transaction and leave it uncommitted, assert the backend's own query reports its
+id on the reduced scale, then commit and assert the delivered event's `transaction.tx_id` is
+that same number. The last step is the half a unit test cannot fake — it is pgoutput's own
+value. Wired into the CI matrix and the evidence script.
+
+### Fixed: a truncated composite primary key produced a write that addressed the whole tenant
+
+**Breaking.** `Event::primary_key_values()` used to build a key from whichever declared key
+columns happened to be present in the row image, returning `None` only when *none* of them
+were. For a single-column key that is the same thing. For a composite key it is not:
+
+```text
+primary_key = ["tenant_id", "id"]
+after       = { "tenant_id": 7, "name": "…" }     // `id` absent
+before      → Some({ "tenant_id": 7 })            // looks like a valid key
+```
+
+Nothing downstream could tell that apart from a real key. `RowWrite::Delete { key }` carried it
+into `DELETE FROM t WHERE tenant_id = 7`, which removes **every row of that tenant**; an upsert
+collapsed the tenant onto one row; as a message key it merged distinct rows into a single
+log-compaction group. All silent, and none of it recoverable from the event stream — the
+delivered events never described those rows.
+
+`primary_key_values()` is now all-or-nothing: any missing key column yields `None`, so the event
+routes to `RowWrite::None { reason: NoRowWrite::MissingPrimaryKey }` and a sink has to handle it
+explicitly. A visible gap beats an invisible over-write.
+
+The transform-pipeline guard that rejects a stage for destroying the message key got stronger
+for free: a projection or rename that drops *one* column of a composite key now trips it, where
+before it silently emitted the partial key.
+
+**Migration:** a sink that matched `RowWrite::Delete`/`Replace` and ignored `RowWrite::None` now
+sees `None` for events it previously "handled" with a wrong key. That is the bug surfacing, not
+a new one — but log or alert on `NoRowWrite::MissingPrimaryKey` rather than dropping it, because
+it means the source is not supplying the full key (on PostgreSQL, usually a `REPLICA IDENTITY`
+that does not cover it).
+
+### Fixed: a custom source's `resume_offset_for` was discarded
+
+`StreamHandle::resume_offset_for` is documented as the hook a connector uses to say "an
+event's own offset is not where a restart resumes", and as what "the runtime uses for both the
+durable checkpoint and the source-side confirmation". It was only ever consulted on the
+PostgreSQL path. `build_checkpoint_offset`'s generic branch — the one every custom `impl Source`
+takes — read `event.source.offset` directly.
+
+So a third-party connector whose log filters at transaction granularity, which is the exact
+situation the override exists for, implemented it correctly and then took the guaranteed
+duplicate-per-restart the PostgreSQL connector was fixed for. Nothing surfaced it: the override
+was called by no one, the checkpoint looked plausible, and the duplicates arrived one deploy
+later.
+
+Every branch now routes through it, so the built-in connectors and a registered custom source
+get identical treatment. The default still returns `None` and falls back to the event's own
+offset, so MySQL and SQL Server — whose offsets are already exclusive boundaries — are
+unchanged. Covered by `a_custom_sources_resume_position_reaches_the_checkpoint`, which fails
+with the fix reverted.
+
+This also repaired `cargo clippy --lib --no-default-features -D warnings`, which had been
+failing on `resume_offset_for` as dead code: with no connector features enabled, nothing called
+it. CI lints `--all-features` only, so the foundation-only profile the README documents did not
+pass its own lint gate.
+
+### Fixed: the incremental-snapshot watermark bracket ignored commit visibility
+
+The DBLog override window suppressed a chunk row when a live event for the same key landed in
+`(low, high]`. That test assumes anything at or below the low watermark is already visible to
+the chunk `SELECT`, and **on every supported database it is not**: reaching the log and becoming
+visible are separate steps. PostgreSQL advances `pg_current_wal_lsn()` when it writes the commit
+record, flushes it, and only then clears the transaction from the proc array. MySQL's binlog
+position advances at the flush stage, before the InnoDB engine commit.
+
+A transaction caught in that gap sits *below* the low watermark and is still invisible to the
+chunk read. The chunk therefore held its **pre-image**, the position test did not suppress it,
+and the chunk row was emitted after the newer stream event — resurrecting the stale value. The
+window is one commit's flush-to-visibility gap, an fsync long under `synchronous_commit = on`;
+over a multi-hour snapshot of a hot table it is not theoretical.
+
+`IncrementalSnapshotBackend` gains:
+
+```rust
+async fn in_flight_transactions(&mut self) -> Result<HashSet<u64>>   // default: empty
+```
+
+The driver calls it **after** the low watermark and **before** the chunk read, and tests
+`position <= high && (position > low || in_flight.contains(tx_id))`. That call order is what
+makes the pair exhaustive: a transaction invisible to the chunk's snapshot either was running
+when the set was read — so it is in the set — or started afterwards, in which case it commits
+after the low watermark was read and the position test catches it. There is no third case.
+
+Per connector:
+
+- **PostgreSQL** implements it from `pg_current_snapshot()`, truncating `xid8` to the 32-bit xid
+  pgoutput's `BEGIN` reports. Closed.
+- **SQL Server** needs nothing. `fn_cdc_get_max_lsn()` reports what the capture job has already
+  harvested, so its watermark *lags* visibility instead of leading it — the safe direction, at
+  the cost of harmless over-suppression.
+- **MySQL / MariaDB: closed, by a different mechanism.** No in-flight *transaction id* is
+  available on a scale a binlog event shares, so `in_flight_transactions` stays empty here — but
+  the executed-GTID set closes the same gap without needing one, and this release adopts it. See
+  the entry below.
+
+`in_flight_transactions` has a default so third-party backends still compile, but accepting the
+default is a correctness decision — the trait documentation says so, and says which way to go
+when your database has no usable list.
+
+Regression tests drive the real state machine and fail with the fix reverted:
+`a_transaction_below_the_low_watermark_but_still_invisible_is_suppressed`,
+`an_unrelated_transaction_below_the_low_watermark_suppresses_nothing`,
+`the_high_watermark_still_bounds_the_in_flight_set`.
+
+### Fixed: the override window lost unchanged-TOAST columns it could have recovered
+
+Suppressing a *complete* chunk row in favour of an *incomplete* stream event traded one gap for
+another. A PostgreSQL unchanged-TOAST `UPDATE` omits the large column, so its event is a
+`RowWrite::Merge` — and a merge into a row the consumer does not have yet, the normal case during
+a first snapshot, applies nothing. The chunk row that carried the column had just been dropped,
+so no delivery contained it. Silent, and narrow enough to survive a staging soak: it needs a row
+whose value crosses the ~8 KB TOAST threshold, updated without touching that column, inside the
+watermark bracket of the chunk containing it.
+
+Emitting the chunk row anyway is not the fix — placing its pre-image after a newer event
+resurrects every *other* column's stale value, which is worse. Instead the **event is now
+repaired from the chunk's own image of that row** and delivered as a complete
+`RowWrite::Replace`, so the suppression costs nothing.
+
+`Event::unavailable_columns` says such a value is unrecoverable because reading it back
+out-of-band races concurrent writes. That objection does not apply here, and the reason is the
+whole argument:
+
+- The value is not a fresh read. It is **this chunk's** `SELECT`, at a snapshot whose position
+  the driver knows.
+- `unavailable_columns` means the `UPDATE` did not modify those columns, so their post-event
+  value equals their value at the start of the event.
+- Anything that could have changed a column in between is another transaction committing after
+  the chunk snapshot — therefore also inside the bracket, therefore already folded into the
+  chunk's image. If it modified the column it carried it; if not, the chunk value stands.
+
+The driver knows every write between the read and the event. That is exactly what an out-of-band
+read does not, and it is why this is a repair rather than a guess. The chunk row doubles as the
+shadow image, updated by each in-bracket event, so a later event omitting a column an earlier one
+wrote is filled with the *new* value.
+
+Deliberately bounded. Only columns the chunk actually read, only for that key's own row. An event
+for a key outside the current chunk passes through untouched — nothing is being suppressed for it,
+so nothing is lost and nothing may be invented. An event past the high watermark is left alone
+too: the chunk is delivered first, so the consumer has the row and the merge is correct. A column
+that genuinely cannot be filled — a schema change inside the chunk window — is logged at WARN with
+the table, key and columns rather than passing silently.
+
+The `Event::unavailable_columns` and API-guide notes now carry the exception, so the
+documentation no longer contradicts the behaviour.
+
+Six tests, three of which fail with the repair reverted:
+`an_omitted_toast_column_is_filled_from_the_chunks_own_image`,
+`a_later_event_is_filled_from_an_earlier_events_value_not_the_chunks`,
+`a_partial_before_image_is_filled_from_the_pre_event_state`,
+`a_repaired_event_still_validates`, `an_event_for_a_key_outside_the_chunk_is_left_alone`,
+`an_event_past_the_high_watermark_is_not_repaired`.
+
+### Fixed: filter thresholds compared through `f64`
+
+The crate emits column values as text specifically because a JSON number is an IEEE-754 double
+by the time most consumers see it. `FilterProjectionTransform`'s ordering operators then parsed
+both sides back into `f64`, reintroducing that loss at the point where it decides whether a row
+is kept:
+
+```text
+9007199254740993 > 9007199254740992   // f64: false. Both round to the same double.
+```
+
+A threshold filter on a snowflake id or a `numeric(38,4)` amount silently dropped or kept the
+wrong rows. `Lt`/`LtEq`/`Gt`/`GtEq` now compare exact decimals — sign, then integer digits by
+length and lexicographically, then fraction digits — with no mantissa ceiling and no new
+dependency.
+
+**Behaviour change:** exponent notation (`1e3`) is no longer accepted and evaluates to `false`,
+as any non-numeric operand already did. Normalising `1e3` against `1000` needs machinery this
+does not have, and a rule that quietly mis-orders is worse than one that visibly matches
+nothing. Write the expanded form.
+
+### Changed: table include/exclude lists take glob patterns
+
+**Breaking.** `table_include_list` and `table_exclude_list` matched **exact strings only**, while
+the sink router's `table_matches` matched globs, and nothing documented the difference. So
+`table_exclude_list = ["public.tmp_*"]` excluded nothing at all — indistinguishable from a set of
+tables that never changed — and on the include side an allowlist matching nothing is
+indistinguishable from an idle database. Debezium's equivalents take regexes, so operators
+arrive expecting patterns to work.
+
+There is now one matcher, shared by routing and connector filtering, with the pattern table
+documented in the [configuration reference](site/content/docs/config-reference.md). `*` and `?`
+work inside a segment and do not cross the `.`; blank entries are ignored rather than treated as
+catch-alls.
+
+Two related fixes came with it:
+
+- **An unqualified entry is schema-agnostic**, so `table_include_list = ["users"]` captures
+  `public.users` *and* `tenant_private.users`. That was already true and undocumented, and on an
+  allowlist it is a widening of the thing the list exists to bound. It stays — MySQL callers name
+  tables bare — but `connect()` now logs a WARN naming each unqualified include entry. The public
+  `table_matches` doc table also claimed a bare pattern matched "bare-table only", which
+  contradicted both the code and its own test; it now describes what happens.
+- **The glob matcher no longer backtracks exponentially.** The recursive form ("consume nothing,
+  else consume one byte, recurse both ways") does not return in useful time on
+  `a*a*a*a*a*b` against a run of `a`s. Patterns come from operator config rather than untrusted
+  input, so this was a latency cliff rather than a vulnerability — but a config typo should not
+  be able to hang a pipeline. Replaced with greedy matching and a single backtrack point.
+
+**Migration:** if a list carried a literal `*` as a no-op placeholder, it is now a catch-all.
+Audit both lists before upgrading. Entries without `*` or `?` behave exactly as before.
+
 ## 0.11.0
 
 A correctness release. Six blockers found and closed — four distinct failure modes: silent
