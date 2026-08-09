@@ -8,7 +8,7 @@ what breaks and what to do about it.
 ## 0.12.0
 
 A second correctness pass over the whole tree, plus round-2 feedback from the `rustcdc-server`
-maintainers against the released 0.11.0. Thirty-one findings, all closed here, and the shape of them differs from last time:
+maintainers against the released 0.11.0. Thirty-four findings, all closed here, and the shape of them differs from last time:
 none was visible by reading a function in isolation, and half required reasoning about what a
 database actually guarantees rather than about what this code says.
 
@@ -905,6 +905,31 @@ Two related fixes came with it:
 
 **Migration:** if a list carried a literal `*` as a no-op placeholder, it is now a catch-all.
 Audit both lists before upgrading. Entries without `*` or `?` behave exactly as before.
+
+### Fixed: container-backed tests ran out of stack on Linux, and two CI jobs ran the wrong suites
+
+Three of the container suites — `postgres_incremental_snapshot_reconnect_integration`,
+`postgres_handoff_integration` and `postgres_snapshot_integration` — passed with under 15% stack
+headroom: measured against the built binaries, all three overflow at 1.75 MiB and pass at 2 MiB,
+which is exactly what libtest gives a test thread. A debug build's un-inlined poll chain
+(testcontainers' Docker API futures, `tokio-postgres`, the snapshot driver) costs that much, and
+x86_64 Linux frames are slightly larger than aarch64 ones — enough that CI aborted the whole binary
+with `fatal runtime error: stack overflow`. Because that is a SIGABRT rather than a test failure, the
+suite reported no result and the log looked like a crash in the connector.
+
+The threshold is identical before and after this release's changes (measured at both commits), so
+this was a standing cliff rather than a regression. A new `.cargo/config.toml` sets
+`RUST_MIN_STACK = "16777216"` for the whole repository — centrally, because the shape is shared by
+every container suite, and a per-test workaround would leave the next one for CI to find. An
+unbounded recursion still fails, since it exhausts 16 MiB as readily as 2 MiB.
+
+Separately, two CI steps passed `--test <one_suite> --examples --tests`. `--tests` selects *every*
+test target, so those jobs ran the entire integration suite under one suite's name — and two of this
+round's failures were consequently reported against the wrong connector. Both tests build their own
+example with `cargo build --example ...` before spawning it, so the flags were never needed. Each
+job now runs exactly the suite it is named for.
+
+This affects contributors and CI only; no library behaviour changes.
 
 ### Fixed: the policy gate passed local-only markdown links, and no document mentioned `cargo fmt`
 

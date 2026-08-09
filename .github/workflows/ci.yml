@@ -311,10 +311,13 @@ jobs:
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration' && matrix.suite != 'example_pg_to_stdout'
         run: cargo test --test ${{ matrix.suite }} --features postgres
-      # Spawns the compiled example, so the example has to be built alongside the test.
-      - name: cargo test --test example_pg_to_stdout (with examples)
+      # The test builds the example itself (`cargo build --example pg_to_stdout`) before spawning
+      # it, so no extra target selection is needed. It used to pass `--examples --tests`, and
+      # `--tests` selects *every* test target — so this matrix entry ran the whole integration
+      # suite and reported unrelated failures under this job's name.
+      - name: cargo test --test example_pg_to_stdout
         if: matrix.suite == 'example_pg_to_stdout'
-        run: cargo test --test example_pg_to_stdout --features postgres --examples --tests
+        run: cargo test --test example_pg_to_stdout --features postgres
       - name: cargo test --test ${{ matrix.suite }} (metrics)
         if: matrix.suite == 'otel_metrics_integration' || matrix.suite == 'otel_tracing_integration'
         run: cargo test --test ${{ matrix.suite }} --features postgres,metrics
@@ -516,10 +519,13 @@ jobs:
       - name: cargo test --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
         run: cargo test --test ${{ matrix.suite }} --features sqlserver
-      # Spawns the compiled example, so the example has to be built alongside the test.
-      - name: cargo test --test sqlserver_to_otel_example_integration (with examples)
+      # The test builds the example itself (`cargo build --example sqlserver_to_otel`) before
+      # spawning it, so no extra target selection is needed here. It used to pass
+      # `--examples --tests`, and `--tests` selects *every* test target — so this matrix entry ran
+      # the whole integration suite, and a PostgreSQL failure was reported as a SQL Server one.
+      - name: cargo test --test sqlserver_to_otel_example_integration
         if: matrix.suite == 'sqlserver_to_otel_example_integration'
-        run: cargo test --test sqlserver_to_otel_example_integration --features sqlserver,metrics --examples --tests
+        run: cargo test --test sqlserver_to_otel_example_integration --features sqlserver,metrics
       - name: cargo test --test runtime_sqlserver_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_sqlserver_process_crash_integration'
         run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins

@@ -1,0 +1,23 @@
+[env]
+# Stack size for spawned threads, which is what libtest gives each test.
+#
+# libtest's default is 2 MiB, and several container-backed suites sit within a rounding error of
+# it. Their nested poll chain in a **debug** build — testcontainers' Docker API futures,
+# `tokio-postgres`, and the incremental-snapshot driver, none of it inlined — measures at just
+# under 2 MiB on aarch64 macOS and just over it on x86_64 Linux, where CI aborted the whole test
+# binary with `fatal runtime error: stack overflow`. That is a SIGABRT rather than a test failure,
+# so the suite reports *no result at all* and the log looks like a crash in the connector.
+#
+# Measured by running the built binaries directly under `RUST_MIN_STACK`: at 1.75 MiB,
+# `postgres_incremental_snapshot_reconnect_integration`, `postgres_handoff_integration` and
+# `postgres_snapshot_integration` all overflow; at 2 MiB all pass. The threshold is *unchanged*
+# across the 0.12.0 audit, so this is a set of tests that never had headroom rather than a leak or
+# a regression — and any platform whose debug frames are marginally larger falls off the cliff.
+#
+# Fixed here rather than per test: the shape is shared by every container suite, so a helper in one
+# file would leave the next one to be discovered by CI. A real unbounded recursion still fails,
+# because it exhausts 16 MiB as readily as 2 MiB.
+#
+# The value must not be set *small* anywhere: `[env]` applies to `rustc` too, and a 1 MiB setting
+# makes the compiler itself die with SIGBUS before any test runs.
+RUST_MIN_STACK = "16777216"
