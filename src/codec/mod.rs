@@ -188,7 +188,8 @@ pub trait EventEncoder: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::SerializationError`] when the key cannot be encoded.
+    /// Returns [`Error::SerializationError`](crate::Error::SerializationError) when the key cannot
+    /// be encoded.
     ///
     /// # Example
     ///

@@ -83,10 +83,7 @@ impl Fixture {
     /// instead, panicking inside a library on caller-supplied data; every other constructor in
     /// this crate returns a `Result`, and a fixture builder is exactly the kind of caller that
     /// wants to report the problem rather than abort.
-    pub fn new(
-        metadata: FixtureMetadata,
-        messages: Vec<FixtureMessage>,
-    ) -> Result<Self, String> {
+    pub fn new(metadata: FixtureMetadata, messages: Vec<FixtureMessage>) -> Result<Self, String> {
         let fixture = Self { metadata, messages };
         fixture.validate()?;
         Ok(fixture)
@@ -375,7 +372,10 @@ mod tests {
         let error = crate::deterministic_replay::ReplaySession::new(fixture)
             .err()
             .expect("a replay session must refuse a miscounted fixture");
-        assert!(error.contains("message_count 2") && error.contains("carries 1"), "{error}");
+        assert!(
+            error.contains("message_count 2") && error.contains("carries 1"),
+            "{error}"
+        );
     }
 
     #[test]

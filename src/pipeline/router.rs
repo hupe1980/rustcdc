@@ -531,8 +531,8 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::glob::glob_segment_matches;
     use super::*;
+    use crate::core::glob::glob_segment_matches;
     use crate::core::{Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     use crate::sink::MemorySinkAdapter;
 

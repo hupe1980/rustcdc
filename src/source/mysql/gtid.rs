@@ -280,7 +280,13 @@ mod tests {
     #[test]
     fn contains_gtid_rejects_anything_that_is_not_a_single_gtid() {
         let parsed = set(&format!("{A}:1-5"));
-        for malformed in ["", "not-a-gtid", &format!("{A}:1-5"), &format!("{A}:"), ":3"] {
+        for malformed in [
+            "",
+            "not-a-gtid",
+            &format!("{A}:1-5"),
+            &format!("{A}:"),
+            ":3",
+        ] {
             assert!(
                 !parsed.contains_gtid(malformed),
                 "{malformed:?} is not a single GTID"
@@ -294,11 +300,11 @@ mod tests {
     #[test]
     fn a_malformed_set_is_refused_rather_than_partially_parsed() {
         for malformed in [
-            A,                            // uuid with no intervals
-            &format!("{A}:abc"),          // non-numeric bound
-            &format!("{A}:9-1"),          // backwards range
-            &format!("{A}:1-"),           // missing upper bound
-            ":5",                         // no uuid
+            A,                   // uuid with no intervals
+            &format!("{A}:abc"), // non-numeric bound
+            &format!("{A}:9-1"), // backwards range
+            &format!("{A}:1-"),  // missing upper bound
+            ":5",                // no uuid
         ] {
             let error =
                 GtidSet::parse(malformed).expect_err(&format!("{malformed:?} must be refused"));

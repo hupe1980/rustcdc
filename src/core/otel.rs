@@ -357,9 +357,10 @@ impl OTelMetricsCollector {
     /// [`SourceMetadata::timestamp`](crate::core::SourceMetadata::timestamp).
     pub fn record_replication_lag_gauge_ms(&self, lag_ms: u64) {
         if let Ok(mut state) = self.state.lock() {
-            state
-                .gauges
-                .insert("rustcdc.runtime.replication_lag_ms".to_string(), lag_ms as f64);
+            state.gauges.insert(
+                "rustcdc.runtime.replication_lag_ms".to_string(),
+                lag_ms as f64,
+            );
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.replication_lag_ms.record(lag_ms, &[]);
@@ -393,9 +394,10 @@ impl OTelMetricsCollector {
     pub fn record_checkpoint_offset(&self, offset: &str) {
         if let Ok(mut state) = self.state.lock() {
             let surrogate = offset.len() as u64;
-            state
-                .gauges
-                .insert("rustcdc.runtime.checkpoint_offset".to_string(), surrogate as f64);
+            state.gauges.insert(
+                "rustcdc.runtime.checkpoint_offset".to_string(),
+                surrogate as f64,
+            );
 
             if let Some(sdk) = &self.sdk {
                 sdk.instruments.checkpoint_offset.record(surrogate, &[]);
@@ -1148,7 +1150,10 @@ mod tests {
         collector.record_events_filtered(2);
         let report = collector.export_metrics().unwrap();
         assert_eq!(report.total_events_processed(), 15);
-        assert_eq!(report.get_counter("rustcdc.runtime.events_filtered"), Some(2));
+        assert_eq!(
+            report.get_counter("rustcdc.runtime.events_filtered"),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1174,7 +1179,10 @@ mod tests {
             report.get_gauge("rustcdc.runtime.replication_lag_ms"),
             Some(1_000.0)
         );
-        assert_eq!(report.get_gauge("rustcdc.runtime.buffer_depth"), Some(500.0));
+        assert_eq!(
+            report.get_gauge("rustcdc.runtime.buffer_depth"),
+            Some(500.0)
+        );
         assert_eq!(
             report.get_gauge("rustcdc.runtime.snapshot_progress_percent"),
             Some(75.0)

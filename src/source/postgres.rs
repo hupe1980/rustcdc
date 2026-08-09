@@ -77,6 +77,14 @@ pub struct PostgresStreamHandle {
     stream: PostgresStream,
     provider: Box<dyn PgOutputMessageProvider>,
     relation_map: HashMap<u32, PgRelation>,
+    /// Real primary key of each published table, by `(schema, table)`, read from the catalog
+    /// once at stream start.
+    ///
+    /// Needed because pgoutput's per-column key flag means "part of the replica identity", and
+    /// under `REPLICA IDENTITY FULL` PostgreSQL sets it on every column. See
+    /// [`query_publication_primary_keys`](super::postgres::query::query_publication_primary_keys)
+    /// for what reading the flag as a primary key breaks.
+    catalog_primary_keys: HashMap<(String, String), Vec<String>>,
     /// Relations already warned about for an unusable REPLICA IDENTITY.
     ///
     /// pgoutput re-sends RELATION on every poll, so without this the warning would
@@ -153,12 +161,14 @@ impl PostgresStreamHandle {
         slot_idle_advance_interval_ms: u64,
         table_include_list: Vec<String>,
         table_exclude_list: Vec<String>,
+        catalog_primary_keys: HashMap<(String, String), Vec<String>>,
     ) -> Self {
         Self {
             source_name,
             stream,
             provider,
             relation_map: HashMap::new(),
+            catalog_primary_keys,
             warned_replica_identity: std::collections::HashSet::new(),
             warned_unknown_messages: std::collections::HashSet::new(),
             current_xid: None,
@@ -1504,6 +1514,7 @@ mod tests {
             0,
             Vec::new(),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         let started = std::time::Instant::now();
@@ -1596,6 +1607,7 @@ mod tests {
             0,
             Vec::new(),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
         let events = handle
             .next_events(2_000)
@@ -1645,6 +1657,7 @@ mod tests {
             0,
             Vec::new(),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         // Simulate having shrunk hard during an earlier spike.
@@ -1688,13 +1701,23 @@ mod tests {
     }
 
     fn build_relation(oid: u32, ns: &str, name: &str, cols: &[(&str, bool)]) -> Vec<u8> {
+        build_relation_with_identity(oid, ns, name, cols, b'd')
+    }
+
+    fn build_relation_with_identity(
+        oid: u32,
+        ns: &str,
+        name: &str,
+        cols: &[(&str, bool)],
+        replica_identity: u8,
+    ) -> Vec<u8> {
         let mut buf = vec![b'R'];
         buf.extend_from_slice(&oid.to_be_bytes());
         buf.extend_from_slice(ns.as_bytes());
         buf.push(0);
         buf.extend_from_slice(name.as_bytes());
         buf.push(0);
-        buf.push(b'd'); // replica identity = default
+        buf.push(replica_identity);
         let num: u16 = cols.len() as u16;
         buf.extend_from_slice(&num.to_be_bytes());
         for (col, is_key) in cols {
@@ -1784,7 +1807,15 @@ mod tests {
         initial_lsn: u64,
         provider: MockPgOutputProvider,
     ) -> PostgresStreamHandle {
-        PostgresStreamHandle::new(
+        make_stream_handle_with_keys(initial_lsn, provider, std::collections::HashMap::new())
+    }
+
+    fn make_stream_handle_with_keys(
+        initial_lsn: u64,
+        provider: MockPgOutputProvider,
+        catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
+    ) -> PostgresStreamHandle {
+        let mut handle = PostgresStreamHandle::new(
             "postgres".into(),
             PostgresStream {
                 slot_name: "slot".into(),
@@ -1798,7 +1829,185 @@ mod tests {
             0, // idle advance disabled in unit tests
             Vec::new(),
             Vec::new(),
-        )
+            catalog_primary_keys,
+        );
+        handle.stream.replication_status = StreamState::Streaming;
+        handle
+    }
+
+    /// A `REPLICA IDENTITY FULL` table's key is its primary key, not its every column.
+    ///
+    /// PostgreSQL sets the pgoutput replica-identity flag on every column under `FULL`, so reading
+    /// that flag as the primary key reported the whole row as the key. See
+    /// `query_publication_primary_keys` for what that breaks; these tests pin the resolution.
+    mod full_replica_identity_key_tests {
+        use super::*;
+
+        const OID: u32 = 77;
+
+        fn catalog(keys: &[&str]) -> std::collections::HashMap<(String, String), Vec<String>> {
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                ("public".to_string(), "toasty".to_string()),
+                keys.iter().map(|k| (*k).to_string()).collect(),
+            );
+            map
+        }
+
+        /// Every column flagged, as PostgreSQL sends it under FULL.
+        fn full_relation() -> Vec<u8> {
+            build_relation_with_identity(
+                OID,
+                "public",
+                "toasty",
+                &[("id", true), ("small", true), ("big", true)],
+                b'f',
+            )
+        }
+
+        fn batch() -> MockPgOutputProvider {
+            MockPgOutputProvider::new(vec![vec![
+                xlog(100, full_relation()),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(
+                    150,
+                    build_insert(OID, &[Some("1"), Some("s"), Some("wide")]),
+                ),
+                xlog(200, build_commit(200, 250, 0)),
+            ]])
+        }
+
+        #[tokio::test]
+        async fn the_key_is_the_catalog_primary_key_not_every_flagged_column() {
+            let mut handle = make_stream_handle_with_keys(0, batch(), catalog(&["id"]));
+            let events = handle.next_events(50).await.unwrap();
+
+            assert_eq!(
+                events[0].primary_key,
+                Some(vec!["id".to_string()]),
+                "under FULL every column carries the replica-identity flag; reporting them all \
+                 as the key makes the key change with any column, so a compacted topic cannot \
+                 collapse a row and one row's versions scatter across partitions"
+            );
+            assert_eq!(
+                events[0].primary_key_values(),
+                Some(serde_json::json!({"id": "1"})),
+                "the key must address the row, and must not carry the row's payload"
+            );
+        }
+
+        /// The reason the live TOAST test failed: a key that includes an unavailable column is a
+        /// partial key, and a partial key must be refused rather than widened — so the whole
+        /// update degraded to no write at all.
+        #[tokio::test]
+        async fn an_unavailable_column_does_not_destroy_the_key() {
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(100, full_relation()),
+                xlog(100, build_begin(200, 0, 10)),
+                // 'u' marks an unchanged TOAST value: present in the row, absent from the WAL.
+                xlog(150, {
+                    let mut buf = vec![b'U'];
+                    buf.extend_from_slice(&OID.to_be_bytes());
+                    buf.push(b'N');
+                    buf.extend_from_slice(&3u16.to_be_bytes());
+                    buf.push(b't');
+                    buf.extend_from_slice(&1i32.to_be_bytes());
+                    buf.extend_from_slice(b"1");
+                    buf.push(b't');
+                    buf.extend_from_slice(&2i32.to_be_bytes());
+                    buf.extend_from_slice(b"s2");
+                    buf.push(b'u');
+                    buf
+                }),
+                xlog(200, build_commit(200, 250, 0)),
+            ]]);
+            let mut handle = make_stream_handle_with_keys(0, provider, catalog(&["id"]));
+            let events = handle.next_events(50).await.unwrap();
+
+            assert_eq!(events[0].unavailable_columns, vec!["big".to_string()]);
+            assert!(
+                matches!(events[0].row_write(), crate::core::RowWrite::Merge { .. }),
+                "an unchanged-TOAST update must still merge; it wrote nothing when the \
+                 unavailable column was treated as part of the key: {:?}",
+                events[0].row_write()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_full_table_without_a_primary_key_reports_no_key_rather_than_the_whole_row() {
+            let mut handle =
+                make_stream_handle_with_keys(0, batch(), std::collections::HashMap::new());
+            let events = handle.next_events(50).await.unwrap();
+
+            assert_eq!(
+                events[0].primary_key, None,
+                "FULL without a primary key has no key to report; the whole row is not one"
+            );
+        }
+
+        /// The same flag drove the schema-change event, so a FULL table was published as one
+        /// whose every column was a non-nullable primary key — which an Avro schema turns into a
+        /// record with no optional fields.
+        #[tokio::test]
+        async fn the_published_schema_marks_only_the_real_key() {
+            let provider = MockPgOutputProvider::new(vec![
+                vec![xlog(100, full_relation())],
+                // A changed relation is what emits the schema-change event, and it is released
+                // with the transaction that carried it.
+                vec![
+                    xlog(105, build_begin(300, 0, 11)),
+                    xlog(
+                        110,
+                        build_relation_with_identity(
+                            OID,
+                            "public",
+                            "toasty",
+                            &[
+                                ("id", true),
+                                ("small", true),
+                                ("big", true),
+                                ("added", true),
+                            ],
+                            b'f',
+                        ),
+                    ),
+                    xlog(300, build_commit(300, 350, 0)),
+                ],
+            ]);
+            let mut handle = make_stream_handle_with_keys(0, provider, catalog(&["id"]));
+            // A poll keeps reading until it has something, so the schema change may land in
+            // either poll; collect both rather than assuming.
+            let mut events = handle.next_events(50).await.unwrap();
+            events.extend(handle.next_events(50).await.unwrap());
+
+            let schema = events
+                .iter()
+                .find(|event| event.op == crate::core::Operation::SchemaChange)
+                .and_then(|event| event.after.clone())
+                .and_then(|after| after.get("result_schema").cloned())
+                .expect("a changed relation publishes its schema");
+
+            assert_eq!(
+                schema["primary_keys"],
+                serde_json::json!(["id"]),
+                "the published key must be the real one: {schema}"
+            );
+            for column in schema["columns"].as_array().expect("columns array") {
+                let name = column["name"].as_str().expect("column name");
+                let expected_key = name == "id";
+                let constraints = column["constraints"].as_array().expect("constraints array");
+                assert_eq!(
+                    constraints.contains(&serde_json::json!("primary_key")),
+                    expected_key,
+                    "column '{name}' primary-key constraint is wrong: {column}"
+                );
+                assert_eq!(
+                    column["nullable"].as_bool(),
+                    Some(!expected_key),
+                    "column '{name}' nullability follows the real key, not the identity flag"
+                );
+            }
+        }
     }
 
     // ─── Pgoutput decoder tests ───────────────────────────────────────────────
@@ -2085,6 +2294,7 @@ mod tests {
             0, // idle advance disabled in unit tests
             Vec::new(),
             Vec::new(),
+            std::collections::HashMap::new(),
         );
         let result = handle.next_events(100).await;
         assert!(result.is_err());
@@ -3145,6 +3355,7 @@ mod tests {
             0,                                   // idle advance disabled in unit tests
             vec!["public.allowed_table".into()], // include-list excludes "excluded_table"
             Vec::new(),
+            std::collections::HashMap::new(),
         );
 
         // next_events times out with no events (batch is filtered) but must have

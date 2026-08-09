@@ -241,11 +241,7 @@ pub(super) fn mysql_row_to_json(row: &MysqlRow) -> serde_json::Value {
         let value = row
             .as_ref(index)
             .map(|value| {
-                mysql_value_to_json_for_column(
-                    value,
-                    column.column_type(),
-                    column.character_set(),
-                )
+                mysql_value_to_json_for_column(value, column.column_type(), column.character_set())
             })
             .unwrap_or(serde_json::Value::Null);
         object.insert(name, value);

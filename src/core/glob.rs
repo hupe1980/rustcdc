@@ -208,6 +208,9 @@ mod tests {
         assert!(is_schema_agnostic("orders"));
         assert!(is_schema_agnostic("audit_*"));
         assert!(!is_schema_agnostic("public.orders"));
-        assert!(!is_schema_agnostic("*"), "a catch-all is not a silent widening");
+        assert!(
+            !is_schema_agnostic("*"),
+            "a catch-all is not a silent widening"
+        );
     }
 }

@@ -54,10 +54,16 @@
 //! stream value — the very corruption the override window exists to prevent, reachable
 //! whenever a commit's fsync overlaps a chunk read.
 //!
-//! So the bracket has a second half: a transaction that was still in flight when the
-//! chunk was read is inside the window regardless of its position. See
-//! [`IncrementalSnapshotBackend::in_flight_transactions`] for the ordering argument that
-//! makes the pair exhaustive, and for which backends can supply the set.
+//! So membership in the window is a question about **visibility**, not about ordering, and only
+//! the backend can answer it — the evidence differs per engine and none of it is a log position.
+//! [`IncrementalSnapshotBackend::event_in_bracket`] is that question. Its default is the ordinal
+//! test, which is correct only where the watermark lags visibility rather than leading it
+//! (SQL Server, whose capture job harvests after commit); the backends that need more override it:
+//!
+//! * **PostgreSQL** captures `pg_current_snapshot()` alongside the LSN and asks whether the
+//!   event's `xid` was invisible to the low watermark's snapshot — `xid >= xmax || xip.contains`.
+//! * **MySQL** captures `Executed_Gtid_Set`, which the server updates *after* the engine commit,
+//!   and takes the set difference between the two bounds.
 //!
 //! # Why events past the high watermark are held back
 //!
@@ -923,12 +929,13 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         // Watermarks bracket the read: any event between them may have superseded a
         // row the read returned.
         //
-        // The three calls below are ordered, and the order is what makes the bracket
-        // sound rather than merely plausible. `in_flight_transactions` must be observed
-        // *after* the low watermark and *before* the chunk read, so that every
-        // transaction the read cannot see is caught either by the id set or by the
-        // position test — see `IncrementalSnapshotBackend::in_flight_transactions` for
-        // the argument, and the commit-visibility race it closes.
+        // The three calls below are ordered, and the order is what makes the bracket sound
+        // rather than merely plausible. The low watermark must be observed *before* the chunk
+        // read and the high one *after* it, because each carries the visibility evidence
+        // `event_in_bracket` tests against — PostgreSQL's transaction snapshot, MySQL's
+        // executed-GTID set — and evidence captured on the wrong side of the read answers a
+        // question about the wrong moment. See `IncrementalSnapshotBackend::event_in_bracket`
+        // for the commit-visibility race this closes.
         let low_watermark = self.backend.current_position().await?;
         let rows = {
             let spec = self.tables[table_idx].spec.clone();
@@ -1276,15 +1283,14 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                         // An event supersedes a chunk row when it targets the same table
                         // and the chunk read could not have seen it.
                         //
-                        // "Could not have seen it" is two conditions, not one. The
-                        // position test covers a transaction that committed after the low
-                        // watermark. The id test covers one that had already reached the
-                        // log *below* the low watermark but was still invisible to the
-                        // chunk's snapshot, because committing to the log and becoming
-                        // visible are separate steps — the race documented on
-                        // `IncrementalSnapshotBackend::in_flight_transactions`. Checking
-                        // only the position leaves that transaction unsuppressed and lets
-                        // the chunk's pre-image overwrite the newer stream value.
+                        // "Could not have seen it" is a visibility question, and the backend
+                        // answers it via `event_in_bracket`. A log position alone is not
+                        // enough: a transaction can have reached the log *below* the low
+                        // watermark and still have been invisible to the chunk's snapshot,
+                        // because committing to the log and becoming visible are separate
+                        // steps. Testing only the position leaves that transaction
+                        // unsuppressed and lets the chunk's pre-image overwrite the newer
+                        // stream value.
                         //
                         // The upper bound stays absolute: an event past the high watermark
                         // committed after the `SELECT` finished, and the chunk is emitted
@@ -2025,7 +2031,7 @@ mod tests {
                 clock: Arc::new(Mutex::new(100)),
                 advance_on_read: 0,
                 reads,
-                    in_flight: HashSet::new(),
+                in_flight: HashSet::new(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2214,7 +2220,7 @@ mod tests {
                 clock: Arc::new(Mutex::new(100)),
                 advance_on_read: 0,
                 reads: Arc::clone(&reads),
-                    in_flight: HashSet::new(),
+                in_flight: HashSet::new(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2412,7 +2418,7 @@ mod tests {
                 clock: Arc::new(Mutex::new(100)),
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
-                    in_flight: HashSet::new(),
+                in_flight: HashSet::new(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2461,7 +2467,7 @@ mod tests {
                 clock: Arc::new(Mutex::new(100)),
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
-                    in_flight: HashSet::new(),
+                in_flight: HashSet::new(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2489,7 +2495,7 @@ mod tests {
             clock: Arc::new(Mutex::new(100)),
             advance_on_read: 0,
             reads: Arc::clone(&reads),
-                in_flight: HashSet::new(),
+            in_flight: HashSet::new(),
         };
         let resume = IncrementalSnapshotState {
             paused: false,
@@ -2545,7 +2551,7 @@ mod tests {
             clock: Arc::new(Mutex::new(100)),
             advance_on_read: 0,
             reads: Arc::clone(&reads),
-                in_flight: HashSet::new(),
+            in_flight: HashSet::new(),
         };
         let resume = IncrementalSnapshotState {
             paused: false,
@@ -2664,7 +2670,7 @@ mod tests {
                 clock: Arc::new(Mutex::new(100)),
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
-                    in_flight: HashSet::new(),
+                in_flight: HashSet::new(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2737,8 +2743,7 @@ mod stop_durability_tests {
     /// next restart for exactly the same reason.
     #[tokio::test]
     async fn requesting_a_table_clears_the_stopped_flag() {
-        let (mut driver, _reads) =
-            driver_with(vec![json!({ "id": 1 })], Vec::new(), 0, 10).await;
+        let (mut driver, _reads) = driver_with(vec![json!({ "id": 1 })], Vec::new(), 0, 10).await;
         IncrementalSnapshotDriver::stop_snapshot(&mut driver);
         assert!(driver.incremental_snapshot_state().unwrap().stopped);
 
@@ -3136,9 +3141,13 @@ mod row_filter_tests {
     use super::*;
     use serde_json::json;
 
-    fn config_with_condition(tables: Vec<&str>, condition: Option<&str>) -> IncrementalSnapshotConfig {
-        let mut config =
-            IncrementalSnapshotConfig::new(tables.into_iter().map(String::from).collect::<Vec<_>>());
+    fn config_with_condition(
+        tables: Vec<&str>,
+        condition: Option<&str>,
+    ) -> IncrementalSnapshotConfig {
+        let mut config = IncrementalSnapshotConfig::new(
+            tables.into_iter().map(String::from).collect::<Vec<_>>(),
+        );
         config.chunk_size = 10;
         if let Some(condition) = condition {
             config
@@ -3170,9 +3179,12 @@ mod row_filter_tests {
             .await
             .expect("request succeeds");
 
-        let condition = driver
-            .incremental_snapshot_state()
-            .and_then(|state| state.tables.first().and_then(|table| table.condition.clone()));
+        let condition = driver.incremental_snapshot_state().and_then(|state| {
+            state
+                .tables
+                .first()
+                .and_then(|table| table.condition.clone())
+        });
         assert_eq!(
             condition.as_deref(),
             Some("tenant_id = 42"),
@@ -3197,9 +3209,12 @@ mod row_filter_tests {
             .await
             .expect("request succeeds");
 
-        let condition = driver
-            .incremental_snapshot_state()
-            .and_then(|state| state.tables.first().and_then(|table| table.condition.clone()));
+        let condition = driver.incremental_snapshot_state().and_then(|state| {
+            state
+                .tables
+                .first()
+                .and_then(|table| table.condition.clone())
+        });
         assert_eq!(condition.as_deref(), Some("id > 100"));
     }
 
@@ -3224,9 +3239,12 @@ mod row_filter_tests {
             .await
             .expect("re-request succeeds");
 
-        let condition = driver
-            .incremental_snapshot_state()
-            .and_then(|state| state.tables.first().and_then(|table| table.condition.clone()));
+        let condition = driver.incremental_snapshot_state().and_then(|state| {
+            state
+                .tables
+                .first()
+                .and_then(|table| table.condition.clone())
+        });
         assert_eq!(
             condition.as_deref(),
             Some("id > 100"),
@@ -3274,21 +3292,29 @@ mod row_filter_tests {
             condition_of(&after_restart),
             "a table must not change which rows it snapshots because the process restarted"
         );
-        assert_eq!(condition_of(&after_restart).as_deref(), Some("tenant_id = 42"));
+        assert_eq!(
+            condition_of(&after_restart).as_deref(),
+            Some("tenant_id = 42")
+        );
     }
 
     #[tokio::test]
     async fn a_table_with_no_filter_reports_none() {
-        let mut driver =
-            driver_with_config(vec![json!({ "id": 1 })], config_with_condition(Vec::new(), None))
-                .await;
+        let mut driver = driver_with_config(
+            vec![json!({ "id": 1 })],
+            config_with_condition(Vec::new(), None),
+        )
+        .await;
         driver
             .request_snapshot_tables(SnapshotRequest::new(["public.users"]))
             .await
             .expect("request succeeds");
         assert!(driver
             .incremental_snapshot_state()
-            .and_then(|state| state.tables.first().and_then(|table| table.condition.clone()))
+            .and_then(|state| state
+                .tables
+                .first()
+                .and_then(|table| table.condition.clone()))
             .is_none());
     }
 }
@@ -3321,7 +3347,10 @@ mod resnapshot_identity_tests {
             .filter(|event| event.op == Operation::Read)
             .filter(|event| guard.should_process(event).expect("fingerprintable"))
             .count();
-        assert_eq!(delivered_first, 1, "the first snapshot must deliver the row");
+        assert_eq!(
+            delivered_first, 1,
+            "the first snapshot must deliver the row"
+        );
 
         // The table is now complete; this is the deliberate re-snapshot path.
         let enqueued = driver
@@ -3413,7 +3442,10 @@ mod resnapshot_identity_tests {
 
         let resumed = driver_resuming_from(rows, Some(state.clone()), 10).await;
         assert_eq!(
-            resumed.incremental_snapshot_state().expect("state").generation,
+            resumed
+                .incremental_snapshot_state()
+                .expect("state")
+                .generation,
             state.generation,
             "the offsets are documented as stable across a restart, so the generation they \
              embed has to be persisted"

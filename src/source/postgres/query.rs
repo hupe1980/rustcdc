@@ -31,6 +31,76 @@ impl ReconcileOps for Client {
     }
 }
 
+/// Primary-key columns of every table in `publication`, keyed by `(schema, table)`.
+///
+/// # Why the stream needs this at all
+///
+/// pgoutput's RELATION message flags each column with `LOGICALREP_IS_REPLICA_IDENTITY`, and that
+/// flag is **not** "part of the primary key". PostgreSQL sets it on *every* column of a table with
+/// `REPLICA IDENTITY FULL` — its own source says so: "REPLICA IDENTITY FULL means all columns are
+/// sent as part of key." Reading the flag as a primary key therefore reports the whole row as the
+/// key for such a table, which:
+///
+/// * makes the key change whenever **any** column changes, so a log-compacted topic can never
+///   collapse a row's history and per-key routing sends one row's versions to several partitions;
+/// * disagrees with the snapshot path, which reads the real key from this catalog — so the same
+///   row is keyed one way while being snapshotted and another way while being streamed, defeating
+///   the handoff's deduplication and the idempotency digest;
+/// * turns an unchanged-TOAST update into no write at all, because one of the "key" columns is
+///   unavailable and a partial key must be refused rather than widened.
+///
+/// The flag is right for `DEFAULT` and `INDEX` identities, where it names the primary key or the
+/// nominated index. Only `FULL` needs this lookup, and only the catalog can answer it.
+///
+/// Ordering matters: a composite key is returned in index order, matching
+/// [`query_primary_key_columns_and_types`] so the two paths produce identical keys.
+pub(super) async fn query_publication_primary_keys(
+    client: &Client,
+    publication: &str,
+) -> Result<std::collections::HashMap<(String, String), Vec<String>>> {
+    let rows = client
+        .query(
+            "
+            SELECT
+              published.schemaname,
+              published.tablename,
+              attribute.attname
+            FROM pg_catalog.pg_publication_tables published
+            JOIN pg_catalog.pg_class class_def
+              ON class_def.relname = published.tablename
+            JOIN pg_catalog.pg_namespace namespace_def
+              ON namespace_def.oid = class_def.relnamespace
+             AND namespace_def.nspname = published.schemaname
+            JOIN pg_catalog.pg_index index_def
+              ON index_def.indrelid = class_def.oid
+             AND index_def.indisprimary
+            JOIN LATERAL unnest(index_def.indkey) WITH ORDINALITY AS key_attnum(attnum, ord) ON TRUE
+            JOIN pg_catalog.pg_attribute attribute
+              ON attribute.attrelid = class_def.oid
+             AND attribute.attnum = key_attnum.attnum
+            WHERE published.pubname = $1
+            ORDER BY published.schemaname, published.tablename, key_attnum.ord
+            ",
+            &[&publication],
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed querying primary keys for publication '{publication}': {error}"
+            ))
+        })?;
+
+    let mut keys: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        let column: String = row.get(2);
+        keys.entry((schema, table)).or_default().push(column);
+    }
+    Ok(keys)
+}
+
 pub(super) async fn query_primary_key_columns_and_types(
     client: &Client,
     schema: &str,

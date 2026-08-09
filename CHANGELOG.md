@@ -8,7 +8,7 @@ what breaks and what to do about it.
 ## 0.12.0
 
 A second correctness pass over the whole tree, plus round-2 feedback from the `rustcdc-server`
-maintainers against the released 0.11.0. Thirty findings, all closed here, and the shape of them differs from last time:
+maintainers against the released 0.11.0. Thirty-one findings, all closed here, and the shape of them differs from last time:
 none was visible by reading a function in isolation, and half required reasoning about what a
 database actually guarantees rather than about what this code says.
 
@@ -22,21 +22,68 @@ CDC implementation available to check, Debezium's included.
 Every fix carries a regression test that was **confirmed to fail with the fix reverted**, by
 reverting it, rather than asserted to.
 
-It is a **breaking** release in five ways: a truncated composite primary key no longer resolves
-to a key at all; `table_include_list` / `table_exclude_list` entries are glob patterns rather
-than exact strings; `EventEncoder::encode_key` returns `Result<Option<_>>`;
+It is a **breaking** release in six ways: a truncated composite primary key no longer resolves
+to a key at all; a PostgreSQL table with `REPLICA IDENTITY FULL` and no primary key now reports no
+key rather than an all-columns one; `table_include_list` / `table_exclude_list` entries are glob
+patterns rather than exact strings; `EventEncoder::encode_key` returns `Result<Option<_>>`;
 `StreamHandle::request_snapshot_tables` takes a `SnapshotRequest`; and the replay fixture format
 renames `expected_event_count` to `message_count`. `IncrementalSnapshotBackend` gains a method and
 `IncrementalSnapshotState` two fields, but both are defaulted so existing implementations compile
 and existing checkpoints load unchanged — though accepting the backend default is a correctness
 decision, and the trait says so. Each has its own entry below with the migration.
 
-Two conditions remain open on a 1.0 release, one of them new and a database limitation rather
-than a defect. [FINDINGS.md](FINDINGS.md) has the full audit.
+Two conditions remain open on a 1.0 release, neither a correctness defect. There is no
+end-to-end throughput measurement — the benchmarks in `benches/` measure encode and transform
+stages in isolation, and no published figure should be read as a pipeline number. And with the
+`sqlserver` feature enabled, `tiberius 0.12.3` pins `tokio-rustls 0.24`, pulling in a second,
+older rustls that carries three advisories; it is not fixable from this crate and needs either a
+`tiberius` release on rustls 0.23 or a native TDS client.
 
 Four of the fifteen came from `rustcdc-server`'s round-2 report (B-4, F-8, F-9, F-10). Every
 claim in it was verified against the source before acting; all four held, and B-4's mechanism
 was diagnosed exactly right. One consequence of B-4 was worse than reported — see its entry.
+
+### Fixed: PostgreSQL reported the whole row as the primary key under `REPLICA IDENTITY FULL`
+
+pgoutput's `RELATION` message flags each column as part of the **replica identity**, and this crate
+read that flag as "part of the primary key". Under `REPLICA IDENTITY FULL` PostgreSQL sets it on
+every column — its own source says so: *"REPLICA IDENTITY FULL means all columns are sent as part
+of key."* So every streamed event from a `FULL` table claimed a primary key consisting of the
+entire row.
+
+Three consequences, in increasing order of how quietly they break things:
+
+1. The key changed whenever **any** column changed. A log-compacted topic could never collapse a
+   row's history, and one row's versions hashed to different partitions — so per-key ordering, the
+   property partitioning exists to provide, did not hold.
+2. It disagreed with the snapshot phase, which reads the real key from the catalog. The same row
+   was keyed one way while being snapshotted and another way while being streamed, which defeats
+   the handoff's deduplication and the idempotency digest.
+3. Combined with the all-or-nothing key rule introduced in this release, an unchanged-TOAST update
+   produced **no write at all**: one of the "key" columns was the unavailable TOAST value, so the
+   key was partial and correctly refused. A 40 kB column that never changed took the whole update
+   down with it.
+
+The same flag also drove the schema-change event, so a `FULL` table was published as one whose
+every column was a non-nullable primary key. That description reaches schema history and the
+registry codecs, where it becomes an Avro record with no optional fields — and a later NULL in any
+column then fails to encode.
+
+`primary_key` now means the table's primary key. It is read from the catalog once per stream start
+for `FULL` relations, matching what the snapshot path already used. `DEFAULT` and `INDEX` are
+unchanged: there the flags already name a genuine row key.
+
+**Breaking.** A `FULL` table **without** a primary key now reports `primary_key: None` and its
+events carry no key, where previously they carried an all-columns key. There is no key to report in
+that case, and the previous value could not address a row across versions. Match on the
+before-image — `FULL` provides a complete one — or add a primary key. The condition is logged once
+per table, as `NOTHING` and keyless `DEFAULT` already were.
+
+A table added to the publication *after* the stream started is not in the catalog snapshot, so a
+`FULL` table added mid-stream reports no key until the stream restarts. The warning names it.
+
+Found by a live PostgreSQL run of the pre-existing unchanged-TOAST test, not by reading the code:
+the defect was invisible at the call site, because the flag's name matched the meaning we assumed.
 
 ### Fixed: MySQL's incremental-snapshot commit-visibility window, via GTID sets
 
@@ -65,13 +112,14 @@ tests assert exactly this pair of divergences from the ordinal test — one wher
 **New on the trait, defaulted:**
 
 ```rust
-fn event_in_bracket(&self, event, position, low, high, in_flight) -> BracketPosition
+fn event_in_bracket(&self, event, position, low, high) -> BracketPosition
 ```
 
 The bracket decision belongs to the backend, because only it knows whether its watermark is an
 ordered coordinate or a set — and `>` cannot express membership in a GTID set, which is only
-*partially* ordered. The default is the ordinal test the driver used to inline, so PostgreSQL and
-SQL Server are unchanged and a third-party backend keeps compiling. `BracketPosition` is exported.
+*partially* ordered. The default is the ordinal test the driver used to inline, so SQL Server is
+unchanged and a third-party backend keeps compiling; PostgreSQL overrides it with its transaction
+snapshot (see the entry below). `BracketPosition` is exported.
 
 The binlog coordinate still orders the watermark, but only to answer a different question: has the
 stream caught up to the high watermark, so the chunk can be emitted? That is safe on the
@@ -720,33 +768,37 @@ and the chunk row was emitted after the newer stream event — resurrecting the 
 window is one commit's flush-to-visibility gap, an fsync long under `synchronous_commit = on`;
 over a multi-hour snapshot of a hot table it is not theoretical.
 
-`IncrementalSnapshotBackend` gains:
+The fix makes bracket membership a **visibility** question rather than an ordering one, and gives
+it to the backend, which is the only party that knows what evidence its engine offers:
 
 ```rust
-async fn in_flight_transactions(&mut self) -> Result<HashSet<u64>>   // default: empty
+fn event_in_bracket(&self, event, position, low, high) -> BracketPosition   // default: ordinal
 ```
 
-The driver calls it **after** the low watermark and **before** the chunk read, and tests
-`position <= high && (position > low || in_flight.contains(tx_id))`. That call order is what
-makes the pair exhaustive: a transaction invisible to the chunk's snapshot either was running
-when the set was read — so it is in the set — or started afterwards, in which case it commits
-after the low watermark was read and the position test catches it. There is no third case.
+The driver observes the low watermark **before** the chunk read and the high one **after** it, so
+each carries the visibility evidence taken at the right moment. An earlier attempt instead had the
+backend return a set of in-flight transaction *ids*; it was withdrawn, because MySQL has no id on a
+scale a binlog event shares, and because a per-engine visibility test is what the question actually
+needs.
 
 Per connector:
 
-- **PostgreSQL** implements it from `pg_current_snapshot()`, truncating `xid8` to the 32-bit xid
-  pgoutput's `BEGIN` reports. Closed.
+- **PostgreSQL** overrides it from `pg_current_snapshot()`, captured alongside the LSN in one
+  round trip, and asks whether the event's `xid` was invisible to the low watermark's snapshot:
+  `xid >= xmax || xip.contains(xid)`. Both halves are required — the first shipped version of this
+  fix used only the `xip` list, and a live server showed the mid-commit case reports the in-flight
+  xid *equal to* `xmax` with `xip` empty, so the very case the fix existed for slipped through.
+  Closed, and validated against a live PostgreSQL rather than argued.
 - **SQL Server** needs nothing. `fn_cdc_get_max_lsn()` reports what the capture job has already
   harvested, so its watermark *lags* visibility instead of leading it — the safe direction, at
   the cost of harmless over-suppression.
 - **MySQL / MariaDB: closed, by a different mechanism.** No in-flight *transaction id* is
-  available on a scale a binlog event shares, so `in_flight_transactions` stays empty here — but
-  the executed-GTID set closes the same gap without needing one, and this release adopts it. See
-  the entry below.
+  available on a scale a binlog event shares — but the executed-GTID set closes the same gap
+  without needing one, and this release adopts it. See the entry above.
 
-`in_flight_transactions` has a default so third-party backends still compile, but accepting the
-default is a correctness decision — the trait documentation says so, and says which way to go
-when your database has no usable list.
+`event_in_bracket` has a default so third-party backends still compile, but accepting the
+default is a correctness decision — the trait documentation says so, and says which way to go when
+your database offers no visibility evidence beyond a log position.
 
 Regression tests drive the real state machine and fail with the fix reverted:
 `a_transaction_below_the_low_watermark_but_still_invisible_is_suppressed`,
@@ -853,6 +905,23 @@ Two related fixes came with it:
 
 **Migration:** if a list carried a literal `*` as a no-op placeholder, it is now a catch-all.
 Audit both lists before upgrading. Entries without `*` or `?` behave exactly as before.
+
+### Fixed: the policy gate passed local-only markdown links, and no document mentioned `cargo fmt`
+
+Two gaps in the checks themselves, both found by CI rejecting a tree that had passed every local
+gate.
+
+The markdown link check tested `-e path` — existence on the author's disk. A **gitignored** target
+resolves there and nowhere else, so a link to a local-only file looked correct locally and broke for
+CI and every reader. That is how a link to a local audit note reached a released changelog. The gate
+now also rejects any link whose target `git check-ignore` matches.
+
+Separately, no file in the repository mentioned `cargo fmt`, though CI fails the build on
+`cargo fmt --check`. Formatting is invisible to the compiler and to every test, so a tree that
+builds clean and passes 1,103 tests can still be rejected — as one was, on `tests/` files. The
+contributing guide now lists `cargo fmt --all` and `scripts/ci-policy-gate.sh` as the local
+equivalents of CI's `quality` and `policy-gate` jobs, since a checklist that omits a gate CI
+enforces is worse than no checklist.
 
 ## 0.11.0
 

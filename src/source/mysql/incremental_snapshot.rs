@@ -82,7 +82,9 @@ pub struct BinlogPos {
 }
 
 impl Ord for BinlogPos {
-    /// Compares the binlog coordinate only; see [`BinlogPos::executed_gtids`].
+    /// Compares the binlog coordinate only. The GTID set a position also carries is deliberately
+    /// excluded: it is a set, so it has no total order, and ordering by it would contradict the
+    /// binlog sequence the driver relies on for chunk resumption.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         compare_binlog_position(&self.file, self.position, &other.file, other.position)
     }
@@ -217,10 +219,12 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
     /// snapshot from a quiesced replica or restrict the snapshot with
     /// [`IncrementalSnapshotConfig::table_conditions`](crate::source::IncrementalSnapshotConfig::table_conditions).
     ///
-    /// [`IncrementalSnapshotBackend::in_flight_transactions`] stays at its empty default here,
-    /// and deliberately: no in-flight *transaction id* is available on a scale a binlog event
-    /// shares, so returning InnoDB ids would look plausible and never match. The GTID set closes
-    /// the same gap without needing one.
+    /// The bracket test itself lives in
+    /// [`event_in_bracket`](crate::source::IncrementalSnapshotBackend::event_in_bracket), which
+    /// this backend overrides to compare GTID sets. An earlier design instead reported in-flight
+    /// *transaction ids* to the driver; that could not work on MySQL, because no in-flight id is
+    /// available on a scale a binlog event shares — returning InnoDB ids would have looked
+    /// plausible and matched nothing. The GTID set closes the same gap without needing one.
     async fn current_position(&mut self) -> Result<BinlogPos> {
         let mut conn = self.pool.get_conn().await.map_err(|error| {
             Error::SourceError(format!(
@@ -632,10 +636,7 @@ mod gtid_bracket_tests {
                 expected,
                 "with no GTID sets the classification must match the ordinal test at {position}"
             );
-            assert_eq!(
-                super::default_bracket(&event, &pos, &low, &high),
-                expected,
-            );
+            assert_eq!(super::default_bracket(&event, &pos, &low, &high), expected,);
         }
     }
 

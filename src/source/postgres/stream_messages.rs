@@ -183,6 +183,29 @@ impl PostgresStreamHandle {
 
     fn relation_primary_key(&self, relation_oid: u32) -> Option<Vec<String>> {
         let relation = self.relation_map.get(&relation_oid)?;
+        self.resolve_primary_key(relation)
+    }
+
+    /// The table's primary key, never merely its replica identity.
+    ///
+    /// pgoutput's column flag means "part of the replica identity". Under `DEFAULT` and `INDEX`
+    /// that set *is* a row key — the primary key or the nominated unique index — and the flags are
+    /// the best available answer. Under `FULL` PostgreSQL flags **every** column, so the flags
+    /// describe the whole row rather than a key; the answer then comes from the catalog snapshot
+    /// taken at stream start, which is also what the snapshot path uses, keeping one row's key
+    /// identical across both phases.
+    ///
+    /// `None` when there is genuinely no key to report: `NOTHING`, `DEFAULT` on a table without a
+    /// primary key, or `FULL` on a table without one. Reporting the full row instead would produce
+    /// a "key" that changes with every column and cannot address a row across versions.
+    fn resolve_primary_key(&self, relation: &PgRelation) -> Option<Vec<String>> {
+        if relation.replica_identity == b'f' {
+            let key = self
+                .catalog_primary_keys
+                .get(&(relation.namespace.clone(), relation.name.clone()))?;
+            return (!key.is_empty()).then(|| key.clone());
+        }
+
         let keys: Vec<String> = relation
             .columns
             .iter()
@@ -346,26 +369,30 @@ impl PostgresStreamHandle {
             .collect()
     }
 
-    fn relation_to_table_schema(relation: &PgRelation) -> TableSchema {
-        let primary_keys: Vec<String> = relation
-            .columns
-            .iter()
-            .filter(|column| column.is_key())
-            .map(|column| column.name.clone())
-            .collect();
+    /// `primary_keys` is the resolved key from [`Self::resolve_primary_key`], not the raw
+    /// replica-identity flags: under `REPLICA IDENTITY FULL` every column carries the flag, and
+    /// deriving the schema from it published a table whose every column was a non-nullable primary
+    /// key. That description reaches schema history and the registry codecs, where it becomes an
+    /// Avro record with no optional fields — so a later NULL in any column fails to encode.
+    fn relation_to_table_schema(
+        relation: &PgRelation,
+        primary_keys: Option<&Vec<String>>,
+    ) -> TableSchema {
+        let primary_keys: Vec<String> = primary_keys.cloned().unwrap_or_default();
 
         let columns = relation
             .columns
             .iter()
             .map(|column| {
+                let is_primary_key = primary_keys.contains(&column.name);
                 let mut constraints = Vec::new();
-                if column.is_key() {
+                if is_primary_key {
                     constraints.push("primary_key".to_string());
                 }
                 ColumnDef {
                     name: column.name.clone(),
                     data_type: pg_type_name(column.type_oid),
-                    nullable: !column.is_key(),
+                    nullable: !is_primary_key,
                     constraints,
                 }
             })
@@ -394,7 +421,10 @@ impl PostgresStreamHandle {
                 "ALTER TABLE {}.{} /* derived from pgoutput RELATION metadata */",
                 relation.namespace, relation.name
             ),
-            result_schema: Some(Self::relation_to_table_schema(relation)),
+            result_schema: Some(Self::relation_to_table_schema(
+                relation,
+                self.resolve_primary_key(relation).as_ref(),
+            )),
             schema_diff: None,
             ts: ts_ms,
         };
@@ -483,6 +513,21 @@ impl PostgresStreamHandle {
                                      Fix with: ALTER TABLE {}.{} REPLICA IDENTITY FULL \
                                      (or DEFAULT with a primary key).",
                                     rel.namespace, rel.name,
+                                );
+                                self.warned_replica_identity.insert(rel.oid);
+                            }
+                            // FULL identifies a row by its whole before-image, which is not a
+                            // key. When the table has no primary key in the catalog there is
+                            // nothing to report, and a consumer that keys on `primary_key` needs
+                            // to hear that from the log rather than infer it from absent keys.
+                            b'f' if self.resolve_primary_key(&rel).is_none() => {
+                                tracing::warn!(
+                                    target: "rustcdc::source::postgres",
+                                    table = %format!("{}.{}", rel.namespace, rel.name),
+                                    "table has REPLICA IDENTITY FULL but no primary key, so \
+                                     events carry no key: pgoutput flags every column as replica \
+                                     identity and the whole row is not usable as one. Match on \
+                                     the before-image, or add a primary key.",
                                 );
                                 self.warned_replica_identity.insert(rel.oid);
                             }

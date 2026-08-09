@@ -710,7 +710,8 @@ mod tests {
                 payload: r#"{"schema":"public","table":"users","after":{"id":1}}"#.to_string(),
                 tags: vec![],
             }],
-        ).expect("fixture is valid");
+        )
+        .expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let first = session.replay();
@@ -819,7 +820,8 @@ mod tests {
                     tags: vec![],
                 },
             ],
-        ).expect("fixture is valid");
+        )
+        .expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -857,7 +859,8 @@ mod tests {
                 payload: r#"{"sql":"BEGIN"}"#.to_string(),
                 tags: vec![],
             }],
-        ).expect("fixture is valid");
+        )
+        .expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();
@@ -894,7 +897,8 @@ mod tests {
                     .to_string(),
                 tags: vec![],
             }],
-        ).expect("fixture is valid");
+        )
+        .expect("fixture is valid");
 
         let mut session = ReplaySession::new(fixture).unwrap();
         let result = session.replay();

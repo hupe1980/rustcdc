@@ -28,9 +28,8 @@
 //! # What is still not covered
 //!
 //! **AWS Glue.** Its 18-byte framing and UUID schema identity are unit-tested, but the
-//! service has no self-hostable implementation, so there is no container to point at. That
-//! remains an explicit gap in FINDINGS.md rather than something this file silently implies
-//! it covers.
+//! service has no self-hostable implementation, so there is no container to point at. It is
+//! called out here so this file does not silently imply it covers that path.
 
 use rustcdc::codec::{
     detect_wire_format, preflight_schema_registry, warm_schema_cache, ApicurioRegistryConfig,

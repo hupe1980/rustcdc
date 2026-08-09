@@ -467,7 +467,10 @@ mod tests {
             .expect("nonce present")
             .to_string();
         let server_first = format!("r={nonce}serverpart,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
-        let client_final = exchange.client_final(&server_first).await.expect("continues");
+        let client_final = exchange
+            .client_final(&server_first)
+            .await
+            .expect("continues");
 
         assert!(
             client_final.starts_with("c=biws,"),

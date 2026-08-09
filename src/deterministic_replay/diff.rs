@@ -520,9 +520,7 @@ mod field_coverage_tests {
             ),
             (
                 "envelope_version",
-                Box::new(|event: &mut Event| {
-                    event.envelope_version = EVENT_ENVELOPE_VERSION + 1
-                }),
+                Box::new(|event: &mut Event| event.envelope_version = EVENT_ENVELOPE_VERSION + 1),
             ),
             (
                 "source.offset",

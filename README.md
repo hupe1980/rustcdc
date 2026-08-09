@@ -41,8 +41,8 @@ server.
 
 **Pre-1.0.** Latest published release is 0.11.0; 0.12.0 is in development and is a breaking
 release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are validated by
-1099 unit tests, 133 documentation samples compiled as doctests, 41 deterministic-replay golden
-fixtures, and 64 integration suites, the
+1103 unit tests, 133 documentation samples compiled as doctests, 41 deterministic-replay golden
+fixtures, and 61 integration suites, the
 container-backed ones running against real PostgreSQL 12/14/15/16, MySQL 8.0/8.4,
 MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
 

@@ -27,8 +27,7 @@
 mod driver;
 
 pub use driver::{
-    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver,
-    SnapshotTable,
+    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable,
 };
 
 use serde::{Deserialize, Serialize};
@@ -134,7 +133,9 @@ pub struct IncrementalSnapshotTableState {
     ///
     /// Reflects the merged result: a per-request condition from
     /// [`SnapshotRequest`](crate::source::SnapshotRequest) where one was given, otherwise the
-    /// configured [`IncrementalSnapshotConfig::table_conditions`] entry, otherwise `None`.
+    /// configured
+    /// [`IncrementalSnapshotConfig::table_conditions`](crate::source::IncrementalSnapshotConfig::table_conditions)
+    /// entry, otherwise `None`.
     ///
     /// `#[serde(default)]`, so a checkpoint written before this field existed loads as "no
     /// filter" — which is what it means for a state that could not record one.

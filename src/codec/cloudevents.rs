@@ -546,7 +546,9 @@ mod partial_payload_contract_tests {
     #[test]
     fn the_cloudevents_data_carries_every_partial_payload_field() {
         let event = event_with_holes();
-        let encoded = CloudEventsEncoder::default().encode(&event).expect("encode");
+        let encoded = CloudEventsEncoder::default()
+            .encode(&event)
+            .expect("encode");
         let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
         let data = ce.get("data").expect("data payload");
 
@@ -574,7 +576,9 @@ mod partial_payload_contract_tests {
         event.transaction = Some(crate::core::TransactionMetadata::new(42, 1, Some(2)));
         event.snapshot = Some(crate::core::SnapshotMetadata::new("snap-1", 0, false));
 
-        let encoded = CloudEventsEncoder::default().encode(&event).expect("encode");
+        let encoded = CloudEventsEncoder::default()
+            .encode(&event)
+            .expect("encode");
         let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
         let data = ce.get("data").expect("data payload");
 
@@ -625,9 +629,13 @@ mod partial_payload_contract_tests {
         event.before_unavailable_columns.clear(); // validation forbids both together
         event.before_is_key_only = true;
         event.before = Some(serde_json::json!({ "id": "1" }));
-        event.validate().expect("a well-formed key-only before-image");
+        event
+            .validate()
+            .expect("a well-formed key-only before-image");
 
-        let encoded = CloudEventsEncoder::default().encode(&event).expect("encode");
+        let encoded = CloudEventsEncoder::default()
+            .encode(&event)
+            .expect("encode");
         let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
         assert_eq!(
             ce["data"].get("before_is_key_only"),

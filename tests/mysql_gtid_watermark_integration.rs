@@ -48,8 +48,10 @@ fn source_error(error: impl std::fmt::Display) -> rustcdc::Error {
 
 /// Read `Executed_Gtid_Set` the way the connector's watermark does.
 async fn executed_gtid_set(pool: &sqlx::MySqlPool) -> rustcdc::Result<String> {
-    let row: (String, u64, String, String, String) =
-        sqlx::query_as("SHOW MASTER STATUS").fetch_one(pool).await.map_err(source_error)?;
+    let row: (String, u64, String, String, String) = sqlx::query_as("SHOW MASTER STATUS")
+        .fetch_one(pool)
+        .await
+        .map_err(source_error)?;
     Ok(row.4)
 }
 
@@ -110,7 +112,11 @@ async fn an_events_gtid_falls_inside_the_executed_set_difference() -> rustcdc::R
         .await
         .map_err(source_error)?;
 
-    let host = container.get_host().await.map_err(source_error)?.to_string();
+    let host = container
+        .get_host()
+        .await
+        .map_err(source_error)?
+        .to_string();
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await

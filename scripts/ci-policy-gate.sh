@@ -64,6 +64,13 @@ run_markdown_link_check() {
       if [[ ! -e "$resolved" ]]; then
         echo "broken markdown link in $markdown_file -> $target" >&2
         failed=$((failed + 1))
+      elif git -C "$repo_root" check-ignore -q "$resolved" 2>/dev/null; then
+        # Existence on the author's disk is not the test: a gitignored target is not in
+        # the repository, so the link is broken for CI and for every reader while looking
+        # fine locally. This is how a link to a local-only audit note reached a released
+        # CHANGELOG — it resolved for the person who wrote it and for nobody else.
+        echo "markdown link in $markdown_file -> $target resolves only locally (gitignored)" >&2
+        failed=$((failed + 1))
       fi
     done < <(rg --no-line-number --no-filename --pcre2 -o '\[[^][]+\]\(([^)]+)\)' "$markdown_file")
   }

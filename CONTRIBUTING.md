@@ -67,6 +67,9 @@ let t: BoxTransform = BoxTransform::new(MyTransform);
 
 ## Code Style
 
+- `cargo fmt --all` before every commit. CI runs `cargo fmt --check` and fails the build on any
+  difference, including in `tests/` — formatting is not checked by the compiler, so a tree that
+  builds and passes every test can still fail this gate.
 - `cargo clippy --all-features` must produce zero warnings before submitting a PR.
 - `#[forbid(unsafe_code)]` is set at the crate root — no unsafe code.
 - Prefer `is_some_and` over `map_or(false, ...)`.
@@ -81,6 +84,14 @@ let t: BoxTransform = BoxTransform::new(MyTransform);
 ## Submitting a Pull Request
 
 1. Fork the repository and create a feature branch.
-2. Run `cargo test --lib` and ensure all tests pass.
-3. Run `cargo clippy --all-features` and fix any warnings.
-4. Open a PR with a clear description of the change and its motivation.
+2. Run `cargo fmt --all`.
+3. Run `cargo test --lib` and ensure all tests pass.
+4. Run `cargo clippy --all-targets --all-features -- -D warnings` and fix any warnings.
+5. Run `bash scripts/ci-policy-gate.sh`. It catches drift CI would otherwise reject: docs that
+   no longer match config, a `tests/*.rs` no workflow runs, and markdown links that are broken —
+   including links that resolve on your machine but point at a gitignored path, which is broken
+   for everyone else.
+6. Open a PR with a clear description of the change and its motivation.
+
+Steps 2, 4 and 5 are the local equivalents of CI's `quality` and `policy-gate` jobs; running them
+is much faster than learning their result from a failed build.

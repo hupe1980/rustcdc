@@ -1,3 +1,16 @@
+//! Exported OTel metrics must carry the series names the runbook tells operators to alert on.
+//!
+//! # Why the names are asserted rather than merely observed
+//!
+//! This suite used to expect `rustcdc_events_processed_total` — a name that appears in no
+//! document and that only the OTLP path ever produced. The text exposition emitted
+//! `rustcdc_runtime_events_polled_total`, which is what the runbook, config reference and
+//! troubleshooting guide all reference. So every alert an operator copied from the docs matched
+//! nothing on the OTLP path, and this test confirmed the divergence instead of catching it.
+//!
+//! The names below are therefore the documented contract, and the test also asserts the old
+//! names are *absent*, so the two surfaces cannot drift apart again.
+
 #![cfg(feature = "metrics")]
 
 use std::time::Duration;
@@ -114,8 +127,8 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> rus
             .await
             .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-        if body.contains("rustcdc_events_processed_total")
-            && body.contains("rustcdc_events_filtered_total")
+        if body.contains("rustcdc_runtime_events_polled_total")
+            && body.contains("rustcdc_runtime_events_filtered_total")
         {
             metrics_text = body;
             break;
@@ -131,18 +144,18 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> rus
 
     let insert_total = metric_value(
         &metrics_text,
-        "rustcdc_events_processed_total",
+        "rustcdc_runtime_events_polled_total",
         &["operation=\"insert\""],
     )
     .unwrap_or(0.0);
     let update_total = metric_value(
         &metrics_text,
-        "rustcdc_events_processed_total",
+        "rustcdc_runtime_events_polled_total",
         &["operation=\"update\""],
     )
     .unwrap_or(0.0);
     let filtered_total =
-        metric_value(&metrics_text, "rustcdc_events_filtered_total", &[]).unwrap_or(0.0);
+        metric_value(&metrics_text, "rustcdc_runtime_events_filtered_total", &[]).unwrap_or(0.0);
 
     assert!(
         insert_total >= 500.0,
@@ -157,9 +170,25 @@ async fn otel_metrics_exports_over_otlp_to_queryable_prometheus_backend() -> rus
         "expected filtered counter >= 500, got {filtered_total}"
     );
     assert!(
-        metric_value(&metrics_text, "rustcdc_replication_lag_ms", &[]).is_some(),
-        "expected rustcdc_replication_lag_ms gauge in exported metrics"
+        metric_value(&metrics_text, "rustcdc_runtime_replication_lag_ms", &[]).is_some(),
+        "expected rustcdc_runtime_replication_lag_ms gauge in exported metrics"
     );
+
+    // The pre-`rustcdc.runtime.*` names must not reappear alongside the documented ones: two
+    // series for one quantity is how an operator ends up alerting on the wrong one.
+    for retired in [
+        "rustcdc_events_processed_total",
+        "rustcdc_events_filtered_total",
+        "rustcdc_replication_lag_ms",
+    ] {
+        assert!(
+            !metrics_text
+                .lines()
+                .any(|line| line.trim_start().starts_with(retired)),
+            "'{retired}' is not a documented series name; the OTLP and text expositions must \
+             agree on one naming scheme"
+        );
+    }
 
     Ok(())
 }

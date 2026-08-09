@@ -78,7 +78,11 @@ async fn an_uncommitted_transactions_id_matches_the_id_pgoutput_reports() -> rus
         .await
         .map_err(source_error)?;
 
-    let host = container.get_host().await.map_err(source_error)?.to_string();
+    let host = container
+        .get_host()
+        .await
+        .map_err(source_error)?
+        .to_string();
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await

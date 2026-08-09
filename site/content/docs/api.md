@@ -321,6 +321,34 @@ renames, or rewrites *any* key column — an `include_columns` projection that o
 rename, `MaskRule::Encrypt` on a key — is rejected with an error naming the stage, rather than
 emitting the record unkeyed.
 
+#### `primary_key` is the table's key, not its replica identity
+
+On PostgreSQL, `primary_key` names the table's **primary key**. That is worth stating because
+pgoutput does not send one: its `RELATION` message flags each column as part of the *replica
+identity*, and under `REPLICA IDENTITY FULL` PostgreSQL sets that flag on **every column** — its
+own source comments, "REPLICA IDENTITY FULL means all columns are sent as part of key."
+
+Taking the flags at face value under `FULL` reports the whole row as the key, which is not one:
+
+- the key changes whenever any column changes, so a compacted topic cannot collapse a row's
+  history and one row's versions hash to different partitions;
+- it disagrees with the snapshot phase, which reads the real key from the catalog — so the same
+  row is keyed one way while snapshotted and another way while streamed;
+- combined with the all-or-nothing rule above, an unchanged-TOAST update writes **nothing**,
+  because one of the "key" columns is unavailable.
+
+So the connector reads the real primary key from the catalog once per stream start and uses it for
+`FULL` relations. Under `DEFAULT` and `INDEX` the flags already name a genuine row key (the
+primary key, or the nominated unique index) and are used as-is.
+
+`primary_key` is `None` — and events carry no key — when the table genuinely has none to report:
+`REPLICA IDENTITY NOTHING`, or `DEFAULT`/`FULL` on a table without a primary key. Each is logged
+once per table. Match on the before-image in that case; `FULL` gives you a complete one.
+
+A table added to the publication *after* the stream started is not in that catalog snapshot, so a
+`FULL` table added mid-stream reports no key until the stream is restarted. The warning names the
+table when it happens.
+
 #### The underlying fields
 
 `row_write()` is derived from these. Read them directly only if you need finer control.

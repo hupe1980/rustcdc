@@ -19,8 +19,7 @@ pub use incremental_snapshot::{
     IncrementalSnapshotTableState,
 };
 pub use incremental_snapshot::{
-    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver,
-    SnapshotTable,
+    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable,
 };
 pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TableProgress};
 pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
@@ -100,7 +99,11 @@ impl SnapshotRequest {
     /// failed to match its table would snapshot the whole table, which is the load the filter
     /// was written to avoid.
     #[must_use]
-    pub fn with_condition(mut self, table: impl Into<String>, condition: impl Into<String>) -> Self {
+    pub fn with_condition(
+        mut self,
+        table: impl Into<String>,
+        condition: impl Into<String>,
+    ) -> Self {
         self.conditions.insert(table.into(), condition.into());
         self
     }
@@ -155,7 +158,11 @@ pub(crate) fn table_is_allowed(
     // identifiers case-insensitively, so both sides are lowered once here.
     let key = match schema {
         Some(schema) if !schema.is_empty() => {
-            format!("{}.{}", schema.to_ascii_lowercase(), table.to_ascii_lowercase())
+            format!(
+                "{}.{}",
+                schema.to_ascii_lowercase(),
+                table.to_ascii_lowercase()
+            )
         }
         _ => table.to_ascii_lowercase(),
     };
@@ -1033,12 +1040,7 @@ mod tests {
             &none,
             &exclude
         ));
-        assert!(table_is_allowed(
-            Some("public"),
-            "orders",
-            &none,
-            &exclude
-        ));
+        assert!(table_is_allowed(Some("public"), "orders", &none, &exclude));
         assert!(
             table_is_allowed(Some("staging"), "tmp_import", &none, &exclude),
             "the pattern names a schema, so it must not reach another one"
@@ -1046,7 +1048,12 @@ mod tests {
 
         let include = vec!["public.*".to_string()];
         assert!(table_is_allowed(Some("public"), "orders", &include, &none));
-        assert!(!table_is_allowed(Some("staging"), "orders", &include, &none));
+        assert!(!table_is_allowed(
+            Some("staging"),
+            "orders",
+            &include,
+            &none
+        ));
 
         let include = vec!["*.audit_?".to_string()];
         assert!(table_is_allowed(Some("any"), "audit_1", &include, &none));

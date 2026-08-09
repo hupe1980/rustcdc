@@ -96,68 +96,68 @@ impl SqlServerStreamHandle {
     }
 
     /// Where the next LSN window sits, given the window just finished, `fn_cdc_increment_lsn(lsn_end)`
-/// and `fn_cdc_get_max_lsn()`.
-///
-/// Extracted as a pure function so the decision is testable — the SQL that feeds it needs a server.
-///
-/// # `lsn_end` never exceeds what the capture job has harvested
-///
-/// That is the whole rule, and it is what stops the read point walking forward on a quiet
-/// database. `fn_cdc_get_max_lsn()` reports what the capture job has harvested into `cdc.*`, so
-/// while nothing changes it does not move. Clamping the end *up* to the incremented start — to keep
-/// the window non-inverted — made the next advance increment from that clamped end, pushing the
-/// read point one minimal LSN step above the harvested maximum on every empty poll, indefinitely.
-///
-/// So an **empty window is represented, not avoided**: `lsn_start > lsn_end` means "nothing to
-/// read yet", and the poll skips querying rather than issuing a round trip per capture instance
-/// for a range that cannot contain anything.
-///
-/// # Why the lower bound only moves when something was consumed
-///
-/// The naive repair — park one step past the maximum and stop — **skips an LSN**, and it is worth
-/// being precise about which. Parked at `[M+1, M+1]` with nothing harvested at `M+1`, a later
-/// advance sees the maximum has moved and increments from the parked *end* to `M+2`. But `M+1` was
-/// never readable when that window was set, so it is never read at all.
-///
-/// The fix is to distinguish the two cases by whether the window was empty:
-///
-/// - **consumed** (`start <= end`): everything through `end` was read, so the next lower bound is
-///   `increment(end)`;
-/// - **empty** (`start > end`): nothing was read, so the lower bound **stays** and only the upper
-///   bound is refreshed from the harvested maximum.
-///
-/// An empty window whose maximum later jumps therefore reopens as `[start, new_max]` — with the
-/// original `start` intact, so nothing between it and the new maximum is skipped.
-/// # End-to-end validation
-///
-/// The transitions are pinned by `window_advance_tests`, including the skip that made the naive
-/// repair worse than the creep. The rule is validated against a live SQL Server 2022 by
-/// `sqlserver_idle_window_integration`, which polls repeatedly against a **standing** harvested
-/// maximum and then requires a subsequent write to arrive — plus
-/// `sqlserver_stream_integration`, `sqlserver_window_truncation_integration` and
-/// `sqlserver_snapshot_integration`, which advance real windows throughout.
-///
-/// The idle test deliberately does **not** call `sys.sp_cdc_scan` during its idle phase, unlike the
-/// other SQL Server suites. A scan harvests whatever is in the log, so `fn_cdc_get_max_lsn()` would
-/// keep advancing and the read point would never be left behind a standing maximum — masking the
-/// exact condition the creep needed. Getting that wrong is what made a first version of the test
-/// report zero events and look like a connector fault.
-fn next_window(
-    current_start: [u8; 10],
-    current_end: [u8; 10],
-    incremented_end: [u8; 10],
-    harvested_max: [u8; 10],
-) -> ([u8; 10], [u8; 10]) {
-    if compare_lsn(&current_start, &current_end).is_gt() {
-        // The window was empty: nothing was consumed, so the lower bound must not move.
-        (current_start, harvested_max)
-    } else {
-        // The window was read through `current_end`.
-        (incremented_end, harvested_max)
+    /// and `fn_cdc_get_max_lsn()`.
+    ///
+    /// Extracted as a pure function so the decision is testable — the SQL that feeds it needs a server.
+    ///
+    /// # `lsn_end` never exceeds what the capture job has harvested
+    ///
+    /// That is the whole rule, and it is what stops the read point walking forward on a quiet
+    /// database. `fn_cdc_get_max_lsn()` reports what the capture job has harvested into `cdc.*`, so
+    /// while nothing changes it does not move. Clamping the end *up* to the incremented start — to keep
+    /// the window non-inverted — made the next advance increment from that clamped end, pushing the
+    /// read point one minimal LSN step above the harvested maximum on every empty poll, indefinitely.
+    ///
+    /// So an **empty window is represented, not avoided**: `lsn_start > lsn_end` means "nothing to
+    /// read yet", and the poll skips querying rather than issuing a round trip per capture instance
+    /// for a range that cannot contain anything.
+    ///
+    /// # Why the lower bound only moves when something was consumed
+    ///
+    /// The naive repair — park one step past the maximum and stop — **skips an LSN**, and it is worth
+    /// being precise about which. Parked at `[M+1, M+1]` with nothing harvested at `M+1`, a later
+    /// advance sees the maximum has moved and increments from the parked *end* to `M+2`. But `M+1` was
+    /// never readable when that window was set, so it is never read at all.
+    ///
+    /// The fix is to distinguish the two cases by whether the window was empty:
+    ///
+    /// - **consumed** (`start <= end`): everything through `end` was read, so the next lower bound is
+    ///   `increment(end)`;
+    /// - **empty** (`start > end`): nothing was read, so the lower bound **stays** and only the upper
+    ///   bound is refreshed from the harvested maximum.
+    ///
+    /// An empty window whose maximum later jumps therefore reopens as `[start, new_max]` — with the
+    /// original `start` intact, so nothing between it and the new maximum is skipped.
+    /// # End-to-end validation
+    ///
+    /// The transitions are pinned by `window_advance_tests`, including the skip that made the naive
+    /// repair worse than the creep. The rule is validated against a live SQL Server 2022 by
+    /// `sqlserver_idle_window_integration`, which polls repeatedly against a **standing** harvested
+    /// maximum and then requires a subsequent write to arrive — plus
+    /// `sqlserver_stream_integration`, `sqlserver_window_truncation_integration` and
+    /// `sqlserver_snapshot_integration`, which advance real windows throughout.
+    ///
+    /// The idle test deliberately does **not** call `sys.sp_cdc_scan` during its idle phase, unlike the
+    /// other SQL Server suites. A scan harvests whatever is in the log, so `fn_cdc_get_max_lsn()` would
+    /// keep advancing and the read point would never be left behind a standing maximum — masking the
+    /// exact condition the creep needed. Getting that wrong is what made a first version of the test
+    /// report zero events and look like a connector fault.
+    fn next_window(
+        current_start: [u8; 10],
+        current_end: [u8; 10],
+        incremented_end: [u8; 10],
+        harvested_max: [u8; 10],
+    ) -> ([u8; 10], [u8; 10]) {
+        if compare_lsn(&current_start, &current_end).is_gt() {
+            // The window was empty: nothing was consumed, so the lower bound must not move.
+            (current_start, harvested_max)
+        } else {
+            // The window was read through `current_end`.
+            (incremented_end, harvested_max)
+        }
     }
-}
 
-/// Read one page of changes for a single capture instance in the current window.
+    /// Read one page of changes for a single capture instance in the current window.
     ///
     /// The instance's own [`CaptureInstanceMeta::capture_floor`] raises the lower bound:
     /// capture instances do not all start at the same LSN, and asking one for changes
@@ -754,6 +754,10 @@ mod window_advance_tests {
     #[test]
     fn an_initially_empty_window_holds_its_lower_bound() {
         assert_eq!(advance(1, 0, 0), (1, 0));
-        assert_eq!(advance(1, 0, 7), (1, 7), "and opens from 1 when the maximum arrives");
+        assert_eq!(
+            advance(1, 0, 7),
+            (1, 7),
+            "and opens from 1 when the maximum arrives"
+        );
     }
 }

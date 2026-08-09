@@ -23,6 +23,14 @@ pub(super) async fn start_postgres_stream(
         })?
     };
 
+    // Read before `client` can be moved into the SqlPeek provider below. One query per stream
+    // start, not per relation: pgoutput cannot report a primary key under REPLICA IDENTITY FULL,
+    // and the alternative — treating its all-columns-flagged identity as the key — keys a row by
+    // its entire contents.
+    let catalog_primary_keys =
+        super::query::query_publication_primary_keys(&client, &connection.config.publication_name)
+            .await?;
+
     let mut stream = PostgresStream {
         slot_name: connection.config.replication_slot_name.clone(),
         publication_name: connection.config.publication_name.clone(),
@@ -119,5 +127,6 @@ pub(super) async fn start_postgres_stream(
         connection.slot_idle_advance_interval_ms,
         connection.config.table_include_list.clone(),
         connection.config.table_exclude_list.clone(),
+        catalog_primary_keys,
     )))
 }

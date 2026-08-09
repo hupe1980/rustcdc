@@ -143,9 +143,9 @@ async fn a_change_after_a_long_idle_period_is_still_captured() -> rustcdc::Resul
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             continue;
         }
-        captured = batch
-            .into_iter()
-            .find(|event| event.op == Operation::Insert && event.table.eq_ignore_ascii_case("idle_probe"));
+        captured = batch.into_iter().find(|event| {
+            event.op == Operation::Insert && event.table.eq_ignore_ascii_case("idle_probe")
+        });
     }
 
     let captured = captured.unwrap_or_else(|| {

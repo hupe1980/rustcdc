@@ -22,8 +22,8 @@ use crate::{
 
 use super::query::{query_all_columns, row_as_text_json};
 use super::{
-    parse_pg_lsn, parse_table_reference, qualified_table_name,
-    query_primary_key_columns_and_types, quote_pg_identifier,
+    parse_pg_lsn, parse_table_reference, qualified_table_name, query_primary_key_columns_and_types,
+    quote_pg_identifier,
 };
 
 /// A [`StreamHandle`] that interleaves PostgreSQL chunk reads with the live
