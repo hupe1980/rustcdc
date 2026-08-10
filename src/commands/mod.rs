@@ -10,19 +10,28 @@ mod init_state;
 mod inspect_checkpoint;
 mod migrate_state;
 mod replay;
-mod run;
+pub(crate) mod run;
 
 /// A minimal valid `AppConfig`, for tests outside this module that need a real one
 /// rather than a hand-written JSON fixture (see `crate::redaction`).
 #[cfg(test)]
 pub(crate) use run::tests::minimal_config as minimal_config_for_tests;
-mod run_batch;
+/// Batch prepare-and-deliver, public so `benches/throughput.rs` can measure it.
+///
+/// The pipeline's throughput is the number this project's premise rests on, and it was
+/// unmeasured: `benches/pipeline.rs` benchmarked encoding, event construction and size
+/// checks — not the pipeline. A benchmark that reconstructs an approximation of this
+/// function measures the approximation, so the real one is exposed instead.
+///
+/// The crate is `publish = false`, so this widens no external API.
+pub mod run_batch;
 mod run_lifecycle;
 mod run_loop;
 mod run_loop_batch;
 pub(crate) mod run_metrics;
 mod run_reconciliation;
 mod run_recovery;
+mod snapshot;
 pub(crate) mod status;
 mod validate_config;
 
@@ -41,5 +50,6 @@ pub async fn dispatch(command: Command, config_path: Option<&Path>) -> Result<()
         Command::InitState(args) => init_state::execute(args, config_path).await,
         Command::InspectCheckpoint(args) => inspect_checkpoint::execute(args, config_path).await,
         Command::Replay(args) => replay::execute(args, config_path).await,
+        Command::Snapshot(args) => snapshot::execute(args).await,
     }
 }

@@ -4,7 +4,9 @@ use figment::{
 };
 use std::path::Path;
 
-use super::schema::{AdminProbeAuthMode, AppConfig, DeliveryContract, SinkConfig, StateBackend};
+use super::schema::{
+    AdminProbeAuthMode, AppConfig, DeliveryContract, SinkConfig, StateBackend, KNOWN_SOURCE_DRIVERS,
+};
 use super::source_profile::validate_source_config;
 use crate::error::ConfigError;
 use crate::token_manifest_policy;
@@ -50,6 +52,7 @@ pub fn load_and_migrate(config_path: &Path) -> Result<AppConfig, ConfigError> {
     // credentials in the file.
     resolve_env_secret_references(&mut migrated_raw, "")?;
 
+    reject_uncompiled_source_driver(&migrated_raw)?;
     reject_removed_delivery_contracts(&migrated_raw)?;
     reject_relocated_http_dlq(&migrated_raw)?;
 
@@ -205,6 +208,62 @@ fn reject_relocated_http_dlq(raw: &serde_json::Value) -> Result<(), ConfigError>
          that was never delivered, which is data loss — recorded rather than silent, but \
          loss. Without `[dlq]` the pipeline halts on a permanently undeliverable event.",
         offenders.join(", ")
+    )))
+}
+
+/// Reject a `[source]` naming a connector this binary was not built with.
+///
+/// Connectors are cargo features (see the `[features]` block in `Cargo.toml`), so
+/// `SourceDriver`'s variants are `#[cfg]`-gated and a config selecting an uncompiled one
+/// would otherwise fail as serde's `unknown variant \`sqlserver\`, expected \`postgres\``.
+/// That message is accurate and actively misleading: it reads as "there is no such
+/// connector" when the truth is "this binary does not have it", and the fix — a rebuild
+/// with a feature flag, or the published image, which has them all — is nowhere in it.
+///
+/// Running *before* deserialization is what makes the message reachable at all. Every
+/// known driver is listed in [`KNOWN_SOURCE_DRIVERS`] whether or not it is compiled in,
+/// which is also what keeps this honest: a name that is neither known nor compiled falls
+/// through to serde, so a genuine typo still gets serde's list of what is valid here.
+fn reject_uncompiled_source_driver(raw: &serde_json::Value) -> Result<(), ConfigError> {
+    let Some(requested) = raw
+        .get("source")
+        .and_then(|source| source.get("type"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+
+    let Some(entry) = KNOWN_SOURCE_DRIVERS
+        .iter()
+        .find(|entry| entry.matches(requested))
+    else {
+        // Not a connector this project has ever had. Let serde report it against the
+        // variants that *are* compiled in, which is the more useful list for a typo.
+        return Ok(());
+    };
+
+    if entry.compiled {
+        return Ok(());
+    }
+
+    let available: Vec<&str> = KNOWN_SOURCE_DRIVERS
+        .iter()
+        .filter(|entry| entry.compiled)
+        .map(|entry| entry.name)
+        .collect();
+    let available = if available.is_empty() {
+        "none — this binary was built with no source connectors at all".to_string()
+    } else {
+        available.join(", ")
+    };
+
+    Err(ConfigError::InvalidSource(format!(
+        "source type \"{requested}\" is a connector this binary was not built with. \
+         Connectors are opt-in cargo features so that a deployment does not link TLS \
+         stacks and dependencies it never uses. Rebuild with `--features {feature}` \
+         (or `--all-features`), or use the published container image, which carries \
+         every connector. Compiled in this binary: {available}.",
+        feature = entry.feature,
     )))
 }
 
@@ -993,14 +1052,27 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         .map_err(ConfigError::InvalidState)?;
 
     config
-        .incremental_snapshot
+        .observability
         .validate()
         .map_err(ConfigError::InvalidState)?;
+
+    if let Some(incremental) = config.incremental_snapshot.as_ref() {
+        incremental.validate().map_err(ConfigError::InvalidState)?;
+    }
 
     // Both bootstrap the same tables by different means. Accepting both would read
     // every listed table twice — once blocking, once through the watermark window —
     // and the duplicate would look like genuine change data downstream.
-    if config.incremental_snapshot.is_enabled() && !config.snapshot_tables.is_empty() {
+    //
+    // An empty `[incremental_snapshot]` bootstraps nothing, so it does not conflict:
+    // it exists to make `execute_snapshot` reachable, and refusing it alongside
+    // `snapshot_tables` would rule out a combination that has no overlap.
+    if config
+        .incremental_snapshot
+        .as_ref()
+        .is_some_and(crate::config::schema::IncrementalSnapshotConfig::backfills_at_startup)
+        && !config.snapshot_tables.is_empty()
+    {
         return Err(ConfigError::InvalidState(
             "snapshot_tables and incremental_snapshot.tables are two bootstrapping paths \
              for the same job; set exactly one. incremental_snapshot does not block the \

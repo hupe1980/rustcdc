@@ -493,6 +493,7 @@ pub(crate) struct SinkMetricsSnapshot {
     transform_latency_us_last: u64,
     transform_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     transform_wasm_instance_pool_size: u64,
+    transform_wasm_instance_pool_peak_in_use: u64,
     transform_wasm_invocations_total: u64,
     transform_wasm_errors_total: u64,
     transform_wasm_filtered_total: u64,
@@ -711,6 +712,17 @@ impl SinkMetricsSnapshot {
             "Configured WASM instance pool size",
             &sink_labels,
             self.transform_wasm_instance_pool_size,
+        );
+        // The configured size alone cannot tell an operator whether the pool is doing
+        // anything: eight slots that are never more than one-deep look identical from the
+        // outside to a pool of one, while costing eight compiled modules of memory. This
+        // is the number to compare against `..._pool_size` when tuning
+        // `wasm.instance_pool_size` or `runtime.prepare_parallelism`.
+        encoder.gauge(
+            "rustcdc_runtime_transform_wasm_instance_pool_peak_in_use",
+            "High-water mark of simultaneously-busy WASM instance pool slots",
+            &sink_labels,
+            self.transform_wasm_instance_pool_peak_in_use,
         );
         encoder.counter(
             "rustcdc_runtime_transform_wasm_invocations_total",
@@ -1423,6 +1435,7 @@ pub(super) fn sink_metrics_snapshot(
         transform_latency_us_last,
         transform_latency_us_buckets: *transform_latency_us_buckets,
         transform_wasm_instance_pool_size: wasm_metrics.instance_pool_size,
+        transform_wasm_instance_pool_peak_in_use: wasm_metrics.instance_pool_peak_in_use,
         transform_wasm_invocations_total: wasm_metrics.transform_total,
         transform_wasm_errors_total: wasm_metrics.transform_error_total,
         transform_wasm_filtered_total: wasm_metrics.filtered_total,

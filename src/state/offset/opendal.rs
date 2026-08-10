@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use opendal::Operator;
-use rustcdc::checkpoint::{Checkpoint, FileCheckpoint};
+use rustcdc::checkpoint::{
+    validate_checkpoint_progress, Checkpoint, FileCheckpoint, StoredCheckpointRecord,
+};
 use rustcdc::core::{Error as RtError, Offset};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +60,12 @@ pub(crate) struct OpenDalCheckpoint {
     mirror: FileCheckpoint,
     /// This process's lease identity, re-verified before every checkpoint write.
     owner: Arc<OwnedLease>,
+    /// The last record this process knows to be durable, for the pre-write guard.
+    ///
+    /// Seeded from the remote store at startup and advanced after each accepted write, so
+    /// the guard costs no round trip. The lease is what makes an in-memory copy sound: a
+    /// second writer means this instance has been fenced and `renew_if_due` fails first.
+    last: Option<StoredCheckpointRecord>,
 }
 
 /// A lease this process believes it holds on the remote store.
@@ -201,8 +209,18 @@ pub(crate) async fn acquire_lease(
 }
 
 impl OpenDalCheckpoint {
-    fn new(op: Operator, mirror: FileCheckpoint, owner: Arc<OwnedLease>) -> Self {
-        Self { op, mirror, owner }
+    fn new(
+        op: Operator,
+        mirror: FileCheckpoint,
+        owner: Arc<OwnedLease>,
+        last: Option<StoredCheckpointRecord>,
+    ) -> Self {
+        Self {
+            op,
+            mirror,
+            owner,
+            last,
+        }
     }
 
     /// The lease this checkpoint holds, so shutdown can release it.
@@ -222,14 +240,40 @@ impl Checkpoint for OpenDalCheckpoint {
         offset: &dyn Offset,
         committed_event_count: u64,
     ) -> Result<(), RtError> {
-        // ── 1. Write to the remote OpenDAL store FIRST ────────────────────────
+        // ── 1. Confirm this instance still owns the state ─────────────────────
         //
-        // Crash-safety contract: the remote store is always authoritative.
-        // On restart, `build_checkpoint` restores the local mirror from the
-        // remote, so the remote must never be behind the mirror.  Writing
-        // mirror-first (the old order) could leave the local mirror ahead of the
-        // remote after a crash between the two writes; the next startup would
-        // then silently load stale remote state and regress the offset.
+        // An instance that has been fenced out must not keep writing: interleaved
+        // checkpoints from two owners can move the durable position *backwards*, which
+        // replays silently on the next restart. Checked before either write so a fenced
+        // instance touches neither store.
+        self.owner
+            .renew_if_due()
+            .await
+            .map_err(|e| RtError::StateError(e.to_string()))?;
+
+        // ── 2. Refuse a bad record before *anything* becomes durable ──────────
+        //
+        // `validate_checkpoint_progress` refuses a record whose committed-event count goes
+        // backwards, whose count matches the previous record with a different payload, or
+        // whose connector-native stream position *rewinds* while the count keeps climbing.
+        // The last one is the interesting case: it is the shape a connector defect takes,
+        // and it is worse than forgetting progress, because the counters report health
+        // while the recorded resume point sits before data the sink already committed.
+        //
+        // The per-source reasoning is the part that gets reimplemented wrong — PostgreSQL
+        // LSNs legitimately go backwards under concurrent writers, and MySQL binlog
+        // coordinates must not be compared at all when a GTID is present because a
+        // failover resets them — so this calls upstream's guard rather than restating it.
+        //
+        // Two earlier versions of this method got the ordering wrong in opposite
+        // directions. Writing the remote first and letting `FileCheckpoint::save` object
+        // second defeats the guard: the rewind reaches the authoritative store and `save`
+        // reports damage that is already persisted. Putting the mirror first fixed that
+        // but left the remote lagging on a crash between the writes, replaying a batch.
+        // With the check hoisted out of both writes, neither trade is necessary.
+        let next = StoredCheckpointRecord::from_offset(offset, committed_event_count)?;
+        validate_checkpoint_progress(self.last.as_ref(), &next)?;
+
         let record = RemoteCheckpointRecord {
             source_type: offset.source_type().to_string(),
             offset_bytes: offset.encode()?,
@@ -239,27 +283,23 @@ impl Checkpoint for OpenDalCheckpoint {
             RtError::SerializationError(format!("checkpoint remote serialize: {e}"))
         })?;
 
-        // Confirm we still own the state before making it durable. An instance that
-        // has been fenced out must not keep writing: interleaved checkpoints from two
-        // owners can move the durable position *backwards*, which replays silently on
-        // the next restart.
-        self.owner
-            .renew_if_due()
-            .await
-            .map_err(|e| RtError::StateError(e.to_string()))?;
-
+        // ── 3. The authoritative store first ──────────────────────────────────
+        //
+        // The remote is what `build_checkpoint` rebuilds the mirror from on restart, so it
+        // must never lag the mirror: a crash in between would otherwise resume from a
+        // position ahead of the last replicated one. A failure here is surfaced so the
+        // batch is retried, and nothing local has moved.
         self.op.write(KEY_CHECKPOINT, bytes).await.map_err(|e| {
             crate::state::metrics::mark_opendal_write_failure();
             RtError::StateError(format!("OpenDAL checkpoint write: {e}"))
         })?;
 
-        // ── 2. Mirror to local filesystem AFTER remote write confirms ─────────
+        // ── 4. Mirror it locally so `load`/`get_committed_count` stay hot ─────
         //
-        // The local mirror is the hot-path read cache used by `load()`.
-        // If this write fails, the remote already has the latest state and will
-        // be restored at next startup, so we surface the error to retry the
-        // batch (ensuring eventual consistency) without losing data.
+        // The mirror re-applies the same validation, which by construction passes: it was
+        // seeded from the same remote record this instance has been advancing.
         self.mirror.save(offset, committed_event_count).await?;
+        self.last = Some(next);
 
         Ok(())
     }
@@ -297,7 +337,7 @@ pub(crate) async fn build_checkpoint(
     let checkpoint_dir = mirror_dir.join("checkpoint");
     std::fs::create_dir_all(&checkpoint_dir).map_err(AppError::from)?;
 
-    {
+    let restored = {
         match op.read(KEY_CHECKPOINT).await {
             Ok(buf) => {
                 // Parse to extract source_type so we can seed the right file name.
@@ -316,25 +356,43 @@ pub(crate) async fn build_checkpoint(
                 FileCheckpoint::restore_from_record(
                     &checkpoint_dir,
                     &record.source_type,
-                    record.offset_bytes,
+                    record.offset_bytes.clone(),
                     record.committed_event_count,
                 )
                 .map_err(|e| {
                     AppError::Other(format!("restore checkpoint mirror from remote: {e}"))
                 })?;
+
+                // Seed the pre-write guard from what is already durable. Without this the
+                // first write after every restart is unguarded — precisely the write most
+                // likely to carry a bad position, since a restart is when a repointed
+                // source or a reset slot first shows up.
+                let offset = serde_json::from_slice(&record.offset_bytes).map_err(|e| {
+                    AppError::Other(format!(
+                        "remote checkpoint offset payload for source '{}' is not JSON, so the \
+                         stream-position guard cannot be applied: {e}",
+                        record.source_type
+                    ))
+                })?;
+                Some(StoredCheckpointRecord::new(
+                    record.source_type,
+                    record.committed_event_count,
+                    offset,
+                ))
             }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
                 // No remote checkpoint yet — first run.
+                None
             }
             Err(e) => {
                 return Err(AppError::Other(format!("OpenDAL checkpoint read: {e}")));
             }
         }
-    }
+    };
 
     let file_checkpoint = FileCheckpoint::new(&checkpoint_dir);
 
-    Ok(OpenDalCheckpoint::new(op, file_checkpoint, owner))
+    Ok(OpenDalCheckpoint::new(op, file_checkpoint, owner, restored))
 }
 
 /// Build an OpenDAL [`Operator`] for a Redis endpoint.
@@ -383,4 +441,155 @@ pub(crate) fn build_postgresql_operator(
     Ok(Operator::new(builder)
         .map_err(|e| AppError::Other(format!("failed to build OpenDAL PostgreSQL operator: {e}")))?
         .finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustcdc::checkpoint::PostgresOffset;
+
+    fn fs_operator(root: &Path) -> Operator {
+        Operator::new(opendal::services::Fs::default().root(&root.to_string_lossy()))
+            .expect("fs operator")
+            .finish()
+    }
+
+    async fn remote_record(op: &Operator) -> RemoteCheckpointRecord {
+        let bytes = op.read(KEY_CHECKPOINT).await.expect("remote checkpoint");
+        serde_json::from_slice(bytes.to_bytes().as_ref()).expect("remote checkpoint json")
+    }
+
+    /// The remote store must never hold a position the local guard would refuse.
+    ///
+    /// `FileCheckpoint::save` refuses a stream position that rewinds while the
+    /// committed-event count keeps climbing — the signature of a connector defect, and
+    /// strictly worse than forgetting progress, because the resume point ends up behind
+    /// data the sink already committed while the counters still report health.
+    ///
+    /// This backend used to write the remote store *first* and rely on the mirror to
+    /// validate second, so the refused record was already durable by the time the error
+    /// surfaced, and the next startup restored the mirror from it. Deleting the
+    /// `validate_checkpoint_progress` call in `save` — or moving it below the remote
+    /// write — fails this test on the final assertion, which is what makes it evidence
+    /// rather than decoration.
+    #[tokio::test]
+    async fn a_refused_rewind_never_reaches_the_remote_store() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let remote_dir = temp.path().join("remote");
+        std::fs::create_dir_all(&remote_dir).expect("remote dir");
+        let op = fs_operator(&remote_dir);
+
+        let mut checkpoint = build_checkpoint(op.clone(), &temp.path().join("mirror"), "test")
+            .await
+            .expect("build checkpoint");
+
+        checkpoint
+            .save(&PostgresOffset::new(0x16B_6A70, "slot"), 1)
+            .await
+            .expect("the first checkpoint must be accepted");
+        assert_eq!(remote_record(&op).await.committed_event_count, 1);
+
+        // A zero LSN is not a position the stream can reach, so rustcdc reads it as a
+        // decode defect rather than an out-of-order pgoutput commit.
+        let rewound = checkpoint
+            .save(&PostgresOffset::new(0, "slot"), 2)
+            .await
+            .expect_err("a rewound stream position must be refused");
+        assert!(
+            rewound.to_string().contains("backwards"),
+            "the error must name the regression: {rewound}"
+        );
+
+        let remote = remote_record(&op).await;
+        assert_eq!(
+            remote.committed_event_count, 1,
+            "the refused record must not have reached the authoritative store"
+        );
+        let decoded =
+            PostgresOffset::from_bytes(&remote.offset_bytes).expect("remote offset decodes");
+        assert_eq!(
+            decoded.lsn, 0x16B_6A70,
+            "the remote store must still hold the last position the guard accepted"
+        );
+    }
+
+    /// The happy path still replicates, so the guard above is not simply blocking writes.
+    #[tokio::test]
+    async fn an_advancing_checkpoint_reaches_both_stores() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let remote_dir = temp.path().join("remote");
+        std::fs::create_dir_all(&remote_dir).expect("remote dir");
+        let op = fs_operator(&remote_dir);
+        let mirror_dir = temp.path().join("mirror");
+
+        let mut checkpoint = build_checkpoint(op.clone(), &mirror_dir, "test")
+            .await
+            .expect("build checkpoint");
+
+        checkpoint
+            .save(&PostgresOffset::new(10, "slot"), 1)
+            .await
+            .expect("first save");
+        checkpoint
+            .save(&PostgresOffset::new(20, "slot"), 2)
+            .await
+            .expect("second save");
+
+        assert_eq!(remote_record(&op).await.committed_event_count, 2);
+        let loaded = checkpoint
+            .load()
+            .await
+            .expect("load")
+            .expect("a checkpoint is present");
+        assert_eq!(loaded.source_type(), "postgres");
+    }
+
+    /// The guard must survive a restart, because a restart is when it matters most.
+    ///
+    /// The comparison baseline lives in memory so the durability path costs no extra
+    /// round trip to the remote store. That makes the *first* write of each process the
+    /// one at risk: if the baseline started empty, a rewound position would sail through
+    /// and become the durable truth. And a restart is exactly when a repointed source or
+    /// a recreated replication slot first shows up.
+    ///
+    /// Passing `None` instead of `restored` in `build_checkpoint` fails this test.
+    #[tokio::test]
+    async fn the_guard_baseline_survives_a_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let remote_dir = temp.path().join("remote");
+        std::fs::create_dir_all(&remote_dir).expect("remote dir");
+        let op = fs_operator(&remote_dir);
+        let mirror_dir = temp.path().join("mirror");
+
+        // ── First process: record a healthy position, then release the lease ──
+        {
+            let mut checkpoint = build_checkpoint(op.clone(), &mirror_dir, "test")
+                .await
+                .expect("first build");
+            checkpoint
+                .save(&PostgresOffset::new(0x16B_6A70, "slot"), 1)
+                .await
+                .expect("the first checkpoint must be accepted");
+            checkpoint.lease().release().await;
+        }
+
+        // ── Second process: the rewind arrives as its very first write ────────
+        let mut checkpoint = build_checkpoint(op.clone(), &mirror_dir, "test")
+            .await
+            .expect("second build");
+        let rewound = checkpoint
+            .save(&PostgresOffset::new(0, "slot"), 2)
+            .await
+            .expect_err("a rewound stream position must be refused after a restart");
+        assert!(
+            rewound.to_string().contains("backwards"),
+            "the error must name the regression: {rewound}"
+        );
+
+        let remote = remote_record(&op).await;
+        assert_eq!(
+            remote.committed_event_count, 1,
+            "the refused record must not have reached the authoritative store"
+        );
+    }
 }

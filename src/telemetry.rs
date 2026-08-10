@@ -46,31 +46,80 @@ pub fn init(
     otlp_endpoint: Option<&str>,
     service_name: &str,
 ) -> Result<TelemetryGuard, AppError> {
-    init_with_metrics(format, level, otlp_endpoint, None, 30, service_name)
+    init_with_metrics(
+        format,
+        level,
+        otlp_endpoint,
+        None,
+        30,
+        OtlpProtocol::Grpc,
+        service_name,
+    )
+}
+
+/// Which OTLP wire protocol the exporters speak.
+///
+/// `observability.otlp_protocol` has been in the configuration schema, the reference docs
+/// and the `[observability]` example since the beginning, and **nothing read it** — both
+/// exporters were built with a hardcoded `.with_tonic()`. Pointing the server at an
+/// OTLP/HTTP collector on `:4318`, as the documented `otlp_protocol = "http"` invites,
+/// produced a gRPC exporter talking to an HTTP endpoint: no telemetry, no error, and a
+/// setting that reads as applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpProtocol {
+    /// OTLP over gRPC, the default. Collector port 4317.
+    Grpc,
+    /// OTLP over HTTP with protobuf encoding (`http/protobuf`). Collector port 4318.
+    Http,
+}
+
+impl OtlpProtocol {
+    /// Parse the configured value, defaulting to gRPC for anything unrecognised.
+    ///
+    /// The loader validates this field, so an unknown value should not reach here; the
+    /// fallback exists so a future schema change cannot turn a typo into a startup crash
+    /// in the telemetry layer, which is the one subsystem that must never stop the server.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http" | "http/protobuf" | "http-proto" => Self::Http,
+            _ => Self::Grpc,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Grpc => "grpc",
+            Self::Http => "http/protobuf",
+        }
+    }
 }
 
 /// Full initialisation with separate trace and metrics endpoints.
 ///
 /// `otlp_metrics_endpoint` falls back to `otlp_endpoint` when `None`.
 /// `metrics_interval_secs` controls how often the `PeriodicReader` exports.
+#[allow(clippy::too_many_arguments)] // one call site; every argument is a distinct setting
 pub fn init_with_metrics(
     format: Option<&str>,
     level: Option<&str>,
     otlp_endpoint: Option<&str>,
     otlp_metrics_endpoint: Option<&str>,
     metrics_interval_secs: u64,
+    protocol: OtlpProtocol,
     service_name: &str,
 ) -> Result<TelemetryGuard, AppError> {
     let filter =
         EnvFilter::try_new(level.unwrap_or("info")).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let (maybe_tracer_provider, otel_tracer) = build_optional_tracer(otlp_endpoint, service_name)?;
+    let (maybe_tracer_provider, otel_tracer) =
+        build_optional_tracer(otlp_endpoint, protocol, service_name)?;
 
     // Resolve the effective metrics endpoint: explicit override → trace endpoint fallback.
     let effective_metrics_endpoint = otlp_metrics_endpoint.or(otlp_endpoint);
     let maybe_meter_provider = build_optional_meter(
         effective_metrics_endpoint,
         metrics_interval_secs,
+        protocol,
         service_name,
     )?;
 
@@ -137,6 +186,7 @@ pub fn init_with_metrics(
 /// Returns `(None, None)` when no endpoint is configured.
 fn build_optional_tracer(
     endpoint: Option<&str>,
+    protocol: OtlpProtocol,
     service_name: &str,
 ) -> Result<
     (
@@ -151,12 +201,24 @@ fn build_optional_tracer(
 
     validate_otlp_endpoint(endpoint)?;
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .with_timeout(OTLP_EXPORT_TIMEOUT)
-        .build()
-        .map_err(|e| AppError::Other(format!("OTLP exporter init error: {e}")))?;
+    let exporter = match protocol {
+        OtlpProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(OTLP_EXPORT_TIMEOUT)
+            .build(),
+        OtlpProtocol::Http => opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(http_signal_endpoint(endpoint, "/v1/traces"))
+            .with_timeout(OTLP_EXPORT_TIMEOUT)
+            .build(),
+    }
+    .map_err(|e| {
+        AppError::Other(format!(
+            "OTLP span exporter init error ({}): {e}",
+            protocol.as_str()
+        ))
+    })?;
 
     let provider = SdkTracerProvider::builder()
         .with_resource(otel_resource(service_name))
@@ -174,6 +236,7 @@ fn build_optional_tracer(
 fn build_optional_meter(
     endpoint: Option<&str>,
     interval_secs: u64,
+    protocol: OtlpProtocol,
     service_name: &str,
 ) -> Result<Option<SdkMeterProvider>, AppError> {
     let Some(endpoint) = endpoint else {
@@ -184,12 +247,24 @@ fn build_optional_meter(
 
     // The export timeout moved onto the exporter in opentelemetry 0.32 — the
     // `PeriodicReader` builder now only owns the interval.
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .with_timeout(OTLP_EXPORT_TIMEOUT)
-        .build()
-        .map_err(|e| AppError::Other(format!("OTLP metrics exporter init error: {e}")))?;
+    let exporter = match protocol {
+        OtlpProtocol::Grpc => opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .with_timeout(OTLP_EXPORT_TIMEOUT)
+            .build(),
+        OtlpProtocol::Http => opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(http_signal_endpoint(endpoint, "/v1/metrics"))
+            .with_timeout(OTLP_EXPORT_TIMEOUT)
+            .build(),
+    }
+    .map_err(|e| {
+        AppError::Other(format!(
+            "OTLP metrics exporter init error ({}): {e}",
+            protocol.as_str()
+        ))
+    })?;
 
     let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
         .with_interval(Duration::from_secs(interval_secs.max(1)))
@@ -215,6 +290,34 @@ fn otel_resource(service_name: &str) -> opentelemetry_sdk::Resource {
     opentelemetry_sdk::Resource::builder()
         .with_service_name(service_name.to_string())
         .build()
+}
+
+/// Resolve the endpoint an OTLP/HTTP exporter should POST to.
+///
+/// `opentelemetry-otlp`'s HTTP exporter uses `with_endpoint` **verbatim**: given
+/// `http://collector:4318` it posts to `/`, which every collector answers with 404 — and
+/// the SDK reports export failures on its internal log, so the symptom is "no telemetry"
+/// with nothing obvious to point at.
+///
+/// One `otlp_endpoint` setting has to serve both protocols, and for gRPC it is a bare
+/// authority with no path. So this follows the OTLP specification's rule for
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`: a base URL gets the signal path appended. An endpoint
+/// that already carries a path is left exactly as written, which is the escape hatch for
+/// a collector behind a prefix (`https://gw.example.com/otlp/v1/traces`).
+fn http_signal_endpoint(endpoint: &str, signal_path: &str) -> String {
+    let Ok(mut url) = endpoint.parse::<url::Url>() else {
+        // Unparseable endpoints are passed through here for the same reason
+        // `validate_otlp_endpoint` passes them through: the SDK's own error names the
+        // problem more precisely than a guess from here would.
+        return endpoint.to_string();
+    };
+
+    if !matches!(url.path(), "" | "/") {
+        return endpoint.to_string();
+    }
+
+    url.set_path(signal_path);
+    url.to_string()
 }
 
 /// Reject plaintext gRPC (`http://`) to non-loopback hosts unless the
@@ -252,9 +355,12 @@ fn validate_otlp_endpoint(endpoint: &str) -> Result<(), AppError> {
         let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
         if !is_loopback {
             return Err(AppError::Other(format!(
-                "observability.otlp_endpoint '{}' uses plaintext gRPC (http://) to a \
-                 non-loopback host. Use https:// or a local sidecar, or set \
-                 OTLP_ALLOW_INSECURE=1 to override (development only).",
+                "observability.otlp_endpoint '{}' is plaintext (http://) to a \
+                 non-loopback host, so traces and metrics would cross the network \
+                 unencrypted. Use https:// or a local collector sidecar, or set \
+                 OTLP_ALLOW_INSECURE=1 to override (development only). Note this is \
+                 about the transport, not the OTLP protocol: `otlp_protocol = \"http\"` \
+                 against an https:// endpoint is fine.",
                 endpoint
             )));
         }
@@ -265,7 +371,105 @@ fn validate_otlp_endpoint(endpoint: &str) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_otlp_endpoint;
+    use super::{
+        build_optional_tracer, http_signal_endpoint, validate_otlp_endpoint, OtlpProtocol,
+    };
+
+    /// `otlp_protocol = "http"` must put an OTLP/HTTP request on the wire.
+    ///
+    /// Asserting that the config string maps to `OtlpProtocol::Http` proves nothing about
+    /// the exporter — that mapping existed in spirit for the whole time both exporters
+    /// were hardcoded to `.with_tonic()`, and a revert to that would leave every
+    /// enum-level test green. So this drives a real provider at a real socket and reads
+    /// the request line: `POST /v1/traces` over HTTP/1.1 is something a gRPC exporter
+    /// cannot produce.
+    ///
+    /// `build_optional_tracer` is used rather than `init*` because the latter installs a
+    /// process-global subscriber, which no test can do twice.
+    #[tokio::test]
+    async fn the_http_protocol_actually_speaks_otlp_over_http() {
+        use opentelemetry::trace::Tracer as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a collector stand-in");
+        let addr = listener.local_addr().expect("local addr");
+
+        let received = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.ok()?;
+            let mut buf = vec![0u8; 512];
+            let read = socket.read(&mut buf).await.ok()?;
+            Some(String::from_utf8_lossy(&buf[..read]).into_owned())
+        });
+
+        let (provider, tracer) = build_optional_tracer(
+            Some(&format!("http://{addr}")),
+            OtlpProtocol::Http,
+            "otlp-protocol-test",
+        )
+        .expect("the http exporter must build");
+
+        let provider = provider.expect("a configured endpoint yields a provider");
+        let tracer = tracer.expect("a configured endpoint yields a tracer");
+        tracer.in_span("probe", |_| {});
+        let _ = provider.force_flush();
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(10), received)
+            .await
+            .expect("the exporter must reach the collector within the timeout")
+            .expect("the accept task must not panic")
+            .expect("the collector stand-in must receive a request");
+
+        assert!(
+            request.starts_with("POST /v1/traces"),
+            "expected an OTLP/HTTP trace export; a gRPC exporter cannot produce this \
+             request line. Got:\n{request}"
+        );
+        // 127.0.0.1 is loopback, so the plaintext guard admits it — asserted here so a
+        // change to that guard cannot silently make this test unreachable.
+        assert!(request.contains("HTTP/1.1"));
+
+        let _ = provider.shutdown();
+    }
+
+    /// A base endpoint gains the signal path; an explicit one is left alone.
+    ///
+    /// One `otlp_endpoint` serves both protocols, and for gRPC it is a bare authority.
+    /// Passing that straight to the HTTP exporter posts to `/`, which collectors 404 —
+    /// silently, because the SDK reports export failures on its own internal log.
+    #[test]
+    fn a_base_endpoint_gains_the_signal_path_and_an_explicit_one_does_not() {
+        assert_eq!(
+            http_signal_endpoint("http://collector:4318", "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            http_signal_endpoint("http://collector:4318/", "/v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            http_signal_endpoint("https://gw.example.com/otlp/v1/traces", "/v1/traces"),
+            "https://gw.example.com/otlp/v1/traces",
+            "an explicit path is the escape hatch for a collector behind a prefix"
+        );
+        assert_eq!(
+            http_signal_endpoint("not a url", "/v1/traces"),
+            "not a url",
+            "an unparseable endpoint is left for the SDK to complain about precisely"
+        );
+    }
+
+    #[test]
+    fn the_configured_protocol_string_selects_the_exporter() {
+        assert_eq!(OtlpProtocol::from_config("http"), OtlpProtocol::Http);
+        assert_eq!(OtlpProtocol::from_config("HTTP"), OtlpProtocol::Http);
+        assert_eq!(OtlpProtocol::from_config("grpc"), OtlpProtocol::Grpc);
+        // The loader rejects anything else, so this fallback is a backstop rather than a
+        // behaviour anyone should reach.
+        assert_eq!(OtlpProtocol::from_config("nonsense"), OtlpProtocol::Grpc);
+    }
+
     use std::sync::Mutex;
 
     // Serialize tests that mutate OTLP_ALLOW_INSECURE to prevent cross-test races.
@@ -276,7 +480,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         let err = validate_otlp_endpoint("http://otel-collector.prod.example.com:4317")
             .expect_err("must reject non-loopback http");
-        assert!(err.to_string().contains("plaintext gRPC"));
+        assert!(err.to_string().contains("plaintext (http://)"));
     }
 
     #[test]

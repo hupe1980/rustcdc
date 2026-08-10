@@ -1,0 +1,10 @@
+{
+  "checkpoint_format_version": 1,
+  "source_type": "postgres",
+  "committed_event_count": 4242,
+  "offset": {
+    "lsn": 23816816,
+    "slot_name": "cdc_slot"
+  },
+  "content_checksum": "ecaa5ddd8601e6b0c86aeebf0de465d20c7e530b1769ef886faefdc491709140"
+}

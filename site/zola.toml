@@ -59,7 +59,7 @@ repo = "https://github.com/hupe1980/rustcdc-server"
 repo_name = "hupe1980/rustcdc-server"
 ghcr = "https://github.com/hupe1980/rustcdc-server/pkgs/container/rustcdc-server"
 # Shown in the header and in the structured data. Bump with the release.
-version = "0.3.0"
+version = "0.4.0"
 rust_version = "1.94.1"
 # Used for the Open Graph and Twitter card images.
 og_image = "/og.png"

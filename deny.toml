@@ -31,20 +31,30 @@ ignore = [
     # cdc-server no longer parses PEM through it — the admin TLS loader moved to
     # `rustls_pki_types::pem::PemObject` — but two transitive paths remain:
     #   * rustls-pemfile 2.2.0 <- axum-server 0.7 (`tls-rustls` feature), for the
-    #     admin HTTPS listener;
+    #     admin HTTPS listener. Present in every build.
     #   * rustls-pemfile 1.0.4 <- rustls-native-certs 0.6.3 <- tiberius 0.12
-    #     <- rustcdc's `sqlserver` feature.
+    #     <- rustcdc's `sqlserver` feature. Present only under `--features sqlserver`.
     # Both parse files this process supplies, never network input. Remove when
     # axum-server and tiberius move to rustls-pki-types.
     { id = "RUSTSEC-2025-0134" },
 
     # RUSTSEC-2026-0098 / -0099 / -0104: rustls-webpki 0.101.x — URI name-constraint
     # and wildcard-name-constraint acceptance, plus a CRL parsing panic.
-    # Sole path: rustls-webpki 0.101.7 <- rustls 0.21 <- tokio-rustls 0.24
-    # <- tiberius 0.12 <- rustcdc's `sqlserver` feature. It affects only the SQL Server
-    # connector's TLS, not the admin listener or any sink (those are on rustls 0.23),
-    # and none of the three is reachable without name constraints or CRLs in the chain.
-    # Blocked until tiberius releases against a current rustls.
+    #
+    # **These three are absent from a default build.** Sole path: rustls-webpki 0.101.7
+    # <- rustls 0.21 <- tokio-rustls 0.24 <- tiberius 0.12 <- rustcdc's `sqlserver`
+    # feature, which is now opt-in (`--features sqlserver`). A PostgreSQL or MySQL
+    # deployment links exactly one rustls (0.23) and one webpki, and
+    # `cargo deny check advisories` on such a build reports all three as
+    # `advisory-not-detected` — that warning is the intended, load-bearing signal that
+    # the narrow build really is narrow, and `the_default_build_has_one_tls_stack`
+    # asserts it.
+    #
+    # They stay listed because CI audits `--all-features`, where the path does exist.
+    # Under that build they affect only the SQL Server connector's TLS — not the admin
+    # listener and not any sink — and none of the three is reachable without name
+    # constraints or CRLs in the chain. Blocked until tiberius releases against a
+    # current rustls; delete these three when it does, or when `sqlserver` is dropped.
     { id = "RUSTSEC-2026-0098" },
     { id = "RUSTSEC-2026-0099" },
     { id = "RUSTSEC-2026-0104" },

@@ -109,6 +109,11 @@ pub(crate) fn owner_id() -> String {
     format!("{host}:{pid}:{nonce:08x}")
 }
 
+/// This process's host component, as it appears in [`owner_id`].
+pub(crate) fn owner_host() -> String {
+    hostname()
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()

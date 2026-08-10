@@ -14,6 +14,22 @@ use crate::token_manifest_policy::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 
+/// Destructure a `SourceDriver` known to be PostgreSQL, under every feature set.
+///
+/// `let SourceDriver::Postgres(pg) = … else { panic!() }` reads better but does not
+/// compile both ways: in a default (PostgreSQL-only) build the enum has one variant, so
+/// the pattern is irrefutable and `-D irrefutable-let-patterns` rejects the `else`. With
+/// `--all-features` there are four variants and the `else` is required. A `match` with an
+/// allowed-unreachable arm is the one shape that satisfies both.
+#[track_caller]
+fn expect_postgres(config: &crate::config::AppConfig) -> &rustcdc::PostgresSourceConfig {
+    match &config.source.driver {
+        crate::config::schema::SourceDriver::Postgres(pg) => pg,
+        #[allow(unreachable_patterns)]
+        other => panic!("expected a postgres source, got {other:?}"),
+    }
+}
+
 fn write_signed_manifest(path: &Path, tokens: Vec<TokenManifestToken>) -> String {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
     let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
@@ -299,6 +315,7 @@ dir = "/tmp/cdc-state"
 }
 
 #[test]
+#[cfg(feature = "mysql")]
 fn accepts_mysql_source_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path: PathBuf = dir.path().join("cdc.toml");
@@ -339,6 +356,7 @@ dir = "/tmp/cdc-state"
 }
 
 #[test]
+#[cfg(feature = "mysql")]
 fn accepts_mariadb_source_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path: PathBuf = dir.path().join("cdc.toml");
@@ -379,6 +397,7 @@ dir = "/tmp/cdc-state"
 }
 
 #[test]
+#[cfg(feature = "sqlserver")]
 fn accepts_mssql_source_profile_alias() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path: PathBuf = dir.path().join("cdc.toml");
@@ -708,7 +727,14 @@ dir = "/tmp/cdc-state"
     load(&config_path).expect("matching source.kind should load");
 }
 
+/// A `[source.mysql]` block under `kind = "postgres"` must not load.
+///
+/// Gated on `mysql` because the *reason* it fails differs by build: with the connector
+/// compiled in, deserialization fails on the mismatch this test is about; without it, the
+/// config is rejected earlier by `reject_uncompiled_source_driver`, which is a different
+/// property with its own tests in `tests/config_roundtrip.rs`.
 #[test]
+#[cfg(feature = "mysql")]
 fn rejects_source_kind_when_not_matching_configured_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path: PathBuf = dir.path().join("cdc.toml");
@@ -742,8 +768,16 @@ dir = "/tmp/cdc-state"
     );
 }
 
+/// `write_mode` was a single-variant enum whose validator could never fire — serde
+/// rejected everything but `"append"` before `validate()` ever ran. It has been removed:
+/// a configuration knob with exactly one legal value is documentation pretending to be
+/// configuration, and it invited operators to believe an upsert mode existed.
+///
+/// The key is now simply unrecognised, which produces a better message — it names the
+/// key and points at the reference — and this test pins that, so reintroducing the field
+/// when the Iceberg sink actually gains upsert is a deliberate act.
 #[test]
-fn rejects_iceberg_upsert_mode() {
+fn rejects_iceberg_write_mode_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path: PathBuf = dir.path().join("cdc.toml");
     let table_path = dir.path().join("iceberg-table");
@@ -789,7 +823,11 @@ dir = "/tmp/cdc-state"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected invalid iceberg sink config");
-    assert!(err.to_string().contains("unknown variant"));
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("unrecognised configuration key") && rendered.contains("write_mode"),
+        "the error must name the key so an operator can find it: {rendered}"
+    );
 }
 
 #[test]
@@ -2958,9 +2996,7 @@ dir = "/tmp/cdc-state"
 
     let config = load(&config_path).expect("env-referenced secrets must load");
 
-    let crate::config::schema::SourceDriver::Postgres(pg) = &config.source.driver else {
-        panic!("expected postgres source");
-    };
+    let pg = expect_postgres(&config);
     assert_eq!(
         pg.password.resolve().expect("resolve password"),
         "pg-secret-from-env"
@@ -3076,4 +3112,83 @@ dir = "/tmp/cdc-state"
     assert!(err
         .to_string()
         .contains("sink.iceberg.catalog.rest.token must use deferred secret references"));
+}
+
+/// `wal_transport` reaches the connector, and its default is the streaming protocol.
+///
+/// The field is part of rustcdc's own `PostgresSourceConfig`, so it arrives here by
+/// `#[serde(flatten)]` rather than through any code in this crate — which is exactly why
+/// it is worth pinning: nothing in cdc-server would fail if a rename upstream made the
+/// documented key silently inert, and the difference between the two transports is a
+/// per-poll WAL re-read.
+#[test]
+fn postgres_wal_transport_round_trips_and_defaults_to_streaming_replication() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+
+    let default_cfg = write_postgres_config(dir.path(), "default.toml", &state_dir, "");
+    let pg = expect_postgres(&default_cfg);
+    assert_eq!(
+        pg.wal_transport,
+        rustcdc::WalTransport::StreamingReplication,
+        "the default must be the protocol PostgreSQL's own subscribers use"
+    );
+
+    let peek_cfg = write_postgres_config(
+        dir.path(),
+        "peek.toml",
+        &state_dir,
+        "wal_transport = \"sql_peek\"\n",
+    );
+    let pg = expect_postgres(&peek_cfg);
+    assert_eq!(
+        pg.wal_transport,
+        rustcdc::WalTransport::SqlPeek,
+        "the documented fallback must actually select the fallback"
+    );
+}
+
+fn write_postgres_config(
+    dir: &Path,
+    name: &str,
+    state_dir: &Path,
+    extra_source_lines: &str,
+) -> AppConfig {
+    let config_path = dir.join(name);
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+api_version = "v1alpha1"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc_user"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+conn_timeout_secs = 10
+stream_poll_interval_ms = 100
+max_events_per_poll = 1000
+table_include_list = []
+table_exclude_list = []
+{extra_source_lines}
+[source.postgres.transport]
+mode = "plaintext"
+
+[sink]
+type = "stdout"
+
+[state]
+dir = "{}"
+"#,
+            state_dir.display()
+        ),
+    )
+    .expect("write config");
+
+    std::env::set_var("CDC_TEST_SOURCE_PASSWORD", "pg-secret");
+    load(&config_path).expect("config should load")
 }

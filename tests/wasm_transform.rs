@@ -540,21 +540,51 @@ async fn the_wasm_pool_transforms_concurrently() {
             local.get $ptr)
           (func (export "dealloc") (param i32) (param i32))
           (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+          ;; The spin loop must do work the optimiser cannot remove.
+          ;;
+          ;; It used to be a bare counter with no side effect, which Cranelift deleted
+          ;; outright — so each transform took well under a millisecond and there was
+          ;; essentially nothing to run in parallel.
+          ;;
+          ;; Each iteration now loads a byte from the *input* buffer at a computed
+          ;; address and accumulates it, and the total is stored to scratch memory before
+          ;; returning. A load from a runtime-computed pointer cannot be folded to a
+          ;; constant and the store cannot be dropped, so the loop survives optimisation
+          ;; and the guest genuinely occupies a core long enough for `POOL` concurrent
+          ;; invocations to overlap.
           (func (export "transform") (param $ptr i32) (param $len i32) (result i64)
             (local $i i32)
+            (local $acc i32)
             i32.const 0
             local.set $i
+            i32.const 0
+            local.set $acc
             (block $done
               (loop $spin
                 local.get $i
-                i32.const 4000000
+                i32.const 40000000
                 i32.ge_s
                 br_if $done
+                ;; acc += input[ptr + (i & 7)]
+                local.get $acc
+                local.get $ptr
+                local.get $i
+                i32.const 7
+                i32.and
+                i32.add
+                i32.load8_u
+                i32.add
+                local.set $acc
                 local.get $i
                 i32.const 1
                 i32.add
                 local.set $i
                 br $spin))
+            ;; Offsets 0..8 are scratch: `alloc` hands out from 8 upwards and the result
+            ;; is written at 65536, so this cannot corrupt either.
+            i32.const 0
+            local.get $acc
+            i32.store
             i32.const 65536
             local.get $ptr
             local.get $len
@@ -586,17 +616,15 @@ async fn the_wasm_pool_transforms_concurrently() {
             .expect("event survives");
     }
 
-    // One transform on its own establishes the per-event floor on this machine, so the
-    // assertion below is not calibrated against a hardware guess. Take the best of a
-    // few runs so a scheduling hiccup inflates the floor rather than the verdict.
-    let mut single = std::time::Duration::MAX;
-    for _ in 0..3 {
-        let started = std::time::Instant::now();
-        pipeline.apply(sample_event()).await.expect("transform");
-        single = single.min(started.elapsed());
-    }
-
-    let concurrent_started = std::time::Instant::now();
+    // Run `POOL` transforms concurrently, then ask the pool how many slots were ever
+    // busy at the same moment.
+    //
+    // This used to compare wall-clock time for `POOL` concurrent transforms against a
+    // per-event floor measured on its own. That measures the right property and measures
+    // it unreliably: under a full `cargo test` the four worker threads contend with every
+    // other test binary, so the comparison fails against a pool that is working
+    // perfectly. The high-water mark is the same property observed directly, and a busy
+    // machine cannot turn it into a false negative.
     let mut handles = Vec::with_capacity(POOL);
     for i in 0..POOL {
         let pipeline = std::sync::Arc::clone(&pipeline);
@@ -609,13 +637,16 @@ async fn the_wasm_pool_transforms_concurrently() {
     for handle in handles {
         assert!(handle.await.expect("join"), "every event must survive");
     }
-    let concurrent = concurrent_started.elapsed();
 
-    let serialised_floor = single * (POOL as u32);
+    let peak = pipeline
+        .wasm_pool_peak_in_use()
+        .await
+        .expect("a wasm pipeline reports a pool high-water mark");
     assert!(
-        concurrent < serialised_floor,
-        "{POOL} transforms took {concurrent:?}; one takes {single:?}, so a serialised \
-         pipeline would need about {serialised_floor:?}. The pool is not running \
-         concurrently."
+        peak > 1,
+        "the pool never had more than {peak} slot busy at once across {POOL} concurrent \
+         transforms, so it is running one guest at a time. An ideal {POOL}-slot pool \
+         reaches {POOL}; anything above 1 is what proves the slots are genuinely \
+         schedulable in parallel."
     );
 }

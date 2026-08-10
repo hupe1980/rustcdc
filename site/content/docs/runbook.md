@@ -107,6 +107,31 @@ A typo, or a key under the wrong table. The message names the full path. This is
 deliberate: a misspelled `table_include_lst` leaves the include list empty, which
 captures **every table in the database**.
 
+### `postgres at '<host>' refused TLS (the server replied 'N')`
+
+The connector is configured with `transport.mode = "tls"` and the server has
+`ssl = off`. It now fails instead of silently continuing unencrypted — previously
+this connection downgraded to plaintext with no error and no warning, detectable only
+with a packet capture.
+
+Enable TLS on the server, or state the trade-off explicitly:
+
+```toml
+[source.postgres.transport]
+mode = "plaintext"   # credentials and change data in the clear
+```
+
+### `replication slot "<slot>" is active for PID <n>`
+
+An out-of-band `pg_replication_slot_advance` or `pg_drop_replication_slot` was run
+against a slot a live pipeline holds. Under the default
+`wal_transport = "streaming_replication"` a walsender holds the slot for the life of
+the stream, and PostgreSQL refuses both operations on an active slot.
+
+Stop the pipeline first, run the operation, then start it again. This did not apply
+under `sql_peek`, where nothing held the slot persistently — an operator script
+carried over from that transport is the usual source.
+
 
 ## 3. Checkpoint is not advancing
 
@@ -132,6 +157,31 @@ rustcdc inspect-checkpoint --config-file /etc/rustcdc/config.toml
 
 If the checkpoint is advancing but downstream is behind, the pipeline is fine and the
 consumer is the problem — check lag on the sink side, not here.
+
+### `refusing checkpoint write ... the stream position moved backwards`
+
+The connector offered a resume position **behind** the one already stored while the
+committed-event count kept rising. That is not a replay: a replay forgets progress,
+and this reports progress while recording a position before data the sink has already
+committed. The write is refused rather than accepted, so the pipeline halts loudly
+instead of resuming from a position the stream never reached.
+
+Three causes, in order of likelihood:
+
+1. **The source was repointed or rebuilt.** A different server, a restored backup, or
+   a `pg_resetwal`. The stored position describes a log that no longer exists. Clear
+   the checkpoint directory and re-snapshot — see §9.
+2. **A failover on MySQL/MariaDB without GTID.** Binlog file+position is server-local
+   and a promoted replica's coordinates are routinely lower. Enable
+   `gtid_mode_enabled`: with a GTID set the coordinates are not compared at all,
+   because the GTID is what resumes the stream.
+3. **A connector defect.** If neither of the above applies, the message names both
+   positions — report it with that pair.
+
+The guard is deliberately narrow and does not fire on legitimate movement: PostgreSQL
+LSNs go backwards routinely under concurrent writers (pgoutput emits in *commit*
+order while each change keeps its own WAL position), so only a zero LSN is caught
+there.
 
 
 ## 4. Replication slot growth (PostgreSQL)
@@ -179,6 +229,16 @@ tail -n 50 /var/lib/rustcdc/dlq.jsonl | jq -r '[.ts_ms, .table, .source_offset, 
 
 # Which tables and causes dominate?
 jq -r '.error' /var/lib/rustcdc/dlq.jsonl | sort | uniq -c | sort -rn
+```
+
+With the `kafka` target the same questions are answerable from the record headers, without
+deserialising anything — the record key is the source table, and
+`__rustcdc.dlq.source.table`, `__rustcdc.dlq.source.offset`, `__rustcdc.dlq.sink` and
+`__rustcdc.dlq.exception.message` carry the rest:
+
+```bash
+kafka-console-consumer --bootstrap-server kafka:9092 --topic cdc.dlq \
+  --from-beginning --property print.headers=true --property print.key=true
 ```
 
 Common causes and their fixes:
@@ -324,6 +384,16 @@ that no longer exists.
 2. Update the image tag.
 3. `kubectl rollout restart deployment/rustcdc`.
 
+**What CI already checked for you.** `tests/state_compatibility.rs` holds frozen state
+artefacts — a real checkpoint file with its `content_checksum`, snapshot state in the shape
+a previous release wrote, every version of the Kafka state-topic record, the `local_fs`
+owner lease, and the processed-signal ledger — and asserts this build reads all of them
+with the right *values*, not merely that they parse. A release that could not resume an
+existing pipeline fails the build rather than the deploy.
+
+That covers the forward direction only. It cannot cover rollback, because the old binary is
+not present to test against; see below.
+
 With `strategy: Recreate` (**required** — see
 [operations.md §11](@/docs/operations.md#11-kubernetes-deployment)) the old pod stops before
 the new one starts. Capture pauses for `terminationGracePeriodSeconds` plus startup;
@@ -336,6 +406,14 @@ Confirm success: `rustcdc_slo_checkpoint_age_seconds` returns to baseline and
 
 Roll the image tag back and restart. Safe **as long as the state format did not
 change** — checkpoints are forward-compatible within a format version, not backward.
+
+The asymmetry is deliberate and worth understanding: a new build reading old state fills in
+absent fields with documented defaults, and CI proves it does. An *old* build reading new
+state has no such rule — it sees fields it was never taught, and depending on the struct it
+either ignores them (losing whatever they recorded) or refuses the file. A concrete example
+from 0.12: snapshot state gained `stopped`. Roll back to a build that predates it and a
+backfill an operator deliberately stopped starts again from row zero on the next restart,
+because the field carrying that decision is one the old build cannot see.
 
 If the release notes flagged a state-format change, rolling back requires the state as
 it was *before* the upgrade:

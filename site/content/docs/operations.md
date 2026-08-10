@@ -29,6 +29,7 @@ Commands:
   replay               Replay events from a JSONL file
   migrate-state        Migrate state between backends
   init-state           Seed the kafka_topic state backend (errors for other backends)
+  snapshot             Backfill tables on a running instance via the admin API
 ```
 
 ### `rustcdc init`
@@ -65,6 +66,25 @@ Options:
   --admin-read-token-env <VAR>    Env var containing the read token
 ```
 
+### `rustcdc snapshot`
+
+```
+rustcdc snapshot <SCHEMA.TABLE>... [OPTIONS]
+
+Options:
+  --admin-url <URL>                 Admin API base URL [env: RUSTCDC_ADMIN_URL]
+  --signal-id <ID>                  Correlate with an incident or change id
+  --message <TEXT>                  Note recorded in the audit trail
+  --admin-write-token <TOKEN>       Write bearer token
+  --admin-write-token-env <VAR>     Env var containing the write token
+  --admin-ca-file <FILE>            Custom CA for TLS
+  --admin-client-cert-file <FILE>   Client cert for mTLS
+  --admin-client-key-file <FILE>    Client key for mTLS
+```
+
+Requires `[incremental_snapshot]` on the running instance. Returns as soon as the signal
+is accepted — see [§6b](#6b-backfill-a-table-without-a-restart).
+
 ### `rustcdc replay`
 
 ```
@@ -98,9 +118,61 @@ curl http://localhost:8080/readyz    # 200 = ready; 503 = still initialising
 # Full status JSON
 curl -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" http://localhost:8080/status
 
+# The configuration this instance is actually running, credentials redacted
+curl -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" http://localhost:8080/config
+
 # Prometheus metrics
 curl -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" http://localhost:8080/metrics
+
+# The API's own contract — unauthenticated, and the right place to start
+curl http://localhost:8080/openapi.json
 ```
+
+### Control-plane liveness
+
+`/healthz` and `/livez` answer for the HTTP surface and the pipeline task. Neither answers
+for the **signal-action worker** — the single background task that executes every
+`execute_snapshot`, `pause_snapshot`, `resume_snapshot` and `stop_snapshot`.
+
+That distinction matters because the failure is quiet. If the worker exits, the pipeline
+keeps capturing, `/status` keeps reporting `snapshot_requests_available: true`, and `POST
+/signals` keeps answering `STARTED` — while every queued action is silently never executed.
+
+Two metrics make it visible:
+
+| Metric | Meaning |
+|---|---|
+| `rustcdc_admin_signal_worker_alive` | `0` means the worker is gone. Nothing recovers short of a process restart — alert on it |
+| `rustcdc_admin_signal_worker_panics_total` | A signal action panicked and was **recovered**. Not an outage: the worker caught it, released the signal's in-flight guard so it can be retried, and carried on. Treat it as a defect report |
+
+A panicking action used to terminate the worker for the process lifetime. It now unwinds
+into the worker's recovery path, which writes the panic message to the audit trail under
+`action=signal_action_panicked` with the signal id, increments the counter, and continues.
+
+Both alerts ship in `monitoring/rustcdc_slo_alerts.yml`.
+
+### The OpenAPI document
+
+`GET /openapi.json` serves an OpenAPI 3.1 description of every admin endpoint: the two
+token scopes, the signal vocabulary, the request and response shapes, and which status
+codes mean what. Point a generator at it and you have a typed client:
+
+```bash
+curl -s http://localhost:8080/openapi.json > admin.json
+npx @openapitools/openapi-generator-cli generate -i admin.json -g go -o ./client
+```
+
+It is unauthenticated by design — it describes the *shape* of the API rather than any of
+this instance's state, and requiring a credential to discover how to authenticate is a
+loop. It carries no configuration; `/config` is the endpoint for that, and it needs a read
+token.
+
+The document is **generated from the same crate as the handlers**, and
+`tests/architecture.rs` fails the build if the router serves a path the document omits, or
+documents one the router no longer serves. A hand-written spec file would drift a commit
+later with nothing to catch it, and a specification nobody verifies is one that lies in the
+direction that costs most — a consumer generates a client, it is missing an endpoint or
+calls one that 404s, and the mismatch surfaces in their codebase rather than ours.
 
 ### `rustcdc status`
 
@@ -125,6 +197,8 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | `rustcdc_runtime_recoverable_breaker_open_total` | increasing | Circuit breaker firing repeatedly |
 | `rustcdc_slo_readiness_ready_total / rustcdc_slo_readiness_checks_total` | < 0.99 | Readiness probe failures |
 | `rustcdc_audit_log_drop_total` | > 0 | Audit log queue saturated |
+| `rustcdc_snapshot_requests_refused_total` | any increase | An `execute_snapshot` request never reached the pipeline. The request is asynchronous, so the caller was answered `STARTED` and only the notification stream carries the refusal — without this metric a backfill that never ran looks identical to one that did |
+| `rustcdc_snapshot_tables_enqueued_total` | — | Tables accepted for on-demand backfill. Not the request count: one request carries many tables, and a table already in progress is a no-op the runtime does not re-enqueue |
 | `rustcdc_end_to_end_ack_lag_seconds` | p95 > 30 s | **Freshness** — source commit to sink durability, the number a data consumer actually experiences. A histogram, so read it with `histogram_quantile`; see below |
 
 #### Freshness: read the percentile, not the average
@@ -296,6 +370,150 @@ verified by loading them through the runtime's own integrity gates.
    Prometheus metrics.
 
 
+## 6b. Backfill a table without a restart
+
+A table added to the publication after the pipeline started has no history
+downstream. `execute_snapshot` reads it into the live stream — no restart, and the
+stream is never paused:
+
+```bash
+rustcdc snapshot public.invoices \
+  --admin-url https://localhost:8080 \
+  --admin-write-token-env RUSTCDC_WRITE_TOKEN
+```
+
+`rustcdc snapshot` takes the same `--admin-*` TLS and token flags as `rustcdc status`,
+validates the table names before sending, and prints the `signal_id` to follow. Several
+tables in one request are applied atomically — one bad name fails the whole call rather
+than half-applying it:
+
+```bash
+rustcdc snapshot public.invoices public.invoice_lines \
+  --message "backfill for INC-4821" --signal-id INC-4821 \
+  --admin-write-token-env RUSTCDC_WRITE_TOKEN
+```
+
+The equivalent HTTP call, if you would rather not shell out to the binary:
+
+```bash
+curl -X POST https://localhost:8080/signals \
+  -H "Authorization: Bearer $RUSTCDC_WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action_type":"execute_snapshot","tables":["public.invoices"]}'
+```
+
+Requires `[incremental_snapshot]` in the config; an empty `tables` list is enough,
+and is what `rustcdc init --profile prod` writes. Without it the signal is refused
+with a terminal state of `ABORTED` naming the missing section — it does not silently
+report success.
+
+The call answers `STARTED` immediately. Watch the outcome:
+
+```bash
+curl -N -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" \
+  https://localhost:8080/notifications/stream
+```
+
+The terminal notification carries `tables_enqueued` — the number of tables the
+runtime actually took. Expect a delay of up to `runtime.max_poll_wait_ms` before it
+arrives: the pipeline services requests between polls rather than interrupting one,
+because cancelling a poll mid-transform would drop the events already taken from the
+source buffer.
+
+| Situation | Result |
+|---|---|
+| Table not tracked | Added, read from the start |
+| Table in progress | No-op — retrying a request is safe |
+| Table already complete | Rewound and read again |
+| Any name unknown or without a primary key | The **whole request** fails; nothing is mutated |
+
+Requests are durable: an enqueued table reaches the checkpoint with the next commit
+and resumes after a restart.
+
+A backfill in flight can be steered without stopping the pipeline:
+
+| Signal | Effect |
+|---|---|
+| `pause_snapshot` | Suspends chunk reading. The live stream keeps flowing. Reports whether it changed anything, so a redundant call is distinguishable |
+| `resume_snapshot` | Resumes chunk reading, same reporting |
+| `stop_snapshot` | Abandons the remaining tables, reporting how many it dropped |
+
+The pause flag is part of the snapshot state carried in the checkpoint, so a paused
+backfill stays paused across a restart. Progress is visible throughout under
+`.incremental_snapshot` on `/status` and as `rustcdc_incremental_snapshot_*` on `/metrics`.
+
+Use it also to rebuild a downstream store, or to re-run history through a corrected
+transform.
+
+
+## 6c. Running the integration suites
+
+Capture is verified end to end against a real PostgreSQL **and a real MySQL**. Each suite
+manages its own container, so a local run and CI are the same command against the same
+fixture:
+
+```bash
+RUSTCDC_INTEGRATION=1 cargo test --all-features --test integration_postgres -- --test-threads=1
+RUSTCDC_INTEGRATION=1 cargo test --all-features --test integration_mysql    -- --test-threads=1
+```
+
+`--test-threads=1` is required: each suite binds a fixed host port and a fixed container
+name, deliberately, so a killed run leaves exactly one thing to clean up.
+
+Requires a working Docker daemon. Without `RUSTCDC_INTEGRATION=1` every test returns
+immediately — and `tests/architecture.rs::every_integration_suite_is_run_by_ci` enumerates
+`tests/integration_*.rs` from disk and asserts each one is named in the workflow. A suite
+that CI does not run is not merely unrun: it is env-gated, so it *reports success*. Adding
+a suite and forgetting to wire it up fails the unit suite.
+
+What it covers:
+
+| Test | Property |
+|---|---|
+| `insert_update_and_delete_are_captured_in_order` | Commit order and full before-images, across **both** `wal_transport` values |
+| `the_resume_position_does_not_lose_events` | Rows committed while the pipeline is down are captured after a restart, in order, with a bounded replay window |
+| `a_tls_transport_refuses_a_server_without_tls` | `mode = "tls"` fails against `ssl = off` rather than silently downgrading |
+| `a_replica_identity_full_table_reports_only_its_real_primary_key` | The key is the table's key, not every column — the Kafka message key is derived from it |
+| `an_on_demand_snapshot_backfills_rows_the_stream_could_never_deliver` | `execute_snapshot` reaches a live runtime and produces rows |
+| `a_startup_backfill_reads_only_the_rows_its_filter_selects` | `table_conditions` is actually applied |
+
+And for MySQL:
+
+| Test | Property |
+|---|---|
+| `insert_update_and_delete_are_captured_in_order` | Commit order, and a `DELETE` carrying a usable before-image |
+| `the_primary_key_is_the_declared_key_not_every_column` | `binlog_row_metadata=FULL` sends every column; the key must not widen to match |
+| `the_resume_position_does_not_lose_events` | MySQL has no server-side slot, so this exercises **this project's** checkpoint rather than the server's bookkeeping |
+| `a_clean_restart_redelivers_nothing` | Exact zero replay across a clean restart |
+| `capture_works_without_gtid` | The file+position resume path, for servers with GTID off |
+
+> **MySQL needs two binlog settings, not one.** `binlog_row_image=FULL` decides which
+> *columns* are logged; `binlog_row_metadata=FULL` decides whether column names and
+> primary-key flags travel with them. MySQL 8 defaults the latter to `MINIMAL` and MariaDB
+> to `NO_LOG`, under which events carry positional placeholders (`@0`, `@1`, …) and no
+> primary key — so the connector refuses to start rather than emit that. The error names
+> the setting and the fix. This fixture was written with only the first setting and hit it
+> on its first run.
+
+The resume tests assert **no gaps and no replay**, both exactly.
+
+They did not always. This suite found a real defect on its first run: a *clean* shutdown
+redelivered the last transaction on every restart, deterministically. The tests were
+written to assert "no gaps exactly, duplicates within a bound" — which was the honest
+assertion while the defect stood, since at-least-once is the contract and asserting "no
+duplicates" would have been asserting exactly-once.
+
+The diagnosis we reported upstream was wrong, and the correction is worth recording:
+we said `START_REPLICATION` was inclusive and suggested resuming at `lsn + 1`. PostgreSQL
+logical decoding filters at *transaction* granularity, and a change's own LSN always
+precedes its transaction's commit record, so either position replays the whole transaction.
+rustcdc 0.11 fixed it properly with `StreamHandle::resume_offset_for`, and the bound was
+tightened to zero.
+
+If a run is interrupted, clean up with
+`docker rm -f rustcdc-integration-postgres rustcdc-integration-mysql`.
+
+
 ## 7. Dry run
 
 Test the full transform + sink pipeline with synthetic events, without connecting
@@ -350,6 +568,26 @@ recoverable_error_breaker_max_open_cycles       = 10     # was 3
 
 
 ## 9. Performance tuning
+
+### Measured baselines
+
+Throughput is measured, not asserted. `benches/throughput.rs` drives the real batch path;
+`benches/BASELINES.md` carries the numbers and what they mean.
+
+```bash
+cargo bench --bench throughput -- --save-baseline main
+# …change something…
+cargo bench --bench throughput -- --baseline main
+```
+
+The figures are hardware-specific and the full-pipeline one is fsync-dominated, so the
+number that matters is the **ratio to a baseline taken on the same machine**, not the
+absolute value. Two results worth knowing before you tune anything:
+
+* the transform stage costs 0.42-0.92 µs/event, and full batch delivery ~47.6 µs/event — so
+  **delivery dominates by ~100×**;
+* consequently `prepare_parallelism` moves nothing for a JSON codec and a durable sink. See
+  [when it actually helps](@/docs/configuration.md#when-prepare-parallelism-actually-helps).
 
 ### Baseline metrics
 
@@ -445,6 +683,57 @@ bearer_token = { env = "INGEST_TOKEN" }
 
 Credentials backed by `SecretString` are never emitted in logs, config snapshots
 (`/status`), or support bundles.
+
+### What `/status` redaction actually covers
+
+The configuration snapshot on `/config` is readable by any **read**-scoped token, so
+redaction is a boundary, not a courtesy. Three independent rules apply, deliberately — a secret that
+slips past one is usually caught by another:
+
+| Rule | Catches |
+|---|---|
+| **Named paths** | An enumerated list (`source.password`, `state.backend.postgres.url`, …) redacted whole, because a credential is not always in the userinfo |
+| **Key names** | Any key containing `password`, `secret`, `token`, `credential`, `api_key`, `authorization`, `private_key`, `key_file` — at any depth. Separators are normalised, so `x-api-key` and `client.secret` match the same tokens as `api_key` |
+| **URL values** | Any string that parses as `scheme://…`, under *any* key: userinfo is replaced, and query parameters whose **name** looks secret (`?api_key=`, `?token=`) have their values replaced |
+
+The URL rule is value-driven on purpose. `sink.http.url` was named like nothing sensitive
+and was on no list, so a webhook URL carrying its credential came back verbatim. The
+loader now also rejects userinfo in that field outright, which leaves the query string as
+the only way a credential can reach it — hence the second half of the rule.
+
+A property test in `tests/fuzz_properties.rs` generates key and parameter names rather
+than listing them, which is what found the hyphenated spelling the enumerated tests all
+missed.
+
+### Control-plane panic guard
+
+Every admin handler runs behind a panic guard: a panic becomes a logged `500` rather than
+an aborted task, which is what a client would otherwise see as a bare connection reset
+with no status, no body and nothing in the log. The panic payload is logged but never
+returned — it can carry file paths and internal state.
+
+This is defence in depth, not a licence to panic. It exists because a panic *was* reachable
+from outside: the audit-trail detail was capped with a byte slice, which aborted the task
+whenever the budget landed inside a multi-byte character. Any write-scope token could
+trigger it, and doing so killed the signal-action worker for the life of the process —
+after which every asynchronous signal was accepted, answered `STARTED`, and never run.
+
+### Transport encryption
+
+`transport.mode = "tls"` is enforced on **every** connection the server opens to the
+source, including the replication-slot lag sampler behind
+`rustcdc_runtime_replication_slot_lag_bytes`.
+
+That sampler used to connect with TLS disabled regardless of the configured
+transport, so a TLS-configured PostgreSQL deployment put its replication password on
+the wire in the clear once every 15 seconds for the life of the process, with nothing
+in the logs to say so. It now builds its TLS client from the same
+`ca_cert_path` / `client_cert_path` / `client_key_path` as the capture connection, and
+a transport it cannot honour fails the sample rather than downgrading it.
+
+The connector itself no longer accepts `sslmode=prefer` semantics either: a TLS
+transport against a server with `ssl = off` fails to connect. If you need plaintext,
+say so — the configuration is the audit record.
 
 ### Metric units
 
@@ -700,10 +989,45 @@ spec:
 > For production, prefer `kafka_topic` or `postgres` state backends over
 > `local_fs` so the state survives pod rescheduling without a PVC.
 >
-> **Whichever you choose, `strategy: Recreate` above is mandatory.** The remote
-> backends hold an owner lease that refuses a second concurrent writer, and a rolling
-> update would make the new pod fail its lease acquisition and crash-loop until the old
-> pod exits — which, with `maxUnavailable: 0`, it never does.
+> **Whichever you choose, `strategy: Recreate` above is mandatory.** *Every* backend now
+> holds an owner lease that refuses a second concurrent writer, and a rolling update would
+> make the new pod fail its lease acquisition and crash-loop until the old pod exits —
+> which, with `maxUnavailable: 0`, it never does.
+
+### State ownership
+
+One process owns a pipeline's state. Every backend enforces that, and each enforces it
+with whatever its store makes available:
+
+| Backend | Fenced by |
+|---|---|
+| `local_fs` | An owner+epoch lease in `<state.dir>/owner_lease.json`, re-asserted before durable writes |
+| `redis`, `postgresql` | The same lease, held as a key in the remote store |
+| `kafka_topic` | The broker, by transactional id — a second producer with the same id fences the first |
+
+A second instance starting against a live lease refuses to run and names the holder. A
+crashed owner's lease expires after 60 s, so recovery needs no manual step, and an owner
+whose lease is stolen while it was partitioned discovers this on its next heartbeat and
+stops writing rather than continuing blind.
+
+`local_fs` gets one refinement the others cannot: if the recorded owner is a process **on
+this host** whose PID is no longer running, the lease is taken over immediately rather than
+after the TTL. That is the ordinary crash-and-restart case — systemd or a container runtime
+bringing the process back seconds later — and waiting a minute for a directory nobody holds
+would be worse than the problem the lease solves. A lease from another host is never
+second-guessed this way: a foreign PID means nothing locally, and treating it as stale is
+precisely how two hosts came to share one NFS state directory.
+
+**What this does not do.** Acquisition is read-then-write, not compare-and-swap, so two
+instances starting inside the same millisecond-scale window can both see a free slot. It
+converts the common silent interleave — two writers, last-write-wins, the durable position
+sliding backwards — into a loud refusal. It is not a substitute for a store with real CAS,
+and on a filesystem that does not honour write visibility across hosts it guarantees
+nothing. `strategy: Recreate` and `ReadWriteOnce` remain the right things to configure;
+they are simply no longer the *only* thing standing between you and a corrupted checkpoint.
+
+Deleting `owner_lease.json` by hand forces a takeover. Do that only when you are certain no
+other process is running, because it is exactly the safety this file provides.
 
 ### ConfigMap
 

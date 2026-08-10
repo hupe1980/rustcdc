@@ -888,7 +888,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::config::schema::{
-        IcebergCatalogConfig, IcebergRestCatalogConfig, IcebergSchemaMode, IcebergWriteMode,
+        IcebergCatalogConfig, IcebergRestCatalogConfig, IcebergSchemaMode,
     };
     use arrow_array::{Array, StringArray};
     use iceberg::Error;
@@ -944,7 +944,6 @@ mod tests {
             catalog,
             namespace: "cdc".to_string(),
             table_name: "events".to_string(),
-            write_mode: IcebergWriteMode::Append,
             schema_mode: IcebergSchemaMode::Normalized,
             max_commit_retries: 3,
             retry_backoff_ms: 5,
@@ -1237,7 +1236,6 @@ mod tests {
                         .map(rustcdc::SecretString::new),
                 },
             },
-            write_mode: IcebergWriteMode::Append,
             schema_mode: IcebergSchemaMode::Normalized,
             namespace: "cdc".to_string(),
             table_name: "events".to_string(),

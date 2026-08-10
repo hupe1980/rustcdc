@@ -66,6 +66,7 @@ dir = "/tmp/cdc-test"
 }
 
 #[test]
+#[cfg(feature = "mysql")]
 fn mysql_source_config_loads() {
     let cfg = load_from_str(
         r#"
@@ -680,8 +681,178 @@ chunk_size = 2500
     ))
     .expect("incremental snapshot config must load");
 
-    assert!(cfg.incremental_snapshot.is_enabled());
-    assert_eq!(cfg.incremental_snapshot.chunk_size, 2500);
+    let incremental = cfg
+        .incremental_snapshot
+        .expect("a declared section must be present");
+    assert!(incremental.backfills_at_startup());
+    assert_eq!(incremental.chunk_size, 2500);
+}
+
+/// A per-table row filter must survive the load intact.
+///
+/// The expression is interpolated into the chunk `SELECT`, so any mangling in transit —
+/// quote handling, whitespace normalisation — changes which rows get backfilled. This
+/// deliberately uses a condition containing quotes and a comparison operator.
+#[test]
+fn incremental_snapshot_table_conditions_load() {
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[incremental_snapshot]
+tables = ["public.orders"]
+
+[incremental_snapshot.table_conditions]
+"public.orders" = "t.created_at >= '2026-01-01' AND t.region = 'eu'"
+"#
+    ))
+    .expect("a table condition must load");
+
+    let incremental = cfg
+        .incremental_snapshot
+        .expect("a declared section must be present");
+    assert_eq!(
+        incremental
+            .table_conditions
+            .get("public.orders")
+            .map(String::as_str),
+        Some("t.created_at >= '2026-01-01' AND t.region = 'eu'"),
+        "the SQL expression must reach the runtime byte-for-byte"
+    );
+}
+
+/// A filter for a table outside `tables` is accepted — it scopes a later on-demand request.
+///
+/// This used to be **rejected**, because until rustcdc 0.12 the on-demand path could not
+/// see `table_conditions` at all: `enqueue_tables` resolved the table without them and the
+/// driver did not retain the config, so the filter was structurally unreachable and
+/// accepting it would have meant backfilling the whole table while the operator believed
+/// it was scoped. Worse, the startup and on-demand paths disagreed with *each other* — a
+/// runtime-requested table ran unfiltered and a restart adopted it filtered — so the rows
+/// delivered matched no single predicate.
+///
+/// 0.12 resolves all three paths through one function. Pre-declaring is now the supported
+/// way to scope a backfill you will request later, and refusing it would reject a working
+/// configuration. The typo case moved to where both lists arrive together: a `conditions`
+/// entry in an `execute_snapshot` request must name a table in that request's `tables`.
+#[test]
+fn a_table_condition_may_be_predeclared_for_a_later_on_demand_snapshot() {
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[incremental_snapshot]
+tables = []
+
+[incremental_snapshot.table_conditions]
+"public.orders" = "t.region = 'eu'"
+"#
+    ))
+    .expect("a pre-declared condition must load");
+
+    let incremental = cfg
+        .incremental_snapshot
+        .expect("a declared section must be present");
+    assert!(
+        !incremental.backfills_at_startup(),
+        "nothing is backfilled at startup"
+    );
+    assert_eq!(
+        incremental
+            .table_conditions
+            .get("public.orders")
+            .map(String::as_str),
+        Some("t.region = 'eu'"),
+        "the filter must survive to be applied when the table is requested"
+    );
+}
+
+/// A blank filter is still refused — it reads as "scope this" and does nothing.
+#[test]
+fn a_blank_table_condition_is_rejected() {
+    let error = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[incremental_snapshot]
+tables = ["public.orders"]
+
+[incremental_snapshot.table_conditions]
+"public.orders" = "   "
+"#
+    ))
+    .expect_err("a blank filter must be rejected");
+
+    assert!(
+        error.to_string().contains("empty"),
+        "the error must say the filter is blank: {error}"
+    );
+}
+
+/// A declared-but-empty `[incremental_snapshot]` is a real configuration.
+///
+/// It installs the incremental-snapshot driver without backfilling anything, which is
+/// the only way to make `POST /signals` with `execute_snapshot` available on a pipeline
+/// that has nothing to backfill at startup. While the field was a defaulted struct,
+/// "absent" and "present and empty" were the same value and this was unexpressible.
+#[test]
+fn an_empty_incremental_snapshot_section_is_distinguishable_from_an_absent_one() {
+    let declared = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[incremental_snapshot]
+tables = []
+"#
+    ))
+    .expect("an empty section must load");
+
+    let incremental = declared
+        .incremental_snapshot
+        .expect("the declared section must survive the load");
+    assert!(
+        !incremental.backfills_at_startup(),
+        "an empty list bootstraps nothing"
+    );
+
+    let absent = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+"#
+    ))
+    .expect("an absent section must load");
+    assert!(absent.incremental_snapshot.is_none());
+}
+
+/// An empty section does not conflict with `snapshot_tables`.
+///
+/// The mutual exclusion exists because both would read the same tables; an empty list
+/// reads none, so refusing the combination would rule out "blocking bootstrap now,
+/// on-demand snapshots later" for no reason.
+#[test]
+fn an_empty_incremental_snapshot_section_coexists_with_snapshot_tables() {
+    load_from_str(&format!(
+        r#"snapshot_tables = ["public.orders"]
+{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[incremental_snapshot]
+tables = []
+"#
+    ))
+    .expect("an empty incremental section bootstraps nothing and cannot conflict");
 }
 
 /// Both paths bootstrap the same tables; accepting both would read every table
@@ -1016,5 +1187,240 @@ dlq_path = "/var/log/cdc/dlq.jsonl"
     assert!(
         message.contains("opt-in") || message.contains("halts"),
         "must say the behaviour changed, not just the key name: {message}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Settings that must actually reach something
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `otlp_protocol` selects a real exporter, and a typo is refused.
+///
+/// This field sat in the schema, the reference docs and the `[observability]` example
+/// while **both** exporters were built with a hardcoded `.with_tonic()`. Setting the
+/// documented `otlp_protocol = "http"` and pointing at a collector's `:4318` listener
+/// produced a gRPC exporter talking to an HTTP endpoint: no telemetry, no error, and a
+/// setting that reads as applied.
+///
+/// Asserting the parse alone would not have caught that — the value parsed fine. The
+/// mapping to `OtlpProtocol` is what the exporter switches on, so that is what is pinned.
+#[test]
+fn otlp_protocol_maps_to_the_exporter_and_rejects_anything_else() {
+    use rustcdc_server::telemetry::OtlpProtocol;
+
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[observability]
+otlp_protocol = "http"
+"#
+    ))
+    .expect("http protocol must load");
+    assert_eq!(
+        OtlpProtocol::from_config(&cfg.observability.otlp_protocol),
+        OtlpProtocol::Http
+    );
+
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+"#
+    ))
+    .expect("default must load");
+    assert_eq!(
+        OtlpProtocol::from_config(&cfg.observability.otlp_protocol),
+        OtlpProtocol::Grpc,
+        "the default is gRPC, matching the collector's 4317 listener"
+    );
+
+    let error = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[sink]
+type = "stdout"
+
+[observability]
+otlp_protocol = "htpp"
+"#
+    ))
+    .expect_err("a misspelled protocol must be refused, not silently defaulted");
+    assert!(
+        error.to_string().contains("otlp_protocol"),
+        "the error must name the field: {error}"
+    );
+}
+
+/// The PostgreSQL state backend keeps its two artifacts in the two configured tables.
+///
+/// `schema_history_table` was parsed, defaulted to a distinct name, documented — and never
+/// read: the schema-history operator was built against `checkpoint_table`, so both
+/// artifacts shared one table. Nothing was corrupted, but truncating the checkpoint table
+/// to force a re-snapshot — a routine recovery step — also destroyed the schema history
+/// that MySQL and SQL Server need to decode their logs.
+#[test]
+fn the_postgres_state_backend_uses_both_configured_tables() {
+    std::env::set_var(
+        "CDC_TEST_STATE_URL",
+        "postgres://state:pw@localhost:5432/state",
+    );
+
+    let cfg = load_from_str(&format!(
+        r#"{SOURCE_AND_STATE}
+
+[state.backend.postgresql]
+url = {{ env = "CDC_TEST_STATE_URL" }}
+checkpoint_table = "cp_table"
+schema_history_table = "sh_table"
+
+[sink]
+type = "stdout"
+"#
+    ))
+    .expect("state table config must load");
+
+    let rustcdc_server::config::schema::StateBackend::Postgresql(pg) = &cfg.state.offset.backend
+    else {
+        panic!("expected the postgresql state backend");
+    };
+    assert_eq!(pg.checkpoint_table, "cp_table");
+    assert_eq!(
+        pg.schema_history_table, "sh_table",
+        "the schema-history table must survive the load; it is what the operator provisions"
+    );
+    assert_ne!(
+        pg.checkpoint_table, pg.schema_history_table,
+        "the two artifacts have different lifecycles and must not share a table"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Connectors are cargo features
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A config naming a connector this binary lacks must say so, and say how to fix it.
+///
+/// Connectors are opt-in features, so `SourceDriver`'s variants are `#[cfg]`-gated. Left
+/// alone, a `sqlserver` config on a PostgreSQL-only build fails with serde's `unknown
+/// variant \`sqlserver\`, expected \`postgres\`` — which reads as "no such connector"
+/// when the truth is "this binary was not built with it", and contains nothing about the
+/// rebuild that fixes it.
+///
+/// Gated on the *absence* of the feature, because with `--all-features` the config is
+/// simply valid. CI runs the no-default-features matrix, which is where this executes.
+#[test]
+#[cfg(not(feature = "sqlserver"))]
+fn a_config_for_an_uncompiled_connector_names_the_feature_to_rebuild_with() {
+    let error = load_from_str(
+        r#"api_version = "v1"
+
+[source.sqlserver]
+host = "localhost"
+port = 1433
+user = "cdc"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
+database = "mydb"
+conn_timeout_secs = 10
+cdc_enabled = true
+cdc_schema = "cdc"
+prereq_pool_size = 2
+stream_poll_interval_ms = 200
+max_events_per_poll = 1000
+
+[source.sqlserver.transport]
+mode = "plaintext"
+
+[sink]
+type = "stdout"
+
+[state]
+dir = "/tmp/cdc-test"
+"#,
+    )
+    .expect_err("a connector this build lacks must be rejected");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("--features sqlserver"),
+        "the error must name the cargo feature to rebuild with: {rendered}"
+    );
+    assert!(
+        !rendered.contains("unknown variant"),
+        "serde's raw variant error must not be what reaches the operator: {rendered}"
+    );
+}
+
+/// The `mssql` alias resolves to the same connector, and the same message.
+///
+/// The alias exists because that is what the product is called in half its own
+/// documentation. It has to be understood by the gate too, or an operator using it gets
+/// serde's typo error instead of the feature message — the exact failure the gate exists
+/// to prevent, reached by the spelling most likely to be used.
+#[test]
+#[cfg(not(feature = "sqlserver"))]
+fn the_mssql_alias_is_understood_by_the_feature_gate() {
+    let error = load_from_str(
+        r#"api_version = "v1"
+
+[source.mssql]
+host = "localhost"
+port = 1433
+user = "cdc"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
+database = "mydb"
+conn_timeout_secs = 10
+cdc_enabled = true
+cdc_schema = "cdc"
+prereq_pool_size = 2
+stream_poll_interval_ms = 200
+max_events_per_poll = 1000
+
+[source.mssql.transport]
+mode = "plaintext"
+
+[sink]
+type = "stdout"
+
+[state]
+dir = "/tmp/cdc-test"
+"#,
+    )
+    .expect_err("the alias must be rejected the same way");
+
+    assert!(
+        error.to_string().contains("--features sqlserver"),
+        "the alias must reach the same message: {error}"
+    );
+}
+
+/// A genuine typo still gets serde's list of what is valid, not the feature message.
+///
+/// The gate only recognises names in `KNOWN_SOURCE_DRIVERS`. Anything else falls through,
+/// which is deliberate: telling someone who wrote `postgresql` to "rebuild with
+/// `--features postgresql`" would send them after a feature that does not exist.
+#[test]
+fn an_unknown_connector_name_is_not_mistaken_for_a_missing_feature() {
+    let error = load_from_str(
+        r#"api_version = "v1"
+
+[source.postgresql]
+host = "localhost"
+
+[sink]
+type = "stdout"
+
+[state]
+dir = "/tmp/cdc-test"
+"#,
+    )
+    .expect_err("an unknown connector must be rejected");
+
+    assert!(
+        !error.to_string().contains("--features"),
+        "a typo must not be reported as a missing cargo feature: {error}"
     );
 }

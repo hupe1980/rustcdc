@@ -17,6 +17,14 @@ pub async fn execute(args: InitArgs) -> Result<(), AppError> {
         }
     }
 
+    // The state directory is created here, not left to the first `run`.
+    //
+    // The loader validates that the parent of `admin.notification_log_file` exists, and
+    // the prod template puts that file inside the state directory — so without this the
+    // emitted config fails `validate-config`, which is the very next step this command
+    // tells the operator to run.
+    std::fs::create_dir_all(&args.state_dir)?;
+
     let template = render_template(&args);
     std::fs::write(&args.output, template)?;
 
@@ -127,13 +135,27 @@ create_replication_slot_if_missing = false
 # see the rustcdc PostgresSourceConfig::failover_slot docs.
 failover_slot = false
 conn_timeout_secs = 10
+# `START_REPLICATION ... LOGICAL` over the streaming replication protocol — the
+# server pushes WAL as it is written. Needs the REPLICATION role attribute and a
+# direct connection. Switch to "sql_peek" only if the environment cannot grant
+# either; it re-decodes from the slot's restart_lsn on every poll.
+wal_transport = "streaming_replication"
 stream_poll_interval_ms = 100
 max_events_per_poll = 1000
 table_include_list = []
 table_exclude_list = []
 
+# mode = "tls" now *requires* TLS: a server with `ssl = off` fails the connection
+# rather than silently downgrading it to plaintext.
 [source.postgres.transport]
 mode = "tls"
+
+# Declared with no tables: nothing is backfilled at startup, but the
+# incremental-snapshot driver is installed, which is what makes
+# `POST /signals` with action_type = "execute_snapshot" work against a running
+# pipeline. Remove this section if on-demand snapshots are not wanted.
+[incremental_snapshot]
+tables = []
 
 [sink]
 type = "stdout"
@@ -159,6 +181,12 @@ max_delay_ms = 10000
 bind = "{admin_bind}"
 read_token_env = "CDC_ADMIN_READ_TOKEN"
 write_token_env = "CDC_ADMIN_WRITE_TOKEN"
+# Required whenever write-capable signalling is enabled, and the template used to
+# omit it — so `init --profile prod` produced a config that failed the
+# `validate-config` step this command prints as its own next step. A write signal
+# whose outcome is only visible in the admin process's memory is not an audit trail;
+# swap in `[admin.notification_kafka]` if the durable channel should be a topic.
+notification_log_file = "{state_dir}/admin-notifications.jsonl"
 
 [admin.tls]
 cert_file = "/etc/cdc/admin/tls.crt"
@@ -205,5 +233,91 @@ mod tests {
         assert!(rendered.contains("mode = \"tls\""));
         assert!(rendered.contains("read_token_env = \"CDC_ADMIN_READ_TOKEN\""));
         assert!(rendered.contains("[admin.tls]"));
+    }
+
+    /// Both starter configs must survive the real loader.
+    ///
+    /// These are the first configuration an operator ever runs, and the printed next step
+    /// is `validate-config` — so a template that does not load turns the very first
+    /// command into an error message. Nothing checked it: the assertions above are all
+    /// substring matches, which pass equally well against a file the loader rejects. It
+    /// found one: the prod template enabled write-capable admin signalling without the
+    /// notification channel the loader requires alongside it.
+    ///
+    /// The prod template's admin TLS paths are rewritten to files that exist, because
+    /// provisioning that certificate is step 2 of the printed next steps — it is the
+    /// operator's to supply, and everything *else* in the template has to be right.
+    #[test]
+    fn both_templates_load_through_the_real_loader() {
+        // Only referenced by the prod template, but set for both so the test does not
+        // depend on which one names it.
+        std::env::set_var("CDC_SOURCE__POSTGRES__PASSWORD", "template-test-secret");
+
+        for profile in [InitProfile::Dev, InitProfile::Prod] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut args = args_for(profile);
+            args.state_dir = dir.path().join("state");
+            // `execute` creates this; the render-only path here has to as well.
+            std::fs::create_dir_all(&args.state_dir).expect("state dir");
+
+            let path = dir.path().join("cdc.toml");
+            std::fs::write(
+                &path,
+                with_provisioned_admin_tls(&render_template(&args), dir.path()),
+            )
+            .expect("write template");
+
+            crate::config::load(&path)
+                .unwrap_or_else(|e| panic!("the starter template must load: {e}"));
+        }
+    }
+
+    /// The prod template ships on-demand snapshots switched on.
+    ///
+    /// A declared-but-empty `[incremental_snapshot]` backfills nothing at startup and is
+    /// the only way `execute_snapshot` is reachable later — an operator who needs to
+    /// backfill a newly published table should not have to restart the pipeline to earn
+    /// the capability.
+    #[test]
+    fn the_prod_template_enables_on_demand_snapshots() {
+        std::env::set_var("CDC_SOURCE__POSTGRES__PASSWORD", "template-test-secret");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = args_for(InitProfile::Prod);
+        args.state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&args.state_dir).expect("state dir");
+
+        let path = dir.path().join("cdc.toml");
+        std::fs::write(
+            &path,
+            with_provisioned_admin_tls(&render_template(&args), dir.path()),
+        )
+        .expect("write template");
+
+        let config = crate::config::load(&path).expect("prod template loads");
+        let incremental = config
+            .incremental_snapshot
+            .expect("the section must be declared so execute_snapshot is reachable");
+        assert!(
+            !incremental.backfills_at_startup(),
+            "the template must not silently backfill tables nobody listed"
+        );
+    }
+
+    /// Stand in for the operator's step 2: point `[admin.tls]` at files that exist.
+    ///
+    /// The loader only checks that they are files at load time — the certificate itself is
+    /// parsed when the listener starts — so empty placeholders are enough to get past the
+    /// one prerequisite the template cannot satisfy on its own.
+    fn with_provisioned_admin_tls(rendered: &str, dir: &std::path::Path) -> String {
+        let mut out = rendered.to_string();
+        for name in ["tls.crt", "tls.key", "clients-ca.crt"] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"").expect("placeholder admin TLS file");
+            out = out.replace(
+                &format!("/etc/cdc/admin/{name}"),
+                &path.display().to_string(),
+            );
+        }
+        out
     }
 }

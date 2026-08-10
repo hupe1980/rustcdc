@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc-server"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # The shipped container image builds `--all-features`, so this is the requirement for the
 # artifact users actually consume. The default feature set alone still builds on 1.94.0
@@ -29,7 +29,45 @@ exclude = ["fuzz"]
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Features
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# **Connectors are opt-in, and the default is PostgreSQL alone.**
+#
+# They used to be compiled unconditionally, which meant a PostgreSQL-only deployment
+# still linked `tiberius` — and with it a *second* TLS stack (rustls 0.21, its own
+# webpki, its own X.509 verifier) carrying four suppressed RUSTSEC advisories that the
+# admin listener and every sink, on rustls 0.23, do not have. Each suppression in
+# `deny.toml` carries a real reachability analysis showing the path is unreachable in a
+# PostgreSQL deployment, and that is still true — but "unreachable in your configuration"
+# is not an answer any scanner, auditor or procurement questionnaire accepts, and it
+# makes a minimal-attack-surface claim unarguable.
+#
+# The published container image builds with `--all-features`, so the shipped artifact
+# carries every connector and loses nothing. Only a source build narrows.
+#
+# A config naming a connector that was not compiled in is rejected at load with a message
+# naming the feature to rebuild with — see `reject_uncompiled_source_driver`. It is never
+# a serde "unknown variant" error, and it never silently loads.
 [features]
+default = ["postgres"]
+
+# PostgreSQL logical replication. The default, and the only connector most deployments
+# need. Adds no TLS stack of its own beyond rustls 0.23, which is already present.
+postgres = ["rustcdc/postgres"]
+
+# MySQL and MariaDB binlog. One feature, because MariaDB's connector is a thin layer over
+# MySQL's upstream (`rustcdc/mariadb` implies `rustcdc/mysql`) and splitting them would
+# offer a build that cannot exist.
+mysql = ["rustcdc/mysql", "rustcdc/mariadb"]
+
+# SQL Server CDC. **This is the one that costs.** `tiberius 0.12` pins rustls 0.21, so
+# enabling it re-adds the second TLS stack and the four suppressed advisories documented
+# in `deny.toml`. Enable it when you capture SQL Server; the analysis says it is safe, and
+# a deployment that does not need it should not have to rely on that analysis.
+sqlserver = ["rustcdc/sqlserver"]
+
 # AWS Glue Schema Registry as a codec backend.
 #
 # Off for a plain `cargo build` because it pulls the AWS SDK (~45 crates) that no
@@ -38,11 +76,12 @@ unsafe_code = "forbid"
 glue = ["rustcdc/glue", "dep:aws-config", "dep:aws-sdk-glue"]
 
 [dependencies]
-rustcdc = { version = "0.9.0", features = [
-    "postgres",
-    "mysql",
-    "mariadb",
-    "sqlserver",
+# `default-features = false` so that `rustcdc/postgres` — which is in rustcdc's own
+# default set — arrives through *our* `postgres` feature and nowhere else. Without it,
+# `--no-default-features` here would still drag the PostgreSQL connector in, and the
+# feature split would be decorative.
+rustcdc = { version = "0.12.0", default-features = false, features = [
+    "tls",
     "metrics",
     "avro",
     "schemreg",
@@ -72,7 +111,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # Web / admin API
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-tower-http = { version = "0.6", features = ["trace", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "catch-panic"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rustls = "0.23"
 # PEM parsing comes from rustls-pki-types, not the unmaintained `rustls-pemfile`
@@ -85,7 +124,25 @@ url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = { version = "0.32" }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "metrics"] }
+# `default-features = false` to drop `logs`, which nothing here exports.
+#
+# `reqwest-blocking-client` is deliberate and **not** an oversight: the OTLP/HTTP exporter
+# is driven by the SDK's batch processor, which runs on its own dedicated OS thread
+# (`OpenTelemetry.Traces.BatchProcessor`) with no tokio reactor attached. The async
+# `reqwest-client` panics there with "there is no reactor running" on the first export —
+# caught by `the_http_protocol_actually_speaks_otlp_over_http`, which drives a real
+# exporter at a real socket rather than asserting the config mapping.
+#
+# `reqwest-rustls` keeps the exporter on the one TLS stack this project links.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "grpc-tonic",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+    "trace",
+    "metrics",
+    "internal-logs",
+] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics"] }
 tracing-opentelemetry = "0.33"
 
@@ -107,7 +164,7 @@ tokio-postgres = "0.7"
 # installed in main.rs) and every compression codec the docs offer (zstd is not
 # in krafka's default set — without compression-all a `compression = "zstd"`
 # config would fail validation at startup).
-krafka = { version = "0.16.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
+krafka = { version = "0.18.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
 
 # AWS SDK, only for the optional `glue` feature: the Glue registry client is
 # constructed from an `aws_sdk_glue::Client`, which needs the credential chain.
@@ -129,6 +186,10 @@ opendal = { version = "0.57", features = ["services-fs", "services-s3", "service
 name = "pipeline"
 harness = false
 
+[[bench]]
+name = "throughput"
+harness = false
+
 [dev-dependencies]
 # Drives the real axum router in-process, so the security suite probes the same
 # middleware, extractors and handlers a network client would hit — not a
@@ -137,16 +198,19 @@ tower = { version = "0.5", features = ["util"] }
 # Statistical benchmarking with baseline comparison — the regression gate for the
 # hot path (CR-004). `default-features = false` drops the unmaintained `plotters`
 # tree; cargo-deny flags it and the HTML report is not what CI consumes.
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+# `async_tokio` for `benches/throughput.rs`, which measures the real async batch path.
+# `default-features = false` still drops the unmaintained `plotters` tree that cargo-deny
+# flags; the HTML report is not what CI consumes.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
 # test-harnesses: rustcdc's `testkit::AdapterConformanceSuite`, so the sinks are
 # checked against the library's own adapter contract instead of a local restatement.
-rustcdc = { version = "0.9.0", features = ["test-harnesses"] }
+rustcdc = { version = "0.12.0", features = ["test-harnesses"] }
 wat = "1"
 # test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
 # in unit tests without Docker.
-krafka = { version = "0.16.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
+krafka = { version = "0.18.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
 
 # Benchmarks compile against the dev-dependency graph, which carries rustcdc's
 # `test-harnesses` feature (the delivery-contract tests need its fault injection).

@@ -317,3 +317,63 @@ groups:
             throughput, and whether the pipeline is working through a backlog
             after a restart -- a recovering pipeline breaches this legitimately
             and should clear on its own.
+
+      - alert: RUSTCDCSnapshotRequestsRefused
+        expr: increase(rustcdc_snapshot_requests_refused_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            An on-demand incremental snapshot request was refused in the last
+            15 minutes.
+          description: >
+            `POST /signals` with action_type=execute_snapshot did not reach the
+            pipeline.  The usual causes are a config with no
+            [incremental_snapshot] section (there is no snapshot for the
+            requested tables to join), a table name that does not resolve or has
+            no primary key, or a pipeline too busy to answer within the request
+            budget.  This matters because the request is *asynchronous*: the
+            caller was answered STARTED and the refusal only appears on the
+            notification stream, so an operator who fired the request and moved
+            on has no reason to think the backfill is not running.  The
+            corresponding terminal audit entry names the exact reason.
+
+      - alert: RUSTCDCSignalWorkerDown
+        expr: rustcdc_admin_signal_worker_alive == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            The signal-action worker is not running; the control plane is dead
+            while the process looks healthy.
+          description: >
+            Every control signal — execute_snapshot, pause/resume/stop_snapshot
+            — is executed by one background task.  If it exits, the pipeline
+            keeps capturing and `/status` keeps reporting
+            snapshot_requests_available=true, and `POST /signals` keeps
+            answering STARTED, while every queued action is silently never
+            executed.  Nothing recovers short of a process restart.
+            RUSTCDCSignalWithoutTerminalNotification also fires eventually, but
+            it names a symptom ("actions are not reaching a terminal state")
+            that a merely slow pipeline produces too; this names the cause.
+            Restart the process.  A panic that was *recovered* shows up as
+            rustcdc_admin_signal_worker_panics_total instead and does not
+            trigger this alert — the worker survived.
+
+      - alert: RUSTCDCSignalActionPanicked
+        expr: increase(rustcdc_admin_signal_worker_panics_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            A signal action panicked and was recovered in the last hour.
+          description: >
+            The worker caught the panic, released the signal's in-flight guard
+            so it can be retried, and carried on — so this is not an outage.
+            It is a bug that reached production: an action panicked rather than
+            returning an error.  The audit trail carries the panic message under
+            action=signal_action_panicked with the signal id.  Treat it as a
+            defect report, not an incident.

@@ -101,6 +101,51 @@ slot:
 - After a batch is delivered to the sink, the connector acknowledges the LSN to
   PostgreSQL, allowing WAL segments to be reclaimed
 
+### WAL transport — how the stream is read
+
+PostgreSQL offers two ways to consume a logical replication slot, and they are not
+equivalent. `source.postgres.wal_transport` selects between them.
+
+| Value | Mechanism | When |
+|---|---|---|
+| `"streaming_replication"` *(default)* | `START_REPLICATION ... LOGICAL` over the streaming replication protocol — what `pg_recvlogical` and PostgreSQL's own subscribers use | Always, unless one of the constraints below applies |
+| `"sql_peek"` | `pg_logical_slot_peek_binary_changes()` over an ordinary SQL connection | Fallback for environments that cannot grant a replication connection |
+
+Under `streaming_replication` the server **pushes** WAL as it is written over a
+long-lived connection, and progress is reported with Standby Status Updates. Latency
+is not bounded by `stream_poll_interval_ms`.
+
+`sql_peek` is slower by construction, and the cost grows with the workload rather
+than staying constant. The peek is non-consuming: PostgreSQL begins decoding at the
+slot's `restart_lsn` and only emits past `confirmed_flush_lsn`, so **any long-running
+transaction on the source pins `restart_lsn` and every poll re-reads the WAL between
+the two**. Delivery latency is also bounded by the poll interval rather than pushed
+by the server. Selecting it logs a warning at startup — including from
+`validate-config` and `dry-run`, so a config review catches it before a deploy does.
+
+Reach for `sql_peek` only when you cannot fix the environment:
+
+- a managed service that withholds the `REPLICATION` attribute from the application role
+- a connection routed through a pooler in transaction-pooling mode, which cannot carry
+  a replication stream
+
+```toml
+[source.postgres]
+wal_transport = "streaming_replication"   # or "sql_peek"
+```
+
+> **Out-of-band slot operations need the pipeline stopped.** Under
+> `streaming_replication` a walsender holds the slot for the life of the stream, and
+> PostgreSQL refuses `pg_replication_slot_advance` or `pg_drop_replication_slot` on an
+> active slot. Stop the pipeline first; an operator script that runs alongside a live
+> one fails with *"replication slot is active for PID N"*. This did not apply under
+> `sql_peek`, where nothing held the slot persistently.
+
+> **TLS is now enforced, not preferred.** A connector configured with
+> `transport.mode = "tls"` against a server with `ssl = off` fails to connect instead
+> of silently falling back to an unencrypted connection. Either enable TLS on the
+> server or set `mode = "plaintext"` explicitly.
+
 ### Offset / LSN
 
 The checkpoint stored by rustcdc is the WAL **Log Sequence Number (LSN)**, for
@@ -435,6 +480,9 @@ create_replication_slot_if_missing = false   # true only for first-time provisio
 failover_slot                      = false   # PostgreSQL 17+: create failover-enabled slots
 slot_idle_advance_interval_ms      = 30000   # idle slot advance; 0 disables (not recommended)
 
+# WAL transport
+wal_transport = "streaming_replication"   # streaming_replication | sql_peek
+
 # Polling
 stream_poll_interval_ms = 100
 max_events_per_poll     = 1000
@@ -463,7 +511,8 @@ mode = "plaintext"    # plaintext | tls
 | `create_replication_slot_if_missing` | `false` | Allow the connector to create a missing slot. Keep `false` in production: a vanished slot is a data-loss event, and recreating it silently resumes from "now" and skips everything in between |
 | `failover_slot` | `false` | PostgreSQL 17+: create the slot with `failover = true` so it is synchronized to standbys and capture survives promotion. Only applies when the connector creates the slot; requires cluster-side sync configuration |
 | `slot_idle_advance_interval_ms` | `30000` | Advance the slot when no committed events arrive so PostgreSQL can recycle WAL. `0` disables (not recommended for long-lived streams) |
-| `stream_poll_interval_ms` | — | Stream poll interval in milliseconds |
+| `wal_transport` | `"streaming_replication"` | How the WAL stream is read. `"sql_peek"` is the fallback for a role without `REPLICATION` or a connection that must route through a pooler — see [WAL transport](#wal-transport-how-the-stream-is-read) for the cost |
+| `stream_poll_interval_ms` | — | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
 | `max_events_per_poll` | — | Maximum events yielded per poll cycle |
 | `table_include_list` | empty (= all) | Exact `schema.table` names to capture; takes precedence over the exclude list |
 | `table_exclude_list` | empty | Exact `schema.table` names to suppress; ignored when the include list is non-empty |

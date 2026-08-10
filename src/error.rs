@@ -74,18 +74,21 @@ impl AppError {
     /// we do not understand risks an infinite loop against a permanent failure, and a
     /// terminal error is at least loud.
     ///
-    /// # Known limitation: flush errors arrive unclassified
+    /// # Flush errors keep their classification (since rustcdc 0.11)
     ///
-    /// `TableRouter::send` passes a sink's error through untouched, so send-path
-    /// failures keep their classification and are retried. `TableRouter::flush_all`
-    /// does not: it collects each sink's error into a string and returns a single
-    /// `Error::StateError`, which upstream classifies as Terminal. A transient network
-    /// failure surfacing during flush is therefore treated as fatal here.
+    /// `TableRouter::send` passes a sink's error through untouched, so send-path failures
+    /// have always kept their classification. `flush_all` and `close_all` used to flatten
+    /// every branch's error into one string and return `Error::StateError`, which is
+    /// `ErrorKind::Terminal`: a broker leader election surfacing during flush became a
+    /// process exit, a restart and a full replay, while the identical failure surfacing
+    /// from `send` was retried. Which one you got was decided by batch boundaries.
     ///
-    /// This is deliberately **not** worked around by matching on message text — a
-    /// classifier built on string contents is worse than one that is conservative.
-    /// The correct fix is upstream: `flush_all` should preserve the most severe
-    /// underlying `ErrorKind` rather than flattening to a string.
+    /// We refused to work around that by matching on message text — a classifier built on
+    /// string contents is worse than one that is conservative — and reported it upstream
+    /// instead. 0.11 returns `Error::Aggregate { kind, detail }` from both, where `kind`
+    /// is the most severe `ErrorKind` among the branches, so `Error::kind` (and therefore
+    /// the `Self::Runtime` arm below) now classifies a fan-out failure by what actually
+    /// went wrong. `a_transient_flush_failure_is_retryable` holds that.
     pub fn is_recoverable(&self) -> bool {
         match self {
             Self::Runtime(err) => err.is_recoverable(),
@@ -195,6 +198,52 @@ mod tests {
         assert!(
             rendered.contains("No space left on device"),
             "root cause must survive: {rendered}"
+        );
+    }
+
+    /// A broker hiccup during `flush_all` must be retried, not treated as fatal.
+    ///
+    /// This is the property that used to fail. `flush_all` aggregated every branch's
+    /// error into `StateError`, which is Terminal, so the same reset connection was
+    /// retried when it surfaced from `send` and fatal when it surfaced from `flush` —
+    /// decided by where the batch boundary happened to fall. Since rustcdc 0.11 the
+    /// aggregate carries the most severe `ErrorKind` among its branches instead.
+    #[test]
+    fn a_transient_flush_failure_is_retryable() {
+        use rustcdc::core::Error as RtError;
+
+        let aggregated = RtError::aggregate(vec![(
+            "route 'public.*'".to_string(),
+            RtError::SourceError("connection reset by peer".to_string()),
+        )])
+        .expect_err("a failure list must aggregate into an error");
+
+        assert!(
+            AppError::Runtime(aggregated).is_recoverable(),
+            "a transient failure must stay retryable after aggregation"
+        );
+    }
+
+    /// …but the severest branch still wins, so a real fault is not retried forever.
+    #[test]
+    fn a_terminal_branch_makes_the_whole_aggregate_terminal() {
+        use rustcdc::core::Error as RtError;
+
+        let aggregated = RtError::aggregate(vec![
+            (
+                "route 'public.*'".to_string(),
+                RtError::SourceError("connection reset by peer".to_string()),
+            ),
+            (
+                "default".to_string(),
+                RtError::SchemaError("column 'total' vanished".to_string()),
+            ),
+        ])
+        .expect_err("a failure list must aggregate into an error");
+
+        assert!(
+            !AppError::Runtime(aggregated).is_recoverable(),
+            "one terminal branch must make the aggregate terminal"
         );
     }
 }

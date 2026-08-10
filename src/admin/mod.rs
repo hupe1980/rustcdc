@@ -1,5 +1,10 @@
 mod auth;
+mod notify;
+mod openapi;
+mod prometheus;
 mod rate_limit;
+mod signal_ledger;
+mod signals;
 mod tls;
 
 use auth::{
@@ -18,12 +23,16 @@ use axum::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
 use ed25519_dalek::{Signer, SigningKey};
-use krafka::consumer::{AutoOffsetReset, Consumer};
+use futures::FutureExt as _;
+use krafka::consumer::{AutoOffsetReset, Consumer, ConsumerRecord};
 use krafka::producer::{Acks, Producer, ProducerRecord};
+use notify::*;
+use prometheus::*;
 use rate_limit::{AbuseLimitScope, AdminAbuseGuard, RATE_LIMIT_STALE_CLIENT_TTL};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use signals::*;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -86,7 +95,6 @@ pub struct AdminStateData {
     pub checkpoint_age_seconds: Option<f64>,
     /// Replication slot lag in bytes, sampled every 15 s by the admin side-channel poller.
     /// `None` before the first successful sample or for non-PostgreSQL sources.
-    pub replication_slot_lag_bytes: Option<i64>,
     pub restart_recovery_seconds: Option<f64>,
     /// Consecutive source poll errors currently accumulated.
     ///
@@ -129,6 +137,27 @@ pub struct AdminStateData {
     pub signal_ingress_line_too_large_rejections_total: u64,
     pub signal_ingress_validation_rejections_total: u64,
     pub signal_action_queue_depth: usize,
+    /// On-demand snapshot requests the runtime accepted.
+    ///
+    /// Counted separately from the signal lifecycle because the audit trail is bounded to
+    /// 512 entries and lives only in memory: without these an operator scraping metrics
+    /// cannot tell a pipeline that has been asked to backfill four tables from one that
+    /// has been asked and refused every time.
+    pub snapshot_requests_accepted_total: u64,
+    /// On-demand snapshot requests the runtime refused, for any reason.
+    pub snapshot_requests_refused_total: u64,
+    /// Tables the runtime actually enqueued across all accepted requests.
+    ///
+    /// Not the same as the request count: one request carries many tables, and a table
+    /// already in progress is a no-op that the runtime does not re-enqueue.
+    pub snapshot_tables_enqueued_total: u64,
+    /// Whether this pipeline can service an on-demand snapshot at all.
+    ///
+    /// Reported so an operator can find out *before* firing a signal rather than by
+    /// reading an `ABORTED` notification afterwards — the request is asynchronous, so the
+    /// `POST` answers `STARTED` either way. It is `false` for any pipeline with no
+    /// `[incremental_snapshot]` section.
+    pub snapshot_requests_available: bool,
     pub notification_log_enabled: bool,
     pub notification_kafka_enabled: bool,
     pub notification_log_emitted_total: u64,
@@ -137,6 +166,12 @@ pub struct AdminStateData {
     pub notification_channel_emit_failures_total: HashMap<String, u64>,
     pub audit_entries_total: u64,
     pub audit_recent_entries: Vec<AuditTrailEntry>,
+    /// Signal actions that panicked and were recovered.
+    ///
+    /// Non-zero means a bug was hit *and* survived. It must be visible: the alternative is
+    /// inferring it from `signal_actions_without_terminal_total`, which fires 30 s later
+    /// and names a different thing.
+    pub signal_worker_panics_total: u64,
     /// Ed25519 signing key loaded from `CDC_AUDIT_SIGNING_KEY_HEX` at startup.
     #[serde(skip)]
     pub(crate) audit_signing_key: Option<ed25519_dalek::SigningKey>,
@@ -183,6 +218,13 @@ const AUDIT_TRAIL_MAX_ENTRIES: usize = 512;
 /// At 512 entries × 4 KiB per detail the ring buffer is bounded to ~2 MiB.
 const AUDIT_DETAIL_MAX_BYTES: usize = 4096;
 const SIGNAL_TERMINAL_TIMEOUT_SECONDS: i64 = 30;
+
+/// How often the Kafka ingress loop re-reads a dispatched signal's lifecycle state.
+///
+/// Short enough that a fast action (the common case — `execute_snapshot` returns once the
+/// tables are enqueued, not once they are read) does not add perceptible latency to the
+/// offset commit, long enough not to spin on the state lock.
+const SIGNAL_TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SIGNAL_ACTION_QUEUE_CAPACITY: usize = 128;
 const SIGNAL_INGRESS_MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Number of consecutive source poll errors that must accumulate before `/readyz`
@@ -205,11 +247,6 @@ struct AuditLogWriter {
     drop_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
-struct KafkaNotificationPublisher {
-    topic: String,
-    producer: Mutex<Producer>,
-}
-
 #[derive(Debug, Clone)]
 struct QueuedSignalAction {
     signal_id: String,
@@ -218,9 +255,35 @@ struct QueuedSignalAction {
     message: String,
     traceparent: Option<String>,
     additional_data: serde_json::Value,
+    /// Fully-qualified `"schema.table"` names an `execute_snapshot` applies to.
+    tables: Vec<String>,
+    /// Per-request row filters, overriding `incremental_snapshot.table_conditions`.
+    conditions: BTreeMap<String, String>,
     actor_source_ip: Option<String>,
     actor_token_id: String,
 }
+
+/// How long a queued `execute_snapshot` waits for the event loop to answer.
+///
+/// The loop picks requests up between polls, so the healthy wait is bounded by
+/// `runtime.max_poll_wait_ms` plus one batch's delivery — well under a second in any
+/// ordinary configuration. This ceiling exists so a wedged pipeline reports a timeout
+/// instead of pinning a signal-worker slot forever.
+///
+/// **Derived from [`SIGNAL_TERMINAL_TIMEOUT_SECONDS`] rather than chosen.** That constant
+/// is the budget after which a `STARTED` signal with no terminal state is counted as
+/// unhealthy and surfaces in the SLO reasons. A request timeout *above* it would make an
+/// ordinary in-flight snapshot look like a stuck worker, and the operator would be paged
+/// for a request that was about to answer. Staying inside it means the timeout always
+/// produces an explicit `ABORTED` — with a diagnostic naming the pipeline — before the
+/// health check has anything to complain about.
+const SNAPSHOT_REQUEST_TIMEOUT: Duration =
+    Duration::from_secs(SIGNAL_TERMINAL_TIMEOUT_SECONDS as u64 - 5);
+
+const _: () = assert!(
+    SNAPSHOT_REQUEST_TIMEOUT.as_secs() < SIGNAL_TERMINAL_TIMEOUT_SECONDS as u64,
+    "a snapshot request must time out before an unterminated signal is reported unhealthy"
+);
 
 #[derive(Debug, Clone)]
 struct SignalActionEnvelope {
@@ -230,6 +293,9 @@ struct SignalActionEnvelope {
     message: String,
     traceparent: Option<String>,
     additional_data: serde_json::Value,
+    tables: Vec<String>,
+    /// Per-request row filters, already validated against `tables`.
+    conditions: BTreeMap<String, String>,
     actor_source_ip: Option<String>,
     actor_token_id: String,
 }
@@ -267,6 +333,27 @@ impl SignalIngressSource {
     }
 }
 
+/// What one polled batch of Kafka signal records produced.
+struct KafkaIngestOutcome {
+    /// Records whose action reached a terminal state.
+    ingested: u64,
+    /// Whether the consumer may advance its committed offset past this batch.
+    ///
+    /// `false` means an action is still in flight past its terminal budget, and losing it
+    /// to a crash is worse than redelivering it — which the ledger makes a no-op anyway.
+    commit: bool,
+}
+
+/// A signal handed to the action pipeline, identified well enough to wait on.
+///
+/// The pair is the same key `signal_inflight` and `latest_signal_action_state` use — a
+/// signal id alone is not enough, because one id can carry several action types.
+#[derive(Debug, Clone)]
+struct DispatchedSignal {
+    signal_id: String,
+    action_type: String,
+}
+
 #[derive(Debug, Clone)]
 enum SignalActionExecutionResult {
     ExistingState {
@@ -297,91 +384,6 @@ enum SignalActionExecutionResult {
         error: String,
         retry_after_seconds: Option<u64>,
     },
-}
-
-impl KafkaNotificationPublisher {
-    async fn new(config: &AdminNotificationKafkaConfig) -> Result<Self, AppError> {
-        let auth = config.security.to_auth_config().map_err(|err| {
-            AppError::Other(format!(
-                "invalid admin.notification_kafka security configuration: {err}"
-            ))
-        })?;
-        let compression = config.compression.to_krafka().map_err(|err| {
-            AppError::Other(format!(
-                "invalid admin.notification_kafka compression configuration: {err}"
-            ))
-        })?;
-        let producer = Producer::builder()
-            .bootstrap_servers(config.normalized_brokers().join(","))
-            .client_id(config.client_id.clone())
-            .acks(Acks::All)
-            .idempotent(true)
-            .compression(compression)
-            .retries(config.retry_max_attempts)
-            .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
-            .request_timeout(Duration::from_millis(config.ack_timeout_ms))
-            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-                config.ack_timeout_ms,
-            )))
-            .delivery_timeout(Duration::from_millis(
-                config.ack_timeout_ms.saturating_add(
-                    config
-                        .retry_backoff_ms
-                        .saturating_mul(config.retry_max_attempts as u64),
-                ),
-            ))
-            .max_in_flight(5)
-            .auth(auth)
-            .build()
-            .await
-            .map_err(|err| {
-                AppError::Other(format!(
-                    "failed to build admin.notification_kafka producer: {err}"
-                ))
-            })?;
-
-        Ok(Self {
-            topic: config.topic.clone(),
-            producer: Mutex::new(producer),
-        })
-    }
-
-    async fn send_event(&self, event: &serde_json::Value) -> Result<(), AppError> {
-        let payload = serde_json::to_vec(event).map_err(|err| {
-            AppError::Other(format!("failed to serialize notification event: {err}"))
-        })?;
-        let key = event
-            .get("signalid")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("notification")
-            .as_bytes()
-            .to_vec();
-
-        let record = ProducerRecord::new(self.topic.clone(), payload).with_key(key);
-        let producer = self.producer.lock().await;
-        let metadata = producer.send_record(record).await.map_err(|err| {
-            AppError::Other(format!(
-                "failed to emit notification event to admin.notification_kafka topic {}: {err}",
-                self.topic
-            ))
-        })?;
-        crate::sink::enforce_durable_confirmation(&metadata, "notification")
-            .map_err(|e| AppError::Other(e.to_string()))?;
-        producer.flush().await.map_err(|err| {
-            AppError::Other(format!(
-                "failed to flush admin.notification_kafka topic {}: {err}",
-                self.topic
-            ))
-        })?;
-
-        Ok(())
-    }
-}
-
-async fn build_kafka_notification_publisher(
-    config: &AdminNotificationKafkaConfig,
-) -> Result<Arc<KafkaNotificationPublisher>, AppError> {
-    KafkaNotificationPublisher::new(config).await.map(Arc::new)
 }
 
 impl AuditLogWriter {
@@ -488,7 +490,36 @@ pub struct AdminState {
     notification_log: Option<Arc<AuditLogWriter>>,
     notification_kafka: Option<Arc<KafkaNotificationPublisher>>,
     signal_action_tx: mpsc::Sender<QueuedSignalAction>,
+    /// The runtime's control handle, installed once the runtime exists.
+    ///
+    /// A `OnceLock` rather than a constructor argument because `AdminState` is built
+    /// before `CdcRuntime` — the admin server must be answering `/healthz` while the
+    /// source connection is still being established. Absent means "this process cannot
+    /// snapshot", which any pipeline without `[incremental_snapshot]` legitimately is,
+    /// and which the signal path reports rather than papers over.
+    ///
+    /// This used to be an `mpsc::Sender<SnapshotRequest>` feeding a hand-built bridge —
+    /// a request type, a oneshot reply, and a drain point in the event loop — because
+    /// every control operation on `CdcRuntime` took `&mut self` and the loop owns that
+    /// borrow for its lifetime. rustcdc 0.11's `RuntimeControl` is that bridge, written
+    /// once upstream where the invariants live, so all of it is gone.
+    runtime_control: Arc<std::sync::OnceLock<rustcdc::core::RuntimeControl>>,
     signal_inflight: Arc<DashMap<(String, String), ()>>,
+    /// How long the Kafka ingress loop waits for a dispatched signal to reach a terminal
+    /// state before holding the offset.
+    ///
+    /// A field rather than the bare constant so tests can exercise the timeout path in
+    /// milliseconds. At the production budget of 30 s the case where this matters — an
+    /// action still in flight, so the offset must *not* advance and the record must *not*
+    /// be ledgered — is not something a unit test can wait for, and it is exactly the
+    /// ordering that distinguishes this from the at-most-once version.
+    signal_terminal_budget: Duration,
+    /// Signal-ingress records whose action already reached a terminal state.
+    ///
+    /// Durable, unlike `signal_inflight` and the audit ring, so the Kafka ingress channel
+    /// can commit its offsets *after* an action completes rather than before it starts.
+    /// `None` only where the state directory is unavailable — in hand-built test states.
+    signal_ledger: Option<Arc<signal_ledger::ProcessedSignalLedger>>,
     /// Aggregate audit-log drop counter sourced directly from the `AuditLogWriter`
     /// atomics — does not require holding the `RwLock<AdminStateData>` write lock.
     audit_log_drop_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -540,6 +571,11 @@ const ADMIN_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 struct AdminWorkers {
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
     handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// The signal-action worker, for liveness reporting only.
+    ///
+    /// An `AbortHandle` rather than a `JoinHandle` because the latter is owned by
+    /// `handles` for shutdown, and `is_finished` is all liveness needs.
+    signal_worker: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl AdminWorkers {
@@ -548,6 +584,7 @@ impl AdminWorkers {
         Self {
             shutdown_tx: Arc::new(shutdown_tx),
             handles: Arc::new(std::sync::Mutex::new(Vec::new())),
+            signal_worker: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -604,6 +641,12 @@ impl AdminState {
             None
         };
         let (signal_action_tx, signal_action_rx) = mpsc::channel(SIGNAL_ACTION_QUEUE_CAPACITY);
+        // Built unconditionally rather than only when the Kafka channel is configured: the
+        // ledger is cheap when unused, and building it lazily would mean the one path that
+        // needs durability is the one that could silently fail to get it.
+        let signal_ledger = Some(Arc::new(signal_ledger::ProcessedSignalLedger::open(
+            &config.state.offset.dir,
+        )?));
         let signal_ingress_file = config.admin.signal_ingress_file.clone();
         let signal_ingress_kafka = config.admin.signal_ingress_kafka.clone();
         let state = Self {
@@ -622,7 +665,6 @@ impl AdminState {
                 admin_api_latency_us_sum: 0.0,
                 admin_api_latency_us_count: 0,
                 checkpoint_age_seconds: None,
-                replication_slot_lag_bytes: None,
                 restart_recovery_seconds: None,
                 source_consecutive_errors: 0,
                 degraded_since: None,
@@ -655,6 +697,10 @@ impl AdminState {
                 signal_ingress_line_too_large_rejections_total: 0,
                 signal_ingress_validation_rejections_total: 0,
                 signal_action_queue_depth: 0,
+                snapshot_requests_accepted_total: 0,
+                snapshot_requests_refused_total: 0,
+                snapshot_tables_enqueued_total: 0,
+                snapshot_requests_available: false,
                 notification_log_enabled: notification_log.is_some(),
                 notification_kafka_enabled: notification_kafka.is_some(),
                 notification_log_emitted_total: 0,
@@ -663,6 +709,7 @@ impl AdminState {
                 notification_channel_emit_failures_total: HashMap::new(),
                 audit_entries_total: 0,
                 audit_recent_entries: Vec::new(),
+                signal_worker_panics_total: 0,
                 audit_signing_key: load_audit_signing_key(&config.admin),
                 audit_ip_pseudonymise: config.admin.audit_ip_pseudonymise,
                 audit_ip_salt: resolve_audit_ip_salt(&config.admin),
@@ -678,7 +725,10 @@ impl AdminState {
             notification_log,
             notification_kafka,
             signal_action_tx,
+            runtime_control: Arc::new(std::sync::OnceLock::new()),
             signal_inflight: Arc::new(DashMap::new()),
+            signal_terminal_budget: Duration::from_secs(SIGNAL_TERMINAL_TIMEOUT_SECONDS as u64),
+            signal_ledger,
             workers: AdminWorkers::new(),
             notification_broadcast: Arc::new(
                 tokio::sync::broadcast::channel(NOTIFICATION_STREAM_BUFFER).0,
@@ -751,10 +801,28 @@ impl AdminState {
         }));
     }
 
+    /// Is the signal-action worker still running?
+    ///
+    /// `JoinHandle::is_finished` is the direct observation. Anything derived — a heartbeat
+    /// timestamp, a queue depth — reports "no work happened recently", which a quiet
+    /// control plane also reports. Those are different states and an operator needs to tell
+    /// them apart.
+    fn signal_worker_alive(&self) -> bool {
+        self.workers
+            .signal_worker
+            .lock()
+            .ok()
+            .and_then(|handle| handle.as_ref().map(|h| !h.is_finished()))
+            // No handle means the worker was never spawned, which only happens in
+            // hand-built test states. Reporting "alive" there avoids a false alarm about a
+            // worker that was never meant to exist.
+            .unwrap_or(true)
+    }
+
     fn spawn_signal_action_worker(&self, mut rx: mpsc::Receiver<QueuedSignalAction>) {
         let worker_state = self.clone();
         let mut shutdown = self.workers.subscribe();
-        self.workers.track(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 let action = tokio::select! {
                     action = rx.recv() => match action {
@@ -768,20 +836,95 @@ impl AdminState {
                     data.signal_action_queue_depth =
                         data.signal_action_queue_depth.saturating_sub(1);
                 }
-                worker_state.process_queued_signal_action(action).await;
+                // **A panic here must not take the control plane with it.**
+                //
+                // Without this the task dies and never returns. The pipeline keeps
+                // capturing, `/status` keeps reporting `snapshot_requests_available:
+                // true`, and `POST /signals` keeps answering `STARTED` — while every
+                // queued action is silently never executed. The SLO does catch it 30 s
+                // later, but it names the symptom ("actions are not reaching a terminal
+                // state") rather than the cause, and nothing recovers short of a process
+                // restart. A live-looking process with a dead subsystem is the worst
+                // shape an on-call can be handed.
+                //
+                // Note the asymmetry this removes: `panic_guard()` already wraps the HTTP
+                // layer in a `CatchPanicLayer`, so a panicking *handler* returns 500 and
+                // the server survives. The workers behind those handlers had no
+                // equivalent.
+                let signal_id = action.signal_id.clone();
+                let inflight_key = (
+                    action.signal_id.clone(),
+                    action.action_type.as_str().to_string(),
+                );
+                let outcome =
+                    std::panic::AssertUnwindSafe(worker_state.process_queued_signal_action(action))
+                        .catch_unwind()
+                        .await;
+
+                if let Err(panic) = outcome {
+                    // Release the in-flight guard, or this (signal_id, action_type) is
+                    // permanently unusable: `execute_signal_action_envelope` reads a
+                    // present entry as "already running" and refuses every retry.
+                    worker_state.signal_inflight.remove(&inflight_key);
+                    worker_state.record_signal_worker_panic().await;
+                    tracing::error!(
+                        target: "rustcdc_audit",
+                        action = "signal_action_panicked",
+                        signal_id = %signal_id,
+                        panic = %panic_message(&panic),
+                        "a signal action panicked; the worker has recovered and the signal \
+                         is released for retry"
+                    );
+                }
             }
-        }));
+        });
+        // Tracked twice on purpose: `workers.handles` owns shutdown, and `signal_worker`
+        // holds a second handle purely so liveness can be observed without draining the
+        // shutdown list.
+        if let Ok(mut slot) = self.workers.signal_worker.lock() {
+            *slot = Some(handle.abort_handle());
+        }
+        self.workers.track(handle);
+    }
+
+    /// Count a recovered worker panic, for `rustcdc_admin_signal_worker_panics_total`.
+    async fn record_signal_worker_panic(&self) {
+        let mut data = self.data.write().await;
+        data.signal_worker_panics_total = data.signal_worker_panics_total.saturating_add(1);
     }
 
     fn spawn_signal_ingress_file_worker(&self, path: PathBuf) {
         let worker_state = self.clone();
         let mut shutdown = self.workers.subscribe();
+
+        // **Start at the end of the file, not the beginning.**
+        //
+        // This offset is process-local — nothing persists it — so starting at 0 meant
+        // every restart re-read the whole file and **re-executed every signal in it**.
+        // While `execute_snapshot` was a no-op that only produced duplicate audit
+        // entries; now it snapshots, and rustcdc rewinds an already-complete table and
+        // reads it again, so a restart re-scanned every table ever requested through this
+        // channel. A file that accumulates signals over months turns each restart into a
+        // full re-read of all of them.
+        //
+        // The file is a live channel, not a durable queue: a signal appended while the
+        // server is down is not processed. That is the safe direction — the operator gets
+        // no `STARTED` notification and can see it did not run, whereas a replay is
+        // indistinguishable from normal operation. Use the Kafka ingress channel when
+        // signals must survive a restart; it has real committed offsets.
+        //
+        // Read **here**, not inside the task: the spawn only queues the future, so taking
+        // the length on first poll would race anything appended between `AdminState::new`
+        // returning and the scheduler getting to it — and lose exactly the signals sent
+        // immediately after startup, non-deterministically.
+        let mut offset: u64 = std::fs::metadata(&path).map_or(0, |m| m.len());
+
         self.workers.track(tokio::spawn(async move {
             {
-                let mut offset: u64 = 0;
-
                 loop {
                     if let Ok(metadata) = std::fs::metadata(&path) {
+                        // Truncated or rotated: the bytes this offset described are gone,
+                        // so re-read from the start of whatever replaced them.
                         if metadata.len() < offset {
                             offset = 0;
                         }
@@ -828,12 +971,17 @@ impl AdminState {
                                     continue;
                                 }
 
+                                // The file channel has no durable cursor to protect —
+                                // it deliberately starts at EOF and never replays — so it
+                                // only counts what it dispatched, and does not wait for a
+                                // terminal state the way the Kafka loop must.
                                 if worker_state
                                     .process_signal_ingress_payload(
                                         &line,
                                         SignalIngressSource::File,
                                     )
                                     .await
+                                    .is_some()
                                 {
                                     ingested_lines = ingested_lines.saturating_add(1);
                                 }
@@ -898,7 +1046,23 @@ impl AdminState {
                         .bootstrap_servers(config.normalized_brokers().join(","))
                         .group_id(config.group_id.clone())
                         .client_id(config.client_id.clone())
-                        .auto_offset_reset(AutoOffsetReset::Earliest)
+                        // **A signal is a command, not state.** `Earliest` meant that a
+                        // group with no committed offset — a first start, a renamed
+                        // `group_id`, or a group whose offsets aged out of
+                        // `offsets.retention.minutes` — replayed the entire signal topic
+                        // and **re-executed every `execute_snapshot` in its history**.
+                        // rustcdc rewinds an already-complete table and reads it again, so
+                        // that is a full re-scan of every table ever requested, plus the
+                        // duplicate `read` events downstream.
+                        //
+                        // The in-memory idempotency guard does not cover it: replayed
+                        // signal ids are deduplicated against `audit_recent_entries`, which
+                        // holds 512 entries and starts empty on every boot.
+                        //
+                        // `Latest` keeps the useful case — a committed offset still wins,
+                        // so signals sent during a brief restart are processed — and drops
+                        // only commands issued to a consumer that had never run.
+                        .auto_offset_reset(AutoOffsetReset::Latest)
                         .enable_auto_commit(false)
                         .request_timeout(Duration::from_millis(1_000))
                         .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
@@ -958,30 +1122,18 @@ impl AdminState {
                             continue;
                         }
 
-                        let mut ingested_records = 0_u64;
-                        for record in records {
-                            let Some(value) = &record.value else {
-                                continue;
-                            };
+                        let outcome = worker_state.ingest_kafka_signal_batch(records).await;
+                        let ingested_records = outcome.ingested;
 
-                            if worker_state
-                                .process_signal_ingress_payload(
-                                    value.as_ref(),
-                                    SignalIngressSource::Kafka,
-                                )
-                                .await
-                            {
-                                ingested_records = ingested_records.saturating_add(1);
+                        if outcome.commit {
+                            if let Err(error) = consumer.commit().await {
+                                tracing::warn!(
+                                    target: "rustcdc_audit",
+                                    action = "signal_ingress_kafka_commit_failed",
+                                    error = %error,
+                                    "failed committing kafka signal ingress offsets"
+                                );
                             }
-                        }
-
-                        if let Err(error) = consumer.commit().await {
-                            tracing::warn!(
-                                target: "rustcdc_audit",
-                                action = "signal_ingress_kafka_commit_failed",
-                                error = %error,
-                                "failed committing kafka signal ingress offsets"
-                            );
                         }
 
                         if ingested_records > 0 {
@@ -1002,13 +1154,20 @@ impl AdminState {
         }));
     }
 
+    /// Feed one ingress payload through the signal pipeline.
+    ///
+    /// Returns the `(signal_id, action_type)` that was dispatched, so a caller that owns a
+    /// durable cursor — the Kafka ingress loop — can wait for the action to reach a
+    /// terminal state before committing past it. `None` means nothing was dispatched:
+    /// blank, oversized, unparseable, or rejected by validation. Those are settled
+    /// decisions, not pending work.
     async fn process_signal_ingress_payload(
         &self,
         payload: &[u8],
         source: SignalIngressSource,
-    ) -> bool {
+    ) -> Option<DispatchedSignal> {
         if payload.iter().all(|b| b.is_ascii_whitespace()) {
-            return false;
+            return None;
         }
 
         if payload.len() > SIGNAL_INGRESS_MAX_LINE_BYTES {
@@ -1021,7 +1180,7 @@ impl AdminState {
                 payload_bytes = payload.len(),
                 "rejected oversized signal ingress payload"
             );
-            return false;
+            return None;
         }
 
         let record = match serde_json::from_slice::<SignalIngressRecord>(payload) {
@@ -1035,12 +1194,11 @@ impl AdminState {
                     error = %error,
                     "failed to parse signal ingress record"
                 );
-                return false;
+                return None;
             }
         };
 
-        self.process_signal_ingress_record(record, source).await;
-        true
+        self.process_signal_ingress_record(record, source).await
     }
 
     #[cfg(test)]
@@ -1052,13 +1210,14 @@ impl AdminState {
     pub async fn process_source_signal_ingress_payload(&self, payload: &[u8]) -> bool {
         self.process_signal_ingress_payload(payload, SignalIngressSource::Source)
             .await
+            .is_some()
     }
 
     async fn process_signal_ingress_record(
         &self,
         record: SignalIngressRecord,
         source: SignalIngressSource,
-    ) {
+    ) -> Option<DispatchedSignal> {
         let message = record.message.unwrap_or_default().trim().to_string();
         if matches!(record.action_type, SignalActionType::LogMarker) && message.is_empty() {
             self.record_signal_ingress_validation_rejection().await;
@@ -1069,14 +1228,47 @@ impl AdminState {
                 ingress_channel = source.channel_label(),
                 "ignoring log_marker ingress record with empty message"
             );
-            return;
+            return None;
         }
+
+        let tables = match validate_signal_tables(record.action_type, record.tables) {
+            Ok(tables) => tables,
+            Err(error) => {
+                self.record_signal_ingress_validation_rejection().await;
+                tracing::warn!(
+                    target: "rustcdc_audit",
+                    action = "signal_ingress_rejected",
+                    reason = "invalid_tables",
+                    ingress_channel = source.channel_label(),
+                    error = %error,
+                    "ignoring ingress record with an unusable table list"
+                );
+                return None;
+            }
+        };
 
         let signal_id =
             normalize_optional_id(record.signal_id.as_deref()).unwrap_or_else(generated_signal_id);
         let correlation_id = normalize_optional_id(record.correlation_id.as_deref())
             .unwrap_or_else(|| signal_id.clone());
         let traceparent = normalize_optional_id(record.traceparent.as_deref());
+        let conditions =
+            match validate_signal_conditions(record.action_type, &tables, record.conditions) {
+                Ok(conditions) => conditions,
+                Err(error) => {
+                    self.record_signal_ingress_validation_rejection().await;
+                    tracing::warn!(
+                        target: "rustcdc_audit",
+                        action = "signal_ingress_rejected",
+                        reason = "invalid_conditions",
+                        ingress_channel = source.channel_label(),
+                        error = %error,
+                        "ignoring ingress record with an unusable row filter"
+                    );
+                    return None;
+                }
+            };
+
         let envelope = SignalActionEnvelope {
             signal_id,
             correlation_id,
@@ -1084,27 +1276,329 @@ impl AdminState {
             message,
             traceparent,
             additional_data: record.additional_data.unwrap_or(serde_json::Value::Null),
+            tables,
+            conditions,
             actor_source_ip: Some(source.actor_source_ip().to_string()),
             actor_token_id: source.actor_token_id().to_string(),
         };
 
         let result = self.execute_signal_action_envelope(envelope).await;
-        if let SignalActionExecutionResult::Aborted {
-            signal_id,
-            action_type,
-            error,
-            ..
-        } = result
-        {
+        match result {
+            SignalActionExecutionResult::Aborted {
+                signal_id,
+                action_type,
+                error,
+                ..
+            } => {
+                tracing::warn!(
+                    target: "rustcdc_audit",
+                    action = "signal_ingress_aborted",
+                    ingress_channel = source.channel_label(),
+                    signal_id = %signal_id,
+                    action_type = %action_type,
+                    error = %error,
+                    "ingress signal action aborted"
+                );
+                // Terminal already: the ABORTED lifecycle entry is written. Reporting it
+                // as still-pending would make the ingress loop wait out its whole terminal
+                // budget for a state that will never change.
+                None
+            }
+            SignalActionExecutionResult::ExistingState {
+                signal_id,
+                action_type,
+                ..
+            }
+            | SignalActionExecutionResult::Started {
+                signal_id,
+                action_type,
+                ..
+            }
+            | SignalActionExecutionResult::Terminal {
+                signal_id,
+                action_type,
+                ..
+            } => Some(DispatchedSignal {
+                signal_id,
+                action_type,
+            }),
+        }
+    }
+
+    /// Ingest one polled batch of Kafka signal records, reporting whether to commit.
+    ///
+    /// Extracted from the ingress worker so a test can drive it directly. The worker's
+    /// remaining job is polling and committing; everything that decides *whether* the
+    /// offset may advance lives here, which is the part with a correctness argument.
+    async fn ingest_kafka_signal_batch(&self, records: Vec<ConsumerRecord>) -> KafkaIngestOutcome {
+        // **Commit after the action is decided, never before it starts.**
+        //
+        // This loop used to call `commit()` unconditionally once every
+        // record had been *queued*. An async action — every
+        // `execute_snapshot` — had not run at that point, so a crash
+        // between the commit and the worker draining the queue lost the
+        // command permanently: a `STARTED` entry in a 512-entry in-memory
+        // ring that the restart then emptied, and no terminal state. The
+        // channel documented as the durable one was at-most-once.
+        //
+        // The reason it was written that way is that the opposite trade is
+        // also bad: redelivering an `execute_snapshot` re-runs it, and
+        // rustcdc rewinds an already-complete table and reads it again.
+        // `ProcessedSignalLedger` removes the dilemma — a record whose
+        // action reached a terminal state is durably marked, so redelivery
+        // is a skip rather than a re-execution.
+        let mut ingested_records = 0_u64;
+        let mut commit_batch = true;
+        for record in records {
+            let ledger_key =
+                signal_ledger::kafka_ingress_key(&record.topic, record.partition, record.offset);
+            if self.signal_ingress_already_processed(&ledger_key) {
+                // Decided in a previous life; the offset simply had not
+                // been committed before the process went away.
+                continue;
+            }
+
+            let Some(value) = &record.value else {
+                self.mark_signal_ingress_processed(&ledger_key);
+                continue;
+            };
+
+            let dispatched = self
+                .process_signal_ingress_payload(value.as_ref(), SignalIngressSource::Kafka)
+                .await;
+
+            match dispatched {
+                // Rejected outright — blank, oversized, unparseable, or
+                // invalid. That verdict will not change on redelivery, so
+                // it is settled and the offset may advance past it.
+                None => self.mark_signal_ingress_processed(&ledger_key),
+                Some(dispatched) => {
+                    if self.await_signal_terminal(&dispatched).await {
+                        ingested_records = ingested_records.saturating_add(1);
+                        self.mark_signal_ingress_processed(&ledger_key);
+                    } else {
+                        // Still running past its terminal budget. Hold the
+                        // offset: the next poll redelivers this record and
+                        // the in-flight guard makes that a no-op until it
+                        // finishes. Committing here is the loss this whole
+                        // block exists to prevent.
+                        tracing::warn!(
+                            target: "rustcdc_audit",
+                            action = "signal_ingress_kafka_commit_deferred",
+                            topic = %record.topic,
+                            partition = record.partition,
+                            offset = record.offset,
+                            signal_id = %dispatched.signal_id,
+                            action_type = %dispatched.action_type,
+                            "signal action has not reported a terminal state; \
+                             holding the ingress offset rather than risking \
+                             the command being lost"
+                        );
+                        commit_batch = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        KafkaIngestOutcome {
+            ingested: ingested_records,
+            commit: commit_batch,
+        }
+    }
+
+    /// Has this ingress record's action already been decided in an earlier process?
+    ///
+    /// Without a ledger this is always `false`, which is the pre-existing behaviour: the
+    /// caller then relies on the offset commit alone.
+    fn signal_ingress_already_processed(&self, key: &str) -> bool {
+        self.signal_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.contains(key))
+    }
+
+    /// Durably mark an ingress record as decided, before its offset is committed.
+    ///
+    /// A write failure is logged and not propagated. The ledger makes redelivery *safe*;
+    /// it is not what makes delivery happen, and refusing to commit because a dedup cache
+    /// could not be written would stall the channel over a recoverable condition. The cost
+    /// of the failure is a possible duplicate after a crash, which is the behaviour this
+    /// channel had unconditionally before the ledger existed.
+    fn mark_signal_ingress_processed(&self, key: &str) {
+        let Some(ledger) = self.signal_ledger.as_ref() else {
+            return;
+        };
+        if let Err(error) = ledger.record(key) {
             tracing::warn!(
                 target: "rustcdc_audit",
-                action = "signal_ingress_aborted",
-                ingress_channel = source.channel_label(),
-                signal_id = %signal_id,
-                action_type = %action_type,
+                action = "signal_ingress_ledger_write_failed",
                 error = %error,
-                "ingress signal action aborted"
+                key = %key,
+                "could not durably record a processed signal; a crash before the offset \
+                 commit could redeliver and re-execute it"
             );
+        }
+    }
+
+    /// Wait for a dispatched signal to reach a terminal lifecycle state.
+    ///
+    /// Returns `false` on timeout, which the Kafka ingress loop reads as "do not commit
+    /// past this record yet". A slow action therefore holds the consumer offset instead of
+    /// risking the command being lost, and the next poll redelivers the same record — the
+    /// in-flight guard makes that a no-op while it is still running.
+    ///
+    /// Bounded by [`SIGNAL_TERMINAL_TIMEOUT_SECONDS`], the same budget the SLO uses for
+    /// "accepted but never reported a terminal state", so a signal that trips this is
+    /// already visible as `signal_actions_without_terminal_total`.
+    async fn await_signal_terminal(&self, dispatched: &DispatchedSignal) -> bool {
+        let deadline = tokio::time::Instant::now() + self.signal_terminal_budget;
+        loop {
+            {
+                let data = self.data.read().await;
+                match latest_signal_action_state(
+                    &data,
+                    &dispatched.signal_id,
+                    &dispatched.action_type,
+                ) {
+                    // Absent means the audit ring has already evicted it under load, which
+                    // this loop cannot distinguish from "never recorded". Treating it as
+                    // terminal is the safe reading: the alternative is holding the offset
+                    // forever on a signal whose outcome is unknowable from here.
+                    None => return true,
+                    Some(state) if state != "STARTED" => return true,
+                    Some(_) => {}
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(SIGNAL_TERMINAL_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Hand the admin API the channel the event loop listens on for snapshot requests.
+    ///
+    /// Called once, after `CdcRuntime::start()` has confirmed the pipeline can actually
+    /// service one. A second call is ignored: the first executor is the live one, and
+    /// silently replacing it would leave requests queued on a receiver nobody polls.
+    pub async fn attach_runtime_control(&self, control: rustcdc::core::RuntimeControl) {
+        if self.runtime_control.set(control).is_err() {
+            tracing::warn!("a runtime control handle is already attached; ignoring the second");
+            return;
+        }
+        self.data.write().await.snapshot_requests_available = true;
+    }
+
+    /// Advertise the snapshot capability without a runtime behind it.
+    ///
+    /// `RuntimeControl` is not constructible outside rustcdc, so the signal-path tests
+    /// assert the *dispatch* and reporting behaviour with the capability advertised and no
+    /// runtime attached. The end-to-end path — a real runtime servicing a real request —
+    /// is covered by `tests/integration_postgres.rs`, which is where it belongs.
+    #[cfg(test)]
+    async fn advertise_snapshot_capability(&self) {
+        self.data.write().await.snapshot_requests_available = true;
+    }
+
+    /// Ask the running pipeline to snapshot `tables`, returning how many it enqueued.
+    ///
+    /// The error is a rendered string rather than a typed error because every caller puts
+    /// it straight into an audit record and a notification payload, and the distinctions
+    /// that matter to an operator ("no such table", "snapshots are not configured") are
+    /// already in the message rustcdc produced.
+    async fn request_incremental_snapshot(
+        &self,
+        tables: Vec<String>,
+        conditions: BTreeMap<String, String>,
+    ) -> Result<usize, String> {
+        let outcome = self.dispatch_incremental_snapshot(tables, conditions).await;
+
+        // Counted here rather than at each `return`, so a future early exit cannot escape
+        // the accounting — a refusal that is not counted looks exactly like no request.
+        let mut data = self.data.write().await;
+        match &outcome {
+            Ok(enqueued) => {
+                data.snapshot_requests_accepted_total =
+                    data.snapshot_requests_accepted_total.saturating_add(1);
+                data.snapshot_tables_enqueued_total = data
+                    .snapshot_tables_enqueued_total
+                    .saturating_add(*enqueued as u64);
+            }
+            Err(_) => {
+                data.snapshot_requests_refused_total =
+                    data.snapshot_requests_refused_total.saturating_add(1);
+            }
+        }
+
+        outcome
+    }
+
+    /// Build the rustcdc request and hand it to the runtime.
+    ///
+    /// The per-request conditions override the configured `table_conditions` for the same
+    /// table; a table with no override keeps its configured filter. That merge happens
+    /// inside rustcdc, in one place, which is the fix for the defect where a runtime
+    /// request ran unfiltered and a restart then adopted the same table *with* the filter
+    /// — producing a table whose rows corresponded to no single predicate.
+    async fn dispatch_incremental_snapshot(
+        &self,
+        tables: Vec<String>,
+        conditions: BTreeMap<String, String>,
+    ) -> Result<usize, String> {
+        self.with_control("execute_snapshot", |control| async move {
+            let mut request = rustcdc::source::SnapshotRequest::new(tables);
+            for (table, condition) in conditions {
+                request = request.with_condition(table, condition);
+            }
+            control.request_incremental_snapshot_filtered(request).await
+        })
+        .await
+    }
+
+    /// Live incremental-snapshot progress, or `None` when nothing is in flight.
+    ///
+    /// Non-blocking by construction: rustcdc republishes this snapshot every poll and
+    /// `RuntimeControl::incremental_snapshot_state` reads the published copy, so a busy
+    /// pipeline cannot starve it and a stalled one cannot hang it. It is stale by at most
+    /// one poll, which is the right trade for a number an operator refreshes in a
+    /// dashboard.
+    ///
+    /// Before rustcdc 0.11 there was no way to answer this at all: an operator who fired
+    /// `execute_snapshot` learned how many tables were accepted and nothing after that,
+    /// which for a multi-hour backfill was the entire operational experience.
+    fn incremental_snapshot_progress(&self) -> Option<rustcdc::IncrementalSnapshotState> {
+        self.runtime_control
+            .get()
+            .and_then(|control| control.incremental_snapshot_state())
+    }
+
+    /// Run a control operation against the runtime, with the shared budget and messaging.
+    ///
+    /// The timeout is ours, not rustcdc's: commands are applied between polls, so a loop
+    /// that has stopped turning leaves one waiting, and the crate documents that a caller
+    /// with an SLO should impose one. Ours is derived from
+    /// [`SIGNAL_TERMINAL_TIMEOUT_SECONDS`] so a request always resolves before an
+    /// unterminated signal is reported unhealthy.
+    async fn with_control<T, F, Fut>(&self, action: &str, call: F) -> Result<T, String>
+    where
+        F: FnOnce(rustcdc::core::RuntimeControl) -> Fut,
+        Fut: std::future::Future<Output = rustcdc::core::Result<T>>,
+    {
+        let Some(control) = self.runtime_control.get() else {
+            return Err(format!(
+                "this pipeline cannot service '{action}': no [incremental_snapshot] section \
+                 is configured, so there is no snapshot to act on. Configure \
+                 incremental_snapshot.tables (it may be empty) and restart."
+            ));
+        };
+
+        match tokio::time::timeout(SNAPSHOT_REQUEST_TIMEOUT, call(control.clone())).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err(format!(
+                "the pipeline did not answer '{action}' within {}s; control commands are \
+                 applied between polls, so it may be blocked on the source or the sink",
+                SNAPSHOT_REQUEST_TIMEOUT.as_secs()
+            )),
         }
     }
 
@@ -1156,6 +1650,8 @@ impl AdminState {
             message,
             traceparent,
             additional_data,
+            tables,
+            conditions,
             actor_source_ip,
             actor_token_id,
         } = envelope;
@@ -1281,6 +1777,8 @@ impl AdminState {
                 message,
                 traceparent,
                 additional_data,
+                tables,
+                conditions,
                 actor_source_ip,
                 actor_token_id,
             };
@@ -1718,14 +2216,6 @@ impl AdminState {
         }
     }
 
-    /// Record the latest replication slot lag sampled by the background poller.
-    ///
-    /// Called every 15 s from the admin side-channel task (PostgreSQL sources only).
-    /// Pass `None` to signal that sampling failed so the metric reflects staleness.
-    pub async fn record_slot_lag(&self, lag_bytes: Option<i64>) {
-        self.data.write().await.replication_slot_lag_bytes = lag_bytes;
-    }
-
     /// Record consecutive source poll errors for the `/readyz` health signal.
     ///
     /// Pass `0` to indicate recovery (called implicitly by `record_batch`).
@@ -2053,22 +2543,137 @@ impl AdminState {
             .await;
         }
 
+        // Do the work the signal names, then report what happened.
+        //
+        // This block used to be absent: every queued action went straight to its terminal
+        // audit entry, so `execute_snapshot` recorded `COMPLETED` and emitted a
+        // notification saying so **without snapshotting anything**. The API reported
+        // success for an operation that did not exist, which is worse than not offering it
+        // — an operator watching the notification stream had no way to tell.
+        let outcome = self.run_signal_action(&action).await;
+
+        let (lifecycle_action, result, state, detail) = match outcome {
+            Ok(detail) => (
+                action.action_type.terminal_audit_action(),
+                action.action_type.terminal_result(),
+                action.action_type.terminal_state(),
+                detail,
+            ),
+            Err(error) => (
+                action.action_type.queue_rejected_audit_action(),
+                "failed",
+                "ABORTED",
+                serde_json::json!({ "error": error }),
+            ),
+        };
+
+        let additional_data = merge_signal_detail(action.additional_data, detail);
+
         self.append_signal_lifecycle_entry(
             &action.signal_id,
             &action.correlation_id,
             action.action_type,
-            action.action_type.terminal_audit_action(),
-            action.action_type.terminal_result(),
-            action.action_type.terminal_state(),
+            lifecycle_action,
+            result,
+            state,
             &action.message,
             action.traceparent,
-            action.additional_data,
+            additional_data,
             action.actor_source_ip,
             Some(action.actor_token_id),
         )
         .await;
 
         self.signal_inflight.remove(&key);
+    }
+
+    /// Perform a queued signal action, returning detail to attach to its terminal record.
+    async fn run_signal_action(
+        &self,
+        action: &QueuedSignalAction,
+    ) -> Result<serde_json::Value, String> {
+        // A deliberate panic, so the worker's recovery path can be tested through the real
+        // code rather than a restatement of it. There is no way to make a *real* action
+        // panic on demand, and a recovery path that has never actually unwound is a
+        // recovery path nobody has tested.
+        #[cfg(test)]
+        if action.message == PANIC_PROBE_MESSAGE {
+            panic!("deliberate panic from the signal-action panic probe");
+        }
+
+        match action.action_type {
+            SignalActionType::ExecuteSnapshot => {
+                let enqueued = self
+                    .request_incremental_snapshot(action.tables.clone(), action.conditions.clone())
+                    .await?;
+                tracing::info!(
+                    target: "rustcdc_audit",
+                    action = "signal_execute_snapshot",
+                    signal_id = %action.signal_id,
+                    enqueued,
+                    tables = ?action.tables,
+                    "incremental snapshot enqueued on the running pipeline"
+                );
+                Ok(serde_json::json!({
+                    "tables": action.tables,
+                    "tables_enqueued": enqueued,
+                }))
+            }
+            // `LogMarker` is the marker; writing the audit entry *is* the work.
+            SignalActionType::LogMarker => Ok(serde_json::Value::Null),
+
+            // Real operations since rustcdc 0.11. These returned `501` in the previous
+            // release because the runtime had no such control — and before *that* they
+            // answered `200 OK` and recorded `PAUSED` / `RESUMED` / `ABORTED` while doing
+            // nothing at all.
+            //
+            // The live change stream is untouched in every case: only chunk reading is
+            // affected, so a backfill loading a production primary during business hours
+            // can be held until the evening without stopping capture.
+            SignalActionType::PauseSnapshot => {
+                let already_paused = self
+                    .with_control("pause_snapshot", |control| async move {
+                        control.pause_incremental_snapshot().await
+                    })
+                    .await?;
+                Ok(serde_json::json!({ "already_paused": already_paused }))
+            }
+            SignalActionType::ResumeSnapshot => {
+                let was_paused = self
+                    .with_control("resume_snapshot", |control| async move {
+                        control.resume_incremental_snapshot().await
+                    })
+                    .await?;
+                Ok(serde_json::json!({ "was_paused": was_paused }))
+            }
+            SignalActionType::StopSnapshot => {
+                let tables_abandoned = self
+                    .with_control("stop_snapshot", |control| async move {
+                        control.stop_incremental_snapshot().await
+                    })
+                    .await?;
+                Ok(serde_json::json!({ "tables_abandoned": tables_abandoned }))
+            }
+        }
+    }
+}
+
+/// Fold execution detail into the caller's `additional_data`.
+///
+/// The operator's own payload is preserved: it is what correlates the signal with
+/// whatever raised it, and overwriting it to report an outcome would trade one useful
+/// field for another.
+fn merge_signal_detail(caller: serde_json::Value, detail: serde_json::Value) -> serde_json::Value {
+    match (caller, detail) {
+        (caller, serde_json::Value::Null) => caller,
+        (serde_json::Value::Object(mut caller), serde_json::Value::Object(detail)) => {
+            for (key, value) in detail {
+                caller.insert(key, value);
+            }
+            serde_json::Value::Object(caller)
+        }
+        (serde_json::Value::Null, detail) => detail,
+        (caller, detail) => serde_json::json!({ "request": caller, "result": detail }),
     }
 }
 
@@ -2155,15 +2760,16 @@ fn append_audit_entry(
     actor_source_ip: Option<String>,
     actor_token_id: Option<String>,
 ) -> AuditTrailEntry {
-    // Truncate detail to prevent memory amplification from write-scope
-    // tokens with large message payloads.
-    let detail = if detail.len() > AUDIT_DETAIL_MAX_BYTES {
-        let mut truncated = detail[..AUDIT_DETAIL_MAX_BYTES].to_string();
-        truncated.push_str(" [truncated]");
-        truncated
-    } else {
-        detail.to_string()
-    };
+    // Truncate detail to prevent memory amplification from write-scope tokens with large
+    // message payloads.
+    //
+    // Through `crate::text`, because this string embeds the caller's `message` and
+    // `additional_data` verbatim and `serde_json` does not escape non-ASCII: the previous
+    // `detail[..AUDIT_DETAIL_MAX_BYTES]` panicked whenever the budget landed inside a
+    // multi-byte character. From the HTTP handler that failed one request; from the
+    // signal-action worker it killed the task, and every asynchronous signal afterwards
+    // was silently never processed.
+    let detail = crate::text::truncate_utf8(detail, AUDIT_DETAIL_MAX_BYTES, " [truncated]");
     let detail: &str = &detail;
     data.audit_entries_total = data.audit_entries_total.saturating_add(1);
     let sequence = data.audit_entries_total;
@@ -2277,8 +2883,11 @@ fn resolve_audit_ip_salt(cfg: &crate::config::schema::AdminConfig) -> [u8; 16] {
     if let Some(env_name) = &cfg.audit_ip_salt_env {
         if let Ok(val) = std::env::var(env_name) {
             let val = val.trim();
-            if val.len() >= 32 {
-                if let Ok(bytes) = hex::decode(&val[..32]) {
+            // `get` rather than `&val[..32]`: the index is a byte offset, so a value that
+            // is not ASCII — a pasted passphrase rather than hex — would panic at startup
+            // instead of taking the documented warning path below.
+            if let Some(prefix) = val.get(..32) {
+                if let Ok(bytes) = hex::decode(prefix) {
                     if let Ok(arr) = <[u8; 16]>::try_from(bytes.as_slice()) {
                         tracing::debug!(
                             env_var = %env_name,
@@ -2326,722 +2935,6 @@ fn pseudonymise_ip(ip: &str, salt: &[u8; 16]) -> String {
 
 fn elapsed_ms(started_at: DateTime<Utc>, marker: Option<DateTime<Utc>>) -> Option<u64> {
     marker.map(|ts| (ts - started_at).num_milliseconds().max(0) as u64)
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ControlNotification {
-    id: u64,
-    at: DateTime<Utc>,
-    signal_id: String,
-    correlation_id: String,
-    action_type: String,
-    state: String,
-    traceparent: Option<String>,
-    detail: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SignalActionType {
-    LogMarker,
-    ExecuteSnapshot,
-    PauseSnapshot,
-    ResumeSnapshot,
-    StopSnapshot,
-}
-
-impl SignalActionType {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::LogMarker => "log_marker",
-            Self::ExecuteSnapshot => "execute_snapshot",
-            Self::PauseSnapshot => "pause_snapshot",
-            Self::ResumeSnapshot => "resume_snapshot",
-            Self::StopSnapshot => "stop_snapshot",
-        }
-    }
-
-    fn started_audit_action(self) -> &'static str {
-        match self {
-            Self::LogMarker => "signal_log_marker_started",
-            Self::ExecuteSnapshot => "signal_execute_snapshot_started",
-            Self::PauseSnapshot => "signal_pause_snapshot_started",
-            Self::ResumeSnapshot => "signal_resume_snapshot_started",
-            Self::StopSnapshot => "signal_stop_snapshot_started",
-        }
-    }
-
-    fn in_progress_audit_action(self) -> Option<&'static str> {
-        match self {
-            Self::ExecuteSnapshot => Some("signal_execute_snapshot_in_progress"),
-            _ => None,
-        }
-    }
-
-    fn queue_rejected_audit_action(self) -> &'static str {
-        match self {
-            Self::LogMarker => "signal_log_marker_aborted",
-            Self::ExecuteSnapshot => "signal_execute_snapshot_aborted",
-            Self::PauseSnapshot => "signal_pause_snapshot_aborted",
-            Self::ResumeSnapshot => "signal_resume_snapshot_aborted",
-            Self::StopSnapshot => "signal_stop_snapshot_aborted",
-        }
-    }
-
-    fn terminal_audit_action(self) -> &'static str {
-        match self {
-            Self::LogMarker => "signal_log_marker_completed",
-            Self::ExecuteSnapshot => "signal_execute_snapshot_completed",
-            Self::PauseSnapshot => "signal_pause_snapshot_paused",
-            Self::ResumeSnapshot => "signal_resume_snapshot_resumed",
-            Self::StopSnapshot => "signal_stop_snapshot_aborted",
-        }
-    }
-
-    fn terminal_state(self) -> &'static str {
-        match self {
-            Self::LogMarker => "COMPLETED",
-            Self::ExecuteSnapshot => "COMPLETED",
-            Self::PauseSnapshot => "PAUSED",
-            Self::ResumeSnapshot => "RESUMED",
-            Self::StopSnapshot => "ABORTED",
-        }
-    }
-
-    fn terminal_result(self) -> &'static str {
-        match self {
-            Self::LogMarker | Self::ExecuteSnapshot => "completed",
-            Self::PauseSnapshot => "paused",
-            Self::ResumeSnapshot => "resumed",
-            Self::StopSnapshot => "aborted",
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SignalActionRequest {
-    signal_id: Option<String>,
-    correlation_id: Option<String>,
-    action_type: SignalActionType,
-    message: Option<String>,
-    #[serde(default)]
-    additional_data: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SignalIngressRecord {
-    signal_id: Option<String>,
-    correlation_id: Option<String>,
-    action_type: SignalActionType,
-    message: Option<String>,
-    #[serde(default)]
-    additional_data: Option<serde_json::Value>,
-    #[serde(default)]
-    traceparent: Option<String>,
-}
-
-fn normalize_optional_id(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-}
-
-fn generated_signal_id() -> String {
-    format!("signal-{}", Utc::now().timestamp_micros())
-}
-
-fn is_control_lifecycle_state(state: &str) -> bool {
-    matches!(
-        state,
-        "STARTED"
-            | "IN_PROGRESS"
-            | "TABLE_SCAN_COMPLETED"
-            | "PAUSED"
-            | "RESUMED"
-            | "COMPLETED"
-            | "ABORTED"
-            | "SKIPPED"
-    )
-}
-
-fn is_control_action_type(action_type: &str) -> bool {
-    matches!(
-        action_type,
-        "log_marker" | "execute_snapshot" | "pause_snapshot" | "resume_snapshot" | "stop_snapshot"
-    )
-}
-
-fn notification_from_audit_entry(entry: &AuditTrailEntry) -> Option<ControlNotification> {
-    if !entry.action.starts_with("signal_") {
-        return None;
-    }
-
-    let detail = serde_json::from_str::<serde_json::Value>(&entry.detail).ok()?;
-    let signal_id = detail.get("signal_id")?.as_str()?.to_string();
-    let correlation_id = detail
-        .get("correlation_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(signal_id.as_str())
-        .to_string();
-    let action_type = detail
-        .get("action_type")
-        .and_then(serde_json::Value::as_str)?;
-    if !is_control_action_type(action_type) {
-        return None;
-    }
-    let state = detail
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("UNKNOWN")
-        .to_string();
-    if !is_control_lifecycle_state(&state) {
-        return None;
-    }
-    let traceparent = detail
-        .get("traceparent")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-
-    Some(ControlNotification {
-        id: entry.sequence,
-        at: entry.at,
-        signal_id,
-        correlation_id,
-        action_type: action_type.to_string(),
-        state,
-        traceparent,
-        detail,
-    })
-}
-
-fn collect_control_notifications(data: &AdminStateData) -> Vec<ControlNotification> {
-    data.audit_recent_entries
-        .iter()
-        .filter_map(notification_from_audit_entry)
-        .collect()
-}
-
-fn notification_to_cloudevent(notification: &ControlNotification) -> serde_json::Value {
-    notification_to_cloudevent_with_source(notification, "urn:cdc-server:admin:notifications")
-}
-
-fn notification_to_cloudevent_with_source(
-    notification: &ControlNotification,
-    source: &str,
-) -> serde_json::Value {
-    let mut event = serde_json::Map::new();
-    event.insert(
-        "id".to_string(),
-        serde_json::Value::String(format!("{}", notification.id)),
-    );
-    event.insert(
-        "source".to_string(),
-        serde_json::Value::String(source.to_string()),
-    );
-    event.insert(
-        "type".to_string(),
-        serde_json::Value::String(format!(
-            "cdc.signal.{}",
-            notification.state.to_ascii_lowercase()
-        )),
-    );
-    event.insert(
-        "specversion".to_string(),
-        serde_json::Value::String("1.0".to_string()),
-    );
-    event.insert(
-        "time".to_string(),
-        serde_json::Value::String(notification.at.to_rfc3339()),
-    );
-    event.insert(
-        "datacontenttype".to_string(),
-        serde_json::Value::String("application/json".to_string()),
-    );
-    event.insert(
-        "signalid".to_string(),
-        serde_json::Value::String(notification.signal_id.clone()),
-    );
-    event.insert(
-        "correlationid".to_string(),
-        serde_json::Value::String(notification.correlation_id.clone()),
-    );
-    event.insert(
-        "actiontype".to_string(),
-        serde_json::Value::String(notification.action_type.clone()),
-    );
-    if let Some(traceparent) = &notification.traceparent {
-        event.insert(
-            "traceparent".to_string(),
-            serde_json::Value::String(traceparent.clone()),
-        );
-    }
-
-    event.insert(
-        "data".to_string(),
-        serde_json::json!({
-            "signal_id": notification.signal_id,
-            "correlation_id": notification.correlation_id,
-            "action_type": notification.action_type,
-            "state": notification.state,
-            "detail": notification.detail,
-        }),
-    );
-
-    serde_json::Value::Object(event)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SignalNotificationHealth {
-    without_terminal_total: u64,
-    duplicate_terminal_total: u64,
-    lag_seconds: f64,
-}
-
-fn signal_terminal_state(state: &str) -> bool {
-    matches!(
-        state,
-        "COMPLETED" | "ABORTED" | "SKIPPED" | "PAUSED" | "RESUMED"
-    )
-}
-
-fn parse_signal_lifecycle_detail(detail: &str) -> Option<(String, String, String)> {
-    let parsed = serde_json::from_str::<serde_json::Value>(detail).ok()?;
-    let signal_id = parsed
-        .get("signal_id")
-        .and_then(serde_json::Value::as_str)?
-        .to_string();
-    let action_type = parsed
-        .get("action_type")
-        .and_then(serde_json::Value::as_str)?
-        .to_string();
-    if !is_control_action_type(&action_type) {
-        return None;
-    }
-    let state = parsed
-        .get("state")
-        .and_then(serde_json::Value::as_str)?
-        .to_string();
-    Some((signal_id, action_type, state))
-}
-
-/// Lifecycle aggregate per `(signal_id, action_type)`: earliest STARTED
-/// timestamp (if any) and count of terminal-state entries.
-type SignalLifecycleAggregate = (Option<DateTime<Utc>>, u64);
-
-fn signal_notification_health(
-    data: &AdminStateData,
-    now: DateTime<Utc>,
-) -> SignalNotificationHealth {
-    let mut lifecycle_by_signal: HashMap<(String, String), SignalLifecycleAggregate> =
-        HashMap::new();
-    let mut lag_samples = Vec::new();
-
-    for entry in &data.audit_recent_entries {
-        if !entry.action.starts_with("signal_") {
-            continue;
-        }
-
-        let Some((signal_id, action_type, state)) = parse_signal_lifecycle_detail(&entry.detail)
-        else {
-            continue;
-        };
-        if !is_control_lifecycle_state(&state) {
-            continue;
-        }
-
-        let key = (signal_id, action_type);
-        let lifecycle = lifecycle_by_signal.entry(key).or_insert((None, 0));
-        if state == "STARTED" {
-            lifecycle.0 = Some(match lifecycle.0 {
-                Some(started_at) => started_at.min(entry.at),
-                None => entry.at,
-            });
-        }
-        if signal_terminal_state(&state) {
-            lifecycle.1 = lifecycle.1.saturating_add(1);
-            if let Some(started_at) = lifecycle.0 {
-                let lag = (entry.at - started_at).num_milliseconds().max(0) as f64 / 1000.0;
-                lag_samples.push(lag);
-            }
-        }
-    }
-
-    let without_terminal_total = lifecycle_by_signal
-        .values()
-        .filter(|(started_at, terminal_count)| {
-            started_at
-                .map(|ts| (now - ts).num_seconds() > SIGNAL_TERMINAL_TIMEOUT_SECONDS)
-                .unwrap_or(false)
-                && *terminal_count == 0
-        })
-        .count() as u64;
-
-    let duplicate_terminal_total = lifecycle_by_signal
-        .values()
-        .filter(|(_, terminal_count)| *terminal_count > 1)
-        .count() as u64;
-
-    let lag_seconds = lag_samples.into_iter().fold(0.0_f64, f64::max);
-
-    SignalNotificationHealth {
-        without_terminal_total,
-        duplicate_terminal_total,
-        lag_seconds,
-    }
-}
-
-fn latest_signal_action_state(
-    data: &AdminStateData,
-    signal_id: &str,
-    action_type: &str,
-) -> Option<String> {
-    data.audit_recent_entries.iter().rev().find_map(|entry| {
-        if !entry.action.starts_with("signal_") {
-            return None;
-        }
-
-        let Ok(detail) = serde_json::from_str::<serde_json::Value>(&entry.detail) else {
-            return None;
-        };
-
-        let entry_signal_id = detail
-            .get("signal_id")
-            .and_then(serde_json::Value::as_str)?;
-        let entry_action_type = detail
-            .get("action_type")
-            .and_then(serde_json::Value::as_str)?;
-        let state = detail.get("state").and_then(serde_json::Value::as_str)?;
-
-        if entry_signal_id == signal_id && entry_action_type == action_type {
-            return Some(state.to_string());
-        }
-
-        None
-    })
-}
-
-fn signal_action_requires_async_worker(action_type: SignalActionType) -> bool {
-    !matches!(action_type, SignalActionType::LogMarker)
-}
-
-async fn signal_action(
-    State(admin): State<AdminState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(request): Json<SignalActionRequest>,
-) -> Response {
-    let Some(actor_token_id) = admin.authorize_write_token_id(&headers) else {
-        return unauthorized_response();
-    };
-
-    let message = request.message.unwrap_or_default().trim().to_string();
-    if matches!(request.action_type, SignalActionType::LogMarker) && message.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "message must not be empty for action_type=log_marker",
-        )
-            .into_response();
-    }
-
-    let signal_id =
-        normalize_optional_id(request.signal_id.as_deref()).unwrap_or_else(generated_signal_id);
-    let correlation_id = normalize_optional_id(request.correlation_id.as_deref())
-        .unwrap_or_else(|| signal_id.clone());
-    let traceparent = headers
-        .get("traceparent")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| normalize_optional_id(Some(value)));
-    let envelope = SignalActionEnvelope {
-        signal_id,
-        correlation_id,
-        action_type: request.action_type,
-        message,
-        traceparent,
-        additional_data: request.additional_data.unwrap_or(serde_json::Value::Null),
-        actor_source_ip: Some(peer_addr.ip().to_string()),
-        actor_token_id: actor_token_id.clone(),
-    };
-
-    match admin.execute_signal_action_envelope(envelope).await {
-        SignalActionExecutionResult::ExistingState {
-            signal_id,
-            correlation_id,
-            action_type,
-            current_state,
-            expected_terminal_state,
-        } => Json(serde_json::json!({
-            "api_version": "v1",
-            "signal_id": signal_id,
-            "correlation_id": correlation_id,
-            "action_type": action_type,
-            "current_state": current_state,
-            "expected_terminal_state": expected_terminal_state,
-            "idempotent_replay": true,
-        }))
-        .into_response(),
-        SignalActionExecutionResult::Started {
-            signal_id,
-            correlation_id,
-            action_type,
-            expected_terminal_state,
-        } => {
-            tracing::info!(
-                target: "rustcdc_audit",
-                action = "signal_action",
-                signal_id = %signal_id,
-                correlation_id = %correlation_id,
-                action_type = %action_type,
-                token_id = %actor_token_id,
-                result = "accepted_async",
-                "typed signal queued for async completion"
-            );
-
-            Json(serde_json::json!({
-                "api_version": "v1",
-                "signal_id": signal_id,
-                "correlation_id": correlation_id,
-                "action_type": action_type,
-                "current_state": "STARTED",
-                "expected_terminal_state": expected_terminal_state,
-                "idempotent_replay": false,
-            }))
-            .into_response()
-        }
-        SignalActionExecutionResult::Terminal {
-            signal_id,
-            correlation_id,
-            action_type,
-            current_state,
-            expected_terminal_state,
-        } => {
-            tracing::info!(
-                target: "rustcdc_audit",
-                action = "signal_action",
-                signal_id = %signal_id,
-                correlation_id = %correlation_id,
-                action_type = %action_type,
-                token_id = %actor_token_id,
-                result = "accepted",
-                "typed signal processed"
-            );
-
-            Json(serde_json::json!({
-                "api_version": "v1",
-                "signal_id": signal_id,
-                "correlation_id": correlation_id,
-                "action_type": action_type,
-                "current_state": current_state,
-                "expected_terminal_state": expected_terminal_state,
-                "idempotent_replay": false,
-            }))
-            .into_response()
-        }
-        SignalActionExecutionResult::Aborted {
-            signal_id,
-            correlation_id,
-            action_type,
-            expected_terminal_state,
-            error,
-            retry_after_seconds,
-        } => {
-            let mut headers = HeaderMap::new();
-            if let Some(retry_after) = retry_after_seconds {
-                if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                    headers.insert(RETRY_AFTER, value);
-                }
-            }
-
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                headers,
-                Json(serde_json::json!({
-                    "api_version": "v1",
-                    "signal_id": signal_id,
-                    "correlation_id": correlation_id,
-                    "action_type": action_type,
-                    "current_state": "ABORTED",
-                    "expected_terminal_state": expected_terminal_state,
-                    "idempotent_replay": false,
-                    "error": error,
-                })),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn notifications_authed(
-    State(admin): State<AdminState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    let (allowed, decision_latency) =
-        admin.allow_abuse_scope(AbuseLimitScope::Status, &headers, Some(peer_addr));
-    admin
-        .record_rate_limiter_decision(AbuseLimitScope::Status, decision_latency)
-        .await;
-    if !allowed {
-        admin
-            .record_rate_limited_request(AbuseLimitScope::Status)
-            .await;
-        return rate_limited_response("notifications");
-    }
-
-    if !admin.authorize_read(&headers) {
-        return unauthorized_response();
-    }
-
-    let data = admin.data.read().await;
-    let notifications = collect_control_notifications(&data);
-    Json(serde_json::json!({
-        "api_version": "v1",
-        "notifications_total": notifications.len(),
-        "notifications": notifications,
-    }))
-    .into_response()
-}
-
-async fn notifications_cloudevents_authed(
-    State(admin): State<AdminState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    let (allowed, decision_latency) =
-        admin.allow_abuse_scope(AbuseLimitScope::Status, &headers, Some(peer_addr));
-    admin
-        .record_rate_limiter_decision(AbuseLimitScope::Status, decision_latency)
-        .await;
-    if !allowed {
-        admin
-            .record_rate_limited_request(AbuseLimitScope::Status)
-            .await;
-        return rate_limited_response("notifications_cloudevents");
-    }
-
-    if !admin.authorize_read(&headers) {
-        return unauthorized_response();
-    }
-
-    let data = admin.data.read().await;
-    let notifications = collect_control_notifications(&data);
-    let events = notifications
-        .iter()
-        .map(notification_to_cloudevent)
-        .collect::<Vec<_>>();
-
-    Json(serde_json::json!({
-        "api_version": "v1",
-        "format": "cloudevents",
-        "events_total": events.len(),
-        "events": events,
-    }))
-    .into_response()
-}
-
-async fn notifications_stream_authed(
-    State(admin): State<AdminState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    let (allowed, decision_latency) =
-        admin.allow_abuse_scope(AbuseLimitScope::Status, &headers, Some(peer_addr));
-    admin
-        .record_rate_limiter_decision(AbuseLimitScope::Status, decision_latency)
-        .await;
-    if !allowed {
-        admin
-            .record_rate_limited_request(AbuseLimitScope::Status)
-            .await;
-        return rate_limited_response("notifications_stream");
-    }
-
-    if !admin.authorize_read(&headers) {
-        return unauthorized_response();
-    }
-
-    // Subscribe *before* reading the backlog. The other order has a hole: a notification
-    // raised between the snapshot and the subscription belongs to neither, and the client
-    // never sees it.
-    let live = admin.notification_broadcast.subscribe();
-
-    // `Last-Event-ID` is how EventSource resumes after a dropped connection — the browser
-    // replays it automatically. Ignoring it, as the previous handler did, meant every
-    // reconnect re-delivered the entire ring buffer.
-    let resume_after = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
-
-    let backlog: Vec<ControlNotification> = {
-        let data = admin.data.read().await;
-        collect_control_notifications(&data)
-            .into_iter()
-            .filter(|notification| resume_after.is_none_or(|after| notification.id > after))
-            .collect()
-    };
-
-    let stream = futures::stream::unfold(
-        (backlog.into_iter(), live, resume_after),
-        |(mut backlog, mut live, mut last_id)| async move {
-            if let Some(notification) = backlog.next() {
-                last_id = Some(notification.id);
-                let event = notification_sse_event(&notification);
-                return Some((
-                    Ok::<_, std::convert::Infallible>(event),
-                    (backlog, live, last_id),
-                ));
-            }
-
-            loop {
-                match live.recv().await {
-                    Ok(notification) => {
-                        // The backlog and the live channel overlap by construction: a
-                        // notification raised between the subscribe and the snapshot read
-                        // appears in both. Suppressing anything not newer than the last id
-                        // emitted is what makes the stream exactly-once for the client.
-                        if last_id.is_some_and(|seen| notification.id <= seen) {
-                            continue;
-                        }
-                        last_id = Some(notification.id);
-                        let event = notification_sse_event(&notification);
-                        return Some((Ok(event), (backlog, live, last_id)));
-                    }
-                    // Tell the client it has a gap rather than let it believe the sequence
-                    // is complete. A silent gap in a control-plane feed is worse than a
-                    // slow one.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                        let event = axum::response::sse::Event::default()
-                            .event("lagged")
-                            .data(missed.to_string());
-                        return Some((Ok(event), (backlog, live, last_id)));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                }
-            }
-        },
-    );
-
-    axum::response::sse::Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::new().interval(NOTIFICATION_STREAM_KEEPALIVE))
-        .into_response()
-}
-
-/// Render one notification as an SSE event.
-///
-/// The `id` is the audit sequence, which is what makes `Last-Event-ID` resumption work:
-/// it is monotonic, gapless and already the identity the audit trail uses.
-fn notification_sse_event(notification: &ControlNotification) -> axum::response::sse::Event {
-    axum::response::sse::Event::default()
-        .id(notification.id.to_string())
-        .event("notification")
-        .json_data(notification_to_cloudevent(notification))
-        .unwrap_or_else(|error| {
-            axum::response::sse::Event::default()
-                .event("error")
-                .data(format!("failed to encode notification: {error}"))
-        })
 }
 
 fn slo_reasons(data: &AdminStateData) -> Vec<String> {
@@ -3186,6 +3079,12 @@ pub(crate) fn slo_json(data: &AdminStateData) -> serde_json::Value {
             "started_notification_rejections_total": data.signal_action_started_notification_rejections_total,
             "queue_depth": data.signal_action_queue_depth,
         },
+        "snapshot_requests": {
+            "available": data.snapshot_requests_available,
+            "accepted_total": data.snapshot_requests_accepted_total,
+            "refused_total": data.snapshot_requests_refused_total,
+            "tables_enqueued_total": data.snapshot_tables_enqueued_total,
+        },
         "signal_ingress": {
             "parse_rejections_total": data.signal_ingress_parse_rejections_total,
             "line_too_large_rejections_total": data.signal_ingress_line_too_large_rejections_total,
@@ -3247,293 +3146,6 @@ pub(crate) fn slo_json(data: &AdminStateData) -> serde_json::Value {
         "last_terminal_reason_code": data.last_terminal_reason_code,
         "reasons": slo_reasons(data),
     })
-}
-
-pub(crate) fn slo_prometheus(data: &AdminStateData) -> String {
-    let heartbeat_unix_seconds = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let state_code = match data.state {
-        InstanceState::Starting => 0,
-        InstanceState::Running => 1,
-        InstanceState::Stopping => 2,
-        InstanceState::Stopped => 3,
-        InstanceState::Error => 4,
-    };
-    let terminal_reason_code = data.last_terminal_reason_code.as_deref().unwrap_or("none");
-    let cold_start_to_ready_ms = elapsed_ms(data.started_at, data.first_ready_at).unwrap_or(0);
-    let cold_start_to_checkpoint_advance_ms =
-        elapsed_ms(data.started_at, data.first_checkpoint_advanced_at).unwrap_or(0);
-    let signal_health = signal_notification_health(data, Utc::now());
-
-    let mut metrics = format!(
-        concat!(
-            "# HELP rustcdc_slo_readiness_checks_total Total readiness probes\n",
-            "# TYPE rustcdc_slo_readiness_checks_total counter\n",
-            "rustcdc_slo_readiness_checks_total {}\n",
-            "# HELP rustcdc_slo_readiness_ready_total Ready readiness probes\n",
-            "# TYPE rustcdc_slo_readiness_ready_total counter\n",
-            "rustcdc_slo_readiness_ready_total {}\n",
-            "# HELP rustcdc_slo_readiness_rate Readiness success ratio\n",
-            "# TYPE rustcdc_slo_readiness_rate gauge\n",
-            "rustcdc_slo_readiness_rate {}\n",
-            "# HELP rustcdc_slo_checkpoint_age_seconds Age of the checkpoint file in seconds\n",
-            "# TYPE rustcdc_slo_checkpoint_age_seconds gauge\n",
-            "rustcdc_slo_checkpoint_age_seconds {}\n",
-            "# HELP rustcdc_source_lag_seconds Source lag proxy derived from checkpoint age in seconds\n",
-            "# TYPE rustcdc_source_lag_seconds gauge\n",
-            "rustcdc_source_lag_seconds {}\n",
-            "# HELP rustcdc_slo_admin_api_latency_seconds Last admin API latency in seconds\n",
-            "# TYPE rustcdc_slo_admin_api_latency_seconds gauge\n",
-            "rustcdc_slo_admin_api_latency_seconds {}\n",
-            "# HELP rustcdc_slo_restart_recovery_seconds Time to first ready batch after start\n",
-            "# TYPE rustcdc_slo_restart_recovery_seconds gauge\n",
-            "rustcdc_slo_restart_recovery_seconds {}\n",
-            "# HELP rustcdc_slo_cold_start_to_ready_ms Time from process start to first ready state in milliseconds\n",
-            "# TYPE rustcdc_slo_cold_start_to_ready_ms gauge\n",
-            "rustcdc_slo_cold_start_to_ready_ms {}\n",
-            "# HELP rustcdc_slo_cold_start_to_checkpoint_advance_ms Time from process start to first durable checkpoint advance in milliseconds\n",
-            "# TYPE rustcdc_slo_cold_start_to_checkpoint_advance_ms gauge\n",
-            "rustcdc_slo_cold_start_to_checkpoint_advance_ms {}\n",
-            "# HELP rustcdc_admin_control_plane_up Admin control-plane liveness signal\n",
-            "# TYPE rustcdc_admin_control_plane_up gauge\n",
-            "rustcdc_admin_control_plane_up 1\n",
-            "# HELP rustcdc_admin_control_plane_heartbeat_unix_seconds Admin control-plane heartbeat timestamp\n",
-            "# TYPE rustcdc_admin_control_plane_heartbeat_unix_seconds gauge\n",
-            "rustcdc_admin_control_plane_heartbeat_unix_seconds {}\n",
-            "# HELP rustcdc_admin_control_plane_state_code Admin control-plane state code (starting=0,running=1,stopping=2,stopped=3,error=4)\n",
-            "# TYPE rustcdc_admin_control_plane_state_code gauge\n",
-            "rustcdc_admin_control_plane_state_code {}\n",
-            "# HELP rustcdc_admin_shutdown_requests_os_signal_total Total shutdown requests initiated by OS shutdown signals\n",
-            "# TYPE rustcdc_admin_shutdown_requests_os_signal_total counter\n",
-            "rustcdc_admin_shutdown_requests_os_signal_total {}\n",
-            "# HELP rustcdc_admin_shutdown_completions_stopped_total Total shutdown lifecycles that completed with stopped state\n",
-            "# TYPE rustcdc_admin_shutdown_completions_stopped_total counter\n",
-            "rustcdc_admin_shutdown_completions_stopped_total {}\n",
-            "# HELP rustcdc_admin_shutdown_completions_error_total Total shutdown lifecycles that terminated in error state\n",
-            "# TYPE rustcdc_admin_shutdown_completions_error_total counter\n",
-            "rustcdc_admin_shutdown_completions_error_total {}\n",
-            "# HELP rustcdc_signal_without_terminal_notification_total Accepted signal actions without terminal lifecycle notifications beyond timeout budget\n",
-            "# TYPE rustcdc_signal_without_terminal_notification_total gauge\n",
-            "rustcdc_signal_without_terminal_notification_total {}\n",
-            "# HELP rustcdc_signal_duplicate_terminal_notification_total Signal actions that emitted more than one terminal lifecycle notification\n",
-            "# TYPE rustcdc_signal_duplicate_terminal_notification_total gauge\n",
-            "rustcdc_signal_duplicate_terminal_notification_total {}\n",
-            "# HELP rustcdc_signal_notification_lag_seconds Max observed lag in seconds between STARTED and terminal notification states\n",
-            "# TYPE rustcdc_signal_notification_lag_seconds gauge\n",
-            "rustcdc_signal_notification_lag_seconds {}\n",
-            "# HELP rustcdc_signal_terminal_timeout_budget_seconds Timeout budget in seconds for terminal notification emission\n",
-            "# TYPE rustcdc_signal_terminal_timeout_budget_seconds gauge\n",
-            "rustcdc_signal_terminal_timeout_budget_seconds {}\n",
-            "# HELP rustcdc_signal_action_queue_rejections_total Async signal actions rejected because the worker queue was full or unavailable\n",
-            "# TYPE rustcdc_signal_action_queue_rejections_total counter\n",
-            "rustcdc_signal_action_queue_rejections_total {}\n",
-            "# HELP rustcdc_signal_action_started_notification_rejections_total Signal actions rejected because STARTED lifecycle notifications could not be emitted to non-admin channels\n",
-            "# TYPE rustcdc_signal_action_started_notification_rejections_total counter\n",
-            "rustcdc_signal_action_started_notification_rejections_total {}\n",
-            "# HELP rustcdc_signal_action_queue_depth Current number of queued async signal actions waiting to be processed\n",
-            "# TYPE rustcdc_signal_action_queue_depth gauge\n",
-            "rustcdc_signal_action_queue_depth {}\n",
-            "# HELP rustcdc_signal_ingress_parse_rejections_total Signal ingress records rejected because payload parsing failed\n",
-            "# TYPE rustcdc_signal_ingress_parse_rejections_total counter\n",
-            "rustcdc_signal_ingress_parse_rejections_total {}\n",
-            "# HELP rustcdc_signal_ingress_line_too_large_rejections_total Signal ingress records rejected because line size exceeded the limit\n",
-            "# TYPE rustcdc_signal_ingress_line_too_large_rejections_total counter\n",
-            "rustcdc_signal_ingress_line_too_large_rejections_total {}\n",
-            "# HELP rustcdc_signal_ingress_validation_rejections_total Signal ingress records rejected by semantic validation\n",
-            "# TYPE rustcdc_signal_ingress_validation_rejections_total counter\n",
-            "rustcdc_signal_ingress_validation_rejections_total {}\n",
-            "# HELP rustcdc_signal_ingress_max_line_bytes Maximum accepted signal ingress line size in bytes\n",
-            "# TYPE rustcdc_signal_ingress_max_line_bytes gauge\n",
-            "rustcdc_signal_ingress_max_line_bytes {}\n",
-            "# HELP rustcdc_signal_notification_log_emitted_total Notification lifecycle events emitted to non-admin log channel\n",
-            "# TYPE rustcdc_signal_notification_log_emitted_total counter\n",
-            "rustcdc_signal_notification_log_emitted_total {}\n",
-            "# HELP rustcdc_signal_notification_log_emit_failures_total Notification lifecycle events that failed to emit to non-admin log channel\n",
-            "# TYPE rustcdc_signal_notification_log_emit_failures_total counter\n",
-            "rustcdc_signal_notification_log_emit_failures_total {}\n",
-            "# HELP rustcdc_admin_rate_limited_readyz_total Total `/readyz` requests denied by admin abuse controls\n",
-            "# TYPE rustcdc_admin_rate_limited_readyz_total counter\n",
-            "rustcdc_admin_rate_limited_readyz_total {}\n",
-            "# HELP rustcdc_admin_rate_limited_status_total Total `/status` requests denied by admin abuse controls\n",
-            "# TYPE rustcdc_admin_rate_limited_status_total counter\n",
-            "rustcdc_admin_rate_limited_status_total {}\n",
-            "# HELP rustcdc_admin_rate_limited_metrics_total Total `/metrics` requests denied by admin abuse controls\n",
-            "# TYPE rustcdc_admin_rate_limited_metrics_total counter\n",
-            "rustcdc_admin_rate_limited_metrics_total {}\n",
-            "# HELP rustcdc_admin_rate_limiter_readyz_decisions_total Total `/readyz` limiter decisions evaluated\n",
-            "# TYPE rustcdc_admin_rate_limiter_readyz_decisions_total counter\n",
-            "rustcdc_admin_rate_limiter_readyz_decisions_total {}\n",
-            "# HELP rustcdc_admin_rate_limiter_readyz_decision_latency_seconds_avg Average `/readyz` limiter decision latency in seconds\n",
-            "# TYPE rustcdc_admin_rate_limiter_readyz_decision_latency_seconds_avg gauge\n",
-            "rustcdc_admin_rate_limiter_readyz_decision_latency_seconds_avg {}\n",
-            "# HELP rustcdc_admin_rate_limiter_readyz_decision_latency_seconds_max Max `/readyz` limiter decision latency in seconds\n",
-            "# TYPE rustcdc_admin_rate_limiter_readyz_decision_latency_seconds_max gauge\n",
-            "rustcdc_admin_rate_limiter_readyz_decision_latency_seconds_max {}\n",
-            "# HELP rustcdc_admin_rate_limiter_status_decisions_total Total `/status` limiter decisions evaluated\n",
-            "# TYPE rustcdc_admin_rate_limiter_status_decisions_total counter\n",
-            "rustcdc_admin_rate_limiter_status_decisions_total {}\n",
-            "# HELP rustcdc_admin_rate_limiter_status_decision_latency_seconds_avg Average `/status` limiter decision latency in seconds\n",
-            "# TYPE rustcdc_admin_rate_limiter_status_decision_latency_seconds_avg gauge\n",
-            "rustcdc_admin_rate_limiter_status_decision_latency_seconds_avg {}\n",
-            "# HELP rustcdc_admin_rate_limiter_status_decision_latency_seconds_max Max `/status` limiter decision latency in seconds\n",
-            "# TYPE rustcdc_admin_rate_limiter_status_decision_latency_seconds_max gauge\n",
-            "rustcdc_admin_rate_limiter_status_decision_latency_seconds_max {}\n",
-            "# HELP rustcdc_admin_rate_limiter_metrics_decisions_total Total `/metrics` limiter decisions evaluated\n",
-            "# TYPE rustcdc_admin_rate_limiter_metrics_decisions_total counter\n",
-            "rustcdc_admin_rate_limiter_metrics_decisions_total {}\n",
-            "# HELP rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_avg Average `/metrics` limiter decision latency in seconds\n",
-            "# TYPE rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_avg gauge\n",
-            "rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_avg {}\n",
-            "# HELP rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_max Max `/metrics` limiter decision latency in seconds\n",
-            "# TYPE rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_max gauge\n",
-            "rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_max {}\n",
-            "# HELP rustcdc_admin_reconciliation_recoveries_total Total startup reconciliation markers auto-recovered\n",
-            "# TYPE rustcdc_admin_reconciliation_recoveries_total counter\n",
-            "rustcdc_admin_reconciliation_recoveries_total {}\n",
-            "# HELP rustcdc_admin_reconciliation_recovery_last_unix_seconds Last startup reconciliation recovery timestamp in unix seconds (-1 when unavailable)\n",
-            "# TYPE rustcdc_admin_reconciliation_recovery_last_unix_seconds gauge\n",
-            "rustcdc_admin_reconciliation_recovery_last_unix_seconds {}\n",
-            "# HELP rustcdc_admin_reconciliation_recovery_last_parse_ok Whether the last recovered marker parsed successfully (1=true, 0=false, -1=unavailable)\n",
-            "# TYPE rustcdc_admin_reconciliation_recovery_last_parse_ok gauge\n",
-            "rustcdc_admin_reconciliation_recovery_last_parse_ok {}\n",
-            "# HELP rustcdc_admin_reconciliation_recovery_proof_last_unix_seconds Last reconciliation recovery proof timestamp in unix seconds (-1 when unavailable)\n",
-            "# TYPE rustcdc_admin_reconciliation_recovery_proof_last_unix_seconds gauge\n",
-            "rustcdc_admin_reconciliation_recovery_proof_last_unix_seconds {}\n",
-            "# HELP rustcdc_admin_reconciliation_recovery_proof_last_ok Whether the last reconciliation recovery proof succeeded (1=true, 0=false, -1=unavailable)\n",
-            "# TYPE rustcdc_admin_reconciliation_recovery_proof_last_ok gauge\n",
-            "rustcdc_admin_reconciliation_recovery_proof_last_ok {}\n",
-            "# HELP rustcdc_admin_last_terminal_reason_code Last runtime terminal reason code (label value)\n",
-            "# TYPE rustcdc_admin_last_terminal_reason_code gauge\n",
-            "rustcdc_admin_last_terminal_reason_code{{reason=\"{}\"}} 1\n"
-        ),
-        data.readiness_checks_total,
-        data.readiness_ready_total,
-        readiness_rate(data),
-        data.checkpoint_age_seconds.unwrap_or(0.0),
-        data.checkpoint_age_seconds.unwrap_or(0.0),
-        data.last_admin_api_latency_us.unwrap_or(0) as f64 / 1_000_000.0,
-        data.restart_recovery_seconds.unwrap_or(0.0),
-        cold_start_to_ready_ms,
-        cold_start_to_checkpoint_advance_ms,
-        heartbeat_unix_seconds,
-        state_code,
-        data.shutdown_requests_os_signal_total,
-        data.shutdown_completions_stopped_total,
-        data.shutdown_completions_error_total,
-        signal_health.without_terminal_total,
-        signal_health.duplicate_terminal_total,
-        signal_health.lag_seconds,
-        SIGNAL_TERMINAL_TIMEOUT_SECONDS,
-        data.signal_action_queue_rejections_total,
-        data.signal_action_started_notification_rejections_total,
-        data.signal_action_queue_depth,
-        data.signal_ingress_parse_rejections_total,
-        data.signal_ingress_line_too_large_rejections_total,
-        data.signal_ingress_validation_rejections_total,
-        SIGNAL_INGRESS_MAX_LINE_BYTES,
-        data.notification_log_emitted_total,
-        data.notification_log_emit_failures_total,
-        data.admin_rate_limited_readyz_total,
-        data.admin_rate_limited_status_total,
-        data.admin_rate_limited_metrics_total,
-        data.admin_rate_limiter_readyz_decisions_total,
-        latency_avg_seconds(
-            data.admin_rate_limiter_readyz_decisions_total,
-            data.admin_rate_limiter_readyz_decision_latency_seconds_sum,
-        ),
-        data.admin_rate_limiter_readyz_decision_latency_seconds_max,
-        data.admin_rate_limiter_status_decisions_total,
-        latency_avg_seconds(
-            data.admin_rate_limiter_status_decisions_total,
-            data.admin_rate_limiter_status_decision_latency_seconds_sum,
-        ),
-        data.admin_rate_limiter_status_decision_latency_seconds_max,
-        data.admin_rate_limiter_metrics_decisions_total,
-        latency_avg_seconds(
-            data.admin_rate_limiter_metrics_decisions_total,
-            data.admin_rate_limiter_metrics_decision_latency_seconds_sum,
-        ),
-        data.admin_rate_limiter_metrics_decision_latency_seconds_max,
-        data.reconciliation_recoveries_total,
-        data.reconciliation_recovery_last_unix_seconds.unwrap_or(-1.0),
-        data.reconciliation_recovery_last_parse_ok.map(|ok| if ok { 1 } else { 0 }).unwrap_or(-1),
-        data.reconciliation_recovery_proof_last_unix_seconds.unwrap_or(-1.0),
-        data.reconciliation_recovery_proof_last_ok.map(|ok| if ok { 1 } else { 0 }).unwrap_or(-1),
-        terminal_reason_code,
-    );
-
-    metrics.push_str(&notification_channel_metric_lines(
-        "rustcdc_signal_notification_channel_emitted_total",
-        "Notification lifecycle events emitted to non-admin notification channels by channel",
-        &data.notification_channel_emitted_total,
-    ));
-    metrics.push_str(&notification_channel_metric_lines(
-        "rustcdc_signal_notification_channel_emit_failures_total",
-        "Notification lifecycle events that failed to emit to non-admin notification channels by channel",
-        &data.notification_channel_emit_failures_total,
-    ));
-
-    // Replication slot lag — emitted as -1 when no sample has been taken yet
-    // (non-PostgreSQL sources or before the first 15 s poll completes).
-    // Use this in Prometheus `record_rules` and the `CdcReplicationSlotLagHigh`
-    // alerting rule to catch dangerously high producer lag.
-    {
-        let lag = data.replication_slot_lag_bytes.unwrap_or(-1);
-        metrics.push_str("# HELP rustcdc_source_replication_slot_lag_bytes WAL bytes not yet consumed by the CDC replication slot (-1 = not yet sampled or non-PostgreSQL source)\n");
-        metrics.push_str("# TYPE rustcdc_source_replication_slot_lag_bytes gauge\n");
-        metrics.push_str(&format!(
-            "rustcdc_source_replication_slot_lag_bytes {lag}\n"
-        ));
-    }
-
-    // Consecutive source poll errors — reflects the backoff-retry counter in
-    // `RecoverableErrorState`.  A value ≥ READYZ_SOURCE_CONSECUTIVE_ERROR_THRESHOLD
-    // means /readyz is already returning 503.
-    {
-        let n = data.source_consecutive_errors;
-        metrics.push_str("# HELP rustcdc_source_consecutive_poll_errors Consecutive recoverable source poll errors since last successful batch (0 when healthy)\n");
-        metrics.push_str("# TYPE rustcdc_source_consecutive_poll_errors gauge\n");
-        metrics.push_str(&format!("rustcdc_source_consecutive_poll_errors {n}\n"));
-    }
-
-    let notification_channel_enabled = HashMap::from([
-        ("file".to_string(), data.notification_log_enabled),
-        ("kafka".to_string(), data.notification_kafka_enabled),
-    ]);
-    metrics.push_str(&notification_channel_gauge_lines(
-        "rustcdc_signal_notification_channel_enabled",
-        "Configured non-admin notification channels enabled by channel",
-        &notification_channel_enabled,
-    ));
-
-    // Admin API latency histogram (for histogram_quantile / P50/P95/P99 in Prometheus).
-    metrics.push_str("# HELP rustcdc_slo_admin_api_latency_seconds_histogram Admin API request latency histogram in seconds\n");
-    metrics.push_str("# TYPE rustcdc_slo_admin_api_latency_seconds_histogram histogram\n");
-    let mut cumulative: u64 = 0;
-    for (i, &bound) in ADMIN_API_LATENCY_HISTOGRAM_BUCKETS_US.iter().enumerate() {
-        cumulative += data.admin_api_latency_us_buckets[i];
-        metrics.push_str(&format!(
-            "rustcdc_slo_admin_api_latency_seconds_histogram_bucket{{le=\"{}\"}} {}\n",
-            bound as f64 / 1_000_000.0,
-            cumulative
-        ));
-    }
-    metrics.push_str(&format!(
-        "rustcdc_slo_admin_api_latency_seconds_histogram_bucket{{le=\"+Inf\"}} {}\n",
-        data.admin_api_latency_us_count
-    ));
-    metrics.push_str(&format!(
-        "rustcdc_slo_admin_api_latency_seconds_histogram_sum {}\n",
-        data.admin_api_latency_us_sum / 1_000_000.0
-    ));
-    metrics.push_str(&format!(
-        "rustcdc_slo_admin_api_latency_seconds_histogram_count {}\n",
-        data.admin_api_latency_us_count
-    ));
-
-    metrics
 }
 
 pub(crate) fn runtime_metrics_prometheus(data: &AdminStateData) -> String {
@@ -3640,6 +3252,63 @@ async fn readyz(
     }
 }
 
+/// The running configuration, with every credential redacted.
+///
+/// `AdminState` has built and redacted this snapshot on every startup since the beginning
+/// — and nothing served it. The field was written, the redaction rules were written, the
+/// property tests over those rules were written, and the value was unreachable. Two docs
+/// pages nevertheless described "the `/status` config snapshot a read-scoped token can
+/// read", which is how the gap survived: the documentation described the intent and
+/// everyone read it as the behaviour.
+///
+/// A separate endpoint rather than a field on `/status`. `/status` is polled by dashboards
+/// on a short interval; a whole configuration document in every response is bandwidth
+/// nobody asked for, and the question this answers — "what is this instance *actually*
+/// running, after env-var layering and config migration?" — is asked once during an
+/// incident, not continuously.
+///
+/// Read scope, and rate-limited on the `Status` budget, because it is the same class of
+/// disclosure: everything here has been through `redact_secrets`, but a configuration
+/// still describes hosts, topics, table lists and file paths.
+async fn config_authed(
+    State(admin): State<AdminState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let (allowed, decision_latency) =
+        admin.allow_abuse_scope(AbuseLimitScope::Status, &headers, Some(peer_addr));
+    admin
+        .record_rate_limiter_decision(AbuseLimitScope::Status, decision_latency)
+        .await;
+    if !allowed {
+        admin
+            .record_rate_limited_request(AbuseLimitScope::Status)
+            .await;
+        return rate_limited_response("config");
+    }
+
+    if !admin.authorize_read(&headers) {
+        return unauthorized_response();
+    }
+
+    let start = std::time::Instant::now();
+    let config_json = admin.data.read().await.config_json.clone();
+    admin.record_status_probe(start.elapsed()).await;
+
+    // Served as `application/json` from the stored string rather than re-parsed: it was
+    // produced by `serde_json::to_string_pretty` and then redacted, so re-parsing would
+    // cost an allocation to produce the same bytes.
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        config_json,
+    )
+        .into_response()
+}
+
 async fn status_authed(
     State(admin): State<AdminState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -3662,6 +3331,7 @@ async fn status_authed(
     }
 
     let start = std::time::Instant::now();
+    let snapshot_progress = admin.incremental_snapshot_progress();
     let data = admin.data.read().await;
     let snapshot = serde_json::json!({
         "api_version": "v1",
@@ -3673,6 +3343,10 @@ async fn status_authed(
         "events_processed": data.events_processed,
         "batches_processed": data.batches_processed,
         "slo": slo_json(&data),
+        // Read from the runtime rather than from `AdminStateData`, because it is the
+        // runtime's live view: per-table cursors, completion flags and row counters that
+        // no admin-side counter could reconstruct. `None` when no snapshot is in flight.
+        "incremental_snapshot": snapshot_progress,
         "audit": {
             "entries_total": data.audit_entries_total,
             "recent_entries": data.audit_recent_entries,
@@ -3705,9 +3379,10 @@ async fn metrics(
         return unauthorized_response();
     }
 
+    let snapshot_prom = snapshot_progress_prometheus(admin.incremental_snapshot_progress());
     let data = admin.data.read().await;
     let prom = runtime_metrics_prometheus(&data);
-    let slo_prom = slo_prometheus(&data);
+    let slo_prom = slo_prometheus(&data, admin.signal_worker_alive());
     let auth_prom = admin.auth_prometheus();
     let audit_drop = admin
         .audit_log_drop_counter
@@ -3725,7 +3400,7 @@ async fn metrics(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        format!("{prom}{slo_prom}{auth_prom}{audit_prom}"),
+        format!("{prom}{slo_prom}{auth_prom}{audit_prom}{snapshot_prom}"),
     )
         .into_response()
 }
@@ -3734,12 +3409,121 @@ async fn metrics(
 // Router
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Turn a panic in any admin handler into a `500`, logged, instead of a dropped socket.
+///
+/// Defence in depth for the control plane, not a substitute for not panicking. Without
+/// it, a panicking handler unwinds into tokio, which aborts that task: the client sees a
+/// connection reset with **no status and no body**, and nothing is written to the log —
+/// so the failure looks like a network problem and is diagnosed as one.
+///
+/// This is not hypothetical here. The audit-trail detail was truncated with a byte slice,
+/// which panicked whenever the budget landed inside a multi-byte character, and any
+/// write-scope token could reach it. That specific defect is fixed (`crate::text`), and
+/// the next one of its kind should surface as a `500` with a stack trace in the log rather
+/// than as an unexplained reset.
+///
+/// The panic payload is deliberately **not** returned to the caller: a panic message can
+/// carry file paths and fragments of internal state, and the admin API is reachable by any
+/// read-scoped token. It goes to the log, where it is already trusted with more than that.
+fn panic_guard(
+) -> tower_http::catch_panic::CatchPanicLayer<fn(Box<dyn std::any::Any + Send + 'static>) -> Response>
+{
+    fn on_panic(panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+        let detail = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&'static str>().copied())
+            .unwrap_or("<non-string panic payload>");
+
+        tracing::error!(
+            target: "rustcdc_audit",
+            action = "admin_handler_panic",
+            detail = %detail,
+            "an admin API handler panicked; returning 500. This is a defect — the \
+             handler should have produced an error response"
+        );
+
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "api_version": "v1",
+                "error": "internal server error",
+            })),
+        )
+            .into_response()
+    }
+
+    tower_http::catch_panic::CatchPanicLayer::custom(on_panic as fn(_) -> _)
+}
+
+/// Serve the admin API's OpenAPI 3.1 document.
+///
+/// Unauthenticated on purpose: it describes the *shape* of the API, not its state, and
+/// requiring a credential to discover how to authenticate is a loop. It contains no
+/// configuration, no secrets and nothing about this instance beyond the crate version.
+async fn openapi_document(
+    State(admin): State<AdminState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    // Rate-limited like every other endpoint that does real work.
+    //
+    // It stays **unauthenticated** — it describes the shape of the API rather than any of
+    // this instance's state, carries no configuration, and requiring a credential to
+    // discover how to authenticate is a loop. But unauthenticated and unmetered are
+    // different things, and this was briefly both: it was the only route that was neither
+    // authorised nor limited while serving ~10 KB of freshly-built JSON, which is a cheap
+    // asymmetric-cost request against a process that is also running the pipeline.
+    //
+    // Shares the `Status` scope rather than adding a fourth limiter: the budget an operator
+    // tunes for "read-only admin surface" is the right one, and a separate knob for a
+    // constant document would be a setting nobody has a reason to set.
+    let (allowed, decision_latency) =
+        admin.allow_abuse_scope(AbuseLimitScope::Status, &headers, Some(peer_addr));
+    admin
+        .record_rate_limiter_decision(AbuseLimitScope::Status, decision_latency)
+        .await;
+    if !allowed {
+        admin
+            .record_rate_limited_request(AbuseLimitScope::Status)
+            .await;
+        return rate_limited_response("openapi");
+    }
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::from(openapi::cached_document()),
+    )
+        .into_response()
+}
+
+/// Message that makes a signal action panic, for the worker-recovery test.
+#[cfg(test)]
+pub(super) const PANIC_PROBE_MESSAGE: &str = "__panic_probe__";
+
+/// Render a caught panic payload as text.
+///
+/// `Box<dyn Any>` carries a `&str` for `panic!("literal")` and a `String` for a formatted
+/// one; anything else is opaque. Losing the message would make the audit record useless
+/// for the one thing it is for.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/status", get(status_authed))
+        .route("/config", get(config_authed))
         .route("/metrics", get(metrics))
         .route("/signals", post(signal_action))
         .route("/notifications", get(notifications_authed))
@@ -3748,7 +3532,9 @@ pub fn router(state: AdminState) -> Router {
             get(notifications_cloudevents_authed),
         )
         .route("/notifications/stream", get(notifications_stream_authed))
+        .route("/openapi.json", get(openapi_document))
         .with_state(state)
+        .layer(panic_guard())
 }
 
 /// Spawn the admin HTTP server as a background tokio task.
@@ -3807,5 +3593,7 @@ pub async fn serve(
     Ok(handle)
 }
 
+#[cfg(test)]
+mod auth_tests;
 #[cfg(test)]
 mod tests;

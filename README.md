@@ -22,7 +22,7 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 | | |
 |---|---|
 | 🚀 **Zero-copy streaming** | Low-latency WAL/binlog tailing with back-pressure across all sources |
-| 🔌 **Four sources, five sinks** | Postgres · MySQL · MariaDB · SQL Server → stdout · JSONL · HTTP · Kafka · Iceberg |
+| 🔌 **Four sources, five sinks** | Postgres · MySQL · MariaDB · SQL Server → stdout · JSONL · HTTP · Kafka · Iceberg. [Not all are equally proven](#connector-maturity) — see below |
 | 📐 **Nine wire formats** | JSON · CloudEvents 1.0 · Avro · Protobuf, plus Confluent framing (Avro / JSON Schema / Protobuf) against Confluent **or** Apicurio registries, and AWS Glue framing |
 | 🌊 **Non-blocking backfill** | DBLog watermark incremental snapshots interleave with the live stream and resume mid-chunk after a restart — no held replication slot, no re-read from row zero |
 | 🧩 **Transform pipeline** | Native rules — masking (redact / HMAC / AES-GCM), field mapping, transactional outbox, routing — plus sandboxed WASM modules in any language. A rule that never matches is a metric, not a silent no-op |
@@ -34,6 +34,27 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 | 🧬 **Partial-image safety** | PostgreSQL unchanged-TOAST holes are tracked per image (`unavailable_columns` / `before_unavailable_columns`) and survive transforms, sinks, and the Iceberg schema — absent is never conflated with `NULL` |
 | 🔒 **Security by default** | Kafka SASL (PLAIN · SCRAM · OAUTHBEARER with a built-in OIDC provider · AWS MSK IAM), mTLS with hot certificate reload, Ed25519-signed audit trail, token-manifest auth, per-IP rate limiting, IP pseudonymisation (GDPR) |
 | 🐳 **Distroless multi-arch image** | `linux/amd64` + `linux/arm64`, SLSA provenance + SBOM, no shell inside |
+
+---
+
+## Connector maturity
+
+Not every connector carries the same evidence, and the difference is worth stating rather
+than leaving for you to discover:
+
+| Connector | End-to-end tested in CI | Against |
+|---|---|---|
+| PostgreSQL | ✅ | A real server, both WAL transports, resume, TLS enforcement, on-demand snapshots, row filters |
+| MySQL | ✅ | A real server, GTID and file+position, resume, primary-key shape |
+| MariaDB | ⚠️ unit-tested only | Shares the MySQL binlog connector; no container suite of its own yet |
+| SQL Server | ⚠️ unit-tested only | No container suite yet |
+
+Both container suites manage their own database, so a local run and CI execute the same
+command against the same fixture, and a test asserts that CI still runs every suite that
+exists — an env-gated test nobody runs reports success, which is worse than no test.
+
+The gap is closing in that order. Until it does, this table is the honest answer to "how
+well is this exercised?"
 
 ---
 
@@ -72,6 +93,12 @@ docker compose up
 
 See [demo/README.md](demo/README.md) for what to expect and how to explore the admin API.
 
+The admin API describes itself: `GET /openapi.json` serves an OpenAPI 3.1 document —
+unauthenticated, since it describes the shape of the API rather than any state — that a
+generator will turn into a typed client. It is built from the same crate as the handlers,
+and a test fails the build if the router and the document ever disagree in either
+direction.
+
 ### Option B — Docker with your own config
 
 ```bash
@@ -96,6 +123,15 @@ export POSTGRES_PASSWORD="mysecret"
 ./target/release/rustcdc run --config-file config.toml
 # (only the kafka_topic state backend needs a one-time `rustcdc init-state` first)
 ```
+
+**Connectors are cargo features.** `--all-features` above builds them all; the *default*
+is PostgreSQL alone, and `--features mysql` / `--features sqlserver` add the others.
+That is a security boundary rather than packaging taste: `sqlserver` pulls `tiberius`,
+which pins rustls 0.21 — a second TLS stack with its own X.509 verifier and four
+suppressed RUSTSEC advisories that nothing else in the tree carries. A PostgreSQL-only
+build links exactly one rustls, and a config naming a connector the binary lacks is
+rejected at startup with the feature to rebuild with. The container image is built
+`--all-features` and loses nothing.
 
 ### Minimal `config.toml`
 
@@ -199,7 +235,38 @@ rather than re-reading from row zero.
 [incremental_snapshot]
 tables     = ["public.orders", "public.customers"]
 chunk_size = 5000
+
+# Optional: scope a backfill to some of the rows. The live stream still carries
+# every change to the table — this restricts only what the backfill reads.
+[incremental_snapshot.table_conditions]
+"public.orders" = "t.created_at >= '2026-01-01'"
 ```
+
+A backfill in flight can be paused, resumed or abandoned through the admin API
+without touching the live stream, and its per-table progress is reported on
+`/status` and `/metrics`.
+
+**On-demand snapshots.** Tables can be snapshotted on a **running** pipeline —
+no restart, no pause of the live stream:
+
+```bash
+rustcdc snapshot public.invoices --admin-write-token-env RUSTCDC_WRITE_TOKEN
+```
+
+This is the equivalent of Debezium's `execute-snapshot` signal without its
+prerequisite: there is **no signal table in the source**, so it works against a
+read-only role and a read replica. A table already in progress is a no-op, one
+already complete is rewound and read again, and every name is resolved against the
+catalog before anything is mutated. Requests are durable — an enqueued table
+survives a restart. Declare `[incremental_snapshot]` (an empty `tables` list is
+enough) to enable it.
+
+**PostgreSQL WAL transport.** `wal_transport = "streaming_replication"` (the
+default) reads the slot with `START_REPLICATION ... LOGICAL`, the protocol
+`pg_recvlogical` and PostgreSQL's own subscribers use: the server pushes WAL as it
+is written, so latency is not bounded by the poll interval. `"sql_peek"` remains
+available for a role without `REPLICATION` or a connection that must route through
+a pooler.
 
 ---
 
@@ -351,6 +418,13 @@ rustcdc --config-file <FILE> <COMMAND>
   inspect-checkpoint   Print the current checkpoint offset
   replay               Replay events from a saved JSONL file
   status               Query runtime status via the admin API
+  snapshot             Backfill tables on a running instance, without a restart
+```
+
+```bash
+# Backfill a table added to the publication after the pipeline started.
+# No restart, and the live stream is never paused.
+rustcdc snapshot public.invoices --admin-write-token-env RUSTCDC_WRITE_TOKEN
 ```
 
 ---
@@ -392,7 +466,9 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 - **Kafka SASL** — PLAIN, SCRAM-SHA-256/512, OAUTHBEARER (with a built-in OIDC `client_credentials` provider that refreshes per connection), AWS MSK IAM — every mechanism composes with TLS, so `sasl_ssl` + SCRAM-SHA-512 (the default on Redpanda Cloud, Aiven and Strimzi) is a supported combination
 - **mTLS with hot reload** — client certificates re-read on an interval (KIP-1288), so a rotated cert does not need a restart
 - **Secrets are references, never literals** — registry credentials, SASL passwords and masking keys must be `{ env = "VAR" }`; a literal in the config file is rejected at load
-- **TLS everywhere** — admin API and all outbound connections use rustls (no OpenSSL)
+- **`GET /config`** — the configuration this instance is *actually* running, after env-var layering and migration, with three independent redaction rules: enumerated paths, secret-looking key names (separator-insensitive, so `x-api-key` matches), and a value-driven URL rule that strips userinfo *and* secret-named query parameters under any key. Held by a property test that generates names rather than listing them
+- **Control-plane panic guard** — a panic in any admin handler becomes a logged `500`, not a bare connection reset; the payload never reaches the caller
+- **TLS everywhere** — admin API and all outbound connections use rustls (no OpenSSL). A TLS-configured source is TLS on *every* connection, including the replication-slot lag sampler; a server with `ssl = off` fails the connection rather than silently downgrading it
 - **`#![deny(unsafe_code)]`** — enforced workspace-wide
 
 ---
@@ -409,8 +485,16 @@ cargo test --all-features
 # Lint
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Audit licenses and duplicate dependencies
-cargo deny check
+# Audit licenses and duplicate dependencies (--all-features matches CI and the
+# published image; without it the `glue` tree is absent and the AWS SDK's
+# hyper-0.14 skips are reported as unnecessary)
+cargo deny check --all-features
+
+# Throughput (real batch path; saves/compares a criterion baseline)
+cargo bench --bench throughput -- --save-baseline main
+
+# End-to-end against a real PostgreSQL (manages its own container; needs Docker)
+RUSTCDC_INTEGRATION=1 cargo test --all-features --test integration_postgres -- --test-threads=1
 
 # Specific integration suites
 cargo test --test config_roundtrip

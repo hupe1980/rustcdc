@@ -33,7 +33,7 @@ pub async fn execute(args: StatusArgs) -> Result<(), AppError> {
 // ── Admin HTTP client ─────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
-enum AdminClientError {
+pub(super) enum AdminClientError {
     #[error("{0}")]
     Setup(#[from] AppError),
 
@@ -66,16 +66,18 @@ impl From<AdminClientError> for AppError {
 }
 
 #[derive(Debug, Clone, Default)]
-struct AdminTlsClientConfig {
+pub(super) struct AdminTlsClientConfig {
     admin_ca_file: Option<PathBuf>,
     admin_client_cert_file: Option<PathBuf>,
     admin_client_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct AdminAuthClientConfig {
+pub(super) struct AdminAuthClientConfig {
     admin_read_token: Option<String>,
     admin_read_token_env: Option<String>,
+    admin_write_token: Option<String>,
+    admin_write_token_env: Option<String>,
 }
 
 impl From<&crate::cli::AdminTlsClientArgs> for AdminTlsClientConfig {
@@ -93,8 +95,33 @@ impl From<&crate::cli::AdminAuthClientArgs> for AdminAuthClientConfig {
         Self {
             admin_read_token: value.admin_read_token.clone(),
             admin_read_token_env: value.admin_read_token_env.clone(),
+            admin_write_token: value.admin_write_token.clone(),
+            admin_write_token_env: value.admin_write_token_env.clone(),
         }
     }
+}
+
+/// POST a JSON body to a write-scoped admin endpoint.
+///
+/// Separate from `http_get` only in method, body and which token it presents — the write
+/// token, which until now the CLI accepted and never used.
+pub(super) async fn http_post_json(
+    url: &str,
+    body: &serde_json::Value,
+    tls: &AdminTlsClientConfig,
+    auth: &AdminAuthClientConfig,
+) -> Result<String, AdminClientError> {
+    let client = admin_http_client(std::time::Duration::from_secs(30), tls)?;
+
+    let mut request = client.post(url).json(body);
+    if let Some(token) = resolve_token(
+        auth.admin_write_token.as_deref(),
+        auth.admin_write_token_env.as_deref(),
+    )? {
+        request = request.bearer_auth(token);
+    }
+
+    send_and_read(request, url).await
 }
 
 async fn http_get(
@@ -112,6 +139,13 @@ async fn http_get(
         request = request.bearer_auth(token);
     }
 
+    send_and_read(request, url).await
+}
+
+async fn send_and_read(
+    request: reqwest::RequestBuilder,
+    url: &str,
+) -> Result<String, AdminClientError> {
     let response = request
         .send()
         .await

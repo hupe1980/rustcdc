@@ -593,15 +593,22 @@ dir = "{}"
 // Redaction
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// **No secret placed anywhere in a real config may survive into `/status`.**
+/// No credential from a real config reaches `/config`, whichever carrier it uses.
 ///
-/// This is the generalisation the Round 2 credential leak called for. Every earlier
-/// redaction test enumerated a path or a key name, which is precisely how
-/// `sink.http.url` slipped through — it was in neither list. This one plants the same
-/// sentinel in every credential-bearing field the schema has and asserts on the
-/// *output*, so a newly added secret field fails here rather than in production.
+/// Four carriers in one config, because they are covered by four different rules and a
+/// regression in any one of them is a credential disclosure to every read-scoped token:
+///
+/// * a `SecretString` (`source.password`) — redacted by its own `Serialize`
+/// * a `SecretString` behind a differently-named field (`sink.bearer_token`)
+/// * a header map entry (`sink.headers.authorization`, `x-api-key`) — redacted by name
+/// * a **URL query parameter** (`sink.http.url?api_key=`) — redacted by value
+///
+/// The last is the one that was open: `sink.http.url` matches no enumerated path and no
+/// secret-looking key name, and since the loader rejects userinfo in that field outright,
+/// the query string is the only way a credential can actually get there — which is also
+/// how webhook and ingest endpoints normally carry one.
 #[tokio::test]
-async fn no_secret_from_a_real_config_reaches_the_status_endpoint() {
+async fn no_secret_from_a_real_config_reaches_the_config_endpoint() {
     const SENTINEL: &str = "sentinel-secret-9f3a7c";
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -630,7 +637,7 @@ mode = "plaintext"
 
 [sink]
 type = "http"
-url  = "https://api.example.com/events"
+url  = "https://api.example.com/events?region=eu&api_key={SENTINEL}"
 bearer_token = {{ env = "CDC_TEST_SENTINEL_SECRET" }}
 
 [sink.headers]
@@ -639,23 +646,43 @@ x-api-key     = "{SENTINEL}"
 
 [state]
 dir = "{state}"
+
+[admin]
+read_token_env = "CDC_TEST_STATUS_READ_TOKEN"
 "#,
             state = dir.path().join("state").display(),
         ),
     )
     .expect("write config");
 
+    // **The token is the point.** This probe used to be unauthenticated, on the reasoning
+    // that a loopback bind with no tokens leaves `/status` open. It does not — read scope
+    // fails closed when no read token is configured — so the response was the four-byte
+    // string `unauthorized`, and "no secret appears in the body" held trivially. The test
+    // named after redaction never exercised redaction once. The legibility assertion below
+    // is what exposed that, and is why it is here rather than being merely nice to have.
+    std::env::set_var("CDC_TEST_STATUS_READ_TOKEN", "status-read-token");
     let config = rustcdc_server::config::load(&config_path).expect("config loads");
     let state = AdminState::new(&config).await.expect("admin state");
 
-    // No token configured on a loopback bind, so /status is reachable unauthenticated —
-    // which is exactly the exposure worth checking.
-    let (_, body) = probe(state, get("/status", None)).await;
+    let (status, body) = probe(state, get("/config", Some("Bearer status-read-token"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the probe must actually reach the handler, or this asserts nothing: {body}"
+    );
     assert!(
         !body.contains(SENTINEL),
-        "a secret reached the status endpoint. Redaction is enumerate-by-name, so a \
+        "a secret reached the config endpoint. Redaction is enumerate-by-name, so a \
          newly added credential field is invisible to it until someone remembers to \
          add it:\n{body}"
+    );
+
+    // Redaction must stay legible, or operators stop reading the snapshot and it stops
+    // being a diagnostic. The host and the non-secret query parameter survive.
+    assert!(
+        body.contains("api.example.com") && body.contains("region=eu"),
+        "redaction over-reached: the snapshot must still identify the endpoint:\n{body}"
     );
 }
 

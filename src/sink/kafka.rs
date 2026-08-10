@@ -25,6 +25,7 @@ type InFlightSend = Pin<Box<dyn Future<Output = krafka::error::Result<RecordMeta
 /// Producers are held behind `Arc` so a send future can be detached from the
 /// `&mut self` that created it. krafka's `send` takes `&self`, so this costs nothing
 /// but the refcount and is what makes pipelining expressible at all.
+#[derive(Clone)]
 enum KafkaProducerClient {
     Idempotent(Arc<Producer>),
     Transactional(Arc<TransactionalProducer>),
@@ -366,11 +367,15 @@ impl KafkaSink {
             .to_auth_config()
             .map_err(RtError::ConfigError)?;
 
+        // Carries the SOCKS5 proxy and the per-connection in-flight ceiling too, since
+        // krafka 0.18 moved both onto `TransportConfig`. The proxy used to need a second
+        // accessor applied at each builder below, which is precisely how it came to be
+        // silently dropped when only one of them got it.
         let transport = config.transport.to_krafka().map_err(RtError::ConfigError)?;
 
         let (producer, delivery_guarantee) = match config.delivery_mode {
             KafkaDeliveryMode::AtLeastOnceIdempotent => {
-                let producer = Producer::builder()
+                let builder = Producer::builder()
                     .bootstrap_servers(brokers.join(","))
                     .client_id(config.client_id.clone())
                     .acks(Acks::All)
@@ -391,16 +396,11 @@ impl KafkaSink {
                         config.ack_timeout_ms,
                     )))
                     .delivery_timeout(Self::delivery_timeout(config))
-                    .max_in_flight(config.max_in_flight)
                     .transport(transport.clone())
-                    .auth(auth)
-                    .build()
-                    .await
-                    .map_err(|e| {
-                        RtError::ConfigError(format!(
-                            "failed to build idempotent krafka producer: {e}"
-                        ))
-                    })?;
+                    .auth(auth);
+                let producer = builder.build().await.map_err(|e| {
+                    RtError::ConfigError(format!("failed to build idempotent krafka producer: {e}"))
+                })?;
                 (
                     KafkaProducerClient::Idempotent(Arc::new(producer)),
                     SinkDeliveryGuarantee::AtLeastOnceIdempotent,
@@ -425,7 +425,7 @@ impl KafkaSink {
                     ));
                 }
 
-                let producer = TransactionalProducer::builder()
+                let builder = TransactionalProducer::builder()
                     .bootstrap_servers(brokers.join(","))
                     .client_id(config.client_id.clone())
                     .transactional_id(transactional_id)
@@ -443,7 +443,6 @@ impl KafkaSink {
                     .compression_level(config.compression_level)
                     .batch_size(config.batch_size)
                     .linger(Duration::from_millis(config.linger_ms))
-                    .max_in_flight(config.max_in_flight)
                     .retries(config.retry_max_attempts)
                     .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
                     // Bounds how long a batch may sit in flight. It matters more here
@@ -451,14 +450,12 @@ impl KafkaSink {
                     // transaction open and blocks the checkpoint barrier behind it.
                     .delivery_timeout(Self::delivery_timeout(config))
                     .transport(transport.clone())
-                    .auth(auth)
-                    .build()
-                    .await
-                    .map_err(|e| {
-                        RtError::ConfigError(format!(
-                            "failed to build transactional krafka producer: {e}"
-                        ))
-                    })?;
+                    .auth(auth);
+                let producer = builder.build().await.map_err(|e| {
+                    RtError::ConfigError(format!(
+                        "failed to build transactional krafka producer: {e}"
+                    ))
+                })?;
 
                 producer.init_transactions().await.map_err(|e| {
                     RtError::SourceError(format!(
@@ -568,34 +565,51 @@ impl KafkaSink {
         Ok(())
     }
 
-    /// Build the send future without polling it.
+    /// Hand one record to the producer and return a future for its acknowledgement.
     ///
     /// `Bytes` is refcounted, so neither the key nor the value is copied here. The old
     /// `send(&topic, Some(&key), &value)` path took byte slices and krafka's convenience
     /// wrapper did a `Bytes::copy_from_slice` of each — a full duplicate of every payload,
     /// per record, discarded immediately after the accumulator took ownership.
-    fn build_send(&self, key: Bytes, value: Bytes) -> InFlightSend {
-        let topic = self.topic.clone();
+    ///
+    /// # The two arms differ, and the difference is the ordering guarantee
+    ///
+    /// **Idempotent:** `enqueue` (krafka 0.18, our `FEEDBACK_KRAFKA.md` F-1) performs the
+    /// accumulator append *before it returns*, so produce order is call order — settled
+    /// here, at submission, and not dependent on how the returned handles are polled
+    /// afterwards. This is the path that no longer needs [`SendWindow`]'s poll sweep.
+    ///
+    /// **Transactional:** `TransactionalProducer::enqueue` returns a handle that borrows
+    /// the producer, so it cannot be stored in the same struct that owns the producer
+    /// without a self-reference — and `unsafe_code = "forbid"` rules out the usual
+    /// escapes. This arm therefore still boxes a future that appends when first polled,
+    /// and still depends on the ordered sweep. Raised upstream as F-5; when an owned
+    /// transactional handle exists, this arm collapses into the one above and
+    /// [`SendWindow`] loses its reason to exist.
+    ///
+    /// Takes its inputs by value rather than through `&self`: an `InFlightSend` is
+    /// `Send` but not `Sync`, so holding `&KafkaSink` across the enqueue await would make
+    /// the whole `SinkAdapter::send` future non-`Send` and fail the trait's bound.
+    async fn build_send(
+        producer: KafkaProducerClient,
+        topic: String,
+        key: Bytes,
+        value: Bytes,
+    ) -> krafka::error::Result<InFlightSend> {
         // `with_key` unconditionally, including for an empty key. An empty key and an
         // absent key partition differently — murmur2("") pins one partition, absent
         // round-robins — and the original path always passed `Some(key)`. Changing that
         // here would silently repartition an existing topic.
-        match &self.producer {
+        let record = ProducerRecord::new(topic, value).with_key(key);
+        match producer {
             KafkaProducerClient::Idempotent(producer) => {
-                let producer = Arc::clone(producer);
-                Box::pin(async move {
-                    producer
-                        .send_record(ProducerRecord::new(topic, value).with_key(key))
-                        .await
-                })
+                let handle = producer.enqueue(record).await?;
+                Ok(Box::pin(handle))
             }
             KafkaProducerClient::Transactional(producer) => {
-                let producer = Arc::clone(producer);
-                Box::pin(async move {
-                    producer
-                        .send_record(ProducerRecord::new(topic, value).with_key(key))
-                        .await
-                })
+                Ok(Box::pin(
+                    async move { producer.enqueue(record).await?.await },
+                ))
             }
         }
     }
@@ -689,7 +703,14 @@ impl KafkaSink {
             self.await_oldest_send().await?;
         }
 
-        let mut send = self.build_send(key, value);
+        // An enqueue failure is the record never reaching the accumulator at all —
+        // validation, an unknown topic, or the bounded wait for buffer memory expiring.
+        // It is this record's outcome and belongs to this call, not to the window.
+        let mut send =
+            match Self::build_send(self.producer.clone(), self.topic.clone(), key, value).await {
+                Ok(send) => send,
+                Err(error) => return Self::settle(Err(error)),
+            };
         match futures::poll!(send.as_mut()) {
             // Already settled — a small record into a warm accumulator with memory
             // available can complete without ever suspending.
@@ -1150,7 +1171,6 @@ mod tests {
             batch_size: 16 * 1024,
             linger_ms: 0,
             max_pipelined_sends: 128,
-            max_in_flight: 5,
             transport: Default::default(),
             delivery_mode: crate::config::schema::KafkaDeliveryMode::AtLeastOnceIdempotent,
             transactional_id: None,
@@ -2354,16 +2374,20 @@ mod tests {
         use rustcdc::sink::SinkAdapter as _;
         binding.flush().await.expect("flush");
 
-        // No connect_timeout on this builder — use a request budget >= the
-        // 10 s connect default (see load_records for the same workaround).
-        let mut consumer = CompactedTopicConsumer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
-            .topic("cdc.fake.keys".to_string())
-            .client_id("fake-key-check".to_string())
-            .request_timeout(Duration::from_secs(10))
-            .build()
-            .await
-            .expect("compacted consumer");
+        // krafka 0.18 replaced `CompactedTopicConsumer::builder()` with
+        // `from_consumer_builder`, which takes the real `ConsumerBuilder` — so the
+        // connect timeout this used to work around by inflating the request budget is
+        // now simply settable.
+        let mut consumer = CompactedTopicConsumer::from_consumer_builder(
+            krafka::consumer::Consumer::builder()
+                .bootstrap_servers(broker.bootstrap_servers())
+                .client_id("fake-key-check".to_string())
+                .connect_timeout(Duration::from_secs(2))
+                .request_timeout(Duration::from_secs(10)),
+            "cdc.fake.keys",
+        )
+        .await
+        .expect("compacted consumer");
         consumer
             .scan(Duration::from_millis(1_000))
             .await

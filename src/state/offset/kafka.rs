@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use krafka::admin::{AdminClient, ConfigEntry, DescribeConfigsRequest};
 use krafka::consumer::CompactedTopicConsumer;
 use krafka::producer::TransactionalProducer;
-use rustcdc::checkpoint::{Checkpoint, FileCheckpoint, GenericOffset};
+use rustcdc::checkpoint::{
+    validate_checkpoint_progress, Checkpoint, FileCheckpoint, GenericOffset, StoredCheckpointRecord,
+};
 use rustcdc::core::Offset;
 use rustcdc::schema_history::{
     DDLEvent, FileSchemaHistory, SchemaHistory, SchemaHistoryRetention, TableSchema,
@@ -366,11 +368,26 @@ impl KafkaTopicStateWriter {
 pub(crate) struct KafkaTopicCheckpoint {
     inner: FileCheckpoint,
     writer: Arc<KafkaTopicStateWriter>,
+    /// The last record known to be published, for the pre-write guard.
+    ///
+    /// Seeded from the topic at startup and advanced after each accepted write, so the
+    /// guard needs no read of the state topic on the durability path. Transactional
+    /// fencing on the state topic is what makes an in-memory copy sound: a second writer
+    /// for the same transactional id is fenced out before it can publish.
+    last: Option<StoredCheckpointRecord>,
 }
 
 impl KafkaTopicCheckpoint {
-    pub(crate) fn new(inner: FileCheckpoint, writer: Arc<KafkaTopicStateWriter>) -> Self {
-        Self { inner, writer }
+    pub(crate) fn new(
+        inner: FileCheckpoint,
+        writer: Arc<KafkaTopicStateWriter>,
+        last: Option<StoredCheckpointRecord>,
+    ) -> Self {
+        Self {
+            inner,
+            writer,
+            last,
+        }
     }
 }
 
@@ -381,6 +398,24 @@ impl Checkpoint for KafkaTopicCheckpoint {
         offset: &dyn Offset,
         committed_event_count: u64,
     ) -> rustcdc::core::Result<()> {
+        // Validate before publishing. The guard refuses a record whose committed-event
+        // count regresses, whose count collides with a different payload, or whose
+        // connector-native stream position rewinds while the count keeps rising — the
+        // shape a connector defect takes, and the one that makes a pipeline resume before
+        // data the sink already committed while every counter reports health.
+        //
+        // This used to lean on `FileCheckpoint::save` for that validation and therefore
+        // had to write the local file first. That worked, but it inverted the two stores:
+        // the topic is authoritative and the file is a cache `build_both` rebuilds from it
+        // on every startup. Calling the guard directly removes the constraint, so the
+        // publish can go first and the ordering can follow from which store is the truth.
+        //
+        // Under `at_least_once` on this backend the publish is outside any transaction, so
+        // a record that reached the topic *is* durable — there is no barrier abort to
+        // retract it. That is precisely why the check cannot come after it.
+        let next = StoredCheckpointRecord::from_offset(offset, committed_event_count)?;
+        validate_checkpoint_progress(self.last.as_ref(), &next)?;
+
         let record = KafkaTopicCheckpointRecord {
             record_version: KAFKA_TOPIC_CHECKPOINT_VERSION,
             source_type: offset.source_type().to_string(),
@@ -394,11 +429,11 @@ impl Checkpoint for KafkaTopicCheckpoint {
             .await
             .map_err(|e| rustcdc::core::Error::StateError(e.to_string()))?;
 
-        // The local file is written whether or not the Kafka record is durable yet. It is
-        // a cache, and `build_both` rebuilds it from the topic on every startup — so a
-        // file that ran ahead of an aborted transaction is corrected before it is ever
-        // read, and one that matches a committed transaction is simply already right.
+        // The local file trails the topic: it is a cache, and `build_both` purges and
+        // rebuilds it from the topic on every startup, so a file that ran ahead of an
+        // aborted transaction is corrected before it is ever read.
         self.inner.save(offset, committed_event_count).await?;
+        self.last = Some(next);
 
         Ok(())
     }
@@ -495,8 +530,10 @@ impl KafkaTopicSchemaHistory {
 
 #[async_trait]
 impl SchemaHistory for KafkaTopicSchemaHistory {
-    async fn record_ddl(&mut self, ddl: DDLEvent) -> rustcdc::core::Result<u32> {
-        let version = self.inner.record_ddl(ddl).await?;
+    async fn record_ddl(&mut self, ddl_id: &str, ddl: DDLEvent) -> rustcdc::core::Result<u32> {
+        // See the note in `state/schema_history/opendal.rs`: the identity is what makes a
+        // replayed DDL idempotent, and this adapter must not absorb it.
+        let version = self.inner.record_ddl(ddl_id, ddl).await?;
         self.flush_dirty_snapshot().await?;
         Ok(version)
     }
@@ -535,6 +572,66 @@ impl SchemaHistory for KafkaTopicSchemaHistory {
 // Build + initialize
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Rebuild the local checkpoint mirror from the topic, and the guard's baseline with it.
+///
+/// The local file is a **cache** of what Kafka holds, never a second source of truth, so
+/// it is rebuilt on every startup — including when the topic says there is no position
+/// yet.
+///
+/// Purging first is the part that matters. Restoring only when Kafka has a real record
+/// left a stale local file in place whenever the topic held nothing, and `load()` reads
+/// the file: the pipeline would resume from a position Kafka had never confirmed and skip
+/// everything after it. That is silent data loss, and it became easier to reach once the
+/// checkpoint moved inside the sink transaction, where an aborted transaction deliberately
+/// leaves the topic without the record the local file may already have.
+///
+/// Split out of [`build_both`] so it can be tested against a `FakeBroker`, which does not
+/// implement `DescribeConfigs` and so cannot reach the durability preflight `build_both`
+/// runs first.
+async fn restore_checkpoint_mirror(
+    state_dir: &Path,
+    checkpoint: Option<KafkaTopicCheckpointRecord>,
+) -> Result<(FileCheckpoint, Option<StoredCheckpointRecord>), AppError> {
+    let checkpoint_dir = state_dir.join("checkpoint");
+    if checkpoint_dir.exists() {
+        std::fs::remove_dir_all(&checkpoint_dir)?;
+    }
+    std::fs::create_dir_all(&checkpoint_dir)?;
+    let mut file_checkpoint = FileCheckpoint::new(checkpoint_dir.clone());
+
+    let Some(record) = checkpoint.filter(|r| !is_bootstrap_checkpoint_record(r)) else {
+        return Ok((file_checkpoint, None));
+    };
+
+    let offset_bytes = hex::decode(&record.offset_hex).map_err(|e| {
+        AppError::Other(format!(
+            "state.backend.kafka_topic snapshot checkpoint has invalid offset_hex: {e}"
+        ))
+    })?;
+    let offset = GenericOffset::new(record.source_type, offset_bytes);
+    file_checkpoint
+        .save(&offset, record.committed_event_count)
+        .await
+        .map_err(|e| {
+            AppError::Other(format!(
+                "failed restoring checkpoint from kafka topic state: {e}"
+            ))
+        })?;
+
+    // Seed the pre-write guard from what the topic already holds, so the first write after
+    // a restart is guarded like every other one. A restart is exactly when a repointed
+    // source or a recreated slot first surfaces.
+    let baseline = StoredCheckpointRecord::from_offset(&offset, record.committed_event_count)
+        .map_err(|e| {
+            AppError::Other(format!(
+                "state topic checkpoint offset payload is not JSON, so the stream-position \
+                 guard cannot be applied: {e}"
+            ))
+        })?;
+
+    Ok((file_checkpoint, Some(baseline)))
+}
+
 /// Build a fully initialised Kafka-backed `RuntimeState` from the loaded
 /// topic records.  Restores local filesystem mirrors from the Kafka snapshot
 /// so that `FileCheckpoint` / `FileSchemaHistory` remain the immediate-access
@@ -559,40 +656,8 @@ async fn build_both(
     let loaded = load_records(config).await?;
     validate_loaded_records(&loaded, config)?;
 
-    // The local file is a **cache** of what Kafka holds, never a second source of truth,
-    // so it is rebuilt from the topic on every startup — including when the topic says
-    // there is no position yet.
-    //
-    // Purging first is the part that matters. Restoring only when Kafka has a real record
-    // left a stale local file in place whenever the topic held nothing, and `load()` reads
-    // the file: the pipeline would resume from a position Kafka had never confirmed and
-    // skip everything after it. That is silent data loss, and it became easier to reach
-    // once the checkpoint moved inside the sink transaction, where an aborted transaction
-    // deliberately leaves the topic without the record the local file may already have.
-    let checkpoint_dir = state_dir.join("checkpoint");
-    if checkpoint_dir.exists() {
-        std::fs::remove_dir_all(&checkpoint_dir)?;
-    }
-    std::fs::create_dir_all(&checkpoint_dir)?;
-    let mut file_checkpoint = FileCheckpoint::new(checkpoint_dir.clone());
-    if let Some(record) = loaded.checkpoint.clone() {
-        if !is_bootstrap_checkpoint_record(&record) {
-            let offset_bytes = hex::decode(&record.offset_hex).map_err(|e| {
-                AppError::Other(format!(
-                    "state.backend.kafka_topic snapshot checkpoint has invalid offset_hex: {e}"
-                ))
-            })?;
-            let offset = GenericOffset::new(record.source_type, offset_bytes);
-            file_checkpoint
-                .save(&offset, record.committed_event_count)
-                .await
-                .map_err(|e| {
-                    AppError::Other(format!(
-                        "failed restoring checkpoint from kafka topic state: {e}"
-                    ))
-                })?;
-        }
-    }
+    let (file_checkpoint, restored) =
+        restore_checkpoint_mirror(state_dir, loaded.checkpoint.clone()).await?;
 
     let schema_history_path = state_dir.join("schema_history");
     if let Some(bytes) = loaded.schema_history_bytes.clone() {
@@ -619,7 +684,7 @@ async fn build_both(
         .await;
 
     Ok((
-        KafkaTopicCheckpoint::new(file_checkpoint, writer.clone()),
+        KafkaTopicCheckpoint::new(file_checkpoint, writer.clone(), restored),
         KafkaTopicSchemaHistory::new(file_schema_history, writer.clone(), schema_history_path),
         writer,
     ))
@@ -874,29 +939,70 @@ pub(crate) fn validate_topic_config_entries(
     Ok(())
 }
 
-async fn load_records(config: &KafkaTopicStateConfig) -> Result<LoadedKafkaRecords, AppError> {
+/// Build the compacted-topic scanner used to rebuild local state from the topic.
+///
+/// **The isolation level is the whole reason this needs saying.**
+///
+/// Under `effectively_once` the checkpoint record is published *inside the sink's Kafka
+/// transaction*, precisely so an aborted batch leaves neither the data nor the position
+/// describing it. A `read_uncommitted` scanner sees the record anyway: on restart after a
+/// crash, `build_both` would rebuild the local checkpoint from a transaction that was
+/// aborted (or was still open and would be), and the pipeline would resume past events
+/// that were never published. That is the exact data-loss window the shared transaction
+/// exists to close, reopened by the reader.
+///
+/// It was invisible because the test that proves the property
+/// (`an_aborted_batch_publishes_neither_data_nor_checkpoint`) reads the topic through its
+/// own `read_committed` consumer rather than through this path — so it asserted the
+/// broker's behaviour, not the server's.
+///
+/// This function used to hand-build a `Consumer`, set `isolation_level` on it, fetch the
+/// topic's metadata and assign every partition itself, because the old
+/// `CompactedTopicConsumerBuilder` exposed neither `isolation_level` nor `connect_timeout`
+/// — nine hand-picked settings, and everything else unreachable. We reported that;
+/// krafka 0.18 deleted the builder in favour of `from_consumer_builder`, which takes the
+/// real `ConsumerBuilder` and *imposes* `ReadCommitted`, `Earliest` and no auto-commit as
+/// requirements of materialising a table rather than preferences. It also does the
+/// metadata refresh and full-partition assignment, so roughly forty lines here — including
+/// a `state_topic_partitions` helper whose only job was that assignment — are now the
+/// library's problem.
+///
+/// **This became correct in krafka 0.17.** Before it, `read_committed` consumers reported
+/// permanent phantom lag — `is_caught_up()` compared the position against the high
+/// watermark rather than the last stable offset — so `scan()` could never terminate on a
+/// topic with any transactional history. Scanning committed-only would have hung startup.
+async fn build_state_scanner(
+    config: &KafkaTopicStateConfig,
+) -> Result<CompactedTopicConsumer, AppError> {
     let auth = config.security.to_auth_config().map_err(AppError::Other)?;
+    let connect_timeout = crate::sink::kafka_connect_timeout(std::time::Duration::from_millis(
+        config.request_timeout_ms,
+    ));
+    // krafka validates `request_timeout >= connect_timeout` at build time, and readback is
+    // a startup-time operation where a generous network budget costs nothing.
+    let request_timeout =
+        std::time::Duration::from_millis(config.request_timeout_ms).max(connect_timeout);
 
-    // CompactedTopicConsumerBuilder does not expose `connect_timeout` (krafka
-    // 0.13), and krafka validates `request_timeout >= connect_timeout` (10 s
-    // default) at build time. Floor the readback request budget at the connect
-    // default — readback is a startup-time operation where a generous network
-    // budget is safe. TODO(upstream): expose connect_timeout on the builder.
-    let readback_request_timeout =
-        std::time::Duration::from_millis(config.request_timeout_ms.max(10_000));
-    let mut consumer = CompactedTopicConsumer::builder()
-        .bootstrap_servers(config.brokers.clone())
-        .topic(config.topic.clone())
-        .client_id(format!("{}-state-readback", config.client_id))
-        .request_timeout(readback_request_timeout)
-        .auth(auth)
-        .build()
-        .await
-        .map_err(|e| {
-            AppError::Other(format!(
-                "failed to build compacted topic scanner for state backend: {e}"
-            ))
-        })?;
+    CompactedTopicConsumer::from_consumer_builder(
+        krafka::consumer::Consumer::builder()
+            .bootstrap_servers(config.brokers.clone())
+            .client_id(format!("{}-state-readback", config.client_id))
+            .request_timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .auth(auth),
+        config.topic.clone(),
+    )
+    .await
+    .map_err(|e| {
+        AppError::Other(format!(
+            "failed to build the state readback consumer for topic '{}': {e}",
+            config.topic
+        ))
+    })
+}
+
+async fn load_records(config: &KafkaTopicStateConfig) -> Result<LoadedKafkaRecords, AppError> {
+    let mut consumer = build_state_scanner(config).await?;
 
     consumer
         .scan(std::time::Duration::from_millis(
@@ -1132,6 +1238,75 @@ mod tests {
             committed_event_count: 3,
             saved_at_unix_ms: now_unix_ms(),
         }
+    }
+
+    /// **The reader must honour the transaction too.**
+    ///
+    /// `an_aborted_batch_publishes_neither_data_nor_checkpoint` proves the broker hides an
+    /// aborted checkpoint from a `read_committed` consumer — but it builds that consumer
+    /// itself. Production rebuilds local state through `load_records`, and that path used
+    /// the compacted-topic *builder*, which offers no isolation level and therefore scanned
+    /// at krafka's `read_uncommitted` default.
+    ///
+    /// So the aborted checkpoint was hidden from the test and visible to the server. After
+    /// a crash, `build_both` would restore it and the pipeline would resume past events
+    /// that were never published — the exact loss the shared transaction exists to prevent,
+    /// reintroduced by the reader.
+    ///
+    /// Dropping `.isolation_level(IsolationLevel::ReadCommitted)` from `build_state_scanner`
+    /// fails this test.
+    #[tokio::test]
+    async fn the_state_readback_does_not_see_an_aborted_checkpoint() {
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        let (mut sink, writer) =
+            eos_pipeline(&broker, "eos.data.readback", "eos.state.readback").await;
+
+        let mut config = sample_config();
+        config.brokers = broker.bootstrap_servers();
+        config.topic = "eos.state.readback".to_string();
+
+        // A committed checkpoint first, so the assertion below distinguishes "reads only
+        // committed records" from "reads nothing at all".
+        sink.begin_checkpoint_barrier()
+            .await
+            .expect("begin barrier");
+        writer
+            .update_checkpoint(checkpoint_at("00aa"))
+            .await
+            .expect("checkpoint joins the transaction");
+        sink.commit_checkpoint_barrier()
+            .await
+            .expect("commit barrier");
+
+        // Then one that is aborted, exactly as a crashed batch leaves it.
+        sink.begin_checkpoint_barrier()
+            .await
+            .expect("begin second barrier");
+        sink.send_encoded(
+            bytes::Bytes::from_static(b"k1"),
+            bytes::Bytes::from_static(b"doomed-row"),
+        )
+        .await
+        .expect("send accepted");
+        writer
+            .update_checkpoint(checkpoint_at("00ff"))
+            .await
+            .expect("checkpoint joins the transaction");
+        sink.abort_checkpoint_barrier()
+            .await
+            .expect("abort barrier");
+
+        let loaded = load_records(&config).await.expect("readback scan");
+        let record = loaded
+            .checkpoint
+            .expect("the committed checkpoint must still be found");
+        assert_eq!(
+            record.offset_hex, "00aa",
+            "the readback must resume from the last committed position, not from the \
+             aborted one that describes data nobody published"
+        );
     }
 
     /// **The crash window, closed.** An aborted batch must leave *neither* the data nor
@@ -1560,6 +1735,145 @@ mod tests {
         assert!(
             loaded.schema_history.is_some(),
             "bootstrap schema history present"
+        );
+    }
+
+    /// The state topic must never hold a position the guard would refuse.
+    ///
+    /// A stream position that rewinds while the committed-event count keeps climbing is
+    /// refused. Under `at_least_once` the publish is not wrapped in a sink transaction
+    /// that could retract it, so a check that ran *after* the publish would be reporting
+    /// damage that is already the durable truth.
+    ///
+    /// Moving the `validate_checkpoint_progress` call in `KafkaTopicCheckpoint::save`
+    /// below the `update_checkpoint` publish fails the final assertion.
+    #[tokio::test]
+    async fn a_refused_rewind_never_reaches_the_state_topic() {
+        use rustcdc::checkpoint::PostgresOffset;
+
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        broker.create_topic("cdc.fake.guard", 1);
+
+        let config = KafkaTopicStateConfig {
+            brokers: broker.bootstrap_servers(),
+            topic: "cdc.fake.guard".to_string(),
+            client_id: "fake-guard-test".to_string(),
+            request_timeout_ms: 2_000,
+            readback_poll_timeout_ms: 500,
+            min_replication_factor: 1,
+            min_insync_replicas: 1,
+            durability_profile: crate::config::schema::KafkaStateDurabilityProfile::Development,
+            security: KafkaSecurityConfig::default(),
+        };
+
+        let writer = Arc::new(KafkaTopicStateWriter::new(&config).await.expect("writer"));
+        writer.seed_bootstrap().await.expect("seed bootstrap");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut checkpoint =
+            KafkaTopicCheckpoint::new(FileCheckpoint::new(temp.path()), Arc::clone(&writer), None);
+
+        checkpoint
+            .save(&PostgresOffset::new(0x16B_6A70, "slot"), 1)
+            .await
+            .expect("the first checkpoint must be accepted");
+
+        // A zero LSN is not a position the stream can reach, so rustcdc reads it as a
+        // decode defect rather than an out-of-order pgoutput commit.
+        let refused = checkpoint
+            .save(&PostgresOffset::new(0, "slot"), 2)
+            .await
+            .expect_err("a rewound stream position must be refused");
+        assert!(
+            refused.to_string().contains("backwards"),
+            "the error must name the regression: {refused}"
+        );
+
+        let loaded = load_records(&config).await.expect("readback scan");
+        let record = loaded.checkpoint.expect("checkpoint record present");
+        assert_eq!(
+            record.committed_event_count, 1,
+            "the refused record must not have reached the state topic"
+        );
+    }
+
+    /// The guard must survive a restart, because a restart is when it matters most.
+    ///
+    /// The comparison baseline lives in memory so the durability path needs no read of the
+    /// state topic. That makes the *first* write of each process the one at risk: if the
+    /// baseline started empty, a rewound position would sail through and become durable.
+    /// And a restart is exactly when a repointed source or a recreated replication slot
+    /// first shows up — the conditions that produce a rewind in the first place.
+    ///
+    /// Returning `None` instead of `Some(baseline)` from `restore_checkpoint_mirror`
+    /// fails this test.
+    ///
+    /// The restart is simulated through `restore_checkpoint_mirror` rather than
+    /// `build_checkpoint`, because the latter starts with a `DescribeConfigs` durability
+    /// preflight the `FakeBroker` does not implement. Everything downstream of that
+    /// preflight — the topic readback, the mirror rebuild, the baseline seeding, and the
+    /// wiring into `KafkaTopicCheckpoint` — is the real code path.
+    #[tokio::test]
+    async fn the_guard_baseline_survives_a_restart() {
+        use rustcdc::checkpoint::PostgresOffset;
+
+        let broker = krafka::testing::FakeBroker::start()
+            .await
+            .expect("fake broker");
+        broker.create_topic("cdc.fake.restart", 1);
+
+        let config = KafkaTopicStateConfig {
+            brokers: broker.bootstrap_servers(),
+            topic: "cdc.fake.restart".to_string(),
+            client_id: "fake-restart-test".to_string(),
+            request_timeout_ms: 2_000,
+            readback_poll_timeout_ms: 500,
+            min_replication_factor: 1,
+            min_insync_replicas: 1,
+            durability_profile: crate::config::schema::KafkaStateDurabilityProfile::Development,
+            security: KafkaSecurityConfig::default(),
+        };
+
+        let writer = Arc::new(KafkaTopicStateWriter::new(&config).await.expect("writer"));
+        writer.seed_bootstrap().await.expect("seed bootstrap");
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // ── First process: record a healthy position, then exit ───────────────
+        {
+            let (mirror, baseline) = restore_checkpoint_mirror(temp.path(), None)
+                .await
+                .expect("first mirror rebuild");
+            assert!(baseline.is_none(), "nothing durable yet");
+            let mut checkpoint = KafkaTopicCheckpoint::new(mirror, Arc::clone(&writer), baseline);
+            checkpoint
+                .save(&PostgresOffset::new(0x16B_6A70, "slot"), 1)
+                .await
+                .expect("the first checkpoint must be accepted");
+        }
+
+        // ── Second process: rebuild from the topic, rewind on the first write ─
+        let loaded = load_records(&config).await.expect("restart readback");
+        let (mirror, baseline) = restore_checkpoint_mirror(temp.path(), loaded.checkpoint)
+            .await
+            .expect("second mirror rebuild");
+        let mut checkpoint = KafkaTopicCheckpoint::new(mirror, Arc::clone(&writer), baseline);
+
+        let refused = checkpoint
+            .save(&PostgresOffset::new(0, "slot"), 2)
+            .await
+            .expect_err("a rewound stream position must be refused after a restart");
+        assert!(
+            refused.to_string().contains("backwards"),
+            "the error must name the regression: {refused}"
+        );
+
+        let loaded = load_records(&config).await.expect("readback scan");
+        let record = loaded.checkpoint.expect("checkpoint record present");
+        assert_eq!(
+            record.committed_event_count, 1,
+            "the refused record must not have reached the state topic"
         );
     }
 }

@@ -11,7 +11,7 @@ use super::run_metrics::{
 };
 
 #[derive(Debug, Default)]
-pub(super) struct BatchPrepareStats {
+pub struct BatchPrepareStats {
     pub(super) transform_ops_total: u64,
     pub(super) transform_latency_us_total: u64,
     pub(super) transform_latency_us_last: u64,
@@ -23,7 +23,7 @@ pub(super) struct BatchPrepareStats {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct SinkDeliveryStats {
+pub struct SinkDeliveryStats {
     /// Events quarantined to the dead-letter queue during this batch.
     pub(super) dlq_events_total: u64,
     pub(super) sink_send_ops_total: u64,
@@ -37,7 +37,7 @@ pub(super) struct SinkDeliveryStats {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct BatchProcessingStats {
+pub struct BatchProcessingStats {
     pub(super) prepare: BatchPrepareStats,
     pub(super) delivery: SinkDeliveryStats,
     pub(super) committed_correctness_samples: Vec<CorrectnessSample>,
@@ -109,7 +109,7 @@ enum PreparedEvent {
 }
 
 #[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
-pub(super) async fn process_batch_events(
+pub async fn process_batch_events(
     sink: &mut crate::pipeline::router::TableRouter,
     events: impl IntoIterator<Item = rustcdc::core::Event>,
     transform_pipeline: &transform::TransformPipeline,

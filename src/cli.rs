@@ -72,6 +72,47 @@ pub enum Command {
 
     /// Initialize durable state artifacts for a configured backend.
     InitState(InitStateArgs),
+
+    /// Snapshot tables on a running instance, without restarting it.
+    Snapshot(SnapshotArgs),
+}
+
+// ── Snapshot ─────────────────────────────────────────────────────────────────
+
+/// Backfill tables on a **running** pipeline through the admin API.
+///
+/// The capability existed only as a hand-written `POST /signals` body, while
+/// `--admin-write-token` and `--admin-write-token-env` were accepted by the CLI and read
+/// by nothing — `status` is the only command that talks to the admin API and it only
+/// reads. This is the command those flags were for.
+#[derive(Debug, Parser)]
+pub struct SnapshotArgs {
+    /// Fully-qualified `schema.table` names to snapshot. Repeatable.
+    #[arg(required = true, value_name = "SCHEMA.TABLE")]
+    pub tables: Vec<String>,
+
+    /// Admin API base URL of the running instance.
+    #[arg(
+        long,
+        env = "RUSTCDC_ADMIN_URL",
+        default_value = "http://127.0.0.1:8080",
+        value_name = "URL"
+    )]
+    pub admin_url: String,
+
+    /// Correlate this request with an existing incident or change id.
+    #[arg(long, value_name = "ID")]
+    pub signal_id: Option<String>,
+
+    /// Free-text note recorded in the audit trail alongside the request.
+    #[arg(long, value_name = "TEXT")]
+    pub message: Option<String>,
+
+    #[command(flatten)]
+    pub admin_tls: AdminTlsClientArgs,
+
+    #[command(flatten)]
+    pub admin_auth: AdminAuthClientArgs,
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────

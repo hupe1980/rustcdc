@@ -1,7 +1,9 @@
-use rustcdc::{
-    MariaDbSourceConfig, MysqlSourceConfig, PostgresSourceConfig, SecretString,
-    SqlServerSourceConfig, TransportConfig,
-};
+#[cfg(feature = "postgres")]
+use rustcdc::PostgresSourceConfig;
+#[cfg(feature = "mysql")]
+use rustcdc::{MariaDbSourceConfig, MysqlSourceConfig};
+#[cfg(feature = "sqlserver")]
+use rustcdc::{SecretString, SqlServerSourceConfig, TransportConfig};
 use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,23 +46,94 @@ fn default_require_primary() -> bool {
 }
 
 /// Tagged discriminator for the CDC source connector.
+///
+/// # Variants are compiled in, not always present
+///
+/// Each variant is gated on the cdc-server feature that provides its connector, because
+/// the config types themselves come from `rustcdc` behind the same gates. A binary built
+/// without `--features sqlserver` has no `Sqlserver` variant at all.
+///
+/// That would ordinarily make a config naming an uncompiled connector fail with serde's
+/// `unknown variant \`sqlserver\`, expected \`postgres\`` — accurate and useless, since it
+/// reads as "that connector does not exist" rather than "this binary was not built with
+/// it". [`crate::config::loader::reject_uncompiled_source_driver`] inspects the `type`
+/// discriminator before deserialization and produces the actionable message instead.
+/// Every known driver name is listed there, whether or not it is compiled in, so the two
+/// lists cannot drift apart silently — `every_source_driver_is_known_to_the_gate` fails
+/// if a variant is added here without a matching entry.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceDriver {
     /// PostgreSQL logical-replication source.
+    #[cfg(feature = "postgres")]
     Postgres(PostgresSourceConfig),
 
     /// MySQL binlog source.
+    #[cfg(feature = "mysql")]
     Mysql(MysqlSourceConfig),
 
     /// MariaDB binlog source.
+    #[cfg(feature = "mysql")]
     Mariadb(MariaDbSourceConfig),
 
     /// SQL Server CDC source.
+    #[cfg(feature = "sqlserver")]
     #[serde(alias = "mssql")]
     Sqlserver(SqlServerProfileConfig),
 }
 
+/// Every source driver this project knows about, compiled in or not.
+///
+/// `(config name, aliases, cargo feature, compiled in this build)`. The single place the
+/// two lists — what serde can parse and what the operator can ask for — are reconciled.
+pub const KNOWN_SOURCE_DRIVERS: &[SourceDriverEntry] = &[
+    SourceDriverEntry {
+        name: "postgres",
+        aliases: &[],
+        feature: "postgres",
+        compiled: cfg!(feature = "postgres"),
+    },
+    SourceDriverEntry {
+        name: "mysql",
+        aliases: &[],
+        feature: "mysql",
+        compiled: cfg!(feature = "mysql"),
+    },
+    SourceDriverEntry {
+        name: "mariadb",
+        aliases: &[],
+        feature: "mysql",
+        compiled: cfg!(feature = "mysql"),
+    },
+    SourceDriverEntry {
+        name: "sqlserver",
+        aliases: &["mssql"],
+        feature: "sqlserver",
+        compiled: cfg!(feature = "sqlserver"),
+    },
+];
+
+/// One row of [`KNOWN_SOURCE_DRIVERS`].
+#[derive(Debug, Clone, Copy)]
+pub struct SourceDriverEntry {
+    /// The `type` value in the config file.
+    pub name: &'static str,
+    /// Accepted spellings that are not the canonical name.
+    pub aliases: &'static [&'static str],
+    /// The cdc-server cargo feature that compiles this connector in.
+    pub feature: &'static str,
+    /// Whether *this* binary has it.
+    pub compiled: bool,
+}
+
+impl SourceDriverEntry {
+    /// Does `value` name this driver, under any accepted spelling?
+    pub fn matches(&self, value: &str) -> bool {
+        self.name == value || self.aliases.contains(&value)
+    }
+}
+
+#[cfg(feature = "sqlserver")]
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct SqlServerProfileConfig {
     pub host: String,
@@ -85,6 +158,7 @@ pub struct SqlServerProfileConfig {
     pub table_exclude_list: Vec<String>,
 }
 
+#[cfg(feature = "sqlserver")]
 impl SqlServerProfileConfig {
     pub fn to_runtime_config(&self) -> SqlServerSourceConfig {
         SqlServerSourceConfig {

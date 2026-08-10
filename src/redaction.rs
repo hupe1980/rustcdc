@@ -93,18 +93,28 @@ fn is_sensitive_header_entry(path: &[String], key: &str) -> bool {
         .any(|candidate| lower == *candidate)
 }
 
+/// Does this name look like it holds a secret?
+///
+/// Separators are normalised to `_` before matching, so the underscore-spelled tokens
+/// above also catch the hyphenated and dotted spellings. Without it `X-Api-Key` — the
+/// ordinary spelling for a header, and a perfectly ordinary query parameter — matched
+/// nothing, because `"x-api-key"` does not contain `"api_key"`. The header rule covered
+/// that one case by exact-matching a separate list; every other surface (query strings,
+/// arbitrary config keys) was uncovered. Found by the property test in
+/// `tests/fuzz_properties.rs`, which generates parameter names rather than listing them.
 fn is_sensitive_key_name(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
+    let normalised = key.to_ascii_lowercase().replace(['-', '.', ' '], "_");
+
     if NON_SECRET_KEY_NAME_EXCEPTIONS
         .iter()
-        .any(|candidate| lower == *candidate)
+        .any(|candidate| normalised == *candidate)
     {
         return false;
     }
 
     SENSITIVE_KEY_NAME_TOKENS
         .iter()
-        .any(|token| lower.contains(token))
+        .any(|token| normalised.contains(token))
 }
 
 fn should_redact_key(path: &[String], key: &str) -> bool {
@@ -121,8 +131,7 @@ fn should_redact_key(path: &[String], key: &str) -> bool {
     is_sensitive_path(&candidate_path) || is_sensitive_key_name(key)
 }
 
-/// Replace the userinfo of a URL-shaped string with `[REDACTED]`, or return `None` if
-/// the value is not a URL carrying credentials.
+/// Strip credentials out of a URL-shaped string, or return `None` if there are none.
 ///
 /// This is deliberately **value**-driven rather than key-driven. Every other rule in
 /// this module asks "is this field named like a secret?", which only protects fields
@@ -131,9 +140,20 @@ fn should_redact_key(path: &[String], key: &str) -> bool {
 /// read-scoped token. A rule that looks at the value catches the next such field
 /// without an edit here.
 ///
-/// Matching is intentionally narrow: a `scheme://` prefix and an `@` before the first
-/// `/` of the authority. Free-text values containing an `@` (an email in a table
-/// comment, say) have no scheme and are left alone.
+/// Two carriers are handled, because a URL has two places to put a secret:
+///
+/// * **userinfo** — `https://user:pass@host/path`
+/// * **query parameters** whose name looks like a secret — `?api_key=…`, `?token=…`.
+///   This is how webhook and ingest endpoints usually carry their credential, and it
+///   was the remaining hole: the loader rejects userinfo in `sink.http.url` outright,
+///   so the only way a credential reaches that field *is* the query string.
+///
+/// The host, path and non-secret parameters are kept, because a redacted snapshot an
+/// operator cannot recognise is a snapshot they stop reading.
+///
+/// Matching is intentionally narrow: a `scheme://` prefix is required. Free-text values
+/// containing an `@` or an `=` (an email in a table comment, say) have no scheme and are
+/// left alone.
 fn strip_url_userinfo(text: &str) -> Option<String> {
     let scheme_end = text.find("://")?;
     if scheme_end == 0
@@ -149,14 +169,64 @@ fn strip_url_userinfo(text: &str) -> Option<String> {
         .find(['/', '?', '#'])
         .map_or(text.len(), |offset| authority_start + offset);
 
-    let at = text[authority_start..authority_end].rfind('@')?;
-    let userinfo_end = authority_start + at;
-
+    let mut changed = false;
     let mut redacted = String::with_capacity(text.len());
     redacted.push_str(&text[..authority_start]);
-    redacted.push_str("[REDACTED]");
-    redacted.push_str(&text[userinfo_end..]);
-    Some(redacted)
+
+    match text[authority_start..authority_end].rfind('@') {
+        Some(at) => {
+            changed = true;
+            redacted.push_str("[REDACTED]");
+            redacted.push_str(&text[authority_start + at..authority_end]);
+        }
+        None => redacted.push_str(&text[authority_start..authority_end]),
+    }
+
+    let rest = &text[authority_end..];
+    match redact_query_secrets(rest) {
+        Some(scrubbed) => {
+            changed = true;
+            redacted.push_str(&scrubbed);
+        }
+        None => redacted.push_str(rest),
+    }
+
+    changed.then_some(redacted)
+}
+
+/// Redact the values of secret-looking query parameters, or `None` if there are none.
+///
+/// `rest` is everything from the first `/`, `?` or `#` onwards, so the fragment is
+/// carried through untouched — a fragment is never sent to the server and splitting on
+/// it keeps `?` inside a fragment from being read as a query.
+fn redact_query_secrets(rest: &str) -> Option<String> {
+    let query_start = rest.find('?')?;
+    let (before, query_and_fragment) = rest.split_at(query_start + 1);
+    let (query, fragment) = match query_and_fragment.find('#') {
+        Some(index) => query_and_fragment.split_at(index),
+        None => (query_and_fragment, ""),
+    };
+
+    let mut changed = false;
+    let mut out = String::with_capacity(rest.len());
+    out.push_str(before);
+
+    for (index, pair) in query.split('&').enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        match pair.split_once('=') {
+            Some((name, _)) if is_sensitive_key_name(name) => {
+                changed = true;
+                out.push_str(name);
+                out.push_str("=[REDACTED]");
+            }
+            _ => out.push_str(pair),
+        }
+    }
+
+    out.push_str(fragment);
+    changed.then_some(out)
 }
 
 fn redact_value(v: &mut serde_json::Value, path: &mut Vec<String>) {
@@ -287,6 +357,48 @@ mod tests {
         );
     }
 
+    /// A credential in a URL **query string** must not survive either.
+    ///
+    /// The loader rejects userinfo in `sink.http.url` outright, so the query string is
+    /// the only place a credential can actually reach that field — and it is how webhook
+    /// and ingest endpoints normally carry one. Neither the sensitive-path list nor the
+    /// key-name tokens see inside a URL, so `/status` returned these verbatim to any
+    /// read-scoped token.
+    #[test]
+    fn url_query_string_credentials_are_stripped() {
+        let input = serde_json::json!({
+            "sink": { "url": "https://api.example.com/events?api_key=hunter2&region=eu" },
+            "webhook": { "url": "https://hooks.example.com/x?token=t0ps3cret" },
+            "both": { "url": "https://u:p@api.example.com/e?access_token=abc#frag" },
+            "harmless": { "url": "https://api.example.com/events?region=eu&page=2" },
+        })
+        .to_string();
+
+        let out = redact_secrets(&input);
+        assert!(
+            !out.contains("hunter2") && !out.contains("t0ps3cret") && !out.contains("abc"),
+            "a query-string credential survived redaction: {out}"
+        );
+
+        let v: Value = serde_json::from_str(&out).expect("valid redacted json");
+        assert_eq!(
+            v["sink"]["url"], "https://api.example.com/events?api_key=[REDACTED]&region=eu",
+            "the non-secret parameters must survive, or the snapshot stops being useful"
+        );
+        assert_eq!(
+            v["webhook"]["url"],
+            "https://hooks.example.com/x?token=[REDACTED]"
+        );
+        assert_eq!(
+            v["both"]["url"], "https://[REDACTED]@api.example.com/e?access_token=[REDACTED]#frag",
+            "userinfo and query credentials are independent carriers; both go"
+        );
+        assert_eq!(
+            v["harmless"]["url"], "https://api.example.com/events?region=eu&page=2",
+            "a URL with no credential must come back byte-identical"
+        );
+    }
+
     /// Redact a genuine `AppConfig`, not a hand-written JSON literal.
     ///
     /// Every other test in this module asserts against a fixture somebody typed, which
@@ -327,6 +439,39 @@ mod tests {
             snapshot.contains("[REDACTED]"),
             "the snapshot must show that redaction ran at all"
         );
+    }
+
+    /// Hyphenated and dotted spellings are the same secret.
+    ///
+    /// The token list is written with underscores, so `x-api-key` matched nothing until
+    /// separators were normalised — and the exact-match header list was the only thing
+    /// covering that spelling, leaving every other surface open. A property test that
+    /// *generates* parameter names caught it; the enumerated tests here never would have,
+    /// because whoever writes them writes the spelling they were already thinking of.
+    #[test]
+    fn separator_spelling_does_not_change_whether_a_name_is_secret() {
+        for name in [
+            "api_key",
+            "api-key",
+            "API-KEY",
+            "x-api-key",
+            "x.api.key",
+            "private-key",
+            "client-secret",
+            "auth-token",
+        ] {
+            assert!(
+                should_redact_key(&[], name),
+                "'{name}' must be recognised as a secret whatever separator it uses"
+            );
+        }
+
+        for name in ["region", "page", "table_name", "keyspace", "monkey"] {
+            assert!(
+                !should_redact_key(&[], name),
+                "'{name}' is not a secret and must survive"
+            );
+        }
     }
 
     #[test]

@@ -210,13 +210,6 @@ fn default_http_backoff_multiplier() -> f64 {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum IcebergWriteMode {
-    #[default]
-    Append,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum IcebergSchemaMode {
     #[default]
     Normalized,
@@ -329,10 +322,6 @@ pub struct IcebergSinkConfig {
     /// Table name within the catalog namespace (default: `"events"`).
     #[serde(default = "default_iceberg_table_name")]
     pub table_name: String,
-
-    /// Write mode: append.
-    #[serde(default)]
-    pub write_mode: IcebergWriteMode,
 
     /// Storage schema mode for persisted events.
     #[serde(default)]
@@ -516,10 +505,6 @@ impl IcebergSinkConfig {
             return Err(
                 "sink.iceberg.retry_backoff_ms must be <= retry_backoff_max_ms".to_string(),
             );
-        }
-
-        if self.write_mode != IcebergWriteMode::Append {
-            return Err("sink.iceberg.write_mode must be \"append\"".to_string());
         }
 
         if self.max_pending_events == 0 {
@@ -873,11 +858,54 @@ pub struct KafkaTransportConfig {
     /// SOCKS5 proxy to reach the brokers through, `host:port`.
     #[serde(default)]
     pub socks5_proxy: Option<String>,
+
+    /// Requests that may be outstanding on one broker connection (default: 10).
+    ///
+    /// This is backpressure, not a rejection threshold: a submitter waits for a slot
+    /// rather than failing. Worst-case per-connection memory is roughly this times the
+    /// largest response.
+    ///
+    /// **It moved here from `sink.kafka.max_in_flight`, and its cap is gone.** It used to
+    /// be rejected above 5, on the standard reasoning that Kafka's idempotent producer
+    /// preserves ordering only up to `max.in.flight.requests.per.connection = 5` (KIP-679)
+    /// and that a retried batch could otherwise land after one produced later. That rule
+    /// protects against several batches for the *same partition* being on the wire at
+    /// once, which krafka's record accumulator does not do: `partition_inflight` holds one
+    /// slot per partition and `dispatch_unblocked_partitions` only flushes partitions
+    /// whose slot is idle, so batches for a partition reach the wire in seal order and
+    /// sequence order cannot diverge from wire order. krafka 0.18 removed its own
+    /// `max_in_flight` producer knob for exactly that reason.
+    ///
+    /// What remains is a per-*connection* pipelining depth, which is a transport concern —
+    /// hence the move. Raising it lets more partitions have requests in flight over the
+    /// same connection; it does not let one partition get ahead of itself.
+    #[serde(default = "default_kafka_max_in_flight")]
+    pub max_in_flight: usize,
 }
 
 impl KafkaTransportConfig {
+    /// Map every transport setting — including the proxy — onto krafka's `TransportConfig`.
+    ///
+    /// The proxy used to need a separate accessor, because krafka carried it on the
+    /// *client* builder while this struct's every other field mapped here. That mismatch
+    /// is how `socks5_proxy` came to be validated for `host:port` shape and then silently
+    /// discarded: `to_krafka` mapped everything else, so the proxy looked mapped too. In
+    /// the topology the setting exists for — brokers behind a bastion that also resolves
+    /// their hostnames — the connection simply failed and looked like a broker outage;
+    /// where the brokers were directly reachable, traffic quietly took the route the
+    /// operator had configured it not to take.
+    ///
+    /// We reported it, and krafka 0.18 moved the proxy onto `TransportConfig`, which is
+    /// what the type's own documentation had claimed all along. There is now one storage
+    /// location, no precedence rule, and no second accessor to forget to call.
     pub fn to_krafka(&self) -> Result<krafka::network::TransportConfig, String> {
         let mut builder = krafka::network::TransportConfig::builder();
+        if let Some(proxy) = &self.socks5_proxy {
+            builder = builder.proxy(krafka::network::ProxyConfig::new(proxy.clone()));
+        }
+        if self.max_in_flight > 0 {
+            builder = builder.max_in_flight_requests(self.max_in_flight);
+        }
         if self.tcp_keepalive_ms > 0 {
             builder = builder.tcp_keepalive(Some(Duration::from_millis(self.tcp_keepalive_ms)));
         }
@@ -997,13 +1025,6 @@ pub struct KafkaSinkConfig {
     #[serde(default = "default_kafka_max_pipelined_sends")]
     pub max_pipelined_sends: usize,
 
-    /// Unacknowledged requests allowed per broker connection (default: 5).
-    ///
-    /// Kafka's idempotent producer preserves ordering only up to 5; a higher value is
-    /// rejected here rather than reordering records under retry.
-    #[serde(default = "default_kafka_max_in_flight")]
-    pub max_in_flight: usize,
-
     /// Transport-level tuning, shared with the preflight admin client.
     #[serde(default)]
     pub transport: KafkaTransportConfig,
@@ -1090,19 +1111,6 @@ impl KafkaSinkConfig {
                 "sink.kafka.max_pipelined_sends must be <= {KAFKA_MAX_PIPELINED_SENDS_LIMIT}; \
                  every outstanding send holds its encoded payload in memory, and a window \
                  this deep already exceeds any useful batch size"
-            ));
-        }
-
-        if self.max_in_flight == 0 {
-            return Err("sink.kafka.max_in_flight must be > 0".to_string());
-        }
-
-        if self.max_in_flight > KAFKA_MAX_IN_FLIGHT_LIMIT {
-            return Err(format!(
-                "sink.kafka.max_in_flight must be <= {KAFKA_MAX_IN_FLIGHT_LIMIT}; Kafka's \
-                 idempotent producer preserves ordering only up to that many \
-                 unacknowledged requests per connection, and beyond it a retried batch \
-                 can land after one that was produced later"
             ));
         }
 
@@ -1516,12 +1524,15 @@ fn default_kafka_max_pipelined_sends() -> usize {
 /// retained encoded payload. Past this the setting buys nothing and costs memory.
 pub(crate) const KAFKA_MAX_PIPELINED_SENDS_LIMIT: usize = 100_000;
 
-/// Kafka's idempotent producer guarantees ordering only up to five unacknowledged
-/// requests per connection.
-pub(crate) const KAFKA_MAX_IN_FLIGHT_LIMIT: usize = 5;
-
+/// Matches krafka's own default and the Kafka Java client's
+/// `max.in.flight.requests.per.connection`.
+///
+/// This was 5 while the setting lived on the sink and was capped there for idempotent
+/// ordering. It is a per-connection pipelining depth now — see
+/// `KafkaTransportConfig::max_in_flight` for why the cap went away — so the default
+/// follows the upstream one rather than an ordering rule it no longer implements.
 fn default_kafka_max_in_flight() -> usize {
-    KAFKA_MAX_IN_FLIGHT_LIMIT
+    10
 }
 
 fn default_kafka_transaction_timeout_ms() -> u64 {

@@ -29,6 +29,43 @@ rustcdc --version
 Building from source needs `cmake`, `clang` and `perl` on the build host — they are
 required by `aws-lc-sys`, the cryptography backend used for TLS.
 
+### Choosing connectors
+
+**A source build captures PostgreSQL only.** Connectors are cargo features, and the
+default is `postgres`:
+
+| Feature | Connectors | Default |
+|---|---|---|
+| `postgres` | PostgreSQL logical replication | **yes** |
+| `mysql` | MySQL and MariaDB binlog | no |
+| `sqlserver` | SQL Server CDC | no |
+| `glue` | AWS Glue Schema Registry codec | no |
+
+```bash
+# MySQL and MariaDB instead of PostgreSQL
+cargo build --release --locked --no-default-features --features mysql
+
+# Everything
+cargo build --release --locked --all-features
+```
+
+At least one connector is required; a build with none fails to compile rather than
+producing a binary that rejects every configuration.
+
+This is a security boundary, not packaging taste. `sqlserver` pulls `tiberius`, which
+pins rustls 0.21 — **a second TLS stack**, with its own X.509 verifier and four
+suppressed RUSTSEC advisories that the admin listener and every sink (on rustls 0.23) do
+not carry. A PostgreSQL deployment that never touches SQL Server should not have to rely
+on "that code path is unreachable" being true; leaving the connector out makes the
+question moot. A default build links exactly one rustls and one webpki, and a test
+asserts it.
+
+A config naming a connector the binary lacks is rejected at startup with the feature to
+rebuild with — it never loads silently.
+
+**The container image is built with `--all-features`** and carries every connector, so
+none of this applies if you deploy the image.
+
 
 ## Run with Docker
 

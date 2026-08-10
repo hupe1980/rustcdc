@@ -18,14 +18,18 @@ pub(super) async fn build(
     (
         Box<dyn rustcdc::checkpoint::Checkpoint>,
         CheckpointAgeSource,
-        Option<std::sync::Arc<opendal::OwnedLease>>,
+        Option<crate::state::StateLease>,
     ),
     AppError,
 > {
     match backend {
         StateBackend::LocalFs => {
-            let (checkpoint, age_source) = local_fs::build_checkpoint(dir).await?;
-            Ok((Box::new(checkpoint), age_source, None))
+            let (checkpoint, age_source, owner) = local_fs::build_checkpoint(dir).await?;
+            Ok((
+                Box::new(checkpoint),
+                age_source,
+                Some(crate::state::StateLease::LocalFs(owner)),
+            ))
         }
         StateBackend::KafkaTopic(kafka_config) => {
             let (checkpoint, writer) =
@@ -45,7 +49,7 @@ pub(super) async fn build(
             Ok((
                 Box::new(checkpoint),
                 local_fs::fallback_age_source(dir),
-                Some(lease),
+                Some(crate::state::StateLease::Remote(lease)),
             ))
         }
         StateBackend::Postgresql(pg_config) => {
@@ -55,7 +59,7 @@ pub(super) async fn build(
             Ok((
                 Box::new(checkpoint),
                 local_fs::fallback_age_source(dir),
-                Some(lease),
+                Some(crate::state::StateLease::Remote(lease)),
             ))
         }
     }

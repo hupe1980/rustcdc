@@ -198,6 +198,60 @@ fn url_userinfo_is_stripped_under_any_key() {
     }
 }
 
+/// The second value-driven carrier, checked the same way.
+///
+/// A URL can hold its credential in the query string as easily as in the userinfo, and
+/// for `sink.http.url` it is the *only* way — the loader rejects userinfo there outright.
+/// Webhook and ingest endpoints normally carry a credential exactly like this, so the
+/// rule has to hold under keys nobody listed as sensitive.
+#[test]
+fn url_query_string_secrets_are_stripped_under_any_key() {
+    const SECRET_PARAMS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "token",
+        "access_token",
+        "password",
+        "client_secret",
+        "X-Api-Key",
+    ];
+
+    for seed in 1..300u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+
+        let mut object = serde_json::Map::new();
+        for _ in 0..1 + rng.below(5) {
+            // A benign key and a benign-looking URL: only the parameter name is a signal.
+            let key = rng.pick(BENIGN_KEY_NAMES).to_string();
+            let param = rng.pick(SECRET_PARAMS);
+            let scheme = rng.pick(&["https", "http"]);
+            object.insert(
+                key,
+                serde_json::Value::String(format!(
+                    "{scheme}://api.example.com/ingest?region=eu&{param}={SENTINEL}&page=2"
+                )),
+            );
+        }
+
+        let input = serde_json::to_string(&serde_json::Value::Object(object)).expect("serialise");
+        let redacted = rustcdc_server::redaction::redact_secrets(&input);
+
+        assert!(
+            !redacted.contains(SENTINEL),
+            "seed {seed}: a URL query-string credential survived redaction under a \
+             non-sensitive key.\n\
+             input:    {input}\n\
+             redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("region=eu") && redacted.contains("page=2"),
+            "seed {seed}: non-secret parameters must survive, or the snapshot stops being \
+             readable.\n\
+             redacted: {redacted}"
+        );
+    }
+}
+
 /// Redaction must be total: any input at all, valid JSON or not, returns rather than
 /// panicking. `/status` calls this on a config snapshot, so a panic here is an admin-API
 /// crash reachable by configuration.

@@ -421,9 +421,9 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.91"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1763,6 +1763,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -3634,9 +3635,9 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.16.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b88c54614fd92292e80e26b14288221047bd1d507932c93471e224b7e0ce601e"
+checksum = "55d20ae10e174d90f0ab2bbf0978a75fd46427c4884674d478d4e5b824318481"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -5769,9 +5770,9 @@ dependencies = [
 
 [[package]]
 name = "rustcdc"
-version = "0.9.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4645d20c533fa1ba73b3b0d345bc9dbcaec753b6a6c44927da0071827d726c16"
+checksum = "1f38a9e0a99b8fedc7f4b54b77209383e3917a7b15ba3aeba08cba6ed8c26327"
 dependencies = [
  "aes-gcm 0.11.0",
  "ahash",
@@ -5782,6 +5783,7 @@ dependencies = [
  "futures-util",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "md-5 0.11.0",
  "mysql_async",
  "mysql_common",
  "opentelemetry",
@@ -5812,7 +5814,7 @@ dependencies = [
 
 [[package]]
 name = "rustcdc-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -7286,6 +7288,7 @@ dependencies = [
  "futures-util",
  "http 1.5.0",
  "http-body 1.1.0",
+ "http-body-util",
  "pin-project-lite",
  "tokio",
  "tower",

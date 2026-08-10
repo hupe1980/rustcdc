@@ -40,8 +40,8 @@ pub(crate) struct SchemaHistoryBox(pub(crate) Box<dyn SchemaHistory>);
 
 #[async_trait]
 impl SchemaHistory for SchemaHistoryBox {
-    async fn record_ddl(&mut self, ddl: DDLEvent) -> RtResult<u32> {
-        self.0.record_ddl(ddl).await
+    async fn record_ddl(&mut self, ddl_id: &str, ddl: DDLEvent) -> RtResult<u32> {
+        self.0.record_ddl(ddl_id, ddl).await
     }
 
     async fn get_schema_at_version(
@@ -91,11 +91,40 @@ pub(crate) struct RuntimeState {
     pub(crate) checkpoint: CheckpointBox,
     pub(crate) schema_history: SchemaHistoryBox,
     pub(crate) checkpoint_age_source: CheckpointAgeSource,
-    /// Remote owner lease, for the backends that hold one (`redis`, `postgresql`).
+    /// Owner lease, for the backends that hold a releasable one.
     ///
-    /// `local_fs` uses a lease *file* that its own `Drop` removes, and `kafka_topic`
-    /// fences at the broker by producer epoch — neither has a record to release.
-    pub(crate) remote_lease: Option<std::sync::Arc<offset::opendal::OwnedLease>>,
+    /// `kafka_topic` is the exception: it fences at the broker by producer epoch, so there
+    /// is no record to release.
+    pub(crate) state_lease: Option<StateLease>,
+}
+
+/// A state-directory or remote-store lease this process holds.
+///
+/// One type so shutdown has one thing to release. The two backends fence very differently
+/// — an OpenDAL key with a TTL versus a file in the state directory — but the contract they
+/// present is identical by design: acquire-or-refuse at startup, re-assert before durable
+/// writes, release on a clean exit so a successor need not wait out the TTL.
+#[derive(Clone)]
+pub(crate) enum StateLease {
+    /// `redis` / `postgresql`, held as an OpenDAL key.
+    Remote(std::sync::Arc<offset::opendal::OwnedLease>),
+    /// `local_fs`, held as a file beside the checkpoint.
+    LocalFs(std::sync::Arc<offset::local_fs::OwnedStateDir>),
+}
+
+impl StateLease {
+    /// Give up the lease, best-effort.
+    ///
+    /// The TTL is what makes the lease *correct*; this only spares a successor from waiting
+    /// it out. That matters in practice: under `strategy: Recreate` the replacement starts
+    /// the moment this process exits, and without the release it would refuse to start for
+    /// a full TTL.
+    pub(crate) async fn release(&self) {
+        match self {
+            Self::Remote(lease) => lease.release().await,
+            Self::LocalFs(owner) => owner.release(),
+        }
+    }
 }
 
 /// Source of checkpoint freshness metrics, resolved at build time.
@@ -144,7 +173,7 @@ pub(crate) async fn build(
     config: &StateConfig,
     sink_transaction: Option<crate::sink::KafkaTransactionHandle>,
 ) -> Result<RuntimeState, AppError> {
-    let (checkpoint, checkpoint_age_source, remote_lease) =
+    let (checkpoint, checkpoint_age_source, state_lease) =
         offset::build(&config.offset.backend, &config.offset.dir, sink_transaction).await?;
     let schema_history =
         schema_history::build(&config.schema_history.backend, &config.schema_history.dir).await?;
@@ -153,6 +182,6 @@ pub(crate) async fn build(
         checkpoint: CheckpointBox(checkpoint),
         schema_history: SchemaHistoryBox(schema_history),
         checkpoint_age_source,
-        remote_lease,
+        state_lease,
     })
 }

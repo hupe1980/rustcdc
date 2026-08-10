@@ -204,6 +204,44 @@ pub(crate) struct WasmPool {
     /// Dispatch cursor. `Relaxed` is right: this only has to spread load, and a missed
     /// increment costs one extra contended lock, not correctness.
     next: std::sync::atomic::AtomicUsize,
+    /// Slots currently held.
+    in_use: std::sync::atomic::AtomicUsize,
+    /// The most slots ever held at once.
+    ///
+    /// This is the only number that answers "is `instance_pool_size` doing anything?".
+    /// `instance_pool_size` reports what was *configured*; a pool of eight that never has
+    /// more than one slot in use looks identical to a pool of one from the outside, and
+    /// costs eight compiled modules' worth of memory to do it.
+    peak_in_use: std::sync::atomic::AtomicUsize,
+}
+
+/// A pool slot, checked out.
+///
+/// Exists to decrement `in_use` on drop; a bare `MutexGuard` cannot, and doing it at each
+/// call site would be forgotten on the first early return.
+pub(crate) struct PooledRuntime<'a> {
+    guard: tokio::sync::MutexGuard<'a, WasmRuntime>,
+    in_use: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl std::ops::Deref for PooledRuntime<'_> {
+    type Target = WasmRuntime;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for PooledRuntime<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for PooledRuntime<'_> {
+    fn drop(&mut self) {
+        self.in_use
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl WasmPool {
@@ -213,10 +251,21 @@ impl WasmPool {
     /// the scan degrades into a spin, while round-robin queues fairly behind the slot
     /// whose turn it is. Under light load the cursor almost always lands on an idle
     /// slot anyway.
-    async fn acquire(&self) -> tokio::sync::MutexGuard<'_, WasmRuntime> {
-        let index =
-            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.runtimes.len();
-        self.runtimes[index].lock().await
+    async fn acquire(&self) -> PooledRuntime<'_> {
+        use std::sync::atomic::Ordering;
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.runtimes.len();
+        let guard = self.runtimes[index].lock().await;
+        let held = self.in_use.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_in_use.fetch_max(held, Ordering::Relaxed);
+        PooledRuntime {
+            guard,
+            in_use: &self.in_use,
+        }
+    }
+
+    /// The most slots ever held at once. See [`WasmPool::peak_in_use`].
+    fn peak_in_use(&self) -> usize {
+        self.peak_in_use.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A runtime for read-only metric collection.
@@ -233,6 +282,8 @@ impl WasmPool {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct WasmRuntimeMetricsSnapshot {
     pub(crate) instance_pool_size: u64,
+    /// High-water mark of simultaneously-busy pool slots.
+    pub(crate) instance_pool_peak_in_use: u64,
     pub(crate) transform_total: u64,
     pub(crate) transform_error_total: u64,
     pub(crate) filtered_total: u64,
@@ -292,6 +343,8 @@ impl TransformPipeline {
                 TransformRuntime::Wasm(Arc::new(WasmPool {
                     runtimes,
                     next: std::sync::atomic::AtomicUsize::new(0),
+                    in_use: std::sync::atomic::AtomicUsize::new(0),
+                    peak_in_use: std::sync::atomic::AtomicUsize::new(0),
                 }))
             }
         };
@@ -363,6 +416,25 @@ impl TransformPipeline {
 
     /// Returns a live metrics snapshot from the WASM runtime, or a zeroed
     /// snapshot when the pipeline uses native mode.
+    /// High-water mark of simultaneously-busy WASM pool slots, or `None` outside WASM mode.
+    ///
+    /// Public because `tests/wasm_transform.rs` asserts the pool's concurrency with it.
+    /// That test used to compare wall-clock time for N concurrent transforms against a
+    /// per-event floor, which measures the right property unreliably: under a full
+    /// `cargo test` the worker threads contend with every other test binary and the
+    /// comparison fails against a pool that is working. A high-water mark is the same
+    /// property observed directly, and does not care how busy the machine is.
+    ///
+    /// It is also the number an operator needs. `instance_pool_size` reports what was
+    /// configured; a pool of eight that never exceeds one slot in use is
+    /// indistinguishable from a pool of one except for the memory it wastes.
+    pub async fn wasm_pool_peak_in_use(&self) -> Option<u64> {
+        match &self.runtime {
+            TransformRuntime::Wasm(pool) => Some(pool.peak_in_use() as u64),
+            TransformRuntime::Native => None,
+        }
+    }
+
     pub(crate) async fn wasm_metrics(&self) -> WasmRuntimeMetricsSnapshot {
         match &self.runtime {
             TransformRuntime::Native => WasmRuntimeMetricsSnapshot::default(),
@@ -374,6 +446,7 @@ impl TransformPipeline {
                     // the operator configured and that actually bounds concurrency is
                     // the number of runtimes.
                     instance_pool_size: pool.len() as u64,
+                    instance_pool_peak_in_use: pool.peak_in_use() as u64,
                     transform_total: m.transform_total,
                     transform_error_total: m.transform_error_total,
                     filtered_total: m.filtered_total,

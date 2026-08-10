@@ -77,6 +77,18 @@ pub(super) async fn execute_event_loop(
     let mut loop_iteration: u64 = 0;
     'event_loop: loop {
         loop_iteration += 1;
+
+        // Control operations (snapshot request, pause, resume, stop) are serviced by
+        // rustcdc itself at the top of `poll_event_batch`, so there is nothing to drain
+        // here.
+        //
+        // This used to be a `try_recv` loop over our own channel, with a long comment
+        // explaining why it could not be a `select!` arm: `poll_event_batch` is not
+        // cancel-safe, and racing it drops events that have left the source's buffer.
+        // rustcdc 0.11 documents that under `# Cancel safety`, services commands between
+        // polls for the same reason, and fixed two places where the crate was racing its
+        // own poll. The reasoning survives upstream; the code here does not need to.
+
         tracing::trace!(loop_iteration, "event loop: entering select");
         tokio::select! {
             biased;

@@ -71,6 +71,9 @@ create_replication_slot_if_missing = false   # true only for first-time provisio
 failover_slot                      = false   # PostgreSQL 17+ failover-enabled slots
 slot_idle_advance_interval_ms      = 30000   # idle WAL advance; 0 disables
 
+# How the WAL stream is read — see the connector guide before changing this
+wal_transport = "streaming_replication"   # streaming_replication | sql_peek
+
 stream_poll_interval_ms = 100
 max_events_per_poll     = 1000
 
@@ -81,6 +84,46 @@ table_exclude_list = []
 [source.postgres.transport]
 mode = "plaintext"                   # plaintext | tls (ca_cert_path, client_cert_path, client_key_path)
 ```
+
+### Table patterns
+
+`table_include_list` and `table_exclude_list` take **glob patterns**, and so do
+`pipeline.routes[].table_pattern`. One matcher serves all three.
+
+| Pattern | Matches |
+|---|---|
+| `public.orders` | exactly that table |
+| `public.*` | every table in `public` |
+| `public.order_?` | `public.order_1`, not `public.order_10` |
+| `orders` | `public.orders` **and** `tenant_private.orders` — an unqualified entry is schema-agnostic |
+
+`*` and `?` work inside a segment and do not cross the `.`, so `public.*` never matches
+`other.orders`. Blank entries are ignored rather than treated as catch-alls.
+
+> **These were exact-match before rustcdc 0.12.** `table_exclude_list = ["public.tmp_*"]`
+> excluded nothing, which is indistinguishable from a set of tables that never changed;
+> an include list matching nothing is indistinguishable from an idle database. If either
+> list carried a literal `*` as a no-op placeholder, **it is now a catch-all** — audit
+> both before upgrading. Entries containing neither `*` nor `?` behave exactly as before.
+
+An unqualified entry on the *include* side widens the very thing the list exists to bound,
+so the connector logs a WARN naming each one at startup. Qualify them unless you mean the
+pattern to span schemas.
+
+`wal_transport` defaults to `streaming_replication`: `START_REPLICATION ... LOGICAL`
+over the streaming replication protocol, which is what `pg_recvlogical` and
+PostgreSQL's own subscribers use. The server pushes WAL as it is written, so delivery
+latency is not bounded by `stream_poll_interval_ms`. It requires the `REPLICATION`
+role attribute and a **direct** connection — a pooler in transaction-pooling mode
+cannot carry a replication stream.
+
+`sql_peek` is the fallback for environments that cannot provide either. It is slower
+by construction and its cost grows with the source's longest-running transaction, so
+selecting it logs a warning at startup and from `validate-config`. See
+[WAL transport](@/docs/connectors/postgres.md#wal-transport-how-the-stream-is-read).
+
+`mode = "tls"` now **requires** TLS: a connector pointed at a server with `ssl = off`
+fails to connect instead of silently downgrading to an unencrypted connection.
 
 See the [PostgreSQL connector guide](@/docs/connectors/postgres.md#7-configuration-reference) for field-by-field documentation.
 
@@ -209,7 +252,7 @@ Content-Type = "application/x-ndjson"
 
 | Field | Default | Description |
 |---|---|---|
-| `url` | — | HTTP endpoint URL. **Must not embed credentials** — a `user:pass@` component is rejected at load, because it travels into the `/status` config snapshot that a read-scoped token can read. Use `bearer_token` or an `authorization` header. |
+| `url` | — | HTTP endpoint URL. **Must not embed credentials** — a `user:pass@` component is rejected at load, because it travels into the `/config` snapshot that a read-scoped token can read. A credential in the query string (`?api_key=`) is redacted there rather than rejected, since that is the only form some endpoints accept — but prefer `bearer_token` or an `authorization` header. |
 | `bearer_token` | — | Bearer token sent as `Authorization: Bearer <token>` |
 | `batch_max_events` | `256` | Maximum events per POST body |
 | `batch_max_delay_ms` | `250` | Maximum time to wait before flushing a partial batch |
@@ -239,7 +282,7 @@ compression_level = 6        # gzip 0–9, zstd 1–22; rejected for codecs with
 batch_size        = 16384    # bytes accumulated per partition batch
 linger_ms           = 0      # ordinary Kafka linger; amortised across the pipelining window
 max_pipelined_sends = 128    # records accepted before waiting for an acknowledgement
-max_in_flight       = 5      # capped at 5: Kafka's idempotence ordering limit
+
 
 # Transport security
 [sink.security]
@@ -270,7 +313,6 @@ registry_ref = "prod"          # or an inline [sink.codec.registry] table
 | `batch_size` | `16384` | Bytes per partition batch before a send |
 | `linger_ms` | `0` | Ordinary Kafka linger: how long a partially-filled batch waits for more records. Because up to `max_pipelined_sends` records are in flight at once, the wait is amortised across all of them rather than paid per record. The default stays `0` because CDC consumers are usually latency-sensitive, not because linger is harmful. |
 | `max_pipelined_sends` | `128` | Records accepted for delivery before the sink waits for an acknowledgement — the pipelining window. `1` restores one broker round-trip per record. Per-partition ordering is unaffected: records reach the broker in submission order regardless of the depth. Two other settings cap the effective depth, so raising this alone past either has no effect: `runtime.sink_flush_interval_events` (a flush drains the window) and `runtime.sink_delivery_queue_capacity` (bounds how far the prepare stage runs ahead). |
-| `max_in_flight` | `5` | Unacknowledged requests per connection. Values above 5 are rejected: Kafka's idempotent producer preserves ordering only up to that, and beyond it a retried batch can land after one produced later. |
 | `ack_timeout_ms` / `retry_backoff_ms` / `retry_max_attempts` | — | Producer retry tuning (the TCP connect timeout follows `ack_timeout_ms` down, capped at 10 s) |
 
 #### `[sink.security]`
@@ -334,8 +376,28 @@ is that it expires and every subsequent reconnect is rejected.
 tcp_keepalive_ms        = 30000    # 0 = OS default
 connections_max_idle_ms = 540000   # 0 = never evict idle connections
 max_connections         = 0        # 0 = unlimited
+max_in_flight           = 10       # unacknowledged requests per connection
 tls_reload_interval_ms  = 300000   # 0 = never re-read the certificate (KIP-1288)
+socks5_proxy            = "bastion.internal:1080"   # omit for a direct connection
 ```
+
+`max_in_flight` **moved here from `[sink.kafka]`, and its cap is gone.** It used to be
+rejected above 5, on the usual reasoning that an idempotent producer preserves ordering
+only up to `max.in.flight.requests.per.connection = 5` (KIP-679) and that a retried batch
+could otherwise land after one produced later.
+
+That rule protects against several batches for the *same partition* being on the wire at
+once, which krafka's record accumulator does not do: it holds one in-flight slot per
+partition and only dispatches partitions whose slot is idle, so batches reach the wire in
+seal order and sequence order cannot diverge from wire order. krafka 0.18 removed its own
+producer-level knob for that reason, leaving the per-*connection* ceiling — which is a
+transport concern, hence the move. Raising it lets more partitions have requests in flight
+over one connection; it does not let a partition get ahead of itself.
+
+`socks5_proxy` tunnels **every** broker connection, and the proxy performs the DNS
+resolution — which is the point in a VPN or bastion topology where broker hostnames do
+not resolve outside the tunnel. Give it as `host:port`; a value without a colon is a
+startup error.
 
 `tls_reload_interval_ms` matters wherever certificates rotate on their own
 schedule (cert-manager, Vault): a long-lived producer that read them once keeps
@@ -474,13 +536,25 @@ framing.
 
 ### Apache Iceberg
 
+**The Iceberg table is an append-only change log, not a mirror of the source table.** Each
+event becomes a row carrying `operation`, `source_offset`, `fingerprint_hex` and the row
+image; nothing merges updates or deletes into a current-state view. Answering "what does
+`public.orders` look like now?" is a `MERGE`/window query the consumer writes.
+
+There is no `write_mode` setting. There used to be one whose only legal value was
+`"append"` — a knob with a single value is documentation pretending to be configuration,
+and it invited the belief that an upsert mode existed. Upsert via Iceberg v2 equality
+deletes is the tracked gap; when it lands the setting returns with two real values.
+
+Because nothing merges, **enable `snapshot_expiry`**: the sink commits a snapshot per
+flush, and unbounded snapshot metadata is read in full on every planning pass.
+
 ```toml
 [sink]
 type       = "iceberg"
 namespace  = "cdc"
 table_name = "events"
 table_path = "/var/lib/rustcdc/iceberg/events"   # local staging/table path (required)
-write_mode = "append"                            # append is the only mode
 
 [sink.catalog.rest]
 uri       = "https://rest-catalog.example.com"
@@ -573,8 +647,9 @@ table_pattern = "public.*"
 sink          = "kafka_all"
 ```
 
-Routes are evaluated top-to-bottom; the first match wins. Route patterns support
-`*` globs (unlike source-side `table_include_list`, which is exact-match).
+Routes are evaluated top-to-bottom; the first match wins. Route patterns and the
+source-side `table_include_list` / `table_exclude_list` use the **same** matcher — see
+[Table patterns](#table-patterns) below.
 
 
 ## 4. State backends (`[state]`)
@@ -633,9 +708,18 @@ dir = "/var/lib/rustcdc/state"        # local mirror for crash recovery
 [state.backend.postgresql]
 url = { env = "STATE_POSTGRES_URL" }  # e.g. postgres://user:pass@pg.example.com:5432/rustcdc_state
 # Optional (with defaults):
-# checkpoint_table     = "rustcdc_checkpoint"
-# schema_history_table = "rustcdc_schema_history"
+# checkpoint_table     = "rustcdc_state_checkpoint"
+# schema_history_table = "rustcdc_state_schema_history"
 ```
+
+**Two tables, deliberately.** The checkpoint and the schema history have different
+lifecycles: truncating the checkpoint table to force a re-snapshot is a routine recovery
+step, and the schema history is what MySQL and SQL Server need to decode their logs at
+all. Losing it to a checkpoint reset would turn a re-snapshot into a re-provision.
+
+Both are created on first write by the OpenDAL PostgreSQL service; the role needs
+`CREATE` on the schema, or you can pre-create them and grant only `SELECT`/`INSERT`/
+`UPDATE`/`DELETE`.
 
 ### Redis
 
@@ -880,6 +964,23 @@ jq -c '.event' /var/lib/rustcdc/dlq.jsonl > replay.jsonl
 rustcdc replay replay.jsonl --config-file cdc.toml
 ```
 
+The `kafka` target additionally attaches the triage fields as **record headers**, so a
+dead-letter topic can be filtered without deserialising every payload — which is what you
+want at 3 a.m. with a console consumer:
+
+| Header | Value |
+|---|---|
+| `__rustcdc.dlq.source.table` | Fully-qualified `"schema.table"` (also the record key) |
+| `__rustcdc.dlq.source.offset` | The upstream position that was skipped |
+| `__rustcdc.dlq.sink` | The sink that refused the event |
+| `__rustcdc.dlq.exception.message` | The rendered error chain, truncated to 2 KiB |
+
+The namespace mirrors krafka's `__krafka.dlq.*` convention without reusing its names:
+those describe a Kafka record that failed to *produce*, these describe a change event no
+sink would accept, and the source table is not a Kafka topic. The exception header is
+truncated because a broker rejecting an oversized record would lose the dead letter
+entirely — the untruncated text is always in the body.
+
 Alert on `rustcdc_dlq_events_total`. Any non-zero rate is a data incident. The shipped
 rules include `RUSTCDCEventsQuarantined` for this. See the
 [runbook](@/docs/runbook.md#5-events-are-being-quarantined).
@@ -969,7 +1070,7 @@ max_delay_ms     = 10000
 | `max_buffer_size` | `1000` | In-memory event buffer; backpressure kicks in at this threshold |
 | `sink_flush_interval_events` | `100` | Flush after this many buffered events |
 | `max_poll_wait_ms` | `100` | Maximum source poll wait before a partial batch flush |
-| `prepare_parallelism` | `8` | Concurrent sink prepare operations |
+| `prepare_parallelism` | `8` | How many events are transformed and encoded concurrently. **Not a general throughput knob** — see below |
 | `sink_send_timeout_ms` | `15000` | Per-request timeout |
 | `sink_flush_timeout_ms` | `60000` | Per-batch flush deadline; set K8s `terminationGracePeriodSeconds` higher |
 | `max_event_bytes` | `1048576` | Maximum serialized event size |
@@ -986,6 +1087,35 @@ max_delay_ms     = 10000
 | `idempotency.ttl_ms` | `0` | Optional fingerprint lifetime; `0` keeps one until capacity evicts it. |
 
 
+### When `prepare_parallelism` actually helps
+
+Only the **prepare** stage — transform and encode — is parallel. Delivery is a single
+sequential loop, and that is deliberate: per-partition ordering is the contract CDC
+consumers depend on, and the sequential consumer is what provides it.
+
+So the knob buys throughput only when preparing an event is expensive *relative to
+delivering* it. Measured on the reference machine (`benches/BASELINES.md`):
+
+| Stage | Cost per event |
+|---|---|
+| Transform, no rules | 0.42 µs |
+| Transform, one mask rule | 0.92 µs |
+| Full batch through a `file_jsonl` sink | 47.6 µs |
+
+Delivery is roughly **100×** the transform, so raising `prepare_parallelism` from 1 to 16
+moves end-to-end throughput by less than measurement noise — it is tuning 1 % of the work.
+
+Raise it when the prepare stage is genuinely expensive:
+
+* **WASM transforms** — guest execution is CPU-bound and pooled; this is the knob that feeds
+  the pool, and it should be set alongside `transform_runtime.wasm.instance_pool_size`.
+* **A heavy codec** — Avro or Protobuf with schema-registry lookups.
+
+Leave it at the default for a JSON codec and a network or disk sink. For Kafka set it to
+`1`: the producer is already async and pipelined, so the prepare stage is never the
+constraint.
+
+
 ## 6b. Snapshots
 
 Two bootstrapping paths exist and **exactly one** may be configured; setting both
@@ -1000,6 +1130,10 @@ snapshot_tables = ["public.orders", "public.customers"]
 [incremental_snapshot]
 tables     = ["public.orders", "public.customers"]
 chunk_size = 5000
+
+# Optional: restrict which *rows* each table's backfill reads.
+[incremental_snapshot.table_conditions]
+"public.orders" = "t.created_at >= '2026-01-01'"
 ```
 
 Prefer `[incremental_snapshot]` for anything large enough that the wait matters:
@@ -1010,8 +1144,72 @@ position — so a restart resumes mid-backfill instead of re-reading from row ze
 
 | Field | Default | Description |
 |---|---|---|
-| `tables` | `[]` | `"schema.table"` entries, processed in order. Empty disables incremental snapshotting. |
+| `tables` | `[]` | `"schema.table"` entries, processed in order. Empty disables incremental snapshotting — but see below: an empty table declared section still enables on-demand snapshots. |
 | `chunk_size` | `5000` | Rows per chunk. Each chunk is one keyset-paginated `SELECT` bracketed by watermarks: bigger chunks backfill faster and hold the override window open longer, smaller ones interleave more finely with the stream. |
+| `table_conditions` | `{}` | Per-table row filter, keyed by `"schema.table"` — Debezium's `additional-condition`. See below. |
+
+### Filtering which rows a backfill reads
+
+`table_conditions` appends a SQL boolean expression to a table's chunk `SELECT`, so a
+backfill can cover one tenant or one date range instead of the whole table. It does
+**not** restrict the live stream, which keeps carrying every change to the table.
+
+```toml
+[incremental_snapshot]
+tables = ["public.orders"]
+
+[incremental_snapshot.table_conditions]
+"public.orders" = "t.region = 'eu' AND t.created_at >= '2026-01-01'"
+```
+
+Alias the table as `t` to qualify a column; that is the alias every connector's chunk
+read uses.
+
+> **This is raw SQL, and it is trusted input.** The expression is interpolated into
+> the chunk `SELECT` — a filter that could only be a bound parameter could not express
+> the predicates this exists for. It carries the same trust level as the connection
+> string.
+>
+> **It is not a tenancy boundary.** Do not accept one over an API, do not build one
+> from user input, and do not treat it as an access control. It is a backfill scope.
+
+A filter that fails to parse surfaces as a chunk-read error naming the table, at the
+first chunk — not as a silently empty backfill.
+
+A condition may be pre-declared for a table that is not in `tables` — that is how you
+scope a backfill you intend to request later through `execute_snapshot`. Since rustcdc
+0.12 all three resolution paths (startup, checkpoint resume, on-demand request) go through
+one function, so a configured filter applies wherever the table is resolved.
+
+That was not always true. Until 0.12 the on-demand path could not see `table_conditions`
+at all, and worse, the two paths disagreed with *each other*: a runtime-requested table ran
+unfiltered and a restart then adopted it **with** the filter, so the rows delivered
+corresponded to no single predicate and where the split fell depended on when the process
+happened to restart. We reported it; this project refused the combination outright until
+the fix landed.
+
+### Snapshotting a table without a restart
+
+With `[incremental_snapshot]` configured, tables can be added to a **running**
+pipeline through the admin API:
+
+```bash
+curl -X POST http://localhost:8080/signals \
+  -H "Authorization: Bearer $RUSTCDC_WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action_type":"execute_snapshot","tables":["public.invoices"]}'
+```
+
+The live stream is not paused and the request survives a restart. Declare the section
+even when the initial set is empty if you want this available:
+
+```toml
+[incremental_snapshot]
+tables = []          # nothing at startup; execute_snapshot still works
+```
+
+See [control-plane signals](#on-demand-snapshots-execute-snapshot) for the semantics
+of an already-tracked or already-completed table.
 
 
 ## 7. Admin API (`[admin]`)
@@ -1091,9 +1289,28 @@ cheap to refuse. A `429` therefore does not imply your credentials are wrong.
 | `GET` | `/readyz` | read | 200 = ready to serve traffic |
 | `GET` | `/metrics` | read | Prometheus text-format metrics |
 | `GET` | `/status` | read | JSON status snapshot (state, counters, audit trail) |
+| `GET` | `/config` | read | The running configuration, every credential redacted |
 | `POST` | `/signals` | write | Send a control-plane signal |
 | `GET` | `/notifications` | read | Recent CloudEvents notification log |
 | `GET` | `/notifications/stream` | read | Server-sent events stream (long-lived) |
+
+#### `/config`
+
+The configuration this instance is **actually** running — after environment-variable
+layering and any config migration — with every credential redacted:
+
+```bash
+curl -s -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" \
+  http://localhost:8080/config | jq .
+```
+
+A separate endpoint rather than a field on `/status`, because `/status` is polled on a
+short interval by dashboards and a whole configuration document in every response is
+bandwidth nobody asked for. This is the question you ask once, during an incident.
+
+Redaction removes credentials, not topology: hosts, topics, table lists and file paths are
+all present, which is what makes the answer useful. See
+[what redaction covers](@/docs/operations.md#what-status-redaction-actually-covers).
 
 #### `/notifications/stream`
 
@@ -1130,22 +1347,205 @@ curl -X POST http://localhost:8080/signals \
   -H "Content-Type: application/json" \
   -d '{"action_type":"log_marker","message":"deploy v2.4.1"}'
 
-# Trigger an ad-hoc snapshot
+# Snapshot tables on the running pipeline — no restart, no pause.
+# `rustcdc snapshot public.orders --admin-write-token-env RUSTCDC_WRITE_TOKEN`
+# is the same request, with the table names validated before they are sent.
 curl -X POST http://localhost:8080/signals \
   -H "Authorization: Bearer $RUSTCDC_WRITE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"action_type":"execute_snapshot","tables":["public.orders"]}'
+
+# Backfill one tenant, without touching the config file or restarting.
+curl -X POST http://localhost:8080/signals \
+  -H "Authorization: Bearer $RUSTCDC_WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "action_type": "execute_snapshot",
+        "tables": ["public.orders", "public.order_items"],
+        "conditions": {
+          "public.orders":      "tenant_id = 42",
+          "public.order_items": "tenant_id = 42"
+        }
+      }'
 ```
 
 **Available actions:**
 
 | `action_type` | Description |
 |---|---|
-| `log_marker` | Insert a named marker in the audit trail and logs |
-| `execute_snapshot` | Trigger a new snapshot for specified tables |
-| `pause_snapshot` | Pause an in-progress snapshot |
-| `resume_snapshot` | Resume a paused snapshot |
-| `stop_snapshot` | Abort the current snapshot |
+| `log_marker` | Insert a named marker in the audit trail and logs. `message` is required |
+| `execute_snapshot` | Snapshot the named `tables` on the running pipeline. `tables` is required; `conditions` optionally scopes them |
+| `pause_snapshot` / `resume_snapshot` | Suspend or resume chunk reading. The live stream is unaffected |
+| `stop_snapshot` | Abandon the remaining tables. Survives a restart |
+
+#### Per-request row filters (`conditions`)
+
+`conditions` is Debezium's `additional-conditions`: a SQL boolean expression per table,
+applied to that table's chunk `SELECT` for **this request only**. It overrides
+`incremental_snapshot.table_conditions` for the tables it names; a table without an
+override keeps its configured filter.
+
+The filter belongs on the request because that is what it is. "Backfill tenant 42's
+orders" is a one-off, and routing it through static configuration means editing a file
+and restarting a process to run something that was meant to be a signal.
+
+Every key must name a table in the same request's `tables` list. A key that does not is
+rejected with `400` rather than accepted and ignored — an ignored filter reads the
+**whole** table, and the only symptom is volume, which is indistinguishable from a large
+table.
+
+> **Raw SQL, and trusted input.** The expression is interpolated into the chunk `SELECT`
+> and carries the same trust level as the connection string. It is **not a tenancy
+> boundary**: do not proxy an end user's input into it. The write-scope token that reaches
+> this endpoint can already `stop_snapshot`; treat it accordingly.
+
+Whether a filter took effect is observable: `/status` reports the effective expression per
+table under `.incremental_snapshot`, and `/metrics` exports
+`rustcdc_incremental_snapshot_table_filtered{table="…"}` as 0 or 1. The expression itself
+is deliberately absent from `/metrics` — it can carry column names and literal values that
+have no business in a scrape.
+
+Unknown fields are rejected with `400`, over HTTP and through the file and Kafka
+ingress channels alike — so a mistyped key fails rather than being dropped.
+
+#### On-demand snapshots (`execute_snapshot`)
+
+This is the equivalent of Debezium's `execute-snapshot` signal, and it needs none of
+the machinery: there is **no signal table in the source**, so it works against a
+read-only role and a read replica.
+
+Use it to backfill a table just added to the publication, rebuild a downstream store,
+or re-run history through a corrected transform. The live stream is never paused — the
+new tables are chunked into it exactly like the ones in `[incremental_snapshot]`,
+under the same DBLog watermark suppression.
+
+| Case | Behaviour |
+|---|---|
+| Table not currently tracked | Added and read from the start |
+| Table already in progress | No-op, so retrying a request is safe |
+| Table already complete | Rewound and read again |
+
+Every name is resolved against the catalog **before anything is mutated**, so one bad
+reference fails the whole request rather than half-applying it. Requests are durable:
+an enqueued table reaches the checkpoint with the next commit and is picked up again
+after a restart, even though it is not in the configured list.
+
+**Requires `[incremental_snapshot]`.** The request adds tables to an existing
+incremental snapshot; with no such section there is nothing to add to, and the signal
+is refused with a terminal state of `ABORTED` naming the missing configuration rather
+than reporting a backfill that never happens. An empty `incremental_snapshot.tables`
+is enough to enable it.
+
+Check before firing rather than after — `/status` and `/metrics` both report the
+capability, because the `POST` answers `STARTED` whether or not the pipeline can
+service it:
+
+```bash
+curl -s -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" \
+  http://localhost:8080/status | jq .slo.snapshot_requests
+# { "available": true, "accepted_total": 3, "refused_total": 0, "tables_enqueued_total": 7 }
+```
+
+`rustcdc_snapshot_requests_available` is the same value as a gauge, and
+`rustcdc_snapshot_requests_refused_total` backs the shipped
+`RUSTCDCSnapshotRequestsRefused` alert.
+
+The signal is asynchronous: the `POST` answers `STARTED`, and the outcome — including
+`tables_enqueued` — arrives on the audit trail and the notification stream. The
+pipeline picks requests up between polls, so expect a delay of up to
+`runtime.max_poll_wait_ms`.
+
+```bash
+# Watch the outcome
+curl -N -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" \
+  http://localhost:8080/notifications/stream
+```
+
+#### Snapshot pause / resume / stop
+
+`pause_snapshot`, `resume_snapshot` and `stop_snapshot` suspend chunk reading, resume
+it, and abandon the remaining tables respectively. The live stream is unaffected in all
+three cases — pausing a backfill to relieve pressure on the source does not pause
+capture.
+
+Pause and resume report whether they changed anything, so a redundant call is
+distinguishable from an effective one. `stop_snapshot` reports how many tables it
+dropped. A paused snapshot survives a restart: the pause flag is part of the snapshot
+state carried in the checkpoint.
+
+These endpoints answered `501 Not Implemented` until rustcdc 0.11 shipped the controls.
+Before that they answered `200 OK` and recorded `PAUSED` / `RESUMED` / `ABORTED` while
+doing nothing at all — an operator pausing a snapshot would have watched it keep running
+under a green audit trail saying it had stopped. Refusing outright was the interim fix;
+this is the real one.
+
+Progress is observable while any of this is happening:
+
+```bash
+curl -s -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" \
+  http://localhost:8080/status | jq .incremental_snapshot
+```
+
+and on `/metrics` as `rustcdc_incremental_snapshot_active`,
+`rustcdc_incremental_snapshot_paused`, `rustcdc_incremental_snapshot_stopped`,
+`rustcdc_incremental_snapshot_generation`,
+`rustcdc_incremental_snapshot_tables_remaining`,
+`rustcdc_incremental_snapshot_rows_emitted`, and the per-table
+`rustcdc_incremental_snapshot_table_rows_emitted{table="…"}` /
+`rustcdc_incremental_snapshot_table_complete{table="…"}` /
+`rustcdc_incremental_snapshot_table_filtered{table="…"}`.
+
+`stopped` is worth alerting on separately from `active`: a stopped snapshot is a
+deliberate operator action, and it must stay stopped across a deploy. `generation` counts
+how many times snapshot work has been requested, which is what makes a deliberate
+re-snapshot distinguishable from a replay — without it the two are byte-identical and the
+idempotency guard drops the re-snapshot, so an operator re-requesting a table gets
+`enqueued: 1` and no rows. All of them are absent
+entirely when no snapshot is in flight, rather than reported as zero — a stale zero and
+"nothing running" are different states and an alert should not have to guess which it is
+looking at.
+
+### Signal ingress channels
+
+Signals can also arrive without an HTTP call, which is what you want when the admin API
+is not reachable from wherever the automation lives — a Kubernetes `Job`, a CI pipeline,
+a control-plane topic other systems already publish to.
+
+```toml
+[admin]
+# Append-only JSONL. One signal per line, same shape as the POST body.
+signal_ingress_file = "/var/lib/rustcdc/signals.jsonl"
+
+[admin.signal_ingress_kafka]
+brokers  = "kafka:9092"
+topic    = "cdc.signals"
+group_id = "rustcdc-signals"
+
+[admin.signal_ingress_kafka.security]   # same shape as [sink.kafka.security]
+protocol = "sasl_ssl"
+mechanism = "scram-sha-512"
+```
+
+Both accept exactly the payload `POST /signals` takes, both reject unknown fields, and
+both are subject to the same validation — an `execute_snapshot` without `tables` is
+refused on every channel.
+
+**Neither replays history on startup, and this matters.** A signal is a *command*, not
+state: re-running one is not idempotent, because rustcdc rewinds an already-complete
+table and reads it again. A channel that replayed its backlog would re-snapshot every
+table ever requested on every restart.
+
+| Channel | On startup | A signal sent while the server is down |
+|---|---|---|
+| `signal_ingress_file` | Resumes at the **current end of file** | Not processed — the read offset is process-local, so there is nothing to resume from |
+| `signal_ingress_kafka` | Resumes from the **committed group offset**; a group with none starts at the end (`auto.offset.reset = latest`) | Processed, as long as the group's offsets have not aged out of `offsets.retention.minutes` |
+
+Use the Kafka channel when signals must survive a restart. The file channel is a live
+tail, not a queue.
+
+The audit trail deduplicates a repeated `signal_id`, but it holds 512 entries in memory
+and starts empty on every boot — so it is a convenience for retries within one process
+lifetime, not the mechanism that makes the above safe.
 
 
 ## 8. Observability (`[observability]`)
@@ -1161,11 +1561,29 @@ service_name               = "rustcdc-server"
 
 | Field | Default | Description |
 |---|---|---|
-| `otlp_endpoint` | — | OTLP gRPC or HTTP endpoint for traces and metrics |
+| `otlp_endpoint` | — | Collector endpoint for traces and metrics. Port `4317` for gRPC, `4318` for HTTP |
 | `otlp_metrics_endpoint` | same as `otlp_endpoint` | Override metrics endpoint |
 | `otlp_metrics_interval_secs` | `30` | Metrics export interval |
-| `otlp_protocol` | `"grpc"` | `"grpc"` or `"http"` |
+| `otlp_protocol` | `"grpc"` | `"grpc"` or `"http"`. Anything else is **rejected at load** — a wrong value is invisible at runtime, because the exporter simply talks the other protocol at the collector and nothing arrives |
 | `service_name` | `"rustcdc-server"` | Service name in telemetry |
+
+`otlp_protocol = "http"` selects OTLP/HTTP with protobuf encoding — the collector's
+`:4318` listener. Give the **base** URL and the signal path is appended for you
+(`/v1/traces`, `/v1/metrics`), matching the OTLP specification's rule for
+`OTEL_EXPORTER_OTLP_ENDPOINT`:
+
+```toml
+[observability]
+otlp_endpoint = "http://otel-collector:4318"   # POSTs to /v1/traces and /v1/metrics
+otlp_protocol = "http"
+```
+
+An endpoint that already carries a path is used exactly as written, which is the escape
+hatch for a collector behind a prefix (`https://gw.example.com/otlp/v1/traces`).
+
+The plaintext guard is about the **transport**, not the protocol: `http://` to a
+non-loopback host is refused for either protocol unless `OTLP_ALLOW_INSECURE=1` is set.
+`otlp_protocol = "http"` against an `https://` endpoint is the normal production shape.
 
 
 ## 9. Environment variables

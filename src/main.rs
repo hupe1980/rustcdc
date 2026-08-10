@@ -60,6 +60,10 @@ async fn main() {
         .as_ref()
         .map(|o| o.service_name.as_str())
         .unwrap_or("rustcdc-server");
+    let otlp_protocol = obs
+        .as_ref()
+        .map(|o| rustcdc_server::telemetry::OtlpProtocol::from_config(&o.otlp_protocol))
+        .unwrap_or(rustcdc_server::telemetry::OtlpProtocol::Grpc);
 
     // Initialise the global tracing subscriber exactly once, including the
     // optional OTel span-exporter and metrics-exporter layers.
@@ -70,6 +74,7 @@ async fn main() {
         otlp_endpoint,
         otlp_metrics_endpoint,
         metrics_interval_secs,
+        otlp_protocol,
         service_name,
     ) {
         Ok(g) => g,

@@ -5,9 +5,7 @@ use rustcdc::core::{
     CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, PostCommitSourceConfirmPolicy,
     RuntimeConfig, RuntimeOptions, TransactionBoundaryPolicy, TransformErrorPolicy,
 };
-use rustcdc::PostgresSourceConfig;
 use std::path::{Path, PathBuf};
-use tokio_postgres::NoTls;
 
 use crate::pipeline::transform;
 use crate::{
@@ -46,15 +44,19 @@ async fn run_pipeline(
     // server-specific mechanism (pg_is_in_recovery, @@global.read_only, etc.).
     if app_config.source.require_primary {
         match &app_config.source.driver {
+            #[cfg(feature = "postgres")]
             crate::config::schema::SourceDriver::Postgres(pg) => {
                 pg.check_is_primary().await?;
             }
+            #[cfg(feature = "mysql")]
             crate::config::schema::SourceDriver::Mysql(mysql) => {
                 mysql.check_is_primary().await?;
             }
+            #[cfg(feature = "mysql")]
             crate::config::schema::SourceDriver::Mariadb(mariadb) => {
                 mariadb.check_is_primary().await?;
             }
+            #[cfg(feature = "sqlserver")]
             crate::config::schema::SourceDriver::Sqlserver(sqlserver) => {
                 sqlserver.to_runtime_config().check_is_primary().await?;
             }
@@ -145,7 +147,7 @@ async fn run_with_runtime_state(
         checkpoint,
         schema_history,
         checkpoint_age_source,
-        remote_lease,
+        state_lease,
     } = state;
 
     if let Some(recovery) = recovered_marker.as_ref() {
@@ -239,11 +241,17 @@ async fn run_with_runtime_state(
     // `snapshot_tables` and `incremental_snapshot` are two bootstrapping paths for the
     // same job, and the loader rejects setting both — a runtime that received both would
     // read every listed table twice.
-    let runtime_config = if app_config.incremental_snapshot.is_enabled() {
-        runtime_config.with_incremental_snapshot(
-            rustcdc::IncrementalSnapshotConfig::new(app_config.incremental_snapshot.tables.clone())
-                .with_chunk_size(app_config.incremental_snapshot.chunk_size),
-        )
+    let runtime_config = if let Some(incremental) = app_config.incremental_snapshot.as_ref() {
+        // Installed even when `tables` is empty: the driver is what services
+        // `execute_snapshot` on a running pipeline, and it adopts unfinished tables from
+        // the checkpoint, so an empty startup list is a real configuration rather than a
+        // no-op — it means "backfill nothing now, stay ready to backfill on request".
+        let snapshot = incremental.table_conditions.iter().fold(
+            rustcdc::IncrementalSnapshotConfig::new(incremental.tables.clone())
+                .with_chunk_size(incremental.chunk_size),
+            |config, (table, condition)| config.with_table_condition(table, condition),
+        );
+        runtime_config.with_incremental_snapshot(snapshot)
     } else if app_config.snapshot_tables.is_empty() {
         runtime_config
     } else {
@@ -288,21 +296,39 @@ async fn run_with_runtime_state(
         requested_delivery_contract.clone(),
     );
 
+    // ── Runtime control surface ───────────────────────────────────────────
+    //
+    // Taken **before** `start()`, and before the event loop borrows the runtime mutably —
+    // after that the runtime is unreachable from the admin task, which is the whole
+    // problem `control_handle` solves.
+    //
+    // Attached only when the runtime can service a snapshot: `request_incremental_snapshot`
+    // adds tables to an *existing* incremental snapshot, so without `[incremental_snapshot]`
+    // there is nothing to add to. Refusing at the admin API with a message naming the
+    // missing config section is more useful than relaying `NotImplemented` from four layers
+    // down.
+    if app_config.incremental_snapshot.is_some() {
+        admin_state
+            .attach_runtime_control(runtime.control_handle())
+            .await;
+    }
+
     tracing::info!("CDC pipeline starting");
     runtime.start().await?;
 
-    // ── Replication-slot lag side-channel (PostgreSQL only) ───────────────
-    // Spawns a lightweight background task that queries `pg_replication_slots`
-    // every 15 s and stores the result in the admin state for the `/metrics`
-    // endpoint.  The task does not affect the main event loop and exits when
-    // the admin state transitions to Stopping/Stopped.
-    if let crate::config::schema::SourceDriver::Postgres(pg) = &app_config.source.driver {
-        let admin_for_lag = admin_state.clone();
-        let pg_for_lag = pg.clone();
-        tokio::spawn(async move {
-            poll_replication_slot_lag(pg_for_lag, admin_for_lag).await;
-        });
-    }
+    // The replication-slot lag metric comes from the runtime's own
+    // `RuntimeAdminSnapshot::replication_slot_lag_bytes` (exported as
+    // `rustcdc_runtime_replication_slot_lag_bytes`).
+    //
+    // This used to be a side-channel: a second PostgreSQL connection polling
+    // `pg_replication_slots` every 15 s, because rustcdc 0.10 refreshed its own figure only
+    // during an idle advance — i.e. only while the pipeline was caught up, which is exactly
+    // when lag is uninteresting. rustcdc 0.11 samples it on a timer regardless of the
+    // caught-up state, so the side-channel is redundant.
+    //
+    // Deleting it removes a second connection, a second credential on the wire every 15
+    // seconds, and the ~120 lines of TLS-connector construction it needed — code that
+    // shipped with a real defect (it connected `NoTls` under `mode = "tls"`).
 
     // ── Main event loop ───────────────────────────────────────────────────
     // We use poll_event_batch() instead of event_batches() so we can call
@@ -390,7 +416,7 @@ async fn run_with_runtime_state(
     // only spares a successor from waiting it out. That matters in practice: with
     // `strategy: Recreate` the replacement pod starts the moment this one exits, and
     // without the release it would sit refusing to start for a full lease TTL.
-    if let Some(lease) = remote_lease {
+    if let Some(lease) = state_lease {
         lease.release().await;
     }
 
@@ -506,7 +532,12 @@ impl Drop for StateDirLock {
 /// `ps -o comm= -p {pid}` (macOS / other Unix).
 /// Falls back to `false` on unsupported platforms so the guard is never a
 /// hard blocker on Windows CI.
-fn is_cdc_process_alive(pid: u32) -> bool {
+/// Is a PID on **this host** a live cdc process?
+///
+/// Shared with the `local_fs` state lease, which uses it to distinguish a crashed owner
+/// from a live one *on the same host* — the one piece of evidence a local filesystem
+/// offers that a remote store does not.
+pub(crate) fn is_cdc_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
         use std::process::{Command, Stdio};
@@ -555,119 +586,6 @@ fn is_cdc_process_alive(pid: u32) -> bool {
         let _ = pid;
         false // Conservative: never evict on unsupported platforms.
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Replication-slot lag side-channel (PostgreSQL)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Background task: polls `pg_replication_slots` every 15 s and publishes the
-/// `confirmed_flush_lsn` lag into the admin state so it is visible on the
-/// `/metrics` endpoint as `cdc_source_replication_slot_lag_bytes`.
-///
-/// The task exits cleanly once the admin state transitions to
-/// `Stopping` or `Stopped` (the main event loop has already finished at that
-/// point), so it does not need an explicit cancellation token.
-async fn poll_replication_slot_lag(pg: PostgresSourceConfig, admin: AdminState) {
-    use tokio::time::{interval, Duration, MissedTickBehavior};
-    let mut ticker = interval(Duration::from_secs(15));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    loop {
-        ticker.tick().await;
-
-        // Stop polling once the runtime is winding down.
-        {
-            let state = admin.data.read().await.state.clone();
-            if matches!(
-                state,
-                InstanceState::Stopping | InstanceState::Stopped | InstanceState::Error
-            ) {
-                break;
-            }
-        }
-
-        match query_slot_lag_bytes(&pg).await {
-            Ok(lag) => {
-                tracing::debug!(
-                    slot = %pg.replication_slot_name,
-                    lag_bytes = lag,
-                    "replication slot lag sampled"
-                );
-                admin.record_slot_lag(Some(lag)).await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    slot = %pg.replication_slot_name,
-                    error = %e,
-                    "failed to sample replication slot lag — metric will show -1"
-                );
-                admin.record_slot_lag(None).await;
-            }
-        }
-    }
-}
-
-/// Issue a single `pg_replication_slots` query and return the number of WAL
-/// bytes not yet consumed by the slot.  Returns an error on connection or
-/// query failure; the caller should treat a transient error as a stale sample.
-async fn query_slot_lag_bytes(pg: &PostgresSourceConfig) -> Result<i64, AppError> {
-    let password = pg.password.expose_secret().map_err(|e| {
-        AppError::Other(format!(
-            "slot lag sampler: failed to resolve source.postgres.password: {e}"
-        ))
-    })?;
-
-    let mut config = tokio_postgres::Config::new();
-    config
-        .host(&pg.host)
-        .port(pg.port)
-        .user(&pg.user)
-        .password(password)
-        .dbname(&pg.database)
-        .connect_timeout(std::time::Duration::from_secs(pg.conn_timeout_secs.min(10)));
-
-    let (client, connection) = match &pg.transport {
-        rustcdc::TransportConfig::Plaintext => config
-            .connect(NoTls)
-            .await
-            .map_err(|e| AppError::Other(format!("slot lag sampler: connect failed: {e}")))?,
-        rustcdc::TransportConfig::Tls { .. } => {
-            // For the side-channel lag query we use NoTls — the same
-            // permissive posture as the primary-guard check so we don't block
-            // production monitoring on certificate paths.
-            config
-                .connect(NoTls)
-                .await
-                .map_err(|e| AppError::Other(format!("slot lag sampler: connect failed: {e}")))?
-        }
-        rustcdc::TransportConfig::RustlsConfig { .. } => config
-            .connect(NoTls)
-            .await
-            .map_err(|e| AppError::Other(format!("slot lag sampler: connect failed: {e}")))?,
-    };
-    tokio::spawn(connection);
-
-    let row = client
-        .query_one(
-            "SELECT (pg_current_wal_lsn() - confirmed_flush_lsn)::bigint \
-             FROM pg_replication_slots WHERE slot_name = $1",
-            &[&pg.replication_slot_name],
-        )
-        .await
-        .map_err(|e| {
-            AppError::Other(format!(
-                "slot lag sampler: pg_replication_slots query failed for slot '{}': {e}",
-                pg.replication_slot_name
-            ))
-        })?;
-
-    let lag: i64 = row.try_get(0).map_err(|e| {
-        AppError::Other(format!(
-            "slot lag sampler: unexpected NULL in lag column: {e}"
-        ))
-    })?;
-    Ok(lag)
 }
 
 #[cfg(test)]
@@ -1027,6 +945,7 @@ pub(super) mod tests {
             slot_idle_advance_interval_ms: 30_000,
             create_replication_slot_if_missing: false,
             failover_slot: false,
+            wal_transport: Default::default(),
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

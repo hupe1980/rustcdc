@@ -61,8 +61,15 @@ pub struct AppConfig {
     /// Chunks are interleaved with the live stream instead of gating it, so capture
     /// starts immediately and a large table does not hold the replication slot open
     /// while it is read. Mutually exclusive with `snapshot_tables`.
+    ///
+    /// `Option` rather than a defaulted struct because *declaring the section* is the
+    /// operator's decision and an empty `tables` list is a legitimate way to make it:
+    /// it enables on-demand snapshots through `POST /signals`
+    /// (`action_type = "execute_snapshot"`) without backfilling anything at startup.
+    /// A defaulted struct cannot tell "absent" from "present and empty", so that
+    /// configuration was unexpressible.
     #[serde(default)]
-    pub incremental_snapshot: IncrementalSnapshotConfig,
+    pub incremental_snapshot: Option<IncrementalSnapshotConfig>,
 
     /// Where undeliverable events are quarantined. Absent = halt instead.
     #[serde(default)]
@@ -85,6 +92,29 @@ pub struct IncrementalSnapshotConfig {
     /// interleave more finely with the stream.
     #[serde(default = "default_incremental_snapshot_chunk_size")]
     pub chunk_size: usize,
+
+    /// Per-table row filter, keyed by `"schema.table"` — Debezium's
+    /// `additional-condition`.
+    ///
+    /// A SQL boolean expression appended to that table's chunk `SELECT`. It restricts
+    /// *which rows are backfilled* — one tenant, or only rows past a cutoff — without
+    /// restricting the live stream, which keeps carrying every change to the table.
+    /// Alias the table as `t` to qualify a column; that is the alias every connector's
+    /// chunk read uses.
+    ///
+    /// # This is raw SQL and it is trusted input
+    ///
+    /// The expression is interpolated into the chunk `SELECT`, because a filter that
+    /// could only be a bound parameter could not express the predicates this exists for.
+    /// It carries the same trust level as the connection string. Config files are already
+    /// trusted here — they hold credentials — but note the consequence: **this is not a
+    /// tenancy boundary.** Do not accept one over an API or from a tenant, and do not
+    /// treat it as an access control. It is a backfill scope, nothing more.
+    ///
+    /// A filter that fails to parse surfaces as a chunk-read error naming the table, at
+    /// the first chunk rather than as a silently empty backfill.
+    #[serde(default)]
+    pub table_conditions: std::collections::BTreeMap<String, String>,
 }
 
 fn default_incremental_snapshot_chunk_size() -> usize {
@@ -98,20 +128,24 @@ impl Default for IncrementalSnapshotConfig {
         Self {
             tables: Vec::new(),
             chunk_size: default_incremental_snapshot_chunk_size(),
+            table_conditions: std::collections::BTreeMap::new(),
         }
     }
 }
 
 impl IncrementalSnapshotConfig {
-    /// Is incremental snapshotting requested?
-    pub fn is_enabled(&self) -> bool {
+    /// Does this section backfill anything at startup?
+    ///
+    /// Distinct from "is the machinery active": a declared section with no tables still
+    /// installs the incremental-snapshot driver, which is what makes `execute_snapshot`
+    /// available. This answers only the narrower question, and is what the mutual
+    /// exclusion with `snapshot_tables` turns on — an empty list bootstraps nothing and
+    /// so cannot conflict with anything.
+    pub fn backfills_at_startup(&self) -> bool {
         !self.tables.is_empty()
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
         if self.chunk_size == 0 {
             return Err("incremental_snapshot.chunk_size must be > 0".to_string());
         }
@@ -122,6 +156,33 @@ impl IncrementalSnapshotConfig {
                      \"schema.table\""
                 ));
             }
+        }
+        for (table, condition) in &self.table_conditions {
+            if !table.contains('.') {
+                return Err(format!(
+                    "incremental_snapshot.table_conditions key '{table}' must be qualified \
+                     as \"schema.table\""
+                ));
+            }
+            if condition.trim().is_empty() {
+                return Err(format!(
+                    "incremental_snapshot.table_conditions['{table}'] is empty; remove the \
+                     entry instead of setting a blank filter"
+                ));
+            }
+            // A condition keyed to a table that is not in `tables` is inert *at startup*,
+            // but no longer meaningless: `execute_snapshot` can name a table that was never
+            // in `tables`, and since rustcdc 0.12 the on-demand path resolves configured
+            // conditions through the same function as the startup path. Pre-declaring one
+            // is therefore a supported way to scope a backfill that will be requested
+            // later, and rejecting it — which this did, because the on-demand path
+            // structurally could not see the filter — would now refuse a working
+            // configuration.
+            //
+            // The typo case it was really guarding is caught where it can be caught
+            // precisely: a `conditions` entry in an `execute_snapshot` request must name a
+            // table in that request's own `tables` list. There the two lists arrive
+            // together, so a mismatch is unambiguous.
         }
         Ok(())
     }
@@ -448,13 +509,37 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_otlp_metrics_interval_secs")]
     pub otlp_metrics_interval_secs: u64,
 
-    /// OTLP protocol for traces: `"grpc"` (default) or `"http"`.
+    /// OTLP wire protocol for traces **and** metrics: `"grpc"` (default) or `"http"`.
+    ///
+    /// `"http"` is OTLP/HTTP with protobuf encoding — the collector's `:4318` listener,
+    /// against `:4317` for gRPC. Getting the pair wrong produces no telemetry, which is
+    /// why an unrecognised value is rejected at load rather than defaulted.
     #[serde(default = "default_otel_protocol")]
     pub otlp_protocol: String,
 
     /// Service name reported to the trace/metrics backend.
     #[serde(default = "default_service_name")]
     pub service_name: String,
+}
+
+impl ObservabilityConfig {
+    /// Accepted values for [`Self::otlp_protocol`].
+    pub const OTLP_PROTOCOLS: &'static [&'static str] = &["grpc", "http"];
+
+    pub fn validate(&self) -> Result<(), String> {
+        let protocol = self.otlp_protocol.trim().to_ascii_lowercase();
+        if !Self::OTLP_PROTOCOLS.contains(&protocol.as_str()) {
+            return Err(format!(
+                "observability.otlp_protocol '{}' is not recognised; expected one of {:?}. \
+                 A wrong value here is invisible at runtime — the exporter simply talks the \
+                 other protocol at the collector and nothing arrives — so it is refused at \
+                 load instead.",
+                self.otlp_protocol,
+                Self::OTLP_PROTOCOLS
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ObservabilityConfig {
@@ -945,12 +1030,11 @@ fn bool_true() -> bool {
 mod tests {
     use super::{
         AdminSignalIngressKafkaConfig, IcebergCatalogConfig, IcebergRestCatalogConfig,
-        IcebergSchemaMode, IcebergSinkConfig, IcebergWriteMode, KafkaCompression,
-        KafkaDeliveryMode, KafkaOidcConfig, KafkaSaslConfig, KafkaSaslMechanism,
-        KafkaSecurityConfig, KafkaSecurityProtocol, KafkaSinkConfig, KafkaStateDurabilityProfile,
-        KafkaTopicStateConfig, PostgresStateConfig, RuntimeConnectionRetryConfig,
-        RuntimeTuningConfig, TransformActionConfig, TransformRuleConfig, TransformRuntimeConfig,
-        TransformRuntimeMode, WasmTransformConfig,
+        IcebergSchemaMode, IcebergSinkConfig, KafkaCompression, KafkaDeliveryMode, KafkaOidcConfig,
+        KafkaSaslConfig, KafkaSaslMechanism, KafkaSecurityConfig, KafkaSecurityProtocol,
+        KafkaSinkConfig, KafkaStateDurabilityProfile, KafkaTopicStateConfig, PostgresStateConfig,
+        RuntimeConnectionRetryConfig, RuntimeTuningConfig, TransformActionConfig,
+        TransformRuleConfig, TransformRuntimeConfig, TransformRuntimeMode, WasmTransformConfig,
     };
     use rustcdc::SecretString;
     use std::path::PathBuf;
@@ -968,7 +1052,6 @@ mod tests {
             batch_size: 16 * 1024,
             linger_ms: 0,
             max_pipelined_sends: 128,
-            max_in_flight: 5,
             transport: Default::default(),
             delivery_mode: KafkaDeliveryMode::AtLeastOnceIdempotent,
             transactional_id: None,
@@ -1326,16 +1409,6 @@ mod tests {
         cfg.compression = KafkaCompression::Zstd;
         cfg.compression_level = Some(12);
         cfg.validate().expect("12 is in zstd's range");
-    }
-
-    /// Above five in-flight requests, a retried batch can land after one produced
-    /// later — the ordering guarantee the idempotent producer exists to give.
-    #[test]
-    fn max_in_flight_is_capped_at_the_idempotence_limit() {
-        let mut cfg = sample_kafka_config("kafka:9092");
-        cfg.max_in_flight = 6;
-        let err = cfg.validate().expect_err("must reject");
-        assert!(err.contains("preserves ordering"), "unexpected: {err}");
     }
 
     #[test]
@@ -1726,7 +1799,6 @@ topic = "cdc-checkpoint-state"
                     credential: None,
                 },
             },
-            write_mode: IcebergWriteMode::Append,
             schema_mode: IcebergSchemaMode::Normalized,
             namespace: "cdc".to_string(),
             table_name: "events".to_string(),
@@ -1761,7 +1833,6 @@ topic = "cdc-checkpoint-state"
                     credential: None,
                 },
             },
-            write_mode: IcebergWriteMode::Append,
             schema_mode: IcebergSchemaMode::Normalized,
             namespace: "cdc".to_string(),
             table_name: "events".to_string(),
@@ -1780,12 +1851,5 @@ topic = "cdc-checkpoint-state"
             .validate()
             .expect_err("blank catalog secrets must be rejected");
         assert!(err.contains("must not be empty"));
-    }
-
-    #[test]
-    fn iceberg_sink_write_mode_rejects_upsert_literal() {
-        let err = serde_json::from_str::<IcebergWriteMode>("\"upsert\"")
-            .expect_err("upsert should be rejected");
-        assert!(err.to_string().contains("unknown variant"));
     }
 }

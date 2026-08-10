@@ -45,8 +45,12 @@ jobs:
       # the configuration a developer and a downstream consumer get by default, and it
       # was never built in CI, so a `#[cfg(feature = "glue")]` boundary error could
       # compile green here and break on the first `cargo build`.
+      #
+      # The second run is the *default* set (PostgreSQL, no glue), not
+      # `--no-default-features`: with connectors now opt-in, the empty set is a
+      # `compile_error!` and would fail here for the wrong reason.
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
 
   # ── Check (all targets, all features) ───────────────────────────────────────
   check:
@@ -61,7 +65,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
       - run: cargo check --all-targets --all-features --locked
-      - run: cargo check --all-targets --no-default-features --locked
+
+  # ── Connector feature matrix ────────────────────────────────────────────────
+  #
+  # Connectors are opt-in cargo features so a PostgreSQL-only deployment does not link
+  # tiberius and its rustls 0.21 stack. That only holds if every combination keeps
+  # compiling, and nothing else in CI would notice a `#[cfg]` arm that stopped matching:
+  # the other jobs all build `--all-features`, where every variant exists.
+  #
+  # `cargo check` rather than `--all-targets` on purpose. The property is that a narrow
+  # *binary* builds; the test fixtures are PostgreSQL-shaped throughout, and gating each
+  # one to compile under a MySQL-only build would be churn that asserts nothing.
+  #
+  # `--no-default-features` alone is deliberately absent: it is a `compile_error!` (see
+  # `src/lib.rs`), because a binary with no connector rejects every configuration.
+  connector-matrix:
+    name: Check (${{ matrix.features }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - postgres
+          - mysql
+          - sqlserver
+          - postgres,mysql,sqlserver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
+      - run: cargo check --no-default-features --features ${{ matrix.features }} --locked
 
   # ── Test ────────────────────────────────────────────────────────────────────
   test:
@@ -76,7 +113,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
       - run: cargo test --all-features --locked
-      - run: cargo test --no-default-features --locked
+      # State compatibility runs on its own line so a failure is unmistakable in the log:
+      # it means this build cannot read state a previous one wrote, which is an upgrade
+      # that breaks every existing pipeline rather than an ordinary test failure.
+      - run: cargo test --all-features --locked --test state_compatibility
+      # The default feature set is PostgreSQL-only, which is what most deployments build
+      # and what every test fixture in this repository is shaped for. `--no-default-features`
+      # is not run here: it has no connector and is a `compile_error!` by design; the
+      # `connector-matrix` job covers the narrow combinations.
+      - run: cargo test --locked
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
   # `rust-version` in Cargo.toml is a promise to downstream consumers. Without a job
@@ -112,8 +157,53 @@ jobs:
       # is held by wasmtime and `--all-features` by the AWS SDK that `glue` pulls in. The
       # declared MSRV has to satisfy the higher of the two, and the shipped container image
       # builds `--all-features`.
-      - run: cargo check --all-targets --no-default-features --locked
+      - run: cargo check --all-targets --locked
       - run: cargo check --all-targets --all-features --locked
+
+  # ── Integration (real PostgreSQL) ───────────────────────────────────────────
+  #
+  # Until this job existed, **nothing in this repository ran against a real database**.
+  # The pipeline was covered end to end by a scripted in-memory source, and every
+  # database-touching test was env-gated and therefore skipped — so the suite was green
+  # with the entire capture path unexercised. That mattered most exactly when it was least
+  # visible: rustcdc 0.10 replaced the PostgreSQL WAL transport with a new wire client and
+  # made it the default, and this job is the only thing that has ever run it here.
+  #
+  # The test manages its own container, so this job and a developer's local run are the
+  # same command against the same fixture. `--test-threads=1` because the tests share one
+  # container name and one host port on purpose: a killed run leaves exactly one thing to
+  # clean up.
+  #
+  # `tests/architecture.rs::every_integration_suite_is_run_by_ci` enumerates
+  # `tests/integration_*.rs` from disk and asserts each one is named here. Adding a suite
+  # and forgetting to wire it up fails the unit suite rather than silently reporting
+  # success — which is what an env-gated test that nobody runs does.
+  #
+  # One job per database, matrixed: they bind fixed host ports and fixed container names so
+  # a killed run leaves exactly one thing to clean up, which means they must not share a
+  # runner.
+  integration:
+    name: Integration (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [integration_postgres, integration_mysql]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
+      - name: Run the ${{ matrix.suite }} suite
+        env:
+          RUSTCDC_INTEGRATION: "1"
+        run: cargo test --all-features --locked --test ${{ matrix.suite }} -- --test-threads=1
+      - name: Clean up the container
+        if: always()
+        run: docker rm -f rustcdc-integration-postgres || true
 
   # ── Fuzz targets (build + short smoke run) ──────────────────────────────────
   #
