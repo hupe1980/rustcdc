@@ -4,10 +4,10 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 use rustcdc::core::RuntimeAdminSnapshot;
-use rustcdc::{fingerprint_event_stable, Event};
+use rustcdc::{Event, fingerprint_event_stable};
 
-use super::run_batch;
-use super::run_recovery::RecoverableErrorSnapshot;
+use super::batch;
+use super::recovery::RecoverableErrorSnapshot;
 use crate::pipeline::transform;
 use crate::sink::{
     HTTP_BATCH_RETRY_DURATION_MS_BUCKETS, HTTP_BATCH_SIZE_BUCKETS, HTTP_RETRY_DELAY_MS_BUCKETS,
@@ -26,7 +26,7 @@ use crate::state;
 /// These bounds span both regimes in one family: 100 us to 5 ms covers per-event
 /// transform, prepare and encode work; 10 ms to 5 s covers network sinks and
 /// checkpoint commits.
-pub(super) const LATENCY_HISTOGRAM_BUCKETS_US: [u64; 10] = [
+pub(crate) const LATENCY_HISTOGRAM_BUCKETS_US: [u64; 10] = [
     100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
 
@@ -41,11 +41,11 @@ pub(super) const LATENCY_HISTOGRAM_BUCKETS_US: [u64; 10] = [
 /// the whole useful range: sub-second for a healthy pipeline, seconds for a busy one,
 /// minutes for one recovering from a backlog, and an hour before a value is genuinely
 /// off-scale.
-pub(super) const END_TO_END_LAG_BUCKETS_MS: [u64; 12] = [
+pub(crate) const END_TO_END_LAG_BUCKETS_MS: [u64; 12] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 300_000, 900_000, 3_600_000,
 ];
 
-pub(super) fn observe_lag_histogram_bucket(
+pub(crate) fn observe_lag_histogram_bucket(
     buckets: &mut [u64; END_TO_END_LAG_BUCKETS_MS.len()],
     lag_ms: u64,
 ) {
@@ -58,11 +58,11 @@ pub(super) fn observe_lag_histogram_bucket(
 }
 
 /// Microseconds to seconds — Prometheus exports base units.
-pub(super) fn micros_to_seconds(micros: u64) -> f64 {
+pub(crate) fn micros_to_seconds(micros: u64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
-pub(super) fn observe_latency_histogram_bucket(
+pub(crate) fn observe_latency_histogram_bucket(
     buckets: &mut [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
     latency_us: u64,
 ) {
@@ -89,7 +89,7 @@ fn mean(total: u64, sample_count: u64) -> f64 {
 }
 
 /// Milliseconds to seconds, for the few signals captured at millisecond scale.
-pub(super) fn millis_to_seconds(millis: u64) -> f64 {
+pub(crate) fn millis_to_seconds(millis: u64) -> f64 {
     millis as f64 / 1_000.0
 }
 
@@ -145,18 +145,18 @@ const MAX_UNMATCHED_RULE_SERIES: usize = 64;
 const MILLIS_THRESHOLD: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone)]
-pub(super) struct CorrectnessSample {
-    pub(super) schema: Option<String>,
-    pub(super) table: String,
-    pub(super) source_name: String,
-    pub(super) source_offset: String,
-    pub(super) source_timestamp: u64,
-    pub(super) event_timestamp: u64,
-    pub(super) fingerprint: Option<String>,
+pub(crate) struct CorrectnessSample {
+    pub(crate) schema: Option<String>,
+    pub(crate) table: String,
+    pub(crate) source_name: String,
+    pub(crate) source_offset: String,
+    pub(crate) source_timestamp: u64,
+    pub(crate) event_timestamp: u64,
+    pub(crate) fingerprint: Option<String>,
 }
 
 impl CorrectnessSample {
-    pub(super) fn from_event(event: &Event) -> Self {
+    pub(crate) fn from_event(event: &Event) -> Self {
         Self {
             schema: event.schema.clone(),
             table: event.table.clone(),
@@ -548,6 +548,14 @@ pub(crate) struct SinkMetricsSnapshot {
     sink_kafka_oauth_token_fetches_total: u64,
     sink_kafka_oauth_token_fetch_failures_total: u64,
     sink_kafka_oauth_token_expiry_epoch_ms: u64,
+    sink_snowflake_rows_appended_total: u64,
+    sink_snowflake_rows_skipped_on_resume_total: u64,
+    sink_snowflake_channel_reopens_total: u64,
+    sink_snowflake_commit_wait_ms_total: u64,
+    sink_snowflake_resume_scan_exhausted_total: u64,
+    sink_zerobus_records_ingested_total: u64,
+    sink_zerobus_ack_wait_ms_total: u64,
+    sink_zerobus_stream_opens_total: u64,
     data_events_total: u64,
     data_duplicates_total: u64,
     data_reorders_total: u64,
@@ -1087,6 +1095,62 @@ impl SinkMetricsSnapshot {
             &sink_labels,
             self.sink_kafka_oauth_token_expiry_epoch_ms,
         );
+        for (name, help, value) in [
+            (
+                "rustcdc_sink_snowflake_rows_appended_total",
+                "Rows appended to the Snowpipe Streaming channel",
+                self.sink_snowflake_rows_appended_total,
+            ),
+            (
+                "rustcdc_sink_snowflake_rows_skipped_on_resume_total",
+                "Rows dropped on resume because Snowflake's committed offset token already \
+                 covered them. Non-zero after a crash between a committed flush and the \
+                 checkpoint write — that window is what this sink's exactly-once handling \
+                 exists for. Persistently rising means the checkpoint is not advancing",
+                self.sink_snowflake_rows_skipped_on_resume_total,
+            ),
+            (
+                "rustcdc_sink_snowflake_channel_reopens_total",
+                "Snowpipe Streaming channel opens, including reopens after a stale \
+                 continuation token. A steadily climbing count means a second writer is \
+                 using the same channel name and the two are fencing each other",
+                self.sink_snowflake_channel_reopens_total,
+            ),
+            (
+                "rustcdc_sink_snowflake_commit_wait_ms_total",
+                "Total milliseconds flush spent waiting for Snowflake to commit. This is the \
+                 sink's dominant latency and it is deliberate: returning earlier would let \
+                 the checkpoint advance past rows a channel reopen discards",
+                self.sink_snowflake_commit_wait_ms_total,
+            ),
+            (
+                "rustcdc_sink_zerobus_records_ingested_total",
+                "Records queued to a Databricks Zerobus ingest stream",
+                self.sink_zerobus_records_ingested_total,
+            ),
+            (
+                "rustcdc_sink_zerobus_ack_wait_ms_total",
+                "Total milliseconds flush spent waiting for Databricks to acknowledge \
+                 durability. The sink's dominant latency and deliberate: returning earlier \
+                 would let the checkpoint advance past records a process exit would lose",
+                self.sink_zerobus_ack_wait_ms_total,
+            ),
+            (
+                "rustcdc_sink_zerobus_stream_opens_total",
+                "Zerobus stream opens, including SDK reconnections. A climbing count means \
+                 the stream keeps dropping, and each reopen re-sends unacknowledged records \
+                 — so it is also a duplicate source",
+                self.sink_zerobus_stream_opens_total,
+            ),
+            (
+                "rustcdc_sink_snowflake_resume_scan_exhausted_total",
+                "Times the bounded resume scan gave up without matching the committed offset \
+                 token. Each one is a window delivered at-least-once — alert on any increase",
+                self.sink_snowflake_resume_scan_exhausted_total,
+            ),
+        ] {
+            encoder.counter(name, help, &sink_labels, value);
+        }
         encoder.gauge(
             "rustcdc_sink_iceberg_flush_lock_contention_ms_max",
             "Maximum observed iceberg flush lock wait time in milliseconds",
@@ -1258,7 +1322,7 @@ impl SinkMetricsSnapshot {
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // test shim mirroring sink_metrics_snapshot's field list
-pub(super) fn sink_metrics_prometheus(
+pub(crate) fn sink_metrics_prometheus(
     sink_name: &str,
     requested_delivery_contract: &str,
     delivery_contract_satisfied: bool,
@@ -1363,7 +1427,7 @@ pub(super) fn sink_metrics_prometheus(
 }
 
 #[allow(clippy::too_many_arguments)] // flat metric field list mirrors the accumulator layout
-pub(super) fn sink_metrics_snapshot(
+pub(crate) fn sink_metrics_snapshot(
     sink_name: &str,
     requested_delivery_contract: &str,
     delivery_contract_satisfied: bool,
@@ -1486,11 +1550,19 @@ pub(super) fn sink_metrics_snapshot(
         sink_iceberg_flush_lock_contention_events_total,
         sink_iceberg_flush_lock_contention_ms_total,
         sink_iceberg_flush_lock_contention_ms_max,
-        // Populated by `with_kafka_oauth` at the one call site that holds the
-        // accumulator; not part of this function's positional argument list, which
-        // is already at the clippy limit.
+        // Populated by `with_kafka_oauth` and `with_snowflake` at the one call site that
+        // holds the accumulator; not part of this function's positional argument list,
+        // which is already at the clippy limit.
         sink_kafka_oauth_token_fetches_total: 0,
         sink_kafka_oauth_token_fetch_failures_total: 0,
+        sink_snowflake_rows_appended_total: 0,
+        sink_snowflake_rows_skipped_on_resume_total: 0,
+        sink_snowflake_channel_reopens_total: 0,
+        sink_snowflake_commit_wait_ms_total: 0,
+        sink_snowflake_resume_scan_exhausted_total: 0,
+        sink_zerobus_records_ingested_total: 0,
+        sink_zerobus_ack_wait_ms_total: 0,
+        sink_zerobus_stream_opens_total: 0,
         sink_kafka_oauth_token_expiry_epoch_ms: 0,
         data_events_total: 0,
         data_duplicates_total: 0,
@@ -1504,7 +1576,7 @@ pub(super) fn sink_metrics_snapshot(
 }
 
 #[cfg(test)]
-pub(super) fn recoverable_error_metrics_prometheus(
+pub(crate) fn recoverable_error_metrics_prometheus(
     total: u64,
     consecutive: u64,
     backoff_ms: u64,
@@ -1524,7 +1596,7 @@ pub(super) fn recoverable_error_metrics_prometheus(
     .render_prometheus()
 }
 
-pub(super) fn recoverable_error_metrics_snapshot(
+pub(crate) fn recoverable_error_metrics_snapshot(
     total: u64,
     consecutive: u64,
     backoff_ms: u64,
@@ -1548,7 +1620,7 @@ pub(super) fn recoverable_error_metrics_snapshot(
     }
 }
 
-pub(super) struct RuntimeLoopMetricsAccumulator {
+pub(crate) struct RuntimeLoopMetricsAccumulator {
     /// Events quarantined to the dead-letter queue.
     ///
     /// Every one of these is an event that was **not delivered** and whose checkpoint
@@ -1614,6 +1686,14 @@ pub(super) struct RuntimeLoopMetricsAccumulator {
     sink_kafka_oauth_token_fetches_total: u64,
     sink_kafka_oauth_token_fetch_failures_total: u64,
     sink_kafka_oauth_token_expiry_epoch_ms: u64,
+    sink_snowflake_rows_appended_total: u64,
+    sink_snowflake_rows_skipped_on_resume_total: u64,
+    sink_snowflake_channel_reopens_total: u64,
+    sink_snowflake_commit_wait_ms_total: u64,
+    sink_snowflake_resume_scan_exhausted_total: u64,
+    sink_zerobus_records_ingested_total: u64,
+    sink_zerobus_ack_wait_ms_total: u64,
+    sink_zerobus_stream_opens_total: u64,
     data_events_total: u64,
     data_duplicates_total: u64,
     data_reorders_total: u64,
@@ -1641,7 +1721,7 @@ pub(super) struct RuntimeLoopMetricsAccumulator {
 
 impl RuntimeLoopMetricsAccumulator {
     #[allow(clippy::too_many_arguments)] // constructor mirrors sink capability flags
-    pub(super) fn new(
+    pub(crate) fn new(
         sink_name: &str,
         requested_delivery_contract: &str,
         delivery_contract_satisfied: bool,
@@ -1714,6 +1794,14 @@ impl RuntimeLoopMetricsAccumulator {
             sink_kafka_oauth_token_fetches_total: 0,
             sink_kafka_oauth_token_fetch_failures_total: 0,
             sink_kafka_oauth_token_expiry_epoch_ms: 0,
+            sink_snowflake_rows_appended_total: 0,
+            sink_snowflake_rows_skipped_on_resume_total: 0,
+            sink_snowflake_channel_reopens_total: 0,
+            sink_snowflake_commit_wait_ms_total: 0,
+            sink_snowflake_resume_scan_exhausted_total: 0,
+            sink_zerobus_records_ingested_total: 0,
+            sink_zerobus_ack_wait_ms_total: 0,
+            sink_zerobus_stream_opens_total: 0,
             data_events_total: 0,
             data_duplicates_total: 0,
             data_reorders_total: 0,
@@ -1742,7 +1830,7 @@ impl RuntimeLoopMetricsAccumulator {
     /// The one-hot `rustcdc_runtime_health` gauge is the alerting source of truth;
     /// this makes the *moment* of a transition (and the stall reason) greppable next
     /// to whatever else the pipeline logged at that time.
-    pub(super) fn observe_health_transition(&mut self, admin: &RuntimeAdminSnapshot) {
+    pub(crate) fn observe_health_transition(&mut self, admin: &RuntimeAdminSnapshot) {
         use rustcdc::core::HealthVerdict;
 
         if self.last_health_verdict.as_ref() == Some(&admin.health) {
@@ -1778,7 +1866,7 @@ impl RuntimeLoopMetricsAccumulator {
 
     /// Refresh the cached WASM metrics snapshot from the live runtime.
     /// Called once per batch by `record_batch_metrics_and_admin`.
-    pub(super) async fn update_transform_metrics(
+    pub(crate) async fn update_transform_metrics(
         &mut self,
         pipeline: &transform::TransformPipeline,
     ) {
@@ -1788,7 +1876,7 @@ impl RuntimeLoopMetricsAccumulator {
         self.unmatched_transform_rules = pipeline.unmatched_rules();
     }
 
-    pub(super) fn merge_batch_processing_stats(&mut self, stats: &run_batch::BatchProcessingStats) {
+    pub(crate) fn merge_batch_processing_stats(&mut self, stats: &batch::BatchProcessingStats) {
         self.dlq_events_total = self
             .dlq_events_total
             .saturating_add(stats.delivery.dlq_events_total);
@@ -1856,7 +1944,7 @@ impl RuntimeLoopMetricsAccumulator {
         }
     }
 
-    pub(super) fn record_checkpoint_commit_latency(&mut self, latency_us: u64) {
+    pub(crate) fn record_checkpoint_commit_latency(&mut self, latency_us: u64) {
         self.checkpoint_commit_ops_total = self.checkpoint_commit_ops_total.saturating_add(1);
         self.checkpoint_commit_latency_us_total = self
             .checkpoint_commit_latency_us_total
@@ -1868,7 +1956,7 @@ impl RuntimeLoopMetricsAccumulator {
         );
     }
 
-    pub(super) fn record_batch_delivery_latency(&mut self, latency_us: u64) {
+    pub(crate) fn record_batch_delivery_latency(&mut self, latency_us: u64) {
         self.batch_delivery_ops_total = self.batch_delivery_ops_total.saturating_add(1);
         self.batch_delivery_latency_us_total = self
             .batch_delivery_latency_us_total
@@ -1877,7 +1965,7 @@ impl RuntimeLoopMetricsAccumulator {
         observe_latency_histogram_bucket(&mut self.batch_delivery_latency_us_buckets, latency_us);
     }
 
-    pub(super) fn record_sink_queue_depth(&mut self, queue_depth: u64) {
+    pub(crate) fn record_sink_queue_depth(&mut self, queue_depth: u64) {
         self.sink_queue_depth_last = queue_depth;
         self.sink_queue_depth_window.push_back(queue_depth);
         if self.sink_queue_depth_window.len() > self.queue_depth_p95_window_samples {
@@ -1885,7 +1973,7 @@ impl RuntimeLoopMetricsAccumulator {
         }
     }
 
-    pub(super) fn record_sink_delivery_delta(
+    pub(crate) fn record_sink_delivery_delta(
         &mut self,
         before: crate::sink::SinkDeliveryMetrics,
         after: crate::sink::SinkDeliveryMetrics,
@@ -2038,9 +2126,53 @@ impl RuntimeLoopMetricsAccumulator {
         self.sink_kafka_oauth_token_fetch_failures_total =
             after.kafka_oauth_token_fetch_failures_total;
         self.sink_kafka_oauth_token_expiry_epoch_ms = after.kafka_oauth_token_expiry_epoch_ms;
+        for (target, before_value, after_value) in [
+            (
+                &mut self.sink_snowflake_rows_appended_total,
+                before.snowflake_rows_appended_total,
+                after.snowflake_rows_appended_total,
+            ),
+            (
+                &mut self.sink_snowflake_rows_skipped_on_resume_total,
+                before.snowflake_rows_skipped_on_resume_total,
+                after.snowflake_rows_skipped_on_resume_total,
+            ),
+            (
+                &mut self.sink_snowflake_channel_reopens_total,
+                before.snowflake_channel_reopens_total,
+                after.snowflake_channel_reopens_total,
+            ),
+            (
+                &mut self.sink_snowflake_commit_wait_ms_total,
+                before.snowflake_commit_wait_ms_total,
+                after.snowflake_commit_wait_ms_total,
+            ),
+            (
+                &mut self.sink_snowflake_resume_scan_exhausted_total,
+                before.snowflake_resume_scan_exhausted_total,
+                after.snowflake_resume_scan_exhausted_total,
+            ),
+            (
+                &mut self.sink_zerobus_records_ingested_total,
+                before.zerobus_records_ingested_total,
+                after.zerobus_records_ingested_total,
+            ),
+            (
+                &mut self.sink_zerobus_ack_wait_ms_total,
+                before.zerobus_ack_wait_ms_total,
+                after.zerobus_ack_wait_ms_total,
+            ),
+            (
+                &mut self.sink_zerobus_stream_opens_total,
+                before.zerobus_stream_opens_total,
+                after.zerobus_stream_opens_total,
+            ),
+        ] {
+            *target = target.saturating_add(after_value.saturating_sub(before_value));
+        }
     }
 
-    pub(super) fn record_correctness_sample(&mut self, sample: &CorrectnessSample) {
+    pub(crate) fn record_correctness_sample(&mut self, sample: &CorrectnessSample) {
         let stream_name = normalize_stream_name_sample(sample);
         let stream_slot = if self.stream_correctness.contains_key(&stream_name)
             || self.stream_correctness.len() < MAX_CORRECTNESS_STREAMS
@@ -2062,28 +2194,28 @@ impl RuntimeLoopMetricsAccumulator {
             } else {
                 self.recent_fingerprints.insert(fp_key.clone());
                 self.recent_fingerprint_window.push_back(fp_key);
-                if self.recent_fingerprint_window.len() > self.dedup_window_size {
-                    if let Some(old) = self.recent_fingerprint_window.pop_front() {
-                        self.recent_fingerprints.remove(&old);
-                    }
+                if self.recent_fingerprint_window.len() > self.dedup_window_size
+                    && let Some(old) = self.recent_fingerprint_window.pop_front()
+                {
+                    self.recent_fingerprints.remove(&old);
                 }
             }
         }
 
         let source_sequence = normalize_source_sequence_sample(sample);
         if let Some(source_sequence) = source_sequence {
-            if let Some(previous) = self.stream_last_source_sequence.get(&stream_slot) {
-                if source_sequence < *previous {
-                    reordered = true;
-                }
+            if let Some(previous) = self.stream_last_source_sequence.get(&stream_slot)
+                && source_sequence < *previous
+            {
+                reordered = true;
             }
             self.stream_last_source_sequence
                 .insert(stream_slot.clone(), source_sequence);
         } else if let Some(source_ts_ms) = normalize_source_timestamp_ms_sample(sample) {
-            if let Some(previous) = self.stream_last_source_ts_ms.get(&stream_slot) {
-                if source_ts_ms < *previous {
-                    reordered = true;
-                }
+            if let Some(previous) = self.stream_last_source_ts_ms.get(&stream_slot)
+                && source_ts_ms < *previous
+            {
+                reordered = true;
             }
             self.stream_last_source_ts_ms
                 .insert(stream_slot.clone(), source_ts_ms);
@@ -2124,7 +2256,7 @@ impl RuntimeLoopMetricsAccumulator {
         }
     }
 
-    pub(super) fn build_runtime_metrics_snapshot(
+    pub(crate) fn build_runtime_metrics_snapshot(
         &self,
         runtime_admin: RuntimeAdminSnapshot,
         recoverable: RecoverableErrorSnapshot,
@@ -2196,6 +2328,17 @@ impl RuntimeLoopMetricsAccumulator {
             self.sink_kafka_oauth_token_fetch_failures_total;
         sink_metrics.sink_kafka_oauth_token_expiry_epoch_ms =
             self.sink_kafka_oauth_token_expiry_epoch_ms;
+        sink_metrics.sink_snowflake_rows_appended_total = self.sink_snowflake_rows_appended_total;
+        sink_metrics.sink_snowflake_rows_skipped_on_resume_total =
+            self.sink_snowflake_rows_skipped_on_resume_total;
+        sink_metrics.sink_snowflake_channel_reopens_total =
+            self.sink_snowflake_channel_reopens_total;
+        sink_metrics.sink_snowflake_commit_wait_ms_total = self.sink_snowflake_commit_wait_ms_total;
+        sink_metrics.sink_snowflake_resume_scan_exhausted_total =
+            self.sink_snowflake_resume_scan_exhausted_total;
+        sink_metrics.sink_zerobus_records_ingested_total = self.sink_zerobus_records_ingested_total;
+        sink_metrics.sink_zerobus_ack_wait_ms_total = self.sink_zerobus_ack_wait_ms_total;
+        sink_metrics.sink_zerobus_stream_opens_total = self.sink_zerobus_stream_opens_total;
         sink_metrics.data_events_total = self.data_events_total;
         sink_metrics.data_duplicates_total = self.data_duplicates_total;
         sink_metrics.data_reorders_total = self.data_reorders_total;
@@ -2472,7 +2615,7 @@ fn format_capability_metric(capability: &str, enabled: bool) -> String {
     )
 }
 
-pub(super) fn p95_u64_window(window: &VecDeque<u64>) -> u64 {
+pub(crate) fn p95_u64_window(window: &VecDeque<u64>) -> u64 {
     if window.is_empty() {
         return 0;
     }
@@ -2489,7 +2632,7 @@ mod tests {
     use serde_json::json;
 
     use super::RuntimeLoopMetricsAccumulator;
-    use super::{parse_numeric_offset_component, parse_postgres_lsn, CorrectnessSample};
+    use super::{CorrectnessSample, parse_numeric_offset_component, parse_postgres_lsn};
     use super::{MetricLabel, PrometheusTextEncoder};
     use std::borrow::Cow;
 
@@ -2846,7 +2989,7 @@ mod tests {
 #[cfg(test)]
 mod end_to_end_lag_tests {
     use super::{
-        observe_lag_histogram_bucket, END_TO_END_LAG_BUCKETS_MS, LATENCY_HISTOGRAM_BUCKETS_US,
+        END_TO_END_LAG_BUCKETS_MS, LATENCY_HISTOGRAM_BUCKETS_US, observe_lag_histogram_bucket,
     };
 
     /// The freshness SLO is a 95th percentile, and `histogram_quantile` needs buckets that

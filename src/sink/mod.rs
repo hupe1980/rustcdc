@@ -1,6 +1,8 @@
 mod http;
 mod iceberg;
 mod kafka;
+mod snowflake;
+mod zerobus;
 
 use std::time::Duration;
 
@@ -13,8 +15,10 @@ pub(crate) use kafka::enforce_durable_confirmation;
 pub(crate) use kafka::kafka_connect_timeout;
 pub use kafka::{KafkaSink, KafkaTransactionHandle};
 pub use rustcdc::sink::{FanOutSinkAdapter as FanOutSink, FileJsonlSink, StdoutSink};
+pub use snowflake::SnowflakeSink;
+pub use zerobus::ZerobusSink;
 
-use crate::codec::{build as build_codec, BuiltCodec};
+use crate::codec::{BuiltCodec, build as build_codec};
 use crate::{
     config::schema::{SinkConfig, StdoutSinkConfig},
     error::AppError,
@@ -88,6 +92,269 @@ pub struct SinkDeliveryMetrics {
     /// Unix epoch. `0` means none has been fetched yet, or the provider returned no
     /// `expires_in`.
     pub kafka_oauth_token_expiry_epoch_ms: u64,
+    /// Rows appended to a Snowpipe Streaming channel.
+    pub snowflake_rows_appended_total: u64,
+    /// Rows dropped on resume because the channel's committed offset token already
+    /// covered them.
+    ///
+    /// Non-zero after a crash between a committed flush and the checkpoint write, which is
+    /// the window this sink's exactly-once handling exists for. Persistently non-zero means
+    /// the checkpoint is not advancing.
+    pub snowflake_rows_skipped_on_resume_total: u64,
+    /// Channel opens, including reopens after a stale continuation token.
+    ///
+    /// A steadily climbing count means another writer is using the same channel name — the
+    /// two fence each other in a loop and neither makes progress.
+    pub snowflake_channel_reopens_total: u64,
+    /// Total time `flush` spent waiting for Snowflake to commit.
+    ///
+    /// This is the sink's dominant latency and it is *deliberate*: returning before the
+    /// commit would let the checkpoint advance past rows a channel reopen discards.
+    pub snowflake_commit_wait_ms_total: u64,
+    /// Times the bounded resume scan gave up without finding the committed offset token.
+    ///
+    /// Each one is a window delivered at-least-once. Alert on any increase.
+    pub snowflake_resume_scan_exhausted_total: u64,
+    /// Records queued to a Zerobus ingest stream.
+    pub zerobus_records_ingested_total: u64,
+    /// Total time `flush` spent waiting for Databricks to acknowledge durability.
+    ///
+    /// The sink's dominant latency, and deliberate: returning earlier would let the
+    /// checkpoint advance past records a process exit would lose.
+    pub zerobus_ack_wait_ms_total: u64,
+    /// Zerobus stream opens, including reconnections by the SDK's recovery path.
+    ///
+    /// A steadily climbing count means the stream keeps dropping; each reopen re-sends
+    /// unacknowledged records, so it is also a duplicate source.
+    pub zerobus_stream_opens_total: u64,
+}
+
+impl SinkDeliveryMetrics {
+    /// Combine two sinks' counters into one pipeline-level figure.
+    ///
+    /// Cumulative counters add; high-water marks and `*_max` take the larger; `*_last`
+    /// gauges take the other side's value when it has one, because a zero there means
+    /// "this sink has never observed the quantity", not "the quantity is zero".
+    ///
+    /// Used both for fan-out children and for a router with several routes, so a
+    /// `[[pipeline.routes]]` deployment reports one number per family rather than
+    /// whichever sink happened to be sampled.
+    pub fn merge(&mut self, other: &Self) {
+        fn add(target: &mut u64, value: u64) {
+            *target = target.saturating_add(value);
+        }
+        fn add_all<const N: usize>(target: &mut [u64; N], value: &[u64; N]) {
+            for (slot, sample) in target.iter_mut().zip(value.iter()) {
+                *slot = slot.saturating_add(*sample);
+            }
+        }
+        fn latest(target: &mut u64, value: u64) {
+            if value != 0 {
+                *target = value;
+            }
+        }
+
+        add(&mut self.retries_total, other.retries_total);
+        add(&mut self.dlq_total, other.dlq_total);
+        add(&mut self.http_requests_total, other.http_requests_total);
+        add(
+            &mut self.http_batch_size_samples_total,
+            other.http_batch_size_samples_total,
+        );
+        add_all(
+            &mut self.http_batch_size_bucket_counts,
+            &other.http_batch_size_bucket_counts,
+        );
+        latest(
+            &mut self.http_batch_oldest_event_age_ms_last,
+            other.http_batch_oldest_event_age_ms_last,
+        );
+        add(&mut self.http_pending_events, other.http_pending_events);
+        add(&mut self.http_pending_bytes, other.http_pending_bytes);
+        self.http_pending_bytes_high_watermark = self
+            .http_pending_bytes_high_watermark
+            .max(other.http_pending_bytes_high_watermark);
+        add(
+            &mut self.http_retry_delay_samples_total,
+            other.http_retry_delay_samples_total,
+        );
+        add_all(
+            &mut self.http_retry_delay_bucket_counts,
+            &other.http_retry_delay_bucket_counts,
+        );
+        add(
+            &mut self.http_batch_retry_duration_samples_total,
+            other.http_batch_retry_duration_samples_total,
+        );
+        add_all(
+            &mut self.http_batch_retry_duration_bucket_counts,
+            &other.http_batch_retry_duration_bucket_counts,
+        );
+        add(
+            &mut self.http_batch_retry_duration_ms_total,
+            other.http_batch_retry_duration_ms_total,
+        );
+        latest(
+            &mut self.http_batch_retry_duration_ms_last,
+            other.http_batch_retry_duration_ms_last,
+        );
+        add(
+            &mut self.retryable_status_429_total,
+            other.retryable_status_429_total,
+        );
+        add(
+            &mut self.retryable_status_5xx_total,
+            other.retryable_status_5xx_total,
+        );
+        add(
+            &mut self.retryable_error_timeout_total,
+            other.retryable_error_timeout_total,
+        );
+        add(
+            &mut self.retryable_error_other_total,
+            other.retryable_error_other_total,
+        );
+        add(
+            &mut self.terminal_status_4xx_total,
+            other.terminal_status_4xx_total,
+        );
+        add(
+            &mut self.terminal_status_other_total,
+            other.terminal_status_other_total,
+        );
+        add(
+            &mut self.terminal_error_timeout_total,
+            other.terminal_error_timeout_total,
+        );
+        add(
+            &mut self.terminal_error_other_total,
+            other.terminal_error_other_total,
+        );
+        add(
+            &mut self.iceberg_orphaned_data_files_total,
+            other.iceberg_orphaned_data_files_total,
+        );
+        add(
+            &mut self.iceberg_flush_lock_contention_events_total,
+            other.iceberg_flush_lock_contention_events_total,
+        );
+        add(
+            &mut self.iceberg_flush_lock_contention_ms_total,
+            other.iceberg_flush_lock_contention_ms_total,
+        );
+        self.iceberg_flush_lock_contention_ms_max = self
+            .iceberg_flush_lock_contention_ms_max
+            .max(other.iceberg_flush_lock_contention_ms_max);
+        add(
+            &mut self.kafka_oauth_token_fetches_total,
+            other.kafka_oauth_token_fetches_total,
+        );
+        add(
+            &mut self.kafka_oauth_token_fetch_failures_total,
+            other.kafka_oauth_token_fetch_failures_total,
+        );
+        latest(
+            &mut self.kafka_oauth_token_expiry_epoch_ms,
+            other.kafka_oauth_token_expiry_epoch_ms,
+        );
+        add(
+            &mut self.snowflake_rows_appended_total,
+            other.snowflake_rows_appended_total,
+        );
+        add(
+            &mut self.snowflake_rows_skipped_on_resume_total,
+            other.snowflake_rows_skipped_on_resume_total,
+        );
+        add(
+            &mut self.snowflake_channel_reopens_total,
+            other.snowflake_channel_reopens_total,
+        );
+        add(
+            &mut self.snowflake_commit_wait_ms_total,
+            other.snowflake_commit_wait_ms_total,
+        );
+        add(
+            &mut self.snowflake_resume_scan_exhausted_total,
+            other.snowflake_resume_scan_exhausted_total,
+        );
+        add(
+            &mut self.zerobus_records_ingested_total,
+            other.zerobus_records_ingested_total,
+        );
+        add(
+            &mut self.zerobus_ack_wait_ms_total,
+            other.zerobus_ack_wait_ms_total,
+        );
+        add(
+            &mut self.zerobus_stream_opens_total,
+            other.zerobus_stream_opens_total,
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SinkMetricsHandle / SinkMetricsRegistry
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// **Why a side channel exists at all.**
+//
+// The pipeline delivers through `TableRouter<BoxedSink>`, and `BoxedSink` exposes only
+// `SinkAdapter` — whose `delivery_metrics()` carries four generic fields
+// (`events_sent`/`events_errored`/`events_retried`/`last_delivered_offset`). Everything
+// else this server exports about a sink — HTTP status classes, batch-size and retry-delay
+// histograms, pending bytes, Iceberg orphaned files and lock contention, Kafka OAUTHBEARER
+// token health — has no room in that struct and cannot be reached once a binding is inside
+// the router.
+//
+// The scrape path used to read the router and fill a local `SinkDeliveryMetrics` from the
+// one field that survived, leaving **thirty** metric families pinned at zero for the life
+// of the process. Four shipped alert rules watched four of them, so they could never fire.
+// Every test that asserted otherwise built the struct by hand and never crossed the
+// erasure boundary — the defect was invisible from inside the suite.
+//
+// A handle is taken on the way *in*, exactly like `KafkaTransactionHandle`, and the
+// binding publishes into it at each flush. Flush is the right cadence rather than an
+// arbitrary one: the run loop samples before and after each batch, and a batch ends with a
+// flush, so both samples land on published values.
+
+/// A published snapshot of one sink binding's extended counters.
+#[derive(Debug, Clone, Default)]
+pub struct SinkMetricsHandle(std::sync::Arc<std::sync::Mutex<SinkDeliveryMetrics>>);
+
+impl SinkMetricsHandle {
+    fn publish(&self, metrics: SinkDeliveryMetrics) {
+        // A poisoned lock means some other thread panicked mid-publish. Metrics are not
+        // worth propagating a panic for; the previous snapshot stays visible.
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = metrics;
+        }
+    }
+
+    /// The most recently published snapshot.
+    pub fn snapshot(&self) -> SinkDeliveryMetrics {
+        self.0.lock().map(|slot| *slot).unwrap_or_default()
+    }
+}
+
+/// Every binding in one pipeline, so the scrape path can total them.
+#[derive(Debug, Clone, Default)]
+pub struct SinkMetricsRegistry {
+    handles: Vec<SinkMetricsHandle>,
+}
+
+impl SinkMetricsRegistry {
+    pub fn register(&mut self, handle: SinkMetricsHandle) {
+        self.handles.push(handle);
+    }
+
+    /// The pipeline-wide total across every registered binding.
+    pub fn snapshot(&self) -> SinkDeliveryMetrics {
+        let mut total = SinkDeliveryMetrics::default();
+        for handle in &self.handles {
+            total.merge(&handle.snapshot());
+        }
+        total
+    }
 }
 
 // Re-export rustcdc's SinkDeliveryGuarantee so callers don't need two imports.
@@ -99,11 +366,26 @@ pub enum BuiltSink {
     Http(Box<HttpSink>),
     Kafka(Box<KafkaSink>),
     Iceberg(Box<IcebergSink>),
-    Fan(Box<FanOutSink>),
+    Snowflake(Box<SnowflakeSink>),
+    Zerobus(Box<ZerobusSink>),
+    /// Fan-out, plus a handle onto each child's published counters.
+    ///
+    /// `FanOutSinkAdapter` erases its children to `BoxedSink`, so the parent cannot ask
+    /// them for extended metrics. The handles are collected while the children are still
+    /// concrete; the parent's `delivery_metrics()` merges them.
+    Fan(Box<FanOutSink>, Vec<SinkMetricsHandle>),
 }
 
 /// Build the concrete sink from the application configuration.
-fn build(config: &SinkConfig) -> BoxFuture<'_, Result<BuiltSink, AppError>> {
+///
+/// `max_event_bytes` is threaded in for transports that produce the transmitted bytes
+/// themselves. Snowflake is the first: its NDJSON row *is* the JSON, so it enforces the
+/// limit on the bytes it is about to send rather than on a second rendering made purely to
+/// measure and thrown away.
+fn build(
+    config: &SinkConfig,
+    max_event_bytes: usize,
+) -> BoxFuture<'_, Result<BuiltSink, AppError>> {
     Box::pin(async move {
         match config {
             SinkConfig::Stdout(StdoutSinkConfig {}) => {
@@ -130,6 +412,14 @@ fn build(config: &SinkConfig) -> BoxFuture<'_, Result<BuiltSink, AppError>> {
                     .map_err(|e| AppError::Other(format!("failed to build HTTP sink: {e}")))?;
                 Ok(BuiltSink::Http(Box::new(sink)))
             }
+            SinkConfig::Snowflake(cfg) => {
+                let sink = SnowflakeSink::new(cfg, max_event_bytes).await?;
+                Ok(BuiltSink::Snowflake(Box::new(sink)))
+            }
+            SinkConfig::Zerobus(cfg) => {
+                let sink = ZerobusSink::new(cfg, max_event_bytes).await?;
+                Ok(BuiltSink::Zerobus(Box::new(sink)))
+            }
             SinkConfig::Kafka(cfg) => {
                 let sink = KafkaSink::new(cfg)
                     .await
@@ -149,17 +439,26 @@ fn build(config: &SinkConfig) -> BoxFuture<'_, Result<BuiltSink, AppError>> {
                     ));
                 }
                 let mut children: Vec<BoxedSink> = Vec::with_capacity(cfg.sinks.len());
+                let mut child_metrics: Vec<SinkMetricsHandle> = Vec::with_capacity(cfg.sinks.len());
                 for (i, child_cfg) in cfg.sinks.iter().enumerate() {
                     // `usize::MAX`: a fan-out child is only ever reached through the
                     // parent binding's direct path, which has already enforced the
                     // limit. Enforcing it again per child would reject the same event
                     // twice and report the child's name for the parent's decision.
-                    let child = build_binding(child_cfg, usize::MAX).await.map_err(|e| {
-                        AppError::Other(format!("failed to build fan-out child sink [{i}]: {e}"))
-                    })?;
+                    let child = build_binding(child_cfg, max_event_bytes)
+                        .await
+                        .map_err(|e| {
+                            AppError::Other(format!(
+                                "failed to build fan-out child sink [{i}]: {e}"
+                            ))
+                        })?;
+                    child_metrics.push(child.metrics_handle());
                     children.push(BoxedSink::new(child));
                 }
-                Ok(BuiltSink::Fan(Box::new(FanOutSink::new(children))))
+                Ok(BuiltSink::Fan(
+                    Box::new(FanOutSink::new(children)),
+                    child_metrics,
+                ))
             }
         }
     })
@@ -181,6 +480,12 @@ pub struct SinkBinding {
     /// is never transmitted, so it rejected events that would have fitted and could not
     /// be calibrated against a broker's `max.message.bytes`.
     pub max_event_bytes: usize,
+    /// Where this binding publishes its extended counters so the scrape path can read
+    /// them after the binding disappears into a `BoxedSink`.
+    ///
+    /// See the module-level note on [`SinkMetricsHandle`] for why the router cannot ask
+    /// for them directly.
+    metrics: SinkMetricsHandle,
 }
 
 impl SinkBinding {
@@ -189,35 +494,39 @@ impl SinkBinding {
         self.transport.transaction_handle()
     }
 
+    /// A read handle onto this binding's extended counters.
+    ///
+    /// Must be taken before the binding is boxed into the router; afterwards the concrete
+    /// transport is unreachable.
+    pub fn metrics_handle(&self) -> SinkMetricsHandle {
+        self.metrics.clone()
+    }
+
+    /// Publish the transport's current counters to the handle.
+    ///
+    /// Called on flush, close and preflight rather than per event: the run loop samples
+    /// the registry at batch boundaries, and a batch ends with a flush, so every sample
+    /// it takes lands on a freshly published value. Publishing per event would put a
+    /// mutex and a ~450-byte copy on the hot path to gain accuracy nothing reads.
+    fn publish_metrics(&self) {
+        self.metrics.publish(self.transport.delivery_metrics());
+    }
+
     /// Encode and deliver a single event.
+    ///
+    /// Three cases, and they are now asked about by *capability* rather than derived from a
+    /// list of variant names — which is what the previous version's own comment said the
+    /// real fix was:
+    ///
+    /// * the transport takes pre-encoded bytes (Kafka, HTTP) — the codec runs here, and the
+    ///   limit measures exactly what goes on the wire;
+    /// * the transport produces the transmitted bytes itself *and* enforces the limit on
+    ///   them (Snowflake, whose NDJSON row is the JSON) — nothing is encoded here at all;
+    /// * the transport owns its own serialisation and cannot report a size (stdout, JSONL,
+    ///   Iceberg, fan-out) — the event's JSON is the honest approximation, and it costs an
+    ///   encode that is thrown away.
     pub async fn send_event(&mut self, event: &Event) -> Result<(), AppError> {
-        if matches!(
-            self.transport,
-            BuiltSink::Stdout(_)
-                | BuiltSink::FileJsonl(_)
-                | BuiltSink::Iceberg(_)
-                | BuiltSink::Fan(_)
-        ) {
-            // These transports serialise the event themselves — Iceberg needs the
-            // structured form for Parquet columns, and the file/stdout writers emit
-            // their own JSON — so there are no encoded bytes to measure at this layer.
-            // Measuring the event's JSON is the honest approximation: it is exactly
-            // what the file and stdout writers emit. The remaining double encode here
-            // is a consequence of `BuiltSink` dispatching on identity rather than
-            // capability; passing encoded bytes uniformly is the real fix.
-            enforce_size_limit(
-                serde_json::to_vec(event)
-                    .map_err(|e| {
-                        AppError::Other(format!("failed to serialize event for size check: {e}"))
-                    })?
-                    .len(),
-                self.max_event_bytes,
-            )?;
-            self.transport
-                .send_event_direct(event)
-                .await
-                .map_err(AppError::Runtime)
-        } else {
+        if self.transport.takes_encoded_bytes() {
             let output = self
                 .codec
                 .encode_async(event)
@@ -236,11 +545,27 @@ impl SinkBinding {
             // Exact: these are the bytes going on the wire, and measuring them costs
             // nothing because they already exist.
             enforce_size_limit(key.len() + value.len(), self.max_event_bytes)?;
-            self.transport
+            return self
+                .transport
                 .send_encoded(key, value)
                 .await
-                .map_err(AppError::Runtime)
+                .map_err(AppError::Runtime);
         }
+
+        if !self.transport.enforces_own_size_limit() {
+            enforce_size_limit(
+                serde_json::to_vec(event)
+                    .map_err(|e| {
+                        AppError::Other(format!("failed to serialize event for size check: {e}"))
+                    })?
+                    .len(),
+                self.max_event_bytes,
+            )?;
+        }
+        self.transport
+            .send_event_direct(event)
+            .await
+            .map_err(AppError::Runtime)
     }
 }
 
@@ -260,11 +585,17 @@ impl SinkAdapter for SinkBinding {
     }
 
     async fn flush(&mut self) -> rustcdc::core::Result<()> {
-        self.transport.flush().await
+        let result = self.transport.flush().await;
+        // Published even when the flush failed: a failed flush is precisely when the
+        // status-class counters this exports have just moved.
+        self.publish_metrics();
+        result
     }
 
     async fn close(&mut self) -> rustcdc::core::Result<()> {
-        self.transport.close().await
+        let result = self.transport.close().await;
+        self.publish_metrics();
+        result
     }
 
     fn delivery_guarantee(&self) -> rustcdc::sink::SinkDeliveryGuarantee {
@@ -300,10 +631,15 @@ impl SinkAdapter for SinkBinding {
     }
 
     async fn preflight_check(&mut self) -> rustcdc::core::Result<()> {
-        self.transport
+        let result = self
+            .transport
             .preflight_check()
             .await
-            .map_err(rustcdc::core::Error::from)
+            .map_err(rustcdc::core::Error::from);
+        // Seeds the handle before the first batch, so the run loop's first
+        // `delivery_before` sample is a real reading rather than a default.
+        self.publish_metrics();
+        result
     }
 
     fn is_closed(&self) -> bool {
@@ -345,12 +681,15 @@ pub fn build_binding(
         let codec = build_codec_from_sink_config(config)
             .await
             .map_err(|e| AppError::Other(format!("failed to build codec: {e}")))?;
-        let transport = build(config).await?;
-        Ok(SinkBinding {
+        let transport = build(config, max_event_bytes).await?;
+        let binding = SinkBinding {
             codec,
             transport,
             max_event_bytes,
-        })
+            metrics: SinkMetricsHandle::default(),
+        };
+        binding.publish_metrics();
+        Ok(binding)
     })
 }
 
@@ -372,7 +711,9 @@ impl BuiltSink {
         match self {
             BuiltSink::Kafka(sink) => sink.preflight_check().await,
             BuiltSink::Http(sink) => Box::pin(sink.preflight_check()).await,
-            BuiltSink::Fan(sink) => Box::pin(sink.preflight_check())
+            BuiltSink::Snowflake(sink) => Box::pin(sink.preflight()).await,
+            BuiltSink::Zerobus(sink) => Box::pin(sink.preflight()).await,
+            BuiltSink::Fan(sink, _) => Box::pin(sink.preflight_check())
                 .await
                 .map_err(AppError::Runtime),
             _ => Ok(()),
@@ -386,8 +727,24 @@ impl BuiltSink {
             BuiltSink::Http(_) => "http",
             BuiltSink::Kafka(_) => "kafka",
             BuiltSink::Iceberg(_) => "iceberg",
-            BuiltSink::Fan(_) => "fan_out",
+            BuiltSink::Snowflake(_) => "snowflake",
+            BuiltSink::Zerobus(_) => "zerobus",
+            BuiltSink::Fan(..) => "fan_out",
         }
+    }
+
+    /// Does this transport want the codec's output rather than the event?
+    pub fn takes_encoded_bytes(&self) -> bool {
+        matches!(self, BuiltSink::Kafka(_) | BuiltSink::Http(_))
+    }
+
+    /// Does this transport enforce `runtime.max_event_bytes` on the bytes it sends?
+    ///
+    /// True only where the transport *is* the encoder, so it can measure the real payload.
+    /// Everything else is measured here against the event's JSON, which for Avro or
+    /// Protobuf is a rendering that never leaves the process.
+    pub fn enforces_own_size_limit(&self) -> bool {
+        matches!(self, BuiltSink::Snowflake(_) | BuiltSink::Zerobus(_))
     }
 
     /// Deliver pre-encoded bytes to transport sinks (Kafka, HTTP).
@@ -407,7 +764,11 @@ impl BuiltSink {
             BuiltSink::Stdout(sink) => sink.send(event).await,
             BuiltSink::FileJsonl(sink) => sink.send(event).await,
             BuiltSink::Iceberg(sink) => sink.send(event).await,
-            BuiltSink::Fan(sink) => Box::pin(sink.send(event)).await,
+            // Snowflake takes the structured event: the pipe owns the column mapping, and
+            // the row goes on the wire as one NDJSON line.
+            BuiltSink::Snowflake(sink) => sink.append_event(event).await,
+            BuiltSink::Zerobus(sink) => sink.append_event(event).await,
+            BuiltSink::Fan(sink, _) => Box::pin(sink.send(event)).await,
             _ => Err(rustcdc::core::Error::StateError(
                 "this sink type requires pre-encoded bytes, not a raw event".to_string(),
             )),
@@ -421,7 +782,9 @@ impl BuiltSink {
             BuiltSink::Http(sink) => sink.flush().await,
             BuiltSink::Kafka(sink) => sink.flush().await,
             BuiltSink::Iceberg(sink) => sink.flush().await,
-            BuiltSink::Fan(sink) => Box::pin(sink.flush()).await,
+            BuiltSink::Snowflake(sink) => sink.flush_pending().await,
+            BuiltSink::Zerobus(sink) => sink.flush_pending().await,
+            BuiltSink::Fan(sink, _) => Box::pin(sink.flush()).await,
         }
     }
 
@@ -432,7 +795,9 @@ impl BuiltSink {
             BuiltSink::Http(sink) => sink.close().await,
             BuiltSink::Kafka(sink) => sink.close().await,
             BuiltSink::Iceberg(sink) => sink.close().await,
-            BuiltSink::Fan(sink) => Box::pin(sink.close()).await,
+            BuiltSink::Snowflake(sink) => sink.close().await,
+            BuiltSink::Zerobus(sink) => sink.close().await,
+            BuiltSink::Fan(sink, _) => Box::pin(sink.close()).await,
         }
     }
 
@@ -440,7 +805,9 @@ impl BuiltSink {
         match self {
             BuiltSink::FileJsonl(sink) => Some(sink.queue_depth()),
             BuiltSink::Http(sink) => Some(sink.pending_events()),
-            BuiltSink::Fan(sink) => sink.queue_depth(),
+            BuiltSink::Snowflake(sink) => Some(sink.pending_rows()),
+            BuiltSink::Zerobus(sink) => Some(sink.pending_records()),
+            BuiltSink::Fan(sink, _) => sink.queue_depth(),
             _ => None,
         }
     }
@@ -448,7 +815,9 @@ impl BuiltSink {
     pub fn flush_tick_interval(&self) -> Option<Duration> {
         match self {
             BuiltSink::Http(sink) => Some(sink.flush_tick_interval()),
-            BuiltSink::Fan(sink) => sink.flush_tick_interval(),
+            BuiltSink::Snowflake(sink) => Some(sink.flush_tick_interval()),
+            BuiltSink::Zerobus(sink) => Some(sink.flush_tick_interval()),
+            BuiltSink::Fan(sink, _) => sink.flush_tick_interval(),
             _ => None,
         }
     }
@@ -492,6 +861,14 @@ impl BuiltSink {
                     kafka_oauth_token_fetches_total: 0,
                     kafka_oauth_token_fetch_failures_total: 0,
                     kafka_oauth_token_expiry_epoch_ms: 0,
+                    snowflake_rows_appended_total: 0,
+                    snowflake_rows_skipped_on_resume_total: 0,
+                    snowflake_channel_reopens_total: 0,
+                    snowflake_commit_wait_ms_total: 0,
+                    snowflake_resume_scan_exhausted_total: 0,
+                    zerobus_records_ingested_total: 0,
+                    zerobus_ack_wait_ms_total: 0,
+                    zerobus_stream_opens_total: 0,
                 }
             }
             BuiltSink::Iceberg(sink) => SinkDeliveryMetrics {
@@ -502,6 +879,27 @@ impl BuiltSink {
                 iceberg_flush_lock_contention_ms_max: sink.flush_lock_contention_ms_max(),
                 ..SinkDeliveryMetrics::default()
             },
+            BuiltSink::Snowflake(sink) => {
+                let accounting = sink.accounting();
+                SinkDeliveryMetrics {
+                    snowflake_rows_appended_total: accounting.rows_appended,
+                    snowflake_rows_skipped_on_resume_total: accounting.rows_skipped_on_resume,
+                    snowflake_channel_reopens_total: accounting.channel_reopens,
+                    snowflake_commit_wait_ms_total: accounting.commit_wait_ms_total,
+                    snowflake_resume_scan_exhausted_total: accounting.resume_scan_exhausted,
+                    retries_total: accounting.retries,
+                    ..SinkDeliveryMetrics::default()
+                }
+            }
+            BuiltSink::Zerobus(sink) => {
+                let accounting = sink.accounting();
+                SinkDeliveryMetrics {
+                    zerobus_records_ingested_total: accounting.records_ingested,
+                    zerobus_ack_wait_ms_total: accounting.ack_wait_ms_total,
+                    zerobus_stream_opens_total: accounting.stream_opens,
+                    ..SinkDeliveryMetrics::default()
+                }
+            }
             BuiltSink::Kafka(sink) => {
                 let connection = sink.connection_metrics();
                 SinkDeliveryMetrics {
@@ -511,7 +909,16 @@ impl BuiltSink {
                     ..SinkDeliveryMetrics::default()
                 }
             }
-            BuiltSink::Fan(_) => SinkDeliveryMetrics::default(),
+            // Each child publishes on its own flush — `FanOutSinkAdapter` forwards
+            // `flush()` to every child, and each child is a `SinkBinding` — so merging
+            // the handles here reports the fan-out's real totals rather than zeros.
+            BuiltSink::Fan(_, child_metrics) => {
+                let mut total = SinkDeliveryMetrics::default();
+                for handle in child_metrics {
+                    total.merge(&handle.snapshot());
+                }
+                total
+            }
             _ => SinkDeliveryMetrics::default(),
         }
     }
@@ -523,14 +930,20 @@ impl BuiltSink {
             BuiltSink::Http(_) => SinkDeliveryGuarantee::AtLeastOnce,
             BuiltSink::Kafka(sink) => sink.delivery_guarantee(),
             BuiltSink::Iceberg(_) => SinkDeliveryGuarantee::AtLeastOnce,
-            BuiltSink::Fan(sink) => sink.delivery_guarantee(),
+            // The channel's committed offset token, plus a `flush` that waits for it, plus
+            // resume filtering — see `sink/snowflake.rs`.
+            BuiltSink::Snowflake(_) => SinkDeliveryGuarantee::EffectivelyOnce,
+            // Not `EffectivelyOnce`: Zerobus streams are ephemeral, so there is no durable
+            // offset to resume from. The ack rules out loss, not duplicates.
+            BuiltSink::Zerobus(_) => SinkDeliveryGuarantee::AtLeastOnce,
+            BuiltSink::Fan(sink, _) => sink.delivery_guarantee(),
         }
     }
 
     pub fn idempotent_delivery_capable(&self) -> bool {
         match self {
-            BuiltSink::Kafka(_) => true,
-            BuiltSink::Fan(sink) => sink.idempotent_delivery_capable(),
+            BuiltSink::Kafka(_) | BuiltSink::Snowflake(_) => true,
+            BuiltSink::Fan(sink, _) => sink.idempotent_delivery_capable(),
             _ => false,
         }
     }
@@ -538,7 +951,7 @@ impl BuiltSink {
     pub fn transactional_checkpoint_barrier_capable(&self) -> bool {
         match self {
             BuiltSink::Kafka(sink) => sink.transactional_checkpoint_barrier_capable(),
-            BuiltSink::Fan(sink) => sink.transactional_checkpoint_barrier_capable(),
+            BuiltSink::Fan(sink, _) => sink.transactional_checkpoint_barrier_capable(),
             _ => false,
         }
     }
@@ -559,7 +972,7 @@ impl BuiltSink {
     pub async fn begin_checkpoint_barrier(&mut self) -> rustcdc::core::Result<()> {
         match self {
             BuiltSink::Kafka(sink) => sink.begin_checkpoint_barrier().await,
-            BuiltSink::Fan(sink) => Box::pin(sink.begin_checkpoint_barrier()).await,
+            BuiltSink::Fan(sink, _) => Box::pin(sink.begin_checkpoint_barrier()).await,
             _ => Ok(()),
         }
     }
@@ -567,7 +980,7 @@ impl BuiltSink {
     pub async fn commit_checkpoint_barrier(&mut self) -> rustcdc::core::Result<()> {
         match self {
             BuiltSink::Kafka(sink) => sink.commit_checkpoint_barrier().await,
-            BuiltSink::Fan(sink) => Box::pin(sink.commit_checkpoint_barrier()).await,
+            BuiltSink::Fan(sink, _) => Box::pin(sink.commit_checkpoint_barrier()).await,
             _ => Ok(()),
         }
     }
@@ -575,7 +988,7 @@ impl BuiltSink {
     pub async fn abort_checkpoint_barrier(&mut self) -> rustcdc::core::Result<()> {
         match self {
             BuiltSink::Kafka(sink) => sink.abort_checkpoint_barrier().await,
-            BuiltSink::Fan(sink) => Box::pin(sink.abort_checkpoint_barrier()).await,
+            BuiltSink::Fan(sink, _) => Box::pin(sink.abort_checkpoint_barrier()).await,
             _ => Ok(()),
         }
     }
@@ -587,7 +1000,9 @@ impl BuiltSink {
             BuiltSink::Http(sink) => sink.is_closed(),
             BuiltSink::Kafka(sink) => sink.is_closed(),
             BuiltSink::Iceberg(sink) => sink.is_closed(),
-            BuiltSink::Fan(sink) => sink.is_closed(),
+            BuiltSink::Snowflake(sink) => sink.is_closed(),
+            BuiltSink::Zerobus(sink) => sink.is_closed(),
+            BuiltSink::Fan(sink, _) => sink.is_closed(),
         }
     }
 }

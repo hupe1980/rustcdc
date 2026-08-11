@@ -67,10 +67,10 @@ fn is_emitted(referenced: &str, emitted: &BTreeSet<String>) -> bool {
         return true;
     }
     for suffix in ["_bucket", "_sum", "_count", "_total"] {
-        if let Some(base) = referenced.strip_suffix(suffix) {
-            if emitted.contains(base) {
-                return true;
-            }
+        if let Some(base) = referenced.strip_suffix(suffix)
+            && emitted.contains(base)
+        {
+            return true;
         }
     }
     emitted

@@ -37,7 +37,7 @@
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rustcdc::core::{Event, Operation, SourceMetadata};
 use rustcdc_server::config::schema::{SinkConfig, TransformRuleConfig};
 use rustcdc_server::pipeline::transform::TransformPipeline;
@@ -188,7 +188,7 @@ fn bench_pipeline_batch(c: &mut Criterion) {
                                 .expect("sink binding");
                             let mut router = rustcdc_server::pipeline::router::single(binding);
 
-                            let stats = rustcdc_server::commands::run_batch::process_batch_events(
+                            let stats = rustcdc_server::runtime::batch::process_batch_events(
                                 &mut router,
                                 batch,
                                 transform,

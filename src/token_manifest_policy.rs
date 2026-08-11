@@ -301,13 +301,13 @@ fn validate_manifest_tokens(path: &Path, tokens: &[TokenManifestToken]) -> Resul
             }
         }
 
-        if let (Some(not_before), Some(expires_at)) = (token.not_before, token.expires_at) {
-            if expires_at <= not_before {
-                return Err(format!(
-                    "admin token manifest token '{}' has expires_at <= not_before",
-                    token.id
-                ));
-            }
+        if let (Some(not_before), Some(expires_at)) = (token.not_before, token.expires_at)
+            && expires_at <= not_before
+        {
+            return Err(format!(
+                "admin token manifest token '{}' has expires_at <= not_before",
+                token.id
+            ));
         }
     }
 

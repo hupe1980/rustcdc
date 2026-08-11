@@ -13,18 +13,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 use chrono::Utc;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
 use tokio::sync::RwLock;
 
-use super::auth::{file_modified_time, load_auth_tokens_from_manifest, AuthToken};
+use super::auth::{AuthToken, file_modified_time, load_auth_tokens_from_manifest};
 use super::tests::{auth_token_manifest, write_signed_manifest};
 use super::{
-    token_sha256_hex, AdminAbuseGuard, AdminScope, AdminState, AdminStateData, AuthSource,
-    AuthState, InstanceState,
+    AdminAbuseGuard, AdminScope, AdminState, AdminStateData, AuthSource, AuthState, InstanceState,
+    token_sha256_hex,
 };
 use crate::config::schema::AdminProbeAuthMode;
 
@@ -688,9 +688,11 @@ fn stale_manifest_policy_blocks_authorization() {
         audit_log_drop_counter: None,
     };
 
-    assert!(admin
-        .authorize_scope_token_id(&headers, AdminScope::Read)
-        .is_none());
+    assert!(
+        admin
+            .authorize_scope_token_id(&headers, AdminScope::Read)
+            .is_none()
+    );
 }
 
 #[test]

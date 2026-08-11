@@ -1,47 +1,31 @@
 //! Owner lease for network-shared state backends.
 //!
-//! # Why this exists
+//! Exactly one process may own a pipeline's state. The two filesystem-scoped mechanisms
+//! that enforce it elsewhere — the state-directory PID file and rustcdc's `OwnerLease`
+//! file — are both no-ops when the authoritative state lives on the network, as it does
+//! for `redis`, `postgresql` and `kafka_topic`: separate containers contend for neither.
+//! Without this lease two instances interleave checkpoint writes last-write-wins, and a
+//! lagging writer moves the durable position **backwards** — a silent replay on the next
+//! restart. A Kubernetes `Deployment` without `strategy: Recreate` surges to two pods on
+//! every rollout, so that is a per-deploy event, not a rare race.
 //!
-//! The whole design rests on exactly one process owning a pipeline's state, and until
-//! now that was enforced by two filesystem-scoped mechanisms:
+//! # What it guarantees
 //!
-//! * `StateDirLock` — a PID file in the local state directory. Two containers have
-//!   separate filesystems and separate PID namespaces, so both acquire it
-//!   unconditionally.
-//! * rustcdc's `OwnerLease` — `HOSTNAME:PID` in a lease *file*. It does refuse
-//!   cross-host conflicts, but only where the file itself is shared. For the OpenDAL
-//!   backends it guards a per-instance local mirror directory, which is never
-//!   contended, so it protects nothing.
+//! A second instance starting against a live lease refuses to run and names the owner. A
+//! crashed owner's lease expires after `LEASE_TTL`, so recovery needs no manual step. An
+//! owner partitioned long enough to lose its lease discovers this on its next renewal and
+//! fences *itself* rather than writing blind.
 //!
-//! For `redis`, `postgresql` and `kafka_topic` the authoritative state lives on the
-//! network and had no mutual exclusion at all: no lease, no fencing token, no CAS. Two
-//! instances interleaved checkpoint writes on a last-write-wins basis, and if the
-//! lagging one wrote last the durable position moved **backwards** — a silent replay on
-//! the next restart.
+//! # What it does not
 //!
-//! That is not a rare race. A Kubernetes `Deployment` without `strategy: Recreate`
-//! surges to two pods on every rollout, so it happened on every deploy.
-//!
-//! # What this guarantees, and what it does not
-//!
-//! **Does:** a second instance that starts while a live lease is held refuses to run,
-//! naming the current owner. A crashed owner's lease expires on its own after
-//! `LEASE_TTL`, so recovery needs no manual step. An owner that loses the store or is
-//! partitioned long enough for its lease to be stolen discovers this on its next
-//! renewal and fences *itself* rather than continuing to write blind.
-//!
-//! **Does not:** this is not a consensus lease. Acquisition is read-then-write, not
-//! compare-and-swap, because OpenDAL's Redis and PostgreSQL services do not expose a
-//! uniform CAS primitive. Two instances starting within the same read-write window can
-//! both observe a free slot and both proceed. That window is milliseconds against a
-//! previously unbounded exposure, and it does not cover the case this was built for —
-//! a rolling update, where the incumbent's lease is live and fresh.
-//!
-//! Anyone needing a hard guarantee should use a store with a real CAS (etcd, ZooKeeper,
-//! Consul) or rely on source-level exclusivity. Note that source exclusivity is uneven:
-//! a PostgreSQL replication slot admits one connection and MySQL rejects a duplicate
-//! `server_id`, but **SQL Server CDC capture tables are ordinary reads with no
-//! exclusivity whatsoever** — that connector has only this lease.
+//! This is not a consensus lease: acquisition is read-then-write, not compare-and-swap,
+//! because OpenDAL's Redis and PostgreSQL services expose no uniform CAS. Two instances
+//! starting inside the same millisecond-wide window can both see a free slot — which is
+//! not the rolling-update case this exists for, where the incumbent's lease is live.
+//! A hard guarantee needs a store with real CAS (etcd, ZooKeeper, Consul) or source-level
+//! exclusivity — and that is uneven: a PostgreSQL replication slot admits one connection
+//! and MySQL rejects a duplicate `server_id`, but **SQL Server CDC capture tables are
+//! ordinary reads with no exclusivity at all**, so that connector has only this lease.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -110,15 +94,66 @@ pub(crate) fn owner_id() -> String {
 }
 
 /// This process's host component, as it appears in [`owner_id`].
-pub(crate) fn owner_host() -> String {
-    hostname()
+///
+/// `None` when the host cannot be determined. Callers that compare hosts must treat that
+/// as "not comparable" rather than as a name — see [`HOST_UNKNOWN`].
+pub(crate) fn owner_host() -> Option<String> {
+    let host = hostname();
+    (host != HOST_UNKNOWN).then_some(host)
 }
 
+/// The placeholder written into a lease when the host is genuinely unknown.
+///
+/// It is a diagnostic string, never an identity: two machines that both fail to resolve a
+/// hostname would otherwise compare equal, and `is_dead_local_owner` would conclude that a
+/// remote owner's PID could be checked against the local process table.
+pub(crate) const HOST_UNKNOWN: &str = "unknown-host";
+
+/// Best-effort hostname, in descending order of trustworthiness.
+///
+/// `$HOSTNAME` alone was the previous implementation and is not enough. It is a *shell*
+/// variable: Docker and Kubernetes export it, but a unit started by systemd, a launchd
+/// job, or anything spawned outside an interactive shell does not, so every such host
+/// resolved to the same literal `"unknown-host"`. With a state directory on a shared
+/// volume that made two different machines indistinguishable, and `is_dead_local_owner`
+/// would then check a *remote* owner's PID against the local process table — a lease steal
+/// from a live writer, which is the exact failure this module exists to prevent.
 fn hostname() -> String {
+    fn non_empty(value: String) -> Option<String> {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
     std::env::var("HOSTNAME")
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "unknown-host".to_string())
+        .and_then(non_empty)
+        // Linux exposes the kernel's own view here; unlike the env var it cannot be
+        // stale or absent inside a namespace.
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .and_then(non_empty)
+        })
+        // The conventional file on Linux and most BSDs.
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .and_then(non_empty)
+        })
+        // macOS and the BSDs have neither of the above: the hostname lives in a sysctl,
+        // and without this every process on such a host resolves to `HOST_UNKNOWN`, which
+        // disables the same-host PID-liveness shortcut in `is_dead_local_owner` — so a
+        // crashed owner's lease can only ever be reclaimed by waiting out the full TTL.
+        // `unsafe_code` is denied here, so this reads the value through `hostname(1)`
+        // rather than `gethostname(2)`. It runs once, at startup.
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| non_empty(String::from_utf8_lossy(&out.stdout).into_owned()))
+        })
+        .unwrap_or_else(|| HOST_UNKNOWN.to_string())
 }
 
 pub(crate) fn now_unix_ms() -> u64 {
@@ -192,6 +227,53 @@ mod tests {
             "two acquisitions in one process must still be distinguishable; a recycled \
              PID on the same host would otherwise look like the previous owner"
         );
+    }
+
+    /// `$HOSTNAME` is a shell variable, not a process one.
+    ///
+    /// Docker and Kubernetes export it; systemd units, launchd jobs and anything else
+    /// started outside an interactive shell do not. Reading only the env var makes every
+    /// such host answer the literal `"unknown-host"` — so two machines sharing a state
+    /// volume compare equal and the same-host PID-liveness shortcut in
+    /// `is_dead_local_owner` becomes a lease steal from a live writer, while a host that
+    /// resolves to the placeholder can never reclaim a crashed owner's lease early.
+    ///
+    /// The bar is **any** source that can name this host, not only the Linux files: an
+    /// earlier version of this test checked `/proc/sys/kernel/hostname` and `/etc/hostname`
+    /// alone, so on macOS — which has neither — it passed while resolution was in fact
+    /// falling through to the placeholder on every run.
+    #[test]
+    fn the_hostname_survives_an_environment_that_does_not_export_hostname() {
+        // Not `set_var`: that is process-global and would race sibling tests. The fallback
+        // chain is exercised directly instead.
+        let resolved = super::hostname();
+        let nameable = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+            .ok()
+            .or_else(|| {
+                std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        if nameable.is_some() {
+            assert_ne!(
+                resolved, HOST_UNKNOWN,
+                "a host that can name itself by any means must never resolve to the \
+                 placeholder, whatever the environment looks like"
+            );
+        }
+
+        // And the placeholder is never handed out as an identity.
+        if resolved == HOST_UNKNOWN {
+            assert!(owner_host().is_none());
+        } else {
+            assert_eq!(owner_host().as_deref(), Some(resolved.as_str()));
+        }
     }
 
     #[test]

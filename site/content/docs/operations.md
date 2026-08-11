@@ -231,7 +231,9 @@ rustcdc handles `SIGTERM` and `SIGINT` gracefully:
 1. Stops accepting new events from the source
 2. Flushes the current in-flight batch to the sink
 3. Advances the checkpoint
-4. Exits with code 0
+4. Releases the owner lease, so a replacement starts immediately instead of waiting
+   out the lease TTL
+5. Exits with code 0
 
 **Kubernetes `terminationGracePeriodSeconds`** must be at least as long as
 `runtime.sink_flush_timeout_ms` (default: 60 s) plus headroom:
@@ -831,6 +833,28 @@ ca_file = "/etc/rustcdc/tls/ca.pem"
 metrics_rate_limit_rps   = 10
 metrics_rate_limit_burst = 20
 ```
+
+**Only name a proxy in `trusted_proxy_ips` if the admin listener is genuinely behind it.**
+That list is what enables `X-Forwarded-For` parsing; while it is empty (the default) no
+request header can influence the rate-limit key at all. When it is populated, the header is
+read right to left past known proxies — see
+[Admin API](@/docs/configuration.md#7-admin-api-admin) in the configuration reference for
+why the direction matters.
+
+### Sink delivery metrics
+
+The `rustcdc_sink_*` and `rustcdc_iceberg_*` families report the transport's own view of
+delivery — HTTP status classes, batch-size and retry-delay histograms, pending bytes,
+Iceberg orphaned files and flush-lock contention, Kafka OAUTHBEARER token health. They are
+sampled once per batch from the sink bindings directly, not through the routing layer,
+because the router's generic adapter interface has room for four counters and these are
+thirty. With `[[pipeline.routes]]` configured they are the **sum across every route**, so a
+per-sink breakdown needs one process per sink.
+
+Four of these back shipped alert rules — `CDCIcebergOrphanedFiles`,
+`RUSTCDCHttpBatchOldestEventAgeHigh`, `RUSTCDCKafkaOAuthTokenFetchFailing` and
+`RUSTCDCKafkaOAuthTokenNearExpiry` — so a dashboard showing them flat at zero under real
+traffic is a bug report, not a healthy pipeline.
 
 ### Token rotation
 

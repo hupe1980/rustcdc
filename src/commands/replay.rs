@@ -10,7 +10,7 @@ use crate::{
 };
 use rustcdc::sink::SinkAdapter as _;
 
-use super::run_batch;
+use crate::runtime::batch;
 
 pub async fn execute(args: ReplayArgs, config_path: Option<&Path>) -> Result<(), AppError> {
     // Build the sink from config (or fall back to stdout if no config given).
@@ -80,10 +80,9 @@ pub async fn execute(args: ReplayArgs, config_path: Option<&Path>) -> Result<(),
 
     // Fail fast if the parity mode is incompatible with the delivery contract
     // and this sink's capabilities.
-    run_batch::validate_parity_contract(args.checkpoint_parity_mode, &sink, delivery_contract)?;
+    batch::validate_parity_contract(args.checkpoint_parity_mode, &sink, delivery_contract)?;
 
-    let checkpoint_parity_plan =
-        run_batch::checkpoint_parity_plan(args.checkpoint_parity_mode, &sink);
+    let checkpoint_parity_plan = batch::checkpoint_parity_plan(args.checkpoint_parity_mode, &sink);
     let transform_pipeline =
         transform::TransformPipeline::from_config(transform_runtime, transform_rules)?;
 
@@ -120,15 +119,15 @@ pub async fn execute(args: ReplayArgs, config_path: Option<&Path>) -> Result<(),
         ))
     })?;
 
-    if let Some(max_file_bytes) = args.max_file_bytes {
-        if metadata.len() > max_file_bytes {
-            return Err(AppError::Other(format!(
-                "replay file {} is {} bytes and exceeds --max-file-bytes {}",
-                args.event_file.display(),
-                metadata.len(),
-                max_file_bytes
-            )));
-        }
+    if let Some(max_file_bytes) = args.max_file_bytes
+        && metadata.len() > max_file_bytes
+    {
+        return Err(AppError::Other(format!(
+            "replay file {} is {} bytes and exceeds --max-file-bytes {}",
+            args.event_file.display(),
+            metadata.len(),
+            max_file_bytes
+        )));
     }
 
     let file = std::fs::File::open(&args.event_file).map_err(|e| {
@@ -191,7 +190,7 @@ pub async fn execute(args: ReplayArgs, config_path: Option<&Path>) -> Result<(),
             continue;
         }
 
-        let batch_stats = run_batch::process_batch_events_with_optional_checkpoint_barrier(
+        let batch_stats = batch::process_batch_events_with_optional_checkpoint_barrier(
             &mut sink,
             events,
             &transform_pipeline,
@@ -357,7 +356,7 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     fn test_suffix() -> String {
         format!(

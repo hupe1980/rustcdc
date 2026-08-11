@@ -156,20 +156,21 @@ skip = [
     { name = "logos-codegen" },
     { name = "logos-derive" },
     { name = "wasmparser" },
+    # petgraph / fixedbitset: wasm-compose (a wasmtime 47 tooling crate) pins petgraph
+    # 0.6, which brings fixedbitset 0.4; the rest of the tree is on petgraph 0.8. Graph
+    # data structures used at module-composition time only.
+    { name = "petgraph" },
+    { name = "fixedbitset" },
     # unicode-width: clap 4 uses 0.2; older diagnostics crates in the wasmtime tree
     # use 0.1. Display-width tables only.
     { name = "unicode-width" },
-    # `glue` feature only (off by default; on in the published image). The AWS SDK's
-    # generated service crates still carry the hyper 0.14 / http 0.2 generation, while
-    # aws-config and everything else here are on hyper 1 / http 1. Both stacks are
-    # rustls-only — `aws-sdk-glue` and `aws-config` are pulled with
-    # `default-features = false, features = ["rustls"]`, so no native-tls path exists.
-    # Resolves when the AWS SDK finishes its hyper 1 migration.
-    { name = "h2" },
+    # http / http-body: the AWS SDK's generated service crates still carry the http 0.2
+    # generation; aws-config and everything else here are on http 1. Type definitions
+    # only — the hyper 0.14 half of this diamond went away when the AWS crates stopped
+    # being pulled with `features = ["rustls"]`, which is `legacy-rustls-ring`.
+    # Resolves when the AWS SDK finishes its migration.
     { name = "http" },
     { name = "http-body" },
-    { name = "hyper" },
-    { name = "hyper-rustls" },
     # Crypto / TLS version diamonds.
     # Root causes (re-verified against the rustcdc 0.8 / krafka 0.15 / iceberg 0.10
     # graph — `cargo tree -i <crate>@<version> --target all -e all`):

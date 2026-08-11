@@ -277,7 +277,7 @@ fn admin_http_client(
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_http_client, AdminTlsClientConfig};
+    use super::{AdminTlsClientConfig, admin_http_client};
     use crate::cli::AdminTlsClientArgs;
 
     #[test]

@@ -10,7 +10,7 @@ use crate::{
 };
 use rustcdc::sink::SinkAdapter;
 
-use super::run_batch;
+use crate::runtime::batch;
 
 pub async fn execute(args: DryRunArgs, config_path: Option<&Path>) -> Result<(), AppError> {
     let config_path = config_path.ok_or(crate::error::ConfigError::NoConfigFile)?;
@@ -28,13 +28,9 @@ async fn dry_run_pipeline(
 
     // Fail fast if the requested parity mode is incompatible with the delivery
     // contract and this sink's capabilities.
-    run_batch::validate_parity_contract(
-        checkpoint_parity_mode,
-        &sink,
-        app_config.delivery_contract,
-    )?;
+    batch::validate_parity_contract(checkpoint_parity_mode, &sink, app_config.delivery_contract)?;
 
-    let checkpoint_parity_plan = run_batch::checkpoint_parity_plan(checkpoint_parity_mode, &sink);
+    let checkpoint_parity_plan = batch::checkpoint_parity_plan(checkpoint_parity_mode, &sink);
     let transform_pipeline = transform::TransformPipeline::from_config(
         app_config.pipeline.transform_runtime.clone(),
         app_config.pipeline.transforms.clone(),
@@ -42,7 +38,7 @@ async fn dry_run_pipeline(
 
     tracing::info!(event_limit, "dry-run starting (synthetic events)");
 
-    let stats = run_batch::process_batch_events_with_optional_checkpoint_barrier(
+    let stats = batch::process_batch_events_with_optional_checkpoint_barrier(
         &mut sink,
         (0..event_limit).map(synthetic_event),
         &transform_pipeline,

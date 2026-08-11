@@ -22,14 +22,14 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 | | |
 |---|---|
 | 🚀 **Zero-copy streaming** | Low-latency WAL/binlog tailing with back-pressure across all sources |
-| 🔌 **Four sources, five sinks** | Postgres · MySQL · MariaDB · SQL Server → stdout · JSONL · HTTP · Kafka · Iceberg. [Not all are equally proven](#connector-maturity) — see below |
+| 🔌 **Four sources, seven sinks** | Postgres · MySQL · MariaDB · SQL Server → stdout · JSONL · HTTP · Kafka · Iceberg · Snowflake · **Databricks**. [Not all are equally proven](#connector-maturity) — see below |
 | 📐 **Nine wire formats** | JSON · CloudEvents 1.0 · Avro · Protobuf, plus Confluent framing (Avro / JSON Schema / Protobuf) against Confluent **or** Apicurio registries, and AWS Glue framing |
 | 🌊 **Non-blocking backfill** | DBLog watermark incremental snapshots interleave with the live stream and resume mid-chunk after a restart — no held replication slot, no re-read from row zero |
 | 🧩 **Transform pipeline** | Native rules — masking (redact / HMAC / AES-GCM), field mapping, transactional outbox, routing — plus sandboxed WASM modules in any language. A rule that never matches is a metric, not a silent no-op |
 | 📦 **Pluggable state** | Checkpoint anywhere: local FS · Kafka topic · Redis · PostgreSQL |
-| ☠️ **Sink-agnostic dead-letter queue** | Permanently undeliverable events are quarantined to a file or Kafka topic with their source offset and cause, so a poison record cannot crash-loop the pipeline. Opt-in, because advancing past an undelivered event is data loss and should be a decision |
+| ☠️ **Sink-agnostic dead-letter queue** | Permanently undeliverable events are quarantined to a file, a Kafka topic or **Amazon SQS** with their source offset and cause, so a poison record cannot crash-loop the pipeline. SQS brings redrive-to-source and broker-level age alarms; it is offered as a DLQ and deliberately *not* as a sink, [with the reasoning written down](https://hupe1980.github.io/rustcdc-server/docs/configuration/). Opt-in, because advancing past an undelivered event is data loss and should be a decision |
 | 🧮 **Failures classified on two axes** | Permanent and *this record's fault* (`MessageTooLarge`) is quarantined; permanent and *environmental* (a revoked ACL) halts the pipeline instead of draining the change stream into the DLQ one event at a time; transient is retried. Conflating the first two is how a dead-letter queue becomes the data loss it exists to prevent |
-| 🎯 **End-to-end exactly-once** | `effectively_once` writes the checkpoint *inside* the sink's Kafka transaction, so the data and the position that describes it commit together — there is no crash window in which one survives without the other. Plus `at_least_once`, and an optional `preserve_transactions` boundary so a sink never commits half a source transaction |
+| 🎯 **End-to-end exactly-once, two ways** | `effectively_once` writes the checkpoint *inside* the sink's Kafka transaction, so the data and the position commit together. The **Snowflake** sink reaches the same guarantee with no Kafka at all: a Snowpipe Streaming channel's offset token is a destination-side record of what is durable, and `flush` does not return until it has advanced. Plus `at_least_once`, and an optional `preserve_transactions` boundary so a sink never commits half a source transaction |
 | 🔭 **First-class observability** | Prometheus `/metrics` + OTLP traces & metrics (gRPC/HTTP), a one-hot runtime health verdict (`healthy · idle · stalled · not_running`) that distinguishes a quiet database from a dead socket, and a data-loss tripwire counter |
 | 🧬 **Partial-image safety** | PostgreSQL unchanged-TOAST holes are tracked per image (`unavailable_columns` / `before_unavailable_columns`) and survive transforms, sinks, and the Iceberg schema — absent is never conflated with `NULL` |
 | 🔒 **Security by default** | Kafka SASL (PLAIN · SCRAM · OAUTHBEARER with a built-in OIDC provider · AWS MSK IAM), mTLS with hot certificate reload, Ed25519-signed audit trail, token-manifest auth, per-IP rate limiting, IP pseudonymisation (GDPR) |
@@ -42,6 +42,8 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 Not every connector carries the same evidence, and the difference is worth stating rather
 than leaving for you to discover:
 
+**Sources**
+
 | Connector | End-to-end tested in CI | Against |
 |---|---|---|
 | PostgreSQL | ✅ | A real server, both WAL transports, resume, TLS enforcement, on-demand snapshots, row filters |
@@ -49,12 +51,28 @@ than leaving for you to discover:
 | MariaDB | ⚠️ unit-tested only | Shares the MySQL binlog connector; no container suite of its own yet |
 | SQL Server | ⚠️ unit-tested only | No container suite yet |
 
-Both container suites manage their own database, so a local run and CI execute the same
-command against the same fixture, and a test asserts that CI still runs every suite that
-exists — an env-gated test nobody runs reports success, which is worse than no test.
+**Sinks**
 
-The gap is closing in that order. Until it does, this table is the honest answer to "how
-well is this exercised?"
+| Sink | End-to-end tested in CI | Against |
+|---|---|---|
+| Kafka | ✅ | **Apache Kafka and Redpanda**, both — ordering through the real router, keyless partitioning, delivery counters |
+| stdout · JSONL | ✅ | Covered by the delivery-contract suite, which crash-injects |
+| HTTP | ⚠️ unit-tested only | Status-class and retry behaviour against a refused socket; no container suite yet |
+| Iceberg | ⚠️ unit-tested only | REST-catalog tests are env-gated on an external catalog. Supports Iceberg REST **and** AWS S3 Tables |
+| Snowflake | ⚠️ contract-tested | The commit wait, stale-sequencer recovery, resume filtering and NDJSON framing are asserted against a **local fake** of the Snowpipe Streaming API on every build. No account-backed suite yet |
+| Databricks (Zerobus) | ⚠️ contract-tested | The durability wait, failure path, JSON framing and advertised contract are asserted against an in-process fake built from the SDK's **own generated gRPC server trait**, so a contract change stops it compiling. No workspace-backed suite yet |
+
+Every container suite manages its own broker or database, so a local run and CI execute the
+same command against the same fixture, and a test asserts that CI still runs every suite
+that exists — an env-gated test nobody runs reports success, which is worse than no test.
+
+**Two brokers, not one.** Redpanda is an independent reimplementation of the Kafka wire
+protocol, so a green run against one says nothing about the other — Apache Kafka propagates
+new-topic metadata asynchronously and elects a group coordinator lazily, and Redpanda does
+neither.
+
+The gap is closing in the order above. Until it does, these tables are the honest answer to
+"how well is this exercised?"
 
 ---
 
@@ -73,6 +91,7 @@ well is this exercised?"
 | [🔌 PostgreSQL connector](https://hupe1980.github.io/rustcdc-server/docs/connectors/postgres/) | WAL, replication slots, cloud databases |
 | [🔌 MySQL / MariaDB connector](https://hupe1980.github.io/rustcdc-server/docs/connectors/mysql/) | Binlog, GTID, schema history |
 | [🔌 SQL Server connector](https://hupe1980.github.io/rustcdc-server/docs/connectors/sqlserver/) | CDC change tables, Always On AG |
+| [🧪 How defects are prevented](https://hupe1980.github.io/rustcdc-server/docs/engineering/) | The structural guards in the test suite — what each caught, and where each is blind |
 
 The site is built with [Zola](https://www.getzola.org) from `site/`; edit the Markdown
 under `site/content/` and open a pull request.
@@ -469,7 +488,7 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 - **`GET /config`** — the configuration this instance is *actually* running, after env-var layering and migration, with three independent redaction rules: enumerated paths, secret-looking key names (separator-insensitive, so `x-api-key` matches), and a value-driven URL rule that strips userinfo *and* secret-named query parameters under any key. Held by a property test that generates names rather than listing them
 - **Control-plane panic guard** — a panic in any admin handler becomes a logged `500`, not a bare connection reset; the payload never reaches the caller
 - **TLS everywhere** — admin API and all outbound connections use rustls (no OpenSSL). A TLS-configured source is TLS on *every* connection, including the replication-slot lag sampler; a server with `ssl = off` fails the connection rather than silently downgrading it
-- **`#![deny(unsafe_code)]`** — enforced workspace-wide
+- **No `unsafe` in the shipped binary** — `src/main.rs` carries `#![forbid(unsafe_code)]`, which no inner `#[allow]` can override. The library is `deny` with exactly one allowlisted site (`test_env`, for the `std::env::set_var` a few tests need), held to that one entry by [an architecture guard](https://hupe1980.github.io/rustcdc-server/docs/engineering/). This line previously claimed the lint was "enforced workspace-wide" while it was applied to nothing
 
 ---
 
@@ -486,8 +505,7 @@ cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 
 # Audit licenses and duplicate dependencies (--all-features matches CI and the
-# published image; without it the `glue` tree is absent and the AWS SDK's
-# hyper-0.14 skips are reported as unnecessary)
+# published image; a narrower run reports the duplicate skips as unnecessary)
 cargo deny check --all-features
 
 # Throughput (real batch path; saves/compares a criterion baseline)

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -9,8 +9,8 @@ use rustcdc::core::{Error as RtError, Offset};
 
 use crate::error::AppError;
 
-use crate::state::remote_lease::{self, LeaseRecord, LEASE_HEARTBEAT, LEASE_TTL};
 use crate::state::CheckpointAgeSource;
+use crate::state::remote_lease::{self, LEASE_HEARTBEAT, LEASE_TTL, LeaseRecord};
 
 /// The owner lease file, beside the checkpoint it protects.
 const OWNER_LEASE_FILE: &str = "owner_lease.json";
@@ -65,15 +65,16 @@ impl OwnedStateDir {
     fn renew(&self) -> Result<(), AppError> {
         let now_ms = remote_lease::now_unix_ms();
 
-        if let Some(existing) = read_lease(&self.path)? {
-            if existing.owner != self.owner && existing.is_live(now_ms, LEASE_TTL) {
-                return Err(AppError::Other(format!(
-                    "local_fs state lease was taken by '{}' while this process held it \
+        if let Some(existing) = read_lease(&self.path)?
+            && existing.owner != self.owner
+            && existing.is_live(now_ms, LEASE_TTL)
+        {
+            return Err(AppError::Other(format!(
+                "local_fs state lease was taken by '{}' while this process held it \
                      (ours: '{}', epoch {}). This instance has been fenced out and will \
                      stop rather than write checkpoints alongside the new owner.",
-                    existing.owner, self.owner, self.epoch,
-                )));
-            }
+                existing.owner, self.owner, self.epoch,
+            )));
         }
 
         write_lease(
@@ -111,15 +112,15 @@ impl OwnedStateDir {
             Err(_) => return,
             _ => {}
         }
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    error = %error,
-                    path = %self.path.display(),
-                    "could not release the local_fs state lease; a successor will wait for \
-                     it to expire"
-                );
-            }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                error = %error,
+                path = %self.path.display(),
+                "could not release the local_fs state lease; a successor will wait for \
+                 it to expire"
+            );
         }
     }
 }
@@ -134,7 +135,15 @@ fn is_dead_local_owner(record: &LeaseRecord) -> bool {
     let (Some(host), Some(pid), Some(_nonce)) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    if host != remote_lease::owner_host() {
+    // `None` means this process could not determine its own hostname. A PID is only
+    // checkable against the local process table when we know the lease was written on
+    // *this* machine, and "both sides failed to resolve a name" is not that knowledge —
+    // treating it as a match would let a host with a shared state volume steal a lease
+    // from a live writer on another host.
+    let Some(local_host) = remote_lease::owner_host() else {
+        return false;
+    };
+    if host != local_host {
         return false;
     }
     let Ok(pid) = pid.parse::<u32>() else {
@@ -375,12 +384,11 @@ fn newest_artifact_modified_at(
         }
     }
 
-    if let Ok(metadata) = std::fs::metadata(schema_history_path) {
-        if let Ok(modified) = metadata.modified() {
-            if modified > newest {
-                newest = modified;
-            }
-        }
+    if let Ok(metadata) = std::fs::metadata(schema_history_path)
+        && let Ok(modified) = metadata.modified()
+        && modified > newest
+    {
+        newest = modified;
     }
 
     if newest == SystemTime::UNIX_EPOCH {
@@ -410,6 +418,17 @@ mod tests {
 
 #[cfg(test)]
 mod lease_tests {
+
+    /// This host's name as `is_dead_local_owner` will compare it.
+    ///
+    /// The tests that seed a lease "from this host" need the same answer the production
+    /// code gets. On a machine where the name cannot be resolved at all the same-host
+    /// liveness shortcut is deliberately disabled, so those tests have nothing to assert
+    /// and skip — the TTL path is covered separately by
+    /// `a_lease_from_another_host_is_judged_by_the_ttl_alone`.
+    fn this_host() -> Option<String> {
+        remote_lease::owner_host()
+    }
     use super::*;
     use rustcdc::checkpoint::PostgresOffset;
 
@@ -556,6 +575,9 @@ mod lease_tests {
     /// `is_dead_local_owner` arm from `acquire_state_dir` fails this test.
     #[tokio::test]
     async fn a_crashed_owner_on_this_host_does_not_block_a_restart() {
+        let Some(host) = this_host() else {
+            return;
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(OWNER_LEASE_FILE);
 
@@ -563,7 +585,7 @@ mod lease_tests {
         write_lease(
             &path,
             &LeaseRecord {
-                owner: format!("{}:0:00000000", remote_lease::owner_host()),
+                owner: format!("{host}:0:00000000"),
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 3,
             },
@@ -581,17 +603,16 @@ mod lease_tests {
     /// process. Our own PID is the sharpest case: it is unambiguously alive.
     #[tokio::test]
     async fn a_live_owner_on_this_host_is_still_refused() {
+        let Some(host) = this_host() else {
+            return;
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(OWNER_LEASE_FILE);
 
         write_lease(
             &path,
             &LeaseRecord {
-                owner: format!(
-                    "{}:{}:00000000",
-                    remote_lease::owner_host(),
-                    std::process::id()
-                ),
+                owner: format!("{host}:{}:00000000", std::process::id()),
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 1,
             },

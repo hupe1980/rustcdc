@@ -128,27 +128,48 @@ impl AdminAbuseGuard {
             return format!("peer:{peer_ip}");
         }
 
+        // `X-Forwarded-For` is read **right to left**, skipping addresses that belong to
+        // trusted proxies, and the first remaining address is the client.
+        //
+        // Reading it left to right — the previous behaviour — hands the rate limiter to
+        // the caller. The header is append-only: a proxy adds the address it saw to the
+        // *end*, so everything to the left of that is whatever the client sent. A client
+        // that sets `X-Forwarded-For: 203.0.113.<random>` on every request gets a fresh
+        // bucket per request and is never limited at all, which is the entire protection
+        // this guard provides for `/status`, `/metrics`, `/readyz` and `/openapi.json`.
+        //
+        // Only the rightmost non-proxy entry is attested by something we trust. This is
+        // the same rule as nginx's `real_ip_recursive on` and the Forwarded-header
+        // guidance in RFC 7239 §7.1.
         if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            for candidate in forwarded.split(',').map(str::trim) {
-                if let Ok(ip) = candidate.parse::<IpAddr>() {
-                    // Only accept globally-routable unicast addresses from
-                    // X-Forwarded-For.  Loopback, link-local, private, and
-                    // unspecified addresses can be spoofed by an attacker
-                    // behind a trusted proxy to exhaust unrelated rate-limit
-                    // buckets or claim a "trusted" identity.
-                    if is_globally_routable(ip) {
-                        return format!("xff:{ip}");
-                    }
+            for candidate in forwarded.rsplit(',').map(str::trim) {
+                let Ok(ip) = candidate.parse::<IpAddr>() else {
+                    // An unparseable hop is not evidence of anything, and skipping past it
+                    // would let a client inject `garbage, 203.0.113.9` to move the cursor.
+                    // Stop and fall back to the peer address.
+                    break;
+                };
+                if self.trusted_proxy_ips.contains(&ip) {
+                    // Our own infrastructure, appended by the hop in front of it. Keep
+                    // walking left.
+                    continue;
                 }
+                // Only accept globally-routable unicast addresses. Loopback, link-local,
+                // private and unspecified addresses can be spoofed by an attacker behind a
+                // trusted proxy to exhaust unrelated rate-limit buckets or claim a
+                // "trusted" identity.
+                if is_globally_routable(ip) {
+                    return format!("xff:{ip}");
+                }
+                break;
             }
         }
 
-        if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-            if let Ok(ip) = real_ip.trim().parse::<IpAddr>() {
-                if is_globally_routable(ip) {
-                    return format!("xri:{ip}");
-                }
-            }
+        if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+            && let Ok(ip) = real_ip.trim().parse::<IpAddr>()
+            && is_globally_routable(ip)
+        {
+            return format!("xri:{ip}");
         }
 
         format!("proxy:{peer_ip}")
@@ -170,6 +191,10 @@ fn is_globally_routable(ip: IpAddr) -> bool {
                 && !v4.is_broadcast()
                 && !v4.is_documentation()
                 && !v4.is_multicast()
+                // Carrier-grade NAT, 100.64.0.0/10 (RFC 6598). Shared between subscribers
+                // and not globally unique, so it identifies a carrier rather than a
+                // client — and `Ipv4Addr::is_private` does not cover it.
+                && !(v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
         }
         IpAddr::V6(v6) => {
             !v6.is_loopback()
@@ -179,11 +204,12 @@ fn is_globally_routable(ip: IpAddr) -> bool {
                 && (v6.segments()[0] & 0xffc0) != 0xfe80
                 // Unique local: fc00::/7 (RFC 4193)
                 && (v6.segments()[0] & 0xfe00) != 0xfc00
-                // IPv4-mapped: ::ffff:0:0/96
-                && !v6.is_loopback()
-                && v6.to_ipv4_mapped().is_none_or(|v4| {
-                    !v4.is_private() && !v4.is_loopback() && !v4.is_link_local()
-                })
+                // An IPv4-mapped address (::ffff:0:0/96) is an IPv4 address wearing a
+                // different notation; judge it by the IPv4 rules above rather than
+                // letting `::ffff:127.0.0.1` through as "not IPv6-loopback".
+                && v6
+                    .to_ipv4_mapped()
+                    .is_none_or(|v4| is_globally_routable(IpAddr::V4(v4)))
         }
     }
 }
@@ -336,6 +362,93 @@ mod tests {
             guard.readyz_limiter.clients.len(),
             RATE_LIMIT_MAX_CLIENT_KEYS
         );
+    }
+
+    fn proxied_guard(proxies: &[&str]) -> AdminAbuseGuard {
+        AdminAbuseGuard {
+            readyz_limiter: EndpointRateLimiter::new(1, 1),
+            status_limiter: EndpointRateLimiter::new(1, 1),
+            metrics_limiter: EndpointRateLimiter::new(1, 1),
+            trusted_proxy_ips: proxies.iter().filter_map(|p| p.parse().ok()).collect(),
+        }
+    }
+
+    fn xff(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", value.parse().expect("header value"));
+        headers
+    }
+
+    fn from_proxy(proxy: &str) -> Option<SocketAddr> {
+        Some(SocketAddr::new(proxy.parse().expect("proxy ip"), 4444))
+    }
+
+    /// The defect this rule exists for.
+    ///
+    /// `X-Forwarded-For` is append-only: the trusted proxy adds the address it observed to
+    /// the **end**, and everything to its left is whatever the client typed. Reading the
+    /// header left to right therefore keyed the rate limiter on an attacker-chosen string,
+    /// so rotating the value gave a fresh token bucket on every request and the limiter
+    /// stopped limiting.
+    #[test]
+    fn a_client_supplied_forwarded_for_prefix_cannot_choose_the_rate_limit_key() {
+        let guard = proxied_guard(&["10.0.0.1"]);
+
+        let spoofed = guard.client_key(&xff("8.8.8.8, 9.9.9.9"), from_proxy("10.0.0.1"));
+        assert_eq!(
+            spoofed, "xff:9.9.9.9",
+            "the rightmost non-proxy hop is the one the trusted proxy attested"
+        );
+
+        // Rotating the prefix must not move the key — that rotation was the bypass.
+        let rotated = guard.client_key(&xff("8.8.4.4, 9.9.9.9"), from_proxy("10.0.0.1"));
+        assert_eq!(spoofed, rotated);
+    }
+
+    /// A chain of trusted proxies is walked through, not stopped at.
+    #[test]
+    fn trusted_proxy_hops_are_skipped_to_reach_the_real_client() {
+        let guard = proxied_guard(&["10.0.0.1", "10.0.0.2"]);
+        let key = guard.client_key(&xff("9.9.9.9, 10.0.0.2"), from_proxy("10.0.0.1"));
+        assert_eq!(key, "xff:9.9.9.9");
+    }
+
+    /// A private or unroutable rightmost hop is not a usable identity, and must not cause
+    /// the walk to continue leftwards into client-controlled text.
+    #[test]
+    fn an_unroutable_rightmost_hop_falls_back_to_the_peer_address() {
+        let guard = proxied_guard(&["10.0.0.1"]);
+        let key = guard.client_key(&xff("9.9.9.9, 192.168.5.5"), from_proxy("10.0.0.1"));
+        assert_eq!(key, "proxy:10.0.0.1");
+    }
+
+    /// Injected garbage must not act as a cursor that skips past the attested hop.
+    #[test]
+    fn an_unparseable_hop_stops_the_walk() {
+        let guard = proxied_guard(&["10.0.0.1"]);
+        let key = guard.client_key(&xff("9.9.9.9, not-an-ip"), from_proxy("10.0.0.1"));
+        assert_eq!(key, "proxy:10.0.0.1");
+    }
+
+    /// An untrusted peer's header is never read at all.
+    #[test]
+    fn forwarded_headers_from_an_untrusted_peer_are_ignored() {
+        let guard = proxied_guard(&["10.0.0.1"]);
+        let key = guard.client_key(&xff("9.9.9.9"), from_proxy("1.1.1.1"));
+        assert_eq!(key, "peer:1.1.1.1");
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_is_not_globally_routable() {
+        assert!(!is_globally_routable(
+            "::ffff:127.0.0.1".parse().expect("mapped loopback")
+        ));
+        assert!(!is_globally_routable(
+            "100.64.0.1".parse().expect("cgnat address")
+        ));
+        assert!(is_globally_routable(
+            "9.9.9.9".parse().expect("public address")
+        ));
     }
 
     #[test]

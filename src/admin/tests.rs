@@ -12,15 +12,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::{
+    Json,
     body::to_bytes,
     extract::{ConnectInfo, State},
-    http::{header::AUTHORIZATION, header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
-    Json,
+    http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER},
 };
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
-use krafka::consumer::{AutoOffsetReset, Consumer, ConsumerRecord};
+use krafka::consumer::{Consumer, ConsumerRecord};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -29,21 +29,18 @@ use super::QueuedSignalAction;
 
 use super::auth::AuthToken;
 use super::{
+    AbuseLimitScope, AdminAbuseGuard, AdminState, AuditTrailEntry, InstanceState,
+    SignalActionRequest, SignalActionType, SignalIngressRecord, SignalIngressSource,
     collect_control_notifications, healthz, notifications_authed, notifications_cloudevents_authed,
     notifications_stream_authed, readyz, runtime_metrics_prometheus, signal_action, slo_json,
-    slo_prometheus, token_sha256_hex, AbuseLimitScope, AdminAbuseGuard, AdminState,
-    AuditTrailEntry, InstanceState, SignalActionRequest, SignalActionType, SignalIngressRecord,
-    SignalIngressSource,
+    slo_prometheus, token_sha256_hex,
 };
 use crate::admin::rate_limit::EndpointRateLimiter;
 use crate::config;
-use crate::config::schema::{
-    AdminNotificationKafkaConfig, AdminProbeAuthMode, AdminSignalIngressKafkaConfig,
-    KafkaSecurityConfig, KafkaSecurityProtocol,
-};
+use crate::config::schema::{AdminProbeAuthMode, KafkaSecurityConfig, KafkaSecurityProtocol};
 use crate::token_manifest_policy::{
-    canonical_signing_payload, TokenManifestFile, TokenManifestSignature, TokenManifestToken,
-    TokenManifestUnsigned,
+    TokenManifestFile, TokenManifestSignature, TokenManifestToken, TokenManifestUnsigned,
+    canonical_signing_payload,
 };
 
 pub(super) fn write_signed_manifest(
@@ -822,7 +819,12 @@ pub(super) fn abuse_guard_honors_forwarded_ip_from_trusted_proxy() {
     );
 
     let peer_addr: SocketAddr = "10.0.0.10:7777".parse().expect("peer addr");
-    assert_eq!(guard.client_key(&headers, Some(peer_addr)), "xff:1.2.3.4");
+    // The **rightmost** hop, not the leftmost. This assertion used to read `1.2.3.4`,
+    // which is the address the *client* put in the header — the proxy appends what it
+    // observed to the end. Keying on the leftmost entry let any caller pick its own
+    // rate-limit bucket and rotate it per request. See
+    // `a_client_supplied_forwarded_for_prefix_cannot_choose_the_rate_limit_key`.
+    assert_eq!(guard.client_key(&headers, Some(peer_addr)), "xff:5.6.7.8");
 }
 
 #[test]
@@ -962,7 +964,7 @@ pub(super) async fn an_action_still_running_holds_the_offset_and_is_not_ledgered
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// execute_snapshot row filters (rustcdc 0.12, F-8)
+// execute_snapshot row filters
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A `conditions` entry naming a table the request does not snapshot is rejected.
@@ -1466,9 +1468,11 @@ async fn signal_action_persists_non_admin_notification_log_events_when_configure
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid event"))
         .collect();
     assert!(events.iter().all(|event| event["specversion"] == "1.0"));
-    assert!(events
-        .iter()
-        .all(|event| event["source"] == "urn:cdc-server:notification-log"));
+    assert!(
+        events
+            .iter()
+            .all(|event| event["source"] == "urn:cdc-server:notification-log")
+    );
 
     let data = admin.data.read().await;
     assert_eq!(data.notification_log_emitted_total, 3);
@@ -1501,194 +1505,6 @@ async fn signal_action_persists_non_admin_notification_log_events_when_configure
     assert!(
         metrics.contains("rustcdc_signal_notification_channel_emitted_total{channel=\"file\"} 3")
     );
-}
-
-#[tokio::test]
-async fn signal_action_emits_non_admin_notification_kafka_events_when_configured() {
-    let Ok(brokers) = std::env::var("CDC_TEST_KAFKA_BROKERS") else {
-        eprintln!("skipping admin notification kafka test (CDC_TEST_KAFKA_BROKERS is not set)");
-        return;
-    };
-    let Ok(topic) = std::env::var("CDC_TEST_KAFKA_TOPIC") else {
-        eprintln!("skipping admin notification kafka test (CDC_TEST_KAFKA_TOPIC is not set)");
-        return;
-    };
-
-    let suffix = test_suffix();
-    let mut cfg = sample_config();
-    let security = KafkaSecurityConfig {
-        protocol: match std::env::var("CDC_TEST_KAFKA_PROTOCOL") {
-            Ok(protocol) if protocol.eq_ignore_ascii_case("tls") => KafkaSecurityProtocol::Tls,
-            _ => KafkaSecurityProtocol::Plaintext,
-        },
-        ssl_ca_location: std::env::var("CDC_TEST_KAFKA_CA").ok().map(PathBuf::from),
-        ..KafkaSecurityConfig::default()
-    };
-    cfg.admin.notification_kafka = Some(AdminNotificationKafkaConfig {
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        client_id: format!("cdc-admin-notifications-{suffix}"),
-        ack_timeout_ms: 1_000,
-        retry_backoff_ms: 100,
-        retry_max_attempts: 3,
-        compression: Default::default(),
-        security,
-    });
-
-    let admin = AdminState::new(&cfg).await.expect("admin state");
-    configure_test_read_write_tokens(&admin);
-
-    let mut write_headers = HeaderMap::new();
-    write_headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_static("Bearer write-secret"),
-    );
-
-    let signal_id = format!("sig-kafka-{suffix}");
-    let correlation_id = format!("corr-kafka-{suffix}");
-    let response = signal_action(
-        State(admin.clone()),
-        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9012))),
-        write_headers,
-        Json(SignalActionRequest {
-            signal_id: Some(signal_id.clone()),
-            correlation_id: Some(correlation_id),
-            action_type: SignalActionType::ExecuteSnapshot,
-            tables: Some(vec!["public.orders".to_string()]),
-            conditions: None,
-            message: Some("run snapshot".to_string()),
-            additional_data: Some(serde_json::json!({"operator": "kafka-test"})),
-        }),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let consumer = Consumer::builder()
-        .bootstrap_servers(brokers)
-        .group_id(format!("cdc-admin-notifications-{suffix}"))
-        .client_id(format!("cdc-admin-notifications-consumer-{suffix}"))
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
-        .request_timeout(Duration::from_millis(1_000))
-        .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-            1_000,
-        )))
-        .auth(kafka_auth_from_env())
-        .build()
-        .await
-        .expect("consumer should build");
-    consumer
-        .subscribe(&[topic.as_str()])
-        .await
-        .expect("consumer should subscribe");
-
-    let seen_states = consume_notification_states_until_seen(
-        &consumer,
-        &signal_id,
-        &["STARTED", "IN_PROGRESS", "ABORTED"],
-        60,
-    )
-    .await;
-
-    assert!(
-        ["STARTED", "IN_PROGRESS", "ABORTED"]
-            .iter()
-            .all(|state| seen_states.contains(*state)),
-        "consumer did not observe expected kafka notification lifecycle states: {seen_states:?}"
-    );
-
-    let data = admin.data.read().await;
-    assert_eq!(
-        data.notification_channel_emitted_total
-            .get("kafka")
-            .copied(),
-        Some(3)
-    );
-    assert_eq!(data.notification_log_emit_failures_total, 0);
-}
-
-#[tokio::test]
-async fn signal_ingress_kafka_processes_execute_snapshot_actions() {
-    let Ok(brokers) = std::env::var("CDC_TEST_KAFKA_BROKERS") else {
-        eprintln!("skipping admin signal ingress kafka test (CDC_TEST_KAFKA_BROKERS is not set)");
-        return;
-    };
-    let Ok(topic) = std::env::var("CDC_TEST_KAFKA_SIGNAL_INGRESS_TOPIC") else {
-        eprintln!(
-            "skipping admin signal ingress kafka test (CDC_TEST_KAFKA_SIGNAL_INGRESS_TOPIC is not set)"
-        );
-        return;
-    };
-
-    let suffix = test_suffix();
-    let mut cfg = sample_config();
-    let security = KafkaSecurityConfig {
-        protocol: match std::env::var("CDC_TEST_KAFKA_PROTOCOL") {
-            Ok(protocol) if protocol.eq_ignore_ascii_case("tls") => KafkaSecurityProtocol::Tls,
-            _ => KafkaSecurityProtocol::Plaintext,
-        },
-        ssl_ca_location: std::env::var("CDC_TEST_KAFKA_CA").ok().map(PathBuf::from),
-        ..KafkaSecurityConfig::default()
-    };
-
-    cfg.admin.signal_ingress_kafka = Some(AdminSignalIngressKafkaConfig {
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        group_id: format!("cdc-admin-signal-ingress-{suffix}"),
-        client_id: format!("cdc-admin-signal-ingress-{suffix}"),
-        poll_timeout_ms: 250,
-        security: security.clone(),
-    });
-
-    let admin = AdminState::new(&cfg).await.expect("admin state");
-
-    let producer = krafka::producer::Producer::builder()
-        .bootstrap_servers(brokers)
-        .client_id(format!("cdc-admin-signal-ingress-producer-{suffix}"))
-        .acks(krafka::producer::Acks::All)
-        .request_timeout(Duration::from_millis(1_000))
-        .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-            1_000,
-        )))
-        .auth(kafka_auth_from_env())
-        .build()
-        .await
-        .expect("signal ingress producer should build");
-
-    let signal_id = format!("sig-ingress-kafka-{suffix}");
-    let correlation_id = format!("corr-ingress-kafka-{suffix}");
-    let payload = serde_json::json!({
-        "signal_id": signal_id,
-        "correlation_id": correlation_id,
-        "action_type": "execute_snapshot",
-        "tables": ["public.orders"],
-        "message": "kafka ingress execute",
-        "additional_data": {"ingress": "kafka"},
-    });
-
-    let record = krafka::producer::ProducerRecord::new(
-        topic,
-        serde_json::to_vec(&payload).expect("serialize kafka ingress payload"),
-    );
-    let _metadata = producer
-        .send_record(record)
-        .await
-        .expect("signal ingress payload send should succeed");
-    producer
-        .flush()
-        .await
-        .expect("producer flush should succeed");
-
-    wait_for_signal_state(&admin, &signal_id, "execute_snapshot", "ABORTED").await;
-
-    let data = admin.data.read().await;
-    let notifications = collect_control_notifications(&data);
-    assert!(notifications.iter().any(|notification| {
-        notification.signal_id == signal_id
-            && notification.action_type == "execute_snapshot"
-            && notification.state == "ABORTED"
-    }));
 }
 
 #[tokio::test]
@@ -2058,9 +1874,11 @@ async fn notifications_cloudevents_renders_required_fields() {
     let first = &events[0];
     assert_eq!(first["specversion"], "1.0");
     assert_eq!(first["source"], "urn:cdc-server:admin:notifications");
-    assert!(first["type"]
-        .as_str()
-        .is_some_and(|v| v.starts_with("cdc.signal.")));
+    assert!(
+        first["type"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("cdc.signal."))
+    );
     assert!(first["id"].as_str().is_some());
     assert!(first["time"].as_str().is_some());
     assert_eq!(first["datacontenttype"], "application/json");
@@ -2190,12 +2008,16 @@ async fn signal_notification_timeout_and_lag_metrics_surface_in_slo() {
         .iter()
         .filter_map(|entry| entry.as_str())
         .collect::<Vec<_>>();
-    assert!(reasons
-        .iter()
-        .any(|reason| reason.contains("duplicate terminal lifecycle notifications")));
-    assert!(reasons
-        .iter()
-        .any(|reason| reason.contains("no non-admin notification channels are enabled")));
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("duplicate terminal lifecycle notifications"))
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("no non-admin notification channels are enabled"))
+    );
     assert_eq!(
         slo["notification_channels"]["enabled_total"].as_u64(),
         Some(0)
@@ -2231,8 +2053,11 @@ async fn signal_notification_emit_failures_surface_in_slo_reasons() {
 
     let metrics = slo_prometheus(&data, true);
     assert!(metrics.contains("rustcdc_signal_notification_log_emit_failures_total 2"));
-    assert!(metrics
-        .contains("rustcdc_signal_notification_channel_emit_failures_total{channel=\"file\"} 2"));
+    assert!(
+        metrics.contains(
+            "rustcdc_signal_notification_channel_emit_failures_total{channel=\"file\"} 2"
+        )
+    );
 }
 
 #[tokio::test]
@@ -2453,13 +2278,17 @@ async fn signal_action_accepts_execute_snapshot_and_emits_lifecycle_notification
 
     assert_eq!(execute_notifications.len(), 3);
     assert!(execute_notifications.iter().any(|n| n.state == "STARTED"));
-    assert!(execute_notifications
-        .iter()
-        .any(|n| n.state == "IN_PROGRESS"));
+    assert!(
+        execute_notifications
+            .iter()
+            .any(|n| n.state == "IN_PROGRESS")
+    );
     assert!(execute_notifications.iter().any(|n| n.state == "ABORTED"));
-    assert!(execute_notifications
-        .iter()
-        .all(|n| n.signal_id == "sig-exec-1" && n.correlation_id == "corr-exec-1"));
+    assert!(
+        execute_notifications
+            .iter()
+            .all(|n| n.signal_id == "sig-exec-1" && n.correlation_id == "corr-exec-1")
+    );
 }
 
 /// Snapshot progress renders as gauges, and is absent when nothing is running.
@@ -2503,10 +2332,15 @@ fn snapshot_progress_renders_only_while_a_snapshot_is_in_flight() {
     assert!(rendered.contains("rustcdc_incremental_snapshot_paused 1"));
     assert!(rendered.contains("rustcdc_incremental_snapshot_tables_remaining 1"));
     assert!(rendered.contains("rustcdc_incremental_snapshot_rows_emitted 1290"));
-    assert!(rendered
-        .contains("rustcdc_incremental_snapshot_table_rows_emitted{table=\"public.orders\"} 1200"));
-    assert!(rendered
-        .contains("rustcdc_incremental_snapshot_table_complete{table=\"public.customers\"} 1"));
+    assert!(
+        rendered.contains(
+            "rustcdc_incremental_snapshot_table_rows_emitted{table=\"public.orders\"} 1200"
+        )
+    );
+    assert!(
+        rendered
+            .contains("rustcdc_incremental_snapshot_table_complete{table=\"public.customers\"} 1")
+    );
 }
 
 /// A table name containing a quote must not break the exposition format.
@@ -2535,12 +2369,9 @@ fn snapshot_progress_escapes_label_values() {
 
 /// Snapshot pause / resume / stop are dispatched to the runtime, not acknowledged blindly.
 ///
-/// This assertion has been rewritten twice, and the history is the point. Originally these
-/// answered `200 OK` and recorded `PAUSED` / `RESUMED` / `ABORTED` while doing **nothing** —
-/// an operator pausing a snapshot to relieve a primary would have watched it keep running
-/// with a green audit trail. We then refused them with `501`, because rustcdc 0.10 had no
-/// such control and an honest refusal beats a false success. rustcdc 0.11 added
-/// `pause_incremental_snapshot` / `resume` / `stop`, so they are now real.
+/// Answering `200 OK` and recording `PAUSED` / `RESUMED` / `ABORTED` without dispatching
+/// would let an operator pausing a snapshot to relieve a primary watch it keep running
+/// behind a green audit trail. These go to `pause_incremental_snapshot` / `resume` / `stop`.
 ///
 /// With no runtime attached the terminal state is `ABORTED` naming the missing
 /// configuration — which is the same path `execute_snapshot` takes, and is what
@@ -2901,10 +2732,15 @@ async fn signal_lifecycle_conformance_matrix_for_http_file_kafka_and_source_ingr
         "additional_data": {"ingress": "kafka"},
     }))
     .expect("serialize kafka matrix execute payload");
-    assert!(admin
-        .process_signal_ingress_payload(kafka_exec_payload.as_slice(), SignalIngressSource::Kafka,)
-        .await
-        .is_some());
+    assert!(
+        admin
+            .process_signal_ingress_payload(
+                kafka_exec_payload.as_slice(),
+                SignalIngressSource::Kafka,
+            )
+            .await
+            .is_some()
+    );
 
     let kafka_log_payload = serde_json::to_vec(&serde_json::json!({
         "signal_id": "sig-matrix-kafka-log-1",
@@ -2914,10 +2750,15 @@ async fn signal_lifecycle_conformance_matrix_for_http_file_kafka_and_source_ingr
         "additional_data": {"ingress": "kafka"},
     }))
     .expect("serialize kafka matrix log payload");
-    assert!(admin
-        .process_signal_ingress_payload(kafka_log_payload.as_slice(), SignalIngressSource::Kafka,)
-        .await
-        .is_some());
+    assert!(
+        admin
+            .process_signal_ingress_payload(
+                kafka_log_payload.as_slice(),
+                SignalIngressSource::Kafka,
+            )
+            .await
+            .is_some()
+    );
 
     let source_exec_payload = serde_json::to_vec(&serde_json::json!({
         "signal_id": "sig-matrix-source-exec-1",
@@ -3187,9 +3028,11 @@ async fn signal_action_is_idempotent_for_duplicate_terminal_signal() {
         .collect();
     assert_eq!(execute_notifications.len(), 3);
     assert!(execute_notifications.iter().any(|n| n.state == "STARTED"));
-    assert!(execute_notifications
-        .iter()
-        .any(|n| n.state == "IN_PROGRESS"));
+    assert!(
+        execute_notifications
+            .iter()
+            .any(|n| n.state == "IN_PROGRESS")
+    );
     assert!(execute_notifications.iter().any(|n| n.state == "ABORTED"));
 }
 
@@ -3327,9 +3170,11 @@ async fn signal_action_fails_closed_without_non_admin_notification_channels() {
         .expect("read response body");
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("valid response json");
     assert_eq!(payload["current_state"], "ABORTED");
-    assert!(payload["error"]
-        .as_str()
-        .is_some_and(|msg| msg.contains("no non-admin notification channels are enabled")));
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("no non-admin notification channels are enabled"))
+    );
 
     assert!(!admin.signal_inflight.contains_key(&(
         "sig-no-channel-1".to_string(),
@@ -3387,9 +3232,11 @@ async fn signal_action_fails_closed_when_notification_flags_are_stale() {
         .expect("read response body");
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("valid response json");
     assert_eq!(payload["current_state"], "ABORTED");
-    assert!(payload["error"]
-        .as_str()
-        .is_some_and(|msg| { msg.contains("no non-admin notification channels are enabled") }));
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|msg| { msg.contains("no non-admin notification channels are enabled") })
+    );
 
     assert!(!admin.signal_inflight.contains_key(&(
         "sig-started-notify-fail-1".to_string(),
@@ -3447,9 +3294,11 @@ async fn log_marker_fails_closed_when_started_notification_cannot_emit() {
         .expect("read response body");
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("valid response json");
     assert_eq!(payload["current_state"], "ABORTED");
-    assert!(payload["error"]
-        .as_str()
-        .is_some_and(|msg| { msg.contains("failed to emit STARTED lifecycle notification") }));
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|msg| { msg.contains("failed to emit STARTED lifecycle notification") })
+    );
 
     let data = admin.data.read().await;
     assert_eq!(data.signal_action_started_notification_rejections_total, 1);
@@ -3471,9 +3320,11 @@ async fn log_marker_fails_closed_when_started_notification_cannot_emit() {
         .iter()
         .filter_map(|entry| entry.as_str())
         .collect::<Vec<_>>();
-    assert!(reasons
-        .iter()
-        .any(|reason| { reason.contains("STARTED lifecycle notifications could not be emitted") }));
+    assert!(
+        reasons.iter().any(|reason| {
+            reason.contains("STARTED lifecycle notifications could not be emitted")
+        })
+    );
 
     let metrics = slo_prometheus(&data, true);
     assert!(metrics.contains("rustcdc_signal_action_started_notification_rejections_total 1"));
@@ -3841,10 +3692,12 @@ async fn signal_ingress_payload_processor_preserves_kafka_actor_metadata() {
     });
     let payload_bytes = serde_json::to_vec(&payload).expect("serialize ingress payload");
 
-    assert!(admin
-        .process_signal_ingress_payload(payload_bytes.as_slice(), SignalIngressSource::Kafka,)
-        .await
-        .is_some());
+    assert!(
+        admin
+            .process_signal_ingress_payload(payload_bytes.as_slice(), SignalIngressSource::Kafka,)
+            .await
+            .is_some()
+    );
 
     wait_for_signal_state(
         &admin,

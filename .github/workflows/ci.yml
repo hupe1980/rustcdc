@@ -41,14 +41,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
-      # Both feature configurations. `glue` is off for a plain `cargo build` — that is
-      # the configuration a developer and a downstream consumer get by default, and it
-      # was never built in CI, so a `#[cfg(feature = "glue")]` boundary error could
-      # compile green here and break on the first `cargo build`.
-      #
-      # The second run is the *default* set (PostgreSQL, no glue), not
-      # `--no-default-features`: with connectors now opt-in, the empty set is a
-      # `compile_error!` and would fail here for the wrong reason.
+      # Both feature configurations. The second run is the *default* set (PostgreSQL
+      # only) — the build a developer and a downstream consumer get without asking —
+      # not `--no-default-features`, which is a `compile_error!` by design because a
+      # binary with no source connector would reject every configuration at startup.
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo clippy --all-targets -- -D warnings
 
@@ -153,10 +149,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang perl pkg-config
-      # Both feature sets, because they have different binding constraints: the default set
-      # is held by wasmtime and `--all-features` by the AWS SDK that `glue` pulls in. The
-      # declared MSRV has to satisfy the higher of the two, and the shipped container image
-      # builds `--all-features`.
+      # Both feature sets: the default is what a plain `cargo build` resolves, and
+      # `--all-features` adds the MySQL and SQL Server connectors and is what the shipped
+      # container image builds. The declared MSRV has to satisfy the higher of the two.
       - run: cargo check --all-targets --locked
       - run: cargo check --all-targets --all-features --locked
 
@@ -183,12 +178,28 @@ jobs:
   # a killed run leaves exactly one thing to clean up, which means they must not share a
   # runner.
   integration:
-    name: Integration (${{ matrix.suite }})
+    name: Integration (${{ matrix.suite }}${{ matrix.broker && format(' / {0}', matrix.broker) || '' }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        suite: [integration_postgres, integration_mysql]
+        include:
+          - suite: integration_postgres
+            container: rustcdc-integration-postgres
+          - suite: integration_mysql
+            container: rustcdc-integration-mysql
+          # Two brokers, one suite. Redpanda is an independent reimplementation of the
+          # Kafka wire protocol, so a green run against one says nothing about the other —
+          # and this matrix proved it on its first run: Apache Kafka propagates new-topic
+          # metadata asynchronously and elects a group coordinator lazily, neither of which
+          # Redpanda does. A Redpanda-only suite would have shipped a harness incapable of
+          # testing Kafka.
+          - suite: integration_kafka
+            broker: redpanda
+            container: rustcdc-integration-kafka
+          - suite: integration_kafka
+            broker: kafka
+            container: rustcdc-integration-kafka
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -200,10 +211,14 @@ jobs:
       - name: Run the ${{ matrix.suite }} suite
         env:
           RUSTCDC_INTEGRATION: "1"
+          RUSTCDC_TEST_BROKER: ${{ matrix.broker }}
         run: cargo test --all-features --locked --test ${{ matrix.suite }} -- --test-threads=1
+      # Removes the container **this** job started. It used to remove
+      # `rustcdc-integration-postgres` unconditionally, so the MySQL job cleaned up a
+      # container it had never started and left its own running.
       - name: Clean up the container
         if: always()
-        run: docker rm -f rustcdc-integration-postgres || true
+        run: docker rm -f ${{ matrix.container }} || true
 
   # ── Fuzz targets (build + short smoke run) ──────────────────────────────────
   #

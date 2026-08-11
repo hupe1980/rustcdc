@@ -1,31 +1,18 @@
 //! Table-level event routing.
 //!
-//! Since rustcdc 0.6.0 the full `TableRouter<S>` implementation — including
-//! all capability-hook delegation — lives in the upstream crate.  This module
-//! re-exports the relevant types and exposes `AppError`-returning builder
-//! helpers that binding.rs uses.
-//!
-//! ## Design
-//!
-//! We use `HeterogeneousTableRouter` (= `TableRouter<BoxedSink>`) so that
-//! different route patterns can point to different concrete sink types (Kafka,
-//! HTTP, Iceberg, …) without a manual unification enum.
-//!
-//! The local `SinkBinding` type is wrapped in a `BoxedSink` at build time;
-//! from that point all routing, lifecycle, and capability-hook delegation is
-//! handled by rustcdc's `TableRouter<BoxedSink>` implementation.
+//! Routing, lifecycle and capability-hook delegation all live upstream in
+//! `TableRouter<BoxedSink>`; this module adds the `AppError`-returning builders and the
+//! thin wrappers that keep `SinkAdapter` out of the command modules. Boxing the sink is
+//! what lets different route patterns point at different concrete sink types without a
+//! unification enum.
 
 use rustcdc::sink::{BoxedSink, SinkAdapter};
 
 use crate::error::AppError;
-use crate::sink::{SinkBinding, SinkDeliveryMetrics};
+use crate::sink::SinkBinding;
 
 // Re-export so command modules can refer to `TableRouter` without importing rustcdc directly.
-pub use rustcdc::{table_matches, HeterogeneousTableRouter as TableRouter};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Builder helpers
-// ─────────────────────────────────────────────────────────────────────────────
+pub use rustcdc::{HeterogeneousTableRouter as TableRouter, table_matches};
 
 /// Create a no-routing router wrapping a single sink binding.
 pub fn single(sink: SinkBinding) -> TableRouter {
@@ -51,13 +38,7 @@ pub fn with_routes(
     builder.build().map_err(AppError::Runtime)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Command-layer helpers
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// These thin wrappers adapt the SinkAdapter trait API (rustcdc::core::Error) to
-// the AppError boundary used by the commands layer, without requiring every
-// command module to import the SinkAdapter trait directly.
+// Adapt the `SinkAdapter` API (`rustcdc::core::Error`) to the command layer's `AppError`.
 
 /// Encode and deliver `event` via the routing table.
 ///
@@ -76,18 +57,16 @@ pub async fn preflight_check(router: &mut TableRouter) -> Result<(), AppError> {
     router.preflight_check().await.map_err(AppError::Runtime)
 }
 
-/// Snapshot of delivery counters from all sinks in the router.
-///
-/// Returns the cdc-server-local `SinkDeliveryMetrics` populated from the
-/// generic `SinkAdapter::delivery_metrics()` fields available through the
-/// abstract routing layer.  HTTP-specific histogram counters are not available
-/// through this path; they are tracked internally by `HttpSink`.
-pub fn delivery_metrics(router: &TableRouter) -> SinkDeliveryMetrics {
-    router
-        .delivery_metrics()
-        .map(|m| SinkDeliveryMetrics {
-            retries_total: m.events_retried,
-            ..SinkDeliveryMetrics::default()
-        })
-        .unwrap_or_default()
-}
+// Delivery counters are **not** read through the router.
+//
+// `TableRouter<BoxedSink>` exposes `SinkAdapter::delivery_metrics()`, which carries four
+// generic fields. This server exports thirty families that have no room in those four —
+// HTTP status classes, batch-size and retry-delay histograms, pending bytes, Iceberg
+// orphaned files and lock contention, Kafka OAUTHBEARER token health. A helper here used
+// to map the one field that survived into a local struct and leave the rest at their
+// defaults, so those thirty families rendered a constant zero and the four alert rules
+// watching them could never fire.
+//
+// The counters now travel out through `crate::sink::SinkMetricsRegistry`, whose handles
+// are collected in `pipeline::binding` while each binding is still concrete. See that
+// module for the full argument.

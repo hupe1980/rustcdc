@@ -1,11 +1,11 @@
 use figment::{
-    providers::{Env, Format, Toml},
     Figment,
+    providers::{Env, Format, Toml},
 };
 use std::path::Path;
 
 use super::schema::{
-    AdminProbeAuthMode, AppConfig, DeliveryContract, SinkConfig, StateBackend, KNOWN_SOURCE_DRIVERS,
+    AdminProbeAuthMode, AppConfig, DeliveryContract, KNOWN_SOURCE_DRIVERS, SinkConfig, StateBackend,
 };
 use super::source_profile::validate_source_config;
 use crate::error::ConfigError;
@@ -57,7 +57,7 @@ pub fn load_and_migrate(config_path: &Path) -> Result<AppConfig, ConfigError> {
     reject_relocated_http_dlq(&migrated_raw)?;
 
     let mut config: AppConfig = serde_json::from_value(migrated_raw).map_err(|e| {
-        ConfigError::InvalidState(format!("failed to deserialize migrated configuration: {e}"))
+        ConfigError::Invalid(format!("failed to deserialize migrated configuration: {e}"))
     })?;
 
     // Typo detection runs against the *file*, never the env-merged document. The
@@ -100,9 +100,8 @@ fn reject_unknown_config_keys(
     raw: &serde_json::Value,
     parsed: &AppConfig,
 ) -> Result<(), ConfigError> {
-    let round_tripped = serde_json::to_value(parsed).map_err(|e| {
-        ConfigError::InvalidState(format!("failed to re-serialise configuration: {e}"))
-    })?;
+    let round_tripped = serde_json::to_value(parsed)
+        .map_err(|e| ConfigError::Invalid(format!("failed to re-serialise configuration: {e}")))?;
 
     let mut unknown = Vec::new();
     collect_unknown_keys(raw, &round_tripped, String::new(), &mut unknown);
@@ -111,7 +110,7 @@ fn reject_unknown_config_keys(
         return Ok(());
     }
     unknown.sort();
-    Err(ConfigError::InvalidState(format!(
+    Err(ConfigError::Invalid(format!(
         "unrecognised configuration key(s): {}. A key the schema does not know is \
          silently ignored, so a typo does not disable a setting — it leaves the default \
          in place. Check the spelling and the table it sits under against \
@@ -195,7 +194,7 @@ fn reject_relocated_http_dlq(raw: &serde_json::Value) -> Result<(), ConfigError>
         return Ok(());
     }
 
-    Err(ConfigError::InvalidState(format!(
+    Err(ConfigError::Invalid(format!(
         "`dlq_path` / `dlq_max_bytes` under {} were removed. The dead-letter queue is \
          now a top-level `[dlq]` section that applies to every sink and can target a \
          file or a Kafka topic:\n\n\
@@ -273,7 +272,7 @@ fn reject_removed_delivery_contracts(raw: &serde_json::Value) -> Result<(), Conf
         .and_then(serde_json::Value::as_str)
         == Some("at_most_once")
     {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "delivery_contract = \"at_most_once\" was removed. It was accepted but never \
              implemented — the checkpoint still advanced after delivery, so deployments \
              that selected it silently received at_least_once. It is not being fixed \
@@ -299,7 +298,7 @@ fn resolve_registry_refs(config: &mut AppConfig) -> Result<(), ConfigError> {
     for (name, registry) in &pool {
         registry
             .validate()
-            .map_err(|e| ConfigError::InvalidState(format!("registries.{name}: {e}")))?;
+            .map_err(|e| ConfigError::Invalid(format!("registries.{name}: {e}")))?;
     }
 
     let mut sinks: Vec<(String, &mut SinkConfig)> = vec![("sink".to_string(), &mut config.sink)];
@@ -342,7 +341,7 @@ fn resolve_sink_registry_refs(
         } else {
             format!("known: {}", pool.keys().cloned().collect::<Vec<_>>().join(", "))
         };
-        ConfigError::InvalidState(format!(
+        ConfigError::Invalid(format!(
             "{path}.codec.registry_ref = \"{name}\" does not match any [registries.*] entry ({known})"
         ))
     })?;
@@ -377,7 +376,7 @@ fn resolve_env_secret_references(
 ) -> Result<(), ConfigError> {
     if let Some(var_name) = as_env_reference(value) {
         let resolved = std::env::var(var_name).map_err(|_| {
-            ConfigError::InvalidState(format!(
+            ConfigError::Invalid(format!(
                 "environment variable '{var_name}' referenced by '{path}' is not set"
             ))
         })?;
@@ -433,7 +432,7 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
                 .get("password")
                 .is_some_and(serde_json::Value::is_string)
             {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "source password must use a deferred secret reference (for example \
                      { env = \"POSTGRES_PASSWORD\" }). A replication credential written \
                      as a literal is readable by anyone who can read the config file, \
@@ -455,15 +454,14 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
     for sink in sink_values {
         let sink_type = sink.get("type").and_then(serde_json::Value::as_str);
 
-        if sink_type == Some("http") {
-            if let Some(token) = sink.get("bearer_token") {
-                if token.is_string() {
-                    return Err(ConfigError::InvalidState(
+        if sink_type == Some("http")
+            && let Some(token) = sink.get("bearer_token")
+            && token.is_string()
+        {
+            return Err(ConfigError::Invalid(
                         "sink.http.bearer_token must use deferred secret references (for example { env = \"VAR\" })"
                             .to_string(),
                     ));
-                }
-            }
         }
 
         if sink_type == Some("iceberg") {
@@ -472,12 +470,12 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
                     .get("catalog")
                     .and_then(|c| c.get("rest"))
                     .and_then(|r| r.get(field));
-                if let Some(value) = value {
-                    if value.is_string() {
-                        return Err(ConfigError::InvalidState(format!(
-                            "sink.iceberg.catalog.rest.{field} must use deferred secret references (for example {{ env = \"VAR\" }})"
-                        )));
-                    }
+                if let Some(value) = value
+                    && value.is_string()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "sink.iceberg.catalog.rest.{field} must use deferred secret references (for example {{ env = \"VAR\" }})"
+                    )));
                 }
             }
         }
@@ -516,7 +514,7 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
                         } else {
                             format!("rules.\"{path}\"")
                         };
-                        return Err(ConfigError::InvalidState(format!(
+                        return Err(ConfigError::Invalid(format!(
                             "pipeline.transforms[..].actions[..] mask {where_}.key must use a \
                              deferred secret reference (for example {{ env = \"VAR\" }}); a key \
                              written into the config file makes every value it masked \
@@ -555,74 +553,74 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
     // State dir must be a non-empty path.
     if config.state.offset.dir.as_os_str().is_empty() {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "state.offset.dir must not be empty".to_string(),
         ));
     }
 
     if config.admin.timeout_ms == 0 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.timeout_ms must be > 0".to_string(),
         ));
     }
 
     if config.admin.metrics_rate_limit_rps == 0 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.metrics_rate_limit_rps must be > 0".to_string(),
         ));
     }
 
     if config.admin.metrics_rate_limit_burst == 0 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.metrics_rate_limit_burst must be > 0".to_string(),
         ));
     }
 
     if config.admin.metrics_rate_limit_burst < config.admin.metrics_rate_limit_rps {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.metrics_rate_limit_burst must be >= admin.metrics_rate_limit_rps".to_string(),
         ));
     }
 
     if config.admin.readyz_rate_limit_rps == 0 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.readyz_rate_limit_rps must be > 0".to_string(),
         ));
     }
 
     if config.admin.readyz_rate_limit_burst == 0 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.readyz_rate_limit_burst must be > 0".to_string(),
         ));
     }
 
     if config.admin.readyz_rate_limit_burst < config.admin.readyz_rate_limit_rps {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.readyz_rate_limit_burst must be >= admin.readyz_rate_limit_rps".to_string(),
         ));
     }
 
     if config.admin.status_rate_limit_rps == 0 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.status_rate_limit_rps must be > 0".to_string(),
         ));
     }
 
     if config.admin.status_rate_limit_burst == 0 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.status_rate_limit_burst must be > 0".to_string(),
         ));
     }
 
     if config.admin.status_rate_limit_burst < config.admin.status_rate_limit_rps {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "admin.status_rate_limit_burst must be >= admin.status_rate_limit_rps".to_string(),
         ));
     }
 
     if config.admin.enabled {
         let admin_addr: std::net::SocketAddr = config.admin.bind.parse().map_err(|e| {
-            ConfigError::InvalidState(format!("admin.bind must be a valid socket address: {e}"))
+            ConfigError::Invalid(format!("admin.bind must be a valid socket address: {e}"))
         })?;
 
         let has_manifest_auth = config.admin.token_manifest_file.is_some();
@@ -632,7 +630,7 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             AdminProbeAuthMode::AllowUnauthenticatedLoopback
         ) && !admin_addr.ip().is_loopback()
         {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "admin.probe_auth_mode=allow_unauthenticated_loopback requires loopback admin.bind"
                     .to_string(),
             ));
@@ -644,7 +642,7 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             .as_ref()
             .is_some_and(|name| name.trim().is_empty())
         {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "admin.read_token_env must not be empty when configured".to_string(),
             ));
         }
@@ -655,7 +653,7 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             .as_ref()
             .is_some_and(|name| name.trim().is_empty())
         {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "admin.write_token_env must not be empty when configured".to_string(),
             ));
         }
@@ -666,100 +664,103 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             .as_ref()
             .is_some_and(|name| name.trim().is_empty())
         {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "admin.audit_signing_key_env must not be empty when configured".to_string(),
             ));
         }
 
         if let Some(audit_log_file) = &config.admin.audit_log_file {
             if audit_log_file.as_os_str().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.audit_log_file must not be empty when configured".to_string(),
                 ));
             }
 
             if audit_log_file.exists() && !audit_log_file.is_file() {
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "admin.audit_log_file exists but is not a file: {}",
                     audit_log_file.display()
                 )));
             }
 
-            if let Some(parent) = audit_log_file.parent() {
-                if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                    return Err(ConfigError::InvalidState(format!(
-                        "admin.audit_log_file parent directory does not exist: {}",
-                        parent.display()
-                    )));
-                }
+            if let Some(parent) = audit_log_file.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.is_dir()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "admin.audit_log_file parent directory does not exist: {}",
+                    parent.display()
+                )));
             }
         }
 
         if let Some(notification_log_file) = &config.admin.notification_log_file {
             if notification_log_file.as_os_str().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.notification_log_file must not be empty when configured".to_string(),
                 ));
             }
 
             if notification_log_file.exists() && !notification_log_file.is_file() {
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "admin.notification_log_file exists but is not a file: {}",
                     notification_log_file.display()
                 )));
             }
 
-            if let Some(parent) = notification_log_file.parent() {
-                if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                    return Err(ConfigError::InvalidState(format!(
-                        "admin.notification_log_file parent directory does not exist: {}",
-                        parent.display()
-                    )));
-                }
+            if let Some(parent) = notification_log_file.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.is_dir()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "admin.notification_log_file parent directory does not exist: {}",
+                    parent.display()
+                )));
             }
         }
 
         if let Some(signal_ingress_file) = &config.admin.signal_ingress_file {
             if signal_ingress_file.as_os_str().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.signal_ingress_file must not be empty when configured".to_string(),
                 ));
             }
 
             if signal_ingress_file.exists() && !signal_ingress_file.is_file() {
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "admin.signal_ingress_file exists but is not a file: {}",
                     signal_ingress_file.display()
                 )));
             }
 
-            if let Some(parent) = signal_ingress_file.parent() {
-                if !parent.as_os_str().is_empty() && !parent.is_dir() {
-                    return Err(ConfigError::InvalidState(format!(
-                        "admin.signal_ingress_file parent directory does not exist: {}",
-                        parent.display()
-                    )));
-                }
+            if let Some(parent) = signal_ingress_file.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.is_dir()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "admin.signal_ingress_file parent directory does not exist: {}",
+                    parent.display()
+                )));
             }
         }
 
         if let Some(notification_kafka) = &config.admin.notification_kafka {
             notification_kafka
                 .validate()
-                .map_err(ConfigError::InvalidState)?;
+                .map_err(ConfigError::Invalid)?;
         }
 
         if let Some(signal_ingress_kafka) = &config.admin.signal_ingress_kafka {
             signal_ingress_kafka
                 .validate()
-                .map_err(ConfigError::InvalidState)?;
+                .map_err(ConfigError::Invalid)?;
         }
 
         if (config.admin.write_token_env.is_some() || has_manifest_auth)
             && config.admin.notification_log_file.is_none()
             && config.admin.notification_kafka.is_none()
         {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "admin.notification_log_file or admin.notification_kafka is required when write-capable admin signaling is enabled"
                     .to_string(),
             ));
@@ -767,18 +768,18 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
         if let Some(manifest_file) = &config.admin.token_manifest_file {
             if config.admin.token_manifest_max_staleness_ms.is_none() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                         "admin.token_manifest_max_staleness_ms is required when admin.token_manifest_file is configured"
                             .to_string(),
                     ));
             }
             if manifest_file.as_os_str().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.token_manifest_file must not be empty when configured".to_string(),
                 ));
             }
             if !manifest_file.is_file() {
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "admin.token_manifest_file does not exist or is not a file: {}",
                     manifest_file.display()
                 )));
@@ -786,12 +787,12 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             let trusted_keys = token_manifest_policy::parse_trusted_manifest_keys(
                 &config.admin.token_manifest_trusted_public_keys_hex,
             )
-            .map_err(ConfigError::InvalidState)?;
+            .map_err(ConfigError::Invalid)?;
             let manifest =
                 token_manifest_policy::load_signed_token_manifest(manifest_file, &trusted_keys)
-                    .map_err(ConfigError::InvalidState)?;
+                    .map_err(ConfigError::Invalid)?;
             if !token_manifest_policy::has_write_scope(&manifest.tokens) {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.token_manifest_file must contain at least one token with write scope"
                         .to_string(),
                 ));
@@ -804,27 +805,27 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             .is_empty()
             && config.admin.token_manifest_file.is_none()
         {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "admin.token_manifest_trusted_public_keys_hex requires admin.token_manifest_file"
                     .to_string(),
             ));
         }
 
         if config.admin.token_manifest_refresh_ms == 0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "admin.token_manifest_refresh_ms must be > 0".to_string(),
             ));
         }
 
         for proxy_ip in &config.admin.trusted_proxy_ips {
             if proxy_ip.trim().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.trusted_proxy_ips entries must not be empty".to_string(),
                 ));
             }
 
             if proxy_ip.parse::<std::net::IpAddr>().is_err() {
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "admin.trusted_proxy_ips contains invalid IP address '{proxy_ip}'"
                 )));
             }
@@ -832,13 +833,13 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
         if let Some(max_staleness_ms) = config.admin.token_manifest_max_staleness_ms {
             if max_staleness_ms == 0 {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.token_manifest_max_staleness_ms must be > 0 when configured".to_string(),
                 ));
             }
 
             if config.admin.token_manifest_file.is_none() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.token_manifest_max_staleness_ms requires admin.token_manifest_file"
                         .to_string(),
                 ));
@@ -847,19 +848,19 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
         if !admin_addr.ip().is_loopback() {
             if config.admin.read_token_env.is_none() && !has_manifest_auth {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.read_token_env or admin.token_manifest_file is required when admin.bind is non-loopback"
                         .to_string(),
                 ));
             }
             if config.admin.write_token_env.is_none() && !has_manifest_auth {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.write_token_env or admin.token_manifest_file is required when admin.bind is non-loopback"
                         .to_string(),
                 ));
             }
             if config.admin.tls.is_none() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.tls is required when admin.bind is non-loopback".to_string(),
                 ));
             }
@@ -867,30 +868,30 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
         if let Some(tls) = &config.admin.tls {
             if tls.cert_file.as_os_str().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.tls.cert_file must not be empty".to_string(),
                 ));
             }
             if tls.key_file.as_os_str().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.tls.key_file must not be empty".to_string(),
                 ));
             }
             if !tls.cert_file.is_file() {
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "admin.tls.cert_file does not exist or is not a file: {}",
                     tls.cert_file.display()
                 )));
             }
             if !tls.key_file.is_file() {
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "admin.tls.key_file does not exist or is not a file: {}",
                     tls.key_file.display()
                 )));
             }
 
             if tls.require_client_cert && tls.client_ca_file.is_none() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "admin.tls.client_ca_file is required when admin.tls.require_client_cert=true"
                         .to_string(),
                 ));
@@ -898,12 +899,12 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
             if let Some(ca_file) = &tls.client_ca_file {
                 if ca_file.as_os_str().is_empty() {
-                    return Err(ConfigError::InvalidState(
+                    return Err(ConfigError::Invalid(
                         "admin.tls.client_ca_file must not be empty when configured".to_string(),
                     ));
                 }
                 if !ca_file.is_file() {
-                    return Err(ConfigError::InvalidState(format!(
+                    return Err(ConfigError::Invalid(format!(
                         "admin.tls.client_ca_file does not exist or is not a file: {}",
                         ca_file.display()
                     )));
@@ -914,59 +915,59 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 
     if let SinkConfig::Http(http) = &config.sink {
         if http.url.trim().is_empty() {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.url must not be empty".to_string(),
             ));
         }
         if !http.verify_tls {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.verify_tls must be true; insecure HTTP TLS bypass is unsupported"
                     .to_string(),
             ));
         }
         validate_http_sink_url_policy(&http.url)?;
         if http.timeout_ms == 0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.timeout_ms must be > 0".to_string(),
             ));
         }
         if http.batch_max_events == 0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.batch_max_events must be > 0".to_string(),
             ));
         }
         if http.batch_max_delay_ms == 0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.batch_max_delay_ms must be > 0".to_string(),
             ));
         }
         if http.max_pending_bytes == 0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.max_pending_bytes must be > 0".to_string(),
             ));
         }
         if http.backoff_multiplier < 1.0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.backoff_multiplier must be >= 1.0".to_string(),
             ));
         }
         if !http.backoff_multiplier.is_finite() {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.backoff_multiplier must be finite".to_string(),
             ));
         }
         if http.backoff_initial_ms == 0 || http.backoff_max_ms == 0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.backoff_initial_ms and backoff_max_ms must be > 0".to_string(),
             ));
         }
         if http.backoff_initial_ms > http.backoff_max_ms {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.backoff_initial_ms must be <= backoff_max_ms".to_string(),
             ));
         }
         if http.batch_retry_time_budget_ms == 0 {
-            return Err(ConfigError::InvalidState(
+            return Err(ConfigError::Invalid(
                 "sink.http.batch_retry_time_budget_ms must be > 0".to_string(),
             ));
         }
@@ -975,12 +976,10 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
             // raw document (`enforce_deferred_secret_literals`) — by this point
             // an inline value is the resolved form of an `{ env = … }` reference.
             let resolved = token.resolve().map_err(|e| {
-                ConfigError::InvalidState(format!(
-                    "sink.http.bearer_token could not be resolved: {e}"
-                ))
+                ConfigError::Invalid(format!("sink.http.bearer_token could not be resolved: {e}"))
             })?;
             if resolved.trim().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "sink.http.bearer_token must not be empty when configured".to_string(),
                 ));
             }
@@ -988,11 +987,11 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     }
 
     if let SinkConfig::Kafka(kafka) = &config.sink {
-        kafka.validate().map_err(ConfigError::InvalidState)?;
+        kafka.validate().map_err(ConfigError::Invalid)?;
     }
 
     if let SinkConfig::Iceberg(iceberg) = &config.sink {
-        iceberg.validate().map_err(ConfigError::InvalidState)?;
+        iceberg.validate().map_err(ConfigError::Invalid)?;
     }
 
     if let SinkConfig::Fan(fan) = &config.sink {
@@ -1012,16 +1011,14 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     match &config.state.offset.backend {
         StateBackend::LocalFs => {}
         StateBackend::KafkaTopic(kafka_state) => {
-            kafka_state.validate().map_err(ConfigError::InvalidState)?;
+            kafka_state.validate().map_err(ConfigError::Invalid)?;
         }
         StateBackend::Redis(redis_config) => {
             let resolved_url = redis_config.url.resolve().map_err(|e| {
-                ConfigError::InvalidState(format!(
-                    "state.offset.redis.url could not be resolved: {e}"
-                ))
+                ConfigError::Invalid(format!("state.offset.redis.url could not be resolved: {e}"))
             })?;
             if resolved_url.trim().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "state.offset.redis.url must not be empty".to_string(),
                 ));
             }
@@ -1029,7 +1026,7 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         StateBackend::Postgresql(pg_config) => {
             let resolved_url = pg_config.url.resolve().unwrap_or_default();
             if resolved_url.trim().is_empty() {
-                return Err(ConfigError::InvalidState(
+                return Err(ConfigError::Invalid(
                     "state.offset.postgresql.url must not be empty".to_string(),
                 ));
             }
@@ -1037,27 +1034,24 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     }
 
     for rule in &config.pipeline.transforms {
-        rule.validate().map_err(ConfigError::InvalidState)?;
+        rule.validate().map_err(ConfigError::Invalid)?;
     }
 
-    config
-        .runtime
-        .validate()
-        .map_err(ConfigError::InvalidState)?;
+    config.runtime.validate().map_err(ConfigError::Invalid)?;
 
     config
         .pipeline
         .transform_runtime
         .validate()
-        .map_err(ConfigError::InvalidState)?;
+        .map_err(ConfigError::Invalid)?;
 
     config
         .observability
         .validate()
-        .map_err(ConfigError::InvalidState)?;
+        .map_err(ConfigError::Invalid)?;
 
     if let Some(incremental) = config.incremental_snapshot.as_ref() {
-        incremental.validate().map_err(ConfigError::InvalidState)?;
+        incremental.validate().map_err(ConfigError::Invalid)?;
     }
 
     // Both bootstrap the same tables by different means. Accepting both would read
@@ -1073,7 +1067,7 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         .is_some_and(crate::config::schema::IncrementalSnapshotConfig::backfills_at_startup)
         && !config.snapshot_tables.is_empty()
     {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "snapshot_tables and incremental_snapshot.tables are two bootstrapping paths \
              for the same job; set exactly one. incremental_snapshot does not block the \
              stream and resumes from its persisted chunk cursor after a restart."
@@ -1085,18 +1079,20 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
-    if let SinkConfig::Kafka(kafka) = &config.sink {
-        if matches!(
+    if let SinkConfig::Kafka(kafka) = &config.sink
+        && matches!(
             kafka.delivery_mode,
             super::schema::KafkaDeliveryMode::Transactional
-        ) && config.delivery_contract != DeliveryContract::EffectivelyOnce
-        {
-            return Err(ConfigError::InvalidState(
+        )
+        && config.delivery_contract != DeliveryContract::EffectivelyOnce
+    {
+        return Err(ConfigError::Invalid(
                 "delivery_contract must be \"effectively_once\" when sink.kafka.delivery_mode=\"transactional\""
                     .to_string(),
             ));
-        }
     }
+
+    validate_durability_waits_fit_the_flush_timeout(config)?;
 
     let sink_name = sink_name(&config.sink);
     let idempotent_delivery_capable = sink_idempotent_delivery_capable(&config.sink);
@@ -1118,7 +1114,7 @@ fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
             requirements.push("transactional checkpoint barrier coupling");
         }
 
-        return Err(ConfigError::InvalidState(format!(
+        return Err(ConfigError::Invalid(format!(
             "delivery_contract='{}' is incompatible with sink.type='{}': missing {}",
             config.delivery_contract.as_label(),
             sink_name,
@@ -1151,7 +1147,7 @@ fn validate_effectively_once_state_backend(config: &AppConfig) -> Result<(), Con
     };
 
     let super::state::StateBackend::KafkaTopic(state) = &config.state.offset.backend else {
-        return Err(ConfigError::InvalidState(format!(
+        return Err(ConfigError::Invalid(format!(
             "delivery_contract='effectively_once' requires state.offset.backend=\"kafka_topic\", \
              but it is \"{}\". End-to-end exactly-once needs the checkpoint written inside the \
              sink's Kafka transaction, so the checkpoint has to live in Kafka; any other backend \
@@ -1171,7 +1167,7 @@ fn validate_effectively_once_state_backend(config: &AppConfig) -> Result<(), Con
         state.normalized_brokers().into_iter().collect();
 
     if sink_brokers != state_brokers {
-        return Err(ConfigError::InvalidState(format!(
+        return Err(ConfigError::Invalid(format!(
             "delivery_contract='effectively_once' requires the sink and the checkpoint topic to \
              be on the same Kafka cluster, because one transaction cannot span two. \
              sink.kafka.brokers is '{}' and state.offset.backend.kafka_topic.brokers is '{}'.",
@@ -1191,6 +1187,51 @@ fn state_backend_label(backend: &super::state::StateBackend) -> &'static str {
     }
 }
 
+/// A sink's durability wait must finish inside the runtime's flush timeout.
+///
+/// `runtime.sink_flush_timeout_ms` wraps `sink.flush()` in a `tokio::time::timeout`. When it
+/// fires first the flush future is **dropped mid-wait** — after the records have been sent.
+/// The run loop then retries the batch, and the records go to the destination twice.
+///
+/// This is not hypothetical: the Snowflake sink shipped with both defaults at 60 000 ms, so
+/// they raced and the runtime usually won. Both sinks that wait for a destination-side
+/// acknowledgement are checked here, because the shape is the trap, not the vendor.
+fn validate_durability_waits_fit_the_flush_timeout(config: &AppConfig) -> Result<(), ConfigError> {
+    /// Headroom for the send itself plus one round trip.
+    const SLACK_MS: u64 = 5_000;
+
+    let flush_timeout = config.runtime.sink_flush_timeout_ms;
+    let mut queue: Vec<&SinkConfig> = vec![&config.sink];
+    queue.extend(config.sinks.iter().map(|named| &named.sink));
+
+    while let Some(sink) = queue.pop() {
+        let (field, wait) = match sink {
+            SinkConfig::Fan(fan) => {
+                queue.extend(fan.sinks.iter());
+                continue;
+            }
+            SinkConfig::Snowflake(snowflake) => (
+                "sink.snowflake.commit_timeout_ms",
+                snowflake.commit_timeout_ms,
+            ),
+            SinkConfig::Zerobus(zerobus) => ("sink.zerobus.ack_timeout_ms", zerobus.ack_timeout_ms),
+            _ => continue,
+        };
+
+        if wait + SLACK_MS > flush_timeout {
+            return Err(ConfigError::Invalid(format!(
+                "{field} ({wait}) must be at least {SLACK_MS} ms below \
+                 runtime.sink_flush_timeout_ms ({flush_timeout}), which wraps the whole \
+                 flush. Otherwise the runtime cancels the durability wait mid-flight — the \
+                 records are already sent, the batch is retried, and a bound the caller \
+                 abandons is not a bound. Raise runtime.sink_flush_timeout_ms to at least {}.",
+                wait + SLACK_MS
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn sink_name(sink: &SinkConfig) -> &'static str {
     match sink {
         SinkConfig::Stdout(_) => "stdout",
@@ -1198,6 +1239,8 @@ fn sink_name(sink: &SinkConfig) -> &'static str {
         SinkConfig::Http(_) => "http",
         SinkConfig::Kafka(_) => "kafka",
         SinkConfig::Iceberg(_) => "iceberg",
+        SinkConfig::Snowflake(_) => "snowflake",
+        SinkConfig::Zerobus(_) => "zerobus",
         SinkConfig::Fan(_) => "fan_out",
     }
 }
@@ -1205,6 +1248,11 @@ fn sink_name(sink: &SinkConfig) -> &'static str {
 fn sink_idempotent_delivery_capable(sink: &SinkConfig) -> bool {
     match sink {
         SinkConfig::Kafka(_) => true,
+        // The channel's offset token is a destination-side record of what is durable, and
+        // `flush` does not return until it has advanced — so a replayed batch is filtered
+        // out on resume rather than duplicated. That is idempotence in the sense this flag
+        // means, without a Kafka transaction anywhere.
+        SinkConfig::Snowflake(_) => true,
         SinkConfig::Fan(fan) => fan.sinks.iter().all(sink_idempotent_delivery_capable),
         _ => false,
     }
@@ -1244,7 +1292,7 @@ fn validate_sink_codec(path: &str, sink: &SinkConfig) -> Result<(), ConfigError>
             match codec {
                 Some(codec) => codec
                     .validate()
-                    .map_err(|e| ConfigError::InvalidState(format!("{path}.codec: {e}"))),
+                    .map_err(|e| ConfigError::Invalid(format!("{path}.codec: {e}"))),
                 None => Ok(()),
             }
         }
@@ -1253,13 +1301,13 @@ fn validate_sink_codec(path: &str, sink: &SinkConfig) -> Result<(), ConfigError>
 
 fn validate_fan_sink_config(fan: &super::schema::FanSinkConfig) -> Result<(), ConfigError> {
     if fan.sinks.is_empty() {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "sink.fan.sinks must contain at least one child sink".to_string(),
         ));
     }
     for (i, child) in fan.sinks.iter().enumerate() {
         if matches!(child, SinkConfig::Fan(_)) {
-            return Err(ConfigError::InvalidState(format!(
+            return Err(ConfigError::Invalid(format!(
                 "sink.fan.sinks[{i}]: nested fan-out sinks are not supported"
             )));
         }
@@ -1268,16 +1316,15 @@ fn validate_fan_sink_config(fan: &super::schema::FanSinkConfig) -> Result<(), Co
 }
 
 pub(crate) fn validate_http_sink_url_policy(url: &str) -> Result<(), ConfigError> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| {
-        ConfigError::InvalidState(format!("sink.http.url must be a valid URL: {e}"))
-    })?;
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| ConfigError::Invalid(format!("sink.http.url must be a valid URL: {e}")))?;
 
     // A credential in the URL is readable by anyone holding a *read*-scoped admin
     // token: `/status` returns the config snapshot, and a URL is not a `SecretString`,
     // so no amount of redaction downstream is guaranteed to catch it. Rejecting it here
     // means the credential never enters the process in a form that can leak.
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "sink.http.url must not embed credentials. A userinfo component travels \
              into every config snapshot, log line and diagnostic that touches the URL, \
              and it is readable by any holder of a read-scoped admin token. Use \
@@ -1293,13 +1340,13 @@ pub(crate) fn validate_http_sink_url_policy(url: &str) -> Result<(), ConfigError
             if matches!(host, "localhost" | "127.0.0.1" | "::1") {
                 Ok(())
             } else {
-                Err(ConfigError::InvalidState(
+                Err(ConfigError::Invalid(
                     "sink.http.url must use https except for localhost loopback testing"
                         .to_string(),
                 ))
             }
         }
-        other => Err(ConfigError::InvalidState(format!(
+        other => Err(ConfigError::Invalid(format!(
             "sink.http.url scheme must be https (or http on localhost); found '{other}'"
         ))),
     }

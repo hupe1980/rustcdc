@@ -8,17 +8,17 @@ mod signals;
 mod tls;
 
 use auth::{
-    bearer_token, constant_time_eq_str, load_auth_state, rate_limited_response, token_sha256_hex,
-    unauthorized_response, AdminScope, AuthSource, AuthState,
+    AdminScope, AuthSource, AuthState, bearer_token, constant_time_eq_str, load_auth_state,
+    rate_limited_response, token_sha256_hex, unauthorized_response,
 };
 
 use axum::{
+    Json, Router,
     extract::{ConnectInfo, State},
     http::StatusCode,
-    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    http::{HeaderMap, HeaderValue, header::RETRY_AFTER},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
@@ -38,16 +38,16 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tower_http::timeout::TimeoutLayer;
 
-use crate::commands::run_metrics::RuntimeMetricsSnapshot;
 use crate::config::{
-    schema::AdminNotificationKafkaConfig, schema::AdminProbeAuthMode,
-    schema::AdminSignalIngressKafkaConfig, schema::AdminTlsConfig, AppConfig,
+    AppConfig, schema::AdminNotificationKafkaConfig, schema::AdminProbeAuthMode,
+    schema::AdminSignalIngressKafkaConfig, schema::AdminTlsConfig,
 };
 use crate::error::AppError;
 use crate::redaction::redact_secrets;
+use crate::runtime::metrics::RuntimeMetricsSnapshot;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared state that the main event loop writes and the admin handlers read.
@@ -498,11 +498,10 @@ pub struct AdminState {
     /// snapshot", which any pipeline without `[incremental_snapshot]` legitimately is,
     /// and which the signal path reports rather than papers over.
     ///
-    /// This used to be an `mpsc::Sender<SnapshotRequest>` feeding a hand-built bridge —
-    /// a request type, a oneshot reply, and a drain point in the event loop — because
-    /// every control operation on `CdcRuntime` took `&mut self` and the loop owns that
-    /// borrow for its lifetime. rustcdc 0.11's `RuntimeControl` is that bridge, written
-    /// once upstream where the invariants live, so all of it is gone.
+    /// Every control operation on `CdcRuntime` takes `&mut self` and the event loop owns
+    /// that borrow for its lifetime, so reaching the runtime from a handler needs a
+    /// bridge. `RuntimeControl` is that bridge, defined upstream where the invariants
+    /// live rather than hand-built here out of a request type and a oneshot reply.
     runtime_control: Arc<std::sync::OnceLock<rustcdc::core::RuntimeControl>>,
     signal_inflight: Arc<DashMap<(String, String), ()>>,
     /// How long the Kafka ingress loop waits for a dispatched signal to reach a terminal
@@ -1016,7 +1015,7 @@ impl AdminState {
                 // Every reconnect backoff races the shutdown watch, so a stop request is
                 // honoured within the current poll rather than after a full backoff.
                 macro_rules! backoff_or_stop {
-                    ($d:expr) => {
+                    ($d:expr_2021) => {
                         tokio::select! {
                             _ = tokio::time::sleep($d) => {}
                             _ = shutdown.changed() => break,
@@ -1125,15 +1124,15 @@ impl AdminState {
                         let outcome = worker_state.ingest_kafka_signal_batch(records).await;
                         let ingested_records = outcome.ingested;
 
-                        if outcome.commit {
-                            if let Err(error) = consumer.commit().await {
-                                tracing::warn!(
-                                    target: "rustcdc_audit",
-                                    action = "signal_ingress_kafka_commit_failed",
-                                    error = %error,
-                                    "failed committing kafka signal ingress offsets"
-                                );
-                            }
+                        if outcome.commit
+                            && let Err(error) = consumer.commit().await
+                        {
+                            tracing::warn!(
+                                target: "rustcdc_audit",
+                                action = "signal_ingress_kafka_commit_failed",
+                                error = %error,
+                                "failed committing kafka signal ingress offsets"
+                            );
                         }
 
                         if ingested_records > 0 {
@@ -1563,9 +1562,9 @@ impl AdminState {
     /// one poll, which is the right trade for a number an operator refreshes in a
     /// dashboard.
     ///
-    /// Before rustcdc 0.11 there was no way to answer this at all: an operator who fired
-    /// `execute_snapshot` learned how many tables were accepted and nothing after that,
-    /// which for a multi-hour backfill was the entire operational experience.
+    /// Without it an operator who fires `execute_snapshot` learns how many tables were
+    /// accepted and nothing after that, which for a multi-hour backfill is the entire
+    /// operational experience.
     fn incremental_snapshot_progress(&self) -> Option<rustcdc::IncrementalSnapshotState> {
         self.runtime_control
             .get()
@@ -2622,12 +2621,8 @@ impl AdminState {
             // `LogMarker` is the marker; writing the audit entry *is* the work.
             SignalActionType::LogMarker => Ok(serde_json::Value::Null),
 
-            // Real operations since rustcdc 0.11. These returned `501` in the previous
-            // release because the runtime had no such control — and before *that* they
-            // answered `200 OK` and recorded `PAUSED` / `RESUMED` / `ABORTED` while doing
-            // nothing at all.
-            //
-            // The live change stream is untouched in every case: only chunk reading is
+            // Real operations, routed through `RuntimeControl`. The live change stream is
+            // untouched in every case: only chunk reading is
             // affected, so a backfill loading a production primary during business hours
             // can be held until the evening without stopping capture.
             SignalActionType::PauseSnapshot => {
@@ -2886,16 +2881,15 @@ fn resolve_audit_ip_salt(cfg: &crate::config::schema::AdminConfig) -> [u8; 16] {
             // `get` rather than `&val[..32]`: the index is a byte offset, so a value that
             // is not ASCII — a pasted passphrase rather than hex — would panic at startup
             // instead of taking the documented warning path below.
-            if let Some(prefix) = val.get(..32) {
-                if let Ok(bytes) = hex::decode(prefix) {
-                    if let Ok(arr) = <[u8; 16]>::try_from(bytes.as_slice()) {
-                        tracing::debug!(
-                            env_var = %env_name,
-                            "audit IP pseudonymisation: stable salt loaded from env"
-                        );
-                        return arr;
-                    }
-                }
+            if let Some(prefix) = val.get(..32)
+                && let Ok(bytes) = hex::decode(prefix)
+                && let Ok(arr) = <[u8; 16]>::try_from(bytes.as_slice())
+            {
+                tracing::debug!(
+                    env_var = %env_name,
+                    "audit IP pseudonymisation: stable salt loaded from env"
+                );
+                return arr;
             }
             tracing::warn!(
                 env_var = %env_name,
@@ -2950,10 +2944,10 @@ fn slo_reasons(data: &AdminStateData) -> Vec<String> {
         InstanceState::Error => reasons.push("pipeline in error state".to_string()),
     }
 
-    if let Some(age) = data.checkpoint_age_seconds {
-        if age > 300.0 {
-            reasons.push(format!("checkpoint age {age:.3}s exceeds 300s threshold"));
-        }
+    if let Some(age) = data.checkpoint_age_seconds
+        && age > 300.0
+    {
+        reasons.push(format!("checkpoint age {age:.3}s exceeds 300s threshold"));
     }
 
     if let Some(latency_us) = data.last_admin_api_latency_us {
@@ -2976,12 +2970,12 @@ fn slo_reasons(data: &AdminStateData) -> Vec<String> {
         ));
     }
 
-    if let Some(recovery) = data.restart_recovery_seconds {
-        if recovery > 30.0 {
-            reasons.push(format!(
-                "restart recovery {recovery:.3}s exceeds 30s threshold"
-            ));
-        }
+    if let Some(recovery) = data.restart_recovery_seconds
+        && recovery > 30.0
+    {
+        reasons.push(format!(
+            "restart recovery {recovery:.3}s exceeds 30s threshold"
+        ));
     }
 
     if signal_health.without_terminal_total > 0 {
@@ -3197,13 +3191,11 @@ async fn livez(State(admin): State<AdminState>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "error").into_response();
     }
 
-    if source_consecutive_errors >= READYZ_SOURCE_CONSECUTIVE_ERROR_THRESHOLD {
-        if let Some(since) = degraded_since {
-            if since.elapsed() > LIVEZ_DEGRADED_TIMEOUT {
-                return (StatusCode::SERVICE_UNAVAILABLE, "source-degraded-timeout")
-                    .into_response();
-            }
-        }
+    if source_consecutive_errors >= READYZ_SOURCE_CONSECUTIVE_ERROR_THRESHOLD
+        && let Some(since) = degraded_since
+        && since.elapsed() > LIVEZ_DEGRADED_TIMEOUT
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "source-degraded-timeout").into_response();
     }
 
     (StatusCode::OK, "alive").into_response()
@@ -3425,8 +3417,8 @@ async fn metrics(
 /// The panic payload is deliberately **not** returned to the caller: a panic message can
 /// carry file paths and fragments of internal state, and the admin API is reachable by any
 /// read-scoped token. It goes to the log, where it is already trusted with more than that.
-fn panic_guard(
-) -> tower_http::catch_panic::CatchPanicLayer<fn(Box<dyn std::any::Any + Send + 'static>) -> Response>
+fn panic_guard()
+-> tower_http::catch_panic::CatchPanicLayer<fn(Box<dyn std::any::Any + Send + 'static>) -> Response>
 {
     fn on_panic(panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
         let detail = panic
@@ -3597,3 +3589,6 @@ pub async fn serve(
 mod auth_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod kafka_tests;

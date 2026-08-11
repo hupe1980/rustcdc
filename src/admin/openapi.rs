@@ -26,7 +26,7 @@
 //! dozen fields whose names are already asserted by the handler tests, and duplicating them
 //! here would create a second thing to keep in step for no gain.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Every path the admin router serves, in the order the router declares them.
 ///

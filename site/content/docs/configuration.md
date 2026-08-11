@@ -430,7 +430,7 @@ are compiled into the binary.
 | `avro_confluent` | Confluent 5-byte header + Avro | required |
 | `json_schema_confluent` | Confluent 5-byte header + JSON | required |
 | `protobuf_confluent` | Confluent header + message-index path + protobuf | required |
-| `glue_avro` | AWS Glue 18-byte header + Avro | AWS Glue (`glue` feature) |
+| `glue_avro` | AWS Glue 18-byte header + Avro | AWS Glue |
 | `cloud_events` | CloudEvents 1.0 JSON envelope | — |
 
 Prefer `avro_confluent` over bare `avro` whenever a registry is available. Avro
@@ -522,12 +522,6 @@ Credentials and region come from the standard AWS chain (environment,
 `~/.aws/credentials`, instance/task role, EKS web identity) — the same chain the
 Kafka sink's `aws_msk_iam` mechanism uses, so one IAM identity covers both.
 
-**Requires the `glue` cargo feature.** It is compiled into the published container
-image; a source build needs `cargo build --features glue`, because Glue pulls the
-AWS SDK (~45 crates) that no other deployment needs. Without it, a `glue_avro`
-codec is rejected at startup naming the remedy rather than falling back to another
-framing.
-
 > Glue is the one backend with no live-service evidence anywhere in the stack —
 > there is no self-hostable implementation to test against. rustcdc covers the
 > Avro conversion, framing, compression byte, schema identity, error
@@ -556,6 +550,7 @@ namespace  = "cdc"
 table_name = "events"
 table_path = "/var/lib/rustcdc/iceberg/events"   # local staging/table path (required)
 
+# Exactly one catalog table: [sink.catalog.rest] or [sink.catalog.s3tables]
 [sink.catalog.rest]
 uri       = "https://rest-catalog.example.com"
 warehouse = "s3://my-warehouse/cdc"
@@ -582,6 +577,49 @@ older_than_ms = 604800000   # 7 days — the time-travel window readers keep
 retain_last   = 10          # always keep at least this many snapshots
 interval_ms   = 3600000     # minimum gap between expiry runs
 ```
+
+### Catalog: REST or S3 Tables
+
+The catalog is chosen by the table key, and exactly one may appear. `[sink.catalog.rest]`
+covers every Iceberg REST catalog — Polaris, Nessie, Gravitino, Lakekeeper, Unity, or a
+self-hosted one. `[sink.catalog.s3tables]` selects AWS S3 Tables:
+
+```toml
+[sink]
+type       = "iceberg"
+namespace  = "cdc"
+table_name = "events"
+table_path = "/var/lib/rustcdc/iceberg/events"
+
+[sink.catalog.s3tables]
+table_bucket_arn = "arn:aws:s3tables:eu-central-1:123456789012:bucket/lakehouse"
+# endpoint_url   = "https://s3tables.eu-central-1.amazonaws.com"   # VPC endpoint / emulator
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `table_bucket_arn` | yes | The S3 Tables table-bucket ARN. Validated at load: a value that is not an `arn:…:s3tables:…` is refused rather than left to fail as an opaque signing error on the first flush |
+| `endpoint_url` | no | Regional default unless set. Use for a VPC endpoint or a local emulator |
+
+There is deliberately no place to write an access key. Credentials come from the standard
+AWS chain — environment, profile, IMDS, EKS web identity — the same chain the `glue` codec
+and MSK IAM authentication use.
+
+**Why this is worth choosing for a CDC change log.** Because nothing merges, this sink
+writes many small data files, and a terminal commit failure leaves data files no snapshot
+references (`rustcdc_iceberg_orphaned_data_files_total`). S3 Tables runs compaction,
+snapshot expiry and unreferenced-file removal as a managed service, which is exactly that
+maintenance burden. Set `[sink.snapshot_expiry]` only for the REST path; letting both this
+sink and the service expire snapshots is duplicated work, not belt-and-braces.
+
+It does **not** turn the change log into a table. Deduplicating to current-row state is
+still a `MERGE INTO` or a view on the reader's side — see the note at the top of this
+section.
+
+**No `[sink.storage]` for S3 Tables.** The service owns the underlying bucket and supplies
+the file IO for it; configuring an OpenDAL storage backend here would point writes at a
+bucket the catalog does not manage, which is how data files end up referenced by nothing.
+
 
 | Field | Default | Description |
 |---|---|---|
@@ -650,6 +688,221 @@ sink          = "kafka_all"
 Routes are evaluated top-to-bottom; the first match wins. Route patterns and the
 source-side `table_include_list` / `table_exclude_list` use the **same** matcher — see
 [Table patterns](#table-patterns) below.
+
+**Routes and named sinks must line up exactly**, and startup refuses three mismatches
+before a single connection is opened:
+
+| Mistake | Why it is refused |
+|---|---|
+| A route names a sink that no `[[sinks]]` entry declares | A typo would otherwise send that table's events to the default `[sink]` |
+| A `[[sinks]]` entry that no route references | It is built — a Kafka producer, an HTTP client, a TLS handshake — and then never receives an event. This is what a mistyped route name leaves behind, and it used to start cleanly |
+| Two routes referencing the same named sink | One binding cannot be owned by two routes. Give the second route its own `[[sinks]]` entry, or merge the patterns |
+
+`rustcdc validate-config` reports all three without contacting anything.
+
+
+### Snowflake (`type = "snowflake"`)
+
+Streams rows into Snowflake through the [Snowpipe Streaming high-performance REST
+API][sf-api] — a pure HTTP path, no JDBC and no Java SDK.
+
+```toml
+[sink]
+type        = "snowflake"
+account_url = "https://myorg-myaccount.snowflakecomputing.com"
+account     = "MYORG-MYACCOUNT"          # as it appears in the JWT claims
+user        = "CDC_SVC"
+private_key = { env = "SNOWFLAKE_PRIVATE_KEY" }   # PKCS#8 PEM
+database    = "CDC"
+schema      = "PUBLIC"
+pipe        = "EVENTS_PIPE"
+channel     = "rustcdc"                  # one channel = one ordered stream
+
+# Batching
+batch_max_rows     = 10000
+batch_max_bytes    = 3145728   # < the API's 4 MiB per-request limit
+batch_max_delay_ms = 1000
+
+# Durability
+commit_timeout_ms  = 60000
+commit_poll_ms     = 250
+
+# Authentication — exactly one of the three below
+[sink.auth]
+type        = "key_pair"
+private_key = { env = "SNOWFLAKE_PRIVATE_KEY" }     # PKCS#8 PEM
+passphrase  = { env = "SNOWFLAKE_KEY_PASSPHRASE" }  # only for an ENCRYPTED key
+```
+
+#### Authentication
+
+All four of Snowflake's REST methods reduce to the same two things: an `Authorization:
+Bearer …` value and an `X-Snowflake-Authorization-Token-Type` naming what kind of credential
+it is. That credential is exchanged once at `POST /oauth/token` for a **scoped** token valid
+only for Snowpipe Streaming, and it is the scoped token that every later request carries.
+
+```toml
+# Key pair — the classic service-account method
+[sink.auth]
+type        = "key_pair"
+private_key = { env = "SNOWFLAKE_PRIVATE_KEY" }
+passphrase  = { env = "SNOWFLAKE_KEY_PASSPHRASE" }   # iff the key is encrypted
+
+# Programmatic access token — simpler, and a bearer secret at rest
+[sink.auth]
+type  = "programmatic_access_token"
+token = { env = "SNOWFLAKE_PAT" }
+
+# Workload identity federation — no long-lived credential at all
+[sink.auth]
+type       = "workload_identity"
+provider   = "oidc"     # oidc | aws | azure | gcp
+token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+```
+
+**Encrypted keys are the common case.** `snowsql`'s own key-generation recipe produces
+`-----BEGIN ENCRYPTED PRIVATE KEY-----` by default. Both forms are accepted, and the
+mismatch is refused **at load** in both directions — an encrypted key with no `passphrase`,
+and a `passphrase` given for an unencrypted key. Guessing which of the two the operator got
+wrong would be worse than saying so, and the alternative is a decryption error at the first
+flush that reads like a corrupt key.
+
+**Prefer workload identity where the platform offers it.** There is no key to rotate, leak,
+or forget to revoke; Snowflake verifies a short-lived attestation against the issuer's
+signing keys. The attestation is **re-read from `token_file` on every exchange**, because
+Kubernetes rewrites a projected service-account token in place at 80 % of its lifetime — a
+token cached at startup stops working within the hour, and that failure looks like an outage
+rather than a stale read.
+
+```sql
+-- The Snowflake side of workload identity federation
+CREATE USER cdc_svc TYPE = SERVICE
+  WORKLOAD_IDENTITY = (
+    TYPE = OIDC
+    ISSUER = 'https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLE'
+    SUBJECT = 'system:serviceaccount:cdc:rustcdc'
+  );
+```
+
+**This is the only sink here that is exactly-once without a Kafka transaction.**
+
+A Snowpipe Streaming *channel* carries an **offset token**: a string attached to a batch,
+which Snowflake persists once those rows are committed, and returns when the channel is
+reopened. That is the same contract this server's checkpoint store provides — enforced on
+the destination side — so after a crash the sink can ask Snowflake what it already has
+rather than guessing. `delivery_contract = "effectively_once"` is accepted with this sink
+and no Kafka anywhere.
+
+**Why `flush` is slower than you might expect, and must be.** `Append Rows` returning `200`
+means Snowflake *buffered* the rows, not that they are durable — and reopening a channel
+**discards uncommitted buffered rows**. A flush that returned on the append would let the
+pipeline checkpoint past rows that vanish on the next restart. So `flush` appends and then
+waits for the channel's committed offset token to reach the batch, bounded by
+`commit_timeout_ms`. Exceeding that bound fails the flush; it does not advance anything.
+
+**Setup on the Snowflake side.** Create the pipe and grant the service user on it, then
+register the public key:
+
+```sql
+CREATE PIPE cdc.public.events_pipe AS
+  COPY INTO cdc.public.events FROM TABLE (DATA_SOURCE(TYPE => 'STREAMING'))
+  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE;
+
+ALTER USER cdc_svc SET RSA_PUBLIC_KEY = 'MIIBIjANBgkq...';
+GRANT OPERATE, MONITOR ON PIPE cdc.public.events_pipe TO ROLE cdc_role;
+```
+
+The fingerprint Snowflake matches is `SHA256:` plus base64 of the SHA-256 over the DER
+public key — what this produces:
+
+```bash
+openssl rsa -pubin -in rsa_key.pub -outform DER \
+  | openssl dgst -sha256 -binary | openssl enc -base64 -A
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `account_url` | — | Must be `https://` unless loopback. The JWT and the scoped token are both bearer credentials |
+| `account` / `user` | — | Upper-cased into the JWT `iss`/`sub`. A lower-cased value fails with "JWT token is invalid" and names neither |
+| `auth` | — | `key_pair`, `programmatic_access_token` or `workload_identity`. See above |
+| `channel` | `"rustcdc"` | Give each pipeline its own. Two writers on one channel fence each other in a loop |
+| `commit_timeout_ms` | `60000` | A durability bound, not a latency knob |
+| `resume_scan_max_events` | `1000000` | Events scanned while skipping past an already-committed token on resume. Exhausting it is at-least-once for that window, logged and counted |
+
+**Metrics.** `rustcdc_sink_snowflake_rows_appended_total`,
+`…_rows_skipped_on_resume_total` (non-zero after a crash between commit and checkpoint —
+that is the window this design exists for), `…_channel_reopens_total` (climbing means a
+second writer shares the channel name), `…_commit_wait_ms_total`, and
+`…_resume_scan_exhausted_total` (alert on any increase).
+
+**Coverage.** The sink's contract — the commit wait, the stale-sequencer recovery, resume
+filtering, NDJSON framing — is asserted against a local fake of the API in
+`tests/snowflake_contract.rs`, which runs on every build. What the fake cannot prove is that
+the request shapes match the live service; there is no account-backed suite yet, and the
+[maturity table](https://github.com/hupe1980/rustcdc-server#connector-maturity) says so.
+
+[sf-api]: https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-rest-api
+
+
+### Databricks (`type = "zerobus"`)
+
+Pushes events straight into a Unity Catalog Delta table via
+[Zerobus Ingest][zb] — no message bus in between.
+
+```toml
+[sink]
+type              = "zerobus"
+endpoint          = "https://<workspace-id>.zerobus.<region>.cloud.databricks.com"
+unity_catalog_url = "https://<workspace>.cloud.databricks.com"
+table             = "main.cdc.events"    # three-part Unity Catalog name
+
+[sink.auth]
+type          = "oauth"                  # service-principal M2M
+client_id     = "<service-principal-id>"
+client_secret = { env = "DATABRICKS_CLIENT_SECRET" }
+
+# Durability and batching
+ack_timeout_ms       = 45000
+flush_interval_ms    = 1000
+max_inflight_records = 10000
+recovery_enabled     = true
+```
+
+**`at_least_once` — and this is where it differs from Snowflake.** Both services acknowledge
+durability; only one lets a client resume. Zerobus streams are *ephemeral*: the service
+definition reserves `last_offset_id` and documents reopening a stream by `stream_id` as
+`NOT SUPPORTED`, so after a crash there is nothing to ask "what did you already commit?".
+A replayed batch is re-ingested.
+
+What the acknowledgement does buy is the absence of **loss**:
+`durability_ack_up_to_offset` means every record at or below it is durable, and `flush()`
+does not return until the batch is covered. Duplicates possible, loss not.
+
+Deduplicate downstream on the primary key plus `source.offset`, or use `MERGE INTO`.
+
+**One stream writes one table**, and ordering is guaranteed per stream. Route to several
+tables with `[[pipeline.routes]]`.
+
+| Field | Default | Notes |
+|---|---|---|
+| `endpoint` / `unity_catalog_url` | — | Must be `https://` unless loopback |
+| `table` | — | Three-part `catalog.schema.table`; a wrong shape is refused at load, not at first flush |
+| `auth` | — | `oauth` (service principal). `no_auth` exists for a loopback endpoint and is refused for anything else |
+| `ack_timeout_ms` | `45000` | A durability bound. Must sit at least 5 s below `runtime.sink_flush_timeout_ms`, or the runtime cancels the wait after the records are sent — refused at load |
+| `recovery_enabled` | `true` | Let the SDK re-establish a dropped stream and re-send unacknowledged records. Those were never acknowledged, so re-sending cannot lose anything |
+
+**Metrics.** `rustcdc_sink_zerobus_records_ingested_total`, `…_ack_wait_ms_total` (the
+dominant latency, and deliberate) and `…_stream_opens_total` — a climbing open count means
+the stream keeps dropping, and every reopen re-sends unacknowledged records, so it is also a
+duplicate source.
+
+**Coverage.** The durability wait, the failure path, JSON framing and the advertised contract
+are asserted in `tests/zerobus_contract.rs` against an in-process fake built from the SDK's
+**own generated server trait** — the same protobuf a real server implements, so a contract
+change stops it compiling. There is no workspace-backed suite; the
+[maturity table](https://github.com/hupe1980/rustcdc-server#connector-maturity) says so.
+
+[zb]: https://docs.databricks.com/aws/en/ingestion/zerobus-overview
 
 
 ## 4. State backends (`[state]`)
@@ -905,7 +1158,7 @@ forward progress instead of halting on them.
 ```toml
 [dlq]
 enabled   = true
-type      = "file"                          # file | kafka
+type      = "file"                          # file | kafka | sqs
 path      = "/var/lib/rustcdc/dlq.jsonl"
 max_bytes = 134217728                       # refuse writes beyond this, do not grow unbounded
 ```
@@ -921,6 +1174,54 @@ topic   = "cdc.dlq"
 protocol = "sasl_ssl"
 mechanism = "scram-sha-512"
 ```
+
+```toml
+[dlq]
+enabled          = true
+type             = "sqs"
+queue_url        = "https://sqs.eu-central-1.amazonaws.com/123456789012/cdc-dlq"
+# region         = "eu-central-1"           # inferred from the URL when absent
+# message_group_id = "rustcdc-dlq"          # FIFO queues only (URL ends `.fifo`)
+```
+
+**Quarantined records contain row data.** They are a copy of the event *after* the
+transform pipeline — so masking applies — but the target still needs the same protection,
+retention policy and access control as the sink itself. A dead-letter file on a shared
+volume, or a topic anyone can read, is an unlogged copy of your database.
+
+#### Why SQS is a dead-letter target and **not** a sink
+
+Worth stating, because the two look interchangeable and are not.
+
+A dead-letter queue is a **terminal work queue**: a human or a repair job reads a record,
+acts on it, and deletes it. That is exactly what SQS is, and it brings two things the file
+and Kafka targets cannot — **redrive-to-source**, which replays a DLQ back to its origin
+with one API call, and broker-level age alarms (`ApproximateAgeOfOldestMessage`) that page
+someone when a quarantined record goes stale. It also closes a real hole: before this, the
+only durable target was a Kafka topic, so an AWS deployment writing to Snowflake or Iceberg
+with no Kafka anywhere had nothing but a file on a pod filesystem — gone at exactly the
+moment you reach for it.
+
+A **sink** is the opposite shape. A CDC consumer re-reads history: it joins late, replays
+from a position, runs a second consumer group for a backfill. SQS consumers *delete* what
+they read, retention caps at 14 days, there are no consumer groups and no compaction, and
+FIFO deduplication covers a **5-minute** window — which cannot underpin any delivery
+contract this server advertises. Offering it as a sink would mean a destination that looks
+like the others and silently supports neither replay nor `effectively_once`. Use Kafka,
+Kinesis, or Iceberg/Snowflake for that.
+
+**The 256 KB limit, and what happens at it.** SQS refuses a message body above 256 KiB, and
+"too large for the sink" is one of the commonest reasons an event is quarantined — so this
+limit is met by exactly the records that most need recording. Refusing the write would turn
+one oversized event into a permanent crash loop, because a DLQ write failure is fatal by
+design. Instead the **payload** is dropped and everything actionable is kept — source
+offset, table, sink, error, original size — with `payload_truncated: true` on the record, a
+`WARN` in the audit log, and a counter. Replay from the source offset; the row is still
+upstream. Use `file` or `kafka` if the payload copy itself matters.
+
+Credentials come from the standard AWS chain (environment, profile, IMDS, EKS web identity)
+— the same chain the `glue` codec, the S3 Tables catalog and MSK IAM use. There is nowhere
+to write an access key.
 
 **It is off by default, and that is deliberate.** Quarantining an event advances the
 checkpoint past something that was never delivered. That is data loss — recorded rather
@@ -1261,10 +1562,23 @@ status_rate_limit_burst  = 40
 trusted_proxy_ips = ["10.0.0.1", "10.0.0.2"]
 ```
 
-**How the buckets behave.** Each endpoint has its own token bucket **per client key** —
-the peer IP, or the `X-Forwarded-For` client when the peer is in `trusted_proxy_ips`. One
+**How the buckets behave.** Each endpoint has its own token bucket **per client key**. One
 noisy peer cannot exhaust another's budget. A client seen for the first time starts with
 the full configured `burst`, and the bucket refills at `rps`.
+
+**How the client key is chosen.** If the peer address is not in `trusted_proxy_ips`, the
+key is the peer address and no header is consulted. If it is, `X-Forwarded-For` is read
+**right to left**: entries that are themselves in `trusted_proxy_ips` are skipped, and the
+first remaining address is the client. That address must be globally routable — loopback,
+private, link-local, carrier-grade-NAT and documentation ranges are rejected — otherwise
+the key falls back to `X-Real-IP` and then to the peer address.
+
+Right-to-left is the security-relevant part. `X-Forwarded-For` is append-only: your proxy
+adds the address it observed to the **end**, so everything to the left of that is whatever
+the client typed. Reading the header left to right would let any caller choose its own
+bucket, and rotate it on every request. Leave `trusted_proxy_ips` empty unless the admin
+listener really is behind a proxy you control — an empty list means headers are never
+consulted at all.
 
 The exception is deliberate: once the limiter is tracking a large number of distinct
 client keys — the signature of an attacker rotating source addresses — a *new* key is
@@ -1557,6 +1871,7 @@ otlp_metrics_endpoint      = "http://otel-collector:4317"   # separate endpoint 
 otlp_metrics_interval_secs = 30
 otlp_protocol              = "grpc"    # grpc | http
 service_name               = "rustcdc-server"
+otlp_allow_insecure        = false     # permit plaintext export to a remote collector
 ```
 
 | Field | Default | Description |
@@ -1566,6 +1881,7 @@ service_name               = "rustcdc-server"
 | `otlp_metrics_interval_secs` | `30` | Metrics export interval |
 | `otlp_protocol` | `"grpc"` | `"grpc"` or `"http"`. Anything else is **rejected at load** — a wrong value is invisible at runtime, because the exporter simply talks the other protocol at the collector and nothing arrives |
 | `service_name` | `"rustcdc-server"` | Service name in telemetry |
+| `otlp_allow_insecure` | `false` | Permit plaintext (`http://`) export to a **non-loopback** collector. Development only — OTLP spans carry table names, column names and source offsets |
 
 `otlp_protocol = "http"` selects OTLP/HTTP with protobuf encoding — the collector's
 `:4318` listener. Give the **base** URL and the signal path is appended for you
@@ -1582,8 +1898,14 @@ An endpoint that already carries a path is used exactly as written, which is the
 hatch for a collector behind a prefix (`https://gw.example.com/otlp/v1/traces`).
 
 The plaintext guard is about the **transport**, not the protocol: `http://` to a
-non-loopback host is refused for either protocol unless `OTLP_ALLOW_INSECURE=1` is set.
+non-loopback host is refused for either protocol unless `otlp_allow_insecure = true`.
 `otlp_protocol = "http"` against an `https://` endpoint is the normal production shape.
+
+That override used to be the environment variable `OTLP_ALLOW_INSECURE=1`, read inside the
+telemetry validator and declared nowhere. A security-relevant switch that lives outside the
+configuration file cannot be seen by `validate-config`, does not appear in `GET /config`,
+and is invisible to the review that reads the rest of these settings. It is a field now,
+like everything else here.
 
 
 ## 9. Environment variables

@@ -274,7 +274,7 @@ async fn stdout_sink_full_conformance_suite() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MemorySinkAdapter (rustcdc 0.4.0) — conformance and new method coverage
+// MemorySinkAdapter — conformance and per-method coverage
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

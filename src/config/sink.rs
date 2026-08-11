@@ -17,12 +17,567 @@ pub enum SinkConfig {
     Http(HttpSinkConfig),
     Kafka(KafkaSinkConfig),
     Iceberg(IcebergSinkConfig),
+    /// Snowflake, via the Snowpipe Streaming high-performance REST API.
+    Snowflake(SnowflakeSinkConfig),
+    /// Databricks Unity Catalog Delta tables, via Zerobus Ingest.
+    Zerobus(Box<ZerobusSinkConfig>),
     /// Deliver each event to all child sinks in sequence.
     ///
     /// The effective delivery guarantee is the weakest guarantee of any child
     /// sink.  All child sinks must flush successfully before the pipeline
     /// advances its checkpoint.
     Fan(FanSinkConfig),
+}
+
+/// How the sink authenticates to Snowflake.
+///
+/// All four of Snowflake's REST authentication methods reduce to the same two things: an
+/// `Authorization: Bearer …` value and an `X-Snowflake-Authorization-Token-Type` naming
+/// what kind of credential it is. That credential is then exchanged at `POST /oauth/token`
+/// for a **scoped** token valid only for Snowpipe Streaming, and it is the scoped token —
+/// never this one — that every subsequent request carries.
+///
+/// The token-type header is documented as optional, and it is sent anyway: without it
+/// Snowflake *guesses*, and its guess is `OAUTH`. A key-pair JWT that arrives unlabelled is
+/// therefore judged as an OAuth token and rejected with a message about the wrong thing.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SnowflakeAuthConfig {
+    /// RSA key pair. The classic service-account method.
+    KeyPair {
+        /// PKCS#8 PEM private key.
+        ///
+        /// A deferred reference — `{ env = "SNOWFLAKE_PRIVATE_KEY" }` — never an inline
+        /// literal; the loader rejects literals for every secret field.
+        ///
+        /// Both `-----BEGIN PRIVATE KEY-----` and `-----BEGIN ENCRYPTED PRIVATE KEY-----`
+        /// are accepted; the latter needs `passphrase`.
+        private_key: SecretString,
+        /// Passphrase for an encrypted PKCS#8 key.
+        ///
+        /// Required if and only if the key is encrypted — `snowsql`'s own key-generation
+        /// recipe produces an encrypted key by default, so this is the common case rather
+        /// than the exotic one. A missing passphrase for an encrypted key is refused at
+        /// load with a message that says which of the two it found.
+        #[serde(default)]
+        passphrase: Option<SecretString>,
+    },
+    /// A programmatic access token: a long-lived secret bound to a role.
+    ///
+    /// Simpler than a key pair and correspondingly blunter — it cannot be scoped by
+    /// fingerprint and it is a bearer secret at rest. Prefer `workload_identity` where the
+    /// platform offers it.
+    ProgrammaticAccessToken { token: SecretString },
+    /// Workload identity federation: no long-lived credential at all.
+    ///
+    /// The platform issues a short-lived attestation — a projected Kubernetes
+    /// service-account token, a SPIFFE JWT-SVID, a cloud metadata token — and Snowflake
+    /// verifies it against the issuer's signing keys. This is the method to reach for when
+    /// the platform supports it: there is no key to rotate, leak or forget to revoke.
+    WorkloadIdentity {
+        /// Which identity provider issued the attestation.
+        provider: SnowflakeWorkloadIdentityProvider,
+        /// File the attestation is read from, on every exchange.
+        ///
+        /// Re-read rather than cached because these tokens are deliberately short-lived and
+        /// the platform rewrites the file in place — Kubernetes refreshes a projected token
+        /// at 80 % of its lifetime. A token read once at startup stops working within the
+        /// hour, and the failure looks like an outage rather than a stale read.
+        token_file: std::path::PathBuf,
+    },
+}
+
+/// Identity providers Snowflake accepts an attestation from.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnowflakeWorkloadIdentityProvider {
+    /// Any OIDC issuer — EKS, AKS, GKE, SPIFFE/SPIRE, or a custom one.
+    Oidc,
+    Aws,
+    Azure,
+    Gcp,
+}
+
+impl SnowflakeWorkloadIdentityProvider {
+    /// The token prefix Snowflake expects: `WIF.<PROVIDER>.<attestation>`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Oidc => "OIDC",
+            Self::Aws => "AWS",
+            Self::Azure => "AZURE",
+            Self::Gcp => "GCP",
+        }
+    }
+}
+
+impl SnowflakeAuthConfig {
+    /// The `X-Snowflake-Authorization-Token-Type` value for this method.
+    pub fn token_type(&self) -> &'static str {
+        match self {
+            Self::KeyPair { .. } => "KEYPAIR_JWT",
+            Self::ProgrammaticAccessToken { .. } => "PROGRAMMATIC_ACCESS_TOKEN",
+            Self::WorkloadIdentity { .. } => "WORKLOAD_IDENTITY_FEDERATION",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::KeyPair {
+                private_key,
+                passphrase,
+            } => {
+                validate_optional_secret(
+                    &Some(private_key.clone()),
+                    "sink.snowflake.auth.private_key",
+                )?;
+                let pem = private_key
+                    .resolve()
+                    .map_err(|e| format!("sink.snowflake.auth.private_key: {e}"))?;
+                let encrypted = pem.contains("BEGIN ENCRYPTED PRIVATE KEY");
+
+                // Both directions, because both fail at the first flush otherwise — and one
+                // of them fails with a decryption error that reads like a corrupt key.
+                if encrypted && passphrase.is_none() {
+                    return Err(
+                        "sink.snowflake.auth.private_key is an ENCRYPTED PKCS#8 key but no \
+                         `passphrase` was given. `snowsql`'s own key-generation recipe \
+                         produces an encrypted key by default, so this is the usual case."
+                            .to_string(),
+                    );
+                }
+                if !encrypted && passphrase.is_some() {
+                    return Err(
+                        "sink.snowflake.auth.passphrase was given but the private key is not \
+                         encrypted (it begins `-----BEGIN PRIVATE KEY-----`). One of the two \
+                         is wrong, and guessing which would be worse than saying so."
+                            .to_string(),
+                    );
+                }
+                if let Some(passphrase) = passphrase {
+                    validate_optional_secret(
+                        &Some(passphrase.clone()),
+                        "sink.snowflake.auth.passphrase",
+                    )?;
+                }
+                if !pem.contains("PRIVATE KEY") {
+                    return Err(
+                        "sink.snowflake.auth.private_key does not look like a PEM private \
+                         key; it must be PKCS#8 (`-----BEGIN PRIVATE KEY-----` or \
+                         `-----BEGIN ENCRYPTED PRIVATE KEY-----`)"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            Self::ProgrammaticAccessToken { token } => {
+                validate_optional_secret(&Some(token.clone()), "sink.snowflake.auth.token")
+            }
+            Self::WorkloadIdentity { token_file, .. } => {
+                if token_file.as_os_str().is_empty() {
+                    return Err("sink.snowflake.auth.token_file must not be empty".to_string());
+                }
+                // Checked at load, because the usual mistake is a projected-volume mount
+                // that never happened — and the symptom is an auth failure at first flush
+                // rather than a missing file.
+                if !token_file.exists() {
+                    return Err(format!(
+                        "sink.snowflake.auth.token_file '{}' does not exist. For a projected \
+                         Kubernetes service-account token, check the volume is mounted.",
+                        token_file.display()
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Snowflake, via the [Snowpipe Streaming high-performance REST API][api].
+///
+/// # Why this sink can be exactly-once without a Kafka transaction
+///
+/// Every other destination here is at-least-once unless a Kafka transaction wraps the
+/// batch and the checkpoint together. Snowpipe Streaming is different: a *channel* carries
+/// an **offset token**, Snowflake persists that token when the rows it accompanied are
+/// committed, and reopening the channel returns the last committed one. That is the same
+/// contract this server's checkpoint store provides, enforced on the destination side —
+/// so the sink can tell, after a crash, exactly what Snowflake already has.
+///
+/// # The subtlety that makes it correct
+///
+/// `Append Rows` returning `200` does **not** mean the rows are durable; it means Snowflake
+/// buffered them. Reopening a channel *discards uncommitted buffered rows*. A `flush()`
+/// that returned as soon as the append succeeded would therefore let the pipeline advance
+/// its checkpoint past rows that a later reopen silently drops — data loss with a green
+/// pipeline.
+///
+/// So `flush()` appends and then **waits for the channel's committed offset token to reach
+/// the batch**, bounded by `commit_timeout_ms`. That is what makes the checkpoint safe, and
+/// it is why this sink reports `idempotent_delivery_capable = true`.
+///
+/// [api]: https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-rest-api
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SnowflakeSinkConfig {
+    /// Account URL, e.g. `https://myorg-myaccount.snowflakecomputing.com`.
+    ///
+    /// The API's own `GET /v2/streaming/hostname` may return a different, ingest-specific
+    /// host; the sink follows it when it does.
+    pub account_url: String,
+
+    /// Login name of the service user the key pair belongs to, e.g. `CDC_SVC`.
+    pub user: String,
+
+    /// Account identifier as it appears in the JWT `iss`/`sub` claims, e.g. `MYORG-MYACCOUNT`.
+    ///
+    /// Separate from `account_url` because the JWT wants the account *identifier* while the
+    /// URL wants a host, and deriving one from the other is wrong for several account
+    /// shapes (privatelink, regionless URLs, custom CNAMEs).
+    pub account: String,
+
+    /// How this pipeline authenticates. See [`SnowflakeAuthConfig`].
+    pub auth: SnowflakeAuthConfig,
+
+    /// Target database, schema and pipe. The pipe defines the table and any transformation.
+    pub database: String,
+    pub schema: String,
+    pub pipe: String,
+
+    /// Channel name. One channel is one ordered stream with one offset token.
+    ///
+    /// Defaults to `rustcdc`. Give each pipeline its own name: two writers sharing a
+    /// channel interleave, and the second to open fences the first.
+    #[serde(default = "default_snowflake_channel")]
+    pub channel: String,
+
+    /// Flush when this many rows have buffered.
+    #[serde(default = "default_snowflake_batch_max_rows")]
+    pub batch_max_rows: usize,
+
+    /// Flush when the buffered NDJSON reaches this many bytes.
+    ///
+    /// The API caps a single `Append Rows` body at 4 MiB, so the default leaves headroom
+    /// and the loader refuses anything at or above the hard limit.
+    #[serde(default = "default_snowflake_batch_max_bytes")]
+    pub batch_max_bytes: usize,
+
+    /// Flush after this long even if neither size threshold is reached.
+    #[serde(default = "default_snowflake_batch_max_delay_ms")]
+    pub batch_max_delay_ms: u64,
+
+    /// How long `flush()` waits for the committed offset token to reach the batch.
+    ///
+    /// This is a durability bound, not a latency knob: exceeding it fails the flush, which
+    /// stops the checkpoint from advancing past rows that may not be durable.
+    #[serde(default = "default_snowflake_commit_timeout_ms")]
+    pub commit_timeout_ms: u64,
+
+    /// Interval between committed-offset polls while waiting.
+    #[serde(default = "default_snowflake_commit_poll_ms")]
+    pub commit_poll_ms: u64,
+
+    /// Per-request HTTP timeout.
+    #[serde(default = "default_snowflake_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+
+    /// Retries for a *retryable* append failure before the flush is reported as failed.
+    #[serde(default = "default_snowflake_max_retries")]
+    pub max_retries: u32,
+
+    /// Events scanned while skipping past an already-committed offset token on resume.
+    ///
+    /// Bounded on purpose. The window only has to cover the one batch that was appended and
+    /// committed but whose checkpoint write did not land, so the default is generous. If it
+    /// is exhausted without finding the token the sink logs loudly, counts it, and resumes
+    /// delivering — at-least-once for that window, said out loud rather than hidden.
+    #[serde(default = "default_snowflake_resume_scan_max_events")]
+    pub resume_scan_max_events: u64,
+}
+
+fn default_snowflake_channel() -> String {
+    "rustcdc".to_string()
+}
+fn default_snowflake_batch_max_rows() -> usize {
+    10_000
+}
+fn default_snowflake_batch_max_bytes() -> usize {
+    3 * 1024 * 1024
+}
+fn default_snowflake_batch_max_delay_ms() -> u64 {
+    1_000
+}
+fn default_snowflake_commit_timeout_ms() -> u64 {
+    // Deliberately below `runtime.sink_flush_timeout_ms` (60 000) with room for the append
+    // and a status poll. The two used to be equal, so the runtime's timeout raced the
+    // sink's own and usually won — cancelling a durability wait mid-flight.
+    45_000
+}
+fn default_snowflake_commit_poll_ms() -> u64 {
+    250
+}
+fn default_snowflake_request_timeout_ms() -> u64 {
+    30_000
+}
+fn default_snowflake_max_retries() -> u32 {
+    5
+}
+fn default_snowflake_resume_scan_max_events() -> u64 {
+    1_000_000
+}
+
+/// The API's hard limit on one `Append Rows` body.
+pub const SNOWFLAKE_MAX_APPEND_BYTES: usize = 4 * 1024 * 1024;
+
+impl SnowflakeSinkConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.account_url, "account_url"),
+            (&self.user, "user"),
+            (&self.account, "account"),
+            (&self.database, "database"),
+            (&self.schema, "schema"),
+            (&self.pipe, "pipe"),
+            (&self.channel, "channel"),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("sink.snowflake.{field} must not be empty"));
+            }
+        }
+
+        // Plaintext is refused for anything but loopback. Not a style preference: the
+        // key-pair JWT authenticates the whole service user, and the scoped token it buys
+        // is a bearer credential too — either one on a cleartext connection is an account
+        // compromise to anyone on the path.
+        //
+        // Loopback is exempt for the same reason `sink.http` exempts it: a local fake or a
+        // sidecar proxy is a real shape, and it is what the contract suite drives.
+        if !self.account_url.starts_with("https://") && !is_loopback_url(&self.account_url) {
+            return Err(format!(
+                "sink.snowflake.account_url '{}' must use https://; the key-pair JWT and the \
+                 scoped token it exchanges for are both bearer credentials. Only loopback \
+                 (127.0.0.1, ::1, localhost) may be plaintext.",
+                self.account_url
+            ));
+        }
+
+        self.auth.validate()?;
+
+        if self.batch_max_rows == 0 {
+            return Err("sink.snowflake.batch_max_rows must be > 0".to_string());
+        }
+        if self.batch_max_bytes == 0 {
+            return Err("sink.snowflake.batch_max_bytes must be > 0".to_string());
+        }
+        if self.batch_max_bytes >= SNOWFLAKE_MAX_APPEND_BYTES {
+            return Err(format!(
+                "sink.snowflake.batch_max_bytes ({}) must be below the API's {SNOWFLAKE_MAX_APPEND_BYTES}-byte \
+                 limit on one Append Rows body, with headroom for the final row",
+                self.batch_max_bytes
+            ));
+        }
+        if self.commit_timeout_ms == 0 {
+            return Err(
+                "sink.snowflake.commit_timeout_ms must be > 0; a zero durability wait would \
+                 let the checkpoint advance past uncommitted rows"
+                    .to_string(),
+            );
+        }
+        if self.commit_poll_ms == 0 {
+            return Err("sink.snowflake.commit_poll_ms must be > 0".to_string());
+        }
+        if self.commit_poll_ms > self.commit_timeout_ms {
+            return Err(format!(
+                "sink.snowflake.commit_poll_ms ({}) must not exceed commit_timeout_ms ({}), or \
+                 the wait gives up before it polls once",
+                self.commit_poll_ms, self.commit_timeout_ms
+            ));
+        }
+        if self.request_timeout_ms == 0 {
+            return Err("sink.snowflake.request_timeout_ms must be > 0".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+/// Databricks [Zerobus Ingest][zb] — a push-based gRPC service that writes directly into a
+/// Unity Catalog Delta table with no message bus in between.
+///
+/// # What it guarantees, and what it does not
+///
+/// **`at_least_once`, and deliberately not more.** This is the opposite conclusion from the
+/// Snowflake sink and the difference is worth being precise about, because both services
+/// acknowledge durability and only one of them lets a client *resume*.
+///
+/// Zerobus streams are **ephemeral**. The service definition reserves `last_offset_id` and
+/// documents reopening a stream by `stream_id` as `NOT SUPPORTED`, so after a crash there is
+/// nothing to ask "what did you already commit?" — offsets are meaningful only within the
+/// life of one stream. Snowpipe Streaming's channel offset token *is* that durable
+/// destination-side record, which is what lets the Snowflake sink filter a replayed batch
+/// and claim `effectively_once`. Here, a replayed batch is re-ingested.
+///
+/// What the durability ack *does* buy is the absence of **loss**:
+/// `IngestRecordResponse.durability_ack_up_to_offset` means every record at or below that
+/// offset is durable, so `flush()` waits for it before the pipeline may advance its
+/// checkpoint. That is exactly the guarantee `at_least_once` names — duplicates possible,
+/// loss not — and it is the same bar every sink here except Snowflake and transactional
+/// Kafka meets.
+///
+/// Deduplicate downstream on the primary key plus `source.offset`, or use a `MERGE INTO`.
+///
+/// [zb]: https://docs.databricks.com/aws/en/ingestion/zerobus-overview
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ZerobusSinkConfig {
+    /// Zerobus ingest endpoint, e.g.
+    /// `https://<workspace-id>.zerobus.<region>.cloud.databricks.com`.
+    pub endpoint: String,
+
+    /// Workspace URL used for Unity Catalog metadata and the OAuth token exchange, e.g.
+    /// `https://<workspace>.cloud.databricks.com`.
+    pub unity_catalog_url: String,
+
+    /// Fully-qualified target table: `catalog.schema.table`.
+    ///
+    /// One stream writes one table, and ordering is guaranteed per stream — so this sink
+    /// delivers every event to a single table in a fixed envelope, exactly as the Iceberg
+    /// sink's `normalized` mode does. Route to several tables with `[[pipeline.routes]]`.
+    pub table: String,
+
+    /// How this pipeline authenticates.
+    pub auth: ZerobusAuthConfig,
+
+    /// Records the SDK may have in flight before `ingest` applies back-pressure.
+    #[serde(default = "default_zerobus_max_inflight_records")]
+    pub max_inflight_records: usize,
+
+    /// How long `flush()` waits for the durability acknowledgement.
+    ///
+    /// A durability bound, not a latency knob: exceeding it fails the flush, which stops the
+    /// checkpoint advancing past records that are not yet durable.
+    #[serde(default = "default_zerobus_ack_timeout_ms")]
+    pub ack_timeout_ms: u64,
+
+    /// Flush after this long even if nothing else forces one.
+    #[serde(default = "default_zerobus_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+
+    /// Let the SDK re-establish a dropped stream and re-send unacknowledged records.
+    ///
+    /// On by default. The records it replays were never acknowledged, so re-sending them
+    /// cannot lose anything — and with this off a transient network fault becomes a failed
+    /// flush and a full batch retry from the pipeline instead.
+    #[serde(default = "default_zerobus_recovery_enabled")]
+    pub recovery_enabled: bool,
+}
+
+/// How the Zerobus sink authenticates to Databricks.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ZerobusAuthConfig {
+    /// OAuth machine-to-machine: a service principal's client id and secret.
+    Oauth {
+        client_id: String,
+        client_secret: SecretString,
+    },
+    /// No credential at all.
+    ///
+    /// Exists for a local Zerobus-protocol endpoint — the contract suite drives one — and
+    /// is refused for any non-loopback endpoint at load, because an unauthenticated stream
+    /// to a real workspace is not a configuration anyone means.
+    NoAuth,
+}
+
+fn default_zerobus_max_inflight_records() -> usize {
+    10_000
+}
+fn default_zerobus_ack_timeout_ms() -> u64 {
+    45_000
+}
+fn default_zerobus_flush_interval_ms() -> u64 {
+    1_000
+}
+fn default_zerobus_recovery_enabled() -> bool {
+    true
+}
+
+impl ZerobusSinkConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.endpoint, "endpoint"),
+            (&self.unity_catalog_url, "unity_catalog_url"),
+            (&self.table, "table"),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("sink.zerobus.{field} must not be empty"));
+            }
+        }
+
+        // Three parts, because the service takes a three-part name and rejects anything
+        // else at stream creation — during the first flush rather than at `validate-config`.
+        let parts = self
+            .table
+            .split('.')
+            .filter(|p| !p.trim().is_empty())
+            .count();
+        if parts != 3 {
+            return Err(format!(
+                "sink.zerobus.table '{}' must be a three-part Unity Catalog name, \
+                 `catalog.schema.table`",
+                self.table
+            ));
+        }
+
+        let loopback = is_loopback_url(&self.endpoint);
+        if !self.endpoint.starts_with("https://") && !loopback {
+            return Err(format!(
+                "sink.zerobus.endpoint '{}' must use https://; the OAuth client secret and \
+                 the token it buys both cross this connection",
+                self.endpoint
+            ));
+        }
+
+        match &self.auth {
+            ZerobusAuthConfig::Oauth {
+                client_id,
+                client_secret,
+            } => {
+                if client_id.trim().is_empty() {
+                    return Err("sink.zerobus.auth.client_id must not be empty".to_string());
+                }
+                validate_optional_secret(
+                    &Some(client_secret.clone()),
+                    "sink.zerobus.auth.client_secret",
+                )?;
+            }
+            ZerobusAuthConfig::NoAuth => {
+                if !loopback {
+                    return Err(format!(
+                        "sink.zerobus.auth type = \"no_auth\" is only allowed for a loopback \
+                         endpoint; '{}' is not one. An unauthenticated stream to a real \
+                         workspace is not a configuration anyone means.",
+                        self.endpoint
+                    ));
+                }
+            }
+        }
+
+        if self.max_inflight_records == 0 {
+            return Err("sink.zerobus.max_inflight_records must be > 0".to_string());
+        }
+        if self.ack_timeout_ms == 0 {
+            return Err(
+                "sink.zerobus.ack_timeout_ms must be > 0; a zero durability wait would let \
+                 the checkpoint advance past records that are not durable"
+                    .to_string(),
+            );
+        }
+        if self.flush_interval_ms == 0 {
+            return Err("sink.zerobus.flush_interval_ms must be > 0".to_string());
+        }
+
+        Ok(())
+    }
 }
 
 /// A named sink configuration, used with `[[sinks]]` + `[[pipeline.routes]]`.
@@ -253,9 +808,67 @@ pub enum IcebergStorageConfig {
     Adls,
 }
 
+/// Which Iceberg catalog backs the table.
+///
+/// Exactly one variant, chosen by the table key: `[sink.catalog.rest]` or
+/// `[sink.catalog.s3tables]`. A flattened enum rather than two `Option` fields, so
+/// "both" and "neither" are unrepresentable instead of validated.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-pub struct IcebergCatalogConfig {
-    pub rest: IcebergRestCatalogConfig,
+#[serde(deny_unknown_fields)]
+pub enum IcebergCatalogConfig {
+    /// Any Iceberg REST catalog — Polaris, Nessie, Gravitino, Lakekeeper, Unity, or a
+    /// self-hosted one.
+    #[serde(rename = "rest")]
+    Rest(IcebergRestCatalogConfig),
+    /// AWS S3 Tables: a managed Iceberg catalog addressed by table-bucket ARN.
+    ///
+    /// Worth calling out for *this* sink specifically. The Iceberg destination here is an
+    /// append-only change log — `iceberg-rust` has no write path for delete files, so
+    /// updates and deletes arrive as additional rows rather than as row-level mutations.
+    /// An append-only writer produces many small data files, and orphans some whenever a
+    /// commit fails terminally (`rustcdc_iceberg_orphaned_data_files_total`). S3 Tables
+    /// runs compaction, snapshot expiry and unreferenced-file removal as a managed
+    /// service, which is exactly that maintenance burden.
+    ///
+    /// It does **not** turn the change log into a table. Deduplicating to current-row
+    /// state is still a `MERGE INTO` or a view on the reader's side.
+    #[serde(rename = "s3tables")]
+    S3Tables(IcebergS3TablesCatalogConfig),
+}
+
+impl IcebergCatalogConfig {
+    /// The warehouse or table-bucket location, used to infer the storage backend.
+    pub fn location(&self) -> &str {
+        match self {
+            Self::Rest(rest) => rest.warehouse.trim(),
+            Self::S3Tables(s3) => s3.table_bucket_arn.trim(),
+        }
+    }
+
+    /// Label for diagnostics and configuration error messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Rest(_) => "rest",
+            Self::S3Tables(_) => "s3tables",
+        }
+    }
+}
+
+/// AWS S3 Tables catalog.
+///
+/// Credentials come from the standard AWS chain (environment, profile, IMDS, EKS web
+/// identity) rather than from this file — the same chain the `glue` codec and the MSK IAM
+/// SASL mechanism use. There is deliberately no place to write an access key here.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IcebergS3TablesCatalogConfig {
+    /// Table-bucket ARN, e.g. `arn:aws:s3tables:eu-central-1:123456789012:bucket/my-bucket`.
+    pub table_bucket_arn: String,
+
+    /// Override the S3 Tables endpoint. Leave unset for the regional default; set it for
+    /// a VPC endpoint or a local emulator.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -273,6 +886,23 @@ pub struct IcebergRestCatalogConfig {
     /// Optional OAuth credential (`<client_id>:<client_secret>`).
     #[serde(default)]
     pub credential: Option<SecretString>,
+}
+
+/// Is this URL pointed at loopback?
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url
+        .trim()
+        .strip_prefix("http://")
+        .or_else(|| url.trim().strip_prefix("https://"))
+        .unwrap_or(url.trim());
+    let host = rest
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once(':')
+        .map(|(host, _port)| host)
+        .unwrap_or(rest.split(['/', '?']).next().unwrap_or(""));
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
 fn validate_optional_secret(secret: &Option<SecretString>, field: &str) -> Result<(), String> {
@@ -467,27 +1097,47 @@ impl IcebergSinkConfig {
             return Err("sink.iceberg.table_path must not be empty".to_string());
         }
 
-        if self.catalog.rest.uri.trim().is_empty() {
-            return Err("sink.iceberg.catalog.rest.uri must not be empty".to_string());
-        }
+        match &self.catalog {
+            IcebergCatalogConfig::Rest(rest) => {
+                if rest.uri.trim().is_empty() {
+                    return Err("sink.iceberg.catalog.rest.uri must not be empty".to_string());
+                }
 
-        if self.catalog.rest.warehouse.trim().is_empty() {
-            return Err("sink.iceberg.catalog.rest.warehouse must not be empty".to_string());
+                if rest.warehouse.trim().is_empty() {
+                    return Err("sink.iceberg.catalog.rest.warehouse must not be empty".to_string());
+                }
+                validate_optional_secret(&rest.token, "sink.iceberg.catalog.rest.token")?;
+                validate_optional_secret(&rest.credential, "sink.iceberg.catalog.rest.credential")?;
+            }
+            IcebergCatalogConfig::S3Tables(s3) => {
+                let arn = s3.table_bucket_arn.trim();
+                if arn.is_empty() {
+                    return Err(
+                        "sink.iceberg.catalog.s3tables.table_bucket_arn must not be empty"
+                            .to_string(),
+                    );
+                }
+                // Checked here rather than left to the AWS SDK: a malformed ARN surfaces
+                // from the SDK as an opaque credential or signing error at first flush,
+                // which is during an incident rather than at `validate-config`.
+                if !arn.starts_with("arn:") || !arn.contains(":s3tables:") {
+                    return Err(format!(
+                        "sink.iceberg.catalog.s3tables.table_bucket_arn '{arn}' is not an S3 \
+                         Tables ARN; it must look like \
+                         `arn:aws:s3tables:<region>:<account-id>:bucket/<name>`"
+                    ));
+                }
+                if let Some(endpoint) = &s3.endpoint_url
+                    && endpoint.trim().is_empty()
+                {
+                    return Err(
+                        "sink.iceberg.catalog.s3tables.endpoint_url must not be empty when \
+                         configured"
+                            .to_string(),
+                    );
+                }
+            }
         }
-
-        if self.namespace.trim().is_empty() {
-            return Err("sink.iceberg.namespace must not be empty".to_string());
-        }
-
-        if self.table_name.trim().is_empty() {
-            return Err("sink.iceberg.table_name must not be empty".to_string());
-        }
-
-        validate_optional_secret(&self.catalog.rest.token, "sink.iceberg.catalog.rest.token")?;
-        validate_optional_secret(
-            &self.catalog.rest.credential,
-            "sink.iceberg.catalog.rest.credential",
-        )?;
 
         if self.max_commit_retries == 0 {
             return Err("sink.iceberg.max_commit_retries must be > 0".to_string());
@@ -873,8 +1523,8 @@ pub struct KafkaTransportConfig {
     /// once, which krafka's record accumulator does not do: `partition_inflight` holds one
     /// slot per partition and `dispatch_unblocked_partitions` only flushes partitions
     /// whose slot is idle, so batches for a partition reach the wire in seal order and
-    /// sequence order cannot diverge from wire order. krafka 0.18 removed its own
-    /// `max_in_flight` producer knob for exactly that reason.
+    /// sequence order cannot diverge from wire order — which is why krafka carries no
+    /// `max_in_flight` producer knob of its own.
     ///
     /// What remains is a per-*connection* pipelining depth, which is a transport concern —
     /// hence the move. Raising it lets more partitions have requests in flight over the
@@ -886,18 +1536,12 @@ pub struct KafkaTransportConfig {
 impl KafkaTransportConfig {
     /// Map every transport setting — including the proxy — onto krafka's `TransportConfig`.
     ///
-    /// The proxy used to need a separate accessor, because krafka carried it on the
-    /// *client* builder while this struct's every other field mapped here. That mismatch
-    /// is how `socks5_proxy` came to be validated for `host:port` shape and then silently
-    /// discarded: `to_krafka` mapped everything else, so the proxy looked mapped too. In
-    /// the topology the setting exists for — brokers behind a bastion that also resolves
-    /// their hostnames — the connection simply failed and looked like a broker outage;
-    /// where the brokers were directly reachable, traffic quietly took the route the
-    /// operator had configured it not to take.
-    ///
-    /// We reported it, and krafka 0.18 moved the proxy onto `TransportConfig`, which is
-    /// what the type's own documentation had claimed all along. There is now one storage
-    /// location, no precedence rule, and no second accessor to forget to call.
+    /// **Including the proxy** — one storage location, no precedence rule, and no second
+    /// accessor to forget to call. When `socks5_proxy` lived on a separate accessor it was
+    /// validated for `host:port` shape and then silently discarded, which in the topology
+    /// the setting exists for (brokers behind a bastion that also resolves their
+    /// hostnames) looked like a broker outage, and everywhere else sent traffic by the
+    /// route the operator had configured it not to take.
     pub fn to_krafka(&self) -> Result<krafka::network::TransportConfig, String> {
         let mut builder = krafka::network::TransportConfig::builder();
         if let Some(proxy) = &self.socks5_proxy {
@@ -935,12 +1579,12 @@ impl KafkaTransportConfig {
                     .to_string(),
             );
         }
-        if let Some(proxy) = &self.socks5_proxy {
-            if !proxy.contains(':') {
-                return Err(format!(
-                    "sink.kafka.transport.socks5_proxy '{proxy}' must be \"host:port\""
-                ));
-            }
+        if let Some(proxy) = &self.socks5_proxy
+            && !proxy.contains(':')
+        {
+            return Err(format!(
+                "sink.kafka.transport.socks5_proxy '{proxy}' must be \"host:port\""
+            ));
         }
         Ok(())
     }
@@ -1121,12 +1765,12 @@ impl KafkaSinkConfig {
                 KafkaCompression::Gzip if !(0..=9).contains(&level) => {
                     return Err(format!(
                         "sink.kafka.compression_level {level} is out of range for gzip (0–9)"
-                    ))
+                    ));
                 }
                 KafkaCompression::Zstd if !(1..=22).contains(&level) => {
                     return Err(format!(
                         "sink.kafka.compression_level {level} is out of range for zstd (1–22)"
-                    ))
+                    ));
                 }
                 KafkaCompression::None | KafkaCompression::Snappy | KafkaCompression::Lz4 => {
                     return Err(format!(
@@ -1137,7 +1781,7 @@ impl KafkaSinkConfig {
                             KafkaCompression::Snappy => "snappy",
                             _ => "lz4",
                         }
-                    ))
+                    ));
                 }
                 _ => {}
             }
@@ -1242,10 +1886,10 @@ impl KafkaSecurityConfig {
                 .map_err(|e| format!("sink.kafka.security.sasl.{field}: {e}"))
         };
 
-        // Build the mechanism first, then layer TLS on with one `with_tls`. krafka 0.16
-        // made that composition structural, so a mechanism cannot end up reachable over
-        // `sasl_plaintext` but not `sasl_ssl` — which is what previously forced this
-        // sink to refuse SCRAM-over-TLS, the default listener on most managed brokers.
+        // Build the mechanism first, then layer TLS on with one `with_tls`. The
+        // composition is structural, so a mechanism cannot end up reachable over
+        // `sasl_plaintext` but not `sasl_ssl` — which would rule out SCRAM-over-TLS, the
+        // default listener on most managed brokers.
         let username = |mechanism: KafkaSaslMechanism| -> Result<String, String> {
             sasl.username.clone().ok_or_else(|| {
                 format!("sink.kafka.security.sasl.username is required for mechanism {mechanism:?}")
@@ -1346,13 +1990,13 @@ impl KafkaSecurityConfig {
                 ("ssl_certificate_location", &self.ssl_certificate_location),
                 ("ssl_key_location", &self.ssl_key_location),
             ] {
-                if let Some(path) = path {
-                    if !path.is_file() {
-                        return Err(format!(
-                            "sink.kafka.security.{field} does not point to a file: {}",
-                            path.display()
-                        ));
-                    }
+                if let Some(path) = path
+                    && !path.is_file()
+                {
+                    return Err(format!(
+                        "sink.kafka.security.{field} does not point to a file: {}",
+                        path.display()
+                    ));
                 }
             }
 
@@ -1363,14 +2007,14 @@ impl KafkaSecurityConfig {
                 (Some(_), None) => {
                     return Err("sink.kafka.security.ssl_key_location is required when \
                                 ssl_certificate_location is set"
-                        .to_string())
+                        .to_string());
                 }
                 (None, Some(_)) => {
                     return Err(
                         "sink.kafka.security.ssl_certificate_location is required when \
                                 ssl_key_location is set"
                             .to_string(),
-                    )
+                    );
                 }
                 _ => {}
             }
@@ -1437,14 +2081,14 @@ impl KafkaSecurityConfig {
                             "sink.kafka.security.sasl needs either `token` or an [.oidc] block \
                              for mechanism oauth_bearer"
                                 .to_string(),
-                        )
+                        );
                     }
                     (Some(_), Some(_)) => {
                         return Err(
                             "sink.kafka.security.sasl declares both a static `token` and an \
                              [.oidc] block; pick one"
                                 .to_string(),
-                        )
+                        );
                     }
                     _ => {}
                 }

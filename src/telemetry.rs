@@ -19,15 +19,15 @@ pub struct TelemetryGuard {
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.tracer_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                eprintln!("warn: OTel tracer shutdown error: {e}");
-            }
+        if let Some(provider) = self.tracer_provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("warn: OTel tracer shutdown error: {e}");
         }
-        if let Some(provider) = self.meter_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                eprintln!("warn: OTel meter shutdown error: {e}");
-            }
+        if let Some(provider) = self.meter_provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("warn: OTel meter shutdown error: {e}");
         }
     }
 }
@@ -36,25 +36,57 @@ impl Drop for TelemetryGuard {
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Initialise the global tracing subscriber and, optionally, the OTel tracer
-/// and metrics provider.
+/// Everything the OTLP exporters need, in one value.
 ///
-/// Must be called exactly once, before any `tracing::*` macros are used.
-pub fn init(
-    format: Option<&str>,
-    level: Option<&str>,
-    otlp_endpoint: Option<&str>,
-    service_name: &str,
-) -> Result<TelemetryGuard, AppError> {
-    init_with_metrics(
-        format,
-        level,
-        otlp_endpoint,
-        None,
-        30,
-        OtlpProtocol::Grpc,
-        service_name,
-    )
+/// Previously seven positional arguments that `main` unpacked field by field from
+/// `ObservabilityConfig`, with the eighth — the insecure-transport override — smuggled in
+/// through a bare `std::env::var` inside the validator. One struct built by
+/// `From<&ObservabilityConfig>` means adding a setting is a field, not a signature change,
+/// and there is exactly one place that decides what telemetry is configured with.
+#[derive(Debug, Clone)]
+pub struct OtlpOptions {
+    /// Traces endpoint. `None` disables trace export.
+    pub endpoint: Option<String>,
+    /// Metrics endpoint. Falls back to [`Self::endpoint`] when `None`.
+    pub metrics_endpoint: Option<String>,
+    /// `PeriodicReader` export interval.
+    pub metrics_interval_secs: u64,
+    pub protocol: OtlpProtocol,
+    pub service_name: String,
+    /// Permit plaintext OTLP to a non-loopback host. See [`validate_otlp_endpoint`].
+    ///
+    /// Named differently from its configuration field (`observability.otlp_allow_insecure`)
+    /// on purpose: `registries.*.allow_insecure` is a distinct setting, and the
+    /// inert-settings scanner matches consumers by field name, so a second
+    /// `.allow_insecure` in the corpus would mark the registry field as externally read
+    /// when it is not.
+    pub insecure_transport: bool,
+}
+
+impl Default for OtlpOptions {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            metrics_endpoint: None,
+            metrics_interval_secs: 30,
+            protocol: OtlpProtocol::Grpc,
+            service_name: "rustcdc-server".to_string(),
+            insecure_transport: false,
+        }
+    }
+}
+
+impl From<&crate::config::schema::ObservabilityConfig> for OtlpOptions {
+    fn from(config: &crate::config::schema::ObservabilityConfig) -> Self {
+        Self {
+            endpoint: config.otlp_endpoint.clone(),
+            metrics_endpoint: config.otlp_metrics_endpoint.clone(),
+            metrics_interval_secs: config.otlp_metrics_interval_secs,
+            protocol: OtlpProtocol::from_config(&config.otlp_protocol),
+            service_name: config.service_name.clone(),
+            insecure_transport: config.otlp_allow_insecure,
+        }
+    }
 }
 
 /// Which OTLP wire protocol the exporters speak.
@@ -94,34 +126,24 @@ impl OtlpProtocol {
     }
 }
 
-/// Full initialisation with separate trace and metrics endpoints.
+/// Initialise the global tracing subscriber and, optionally, the OTel tracer and metrics
+/// providers.
 ///
-/// `otlp_metrics_endpoint` falls back to `otlp_endpoint` when `None`.
-/// `metrics_interval_secs` controls how often the `PeriodicReader` exports.
-#[allow(clippy::too_many_arguments)] // one call site; every argument is a distinct setting
+/// Must be called exactly once, before any `tracing::*` macro is used.
 pub fn init_with_metrics(
     format: Option<&str>,
     level: Option<&str>,
-    otlp_endpoint: Option<&str>,
-    otlp_metrics_endpoint: Option<&str>,
-    metrics_interval_secs: u64,
-    protocol: OtlpProtocol,
-    service_name: &str,
+    otlp: &OtlpOptions,
 ) -> Result<TelemetryGuard, AppError> {
     let filter =
         EnvFilter::try_new(level.unwrap_or("info")).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let (maybe_tracer_provider, otel_tracer) =
-        build_optional_tracer(otlp_endpoint, protocol, service_name)?;
+    let otlp_endpoint = otlp.endpoint.as_deref();
+    let (maybe_tracer_provider, otel_tracer) = build_optional_tracer(otlp_endpoint, otlp)?;
 
     // Resolve the effective metrics endpoint: explicit override → trace endpoint fallback.
-    let effective_metrics_endpoint = otlp_metrics_endpoint.or(otlp_endpoint);
-    let maybe_meter_provider = build_optional_meter(
-        effective_metrics_endpoint,
-        metrics_interval_secs,
-        protocol,
-        service_name,
-    )?;
+    let effective_metrics_endpoint = otlp.metrics_endpoint.as_deref().or(otlp_endpoint);
+    let maybe_meter_provider = build_optional_meter(effective_metrics_endpoint, otlp)?;
 
     // Register the global meter provider so instrument macros work without a handle.
     if let Some(ref mp) = maybe_meter_provider {
@@ -186,8 +208,7 @@ pub fn init_with_metrics(
 /// Returns `(None, None)` when no endpoint is configured.
 fn build_optional_tracer(
     endpoint: Option<&str>,
-    protocol: OtlpProtocol,
-    service_name: &str,
+    otlp: &OtlpOptions,
 ) -> Result<
     (
         Option<SdkTracerProvider>,
@@ -198,8 +219,9 @@ fn build_optional_tracer(
     let Some(endpoint) = endpoint else {
         return Ok((None, None));
     };
+    let (protocol, service_name) = (otlp.protocol, otlp.service_name.as_str());
 
-    validate_otlp_endpoint(endpoint)?;
+    validate_otlp_endpoint(endpoint, otlp.insecure_transport)?;
 
     let exporter = match protocol {
         OtlpProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
@@ -235,15 +257,18 @@ fn build_optional_tracer(
 /// Returns `None` when no endpoint is configured.
 fn build_optional_meter(
     endpoint: Option<&str>,
-    interval_secs: u64,
-    protocol: OtlpProtocol,
-    service_name: &str,
+    otlp: &OtlpOptions,
 ) -> Result<Option<SdkMeterProvider>, AppError> {
     let Some(endpoint) = endpoint else {
         return Ok(None);
     };
+    let (interval_secs, protocol, service_name) = (
+        otlp.metrics_interval_secs,
+        otlp.protocol,
+        otlp.service_name.as_str(),
+    );
 
-    validate_otlp_endpoint(endpoint)?;
+    validate_otlp_endpoint(endpoint, otlp.insecure_transport)?;
 
     // The export timeout moved onto the exporter in opentelemetry 0.32 — the
     // `PeriodicReader` builder now only owns the interval.
@@ -320,23 +345,30 @@ fn http_signal_endpoint(endpoint: &str, signal_path: &str) -> String {
     url.to_string()
 }
 
-/// Reject plaintext gRPC (`http://`) to non-loopback hosts unless the
-/// operator has explicitly opted in with `OTLP_ALLOW_INSECURE=1`.
+/// Reject plaintext (`http://`) OTLP to non-loopback hosts unless the operator has
+/// explicitly opted in with `observability.otlp_allow_insecure`.
 ///
-/// This prevents silent credential/trace exfiltration when a misconfigured
-/// endpoint routes OTLP spans to an attacker-controlled host over the wire.
-fn validate_otlp_endpoint(endpoint: &str) -> Result<(), AppError> {
+/// This prevents silent trace exfiltration when a misconfigured endpoint routes OTLP
+/// spans — which carry table names, column names and source offsets — to a
+/// attacker-controlled host in the clear.
+///
+/// The opt-in used to be the bare environment variable `OTLP_ALLOW_INSECURE=1`, read
+/// here and declared nowhere. That made a security-relevant override invisible to
+/// `validate-config`, absent from `GET /config`, unreachable by the inert-settings
+/// scanner, and impossible to see in the configuration an operator reviews. It is a
+/// configuration field now, for the same reason every other switch in this server is.
+fn validate_otlp_endpoint(endpoint: &str, allow_insecure: bool) -> Result<(), AppError> {
     // Allow the escape hatch for development / test environments, but emit a
     // prominent warning so this setting is never silently carried to production
     // (a security information-disclosure risk).
-    if std::env::var("OTLP_ALLOW_INSECURE").as_deref() == Ok("1") {
+    if allow_insecure {
         // Emit a structured warning via tracing so the override is
         // visible in log aggregators and monitoring dashboards, not only on
         // stderr.  The warning fires at startup and on every re-validation so
         // operators cannot silently carry this setting to production.
         tracing::warn!(
             otlp_endpoint = %endpoint,
-            "OTLP_ALLOW_INSECURE=1 is active: traces are being exported over \
+            "observability.otlp_allow_insecure is active: traces are being exported over \
              plaintext gRPC. CDC pipeline metadata (table names, operation \
              types, source offsets) will be transmitted unencrypted. \
              DO NOT use this setting in production."
@@ -358,7 +390,8 @@ fn validate_otlp_endpoint(endpoint: &str) -> Result<(), AppError> {
                 "observability.otlp_endpoint '{}' is plaintext (http://) to a \
                  non-loopback host, so traces and metrics would cross the network \
                  unencrypted. Use https:// or a local collector sidecar, or set \
-                 OTLP_ALLOW_INSECURE=1 to override (development only). Note this is \
+                 `observability.otlp_allow_insecure = true` to override (development \
+                 only). Note this is \
                  about the transport, not the OTLP protocol: `otlp_protocol = \"http\"` \
                  against an https:// endpoint is fine.",
                 endpoint
@@ -372,7 +405,7 @@ fn validate_otlp_endpoint(endpoint: &str) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_optional_tracer, http_signal_endpoint, validate_otlp_endpoint, OtlpProtocol,
+        OtlpProtocol, build_optional_tracer, http_signal_endpoint, validate_otlp_endpoint,
     };
 
     /// `otlp_protocol = "http"` must put an OTLP/HTTP request on the wire.
@@ -405,8 +438,11 @@ mod tests {
 
         let (provider, tracer) = build_optional_tracer(
             Some(&format!("http://{addr}")),
-            OtlpProtocol::Http,
-            "otlp-protocol-test",
+            &super::OtlpOptions {
+                protocol: OtlpProtocol::Http,
+                service_name: "otlp-protocol-test".to_string(),
+                ..Default::default()
+            },
         )
         .expect("the http exporter must build");
 
@@ -470,40 +506,54 @@ mod tests {
         assert_eq!(OtlpProtocol::from_config("nonsense"), OtlpProtocol::Grpc);
     }
 
-    use std::sync::Mutex;
-
-    // Serialize tests that mutate OTLP_ALLOW_INSECURE to prevent cross-test races.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
+    // These no longer need a mutex. The override used to be a process-global environment
+    // variable, so every test that touched it had to be serialised against every other —
+    // and `std::env::set_var` is a data race against any concurrent `getenv` anywhere in
+    // the binary, which no mutex in this module could prevent. It is a parameter now.
     #[test]
     fn rejects_plaintext_remote_otlp() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let err = validate_otlp_endpoint("http://otel-collector.prod.example.com:4317")
+        let err = validate_otlp_endpoint("http://otel-collector.prod.example.com:4317", false)
             .expect_err("must reject non-loopback http");
         assert!(err.to_string().contains("plaintext (http://)"));
     }
 
     #[test]
     fn allows_loopback_http() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        validate_otlp_endpoint("http://localhost:4317").expect("loopback http must be allowed");
-        validate_otlp_endpoint("http://127.0.0.1:4317").expect("127.0.0.1 must be allowed");
+        validate_otlp_endpoint("http://localhost:4317", false)
+            .expect("loopback http must be allowed");
+        validate_otlp_endpoint("http://127.0.0.1:4317", false).expect("127.0.0.1 must be allowed");
     }
 
     #[test]
     fn allows_tls_remote() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        validate_otlp_endpoint("https://otel-collector.prod.example.com:4317")
+        validate_otlp_endpoint("https://otel-collector.prod.example.com:4317", false)
             .expect("https must be allowed");
     }
 
     #[test]
     fn allows_insecure_override() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        // Safety: test-only, serialized via ENV_MUTEX; no concurrent threads mutate this var.
-        unsafe { std::env::set_var("OTLP_ALLOW_INSECURE", "1") };
-        let result = validate_otlp_endpoint("http://remote-host:4317");
-        unsafe { std::env::remove_var("OTLP_ALLOW_INSECURE") };
-        result.expect("OTLP_ALLOW_INSECURE=1 must bypass the check");
+        validate_otlp_endpoint("http://remote-host:4317", true)
+            .expect("observability.otlp_allow_insecure must bypass the check");
+    }
+
+    /// The override must arrive from configuration, not from the ambient environment.
+    #[test]
+    fn the_insecure_override_comes_from_configuration() {
+        use crate::config::schema::ObservabilityConfig;
+
+        let mut config = ObservabilityConfig {
+            otlp_endpoint: Some("http://remote-host:4317".to_string()),
+            ..Default::default()
+        };
+        let options = super::OtlpOptions::from(&config);
+        assert!(!options.insecure_transport, "the default must be refuse");
+        assert!(
+            validate_otlp_endpoint("http://remote-host:4317", options.insecure_transport).is_err(),
+            "a default configuration must still refuse plaintext to a remote host"
+        );
+
+        config.otlp_allow_insecure = true;
+        let options = super::OtlpOptions::from(&config);
+        assert!(options.insecure_transport);
     }
 }

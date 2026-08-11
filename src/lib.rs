@@ -1,3 +1,17 @@
+// `unsafe` is denied crate-wide by `[workspace.lints]`, which this package opts into.
+//
+// It is `deny` rather than `forbid` for exactly one reason: `test_env::write_env` calls
+// `std::env::set_var`, which Rust 2024 makes `unsafe`, and several tests need a variable in
+// the process environment because `SecretString`'s only deferred form is `{ env = "VAR" }`
+// and krafka resolves the MSK IAM chain from `AWS_*`. That module cannot be `#[cfg(test)]`
+// — `tests/config_roundtrip.rs` is a separate crate and would have to duplicate the
+// `unsafe` — so it is compiled into the library and denied-with-one-exemption instead.
+//
+// `src/main.rs` carries `forbid`, which cannot be overridden at all: the **binary** this
+// project ships contains no `unsafe`, and that is the claim the README makes.
+// `tests/architecture.rs::unsafe_code_appears_only_where_the_allowlist_says_it_may` holds
+// the exemption list to exactly one entry, in both directions.
+
 //! # Connector features
 //!
 //! Source connectors are opt-in cargo features (`postgres`, `mysql`, `sqlserver`), so a
@@ -34,10 +48,18 @@ pub mod error;
 pub mod redaction;
 
 pub mod pipeline;
+/// The capture pipeline's engine, extracted from `commands/`.
+pub mod runtime;
 pub mod sink;
 /// Byte-bounded truncation that cannot panic on a character boundary.
 pub(crate) mod text;
 
 pub mod state;
 pub mod telemetry;
+/// Process-environment mutation for tests, and the crate's only `unsafe`.
+///
+/// `pub` because `tests/config_roundtrip.rs` is a separate crate and cannot reach a
+/// `#[cfg(test)]` item; duplicating the `unsafe` there is exactly what this prevents. The
+/// crate is `publish = false`, so this widens no external API.
+pub mod test_env;
 pub mod token_manifest_policy;

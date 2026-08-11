@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use rustcdc::{
+    SecretString,
     core::{Error as RtError, Event},
     sink::SinkAdapter,
-    SecretString,
 };
 use sha2::Digest;
 
@@ -358,9 +358,16 @@ impl HttpSink {
                     return Ok(());
                 }
                 Ok(status) if Self::is_retryable_status(status) => {
+                    // Classified on **every** observation, including the last one.
+                    //
+                    // This used to sit inside the `attempt < max_retries` branch, so the
+                    // attempt that actually failed the batch — the single most useful one
+                    // to an operator — was never counted. `retryable_status_5xx_total`
+                    // undercounted by one per exhausted batch, and with `max_retries = 0`
+                    // it stayed at zero no matter how many 503s the endpoint returned.
+                    self.classify_status(status, DeliveryPhase::Retryable);
                     if attempt < self.max_retries {
                         self.accounting.retried += 1;
-                        self.classify_status(status, DeliveryPhase::Retryable);
                         let backoff = self.next_backoff(attempt);
                         if self.retry_budget_exhausted(batch_start) {
                             return Err(format!(
@@ -379,9 +386,11 @@ impl HttpSink {
                     return Err(format!("terminal HTTP status {}", status.as_u16()));
                 }
                 Err(e) if e.is_recoverable() => {
+                    // Same reasoning as the retryable-status arm above: the give-up
+                    // attempt is an observation and must be counted.
+                    self.classify_error(&e, DeliveryPhase::Retryable);
                     if attempt < self.max_retries {
                         self.accounting.retried += 1;
-                        self.classify_error(&e, DeliveryPhase::Retryable);
                         let backoff = self.next_backoff(attempt);
                         if self.retry_budget_exhausted(batch_start) {
                             return Err(format!(
@@ -705,8 +714,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use rustcdc::core::{Event, Operation, SourceMetadata};
     use rustcdc::SecretString;
+    use rustcdc::core::{Event, Operation, SourceMetadata};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -761,11 +770,7 @@ mod tests {
 
                 let status = {
                     let mut s = statuses.lock().expect("statuses lock");
-                    if s.is_empty() {
-                        200
-                    } else {
-                        s.remove(0)
-                    }
+                    if s.is_empty() { 200 } else { s.remove(0) }
                 };
                 let response = format!(
                     "HTTP/1.1 {status} TEST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

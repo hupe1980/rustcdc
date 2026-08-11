@@ -1,18 +1,17 @@
 [package]
 name = "rustcdc-server"
-version = "0.4.0"
-edition = "2021"
-# The shipped container image builds `--all-features`, so this is the requirement for the
-# artifact users actually consume. The default feature set alone still builds on 1.94.0
-# (wasmtime is the binding constraint there); the AWS SDK, pulled in only by `glue`, is
-# what needs 1.94.1. Declaring the lower number would be true for a `cargo build` and false
-# for the published image, and would hand anyone enabling `glue` a resolver error instead
-# of a documented requirement.
+version = "0.5.0"
+edition = "2024"
+# The AWS SDK sets this floor; wasmtime is the next constraint at 1.94.0. Declaring the
+# lower number would hand anyone a resolver error instead of a documented requirement.
 rust-version = "1.94.1"
 publish = false
 description = "Change-data-capture server powered by rustcdc"
 repository = "https://github.com/hupe1980/rustcdc-server"
 license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "rustcdc"
@@ -27,7 +26,11 @@ resolver = "2"
 exclude = ["fuzz"]
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`: `test_env` needs `std::env::set_var`, which Rust 2024 makes unsafe.
+# `tests/architecture.rs::unsafe_code_appears_only_where_the_allowlist_says_it_may` holds the
+# exemption list to that one site. `src/main.rs` carries `forbid`, so the shipped binary has
+# none at all.
+unsafe_code = "deny"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Features
@@ -68,13 +71,6 @@ mysql = ["rustcdc/mysql", "rustcdc/mariadb"]
 # a deployment that does not need it should not have to rely on that analysis.
 sqlserver = ["rustcdc/sqlserver"]
 
-# AWS Glue Schema Registry as a codec backend.
-#
-# Off for a plain `cargo build` because it pulls the AWS SDK (~45 crates) that no
-# other deployment needs; **on** in the published container image, which builds with
-# `--all-features`, so the shipped artifact carries every backend.
-glue = ["rustcdc/glue", "dep:aws-config", "dep:aws-sdk-glue"]
-
 [dependencies]
 # `default-features = false` so that `rustcdc/postgres` — which is in rustcdc's own
 # default set — arrives through *our* `postgres` feature and nowhere else. Without it,
@@ -89,6 +85,7 @@ rustcdc = { version = "0.12.0", default-features = false, features = [
     "protobuf",
     "wasm",
     "cloudevents",
+    "glue",
     "encryption",
     "outbox",
 ] }
@@ -124,16 +121,9 @@ url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = { version = "0.32" }
-# `default-features = false` to drop `logs`, which nothing here exports.
-#
-# `reqwest-blocking-client` is deliberate and **not** an oversight: the OTLP/HTTP exporter
-# is driven by the SDK's batch processor, which runs on its own dedicated OS thread
-# (`OpenTelemetry.Traces.BatchProcessor`) with no tokio reactor attached. The async
-# `reqwest-client` panics there with "there is no reactor running" on the first export —
-# caught by `the_http_protocol_actually_speaks_otlp_over_http`, which drives a real
-# exporter at a real socket rather than asserting the config mapping.
-#
-# `reqwest-rustls` keeps the exporter on the one TLS stack this project links.
+# `reqwest-blocking-client` is deliberate: the OTLP/HTTP exporter runs on the SDK's own
+# batch-processor thread with no tokio reactor, where the async client panics on first
+# export. Pinned by `the_http_protocol_actually_speaks_otlp_over_http`.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "grpc-tonic",
     "http-proto",
@@ -160,19 +150,40 @@ async-trait = "0.1"
 dashmap = "6"
 bytes = "1"
 tokio-postgres = "0.7"
-# One crypto backend for the whole process (aws-lc-rs, matching the provider
-# installed in main.rs) and every compression codec the docs offer (zstd is not
-# in krafka's default set — without compression-all a `compression = "zstd"`
-# config would fail validation at startup).
-krafka = { version = "0.18.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
+# One crypto backend for the process (aws-lc-rs, matching main.rs), and `compression-all`
+# because zstd is outside krafka's default set — without it a documented `compression =
+# "zstd"` fails validation at startup.
+krafka = { version = "0.19.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
 
-# AWS SDK, only for the optional `glue` feature: the Glue registry client is
-# constructed from an `aws_sdk_glue::Client`, which needs the credential chain.
-aws-config = { version = "1", optional = true, default-features = false, features = ["behavior-version-latest", "rustls"] }
-aws-sdk-glue = { version = "1", optional = true, default-features = false, features = ["rustls"] }
+# AWS credential chain. Not optional: `iceberg-catalog-s3tables` pulls it unconditionally
+# and the SQS dead-letter target needs it by name.
+#
+# No `rustls` feature — that name selects `legacy-rustls-ring`, i.e. rustls 0.21, a second
+# TLS stack.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+aws-sdk-glue = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+
+# Snowflake key-pair auth. `jsonwebtoken` was dropped: every one of its crypto backends adds
+# a stack the graph does not already have. `rsa` is needed anyway for the `RSA_PUBLIC_KEY_FP`
+# fingerprint and signs PKCS#1 v1.5 over SHA-256 — which is RS256. See `mint_jwt`.
+rsa = { version = "0.9", features = ["sha2", "pkcs5"] }
+base64 = "0.22"
+
+# Amazon SQS dead-letter target. `aws-config` is already unconditional, so this costs one
+# thin SDK client rather than the AWS runtime.
+# No `rustls` feature: it maps to `legacy-rustls-ring` (rustls 0.21), a second TLS stack the
+# architecture guard rejects. `default-https-client` is the modern hyper client.
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
+# AWS S3 Tables — a managed Iceberg catalog. Same version line as `iceberg` and
+# `iceberg-catalog-rest`: all three share the `Catalog` trait.
+#
+# Worth it for this sink specifically — the Iceberg destination is an append-only change log,
+# and S3 Tables runs the compaction and unreferenced-file removal that otherwise falls to the
+# operator.
+iceberg-catalog-s3tables = "0.10.1"
 iceberg-storage-opendal = { version = "0.10.1", features = ["opendal-fs", "opendal-s3", "opendal-gcs", "opendal-azdls"] }
 arrow-array = "58"
 arrow-schema = "58"
@@ -181,6 +192,18 @@ parquet = "58"
 # Storage abstraction (E02-S03) — pinned to the same major as iceberg-storage-opendal
 # so the state backends and the Iceberg sink share one opendal in the graph.
 opendal = { version = "0.57", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
+# Databricks Zerobus Ingest — protocol, OAuth, back-pressure and stream recovery are all
+# upstream; `src/sink/zerobus.rs` owns only the durability decision.
+#
+# `testing` is on in the *normal* dependency because it gates `no_tls()` and
+# `NoAuthHeadersProvider`, which `tests/zerobus_contract.rs` needs to drive the sink through
+# its production path. Gating it behind a cargo feature of our own would make that suite
+# silently skip. Exposure is bounded by validation instead: the loader refuses `no_auth` and
+# plaintext for anything but loopback.
+databricks-zerobus-ingest-sdk = { version = "2.6", default-features = false, features = ["testing"] }
+# Already in the graph via the OTLP exporter and the Zerobus SDK. Named directly so the sink
+# classifies a `tonic::Code` rather than matching error prose.
+tonic = { version = "0.14", default-features = false }
 
 [[bench]]
 name = "pipeline"
@@ -195,12 +218,8 @@ harness = false
 # middleware, extractors and handlers a network client would hit — not a
 # hand-called function that skips the layers where a bypass would live.
 tower = { version = "0.5", features = ["util"] }
-# Statistical benchmarking with baseline comparison — the regression gate for the
-# hot path (CR-004). `default-features = false` drops the unmaintained `plotters`
-# tree; cargo-deny flags it and the HTML report is not what CI consumes.
-# `async_tokio` for `benches/throughput.rs`, which measures the real async batch path.
-# `default-features = false` still drops the unmaintained `plotters` tree that cargo-deny
-# flags; the HTML report is not what CI consumes.
+# `default-features = false` drops the unmaintained `plotters` tree that cargo-deny flags;
+# the HTML report is not what CI consumes. `async_tokio` for `benches/throughput.rs`.
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
@@ -208,16 +227,14 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # checked against the library's own adapter contract instead of a local restatement.
 rustcdc = { version = "0.12.0", features = ["test-harnesses"] }
 wat = "1"
+# The Zerobus contract fake is a real tonic server; `tokio-stream` adapts the listener and
+# the response channel into the streams the generated service signature wants.
+tokio-stream = { version = "0.1", features = ["net"] }
 # test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
 # in unit tests without Docker.
-krafka = { version = "0.18.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
+krafka = { version = "0.19.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
 
-# Benchmarks compile against the dev-dependency graph, which carries rustcdc's
-# `test-harnesses` feature (the delivery-contract tests need its fault injection).
-# That feature refuses to build with `debug_assertions` off, on the sound principle
-# that fault-injection code has no business in an optimised artefact. Keeping the
-# assertions on for `cargo bench` satisfies the guard while retaining `opt-level = 3`,
-# so the numbers still reflect optimised code. Compare benchmarks only against
-# baselines taken with this same profile.
+# `rustcdc/test-harnesses` refuses to build with `debug_assertions` off, so benches keep them
+# on while retaining `opt-level = 3`. Compare only against baselines from this same profile.
 [profile.bench]
 debug-assertions = true

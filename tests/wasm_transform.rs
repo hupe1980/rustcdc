@@ -175,17 +175,16 @@ async fn wasm_drop_transform_returns_none() {
 
 /// A module carrying a **data segment** must load.
 ///
-/// This is the regression guard for the rustcdc 0.8 + wasmtime 47 defect that made the
-/// entire WASM feature unusable: wasmtime evaluates the store's epoch deadline while
-/// initialising data segments, a fresh `Store` starts at deadline `0` which equals the
-/// engine's starting epoch, and `WasmRuntime` armed the deadline only *after*
-/// `linker.instantiate(..)`. Every module carrying a data segment was rejected with
-/// `wasm trap: interrupt` — which is every module a real Rust, AssemblyScript or TinyGo
-/// build produces, since string literals and rodata land there.
+/// The regression guard for a defect that made the entire WASM feature unusable: wasmtime
+/// evaluates the store's epoch deadline while initialising data segments, a fresh `Store`
+/// starts at deadline `0` — the engine's starting epoch — so arming the deadline after
+/// `linker.instantiate(..)` rejects every module carrying a data segment with
+/// `wasm trap: interrupt`. That is every module a real Rust, AssemblyScript or TinyGo build
+/// produces, since string literals and rodata land there.
 ///
-/// The whole WAT fixture suite happened to be data-segment-free, so it stayed green
-/// while nothing real could load. This module embeds the replacement event as a data
-/// segment, so it covers the class by construction. Fixed in rustcdc 0.9.
+/// A data-segment-free WAT fixture suite stays green while nothing real can load, so this
+/// module embeds the replacement event as a data segment and covers the class by
+/// construction.
 #[tokio::test]
 async fn wasm_transform_can_mutate_event_table_name() {
     // This test uses a Rust-like approach: compile a WAT module that reads the

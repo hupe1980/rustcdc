@@ -7,8 +7,8 @@
 
 use std::io::Write as _;
 
-use rustcdc_server::config::schema::{KafkaDeliveryMode, KafkaSecurityProtocol, SinkConfig};
 use rustcdc_server::config::AppConfig;
+use rustcdc_server::config::schema::{KafkaDeliveryMode, KafkaSecurityProtocol, SinkConfig};
 use tempfile::NamedTempFile;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -725,13 +725,11 @@ tables = ["public.orders"]
 
 /// A filter for a table outside `tables` is accepted — it scopes a later on-demand request.
 ///
-/// This used to be **rejected**, because until rustcdc 0.12 the on-demand path could not
-/// see `table_conditions` at all: `enqueue_tables` resolved the table without them and the
-/// driver did not retain the config, so the filter was structurally unreachable and
-/// accepting it would have meant backfilling the whole table while the operator believed
-/// it was scoped. Worse, the startup and on-demand paths disagreed with *each other* — a
-/// runtime-requested table ran unfiltered and a restart adopted it filtered — so the rows
-/// delivered matched no single predicate.
+/// This only holds because both paths resolve `table_conditions` through the same
+/// function. An on-demand path blind to them would backfill the whole table while the
+/// operator believed it was scoped, and would disagree with the startup path — a
+/// runtime-requested table running unfiltered, a restart adopting it filtered — so the
+/// rows delivered would match no single predicate.
 ///
 /// 0.12 resolves all three paths through one function. Pre-declaring is now the supported
 /// way to scope a backfill you will request later, and refusing it would reject a working
@@ -907,8 +905,7 @@ ssn = {{ type = "hmac_sha256", key = "hardcoded-key" }}
 
 #[test]
 fn mask_transform_with_env_key_loads() {
-    // Safety: single-threaded test setup; no other thread reads this variable.
-    unsafe { std::env::set_var("CDC_TEST_MASK_KEY", "s3cret") };
+    let _env = rustcdc_server::test_env::EnvGuard::set(&[("CDC_TEST_MASK_KEY", "s3cret")]);
     let cfg = load_from_str(&format!(
         r#"{SOURCE_AND_STATE}
 
@@ -926,7 +923,6 @@ email = {{ type = "redact", placeholder = "***" }}
 ssn = {{ type = "hmac_sha256", key = {{ env = "CDC_TEST_MASK_KEY" }} }}
 "#
     ));
-    unsafe { std::env::remove_var("CDC_TEST_MASK_KEY") };
 
     let cfg = cfg.expect("mask config with an env key must load");
     assert_eq!(cfg.pipeline.transforms.len(), 1);
@@ -1264,10 +1260,10 @@ otlp_protocol = "htpp"
 /// that MySQL and SQL Server need to decode their logs.
 #[test]
 fn the_postgres_state_backend_uses_both_configured_tables() {
-    std::env::set_var(
+    let _env = rustcdc_server::test_env::EnvGuard::set(&[(
         "CDC_TEST_STATE_URL",
         "postgres://state:pw@localhost:5432/state",
-    );
+    )]);
 
     let cfg = load_from_str(&format!(
         r#"{SOURCE_AND_STATE}

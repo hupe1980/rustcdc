@@ -38,6 +38,12 @@ is written down next to the guarantee rather than left for you to discover in pr
 | [Operations](@/docs/operations.md) | CLI commands, health checks, metrics, replay, Kubernetes |
 | [Runbook](@/docs/runbook.md) | Incident procedures, disaster recovery, upgrade and rollback |
 
+## How this is built
+
+| Guide | What it covers |
+|---|---|
+| [How defects are prevented](@/docs/engineering.md) | The structural guards in the test suite — what each one caught, and where each one is blind |
+
 ## How to read the delivery guarantees
 
 Two claims in these docs are load-bearing, and both are narrower than the words usually

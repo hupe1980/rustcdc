@@ -51,11 +51,10 @@ enum SendSlot {
 /// submitted without yielding — appends on a *later* poll. Poll them backwards and they
 /// append backwards.
 ///
-/// This is not theoretical. `pipelined_sends_reach_the_partition_in_submission_order`
-/// caught it with `FuturesOrdered` in place: 200 records arrived as `0..62`, then
-/// `199..136` reversed, then `63..126`, then `135..127` reversed. Reversed runs of exactly
-/// the records that had queued behind accumulator capacity. For a CDC stream that is
-/// silent replica corruption — `balance=50` applied after `balance=100`.
+/// `pipelined_sends_reach_the_partition_in_submission_order` reproduces this against a
+/// real broker: with `FuturesOrdered` in place, 200 records arrive in reversed runs —
+/// exactly the records that queued behind accumulator capacity. For a CDC stream that is
+/// silent replica corruption: `balance=50` applied after `balance=100`.
 ///
 /// # The invariant
 ///
@@ -119,10 +118,10 @@ impl SendWindow {
             for slot in slots.iter_mut() {
                 // A future must never be polled after it returns `Ready`, so a completed
                 // send is parked in place until the window drains down to it.
-                if let SendSlot::Pending(send) = slot {
-                    if let Poll::Ready(result) = send.as_mut().poll(cx) {
-                        *slot = SendSlot::Done(result);
-                    }
+                if let SendSlot::Pending(send) = slot
+                    && let Poll::Ready(result) = send.as_mut().poll(cx)
+                {
+                    *slot = SendSlot::Done(result);
                 }
             }
 
@@ -367,10 +366,9 @@ impl KafkaSink {
             .to_auth_config()
             .map_err(RtError::ConfigError)?;
 
-        // Carries the SOCKS5 proxy and the per-connection in-flight ceiling too, since
-        // krafka 0.18 moved both onto `TransportConfig`. The proxy used to need a second
-        // accessor applied at each builder below, which is precisely how it came to be
-        // silently dropped when only one of them got it.
+        // Carries the SOCKS5 proxy and the per-connection in-flight ceiling too — one
+        // accessor for every transport setting, so no builder below can be given some of
+        // them and silently miss the rest.
         let transport = config.transport.to_krafka().map_err(RtError::ConfigError)?;
 
         let (producer, delivery_guarantee) = match config.delivery_mode {
@@ -574,10 +572,10 @@ impl KafkaSink {
     ///
     /// # The two arms differ, and the difference is the ordering guarantee
     ///
-    /// **Idempotent:** `enqueue` (krafka 0.18, our `FEEDBACK_KRAFKA.md` F-1) performs the
-    /// accumulator append *before it returns*, so produce order is call order — settled
-    /// here, at submission, and not dependent on how the returned handles are polled
-    /// afterwards. This is the path that no longer needs [`SendWindow`]'s poll sweep.
+    /// **Idempotent:** `enqueue` performs the accumulator append *before it returns*, so
+    /// produce order is call order — settled here, at submission, and not dependent on how
+    /// the returned handles are polled afterwards. This path does not need [`SendWindow`]'s
+    /// poll sweep.
     ///
     /// **Transactional:** `TransactionalProducer::enqueue` returns a handle that borrows
     /// the producer, so it cannot be stored in the same struct that owns the producer
@@ -1054,23 +1052,23 @@ impl rustcdc::sink::SinkAdapter for KafkaSink {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        classify_krafka_error, kafka_connect_timeout, BarrierState, BarrierStateMachine, KafkaSink,
-        RtError,
+        BarrierState, BarrierStateMachine, KafkaSink, RtError, classify_krafka_error,
+        kafka_connect_timeout,
     };
     use crate::config::schema::{
         KafkaCompression, KafkaSecurityConfig, KafkaSecurityProtocol, KafkaSinkConfig,
     };
     use crate::error::AppError;
     use krafka::consumer::{AutoOffsetReset, Consumer};
-    use rustcdc::{fingerprint_event_stable, Event, Operation, SourceMetadata};
+    use rustcdc::{Event, Operation, SourceMetadata, fingerprint_event_stable};
     use serde_json::json;
     use tokio::process::Command;
     use tokio::sync::{Barrier, Mutex};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     #[test]
     fn barrier_state_machine_rejects_invalid_transition_order() {
@@ -1422,9 +1420,10 @@ mod tests {
 
         match KafkaSink::new(&cfg).await {
             Ok(_) => panic!("expected missing tls CA file to be rejected"),
-            Err(err) => assert!(err
-                .to_string()
-                .contains("sink.kafka.security.ssl_ca_location")),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("sink.kafka.security.ssl_ca_location")
+            ),
         }
     }
 
@@ -1988,10 +1987,9 @@ mod tests {
 
     // ── Transactional (effectively-once) coverage ────────────────────────────
     //
-    // krafka 0.16's fake broker serves the full transaction protocol — commit and
-    // abort markers, `read_committed` isolation and the last-stable-offset — so the
-    // checkpoint-barrier path finally has broker-level evidence rather than only the
-    // in-memory state-machine tests above.
+    // The fake broker serves the full transaction protocol — commit and abort markers,
+    // `read_committed` isolation and the last-stable-offset — so the checkpoint-barrier
+    // path has broker-level evidence, not only the in-memory state machine above.
 
     fn transactional_kafka_config(brokers: &str, topic: &str, txn_id: &str) -> KafkaSinkConfig {
         let mut cfg = sample_kafka_config(brokers, topic);
@@ -2374,10 +2372,6 @@ mod tests {
         use rustcdc::sink::SinkAdapter as _;
         binding.flush().await.expect("flush");
 
-        // krafka 0.18 replaced `CompactedTopicConsumer::builder()` with
-        // `from_consumer_builder`, which takes the real `ConsumerBuilder` — so the
-        // connect timeout this used to work around by inflating the request budget is
-        // now simply settable.
         let mut consumer = CompactedTopicConsumer::from_consumer_builder(
             krafka::consumer::Consumer::builder()
                 .bootstrap_servers(broker.bootstrap_servers())

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use krafka::admin::{AdminClient, ConfigEntry, DescribeConfigsRequest};
 use krafka::consumer::CompactedTopicConsumer;
 use krafka::producer::TransactionalProducer;
 use rustcdc::checkpoint::{
-    validate_checkpoint_progress, Checkpoint, FileCheckpoint, GenericOffset, StoredCheckpointRecord,
+    Checkpoint, FileCheckpoint, GenericOffset, StoredCheckpointRecord, validate_checkpoint_progress,
 };
 use rustcdc::core::Offset;
 use rustcdc::schema_history::{
@@ -956,21 +956,10 @@ pub(crate) fn validate_topic_config_entries(
 /// own `read_committed` consumer rather than through this path — so it asserted the
 /// broker's behaviour, not the server's.
 ///
-/// This function used to hand-build a `Consumer`, set `isolation_level` on it, fetch the
-/// topic's metadata and assign every partition itself, because the old
-/// `CompactedTopicConsumerBuilder` exposed neither `isolation_level` nor `connect_timeout`
-/// — nine hand-picked settings, and everything else unreachable. We reported that;
-/// krafka 0.18 deleted the builder in favour of `from_consumer_builder`, which takes the
-/// real `ConsumerBuilder` and *imposes* `ReadCommitted`, `Earliest` and no auto-commit as
-/// requirements of materialising a table rather than preferences. It also does the
-/// metadata refresh and full-partition assignment, so roughly forty lines here — including
-/// a `state_topic_partitions` helper whose only job was that assignment — are now the
-/// library's problem.
-///
-/// **This became correct in krafka 0.17.** Before it, `read_committed` consumers reported
-/// permanent phantom lag — `is_caught_up()` compared the position against the high
-/// watermark rather than the last stable offset — so `scan()` could never terminate on a
-/// topic with any transactional history. Scanning committed-only would have hung startup.
+/// `from_consumer_builder` takes the real `ConsumerBuilder` and *imposes* `ReadCommitted`,
+/// `Earliest` and no auto-commit — requirements of materialising a table, not preferences —
+/// then does the metadata refresh and partition assignment itself. Reading committed-only
+/// is what makes the scan correct: an aborted checkpoint must never be read back as durable.
 async fn build_state_scanner(
     config: &KafkaTopicStateConfig,
 ) -> Result<CompactedTopicConsumer, AppError> {
@@ -1082,10 +1071,20 @@ pub(crate) async fn load_raw_bytes_for_migration(
 ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), AppError> {
     let loaded = load_records(config).await?;
 
-    let checkpoint_bytes = loaded
-        .checkpoint
-        .as_ref()
-        .map(|rec| serde_json::to_vec(rec).expect("KafkaTopicCheckpointRecord serializes cleanly"));
+    // Mapped to an error rather than `.expect(...)`. The claim that this record always
+    // serialises is true of the struct as written today and is not enforced by anything —
+    // a future non-string map key or a non-finite float in a nested `serde_json::Value`
+    // would make `to_vec` fail, and `migrate-state` would abort a disaster-recovery
+    // operation with a panic and a backtrace instead of a diagnosable message.
+    let checkpoint_bytes = match loaded.checkpoint.as_ref() {
+        Some(record) => Some(serde_json::to_vec(record).map_err(|e| {
+            AppError::Other(format!(
+                "state.backend.kafka_topic checkpoint record could not be serialized for \
+                 migration: {e}"
+            ))
+        })?),
+        None => None,
+    };
 
     Ok((checkpoint_bytes, loaded.schema_history_bytes))
 }

@@ -8,39 +8,37 @@ use crate::{
     state::CheckpointAgeSource,
 };
 
-use super::run_lifecycle::{RuntimeLoopOutcome, RuntimeTerminalReasonCode};
-use super::run_loop_batch::handle_polled_batch;
-use super::run_metrics::RuntimeLoopMetricsAccumulator;
-use super::run_reconciliation::CheckpointTxnReconciler;
-use super::run_recovery::{
-    jitter_seed, RecoverableErrorState, RecoveryAction, RecoveryPolicyConfig,
-};
+use super::batch_commit::handle_polled_batch;
+use super::lifecycle::{RuntimeLoopOutcome, RuntimeTerminalReasonCode};
+use super::metrics::RuntimeLoopMetricsAccumulator;
+use super::reconciliation::CheckpointTxnReconciler;
+use super::recovery::{RecoverableErrorState, RecoveryAction, RecoveryPolicyConfig, jitter_seed};
 
-pub(super) struct RuntimeLoopConfig {
-    pub(super) prepare_parallelism: usize,
-    pub(super) sink_flush_interval_events: usize,
-    pub(super) sink_delivery_queue_capacity: usize,
-    pub(super) sink_send_timeout_ms: u64,
-    pub(super) sink_flush_timeout_ms: u64,
-    pub(super) recoverable_error_backoff_initial_ms: u64,
-    pub(super) recoverable_error_backoff_max_ms: u64,
-    pub(super) recoverable_error_backoff_multiplier: f64,
-    pub(super) recoverable_error_backoff_jitter_ratio: f64,
-    pub(super) recoverable_error_breaker_consecutive_threshold: u64,
-    pub(super) recoverable_error_breaker_max_open_cycles: u64,
-    pub(super) recoverable_error_breaker_cooldown_ms: u64,
-    pub(super) sink_name: String,
-    pub(super) requested_delivery_contract: String,
-    pub(super) delivery_contract_satisfied: bool,
-    pub(super) sink_delivery_guarantee: String,
-    pub(super) sink_idempotent_delivery_capable: bool,
-    pub(super) sink_transactional_checkpoint_barrier_capable: bool,
-    pub(super) queue_depth_p95_window_samples: usize,
-    pub(super) correctness_dedup_window_size: usize,
+pub(crate) struct RuntimeLoopConfig {
+    pub(crate) prepare_parallelism: usize,
+    pub(crate) sink_flush_interval_events: usize,
+    pub(crate) sink_delivery_queue_capacity: usize,
+    pub(crate) sink_send_timeout_ms: u64,
+    pub(crate) sink_flush_timeout_ms: u64,
+    pub(crate) recoverable_error_backoff_initial_ms: u64,
+    pub(crate) recoverable_error_backoff_max_ms: u64,
+    pub(crate) recoverable_error_backoff_multiplier: f64,
+    pub(crate) recoverable_error_backoff_jitter_ratio: f64,
+    pub(crate) recoverable_error_breaker_consecutive_threshold: u64,
+    pub(crate) recoverable_error_breaker_max_open_cycles: u64,
+    pub(crate) recoverable_error_breaker_cooldown_ms: u64,
+    pub(crate) sink_name: String,
+    pub(crate) requested_delivery_contract: String,
+    pub(crate) delivery_contract_satisfied: bool,
+    pub(crate) sink_delivery_guarantee: String,
+    pub(crate) sink_idempotent_delivery_capable: bool,
+    pub(crate) sink_transactional_checkpoint_barrier_capable: bool,
+    pub(crate) queue_depth_p95_window_samples: usize,
+    pub(crate) correctness_dedup_window_size: usize,
 }
 
 #[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
-pub(super) async fn execute_event_loop(
+pub(crate) async fn execute_event_loop(
     runtime: &mut CdcRuntime,
     sink: &mut crate::pipeline::router::TableRouter,
     transform_pipeline: &transform::TransformPipeline,
@@ -48,6 +46,7 @@ pub(super) async fn execute_event_loop(
     admin_exit_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
     checkpoint_age_source: &CheckpointAgeSource,
     checkpoint_txn_reconciler: &mut CheckpointTxnReconciler,
+    sink_metrics: &crate::sink::SinkMetricsRegistry,
     dlq: Option<&tokio::sync::Mutex<crate::dlq::DeadLetterQueue>>,
     config: RuntimeLoopConfig,
 ) -> RuntimeLoopOutcome {
@@ -74,6 +73,9 @@ pub(super) async fn execute_event_loop(
         config.correctness_dedup_window_size,
     );
 
+    // Installed before the loop, not inside the `select!`: see [`ShutdownSignals`].
+    let mut shutdown_signals = ShutdownSignals::install();
+
     let mut loop_iteration: u64 = 0;
     'event_loop: loop {
         loop_iteration += 1;
@@ -82,18 +84,15 @@ pub(super) async fn execute_event_loop(
         // rustcdc itself at the top of `poll_event_batch`, so there is nothing to drain
         // here.
         //
-        // This used to be a `try_recv` loop over our own channel, with a long comment
-        // explaining why it could not be a `select!` arm: `poll_event_batch` is not
-        // cancel-safe, and racing it drops events that have left the source's buffer.
-        // rustcdc 0.11 documents that under `# Cancel safety`, services commands between
-        // polls for the same reason, and fixed two places where the crate was racing its
-        // own poll. The reasoning survives upstream; the code here does not need to.
+        // `poll_event_batch` is not cancel-safe — racing it drops events that have left
+        // the source's buffer — so commands are serviced between polls, upstream, under
+        // the guarantee its `# Cancel safety` section documents.
 
         tracing::trace!(loop_iteration, "event loop: entering select");
         tokio::select! {
             biased;
 
-            _ = shutdown_signal() => {
+            _ = shutdown_signals.recv() => {
                 tracing::info!("shutdown signal received - stopping pipeline");
                 admin_state.record_shutdown_request_os_signal().await;
                 admin_state.set_state(InstanceState::Stopping).await;
@@ -126,6 +125,7 @@ pub(super) async fn execute_event_loop(
                             &recovery_policy,
                             &mut recoverable,
                             &mut metrics_accumulator,
+                            sink_metrics,
                             dlq,
                             batch,
                         )
@@ -155,7 +155,7 @@ pub(super) async fn execute_event_loop(
 
 // ── Signal handling ───────────────────────────────────────────────────────────
 
-pub(super) async fn wait_for_admin_exit(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+pub(crate) async fn wait_for_admin_exit(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
     match rx {
         Some(inner) => {
             let _ = inner.changed().await;
@@ -164,42 +164,89 @@ pub(super) async fn wait_for_admin_exit(rx: &mut Option<tokio::sync::watch::Rece
     }
 }
 
-pub(super) async fn shutdown_signal() {
-    let ctrl_c = async {
-        match signal::ctrl_c().await {
-            Ok(()) => {}
-            Err(error) => {
-                tracing::error!(error = %error, "failed to install Ctrl+C handler");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
+/// The process's SIGTERM and SIGINT listeners, installed **once**.
+///
+/// # Why this is a struct and not an `async fn`
+///
+/// It used to be `async fn shutdown_signal()`, awaited fresh inside the event loop's
+/// `select!` — which called `signal::unix::signal(..)` on **every iteration**. A tokio
+/// `Signal` is a receiver, not a query: a signal delivered while no receiver is registered
+/// is dropped, and every loop iteration dropped the previous registration and built a new
+/// one. SIGTERM was therefore only honoured if it arrived in the window where the select
+/// happened to be parked — so `kill` on a busy pipeline did nothing, systemd and Kubernetes
+/// hit their grace period and sent SIGKILL, the checkpoint was never flushed and the owner
+/// lease was never released, leaving the successor to wait out the full lease TTL before it
+/// could start.
+///
+/// Installed once and polled by reference, the registration outlives every iteration and
+/// there is no window. [`Self::recv`] is cancel-safe, which is what lets it sit in a
+/// `select!` arm that loses the race on every batch.
+pub(crate) struct ShutdownSignals {
     #[cfg(unix)]
-    let sigterm = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut stream) => {
-                let _ = stream.recv().await;
+    sigterm: Option<signal::unix::Signal>,
+    #[cfg(unix)]
+    sigint: Option<signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    /// Register the handlers. A handler that cannot be installed is logged and omitted:
+    /// losing one signal is worse than refusing to start, but silently losing it is worse
+    /// still.
+    pub(crate) fn install() -> Self {
+        #[cfg(unix)]
+        {
+            fn stream(kind: signal::unix::SignalKind, name: &str) -> Option<signal::unix::Signal> {
+                match signal::unix::signal(kind) {
+                    Ok(stream) => Some(stream),
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            signal = name,
+                            "failed to install a shutdown handler; this process will not stop \
+                             gracefully on that signal"
+                        );
+                        None
+                    }
+                }
             }
-            Err(error) => {
-                tracing::error!(error = %error, "failed to install SIGTERM handler");
+            Self {
+                sigterm: stream(signal::unix::SignalKind::terminate(), "SIGTERM"),
+                sigint: stream(signal::unix::SignalKind::interrupt(), "SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Resolve when a shutdown signal arrives. Cancel-safe.
+    pub(crate) async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            match (&mut self.sigterm, &mut self.sigint) {
+                (Some(term), Some(int)) => {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = int.recv() => {}
+                    }
+                }
+                (Some(one), None) | (None, Some(one)) => {
+                    let _ = one.recv().await;
+                }
+                (None, None) => std::future::pending::<()>().await,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if signal::ctrl_c().await.is_err() {
                 std::future::pending::<()>().await;
             }
         }
-    };
-
-    #[cfg(not(unix))]
-    let sigterm = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = sigterm => {}
     }
 }
 
 // ── Poll-error recovery ───────────────────────────────────────────────────────
 
-pub(super) async fn handle_poll_error(
+pub(crate) async fn handle_poll_error(
     error: rustcdc::core::Error,
     recoverable: &mut RecoverableErrorState,
     recovery_policy: &RecoveryPolicyConfig,
@@ -251,8 +298,8 @@ pub(super) async fn handle_poll_error(
 #[cfg(test)]
 mod tests {
     use super::handle_poll_error;
-    use crate::commands::run_lifecycle::{RuntimeLoopOutcome, RuntimeTerminalReasonCode};
-    use crate::commands::run_recovery::{RecoverableErrorState, RecoveryPolicyConfig};
+    use crate::runtime::lifecycle::{RuntimeLoopOutcome, RuntimeTerminalReasonCode};
+    use crate::runtime::recovery::{RecoverableErrorState, RecoveryPolicyConfig};
 
     fn deterministic_policy() -> RecoveryPolicyConfig {
         RecoveryPolicyConfig {

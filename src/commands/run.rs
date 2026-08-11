@@ -1,6 +1,6 @@
-use super::run_lifecycle::finalize_runtime_shutdown;
-use super::run_loop::{execute_event_loop, RuntimeLoopConfig};
-use super::run_reconciliation::{CheckpointTxnReconciler, RecoveredMarkerInfo};
+use crate::runtime::event_loop::{RuntimeLoopConfig, execute_event_loop};
+use crate::runtime::lifecycle::finalize_runtime_shutdown;
+use crate::runtime::reconciliation::{CheckpointTxnReconciler, RecoveredMarkerInfo};
 use rustcdc::core::{
     CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, PostCommitSourceConfirmPolicy,
     RuntimeConfig, RuntimeOptions, TransactionBoundaryPolicy, TransformErrorPolicy,
@@ -11,7 +11,7 @@ use crate::pipeline::transform;
 use crate::{
     admin::{self, AdminState, InstanceState},
     cli::{CheckpointParityMode, RunArgs},
-    config::{self, schema::DeliveryContract, AppConfig},
+    config::{self, AppConfig, schema::DeliveryContract},
     error::AppError,
 };
 use rustcdc::sink::SinkAdapter;
@@ -111,6 +111,7 @@ async fn run_pipeline(
     let crate::pipeline::binding::BuiltRouter {
         router: mut sink,
         transaction_handle,
+        sink_metrics,
     } = crate::pipeline::binding::build_router(&app_config).await?;
     let transform_pipeline = transform::TransformPipeline::from_config(
         app_config.pipeline.transform_runtime.clone(),
@@ -127,6 +128,7 @@ async fn run_pipeline(
         &mut admin_exit_rx,
         recovered_marker.clone(),
         state,
+        &sink_metrics,
         checkpoint_parity_mode,
     )
     .await
@@ -141,6 +143,7 @@ async fn run_with_runtime_state(
     admin_exit_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
     recovered_marker: Option<RecoveredMarkerInfo>,
     state: crate::state::RuntimeState,
+    sink_metrics: &crate::sink::SinkMetricsRegistry,
     checkpoint_parity_mode: CheckpointParityMode,
 ) -> Result<(), AppError> {
     let crate::state::RuntimeState {
@@ -221,9 +224,9 @@ async fn run_with_runtime_state(
     };
 
     let options = if app_config.runtime.source_connection_retry.enabled {
-        // `ConnectionRetryPolicy` stopped being `#[non_exhaustive]` in rustcdc 0.8, so
-        // every field is named here — a field added upstream becomes a compile error
-        // instead of silently keeping its default under an operator's explicit config.
+        // `ConnectionRetryPolicy` is not `#[non_exhaustive]`, so every field is named
+        // here — a field added upstream becomes a compile error instead of silently
+        // keeping its default under an operator's explicit config.
         options.with_connection_retry(ConnectionRetryPolicy {
             max_retries: app_config.runtime.source_connection_retry.max_retries,
             initial_delay_ms: app_config.runtime.source_connection_retry.initial_delay_ms,
@@ -277,7 +280,7 @@ async fn run_with_runtime_state(
 
     // Enforce the parity-mode contract at startup so the operator gets an
     // explicit error rather than a silently-degraded effectively_once guarantee.
-    super::run_batch::validate_parity_contract(
+    crate::runtime::batch::validate_parity_contract(
         checkpoint_parity_mode,
         sink,
         app_config.delivery_contract,
@@ -320,14 +323,10 @@ async fn run_with_runtime_state(
     // `RuntimeAdminSnapshot::replication_slot_lag_bytes` (exported as
     // `rustcdc_runtime_replication_slot_lag_bytes`).
     //
-    // This used to be a side-channel: a second PostgreSQL connection polling
-    // `pg_replication_slots` every 15 s, because rustcdc 0.10 refreshed its own figure only
-    // during an idle advance — i.e. only while the pipeline was caught up, which is exactly
-    // when lag is uninteresting. rustcdc 0.11 samples it on a timer regardless of the
-    // caught-up state, so the side-channel is redundant.
-    //
-    // Deleting it removes a second connection, a second credential on the wire every 15
-    // seconds, and the ~120 lines of TLS-connector construction it needed — code that
+    // rustcdc samples this on a timer regardless of the caught-up state, so no
+    // side-channel connection is needed. That saves a second connection, a second
+    // credential on the wire every 15 seconds, and the TLS-connector construction — code
+    // that
     // shipped with a real defect (it connected `NoTls` under `mode = "tls"`).
 
     // ── Main event loop ───────────────────────────────────────────────────
@@ -355,6 +354,7 @@ async fn run_with_runtime_state(
         admin_exit_rx,
         &checkpoint_age_source,
         &mut checkpoint_txn_reconciler,
+        sink_metrics,
         dlq.as_ref(),
         RuntimeLoopConfig {
             prepare_parallelism: app_config.runtime.prepare_parallelism,
@@ -435,16 +435,14 @@ async fn record_post_recovery_checkpoint_proof(
             true,
             format!(
                 "post-recovery checkpoint proof passed: backend={backend_name}, checkpoint_age_seconds={age:.3}, marker_parse_ok={}, marker_detail={}",
-                recovery.parse_ok,
-                recovery.detail
+                recovery.parse_ok, recovery.detail
             ),
         ),
         None => (
             false,
             format!(
                 "post-recovery checkpoint proof incomplete: backend={backend_name}, checkpoint_age_seconds=unavailable, marker_parse_ok={}, marker_detail={}",
-                recovery.parse_ok,
-                recovery.detail
+                recovery.parse_ok, recovery.detail
             ),
         ),
     };
@@ -589,19 +587,17 @@ pub(crate) fn is_cdc_process_alive(pid: u32) -> bool {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::ensure_state_layout;
-    use crate::commands::run_metrics::{
-        recoverable_error_metrics_prometheus, sink_metrics_prometheus,
-    };
-    use crate::commands::run_recovery::{
-        with_recoverable_error_jitter_ms, RecoverableErrorState, RecoveryAction,
-        RecoveryPolicyConfig,
-    };
     use crate::config::schema::{
         AppConfig, KafkaSecurityConfig, KafkaStateDurabilityProfile, KafkaTopicStateConfig,
         OffsetStoreConfig, SchemaHistoryStoreConfig, SinkConfig, StateBackend, StateConfig,
         StdoutSinkConfig,
+    };
+    use crate::runtime::metrics::{recoverable_error_metrics_prometheus, sink_metrics_prometheus};
+    use crate::runtime::recovery::{
+        RecoverableErrorState, RecoveryAction, RecoveryPolicyConfig,
+        with_recoverable_error_jitter_ms,
     };
     use rustcdc::core::{Event, Operation, SourceMetadata};
     use serde_json::json;
@@ -762,11 +758,17 @@ pub(super) mod tests {
         assert!(metrics.contains(
             "rustcdc_sink_delivery_contract_satisfied{sink=\"stdout\",contract=\"at_least_once\"} 1"
         ));
-        assert!(metrics
-            .contains("rustcdc_sink_delivery_guarantee{sink=\"stdout\",mode=\"at_least_once\"} 1"));
+        assert!(
+            metrics.contains(
+                "rustcdc_sink_delivery_guarantee{sink=\"stdout\",mode=\"at_least_once\"} 1"
+            )
+        );
         assert!(metrics.contains("rustcdc_sink_idempotent_delivery_capable{sink=\"stdout\"} 0"));
-        assert!(metrics
-            .contains("rustcdc_sink_transactional_checkpoint_barrier_capable{sink=\"stdout\"} 0"));
+        assert!(
+            metrics.contains(
+                "rustcdc_sink_transactional_checkpoint_barrier_capable{sink=\"stdout\"} 0"
+            )
+        );
         assert!(metrics.contains("rustcdc_sink_flush_ops_total{sink=\"stdout\"} 4"));
         assert!(
             metrics.contains("rustcdc_sink_send_latency_seconds_last{sink=\"stdout\"} 0.000007")
@@ -775,10 +777,15 @@ pub(super) mod tests {
             metrics.contains("rustcdc_sink_flush_latency_seconds_last{sink=\"stdout\"} 0.000025")
         );
         assert!(metrics.contains("rustcdc_runtime_transform_ops_total{sink=\"stdout\"} 12"));
-        assert!(metrics
-            .contains("rustcdc_runtime_transform_latency_seconds_last{sink=\"stdout\"} 0.000006"));
-        assert!(metrics
-            .contains("rustcdc_runtime_transform_wasm_instance_pool_size{sink=\"stdout\"} 0"));
+        assert!(
+            metrics.contains(
+                "rustcdc_runtime_transform_latency_seconds_last{sink=\"stdout\"} 0.000006"
+            )
+        );
+        assert!(
+            metrics
+                .contains("rustcdc_runtime_transform_wasm_instance_pool_size{sink=\"stdout\"} 0")
+        );
         assert!(
             metrics.contains("rustcdc_runtime_transform_wasm_invocations_total{sink=\"stdout\"} 0")
         );
@@ -786,20 +793,29 @@ pub(super) mod tests {
         assert!(
             metrics.contains("rustcdc_runtime_transform_wasm_filtered_total{sink=\"stdout\"} 0")
         );
-        assert!(metrics.contains("rustcdc_runtime_transform_wasm_timeout_total{sink=\"stdout\"} 0"));
+        assert!(
+            metrics.contains("rustcdc_runtime_transform_wasm_timeout_total{sink=\"stdout\"} 0")
+        );
         assert!(metrics.contains("rustcdc_runtime_prepare_ops_total{sink=\"stdout\"} 14"));
-        assert!(metrics
-            .contains("rustcdc_runtime_prepare_latency_seconds_last{sink=\"stdout\"} 0.000008"));
+        assert!(
+            metrics
+                .contains("rustcdc_runtime_prepare_latency_seconds_last{sink=\"stdout\"} 0.000008")
+        );
         assert!(metrics.contains(
             "rustcdc_runtime_batch_delivery_latency_seconds_last{sink=\"stdout\"} 0.00007"
         ));
         assert!(metrics.contains(
             "rustcdc_runtime_checkpoint_commit_latency_seconds_last{sink=\"stdout\"} 0.000009"
         ));
-        assert!(metrics
-            .contains("rustcdc_sink_send_latency_seconds_bucket{sink=\"stdout\",le=\"0.0005\"}"));
-        assert!(metrics
-            .contains("rustcdc_sink_flush_latency_seconds_bucket{sink=\"stdout\",le=\"0.01\"}"));
+        assert!(
+            metrics.contains(
+                "rustcdc_sink_send_latency_seconds_bucket{sink=\"stdout\",le=\"0.0005\"}"
+            )
+        );
+        assert!(
+            metrics
+                .contains("rustcdc_sink_flush_latency_seconds_bucket{sink=\"stdout\",le=\"0.01\"}")
+        );
         assert!(metrics.contains(
             "rustcdc_runtime_transform_latency_seconds_bucket{sink=\"stdout\",le=\"0.005\"}"
         ));
@@ -809,8 +825,11 @@ pub(super) mod tests {
         assert!(metrics.contains(
             "rustcdc_runtime_batch_delivery_latency_seconds_bucket{sink=\"stdout\",le=\"0.0005\"}"
         ));
-        assert!(metrics
-            .contains("rustcdc_runtime_batch_delivery_latency_seconds_count{sink=\"stdout\"} 3"));
+        assert!(
+            metrics.contains(
+                "rustcdc_runtime_batch_delivery_latency_seconds_count{sink=\"stdout\"} 3"
+            )
+        );
         assert!(metrics.contains(
             "rustcdc_runtime_checkpoint_commit_latency_seconds_bucket{sink=\"stdout\",le=\"0.001\"}"
         ));
@@ -842,10 +861,15 @@ pub(super) mod tests {
         assert!(metrics.contains(
             "rustcdc_sink_iceberg_flush_lock_contention_events_total{sink=\"stdout\"} 9"
         ));
-        assert!(metrics
-            .contains("rustcdc_sink_iceberg_flush_lock_contention_ms_total{sink=\"stdout\"} 10"));
-        assert!(metrics
-            .contains("rustcdc_sink_iceberg_flush_lock_contention_ms_max{sink=\"stdout\"} 11"));
+        assert!(
+            metrics.contains(
+                "rustcdc_sink_iceberg_flush_lock_contention_ms_total{sink=\"stdout\"} 10"
+            )
+        );
+        assert!(
+            metrics
+                .contains("rustcdc_sink_iceberg_flush_lock_contention_ms_max{sink=\"stdout\"} 11")
+        );
         assert!(metrics.contains("cdc_data_events_total{sink=\"stdout\"} 0"));
         assert!(metrics.contains("cdc_data_duplicate_rate{sink=\"stdout\"} 0"));
         assert!(metrics.contains("cdc_data_reorder_rate{sink=\"stdout\"} 0"));
@@ -916,8 +940,11 @@ pub(super) mod tests {
             "rustcdc_sink_delivery_guarantee{sink=\"kafka\",mode=\"at_least_once_idempotent\"} 1"
         ));
         assert!(metrics.contains("rustcdc_sink_idempotent_delivery_capable{sink=\"kafka\"} 1"));
-        assert!(metrics
-            .contains("rustcdc_sink_transactional_checkpoint_barrier_capable{sink=\"kafka\"} 0"));
+        assert!(
+            metrics.contains(
+                "rustcdc_sink_transactional_checkpoint_barrier_capable{sink=\"kafka\"} 0"
+            )
+        );
     }
 
     /// Also used by `delivery_contract_tests`, which needs a valid `AppConfig` to

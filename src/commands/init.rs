@@ -11,10 +11,10 @@ pub async fn execute(args: InitArgs) -> Result<(), AppError> {
         )));
     }
 
-    if let Some(parent) = args.output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = args.output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     // The state directory is created here, not left to the first `run`.
@@ -251,7 +251,10 @@ mod tests {
     fn both_templates_load_through_the_real_loader() {
         // Only referenced by the prod template, but set for both so the test does not
         // depend on which one names it.
-        std::env::set_var("CDC_SOURCE__POSTGRES__PASSWORD", "template-test-secret");
+        let _env = crate::test_env::EnvGuard::set(&[(
+            "CDC_SOURCE__POSTGRES__PASSWORD",
+            "template-test-secret",
+        )]);
 
         for profile in [InitProfile::Dev, InitProfile::Prod] {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -280,7 +283,10 @@ mod tests {
     /// the capability.
     #[test]
     fn the_prod_template_enables_on_demand_snapshots() {
-        std::env::set_var("CDC_SOURCE__POSTGRES__PASSWORD", "template-test-secret");
+        let _env = crate::test_env::EnvGuard::set(&[(
+            "CDC_SOURCE__POSTGRES__PASSWORD",
+            "template-test-secret",
+        )]);
         let dir = tempfile::tempdir().expect("tempdir");
         let mut args = args_for(InitProfile::Prod);
         args.state_dir = dir.path().join("state");

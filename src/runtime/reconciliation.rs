@@ -20,12 +20,12 @@ struct CheckpointTxnReconciliationMarker {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct RecoveredMarkerInfo {
-    pub(super) parse_ok: bool,
-    pub(super) detail: String,
+pub(crate) struct RecoveredMarkerInfo {
+    pub(crate) parse_ok: bool,
+    pub(crate) detail: String,
 }
 
-pub(super) struct CheckpointTxnReconciler {
+pub(crate) struct CheckpointTxnReconciler {
     enabled: bool,
     marker_path: PathBuf,
     sink_name: String,
@@ -33,11 +33,11 @@ pub(super) struct CheckpointTxnReconciler {
 }
 
 impl CheckpointTxnReconciler {
-    pub(super) fn marker_path_for(state_dir: &Path) -> PathBuf {
+    pub(crate) fn marker_path_for(state_dir: &Path) -> PathBuf {
         state_dir.join(RECONCILIATION_MARKER_FILE)
     }
 
-    pub(super) fn recover_unresolved_marker(
+    pub(crate) fn recover_unresolved_marker(
         state_dir: &Path,
     ) -> Result<Option<RecoveredMarkerInfo>, AppError> {
         let marker_path = Self::marker_path_for(state_dir);
@@ -95,7 +95,7 @@ impl CheckpointTxnReconciler {
         ))
     }
 
-    pub(super) fn new(
+    pub(crate) fn new(
         state_dir: PathBuf,
         enabled: bool,
         sink_name: String,
@@ -109,7 +109,7 @@ impl CheckpointTxnReconciler {
         }
     }
 
-    pub(super) fn arm(&self, event_count: u64) -> Result<(), AppError> {
+    pub(crate) fn arm(&self, event_count: u64) -> Result<(), AppError> {
         if !self.enabled {
             return Ok(());
         }
@@ -152,7 +152,7 @@ impl CheckpointTxnReconciler {
         Ok(())
     }
 
-    pub(super) fn clear(&self) -> Result<(), AppError> {
+    pub(crate) fn clear(&self) -> Result<(), AppError> {
         if !self.enabled {
             return Ok(());
         }
@@ -167,7 +167,7 @@ impl CheckpointTxnReconciler {
         }
     }
 
-    pub(super) fn validate_armed_event_count(
+    pub(crate) fn validate_armed_event_count(
         &self,
         expected_event_count: u64,
     ) -> Result<(), AppError> {

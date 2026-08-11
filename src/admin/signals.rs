@@ -651,10 +651,10 @@ pub(super) async fn signal_action(
             retry_after_seconds,
         } => {
             let mut headers = HeaderMap::new();
-            if let Some(retry_after) = retry_after_seconds {
-                if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                    headers.insert(RETRY_AFTER, value);
-                }
+            if let Some(retry_after) = retry_after_seconds
+                && let Ok(value) = HeaderValue::from_str(&retry_after.to_string())
+            {
+                headers.insert(RETRY_AFTER, value);
             }
 
             (

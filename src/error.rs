@@ -74,12 +74,12 @@ impl AppError {
     /// we do not understand risks an infinite loop against a permanent failure, and a
     /// terminal error is at least loud.
     ///
-    /// # Flush errors keep their classification (since rustcdc 0.11)
+    /// # Flush errors keep their classification
     ///
-    /// `TableRouter::send` passes a sink's error through untouched, so send-path failures
-    /// have always kept their classification. `flush_all` and `close_all` used to flatten
-    /// every branch's error into one string and return `Error::StateError`, which is
-    /// `ErrorKind::Terminal`: a broker leader election surfacing during flush became a
+    /// `TableRouter::send` passes a sink's error through untouched. `flush_all` and
+    /// `close_all` must not flatten every branch's error into one string and return
+    /// `Error::StateError`, which is `ErrorKind::Terminal`: a broker leader election
+    /// surfacing during flush would become a
     /// process exit, a restart and a full replay, while the identical failure surfacing
     /// from `send` was retried. Which one you got was decided by batch boundaries.
     ///
@@ -203,11 +203,10 @@ mod tests {
 
     /// A broker hiccup during `flush_all` must be retried, not treated as fatal.
     ///
-    /// This is the property that used to fail. `flush_all` aggregated every branch's
-    /// error into `StateError`, which is Terminal, so the same reset connection was
-    /// retried when it surfaced from `send` and fatal when it surfaced from `flush` —
-    /// decided by where the batch boundary happened to fall. Since rustcdc 0.11 the
-    /// aggregate carries the most severe `ErrorKind` among its branches instead.
+    /// The aggregate carries the most severe `ErrorKind` among its branches. Flattening
+    /// them into `StateError` — which is Terminal — would make the same reset connection
+    /// retryable from `send` and fatal from `flush`, decided by where the batch boundary
+    /// happened to fall.
     #[test]
     fn a_transient_flush_failure_is_retryable() {
         use rustcdc::core::Error as RtError;
@@ -267,8 +266,13 @@ pub enum ConfigError {
     #[error("invalid source configuration: {0}")]
     InvalidSource(String),
 
-    #[error("invalid state configuration: {0}")]
-    InvalidState(String),
+    /// Any validation failure that is not source selection.
+    ///
+    /// The message names the section it came from (`registries.<name>: …`,
+    /// `pipeline.transforms[0]…`), so a variant per section would add nothing an
+    /// operator can act on.
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
 }
 
 impl From<figment::Error> for ConfigError {

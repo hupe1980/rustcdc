@@ -3,15 +3,15 @@ use rustcdc::sink::SinkAdapter;
 
 use crate::{admin::AdminState, pipeline::transform, state::CheckpointAgeSource};
 
-use super::run_batch;
-use super::run_lifecycle::{RuntimeLoopOutcome, RuntimeTerminalReasonCode};
-use super::run_loop::RuntimeLoopConfig;
-use super::run_metrics::RuntimeLoopMetricsAccumulator;
-use super::run_reconciliation::CheckpointTxnReconciler;
-use super::run_recovery::{RecoverableErrorState, RecoveryAction, RecoveryPolicyConfig};
+use super::batch;
+use super::event_loop::RuntimeLoopConfig;
+use super::lifecycle::{RuntimeLoopOutcome, RuntimeTerminalReasonCode};
+use super::metrics::RuntimeLoopMetricsAccumulator;
+use super::reconciliation::CheckpointTxnReconciler;
+use super::recovery::{RecoverableErrorState, RecoveryAction, RecoveryPolicyConfig};
 
 #[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
-pub(super) async fn handle_polled_batch(
+pub(crate) async fn handle_polled_batch(
     runtime: &mut CdcRuntime,
     sink: &mut crate::pipeline::router::TableRouter,
     transform_pipeline: &transform::TransformPipeline,
@@ -22,13 +22,14 @@ pub(super) async fn handle_polled_batch(
     recovery_policy: &RecoveryPolicyConfig,
     recoverable: &mut RecoverableErrorState,
     metrics_accumulator: &mut RuntimeLoopMetricsAccumulator,
+    sink_metrics: &crate::sink::SinkMetricsRegistry,
     dlq: Option<&tokio::sync::Mutex<crate::dlq::DeadLetterQueue>>,
     batch: rustcdc::core::EventBatch,
 ) -> Option<RuntimeLoopOutcome> {
     tracing::trace!(batch_len = batch.len(), "handle_polled_batch: enter");
     let batch_delivery_started = std::time::Instant::now();
     let event_count = batch.len() as u64;
-    let delivery_before = crate::pipeline::router::delivery_metrics(sink);
+    let delivery_before = sink_metrics.snapshot();
     let ack_mode = batch.ack_mode();
     let token_present = ack_mode.is_required();
     // Deliver the batch, retrying the **same events** under the recovery policy.
@@ -49,13 +50,26 @@ pub(super) async fn handle_polled_batch(
             Err(outcome) => return Some(outcome),
         };
 
-        if transactional_barrier_active && token_present {
-            if let Err(err) = checkpoint_txn_reconciler.arm(event_count) {
-                return Some(RuntimeLoopOutcome::error(
-                    RuntimeTerminalReasonCode::CheckpointReconciliationError,
-                    err,
-                ));
+        if transactional_barrier_active
+            && token_present
+            && let Err(err) = checkpoint_txn_reconciler.arm(event_count)
+        {
+            // The barrier was opened two statements ago. Returning without aborting
+            // leaves a Kafka transaction that nothing will ever commit or roll back,
+            // and a `read_committed` consumer's last-stable-offset sits behind it
+            // until the broker's `transaction.timeout.ms` elapses — the partition
+            // stops advancing for every consumer, not just this pipeline's.
+            if let Err(abort_err) = sink.abort_checkpoint_barrier().await {
+                tracing::warn!(
+                    error = %abort_err,
+                    "transactional checkpoint barrier abort failed after a \
+                     reconciliation-marker arm error"
+                );
             }
+            return Some(RuntimeLoopOutcome::error(
+                RuntimeTerminalReasonCode::CheckpointReconciliationError,
+                err,
+            ));
         }
 
         match process_batch_events_with_barrier_abort(
@@ -70,13 +84,14 @@ pub(super) async fn handle_polled_batch(
         {
             Ok(stats) => break (transactional_barrier_active, stats),
             Err(err) => {
-                if transactional_barrier_active && token_present {
-                    if let Err(clear_err) = checkpoint_txn_reconciler.clear() {
-                        tracing::warn!(
-                            error = %clear_err,
-                            "failed to clear checkpoint-transaction reconciliation marker after batch delivery error"
-                        );
-                    }
+                if transactional_barrier_active
+                    && token_present
+                    && let Err(clear_err) = checkpoint_txn_reconciler.clear()
+                {
+                    tracing::warn!(
+                        error = %clear_err,
+                        "failed to clear checkpoint-transaction reconciliation marker after batch delivery error"
+                    );
                 }
 
                 if !err.is_recoverable() {
@@ -88,7 +103,7 @@ pub(super) async fn handle_polled_batch(
                 }
 
                 match recoverable
-                    .on_recoverable_error(recovery_policy, super::run_recovery::jitter_seed())
+                    .on_recoverable_error(recovery_policy, super::recovery::jitter_seed())
                 {
                     RecoveryAction::Retry {
                         consecutive,
@@ -156,13 +171,13 @@ pub(super) async fn handle_polled_batch(
                 // discard the data too. Without the abort the records would stay in an
                 // open transaction that nothing will ever commit or roll back, blocking
                 // the partition's last stable offset until the transaction times out.
-                if transactional_barrier_active {
-                    if let Err(abort_err) = sink.abort_checkpoint_barrier().await {
-                        tracing::warn!(
-                            error = %abort_err,
-                            "transactional checkpoint barrier abort failed after a checkpoint error"
-                        );
-                    }
+                if transactional_barrier_active
+                    && let Err(abort_err) = sink.abort_checkpoint_barrier().await
+                {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "transactional checkpoint barrier abort failed after a checkpoint error"
+                    );
                 }
                 return Some(outcome);
             }
@@ -174,22 +189,21 @@ pub(super) async fn handle_polled_batch(
         return Some(outcome);
     }
 
-    if transactional_barrier_active && token_present {
-        if let Err(err) = checkpoint_txn_reconciler.validate_armed_event_count(event_count) {
-            return Some(RuntimeLoopOutcome::error(
-                RuntimeTerminalReasonCode::CheckpointReconciliationError,
-                err,
-            ));
-        }
+    if transactional_barrier_active
+        && token_present
+        && let Err(err) = checkpoint_txn_reconciler.validate_armed_event_count(event_count)
+    {
+        return Some(RuntimeLoopOutcome::error(
+            RuntimeTerminalReasonCode::CheckpointReconciliationError,
+            err,
+        ));
     }
 
-    if transactional_barrier_active {
-        if let Err(err) = checkpoint_txn_reconciler.clear() {
-            return Some(RuntimeLoopOutcome::error(
-                RuntimeTerminalReasonCode::CheckpointReconciliationError,
-                err,
-            ));
-        }
+    if transactional_barrier_active && let Err(err) = checkpoint_txn_reconciler.clear() {
+        return Some(RuntimeLoopOutcome::error(
+            RuntimeTerminalReasonCode::CheckpointReconciliationError,
+            err,
+        ));
     }
 
     // `mark_success` belongs *here*, not at batch entry. Called on entry it meant
@@ -212,6 +226,7 @@ pub(super) async fn handle_polled_batch(
         checkpoint_age_source,
         recoverable,
         metrics_accumulator,
+        sink_metrics,
         event_count,
         delivery_before,
         batch_delivery_started,
@@ -245,8 +260,8 @@ async fn process_batch_events_with_barrier_abort(
     events: impl IntoIterator<Item = rustcdc::core::Event>,
     transactional_barrier_active: bool,
     dlq: Option<&tokio::sync::Mutex<crate::dlq::DeadLetterQueue>>,
-) -> Result<run_batch::BatchProcessingStats, crate::error::AppError> {
-    match run_batch::process_batch_events(
+) -> Result<batch::BatchProcessingStats, crate::error::AppError> {
+    match batch::process_batch_events(
         sink,
         events,
         transform_pipeline,
@@ -261,13 +276,13 @@ async fn process_batch_events_with_barrier_abort(
     {
         Ok(stats) => Ok(stats),
         Err(err) => {
-            if transactional_barrier_active {
-                if let Err(abort_err) = sink.abort_checkpoint_barrier().await {
-                    tracing::warn!(
-                        error = %abort_err,
-                        "transactional checkpoint barrier abort failed after delivery error"
-                    );
-                }
+            if transactional_barrier_active
+                && let Err(abort_err) = sink.abort_checkpoint_barrier().await
+            {
+                tracing::warn!(
+                    error = %abort_err,
+                    "transactional checkpoint barrier abort failed after delivery error"
+                );
             }
             Err(err)
         }
@@ -324,6 +339,7 @@ async fn record_batch_metrics_and_admin(
     checkpoint_age_source: &CheckpointAgeSource,
     recoverable: &RecoverableErrorState,
     metrics_accumulator: &mut RuntimeLoopMetricsAccumulator,
+    sink_metrics: &crate::sink::SinkMetricsRegistry,
     event_count: u64,
     delivery_before: crate::sink::SinkDeliveryMetrics,
     batch_delivery_started: std::time::Instant,
@@ -343,7 +359,7 @@ async fn record_batch_metrics_and_admin(
     let sink_queue_depth_last = sink.queue_depth().unwrap_or(0) as u64;
     metrics_accumulator.record_sink_queue_depth(sink_queue_depth_last);
 
-    let delivery_after = crate::pipeline::router::delivery_metrics(sink);
+    let delivery_after = sink_metrics.snapshot();
     metrics_accumulator.record_sink_delivery_delta(delivery_before, delivery_after);
 
     let recovery_snapshot = recoverable.snapshot();

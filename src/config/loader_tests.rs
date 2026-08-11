@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use super::{load, load_and_migrate};
 use crate::config::schema::AppConfig;
 use crate::token_manifest_policy::{
-    canonical_signing_payload, TokenManifestFile, TokenManifestSignature, TokenManifestToken,
-    TokenManifestUnsigned,
+    TokenManifestFile, TokenManifestSignature, TokenManifestToken, TokenManifestUnsigned,
+    canonical_signing_payload,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -1649,9 +1649,10 @@ require_client_cert = true
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected mTLS client CA requirement failure");
-    assert!(err
-        .to_string()
-        .contains("admin.tls.client_ca_file is required"));
+    assert!(
+        err.to_string()
+            .contains("admin.tls.client_ca_file is required")
+    );
 }
 
 #[test]
@@ -1767,9 +1768,10 @@ notification_log_file = "/tmp/cdc-test-notifications.jsonl"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected empty manifest rejection");
-    assert!(err
-        .to_string()
-        .contains("must contain at least one token entry"));
+    assert!(
+        err.to_string()
+            .contains("must contain at least one token entry")
+    );
 }
 
 #[test]
@@ -1831,9 +1833,10 @@ notification_log_file = "/tmp/cdc-test-notifications.jsonl"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected trusted key requirement failure");
-    assert!(err
-        .to_string()
-        .contains("token_manifest_trusted_public_keys_hex"));
+    assert!(
+        err.to_string()
+            .contains("token_manifest_trusted_public_keys_hex")
+    );
 }
 
 #[test]
@@ -2078,9 +2081,10 @@ notification_log_file = "/tmp/cdc-test-notifications.jsonl"
 
     let err = load(&config_path)
         .expect_err("expected staleness policy requirement for manifest-backed auth");
-    assert!(err
-        .to_string()
-        .contains("token_manifest_max_staleness_ms is required"));
+    assert!(
+        err.to_string()
+            .contains("token_manifest_max_staleness_ms is required")
+    );
 }
 
 #[test]
@@ -2124,9 +2128,10 @@ token_manifest_max_staleness_ms = 1000
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected staleness policy to require manifest file");
-    assert!(err
-        .to_string()
-        .contains("token_manifest_max_staleness_ms requires admin.token_manifest_file"));
+    assert!(
+        err.to_string()
+            .contains("token_manifest_max_staleness_ms requires admin.token_manifest_file")
+    );
 }
 
 #[test]
@@ -2274,9 +2279,10 @@ metrics_rate_limit_burst = 5
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected admin rate-limit validation failure");
-    assert!(err
-        .to_string()
-        .contains("admin.metrics_rate_limit_burst must be >= admin.metrics_rate_limit_rps"));
+    assert!(
+        err.to_string()
+            .contains("admin.metrics_rate_limit_burst must be >= admin.metrics_rate_limit_rps")
+    );
 }
 
 #[test]
@@ -2490,9 +2496,10 @@ sink_flush_interval_events = 100
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected invalid runtime flush interval");
-    assert!(err
-        .to_string()
-        .contains("runtime.sink_flush_interval_events must be <= runtime.max_buffer_size"));
+    assert!(
+        err.to_string()
+            .contains("runtime.sink_flush_interval_events must be <= runtime.max_buffer_size")
+    );
 }
 
 #[test]
@@ -2667,9 +2674,10 @@ mode = "wasm"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected invalid wasm runtime config");
-    assert!(err
-        .to_string()
-        .contains("transform_runtime.wasm.module_path"));
+    assert!(
+        err.to_string()
+            .contains("transform_runtime.wasm.module_path")
+    );
 }
 
 #[test]
@@ -2856,9 +2864,10 @@ dir = "/tmp/cdc-state"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected invalid insecure http sink config");
-    assert!(err
-        .to_string()
-        .contains("sink.http.verify_tls must be true"));
+    assert!(
+        err.to_string()
+            .contains("sink.http.verify_tls must be true")
+    );
 }
 
 #[test]
@@ -2900,9 +2909,10 @@ dir = "/tmp/cdc-state"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected invalid non-https http sink url");
-    assert!(err
-        .to_string()
-        .contains("sink.http.url must use https except for localhost loopback testing"));
+    assert!(
+        err.to_string()
+            .contains("sink.http.url must use https except for localhost loopback testing")
+    );
 }
 
 #[test]
@@ -2944,9 +2954,10 @@ dir = "/tmp/cdc-state"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected inline bearer token literal to be rejected");
-    assert!(err
-        .to_string()
-        .contains("sink.http.bearer_token must use deferred secret references"));
+    assert!(
+        err.to_string()
+            .contains("sink.http.bearer_token must use deferred secret references")
+    );
 }
 
 /// `{ env = "VAR" }` references resolve to the environment value for every
@@ -2958,8 +2969,10 @@ fn resolves_env_secret_references_at_load_time() {
     let config_path: PathBuf = dir.path().join("cdc.toml");
 
     // Unique names to avoid collisions with parallel tests.
-    std::env::set_var("CDC_LOADER_TEST_PG_PASSWORD", "pg-secret-from-env");
-    std::env::set_var("CDC_LOADER_TEST_BEARER", "bearer-from-env");
+    let _env = crate::test_env::EnvGuard::set(&[
+        ("CDC_LOADER_TEST_PG_PASSWORD", "pg-secret-from-env"),
+        ("CDC_LOADER_TEST_BEARER", "bearer-from-env"),
+    ]);
 
     std::fs::write(
         &config_path,
@@ -3109,9 +3122,169 @@ dir = "/tmp/cdc-state"
     .expect("write config");
 
     let err = load(&config_path).expect_err("expected inline iceberg token literal to be rejected");
-    assert!(err
-        .to_string()
-        .contains("sink.iceberg.catalog.rest.token must use deferred secret references"));
+    assert!(
+        err.to_string()
+            .contains("sink.iceberg.catalog.rest.token must use deferred secret references")
+    );
+}
+
+/// AWS S3 Tables is selected by the catalog table key, and needs no warehouse URI.
+///
+/// The catalog is an enum over `[sink.catalog.rest]` and `[sink.catalog.s3tables]` rather
+/// than a struct with two optional sub-tables, so "both" and "neither" cannot be written
+/// down — they are parse errors rather than validation errors.
+#[test]
+fn accepts_iceberg_sink_with_an_s3tables_catalog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path: PathBuf = dir.path().join("cdc.toml");
+
+    let toml = |arn: &str| {
+        format!(
+            r#"
+api_version = "v1"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc_user"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+conn_timeout_secs = 10
+stream_poll_interval_ms = 100
+max_events_per_poll = 1000
+table_include_list = []
+table_exclude_list = []
+
+[source.postgres.transport]
+mode = "plaintext"
+
+[sink]
+type = "iceberg"
+table_path = "/tmp/iceberg-table"
+namespace = "cdc"
+table_name = "events"
+
+[sink.catalog.s3tables]
+table_bucket_arn = "{arn}"
+
+[state]
+dir = "/tmp/cdc-state"
+"#
+        )
+    };
+
+    let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
+
+    std::fs::write(
+        &config_path,
+        toml("arn:aws:s3tables:eu-central-1:123456789012:bucket/cdc"),
+    )
+    .expect("write config");
+    let config = load(&config_path).expect("an s3tables catalog must load");
+    let crate::config::sink::SinkConfig::Iceberg(iceberg) = &config.sink else {
+        panic!("expected an iceberg sink");
+    };
+    assert_eq!(iceberg.catalog.kind(), "s3tables");
+    assert_eq!(
+        iceberg.catalog.location(),
+        "arn:aws:s3tables:eu-central-1:123456789012:bucket/cdc"
+    );
+
+    // A malformed ARN is refused at load. Left to the AWS SDK it surfaces as an opaque
+    // signing failure on the first flush, which is during an incident rather than during
+    // `validate-config`.
+    std::fs::write(&config_path, toml("my-bucket")).expect("write config");
+    let err = load(&config_path).expect_err("a non-ARN must be refused");
+    assert!(
+        err.to_string().contains("is not an S3 Tables ARN"),
+        "unexpected: {err}"
+    );
+}
+
+/// The Snowflake durability wait must fit inside the runtime's flush timeout.
+///
+/// Both defaults were 60 000 ms, so `runtime.sink_flush_timeout_ms` raced
+/// `sink.snowflake.commit_timeout_ms` and usually won — cancelling the wait after the rows
+/// had been appended. The sink reconciles so no duplicate reaches Snowflake either way;
+/// this rule stops the situation arising, because a bound the caller abandons is not a
+/// bound.
+#[test]
+fn rejects_a_snowflake_commit_wait_that_outlives_the_runtime_flush_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path: PathBuf = dir.path().join("cdc.toml");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(
+        &key_path,
+        include_str!("../../tests/fixtures/snowflake_test_key.pem"),
+    )
+    .expect("write key");
+
+    let toml = |commit_timeout_ms: u64, flush_timeout_ms: u64| {
+        format!(
+            r#"
+api_version = "v1"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc_user"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+conn_timeout_secs = 10
+stream_poll_interval_ms = 100
+max_events_per_poll = 1000
+table_include_list = []
+table_exclude_list = []
+
+[source.postgres.transport]
+mode = "plaintext"
+
+[runtime]
+sink_flush_timeout_ms = {flush_timeout_ms}
+
+[sink]
+type = "snowflake"
+account_url = "https://myorg-myaccount.snowflakecomputing.com"
+account = "MYORG-MYACCOUNT"
+user = "CDC_SVC"
+database = "CDC"
+schema = "PUBLIC"
+pipe = "EVENTS_PIPE"
+commit_timeout_ms = {commit_timeout_ms}
+
+[sink.auth]
+type = "key_pair"
+private_key = {{ env = "CDC_TEST_SNOWFLAKE_KEY" }}
+
+[state]
+dir = "/tmp/cdc-state"
+"#
+        )
+    };
+
+    let _env = crate::test_env::EnvGuard::set(&[
+        ("CDC_TEST_SOURCE_PASSWORD", "pg-secret"),
+        (
+            "CDC_TEST_SNOWFLAKE_KEY",
+            include_str!("../../tests/fixtures/snowflake_test_key.pem"),
+        ),
+    ]);
+
+    // Equal timeouts — the shape that shipped, and the one that races.
+    std::fs::write(&config_path, toml(60_000, 60_000)).expect("write config");
+    let err = load(&config_path).expect_err("an equal pair must be refused");
+    assert!(
+        err.to_string().contains("commit_timeout_ms"),
+        "unexpected: {err}"
+    );
+
+    // With headroom it loads.
+    std::fs::write(&config_path, toml(45_000, 60_000)).expect("write config");
+    load(&config_path).expect("a commit wait with headroom must load");
 }
 
 /// `wal_transport` reaches the connector, and its default is the streaming protocol.
@@ -3189,6 +3362,9 @@ dir = "{}"
     )
     .expect("write config");
 
-    std::env::set_var("CDC_TEST_SOURCE_PASSWORD", "pg-secret");
+    // Scoped to the `load` call that needs it. The old code set this variable and never
+    // removed it, so every later test in the binary ran with it present — which is how a
+    // test that depends on an ambient variable passes locally and fails in isolation.
+    let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
     load(&config_path).expect("config should load")
 }

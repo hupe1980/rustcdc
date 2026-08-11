@@ -1,30 +1,23 @@
 //! Pipeline-level dead-letter queue.
 //!
-//! # Why this is not a sink concern
+//! # Why it is not a sink concern
 //!
-//! A dead-letter queue used to exist for exactly one sink — HTTP — and only as a local
-//! file. Every other sink had nowhere to put an event it could never deliver, so a
-//! poison event on the Kafka path produced a terminal error, a restart, a replay, and
-//! the same event failing again: a crash-loop with no quarantine and no forward
-//! progress. Debezium's baseline is a dead-letter topic available to *any* connector.
+//! Whether an event is undeliverable is decided by
+//! [`AppError::is_recoverable`](crate::error::AppError) — a pipeline-level
+//! classification; the sink only reports what happened. So the DLQ lives here and applies
+//! to every sink. Without one, a poison event is a terminal error, a restart, a replay
+//! and the same failure again: a crash loop with no forward progress. Targets are a
+//! file, a Kafka topic or an SQS queue; a file on a container filesystem dies with the
+//! pod, which is the wrong medium for an artefact you reach for during an incident.
 //!
-//! Quarantining is also not really a transport decision. Whether an event is
-//! undeliverable is decided by [`AppError::is_recoverable`](crate::error::AppError),
-//! which is a pipeline-level classification; the sink only reports what happened. So
-//! the DLQ lives here, applies to every sink, and can target a file *or* a Kafka topic
-//! — the latter because a local file on a container filesystem is lost with the pod,
-//! which makes it the wrong medium for the artefact you reach for during an incident.
+//! # Quarantining is opt-in
 //!
-//! # Quarantining is opt-in, and deliberately so
-//!
-//! With no `[dlq]` section configured, a non-recoverable delivery failure is terminal —
-//! exactly as before. That is the safe default: writing an event aside and advancing
-//! the checkpoint past it **is data loss**, correctly recorded but still loss. An
-//! operator has to ask for that trade, because the alternative (halt and page someone)
-//! is the right answer for a pipeline whose contents matter more than its uptime.
-//!
-//! This mirrors the reasoning rustcdc applies to `TransformErrorPolicy::Skip`, which
-//! refuses to run without a dead-letter handler for the same reason.
+//! With no `[dlq]` section, a non-recoverable delivery failure stays terminal. That is
+//! the safe default: setting an event aside and advancing the checkpoint past it **is
+//! data loss**, recorded but still loss. Halting and paging someone is the right answer
+//! for a pipeline whose contents matter more than its uptime, so an operator has to ask
+//! for the other trade. rustcdc's `TransformErrorPolicy::Skip` refuses to run without a
+//! dead-letter handler for the same reason.
 
 use std::path::PathBuf;
 
@@ -35,6 +28,7 @@ use crate::error::AppError;
 
 mod file;
 mod kafka;
+mod sqs;
 
 /// One quarantined event, plus everything needed to understand and replay it.
 ///
@@ -54,8 +48,18 @@ pub struct DeadLetterRecord {
     pub source_offset: String,
     /// Why it was undeliverable. The rendered error chain, not just the outer layer.
     pub error: String,
-    /// The event itself.
+    /// The event itself, or `null` when it had to be dropped to fit a target's message
+    /// limit — see [`DeadLetterRecord::without_payload`].
     pub event: serde_json::Value,
+    /// Whether [`Self::event`] was dropped.
+    ///
+    /// Serialised always, not skipped when false: a consumer must be able to tell "no
+    /// payload because it was too big" from "this field is absent in an older record",
+    /// and a missing field cannot express the difference.
+    pub payload_truncated: bool,
+    /// Size of the full record, when it was truncated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_bytes: Option<usize>,
 }
 
 impl DeadLetterRecord {
@@ -72,6 +76,23 @@ impl DeadLetterRecord {
             error: error.to_string(),
             event: serde_json::to_value(event)
                 .unwrap_or_else(|e| serde_json::json!({ "unserializable": e.to_string() })),
+            payload_truncated: false,
+            original_bytes: None,
+        }
+    }
+
+    /// The same record with its payload dropped, for a target that cannot carry it.
+    ///
+    /// Everything an operator acts on survives — the source offset above all, because that
+    /// is what makes a manual replay possible and the row still exists upstream. The
+    /// payload is set to `null` rather than to a partial value: a truncated JSON object is
+    /// something a consumer might read and trust.
+    pub fn without_payload(&self, original_bytes: usize) -> Self {
+        Self {
+            event: serde_json::Value::Null,
+            payload_truncated: true,
+            original_bytes: Some(original_bytes),
+            ..self.clone()
         }
     }
 
@@ -85,6 +106,7 @@ impl DeadLetterRecord {
 pub enum DeadLetterQueue {
     File(file::FileDlq),
     Kafka(Box<kafka::KafkaDlq>),
+    Sqs(Box<sqs::SqsDlq>),
 }
 
 impl DeadLetterQueue {
@@ -102,6 +124,9 @@ impl DeadLetterQueue {
             DlqTarget::Kafka(kafka_config) => Ok(Some(Self::Kafka(Box::new(
                 kafka::KafkaDlq::new(kafka_config).await?,
             )))),
+            DlqTarget::Sqs(sqs_config) => Ok(Some(Self::Sqs(Box::new(
+                sqs::SqsDlq::new(sqs_config).await?,
+            )))),
         }
     }
 
@@ -115,6 +140,7 @@ impl DeadLetterQueue {
         match self {
             Self::File(sink) => sink.write(record).await,
             Self::Kafka(sink) => sink.write(record).await,
+            Self::Sqs(sink) => sink.write(record).await,
         }
     }
 
@@ -123,6 +149,7 @@ impl DeadLetterQueue {
         match self {
             Self::File(_) => "file",
             Self::Kafka(_) => "kafka",
+            Self::Sqs(_) => "sqs",
         }
     }
 }

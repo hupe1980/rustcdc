@@ -171,13 +171,11 @@ impl IncrementalSnapshotConfig {
                 ));
             }
             // A condition keyed to a table that is not in `tables` is inert *at startup*,
-            // but no longer meaningless: `execute_snapshot` can name a table that was never
-            // in `tables`, and since rustcdc 0.12 the on-demand path resolves configured
-            // conditions through the same function as the startup path. Pre-declaring one
-            // is therefore a supported way to scope a backfill that will be requested
-            // later, and rejecting it — which this did, because the on-demand path
-            // structurally could not see the filter — would now refuse a working
-            // configuration.
+            // not meaningless: `execute_snapshot` can name a table that was never in
+            // `tables`, and the on-demand path resolves configured conditions through the
+            // same function as the startup path. Pre-declaring one is therefore a
+            // supported way to scope a backfill requested later, and rejecting it would
+            // refuse a working configuration.
             //
             // The typo case it was really guarding is caught where it can be caught
             // precisely: a `conditions` entry in an `execute_snapshot` request must name a
@@ -418,11 +416,7 @@ impl Default for AdminConfig {
 
 impl AdminConfig {
     pub fn endpoint_scheme(&self) -> &'static str {
-        if self.tls.is_some() {
-            "https"
-        } else {
-            "http"
-        }
+        if self.tls.is_some() { "https" } else { "http" }
     }
 
     pub fn base_url(&self) -> String {
@@ -520,6 +514,21 @@ pub struct ObservabilityConfig {
     /// Service name reported to the trace/metrics backend.
     #[serde(default = "default_service_name")]
     pub service_name: String,
+
+    /// Permit plaintext (`http://`) OTLP export to a **non-loopback** host.
+    ///
+    /// Off by default, and it should stay off: OTLP spans from this server carry table
+    /// names, column names and source offsets, so an unencrypted export to a remote
+    /// collector is an information disclosure over the wire.
+    ///
+    /// This was the bare environment variable `OTLP_ALLOW_INSECURE=1`, read inside the
+    /// telemetry validator and declared nowhere. A security-relevant override that lives
+    /// outside the configuration file is invisible to `validate-config`, absent from
+    /// `GET /config`, unreachable by the inert-settings scanner, and cannot be reviewed
+    /// alongside the settings it overrides. Every other switch in this server is a field;
+    /// so is this one.
+    #[serde(default)]
+    pub otlp_allow_insecure: bool,
 }
 
 impl ObservabilityConfig {
@@ -550,6 +559,7 @@ impl Default for ObservabilityConfig {
             otlp_metrics_interval_secs: default_otlp_metrics_interval_secs(),
             otlp_protocol: default_otel_protocol(),
             service_name: default_service_name(),
+            otlp_allow_insecure: false,
         }
     }
 }
@@ -1121,10 +1131,8 @@ mod tests {
         assert!(err.contains("in the clear"), "unexpected: {err}");
     }
 
-    /// `SASL_SSL` + SCRAM-SHA-512 is the default secured listener on most managed
-    /// brokers. krafka 0.15 could not construct it, so this sink used to refuse the
-    /// combination; krafka 0.16's `with_tls` makes it reachable, and the negotiated
-    /// protocol must actually be `SASL_SSL` — a config that quietly stayed on
+    /// `SASL_SSL` + SCRAM-SHA-512 is the default secured listener on most managed brokers.
+    /// The negotiated protocol must actually be `SASL_SSL`: a config that quietly stayed on
     /// `SASL_PLAINTEXT` would put the SCRAM exchange on the wire unencrypted.
     #[test]
     fn sasl_ssl_scram_negotiates_tls() {
@@ -1279,17 +1287,15 @@ mod tests {
 
     /// MSK IAM's constructor already implies `SASL_SSL`. Layering our TLS settings on
     /// top must take the CA path / client certificate / SNI without *downgrading* the
-    /// protocol — before krafka 0.16 the MSK arm silently ignored all of them, so a
-    /// private-CA MSK cluster could not be reached at all.
+    /// protocol. An MSK arm that silently ignored them would leave a private-CA MSK
+    /// cluster unreachable.
     #[test]
     fn msk_iam_keeps_sasl_ssl_and_takes_our_tls_settings() {
-        let _guard = AWS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Safety: serialised by AWS_ENV_LOCK; no other thread reads these here.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA_TEST");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
-            std::env::set_var("AWS_REGION", "eu-central-1");
-        }
+        let _env = crate::test_env::EnvGuard::set(&[
+            ("AWS_ACCESS_KEY_ID", "AKIA_TEST"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_REGION", "eu-central-1"),
+        ]);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let ca = dir.path().join("ca.pem");
@@ -1304,12 +1310,6 @@ mod tests {
         security.validate().expect("valid");
         let auth = security.to_auth_config().expect("auth config");
 
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("AWS_REGION");
-        }
-
         assert!(auth.requires_tls(), "MSK IAM must stay on SASL_SSL");
         assert_eq!(
             auth.tls_config().and_then(|t| t.ca_cert_path()),
@@ -1323,13 +1323,11 @@ mod tests {
     /// credentials, and MSK rejects a SigV4 signature made without the token.
     #[test]
     fn msk_region_override_preserves_the_session_token() {
-        let _guard = AWS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Safety: serialised by AWS_ENV_LOCK; no other thread reads these here.
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA_TEST");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
-            std::env::set_var("AWS_SESSION_TOKEN", "session-token");
-        }
+        let _env = crate::test_env::EnvGuard::set(&[
+            ("AWS_ACCESS_KEY_ID", "AKIA_TEST"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", "session-token"),
+        ]);
 
         let mut security = sasl_ssl(KafkaSaslMechanism::AwsMskIam);
         let sasl_cfg = security.sasl.as_mut().expect("sasl");
@@ -1340,20 +1338,12 @@ mod tests {
         let auth = security.to_auth_config().expect("auth config");
         let credentials = auth.aws_msk_iam_credentials().expect("msk credentials");
 
-        unsafe {
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-            std::env::remove_var("AWS_SESSION_TOKEN");
-        }
-
         assert_eq!(credentials.region(), "eu-central-1");
         assert!(
             credentials.has_session_token(),
             "the region override must not discard AWS_SESSION_TOKEN"
         );
     }
-
-    static AWS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A certificate without its key falls back to a server-only handshake, and
     /// the broker then rejects the client with an error naming neither field.
@@ -1374,10 +1364,9 @@ mod tests {
 
     // ─── Kafka producer tuning ───────────────────────────────────────────────
 
-    /// krafka 0.15's transactional builder had no `compression_level`, so this sink
-    /// rejected the pairing rather than accept a silently discarded setting. 0.16
-    /// brought the transactional builder to parity, so exactly-once no longer costs
-    /// the tuning knob.
+    /// The transactional builder reaches `compression_level` too, so exactly-once costs
+    /// no tuning knob. Pinned because this sink used to reject the pairing rather than
+    /// accept a setting the builder would silently discard.
     #[test]
     fn compression_level_is_accepted_for_transactional_delivery() {
         let mut cfg = sample_kafka_config("kafka:9092");
@@ -1791,14 +1780,12 @@ topic = "cdc-checkpoint-state"
     fn iceberg_sink_validate_accepts_append_mode() {
         let cfg = IcebergSinkConfig {
             table_path: std::path::PathBuf::from("/tmp/iceberg-table"),
-            catalog: IcebergCatalogConfig {
-                rest: IcebergRestCatalogConfig {
-                    uri: "http://127.0.0.1:8181".to_string(),
-                    warehouse: "file:///tmp/iceberg-warehouse".to_string(),
-                    token: None,
-                    credential: None,
-                },
-            },
+            catalog: IcebergCatalogConfig::Rest(IcebergRestCatalogConfig {
+                uri: "http://127.0.0.1:8181".to_string(),
+                warehouse: "file:///tmp/iceberg-warehouse".to_string(),
+                token: None,
+                credential: None,
+            }),
             schema_mode: IcebergSchemaMode::Normalized,
             namespace: "cdc".to_string(),
             table_name: "events".to_string(),
@@ -1825,14 +1812,12 @@ topic = "cdc-checkpoint-state"
     fn iceberg_sink_validate_rejects_empty_catalog_secret() {
         let cfg = IcebergSinkConfig {
             table_path: std::path::PathBuf::from("/tmp/iceberg-table"),
-            catalog: IcebergCatalogConfig {
-                rest: IcebergRestCatalogConfig {
-                    uri: "http://127.0.0.1:8181".to_string(),
-                    warehouse: "file:///tmp/iceberg-warehouse".to_string(),
-                    token: Some(SecretString::new("   ")),
-                    credential: None,
-                },
-            },
+            catalog: IcebergCatalogConfig::Rest(IcebergRestCatalogConfig {
+                uri: "http://127.0.0.1:8181".to_string(),
+                warehouse: "file:///tmp/iceberg-warehouse".to_string(),
+                token: Some(SecretString::new("   ")),
+                credential: None,
+            }),
             schema_mode: IcebergSchemaMode::Normalized,
             namespace: "cdc".to_string(),
             table_name: "events".to_string(),

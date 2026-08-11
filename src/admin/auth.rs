@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use axum::http::{header::AUTHORIZATION, header::RETRY_AFTER, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
@@ -267,11 +267,11 @@ impl AuthState {
         };
 
         let now_instant = Instant::now();
-        if let Some(last) = self.last_refresh_attempt {
-            if now_instant.duration_since(last) < refresh_interval {
-                self.enforce_manifest_staleness(max_staleness);
-                return;
-            }
+        if let Some(last) = self.last_refresh_attempt
+            && now_instant.duration_since(last) < refresh_interval
+        {
+            self.enforce_manifest_staleness(max_staleness);
+            return;
         }
         self.last_refresh_attempt = Some(now_instant);
 

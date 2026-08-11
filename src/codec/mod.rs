@@ -29,9 +29,9 @@ use rustcdc::codec::{
     AsyncCodec, BoxedAsyncCodec, CloudEventsEncoder, ConfluentProtobufEncoder, EncoderCodec,
 };
 use rustcdc::{
-    preflight_schema_registry, ApicurioRegistryConfig, AvroEncoder, ConfluentAvroEncoder,
-    ConfluentJsonSchemaEncoder, DynSchemaRegistryClient, ProtobufEncoder, RetryPolicy,
-    SchemaReference, SchemaRegistryAuth, SchemaRegistryConfig, SchemaType, SubjectNameStrategy,
+    ApicurioRegistryConfig, AvroEncoder, ConfluentAvroEncoder, ConfluentJsonSchemaEncoder,
+    DynSchemaRegistryClient, ProtobufEncoder, RetryPolicy, SchemaReference, SchemaRegistryAuth,
+    SchemaRegistryConfig, SchemaType, SubjectNameStrategy, preflight_schema_registry,
 };
 
 pub use crate::config::codec::{CodecConfig, JsonSchemaCodecConfig, RegistryCodecConfig};
@@ -56,7 +56,6 @@ type DynRegistry = Arc<dyn DynSchemaRegistryClient>;
 /// Confluent Avro) reach it through rustcdc's blanket `impl<T: Codec> AsyncCodec for T`;
 /// the two that resolve subjects lazily — Confluent JSON Schema and Protobuf, whose
 /// first encode per subject is a registry round-trip — implement `AsyncCodec` directly.
-/// Before rustcdc 0.9 this was a hand-rolled three-variant dispatch enum here.
 pub type BuiltCodec = BoxedAsyncCodec;
 
 // ─── Build helper ─────────────────────────────────────────────────────────────
@@ -102,7 +101,6 @@ pub async fn build(config: Option<&CodecConfig>, topic: &str) -> Result<BuiltCod
 ///
 /// Credentials and region come from the standard AWS chain, so one IAM identity covers
 /// both this and the Kafka sink's `aws_msk_iam` mechanism.
-#[cfg(feature = "glue")]
 async fn build_glue_avro_codec(
     cfg: &crate::config::codec::GlueCodecConfig,
 ) -> Result<BuiltCodec, String> {
@@ -127,22 +125,6 @@ async fn build_glue_avro_codec(
         .await
         .map_err(|e| format!("failed to build the AWS Glue Avro encoder: {e}"))?;
     Ok(encoder.boxed_async())
-}
-
-/// Stub for builds without the `glue` feature.
-///
-/// Rejected at build time with the remedy named, rather than the codec silently
-/// falling back to something else.
-#[cfg(not(feature = "glue"))]
-async fn build_glue_avro_codec(
-    _cfg: &crate::config::codec::GlueCodecConfig,
-) -> Result<BuiltCodec, String> {
-    Err(
-        "codec type = \"glue_avro\" requires the `glue` cargo feature, which is not \
-         compiled into this binary. The published container image includes it; a source \
-         build needs `cargo build --features glue`."
-            .to_string(),
-    )
 }
 
 // ─── Registry plumbing ────────────────────────────────────────────────────────
@@ -241,11 +223,10 @@ fn non_zero_usize(value: usize) -> Option<usize> {
 /// so a registry problem otherwise surfaces as a failed event mid-pipeline rather than
 /// as a startup failure. The Apicurio native client is constructed lazily and makes no
 /// connection until first use, so there is nothing to preflight against.
-/// `schema_type` selects which schemas the preflight checks. It is **not** cosmetic:
-/// through rustcdc 0.8 preflight always checked the Avro schemas under Avro record
-/// names whatever the codec was, so a JSON Schema or Protobuf deployment with
-/// `auto_register = false` failed against a perfectly correct registry, and one with
-/// `auto_register = true` ran an Avro compatibility check against a JSON subject.
+/// `schema_type` selects which schemas the preflight checks. It is **not** cosmetic: check
+/// Avro schemas under Avro record names for a JSON Schema or Protobuf deployment and
+/// `auto_register = false` fails against a perfectly correct registry, while
+/// `auto_register = true` runs an Avro compatibility check against a JSON subject.
 async fn build_registry_client(
     cfg: &ConfluentRegistryConfig,
     topic: &str,
@@ -272,9 +253,6 @@ async fn build_registry_client(
                     .build()
                     .map_err(|e| format!("failed to build the Apicurio registry client: {e}"))?,
             );
-            // rustcdc 0.9 gave Apicurio a preflight entry point of its own. Before it,
-            // an Apicurio deployment silently got no startup check while a Confluent one
-            // did — the same asymmetry we had to document as a limitation.
             if cfg.preflight {
                 apicurio
                     .preflight(client.as_ref(), schema_type)
@@ -481,17 +459,6 @@ mod tests {
             empty.validate().is_err(),
             "an empty schema name must be rejected"
         );
-    }
-
-    /// Without the feature the codec must fail at build time naming the remedy, not
-    /// fall back to some other framing.
-    #[cfg(not(feature = "glue"))]
-    #[tokio::test]
-    async fn glue_codec_without_the_feature_reports_the_remedy() {
-        let parsed: CodecConfig =
-            toml::from_str("type = \"glue_avro\"\nschema_name = \"cdc-events\"").expect("parse");
-        let err = build(Some(&parsed), "t").await.expect_err("must fail");
-        assert!(err.contains("--features glue"), "unexpected: {err}");
     }
 
     /// A registry-backed codec with neither an inline table nor a `registry_ref`

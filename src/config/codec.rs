@@ -2,10 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use super::registry::ConfluentRegistryConfig;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Codec configuration
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Per-sink output serialisation codec.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -194,9 +190,7 @@ impl CodecConfig {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Registry-backed codec configs
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// How a registry-backed codec names its registry.
 ///

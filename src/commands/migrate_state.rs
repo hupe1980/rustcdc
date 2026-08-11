@@ -323,11 +323,7 @@ fn copy_artifact(
         ArtifactKind::Checkpoint => discover_local_checkpoint(source_root)?,
         ArtifactKind::SchemaHistory => {
             let path = source_root.join("schema_history");
-            if path.exists() {
-                Some(path)
-            } else {
-                None
-            }
+            if path.exists() { Some(path) } else { None }
         }
     };
 
@@ -437,12 +433,12 @@ async fn verify_checkpoint_loads(
             "migrated checkpoint failed committed-count verification: {e}"
         ))
     })?;
-    if let Some(expected) = expected_committed_count {
-        if count != expected {
-            return Err(AppError::Other(format!(
-                "migrated checkpoint committed_event_count mismatch: expected {expected}, loaded {count}"
-            )));
-        }
+    if let Some(expected) = expected_committed_count
+        && count != expected
+    {
+        return Err(AppError::Other(format!(
+            "migrated checkpoint committed_event_count mismatch: expected {expected}, loaded {count}"
+        )));
     }
     Ok(())
 }
@@ -455,9 +451,9 @@ fn write_local_file(target_path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let tmp_path = temp_path(target_path);
     {
         let mut file = fs::File::create(&tmp_path).map_err(AppError::from)?;
-        // State artifacts are trust anchors: rustcdc 0.7.0 rejects checkpoint
-        // files readable by group/other, and schema history deserves the same
-        // posture. Restrict before writing any bytes.
+        // State artifacts are trust anchors: checkpoint files readable by group/other are
+        // rejected upstream, and schema history deserves the same posture. Restrict
+        // before writing any bytes.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

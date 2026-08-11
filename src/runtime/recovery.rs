@@ -1,33 +1,33 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) struct RecoveryPolicyConfig {
-    pub(super) initial_backoff_ms: u64,
-    pub(super) max_backoff_ms: u64,
-    pub(super) backoff_multiplier: f64,
-    pub(super) jitter_ratio: f64,
-    pub(super) breaker_consecutive_threshold: u64,
-    pub(super) breaker_max_open_cycles: u64,
-    pub(super) breaker_cooldown_ms: u64,
+pub(crate) struct RecoveryPolicyConfig {
+    pub(crate) initial_backoff_ms: u64,
+    pub(crate) max_backoff_ms: u64,
+    pub(crate) backoff_multiplier: f64,
+    pub(crate) jitter_ratio: f64,
+    pub(crate) breaker_consecutive_threshold: u64,
+    pub(crate) breaker_max_open_cycles: u64,
+    pub(crate) breaker_cooldown_ms: u64,
     /// Consecutive clean-success polls required to reset `breaker_open_consecutive`.
     /// Prevents a single successful poll from clearing escalation state when
     /// the source is flapping.  Default should be >= 10.
-    pub(super) breaker_clean_window_successes: u64,
+    pub(crate) breaker_clean_window_successes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct RecoverableErrorSnapshot {
-    pub(super) total: u64,
-    pub(super) consecutive: u64,
-    pub(super) backoff_ms: u64,
-    pub(super) backoff_last_ms: u64,
-    pub(super) breaker_open_total: u64,
-    pub(super) breaker_open_consecutive: u64,
+pub(crate) struct RecoverableErrorSnapshot {
+    pub(crate) total: u64,
+    pub(crate) consecutive: u64,
+    pub(crate) backoff_ms: u64,
+    pub(crate) backoff_last_ms: u64,
+    pub(crate) breaker_open_total: u64,
+    pub(crate) breaker_open_consecutive: u64,
     /// Monotonic count of circuit-breaker open events across the full session.
     /// Never resets; used for long-running liveness monitoring.
-    pub(super) lifetime_breaker_open_total: u64,
+    pub(crate) lifetime_breaker_open_total: u64,
 }
 
-pub(super) enum RecoveryAction {
+pub(crate) enum RecoveryAction {
     Retry {
         consecutive: u64,
         backoff_base_ms: u64,
@@ -43,7 +43,7 @@ pub(super) enum RecoveryAction {
     },
 }
 
-pub(super) struct RecoverableErrorState {
+pub(crate) struct RecoverableErrorState {
     total: u64,
     consecutive: u64,
     backoff_ms: u64,
@@ -60,7 +60,7 @@ pub(super) struct RecoverableErrorState {
 }
 
 impl RecoverableErrorState {
-    pub(super) fn new(initial_backoff_ms: u64) -> Self {
+    pub(crate) fn new(initial_backoff_ms: u64) -> Self {
         Self {
             total: 0,
             consecutive: 0,
@@ -73,7 +73,7 @@ impl RecoverableErrorState {
         }
     }
 
-    pub(super) fn mark_success(&mut self, initial_backoff_ms: u64, policy: &RecoveryPolicyConfig) {
+    pub(crate) fn mark_success(&mut self, initial_backoff_ms: u64, policy: &RecoveryPolicyConfig) {
         self.backoff_ms = initial_backoff_ms;
         self.consecutive = 0;
         self.consecutive_successes = self.consecutive_successes.saturating_add(1);
@@ -86,7 +86,7 @@ impl RecoverableErrorState {
         }
     }
 
-    pub(super) fn snapshot(&self) -> RecoverableErrorSnapshot {
+    pub(crate) fn snapshot(&self) -> RecoverableErrorSnapshot {
         RecoverableErrorSnapshot {
             total: self.total,
             consecutive: self.consecutive,
@@ -98,7 +98,7 @@ impl RecoverableErrorState {
         }
     }
 
-    pub(super) fn on_recoverable_error(
+    pub(crate) fn on_recoverable_error(
         &mut self,
         policy: &RecoveryPolicyConfig,
         seed: u64,
@@ -129,8 +129,7 @@ impl RecoverableErrorState {
                 return RecoveryAction::Escalate {
                     message: format!(
                         "recoverable error circuit-breaker opened {} consecutive times (max {}); escalating to terminal error",
-                        self.breaker_open_consecutive,
-                        policy.breaker_max_open_cycles
+                        self.breaker_open_consecutive, policy.breaker_max_open_cycles
                     ),
                 };
             }
@@ -159,7 +158,7 @@ fn next_recoverable_error_backoff_ms(current_ms: u64, max_ms: u64, multiplier: f
     next.min(max_ms).max(current_ms)
 }
 
-pub(super) fn with_recoverable_error_jitter_ms(base_ms: u64, jitter_ratio: f64, seed: u64) -> u64 {
+pub(crate) fn with_recoverable_error_jitter_ms(base_ms: u64, jitter_ratio: f64, seed: u64) -> u64 {
     if base_ms <= 1 || jitter_ratio <= 0.0 {
         return base_ms;
     }
@@ -176,7 +175,7 @@ pub(super) fn with_recoverable_error_jitter_ms(base_ms: u64, jitter_ratio: f64, 
 
 /// Mix in a monotonic counter so the seed is non-zero even when the
 /// system clock is behind UNIX_EPOCH (NTP step, container cold-start, etc.).
-pub(super) fn jitter_seed() -> u64 {
+pub(crate) fn jitter_seed() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);

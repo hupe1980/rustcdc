@@ -8,20 +8,20 @@
 //! recovery, while the OpenDAL layer provides replication to a remote store.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use opendal::Operator;
 use rustcdc::checkpoint::{
-    validate_checkpoint_progress, Checkpoint, FileCheckpoint, StoredCheckpointRecord,
+    Checkpoint, FileCheckpoint, StoredCheckpointRecord, validate_checkpoint_progress,
 };
 use rustcdc::core::{Error as RtError, Offset};
 use serde::{Deserialize, Serialize};
 
 use crate::config::schema::{PostgresStateConfig, RedisStateConfig};
 use crate::error::AppError;
-use crate::state::remote_lease::{self, LeaseRecord, LEASE_HEARTBEAT, LEASE_KEY, LEASE_TTL};
+use crate::state::remote_lease::{self, LEASE_HEARTBEAT, LEASE_KEY, LEASE_TTL, LeaseRecord};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Key constants
@@ -88,13 +88,16 @@ impl OwnedLease {
     pub(crate) async fn renew(&self) -> Result<(), AppError> {
         let now_ms = remote_lease::now_unix_ms();
 
-        if let Some(existing) = read_lease(&self.op).await? {
-            if existing.owner != self.owner && existing.is_live(now_ms, LEASE_TTL) {
-                return Err(AppError::Other(format!(
-                    "{} state lease was taken by '{}' while this process held it                      (ours: '{}', epoch {}). This instance has been fenced out and will                      stop rather than write checkpoints alongside the new owner.",
-                    self.backend, existing.owner, self.owner, self.epoch,
-                )));
-            }
+        if let Some(existing) = read_lease(&self.op).await?
+            && existing.owner != self.owner
+            && existing.is_live(now_ms, LEASE_TTL)
+        {
+            return Err(AppError::Other(format!(
+                "{} state lease was taken by '{}' while this process held it \
+                     (ours: '{}', epoch {}). This instance has been fenced out and will \
+                     stop rather than write checkpoints alongside the new owner.",
+                self.backend, existing.owner, self.owner, self.epoch,
+            )));
         }
 
         write_lease(

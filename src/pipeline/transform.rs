@@ -2,8 +2,8 @@ use rustcdc::outbox::OutboxTransform;
 use rustcdc::transform::UnmatchedRule;
 use rustcdc::wasm::{TransformResult, WasmConfig as RustcdcWasmConfig, WasmRuntime};
 use rustcdc::{
-    fingerprint_event_stable, Error, Event, FieldMappingConfig, FieldMappingTransform,
-    MaskHashConfig, MaskHashTransform, MaskRule, Operation, Result,
+    Error, Event, FieldMappingConfig, FieldMappingTransform, MaskHashConfig, MaskHashTransform,
+    MaskRule, Operation, Result, fingerprint_event_stable,
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -42,9 +42,8 @@ enum CompiledAction {
     /// counters every time.
     Native {
         transform: Box<dyn rustcdc::transform::Transform>,
-        /// Report this stage's never-matched rules. rustcdc 0.9 put
-        /// `unmatched_rules()` on the `Transform` trait, so every stage answers it
-        /// uniformly instead of masking being a special case.
+        /// Report this stage's never-matched rules — `unmatched_rules()` is on the
+        /// `Transform` trait, so every stage answers it uniformly.
         warn_on_unmatched: bool,
     },
 }
@@ -82,8 +81,8 @@ fn compile_action(rule_name: &str, action: TransformActionConfig) -> Result<Comp
                 let compiled = mask_rule(rule_name, &path, rule)?;
                 config.mask_rules.insert(path, compiled);
             }
-            // rustcdc 0.9 made this fallible: `Truncate(0)`, `Redact("")` and an empty
-            // rule path are rejected here. All three make the masking *invisible* rather
+            // Fallible: `Truncate(0)`, `Redact("")` and an empty rule path are rejected
+            // here. All three make the masking *invisible* rather
             // than merely useless — an empty string is indistinguishable downstream from
             // a genuinely empty column.
             let transform = MaskHashTransform::new(config).map_err(|e| {
@@ -518,19 +517,19 @@ fn finalize_transformed(mut event: Event) -> Result<Event> {
 /// present-*and*-listed contradiction because the dangerous reading (trust the payload)
 /// is the one a sink takes.
 fn reconcile_availability_lists(event: &mut Event) {
-    if !event.unavailable_columns.is_empty() {
-        if let Some(Value::Object(after)) = event.after.as_ref() {
-            event
-                .unavailable_columns
-                .retain(|column| !after.contains_key(column));
-        }
+    if !event.unavailable_columns.is_empty()
+        && let Some(Value::Object(after)) = event.after.as_ref()
+    {
+        event
+            .unavailable_columns
+            .retain(|column| !after.contains_key(column));
     }
-    if !event.before_unavailable_columns.is_empty() {
-        if let Some(Value::Object(before)) = event.before.as_ref() {
-            event
-                .before_unavailable_columns
-                .retain(|column| !before.contains_key(column));
-        }
+    if !event.before_unavailable_columns.is_empty()
+        && let Some(Value::Object(before)) = event.before.as_ref()
+    {
+        event
+            .before_unavailable_columns
+            .retain(|column| !before.contains_key(column));
     }
 }
 

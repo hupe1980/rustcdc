@@ -1,9 +1,8 @@
 //! `rustcdc snapshot` — backfill tables on a running instance.
 //!
-//! The runtime capability landed with rustcdc 0.10 and was reachable only by hand-writing
-//! a `POST /signals` body. Meanwhile `--admin-write-token` and `--admin-write-token-env`
-//! were accepted by the CLI and read by nothing: `status` was the only command that talks
-//! to the admin API, and it only reads. This command is what those flags were for.
+//! The runtime capability is otherwise reachable only by hand-writing a `POST /signals`
+//! body, and this is the only command that uses `--admin-write-token` — `status` is the
+//! only other one that talks to the admin API, and it only reads.
 //!
 //! It deliberately does **not** wait for the snapshot to finish. The signal is
 //! asynchronous by design — the pipeline answers `STARTED`, services the request between
@@ -13,7 +12,7 @@
 
 use crate::{cli::SnapshotArgs, error::AppError};
 
-use super::status::{http_post_json, AdminAuthClientConfig, AdminTlsClientConfig};
+use super::status::{AdminAuthClientConfig, AdminTlsClientConfig, http_post_json};
 
 pub async fn execute(args: SnapshotArgs) -> Result<(), AppError> {
     let tables: Vec<String> = args

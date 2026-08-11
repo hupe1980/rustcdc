@@ -7,10 +7,10 @@ pub fn load_and_migrate_value(
     let current_version = config_api_version(&raw)?;
 
     // Accept v1alpha1 as the legacy name for v1 — bump the tag only.
-    if current_version == "v1alpha1" {
-        if let Some(v) = raw.get_mut("api_version") {
-            *v = serde_json::Value::String("v1".to_string());
-        }
+    if current_version == "v1alpha1"
+        && let Some(v) = raw.get_mut("api_version")
+    {
+        *v = serde_json::Value::String("v1".to_string());
     }
 
     let current_version = config_api_version(&raw)?;
@@ -57,7 +57,7 @@ fn normalize_source(mut raw: serde_json::Value) -> Result<serde_json::Value, Con
         .collect();
 
     if source_sub_keys.len() > 1 {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "exactly one source block must be configured".to_string(),
         ));
     }
@@ -104,7 +104,7 @@ fn normalize_sink(raw: &serde_json::Value) -> Result<(), ConfigError> {
         .map(str::to_string);
 
     if sink_type.as_deref() == Some("avro") {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "sink type='avro' is no longer supported. \
              Use type='file_jsonl' or type='iceberg' for file output, or \
              type='kafka' with [sink.kafka.codec] type='avro_confluent' for Confluent Avro."
@@ -113,7 +113,7 @@ fn normalize_sink(raw: &serde_json::Value) -> Result<(), ConfigError> {
     }
 
     if sink_type.as_deref() == Some("otel") {
-        return Err(ConfigError::InvalidState(
+        return Err(ConfigError::Invalid(
             "sink type='otel' is no longer supported. \
              Configure OpenTelemetry export via [observability.otlp_endpoint]."
                 .to_string(),
@@ -187,7 +187,7 @@ fn normalize_state(mut raw: serde_json::Value) -> Result<serde_json::Value, Conf
                 .collect();
             if !stray.is_empty() {
                 stray.sort();
-                return Err(ConfigError::InvalidState(format!(
+                return Err(ConfigError::Invalid(format!(
                     "unrecognised key(s) under [state]: {}. The flat [state] table \
                      accepts only `dir` and `backend`; anything else was previously \
                      dropped without a word. If you meant a top-level setting, move it \
@@ -231,7 +231,7 @@ fn config_api_version(raw: &serde_json::Value) -> Result<String, ConfigError> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            ConfigError::InvalidState(
+            ConfigError::Invalid(
                 "api_version must be present and a string in configuration root".to_string(),
             )
         })

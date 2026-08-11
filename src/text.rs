@@ -1,38 +1,25 @@
 //! Byte-bounded truncation that cannot panic and cannot produce invalid UTF-8.
 //!
-//! Several places here cap a string at a byte budget: the audit-trail detail (so a
-//! write-scope token cannot inflate the in-memory ring buffer), and the dead-letter
-//! record's exception header (so a broker cannot reject the whole record and lose the
-//! quarantined event).
-//!
-//! Both were written as `&text[..LIMIT]`, which **panics** when the limit lands inside a
-//! multi-byte character. For the audit trail that was reachable from outside: the detail
-//! string embeds the caller's `message` and `additional_data` verbatim, and `serde_json`
-//! does not escape non-ASCII, so a signal carrying an accented character positioned at the
-//! 4096-byte boundary panicked the task that appended it. In the HTTP handler that fails
-//! one request; in the signal-action worker — which appends the same lifecycle entries —
-//! it kills the worker task, and every asynchronous signal afterwards is silently never
-//! processed for the life of the process.
+//! Two places cap a string at a byte budget: the audit-trail detail and the dead-letter
+//! record's exception header. Both bound attacker-influenced text, so neither may use
+//! `&text[..LIMIT]` — that panics when the limit lands inside a multi-byte character, and
+//! in the signal-action worker one such panic silently ends all later signal processing.
 
 use std::borrow::Cow;
 
 /// Trim `text` to at most `max_bytes`, never splitting a character.
 ///
-/// Returns the input untouched when it already fits, so the common path allocates
-/// nothing. When it does not fit, the result is the longest prefix that fits *plus*
-/// `suffix` — so the value says on its face that it is incomplete, which is the
-/// difference between a truncated diagnostic and a misleading one.
-///
-/// `suffix` is appended beyond the budget rather than inside it. The budget exists to
-/// bound attacker-influenced input; a fixed marker the caller chose is neither.
+/// Borrows when the input already fits. Otherwise the result is the longest prefix that
+/// fits plus `suffix`, so the value says on its face that it is incomplete. `suffix` is
+/// appended beyond the budget: the budget bounds untrusted input, and a marker the caller
+/// chose is not that.
 pub(crate) fn truncate_utf8<'a>(text: &'a str, max_bytes: usize, suffix: &str) -> Cow<'a, str> {
     if text.len() <= max_bytes {
         return Cow::Borrowed(text);
     }
 
-    // The largest index ≤ max_bytes that starts a character. `floor_char_boundary` would
-    // say this in one call but is still unstable, and a linear scan back over at most
-    // three bytes is not worth waiting for it.
+    // The largest index ≤ max_bytes that starts a character. `floor_char_boundary` is
+    // still unstable; scanning back at most three bytes is not worth waiting for it.
     let mut end = max_bytes;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;

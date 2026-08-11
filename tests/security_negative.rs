@@ -1,11 +1,9 @@
 //! Negative-path security suite.
 //!
-//! Every previous round's security work was *reactive* — a defect found by reading code
-//! (the HTTP-sink URL credential leak), then a regression test written for that one
-//! defect. Four rounds produced exactly one reproduced security finding, and it was not
-//! a test that found it. That asymmetry is the argument for this file.
+//! A regression test written after a defect proves that defect is gone; it does not go
+//! looking. These probes do — each one states an attack and asserts it fails.
 //!
-//! These probes drive the **real axum router** in-process via `tower::ServiceExt`, so
+//! They drive the **real axum router** in-process via `tower::ServiceExt`, so
 //! they exercise the same extractors, middleware and handlers a network client hits.
 //! Calling the handler functions directly would skip precisely the layers where an
 //! authorisation bypass tends to live.
@@ -22,8 +20,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use rustcdc_server::admin::AdminState;
 use rustcdc_server::config::AppConfig;
 use rustcdc_server::token_manifest_policy::{
-    canonical_signing_payload, TokenManifestFile, TokenManifestSignature, TokenManifestToken,
-    TokenManifestUnsigned,
+    TokenManifestFile, TokenManifestSignature, TokenManifestToken, TokenManifestUnsigned,
+    canonical_signing_payload,
 };
 use tower::ServiceExt;
 
@@ -661,7 +659,10 @@ read_token_env = "CDC_TEST_STATUS_READ_TOKEN"
     // string `unauthorized`, and "no secret appears in the body" held trivially. The test
     // named after redaction never exercised redaction once. The legibility assertion below
     // is what exposed that, and is why it is here rather than being merely nice to have.
-    std::env::set_var("CDC_TEST_STATUS_READ_TOKEN", "status-read-token");
+    let _env = rustcdc_server::test_env::EnvGuard::set(&[(
+        "CDC_TEST_STATUS_READ_TOKEN",
+        "status-read-token",
+    )]);
     let config = rustcdc_server::config::load(&config_path).expect("config loads");
     let state = AdminState::new(&config).await.expect("admin state");
 

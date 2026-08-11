@@ -1,3 +1,16 @@
+// The binary this project ships contains no `unsafe`, and this enforces it.
+//
+// `forbid` cannot be overridden by any inner `#[allow]`, so this crate refuses to compile
+// the moment `unsafe` appears anywhere in it. The library is one step weaker — `deny` with
+// a single allowlisted site in `test_env`, which needs `std::env::set_var` for tests whose
+// subject reads the process environment. See the note in `Cargo.toml`.
+#![forbid(unsafe_code)]
+// The dispatch future now nests the AWS SDK's own client stack (SQS for the dead-letter
+// queue, S3 Tables for the Iceberg catalog) inside the pipeline future, and the default
+// 128-deep type-layout query gives up on it. This raises the compiler's limit; it says
+// nothing about runtime recursion.
+#![recursion_limit = "256"]
+
 use clap::Parser;
 
 use rustcdc_server::cli::Cli;
@@ -48,22 +61,12 @@ async fn main() {
         None => None,
     };
 
-    let otlp_endpoint = obs.as_ref().and_then(|o| o.otlp_endpoint.as_deref());
-    let otlp_metrics_endpoint = obs
+    // One conversion, so every OTLP setting travels together and adding one is a struct
+    // field rather than another positional argument threaded through three signatures.
+    let otlp = obs
         .as_ref()
-        .and_then(|o| o.otlp_metrics_endpoint.as_deref());
-    let metrics_interval_secs = obs
-        .as_ref()
-        .map(|o| o.otlp_metrics_interval_secs)
-        .unwrap_or(30);
-    let service_name = obs
-        .as_ref()
-        .map(|o| o.service_name.as_str())
-        .unwrap_or("rustcdc-server");
-    let otlp_protocol = obs
-        .as_ref()
-        .map(|o| rustcdc_server::telemetry::OtlpProtocol::from_config(&o.otlp_protocol))
-        .unwrap_or(rustcdc_server::telemetry::OtlpProtocol::Grpc);
+        .map(rustcdc_server::telemetry::OtlpOptions::from)
+        .unwrap_or_default();
 
     // Initialise the global tracing subscriber exactly once, including the
     // optional OTel span-exporter and metrics-exporter layers.
@@ -71,11 +74,7 @@ async fn main() {
     let _telemetry_guard = match rustcdc_server::telemetry::init_with_metrics(
         cli.log_format.as_deref(),
         cli.log_level.as_deref(),
-        otlp_endpoint,
-        otlp_metrics_endpoint,
-        metrics_interval_secs,
-        otlp_protocol,
-        service_name,
+        &otlp,
     ) {
         Ok(g) => g,
         Err(e) => {

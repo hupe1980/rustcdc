@@ -7,7 +7,7 @@
 //! documented, labelled, exported as a metric and validated at startup without a
 //! single test driving a real crash through the real batch handler.
 //!
-//! These tests drive [`super::run_loop_batch::handle_polled_batch`] — the production
+//! These tests drive [`super::batch_commit::handle_polled_batch`] — the production
 //! code path, not a re-implementation — against a real `CdcRuntime`, a real local-fs
 //! checkpoint store and a real `file_jsonl` sink in a `tempfile` directory. The crash
 //! is injected with rustcdc's [`CheckpointFault::FailSave`], which models the
@@ -35,14 +35,14 @@ use rustcdc::source::{
 };
 
 use crate::admin::AdminState;
-use crate::commands::run_loop::RuntimeLoopConfig;
-use crate::commands::run_loop_batch::handle_polled_batch;
-use crate::commands::run_metrics::RuntimeLoopMetricsAccumulator;
-use crate::commands::run_reconciliation::CheckpointTxnReconciler;
-use crate::commands::run_recovery::{RecoverableErrorState, RecoveryPolicyConfig};
 use crate::config::schema::{AppConfig, DeliveryContract, StateBackend};
 use crate::config::sink::{FileJsonlSinkConfig, SinkConfig};
 use crate::pipeline::transform::TransformPipeline;
+use crate::runtime::batch_commit::handle_polled_batch;
+use crate::runtime::event_loop::RuntimeLoopConfig;
+use crate::runtime::metrics::RuntimeLoopMetricsAccumulator;
+use crate::runtime::reconciliation::CheckpointTxnReconciler;
+use crate::runtime::recovery::{RecoverableErrorState, RecoveryPolicyConfig};
 use crate::state::CheckpointAgeSource;
 
 const SOURCE_TYPE: &str = "scripted";
@@ -185,6 +185,7 @@ impl Source for ScriptedSource {
 struct Pipeline {
     runtime: CdcRuntime,
     router: crate::pipeline::router::TableRouter,
+    sink_metrics: crate::sink::SinkMetricsRegistry,
     transform_pipeline: TransformPipeline,
     admin_state: AdminState,
     checkpoint_age_source: CheckpointAgeSource,
@@ -242,11 +243,13 @@ impl Pipeline {
             "backoff_max_ms": 1,
         }))
         .expect("unreachable http sink config");
-        pipeline.router = crate::pipeline::router::single(
-            crate::sink::build_binding(&unreachable, 1 << 20)
-                .await
-                .expect("http binding"),
-        );
+        let binding = crate::sink::build_binding(&unreachable, 1 << 20)
+            .await
+            .expect("http binding");
+        let mut sink_metrics = crate::sink::SinkMetricsRegistry::default();
+        sink_metrics.register(binding.metrics_handle());
+        pipeline.router = crate::pipeline::router::single(binding);
+        pipeline.sink_metrics = sink_metrics;
         pipeline
     }
 
@@ -266,6 +269,7 @@ impl Pipeline {
             .await
             .expect("router");
         let router = built.router;
+        let sink_metrics = built.sink_metrics;
         let admin_state = AdminState::new(&app_config).await.expect("admin state");
         // The harness uses a `file_jsonl` sink, which has no transaction to share.
         let state = crate::state::build(&app_config.state, built.transaction_handle)
@@ -317,6 +321,7 @@ impl Pipeline {
             loop_config: loop_config_for(&app_config),
             recoverable: RecoverableErrorState::new(recovery_policy.initial_backoff_ms),
             recovery_policy,
+            sink_metrics,
             metrics: RuntimeLoopMetricsAccumulator::new(
                 "file_jsonl",
                 DeliveryContract::AtLeastOnce.as_label(),
@@ -354,6 +359,7 @@ impl Pipeline {
                 &self.recovery_policy,
                 &mut self.recoverable,
                 &mut self.metrics,
+                &self.sink_metrics,
                 None,
                 batch,
             )
@@ -386,7 +392,7 @@ impl Pipeline {
 
 fn config_for(state_dir: &Path, output_path: &Path) -> AppConfig {
     let mut config =
-        super::run::tests::minimal_config(state_dir.to_path_buf(), StateBackend::LocalFs);
+        crate::commands::run::tests::minimal_config(state_dir.to_path_buf(), StateBackend::LocalFs);
     config.sink = SinkConfig::FileJsonl(FileJsonlSinkConfig {
         path: output_path.to_path_buf(),
         rotate_size_bytes: 0,
@@ -472,6 +478,7 @@ async fn a_transient_sink_failure_is_retried_under_the_recovery_policy_then_esca
         &pipeline.recovery_policy,
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
+        &pipeline.sink_metrics,
         None,
         batch,
     )
@@ -522,6 +529,7 @@ async fn an_oversized_event_fails_immediately_without_retrying() {
         &pipeline.recovery_policy,
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
+        &pipeline.sink_metrics,
         None,
         batch,
     )
@@ -581,6 +589,7 @@ async fn a_poison_event_is_quarantined_and_the_batch_completes() {
         &pipeline.recovery_policy,
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
+        &pipeline.sink_metrics,
         Some(&dlq),
         batch,
     )
@@ -637,6 +646,7 @@ async fn without_a_dead_letter_target_a_poison_event_still_halts() {
         &pipeline.recovery_policy,
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
+        &pipeline.sink_metrics,
         None,
         batch,
     )

@@ -11,13 +11,10 @@
 //!
 //! That boundary — "rustcdc tests connectors, cdc-server tests the server" — is defensible
 //! in principle and indefensible in practice, because the defects that matter are
-//! *integration* defects between two independently versioned crates. rustcdc 0.10 replaced
-//! the PostgreSQL WAL transport with a new ~900-line wire client and made it the default;
-//! this file is the only thing in this repository that has ever run it.
-//!
-//! It found a real resume defect on its first run. See
-//! `the_resume_position_does_not_lose_events` for what it asserts and why the bound is
-//! written the way it is.
+//! *integration* defects between two independently versioned crates. The PostgreSQL WAL
+//! transport is a ~900-line wire client upstream, and this file is the only thing in this
+//! repository that runs it. See `the_resume_position_does_not_lose_events` for the
+//! property that matters most and why its bound is written the way it is.
 //!
 //! # Running it
 //!
@@ -330,6 +327,11 @@ sink_flush_interval_events = 1
             .collect()
     }
 
+    /// The state directory the config points at.
+    fn state_path(&self) -> PathBuf {
+        self.dir.path().join("state")
+    }
+
     /// Whatever the pipeline logged, for a failure message.
     fn stderr(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("pipeline.log"))
@@ -450,11 +452,31 @@ sink_flush_interval_events = 1
 /// PostgreSQL refuses a second `START_REPLICATION` while a walsender still holds the slot,
 /// so a test that restarts the pipeline has to actually wait for the first one to exit —
 /// not merely signal it.
+/// Wait until PostgreSQL has released a slot, after the process holding it exited.
+///
+/// A walsender's teardown is not synchronous with its client's exit: the slot stays
+/// `active` for a short window afterwards, and a `START_REPLICATION` inside that window is
+/// refused with *"replication slot is already active"*. The pipeline retries through it —
+/// that is what `source_connection_retry` is for — but a test that spawns the successor
+/// immediately measures the retry schedule rather than the property it names, and fails
+/// when the two do not line up.
+fn wait_for_slot_released(slot: &str, within: Duration) {
+    let deadline = Instant::now() + within;
+    while psql(&format!(
+        "SELECT active FROM pg_replication_slots WHERE slot_name = '{slot}';"
+    )) == "t"
+    {
+        assert!(
+            Instant::now() < deadline,
+            "slot '{slot}' was still held {within:?} after the process holding it exited"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn shutdown(mut child: Child) {
     #[cfg(unix)]
-    unsafe {
-        libc_kill(child.id() as i32);
-    }
+    send_sigterm(child.id() as i32);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match child.try_wait() {
@@ -470,8 +492,13 @@ fn shutdown(mut child: Child) {
 }
 
 /// `SIGTERM` via `kill(1)` — no libc dependency for one signal.
+///
+/// This was `unsafe fn libc_kill`, called from an `unsafe` block, despite spawning a
+/// process and doing nothing unsafe whatsoever. The name and the keyword were left over
+/// from a libc-based version that no longer exists; nothing flagged them because the
+/// crate's `unsafe_code` lint was never actually applied (see `Cargo.toml`).
 #[cfg(unix)]
-unsafe fn libc_kill(pid: i32) {
+fn send_sigterm(pid: i32) {
     let _ = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status();
@@ -499,7 +526,7 @@ unsafe fn libc_kill(pid: i32) {
 ///
 /// So the precondition is: the slot **exists** (both transports), and additionally is
 /// **active** only where something holds it open.
-fn wait_for_slot_ready(slot: &str, wal_transport: &str, within: Duration) {
+fn wait_for_slot_ready(fixture: &Fixture, slot: &str, wal_transport: &str, within: Duration) {
     let needs_walsender = wal_transport == "streaming_replication";
     let deadline = Instant::now() + within;
     loop {
@@ -521,7 +548,8 @@ fn wait_for_slot_ready(slot: &str, wal_transport: &str, within: Duration) {
              {wal_transport}, pg_replication_slots reported {state:?}). Under \
              streaming_replication this means no walsender attached; under sql_peek it \
              means the slot was never created. Either way the DML that follows would be \
-             invisible to the pipeline."
+             invisible to the pipeline.\n\nWhat the pipeline logged:\n{}",
+            fixture.stderr()
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -557,6 +585,7 @@ fn insert_update_and_delete_are_captured_in_order() {
         // The stream has to be established before the DML, or the changes predate the
         // slot and there is nothing to capture.
         wait_for_slot_ready(
+            &fixture,
             &format!("it_basic_{transport}"),
             transport,
             Duration::from_secs(60),
@@ -592,18 +621,12 @@ fn insert_update_and_delete_are_captured_in_order() {
 
 /// A restart loses nothing and replays nothing.
 ///
-/// **This test found a real defect on its first run.** Against rustcdc 0.10 a *clean*
-/// shutdown redelivered the last transaction on every restart — deterministically, with
-/// seconds of idle time beforehand — and under `sql_peek` it was re-emitted on every poll.
-///
-/// The cause was not a missed checkpoint on this side: `rustcdc inspect-checkpoint` showed
-/// the stored LSN was *exactly* the last delivered event's LSN with a matching
-/// `committed_event_count`. We reported it diagnosing `START_REPLICATION` as inclusive; the
-/// symptom was right and the mechanism was not. PostgreSQL logical decoding filters at
-/// **transaction** granularity — a change's own LSN always precedes its transaction's
-/// commit record, so resuming from that LSN, or from `lsn + 1` as we suggested, replays the
-/// whole transaction either way. rustcdc 0.11 resumes from the position *after* the commit
-/// record via `StreamHandle::resume_offset_for`.
+/// The subtlety is where the resume position comes from. PostgreSQL logical decoding
+/// filters at **transaction** granularity: a change's own LSN always precedes its
+/// transaction's commit record, so resuming from the last delivered event's LSN — or from
+/// `lsn + 1` — replays that whole transaction, even though the stored checkpoint is exactly
+/// correct. `StreamHandle::resume_offset_for` gives the position *after* the commit record,
+/// which is the only one that replays nothing.
 ///
 /// Both properties are now asserted exactly:
 ///
@@ -619,6 +642,7 @@ fn the_resume_position_does_not_lose_events() {
     let fixture = Fixture::new("streaming_replication", "it_resume");
     let first = fixture.spawn();
     wait_for_slot_ready(
+        &fixture,
         "it_resume",
         "streaming_replication",
         Duration::from_secs(60),
@@ -627,12 +651,14 @@ fn the_resume_position_does_not_lose_events() {
     psql("INSERT INTO public.orders VALUES (1,'before-restart');");
     fixture.wait_for(1, Duration::from_secs(30));
     shutdown(first);
+    wait_for_slot_released("it_resume", Duration::from_secs(30));
 
     // Committed while nothing is capturing. The slot must retain these.
     psql("INSERT INTO public.orders VALUES (2,'while-down-a'),(3,'while-down-b');");
 
     let second = fixture.spawn();
     wait_for_slot_ready(
+        &fixture,
         "it_resume",
         "streaming_replication",
         Duration::from_secs(60),
@@ -663,11 +689,8 @@ fn the_resume_position_does_not_lose_events() {
         "commit order was not preserved across the restart: {captured:#?}"
     );
 
-    // **Exact.** rustcdc 0.11 resumes from the transaction boundary
-    // (`StreamHandle::resume_offset_for`), so a restart replays nothing at all. This bound
-    // was `<= 6` while 0.10 redelivered the last transaction on every restart; tightening
-    // it is the point of having found that, and a loose bound here would let the
-    // regression back in silently.
+    // **Exact**, not a `<= 6` bound: resuming from the transaction boundary replays
+    // nothing at all, and a loose bound here would let a redelivery back in silently.
     assert_eq!(
         captured.len(),
         4,
@@ -682,11 +705,10 @@ fn the_resume_position_does_not_lose_events() {
 
 /// The exact upstream reproduction, kept as its own test.
 ///
-/// Start, insert one row, idle, shut down cleanly, restart with **no new writes**. Against
-/// rustcdc 0.10 the row arrived a second time, every time. This is the smallest shape that
-/// distinguishes "resumes from the last delivered position" from "resumes from the next
-/// one", and it is deliberately separate from the resume test above so a failure says which
-/// property broke.
+/// Start, insert one row, idle, shut down cleanly, restart with **no new writes**. The
+/// smallest shape that distinguishes "resumes from the last delivered position" from
+/// "resumes from the next one", kept separate from the resume test above so a failure says
+/// which property broke.
 #[test]
 fn a_clean_restart_redelivers_nothing() {
     if !setup() {
@@ -696,6 +718,7 @@ fn a_clean_restart_redelivers_nothing() {
     let fixture = Fixture::new("streaming_replication", "it_no_replay");
     let first = fixture.spawn();
     wait_for_slot_ready(
+        &fixture,
         "it_no_replay",
         "streaming_replication",
         Duration::from_secs(60),
@@ -709,6 +732,7 @@ fn a_clean_restart_redelivers_nothing() {
     // not yet been written.
     std::thread::sleep(Duration::from_secs(4));
     shutdown(first);
+    wait_for_slot_released("it_no_replay", Duration::from_secs(30));
 
     let second = fixture.spawn();
     // Wait for the slot to be *active* before the settle window, not just for time to
@@ -716,6 +740,7 @@ fn a_clean_restart_redelivers_nothing() {
     // trivially satisfied by a pipeline that never started. Without this the test would
     // pass just as happily against a binary that refused to connect.
     wait_for_slot_ready(
+        &fixture,
         "it_no_replay",
         "streaming_replication",
         Duration::from_secs(60),
@@ -738,8 +763,8 @@ fn a_clean_restart_redelivers_nothing() {
 
 /// A TLS-configured connector must refuse a server without TLS rather than downgrade.
 ///
-/// rustcdc 0.10 made `TransportConfig::Tls` enforcing — `tokio-postgres` defaults to
-/// `sslmode=prefer`, which silently falls back to an unencrypted connection. This
+/// `TransportConfig::Tls` is enforcing, where `tokio-postgres` defaults to
+/// `sslmode=prefer` and silently falls back to an unencrypted connection. This
 /// container runs with `ssl = off`, so a TLS transport must fail to connect. Nothing else
 /// in this repository exercises that: it is a negative property, and the only way to check
 /// it is against a server that really does refuse TLS.
@@ -823,6 +848,7 @@ fn an_on_demand_snapshot_backfills_rows_the_stream_could_never_deliver() {
     // The slot has to be streaming before the signal, or the snapshot's watermarks have
     // no stream to bracket.
     wait_for_slot_ready(
+        &fixture,
         "it_snapshot",
         "streaming_replication",
         Duration::from_secs(60),
@@ -852,18 +878,171 @@ fn an_on_demand_snapshot_backfills_rows_the_stream_could_never_deliver() {
     stop_postgres();
 }
 
+/// A configured `table_conditions` filter also scopes an **on-demand** backfill.
+///
+/// This is the property that lets `validate` accept a condition for a table absent from
+/// `incremental_snapshot.tables`: pre-declaring one is how an operator scopes a backfill
+/// they will request later. If the on-demand path resolved tables without the configured
+/// conditions, that configuration would silently read the whole table — and would disagree
+/// with the startup path, so the rows delivered would match no single predicate.
+///
+/// # What makes the assertion sound
+///
+/// All three rows are committed before the pipeline starts, behind the slot's creation
+/// point, so the live stream can never deliver them and `tables = []` means nothing is
+/// backfilled until the signal arrives. Row 900 is excluded by the filter. The wait settles
+/// before counting, so an excluded row arriving late fails rather than being raced past.
+#[test]
+fn an_on_demand_backfill_applies_the_configured_row_filter() {
+    if !setup() {
+        return;
+    }
+
+    psql(
+        "INSERT INTO public.orders VALUES
+           (900,'excluded-by-filter'),
+           (901,'backfill-a'),
+           (902,'backfill-b');",
+    );
+
+    let fixture = Fixture::with_extras(
+        "streaming_replication",
+        "it_snapshot_ondemand_filter",
+        Extras {
+            admin_port: Some(18501),
+            toml: r#"
+[incremental_snapshot]
+tables = []
+chunk_size = 2
+
+[incremental_snapshot.table_conditions]
+"public.orders" = "t.id >= 901"
+"#
+            .to_string(),
+        },
+    );
+
+    let child = fixture.spawn();
+    fixture.wait_for_admin(Duration::from_secs(60));
+    wait_for_slot_ready(
+        &fixture,
+        "it_snapshot_ondemand_filter",
+        "streaming_replication",
+        Duration::from_secs(60),
+    );
+
+    let (status, body) = fixture.post_signal(serde_json::json!({
+        "action_type": "execute_snapshot",
+        "tables": ["public.orders"],
+    }));
+    assert!(
+        (200..300).contains(&status),
+        "POST /signals must be accepted, got {status}: {body}"
+    );
+
+    fixture.wait_for(2, Duration::from_secs(60));
+    // Settle, so an excluded row arriving late is caught rather than raced past.
+    std::thread::sleep(Duration::from_secs(3));
+    let captured = fixture.captured();
+    shutdown(child);
+
+    let mut notes: Vec<String> = captured.iter().map(|(_, _, note)| note.clone()).collect();
+    notes.sort();
+    assert_eq!(
+        notes,
+        vec!["backfill-a".to_string(), "backfill-b".to_string()],
+        "the on-demand backfill must honour the configured filter: {captured:#?}"
+    );
+
+    drop(fixture);
+    stop_postgres();
+}
+
+/// `SIGTERM` stops the process promptly and releases the owner lease.
+///
+/// # Why this needs a real process
+///
+/// Signal delivery is a property of the running binary, and the defect it guards was
+/// invisible to every in-process test: the event loop awaited a *freshly constructed*
+/// `signal::unix::signal(..)` inside its `select!`, so the registration was torn down and
+/// rebuilt on every iteration and a SIGTERM arriving in that window was dropped. The
+/// process then ignored `kill` entirely — systemd and Kubernetes wait out the grace period
+/// and send SIGKILL, which skips the checkpoint flush and leaves the owner lease held, so
+/// the replacement refuses to start until the lease TTL expires.
+///
+/// The admin server is **enabled**, because that is the shape the defect appeared in and
+/// the shape the published image runs.
+///
+/// # What makes the assertion sound
+///
+/// Ten seconds is far longer than a clean stop needs and far shorter than the 60s lease
+/// TTL, so the lease being gone is evidence of release rather than expiry. A row is
+/// committed first so the loop is doing work rather than parked, which is the state the
+/// old code only handled by luck.
+#[test]
+fn sigterm_stops_the_process_and_releases_the_owner_lease() {
+    if !setup() {
+        return;
+    }
+
+    let fixture = Fixture::with_extras(
+        "streaming_replication",
+        "it_sigterm",
+        Extras {
+            admin_port: Some(18503),
+            toml: String::new(),
+        },
+    );
+
+    let mut child = fixture.spawn();
+    fixture.wait_for_admin(Duration::from_secs(60));
+    wait_for_slot_ready(
+        &fixture,
+        "it_sigterm",
+        "streaming_replication",
+        Duration::from_secs(60),
+    );
+    psql("INSERT INTO public.orders VALUES (500,'before-sigterm');");
+    fixture.wait_for(1, Duration::from_secs(30));
+
+    let lease = fixture.state_path().join("owner_lease.json");
+    assert!(
+        lease.exists(),
+        "the pipeline must hold an owner lease while it is running"
+    );
+
+    #[cfg(unix)]
+    send_sigterm(child.id() as i32);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exited = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            _ if Instant::now() >= deadline => break false,
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        exited,
+        "the process must stop on SIGTERM within 10s. It did not, so a real deployment \
+         would be SIGKILLed after its grace period — losing the checkpoint flush and the \
+         lease release.\n\nWhat the pipeline logged:\n{}",
+        fixture.stderr()
+    );
+    assert!(
+        !lease.exists(),
+        "a clean stop must release the owner lease, or the successor waits out the full \
+         TTL before it can start"
+    );
+
+    drop(fixture);
+    stop_postgres();
+}
+
 /// A `table_conditions` filter restricts which rows a startup backfill reads.
-///
-/// # Why the startup path and not the on-demand one
-///
-/// `table_conditions` applies only to tables the driver resolves in
-/// `IncrementalSnapshotDriver::new` — at startup, or when adopting an unfinished table
-/// from a checkpoint. `enqueue_tables`, which services `execute_snapshot`, pushes the
-/// resolved table with no condition, and the driver does not retain the config, so it
-/// structurally cannot apply one. The first version of this test asserted the filter on
-/// the on-demand path and failed with all three rows delivered; that is an upstream defect
-/// (reported in `FEEDBACK_RUSTCDC.md`), and `IncrementalSnapshotConfig::validate` now
-/// refuses the configuration that would walk into it.
 ///
 /// # What makes the assertion sound
 ///
@@ -955,7 +1134,12 @@ fn a_replica_identity_full_table_reports_only_its_real_primary_key() {
 
     let fixture = Fixture::new("streaming_replication", "it_pkey");
     let child = fixture.spawn();
-    wait_for_slot_ready("it_pkey", "streaming_replication", Duration::from_secs(60));
+    wait_for_slot_ready(
+        &fixture,
+        "it_pkey",
+        "streaming_replication",
+        Duration::from_secs(60),
+    );
 
     psql(
         "INSERT INTO public.orders VALUES (1,'one');

@@ -7,7 +7,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RuntimeTerminalReasonCode {
+pub(crate) enum RuntimeTerminalReasonCode {
     ShutdownSignal,
     AdminServerExit,
     RuntimePollError,
@@ -21,22 +21,22 @@ pub(super) enum RuntimeTerminalReasonCode {
     SinkCloseError,
 }
 
-pub(super) struct RuntimeLoopFailure {
-    pub(super) reason: RuntimeTerminalReasonCode,
-    pub(super) error: AppError,
+pub(crate) struct RuntimeLoopFailure {
+    pub(crate) reason: RuntimeTerminalReasonCode,
+    pub(crate) error: AppError,
 }
 
-pub(super) enum RuntimeLoopOutcome {
+pub(crate) enum RuntimeLoopOutcome {
     Clean(RuntimeTerminalReasonCode),
     Error(RuntimeLoopFailure),
 }
 
 impl RuntimeLoopFailure {
-    pub(super) fn new(reason: RuntimeTerminalReasonCode, error: AppError) -> Self {
+    pub(crate) fn new(reason: RuntimeTerminalReasonCode, error: AppError) -> Self {
         Self { reason, error }
     }
 
-    pub(super) fn runtime(reason: RuntimeTerminalReasonCode, error: rustcdc::core::Error) -> Self {
+    pub(crate) fn runtime(reason: RuntimeTerminalReasonCode, error: rustcdc::core::Error) -> Self {
         Self {
             reason,
             error: AppError::Runtime(error),
@@ -45,11 +45,11 @@ impl RuntimeLoopFailure {
 }
 
 impl RuntimeLoopOutcome {
-    pub(super) fn error(reason: RuntimeTerminalReasonCode, error: AppError) -> Self {
+    pub(crate) fn error(reason: RuntimeTerminalReasonCode, error: AppError) -> Self {
         Self::Error(RuntimeLoopFailure::new(reason, error))
     }
 
-    pub(super) fn runtime_error(
+    pub(crate) fn runtime_error(
         reason: RuntimeTerminalReasonCode,
         error: rustcdc::core::Error,
     ) -> Self {
@@ -58,7 +58,7 @@ impl RuntimeLoopOutcome {
 }
 
 impl RuntimeTerminalReasonCode {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ShutdownSignal => "shutdown_signal",
             Self::AdminServerExit => "admin_server_exit",
@@ -75,7 +75,7 @@ impl RuntimeTerminalReasonCode {
     }
 }
 
-pub(super) async fn finalize_runtime_shutdown(
+pub(crate) async fn finalize_runtime_shutdown(
     runtime: &mut CdcRuntime,
     sink: &mut crate::pipeline::router::TableRouter,
     admin_state: &AdminState,

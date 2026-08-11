@@ -212,48 +212,26 @@ fn no_module_spawns_a_detached_thread_with_its_own_runtime() {
 
 /// No source file may exceed a size at which it stops being navigable.
 ///
-/// This exists because the two largest modules grew for five consecutive review cycles
-/// while "split them" sat on the plan. `admin/mod.rs` reached 7 927 lines and
-/// `config/loader.rs` 4 318, and each round that deferred the split also added to them —
-/// the cost rose monotonically with the delay and nothing made that visible until someone
-/// counted.
+/// Not a style preference about ideal file length — a ratchet against the specific failure
+/// of a module doubling while everyone agrees it should shrink. Splitting is mechanical and
+/// the compiler verifies it, so hitting this is a prompt to do fifteen minutes of work, not
+/// to raise the number.
 ///
-/// The limit is deliberately generous. It is not a style preference about ideal file
-/// length; it is a ratchet that stops the specific failure of a module doubling while
-/// everyone agrees it should shrink. Splitting a file is mechanical and the compiler
-/// verifies it, so hitting this is a prompt to do fifteen minutes of work, not to raise
-/// the number.
+/// **The budget must trail the largest file, not lead it.** A guard calibrated above the
+/// worst case in the tree never fires and does no work, so each split tightens both numbers
+/// to just above what survives it.
 ///
-/// **A ratchet only ratchets if it is tightened.** At a flat 4 000 this had never fired,
-/// and a review found `admin/mod.rs` at 3 982 lines carrying five unrelated concerns —
-/// HTTP handlers, state, workers, Prometheus rendering and a Kafka publisher — with a
-/// worker-lifecycle defect sitting three thousand lines from the state it mutates. A guard
-/// calibrated above the worst case in the tree is not doing work.
-///
-/// It fired at 4 144 during that remediation; `prometheus.rs` and `notify.rs` came out and
-/// `admin/mod.rs` is now 3 599.
-///
-/// # Two budgets, because the harm is different
-///
-/// **Production modules get the tighter number.** Length there costs review quality
-/// directly: the defect above was invisible precisely because its two halves could not be
-/// held on screen together.
-///
-/// **Test files get the looser one.** A long test file is a navigation annoyance, not a
-/// correctness risk — tests are read one function at a time and each states its own
-/// premise. `admin/tests.rs` is the current offender at ~3 990 lines and does want
-/// splitting along the command/observation seam, but that is a hand job: an automated
-/// split by brace-matching is defeated by `{}` inside format strings, and corrupting a
-/// 4 000-line test file to satisfy a style guard is a bad trade.
-///
-/// Lower both numbers after the next split. They should trail the largest file, not lead
-/// it.
+/// Production modules get the tighter budget: length there costs review quality directly —
+/// `admin/mod.rs` once carried a worker-lifecycle defect three thousand lines from the state
+/// it mutated. Test files get the looser one; they are read a function at a time and each
+/// states its own premise, so length is a navigation annoyance rather than a correctness
+/// risk.
 #[test]
 fn no_source_file_grows_past_the_point_of_navigability() {
     /// Production modules: tight, because length here costs review quality.
-    const MAX_LINES: usize = 3_700;
+    const MAX_LINES: usize = 3_600;
     /// Test modules: looser, and tracked separately — see the docs above.
-    const MAX_TEST_LINES: usize = 4_000;
+    const MAX_TEST_LINES: usize = 3_850;
 
     let mut oversized = Vec::new();
     let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
@@ -291,6 +269,470 @@ fn no_source_file_grows_past_the_point_of_navigability() {
         "these files exceed their budget ({MAX_LINES} for a module, {MAX_TEST_LINES} for a \
          test file) and should be split by concern \
          (tests move to a sibling `*_tests.rs` cheaply): {oversized:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Panicking constructs in production code
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Production code may panic only where a comment argues the case, and only on this list.
+///
+/// The project has claimed a budget of "at most two panicking constructs in production
+/// code" since the first review, and nothing enforced it. An audit found **five**: the one
+/// documented `unreachable!` in the Kafka sink, three `Mutex::lock().expect(..)` in the
+/// signal ledger — where a single poisoning turned into a permanent outage of the whole
+/// signal-ingress path — and a `serde_json::to_vec(..).expect(..)` on the disaster-recovery
+/// path of `migrate-state`. A KPI with no test behind it is a wish.
+///
+/// Test modules are excluded: `expect` in a test *is* the assertion. The exclusion is by
+/// `#[cfg(test)]` block and by `*_tests.rs` filename, matching how this crate splits them.
+#[test]
+fn production_code_panics_only_where_the_allowlist_says_it_may() {
+    /// Each entry is `(file, snippet)`. A snippet must be specific enough that moving the
+    /// construct somewhere else fails this test rather than silently passing.
+    const ALLOWED: &[(&str, &str)] = &[
+        // Guarded by an observation two lines above: the front of the window was just
+        // matched as `Done`, so the arm cannot be reached.
+        (
+            "src/sink/kafka.rs",
+            "unreachable!(\"front was just observed to be Done\")",
+        ),
+    ];
+
+    let pattern = regex_lite_panics();
+    let mut found: Vec<(String, usize, String)> = Vec::new();
+
+    let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().map(|e| e != "rs").unwrap_or(true) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name.contains("tests") {
+                continue;
+            }
+            let Ok(src) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let relative = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+
+            for (line_no, line) in production_lines(&src) {
+                let trimmed = line.trim();
+                // Doc comments and ordinary comments discuss these constructs constantly;
+                // a mention is not an occurrence.
+                if trimmed.starts_with("//") || trimmed.starts_with("*") {
+                    continue;
+                }
+                if pattern.iter().any(|needle| line.contains(needle)) {
+                    found.push((relative.clone(), line_no, trimmed.to_string()));
+                }
+            }
+        }
+    }
+
+    let unexpected: Vec<_> = found
+        .iter()
+        .filter(|(file, _, line)| {
+            !ALLOWED
+                .iter()
+                .any(|(allowed_file, snippet)| file == allowed_file && line.contains(snippet))
+        })
+        .collect();
+
+    assert!(
+        unexpected.is_empty(),
+        "production code gained panicking constructs that are not on the allowlist in this \
+         test. Either return a `Result`, recover (see `signal_ledger::lock_ledger` for the \
+         poisoned-mutex pattern), or add an entry here with the argument for why it cannot \
+         fire:\n{unexpected:#?}"
+    );
+
+    // The allowlist must not rot: an entry whose construct has been removed should be
+    // deleted, not left as a licence for the next one.
+    for (file, snippet) in ALLOWED {
+        assert!(
+            found
+                .iter()
+                .any(|(f, _, line)| f == file && line.contains(snippet)),
+            "the allowlist still exempts `{snippet}` in {file}, but it is no longer there. \
+             Remove the entry."
+        );
+    }
+}
+
+/// The panicking constructs this crate forbids outside tests.
+fn regex_lite_panics() -> Vec<&'static str> {
+    vec![
+        ".unwrap()",
+        ".expect(",
+        "panic!(",
+        "unreachable!(",
+        "todo!(",
+        "unimplemented!(",
+    ]
+}
+
+/// Lines of `src` outside any `#[cfg(test)]` item, with 1-based line numbers.
+///
+/// Brace-counted rather than parsed: this crate writes `#[cfg(test)] mod tests {` at
+/// column 0 with a matching `}` at column 0, and a full parse would be a dependency for
+/// no extra confidence.
+fn production_lines(src: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    let mut depth: i32 = 0;
+    let mut armed = false;
+
+    for (index, line) in src.lines().enumerate() {
+        if !skipping && line.trim_start().starts_with("#[cfg(test)]") {
+            armed = true;
+            continue;
+        }
+        if armed {
+            // The item's opening brace may be on the attribute's line or the next one.
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            if depth > 0 {
+                armed = false;
+                skipping = true;
+            }
+            continue;
+        }
+        if skipping {
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            if depth <= 0 {
+                skipping = false;
+                depth = 0;
+            }
+            continue;
+        }
+        out.push((index + 1, line));
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `unsafe` in the library
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The library may use `unsafe` only where this list says it may.
+///
+/// `[workspace.lints.rust] unsafe_code = "forbid"` was declared for the whole life of this
+/// project and applied to **nothing**: workspace lints only take effect for a package that
+/// opts in with `[lints] workspace = true`, and this package never did. Underneath a README
+/// line claiming `#![deny(unsafe_code)]` was "enforced workspace-wide" sat six `unsafe`
+/// blocks and one gratuitous `unsafe fn` that wrapped a call to `kill(1)`.
+///
+/// The lint is real now, at `deny`, with exactly one exemption: `test_env::write_env`, the
+/// single place the crate mutates process environment. `src/main.rs` carries `forbid`,
+/// which cannot be overridden, so the **binary** genuinely contains none.
+///
+/// Checked in both directions, like the panic allowlist: an entry whose `unsafe` has been
+/// removed also fails, so the list cannot rot into a standing licence.
+fn uses_unsafe_keyword(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut from = 0usize;
+    while let Some(offset) = code[from..].find("unsafe") {
+        let start = from + offset;
+        let end = start + "unsafe".len();
+        let preceded = start
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+        let continues = bytes
+            .get(end)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+        if !preceded && !continues {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+#[test]
+fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
+    /// `(file, why)`. One entry. Adding a second needs an argument, in code review, here.
+    const ALLOWED: &[(&str, &str)] = &[(
+        "src/test_env.rs",
+        "the one place the crate mutates process environment, serialised by EnvGuard",
+    )];
+
+    let mut found: Vec<String> = Vec::new();
+    let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().map(|e| e != "rs").unwrap_or(true) {
+                continue;
+            }
+            let Ok(src) = fs::read_to_string(&path) else {
+                continue;
+            };
+            // Comments discuss `unsafe` constantly in this crate, and the lint attributes
+            // themselves are spelled `unsafe_code` — so match the *keyword*, with both
+            // boundaries, over code only.
+            if !uses_unsafe_keyword(&code_only(&src)) {
+                continue;
+            }
+            found.push(
+                path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+
+    let unexpected: Vec<&String> = found
+        .iter()
+        .filter(|file| !ALLOWED.iter().any(|(allowed, _)| file.as_str() == *allowed))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "these files use `unsafe` and are not on the allowlist in this test. The library \
+         denies `unsafe_code` and the binary forbids it; if a new site is genuinely \
+         unavoidable, add it here with the argument:\n{unexpected:#?}"
+    );
+
+    for (file, why) in ALLOWED {
+        assert!(
+            found.iter().any(|f| f == file),
+            "the allowlist still exempts {file} ({why}), but it no longer uses `unsafe`. \
+             Remove the entry."
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Secret-named settings must be typed as secrets
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A configuration field whose name says "secret" must be a `SecretString`.
+///
+/// `GET /status` and `GET /config` serialise the running configuration and hand it to any
+/// read-scoped token. `SecretString`'s `Serialize` emits `[REDACTED]`, so a credential with
+/// that type never reaches the wire at all — the name-based rules in `src/redaction.rs` are
+/// a backstop for strings that arrive from elsewhere, not the primary defence.
+///
+/// Which makes the dangerous shape a secret-named field typed as a plain `String`: nothing
+/// about it is redacted at the type level, and it survives only as long as the name rule
+/// happens to match. That is the invariant here, and it is type-driven on purpose — a list
+/// of field names only protects the names somebody remembered.
+///
+/// The allowlist is for names that *look* sensitive and are not. Each entry is a real
+/// category, not an exception granted to a field.
+#[test]
+fn a_secret_named_setting_is_typed_as_a_secret() {
+    /// `(field, why)`. `*_env` names are handled by rule below, not listed here.
+    const NOT_ACTUALLY_SECRET: &[(&str, &str)] = &[(
+        "token_endpoint",
+        "an OAuth token endpoint is a URL; credentials inside it are stripped by the \
+         value-driven URL rule",
+    )];
+
+    let mut plaintext: Vec<String> = Vec::new();
+
+    for (file, src) in glob_src("src/config") {
+        // Only serde-deserialised structs: a resolved runtime type like
+        // `ResolvedRegistryAuth` legitimately holds plaintext and is never serialised into
+        // the snapshot.
+        let code = code_only(&src);
+        let mut derive_buffer = String::new();
+        let mut in_derive = false;
+        let mut is_setting_struct = false;
+
+        for (line_no, line) in code.lines().enumerate() {
+            let trimmed = line.trim();
+
+            if in_derive || trimmed.starts_with("#[derive(") {
+                in_derive = true;
+                derive_buffer.push_str(trimmed);
+                if trimmed.contains(")]") {
+                    in_derive = false;
+                }
+                continue;
+            }
+            if trimmed.starts_with("pub struct ")
+                || trimmed.starts_with("struct ")
+                || trimmed.starts_with("pub enum ")
+                || trimmed.starts_with("enum ")
+            {
+                is_setting_struct = derive_buffer.contains("Deserialize");
+                derive_buffer.clear();
+                continue;
+            }
+            if !is_setting_struct {
+                continue;
+            }
+
+            let Some((name, ty)) = trimmed.trim_start_matches("pub ").split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            let ty = ty.trim().trim_end_matches(',');
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+                continue;
+            }
+            if ty != "String" && ty != "Option<String>" {
+                continue;
+            }
+            if !rustcdc_server::redaction::is_sensitive_key_name(name)
+                || NOT_ACTUALLY_SECRET
+                    .iter()
+                    .any(|(allowed, _)| name == *allowed)
+            {
+                continue;
+            }
+            plaintext.push(format!(
+                "{}:{} — `{name}: {ty}`",
+                Path::new(&file)
+                    .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(Path::new(&file))
+                    .display(),
+                line_no + 1
+            ));
+        }
+    }
+
+    assert!(
+        plaintext.is_empty(),
+        "these settings are named like secrets but typed as plain strings, so nothing \
+         redacts them at the type level and `GET /config` protects them only for as long as \
+         a substring rule happens to match:\n  {}\n\nUse `SecretString`, or — if the field \
+         genuinely is not a secret — add it to `NOT_ACTUALLY_SECRET` with the category.",
+        plaintext.join("\n  ")
+    );
+}
+
+/// The redactor must not blank fields an operator needs in order to *find* a credential.
+///
+/// Over-redaction is a real cost. `GET /config` is where someone answers "which variable
+/// holds my token?"; blanking that pushes them to read the config file off the disk, which
+/// is worse for security rather than better.
+///
+/// The treatment used to be arbitrary rather than chosen — `read_token_env` was redacted and
+/// `audit_signing_key_env` was not, the difference being only which substrings happened to
+/// be in the token list.
+#[test]
+fn env_variable_names_and_endpoints_are_not_treated_as_secrets() {
+    use rustcdc_server::redaction::is_sensitive_key_name;
+
+    for name in [
+        "read_token_env",
+        "write_token_env",
+        "password_env",
+        "token_env",
+        "audit_signing_key_env",
+        "token_endpoint",
+    ] {
+        assert!(
+            !is_sensitive_key_name(name),
+            "`{name}` names a variable or an endpoint, not a secret; redacting it hides the \
+             one thing an operator needs to locate the credential"
+        );
+    }
+
+    // …and the actual secrets must still be caught, or this test is a licence.
+    for name in [
+        "password",
+        "passphrase",
+        "client_secret",
+        "bearer_token",
+        "private_key",
+        "sasl_password",
+        "x-api-key",
+        "access_key_id",
+    ] {
+        assert!(is_sensitive_key_name(name), "`{name}` must be redacted");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool-generated markers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `cargo fix` leaves `FIXME:` comments behind, and they outlive the thing they asked about.
+///
+/// The edition-2024 migration inserted an "audit that the environment access only happens
+/// in single-threaded code" note above every `env::set_var`. Those calls were then routed
+/// through `test_env::EnvGuard`, which *is* that audit — a process-wide lock and restoration
+/// on drop — but two of the comments survived the refactor and read as open questions about
+/// code that had already been answered.
+///
+/// A marker a tool wrote and nobody re-read is worse than no marker: it makes the file look
+/// unfinished in a place that is finished, and it trains readers to skip the ones that
+/// matter.
+#[test]
+fn no_tool_generated_fixme_survives_in_the_tree() {
+    let mut found: Vec<String> = Vec::new();
+    let mut stack = vec![
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("benches"),
+    ];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().map(|e| e != "rs").unwrap_or(true) {
+                continue;
+            }
+            let Ok(src) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for (index, line) in src.lines().enumerate() {
+                // Assembled with `concat!` so this assertion does not match its own
+                // source — the same trick `no_module_spawns_a_detached_thread_…` needs. A
+                // hand-written `FIXME` is a deliberate note and is left alone.
+                if line.contains(concat!("FIXME", ": Audit that the")) {
+                    found.push(format!(
+                        "{}:{}",
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(&path)
+                            .display(),
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        found.is_empty(),
+        "`cargo fix` left these markers behind. Resolve the question and delete the \
+         comment — env mutation belongs in `test_env::EnvGuard`, which is the audit they \
+         ask for:\n  {}",
+        found.join("\n  ")
     );
 }
 
@@ -415,10 +857,10 @@ fn consumer_corpus() -> Vec<(String, String)> {
                 walk(&path, out);
                 continue;
             }
-            if path.extension().is_some_and(|e| e == "rs") {
-                if let Ok(src) = fs::read_to_string(&path) {
-                    out.push((path.to_string_lossy().into_owned(), src));
-                }
+            if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(src) = fs::read_to_string(&path)
+            {
+                out.push((path.to_string_lossy().into_owned(), code_only(&src)));
             }
         }
     }
@@ -431,6 +873,174 @@ fn consumer_corpus() -> Vec<(String, String)> {
         );
     }
     corpus
+}
+
+/// `src` with comments, string literals and char literals blanked out.
+///
+/// The scanner decides "this setting is read" by looking for `.<field>` in the corpus, and
+/// without this it counted **prose**. Three of this crate's own doc comments mention
+/// `.allow_insecure` and `.token_endpoint` while explaining the scanner; every validation
+/// error message that names a TOML path (`"sink.iceberg.catalog.rest.uri"`) contains
+/// `.uri`; every doc example that shows a field access contains that access. All of them
+/// marked settings live that no code reads — which is a false *pass* in a check whose
+/// entire job is to find settings nothing reads.
+///
+/// Rust never needs a string or a comment to read a field, so blanking both loses no true
+/// reader. Byte-for-byte replacement keeps offsets, which keeps any future line reporting
+/// honest.
+fn code_only(src: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Code,
+        LineComment,
+        BlockComment(u32),
+        Str,
+        RawStr(usize),
+        Char,
+    }
+
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut state = State::Code;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+
+        match state {
+            State::Code => {
+                // Raw string: `r"`, `r#"`, `r##"` …
+                if byte == b'r' {
+                    let mut hashes = 0usize;
+                    let mut probe = index + 1;
+                    while bytes.get(probe) == Some(&b'#') {
+                        hashes += 1;
+                        probe += 1;
+                    }
+                    if bytes.get(probe) == Some(&b'"') {
+                        out.extend(std::iter::repeat_n(b' ', probe - index + 1));
+                        index = probe + 1;
+                        state = State::RawStr(hashes);
+                        continue;
+                    }
+                }
+                if byte == b'/' && next == Some(b'/') {
+                    state = State::LineComment;
+                    out.push(b' ');
+                } else if byte == b'/' && next == Some(b'*') {
+                    state = State::BlockComment(1);
+                    out.push(b' ');
+                } else if byte == b'"' {
+                    state = State::Str;
+                    out.push(b' ');
+                } else if byte == b'\'' {
+                    // A lifetime (`&'a str`) is not a char literal. Char literals are at
+                    // most a few bytes and always closed by a quote.
+                    let closes = (1..=4).any(|n| bytes.get(index + n) == Some(&b'\''));
+                    if closes {
+                        state = State::Char;
+                    }
+                    out.push(b' ');
+                } else {
+                    out.push(byte);
+                }
+                index += 1;
+            }
+            State::LineComment => {
+                if byte == b'\n' {
+                    state = State::Code;
+                    out.push(b'\n');
+                } else {
+                    out.push(b' ');
+                }
+                index += 1;
+            }
+            State::BlockComment(depth) => {
+                if byte == b'/' && next == Some(b'*') {
+                    state = State::BlockComment(depth + 1);
+                    out.extend_from_slice(b"  ");
+                    index += 2;
+                } else if byte == b'*' && next == Some(b'/') {
+                    state = if depth == 1 {
+                        State::Code
+                    } else {
+                        State::BlockComment(depth - 1)
+                    };
+                    out.extend_from_slice(b"  ");
+                    index += 2;
+                } else {
+                    out.push(if byte == b'\n' { b'\n' } else { b' ' });
+                    index += 1;
+                }
+            }
+            State::Str => {
+                if byte == b'\\' {
+                    out.extend_from_slice(b"  ");
+                    index += 2;
+                    continue;
+                }
+                if byte == b'"' {
+                    state = State::Code;
+                }
+                out.push(if byte == b'\n' { b'\n' } else { b' ' });
+                index += 1;
+            }
+            State::RawStr(hashes) => {
+                if byte == b'"' && (0..hashes).all(|n| bytes.get(index + 1 + n) == Some(&b'#')) {
+                    out.extend(std::iter::repeat_n(b' ', hashes + 1));
+                    index += hashes + 1;
+                    state = State::Code;
+                    continue;
+                }
+                out.push(if byte == b'\n' { b'\n' } else { b' ' });
+                index += 1;
+            }
+            State::Char => {
+                if byte == b'\\' {
+                    out.extend_from_slice(b"  ");
+                    index += 2;
+                    continue;
+                }
+                if byte == b'\'' {
+                    state = State::Code;
+                }
+                out.push(b' ');
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
+/// Does `src` read `.<field>` as a whole field access?
+///
+/// A bare `src.contains(".token")` — the previous test — also matches `.token_endpoint`,
+/// `.tokens` and `.token_sha256_hex`. That direction of error is the dangerous one for an
+/// *inert-settings* scanner: an unrelated longer field name marks a genuinely dead setting
+/// as live, and the check reports success while missing exactly what it exists to find.
+///
+/// The trailing character must not continue the identifier, **and must not be `(`**: `.port(`
+/// is `SocketAddr::port()`, not a configuration field. Counting method calls seemed harmless
+/// until `tests/snowflake_contract.rs` called `addr.port()` and made a load-bearing SQL
+/// Server exemption look stale. A field access is never a call.
+fn reads_field(src: &str, field: &str) -> bool {
+    let needle = format!(".{field}");
+    let bytes = src.as_bytes();
+    let mut from = 0usize;
+    while let Some(offset) = src[from..].find(&needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let continues = bytes
+            .get(end)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'(');
+        if !continues {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// Public field names of **deserialized** structs in `src/config/**` and `src/cli.rs`.
@@ -492,9 +1102,19 @@ fn declared_settings() -> Vec<(String, String)> {
                 continue;
             }
 
-            // Any other item resets the pending derive, so `#[derive(Deserialize)] enum`
+            // Any other *item* resets the pending derive, so `#[derive(Deserialize)] enum`
             // followed by a plain struct does not leak the derive across.
-            if depth == 0 && !trimmed.is_empty() && !trimmed.starts_with("//") {
+            //
+            // Attributes are **not** items. This used to clear on any non-empty,
+            // non-comment line, which meant a `#[serde(deny_unknown_fields)]` between the
+            // derive and the struct erased the derive — and the whole struct became
+            // invisible to this scanner. Every setting it declared was then exempt from the
+            // inert check by accident, in the guard the project relies on most.
+            if depth == 0
+                && !trimmed.is_empty()
+                && !trimmed.starts_with("//")
+                && !trimmed.starts_with("#[")
+            {
                 derive_buffer.clear();
             }
 
@@ -571,11 +1191,10 @@ fn every_configuration_setting_is_read_by_something() {
         // ── SqlServerProfileConfig::to_runtime_config, src/config/source.rs ─────
         // This is the one config type this crate owns that mirrors a rustcdc struct
         // field-for-field, so its mapper necessarily lives beside the declaration.
-        // These three joined the list when the replication-slot lag side-channel was
-        // deleted (rustcdc 0.11 samples slot lag itself). That connection read
-        // `pg.host/port/user/database/conn_timeout_secs`, which is what had been keeping
-        // them externally referenced; `to_runtime_config` is now their only reader, like
-        // every other field of this struct.
+        // `to_runtime_config` is their only reader, like every other field of this
+        // struct — the replication-slot lag side-channel that used to read
+        // `pg.host/port/user/database/conn_timeout_secs` is gone, since rustcdc samples
+        // slot lag itself.
         ("conn_timeout_secs", "source.rs: to_runtime_config"),
         ("database", "source.rs: to_runtime_config"),
         ("port", "source.rs: to_runtime_config"),
@@ -594,8 +1213,7 @@ fn every_configuration_setting_is_read_by_something() {
             "sink.rs: to_auth_config / OidcTokenProvider builder",
         ),
         ("connections_max_idle_ms", "sink.rs: krafka client builder"),
-        // Moved here from `KafkaSinkConfig` when krafka 0.18 deleted the producer's own
-        // `max_in_flight` — it is a per-connection transport setting, so it maps in
+        // A per-connection transport setting, not a producer one, so it maps in
         // `KafkaTransportConfig::to_krafka` alongside every other field of that struct.
         ("max_in_flight", "sink.rs: to_krafka (TransportConfig)"),
         ("form_parameters", "sink.rs: OidcTokenProvider builder"),
@@ -618,6 +1236,30 @@ fn every_configuration_setting_is_read_by_something() {
         (
             "allow_insecure",
             "registry.rs: guards the http:// URL check",
+        ),
+        // ── same-file consumers found once the scanner stopped reading prose ───
+        //
+        // These three were never inert. They were *masked*: the corpus included comments
+        // and string literals, so an unrelated doc comment or a validation message that
+        // happened to contain `.scope`, `.extensions` or `.user` counted as an external
+        // reader and the check passed for the wrong reason. With `code_only` in place they
+        // surface correctly as same-file consumption, which is what these entries record.
+        ("scope", "sink.rs: OidcTokenProvider::builder().scope()"),
+        (
+            "extensions",
+            "sink.rs: OidcTokenProvider sasl_extension + the static-token arm",
+        ),
+        (
+            "user",
+            "source.rs: SqlServerProfileConfig::to_runtime_config",
+        ),
+        // Read through `IcebergCatalogConfig::location()`, which the sink calls to infer
+        // the storage backend. It stopped having an external reader when the catalog became
+        // an enum over REST and S3 Tables and the two locations were unified behind one
+        // accessor — the scanner caught that on the same commit, which is the point of it.
+        (
+            "warehouse",
+            "sink.rs: IcebergCatalogConfig::location, used by sink/iceberg.rs",
         ),
         (
             "password_env",
@@ -647,14 +1289,31 @@ fn every_configuration_setting_is_read_by_something() {
     // catching anything. Each entry must still be doing work.
     let mut stale: Vec<&str> = Vec::new();
     for (field, why) in CONSUMED_INDIRECTLY {
-        let Some((_, file)) = declared.iter().find(|(name, _)| name == field) else {
+        let declaring: Vec<&String> = declared
+            .iter()
+            .filter(|(name, _)| name == field)
+            .map(|(_, file)| file)
+            .collect();
+
+        if declaring.is_empty() {
             stale.push(field);
             continue;
-        };
-        let access = format!(".{field}");
+        }
+
+        // Two structs declaring the same field name make the "has an external reader"
+        // half of this check undecidable: the scanner matches by name, so a reader of
+        // *either* field satisfies it. Adding a `SnowflakeSinkConfig` with `user` and
+        // `database` made three SQL Server exemptions look stale overnight, and deleting
+        // load-bearing exemptions on the strength of an ambiguity is worse than keeping a
+        // possibly-redundant one. The existence half still applies.
+        if declaring.len() > 1 {
+            continue;
+        }
+
+        let file = declaring[0];
         if corpus
             .iter()
-            .any(|(path, src)| path != file && src.contains(&access))
+            .any(|(path, src)| path != file && reads_field(src, field))
         {
             let _ = why;
             stale.push(field);
@@ -672,10 +1331,9 @@ fn every_configuration_setting_is_read_by_something() {
         if CONSUMED_INDIRECTLY.iter().any(|(name, _)| *name == field) {
             continue;
         }
-        let access = format!(".{field}");
         let read_elsewhere = corpus
             .iter()
-            .any(|(path, src)| *path != file && src.contains(&access));
+            .any(|(path, src)| *path != file && reads_field(src, &field));
         if read_elsewhere {
             continue;
         }
@@ -748,6 +1406,22 @@ fn every_integration_suite_is_run_by_ci() {
         "the integration job must set RUSTCDC_INTEGRATION=1; without it every test in every \
          suite returns immediately and the job passes having tested nothing"
     );
+
+    // `integration_kafka` is parameterised over the broker, and naming the suite once is
+    // not enough: it would run whichever broker the default happens to be and report
+    // coverage of both. Redpanda is an independent reimplementation of the wire protocol,
+    // and the two already disagreed on metadata propagation and coordinator election the
+    // first time this matrix ran.
+    if suites.iter().any(|suite| suite == "integration_kafka") {
+        for broker in ["redpanda", "kafka"] {
+            assert!(
+                workflow.contains(&format!("broker: {broker}")),
+                "the CI matrix must run integration_kafka against `{broker}`. Running one \
+                 broker and claiming both is the coverage-overstatement this file exists \
+                 to prevent."
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

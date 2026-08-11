@@ -256,10 +256,16 @@ pub(crate) fn slo_prometheus(data: &AdminStateData, signal_worker_alive: bool) -
         ),
         data.admin_rate_limiter_metrics_decision_latency_seconds_max,
         data.reconciliation_recoveries_total,
-        data.reconciliation_recovery_last_unix_seconds.unwrap_or(-1.0),
-        data.reconciliation_recovery_last_parse_ok.map(|ok| if ok { 1 } else { 0 }).unwrap_or(-1),
-        data.reconciliation_recovery_proof_last_unix_seconds.unwrap_or(-1.0),
-        data.reconciliation_recovery_proof_last_ok.map(|ok| if ok { 1 } else { 0 }).unwrap_or(-1),
+        data.reconciliation_recovery_last_unix_seconds
+            .unwrap_or(-1.0),
+        data.reconciliation_recovery_last_parse_ok
+            .map(|ok| if ok { 1 } else { 0 })
+            .unwrap_or(-1),
+        data.reconciliation_recovery_proof_last_unix_seconds
+            .unwrap_or(-1.0),
+        data.reconciliation_recovery_proof_last_ok
+            .map(|ok| if ok { 1 } else { 0 })
+            .unwrap_or(-1),
         terminal_reason_code,
     );
 
@@ -278,11 +284,6 @@ pub(crate) fn slo_prometheus(data: &AdminStateData, signal_worker_alive: bool) -
     // measurement, exported by `run_metrics` as
     // `rustcdc_runtime_replication_slot_lag_bytes` — which is the name every alert rule and
     // every docs page already used.
-    //
-    // This block used to publish a second, differently-named gauge fed by a side-channel
-    // connection, because rustcdc 0.10 refreshed its own figure only while the pipeline was
-    // caught up. rustcdc 0.11 samples on a timer, so the second gauge was a duplicate that
-    // nothing consumed and a second PostgreSQL connection nobody needed.
 
     // Consecutive source poll errors — reflects the backoff-retry counter in
     // `RecoverableErrorState`.  A value ≥ READYZ_SOURCE_CONSECUTIVE_ERROR_THRESHOLD
@@ -368,8 +369,8 @@ pub(super) fn snapshot_progress_prometheus(
         u8::from(state.paused)
     );
 
-    // `stopped` is distinct from "no tables left", and rustcdc 0.12 made it so precisely
-    // because conflating them made a stop silently undo itself: a table absent from the
+    // `stopped` is distinct from "no tables left". Conflating them makes a stop silently
+    // undo itself: a table absent from the
     // persisted state looks like one that has not started, so every configured table
     // restarted from row zero on the next deploy — re-running the backfill an operator had
     // just stopped, usually to take load off a production primary.

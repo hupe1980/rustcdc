@@ -4,27 +4,31 @@ use std::{
     collections::HashMap,
     fs,
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
 
-use arrow_array::{builder::StringDictionaryBuilder, types::Int8Type, RecordBatch, StringArray};
+use arrow_array::{RecordBatch, StringArray, builder::StringDictionaryBuilder, types::Int8Type};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use iceberg::ErrorKind;
 use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::ErrorKind;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::{
-    RestCatalog, RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+};
+use iceberg_catalog_s3tables::{
+    S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
+    S3TablesCatalogBuilder,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -34,9 +38,10 @@ use rustcdc::{
     fingerprint_event_stable,
     sink::SinkAdapter,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use crate::config::schema::{IcebergSchemaMode, IcebergSinkConfig, IcebergStorageConfig};
+use crate::config::sink::IcebergCatalogConfig;
 
 pub struct IcebergSink {
     cfg: IcebergSinkConfig,
@@ -45,7 +50,11 @@ pub struct IcebergSink {
     /// Used to enforce `cfg.max_pending_bytes` backpressure.
     pending_bytes: usize,
     closed: bool,
-    catalog: Arc<RestCatalog>,
+    /// Behind the `Catalog` trait rather than a concrete `RestCatalog`, so the REST and
+    /// S3 Tables backends share every code path that follows. Everything this sink asks of
+    /// a catalog — namespace/table existence, `load_table`, `Transaction::commit` — is on
+    /// the trait, and `commit` already takes `&dyn Catalog`.
+    catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     file_name_prefix: String,
     flush_lock: Arc<tokio::sync::Mutex<()>>,
@@ -76,7 +85,7 @@ impl IcebergSink {
         // Cloud-backed warehouses (S3, GCS, ADLS) do not use the local table_path
         // as actual storage; attempting fs::create_dir_all on an s3:// path would
         // silently create a local directory with that literal name.
-        let warehouse = cfg.catalog.rest.warehouse.trim();
+        let warehouse = cfg.catalog.location();
         let is_local = warehouse.starts_with("file://")
             || warehouse.starts_with('/')
             || (!warehouse.contains("://"));
@@ -96,38 +105,65 @@ impl IcebergSink {
             build_storage_factory_from(&effective_storage, cfg)?
         };
 
-        let mut catalog_props = HashMap::from([
-            (
-                REST_CATALOG_PROP_URI.to_string(),
-                cfg.catalog.rest.uri.trim().to_string(),
-            ),
-            (
-                REST_CATALOG_PROP_WAREHOUSE.to_string(),
-                warehouse.to_string(),
-            ),
-        ]);
-        if let Some(token) = &cfg.catalog.rest.token {
-            let resolved = token.resolve().map_err(|e| {
-                RtError::ConfigError(format!(
-                    "sink.iceberg.catalog.rest.token could not be resolved: {e}"
-                ))
-            })?;
-            catalog_props.insert("token".to_string(), resolved.trim().to_string());
-        }
-        if let Some(credential) = &cfg.catalog.rest.credential {
-            let resolved = credential.resolve().map_err(|e| {
-                RtError::ConfigError(format!(
-                    "sink.iceberg.catalog.rest.credential could not be resolved: {e}"
-                ))
-            })?;
-            catalog_props.insert("credential".to_string(), resolved.trim().to_string());
-        }
-
-        let catalog = RestCatalogBuilder::default()
-            .with_storage_factory(Arc::new(storage_factory))
-            .load("cdc-rest", catalog_props)
-            .await
-            .map_err(map_iceberg_error)?;
+        let catalog: Arc<dyn Catalog> = match &cfg.catalog {
+            IcebergCatalogConfig::Rest(rest) => {
+                let mut props = HashMap::from([
+                    (
+                        REST_CATALOG_PROP_URI.to_string(),
+                        rest.uri.trim().to_string(),
+                    ),
+                    (
+                        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+                        warehouse.to_string(),
+                    ),
+                ]);
+                if let Some(token) = &rest.token {
+                    let resolved = token.resolve().map_err(|e| {
+                        RtError::ConfigError(format!(
+                            "sink.iceberg.catalog.rest.token could not be resolved: {e}"
+                        ))
+                    })?;
+                    props.insert("token".to_string(), resolved.trim().to_string());
+                }
+                if let Some(credential) = &rest.credential {
+                    let resolved = credential.resolve().map_err(|e| {
+                        RtError::ConfigError(format!(
+                            "sink.iceberg.catalog.rest.credential could not be resolved: {e}"
+                        ))
+                    })?;
+                    props.insert("credential".to_string(), resolved.trim().to_string());
+                }
+                Arc::new(
+                    RestCatalogBuilder::default()
+                        .with_storage_factory(Arc::new(storage_factory))
+                        .load("cdc-rest", props)
+                        .await
+                        .map_err(map_iceberg_error)?,
+                )
+            }
+            IcebergCatalogConfig::S3Tables(s3) => {
+                // No storage factory: S3 Tables owns the underlying bucket and hands back
+                // the file IO for it. Supplying our own OpenDAL factory here would point
+                // writes at a bucket the catalog does not manage, which is how data files
+                // end up unreferenced by any snapshot.
+                let mut props = HashMap::from([(
+                    S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+                    s3.table_bucket_arn.trim().to_string(),
+                )]);
+                if let Some(endpoint) = &s3.endpoint_url {
+                    props.insert(
+                        S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(),
+                        endpoint.trim().to_string(),
+                    );
+                }
+                Arc::new(
+                    S3TablesCatalogBuilder::default()
+                        .load("cdc-s3tables", props)
+                        .await
+                        .map_err(map_iceberg_error)?,
+                )
+            }
+        };
 
         let namespace = NamespaceIdent::new(cfg.namespace.clone());
         let table_ident = TableIdent::new(namespace.clone(), cfg.table_name.clone());
@@ -144,7 +180,7 @@ impl IcebergSink {
         }
 
         ensure_table_exists(
-            &catalog,
+            catalog.as_ref(),
             &cfg.table_path,
             &namespace,
             &table_ident,
@@ -157,7 +193,7 @@ impl IcebergSink {
             pending: Vec::new(),
             pending_bytes: 0,
             closed: false,
-            catalog: Arc::new(catalog),
+            catalog,
             table_ident,
             file_name_prefix: format!("cdc-{}", uuid::Uuid::new_v4().simple()),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -517,7 +553,7 @@ impl SinkAdapter for IcebergSink {
 }
 
 async fn ensure_table_exists(
-    catalog: &RestCatalog,
+    catalog: &dyn Catalog,
     table_path: &Path,
     namespace: &NamespaceIdent,
     table_ident: &TableIdent,
@@ -846,7 +882,7 @@ fn build_storage_factory_from(
             // AzureStorageScheme is a private type in iceberg-storage-opendal;
             // construct the factory variant via serde_json deserialization
             // (external tagging with the enum variant name).
-            let warehouse = cfg.catalog.rest.warehouse.trim();
+            let warehouse = cfg.catalog.location();
             let scheme_str =
                 if warehouse.starts_with("abfs://") || warehouse.starts_with("abfss://") {
                     "Abfs"
@@ -924,20 +960,18 @@ mod tests {
     }
 
     fn append_cfg(path: PathBuf) -> IcebergSinkConfig {
-        let catalog = IcebergCatalogConfig {
-            rest: IcebergRestCatalogConfig {
-                uri: std::env::var("CDC_TEST_ICEBERG_REST_URI")
-                    .unwrap_or_else(|_| "http://127.0.0.1:8181".to_string()),
-                warehouse: std::env::var("CDC_TEST_ICEBERG_REST_WAREHOUSE")
-                    .unwrap_or_else(|_| "file:///tmp/cdc-iceberg-warehouse".to_string()),
-                token: std::env::var("CDC_TEST_ICEBERG_REST_TOKEN")
-                    .ok()
-                    .map(rustcdc::SecretString::new),
-                credential: std::env::var("CDC_TEST_ICEBERG_REST_CREDENTIAL")
-                    .ok()
-                    .map(rustcdc::SecretString::new),
-            },
-        };
+        let catalog = IcebergCatalogConfig::Rest(IcebergRestCatalogConfig {
+            uri: std::env::var("CDC_TEST_ICEBERG_REST_URI")
+                .unwrap_or_else(|_| "http://127.0.0.1:8181".to_string()),
+            warehouse: std::env::var("CDC_TEST_ICEBERG_REST_WAREHOUSE")
+                .unwrap_or_else(|_| "file:///tmp/cdc-iceberg-warehouse".to_string()),
+            token: std::env::var("CDC_TEST_ICEBERG_REST_TOKEN")
+                .ok()
+                .map(rustcdc::SecretString::new),
+            credential: std::env::var("CDC_TEST_ICEBERG_REST_CREDENTIAL")
+                .ok()
+                .map(rustcdc::SecretString::new),
+        });
 
         IcebergSinkConfig {
             table_path: path,
@@ -1145,10 +1179,10 @@ mod tests {
                     stack.push(path);
                     continue;
                 }
-                if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
-                    if name.ends_with(suffix) {
-                        count += 1;
-                    }
+                if let Some(name) = path.file_name().and_then(|v| v.to_str())
+                    && name.ends_with(suffix)
+                {
+                    count += 1;
                 }
             }
         }
@@ -1169,10 +1203,10 @@ mod tests {
                     stack.push(path);
                     continue;
                 }
-                if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
-                    if name.ends_with(suffix) {
-                        names.push(name.to_string());
-                    }
+                if let Some(name) = path.file_name().and_then(|v| v.to_str())
+                    && name.ends_with(suffix)
+                {
+                    names.push(name.to_string());
                 }
             }
         }
@@ -1222,20 +1256,18 @@ mod tests {
     async fn run_concurrent_flushes(table_root: &Path, writer_count: usize, max_retries: u32) {
         let cfg = IcebergSinkConfig {
             table_path: table_root.to_path_buf(),
-            catalog: IcebergCatalogConfig {
-                rest: IcebergRestCatalogConfig {
-                    uri: std::env::var("CDC_TEST_ICEBERG_REST_URI")
-                        .unwrap_or_else(|_| "http://127.0.0.1:8181".to_string()),
-                    warehouse: std::env::var("CDC_TEST_ICEBERG_REST_WAREHOUSE")
-                        .unwrap_or_else(|_| "file:///tmp/cdc-iceberg-warehouse".to_string()),
-                    token: std::env::var("CDC_TEST_ICEBERG_REST_TOKEN")
-                        .ok()
-                        .map(rustcdc::SecretString::new),
-                    credential: std::env::var("CDC_TEST_ICEBERG_REST_CREDENTIAL")
-                        .ok()
-                        .map(rustcdc::SecretString::new),
-                },
-            },
+            catalog: IcebergCatalogConfig::Rest(IcebergRestCatalogConfig {
+                uri: std::env::var("CDC_TEST_ICEBERG_REST_URI")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8181".to_string()),
+                warehouse: std::env::var("CDC_TEST_ICEBERG_REST_WAREHOUSE")
+                    .unwrap_or_else(|_| "file:///tmp/cdc-iceberg-warehouse".to_string()),
+                token: std::env::var("CDC_TEST_ICEBERG_REST_TOKEN")
+                    .ok()
+                    .map(rustcdc::SecretString::new),
+                credential: std::env::var("CDC_TEST_ICEBERG_REST_CREDENTIAL")
+                    .ok()
+                    .map(rustcdc::SecretString::new),
+            }),
             schema_mode: IcebergSchemaMode::Normalized,
             namespace: "cdc".to_string(),
             table_name: "events".to_string(),

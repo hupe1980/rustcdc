@@ -6,53 +6,53 @@ use crate::error::{AppError, ConfigError};
 use crate::pipeline::transform;
 use rustcdc::sink::SinkAdapter;
 
-use super::run_metrics::{
-    observe_latency_histogram_bucket, CorrectnessSample, LATENCY_HISTOGRAM_BUCKETS_US,
+use super::metrics::{
+    CorrectnessSample, LATENCY_HISTOGRAM_BUCKETS_US, observe_latency_histogram_bucket,
 };
 
 #[derive(Debug, Default)]
 pub struct BatchPrepareStats {
-    pub(super) transform_ops_total: u64,
-    pub(super) transform_latency_us_total: u64,
-    pub(super) transform_latency_us_last: u64,
-    pub(super) transform_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
-    pub(super) prepare_ops_total: u64,
-    pub(super) prepare_latency_us_total: u64,
-    pub(super) prepare_latency_us_last: u64,
-    pub(super) prepare_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
+    pub(crate) transform_ops_total: u64,
+    pub(crate) transform_latency_us_total: u64,
+    pub(crate) transform_latency_us_last: u64,
+    pub(crate) transform_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
+    pub(crate) prepare_ops_total: u64,
+    pub(crate) prepare_latency_us_total: u64,
+    pub(crate) prepare_latency_us_last: u64,
+    pub(crate) prepare_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
 }
 
 #[derive(Debug, Default)]
 pub struct SinkDeliveryStats {
     /// Events quarantined to the dead-letter queue during this batch.
-    pub(super) dlq_events_total: u64,
-    pub(super) sink_send_ops_total: u64,
-    pub(super) sink_send_latency_us_total: u64,
-    pub(super) sink_send_latency_us_last: u64,
-    pub(super) sink_send_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
-    pub(super) sink_flush_ops_total: u64,
-    pub(super) sink_flush_latency_us_total: u64,
-    pub(super) sink_flush_latency_us_last: u64,
-    pub(super) sink_flush_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
+    pub(crate) dlq_events_total: u64,
+    pub(crate) sink_send_ops_total: u64,
+    pub(crate) sink_send_latency_us_total: u64,
+    pub(crate) sink_send_latency_us_last: u64,
+    pub(crate) sink_send_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
+    pub(crate) sink_flush_ops_total: u64,
+    pub(crate) sink_flush_latency_us_total: u64,
+    pub(crate) sink_flush_latency_us_last: u64,
+    pub(crate) sink_flush_latency_us_buckets: [u64; LATENCY_HISTOGRAM_BUCKETS_US.len()],
 }
 
 #[derive(Debug, Default)]
 pub struct BatchProcessingStats {
-    pub(super) prepare: BatchPrepareStats,
-    pub(super) delivery: SinkDeliveryStats,
-    pub(super) committed_correctness_samples: Vec<CorrectnessSample>,
-    pub(super) checkpoint_parity_requested: bool,
-    pub(super) checkpoint_parity_effective: bool,
-    pub(super) runtime_ack_commit_executed: bool,
+    pub(crate) prepare: BatchPrepareStats,
+    pub(crate) delivery: SinkDeliveryStats,
+    pub(crate) committed_correctness_samples: Vec<CorrectnessSample>,
+    pub(crate) checkpoint_parity_requested: bool,
+    pub(crate) checkpoint_parity_effective: bool,
+    pub(crate) runtime_ack_commit_executed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CheckpointParityPlan {
-    pub(super) requested: bool,
-    pub(super) effective: bool,
+pub(crate) struct CheckpointParityPlan {
+    pub(crate) requested: bool,
+    pub(crate) effective: bool,
 }
 
-pub(super) fn checkpoint_parity_plan(
+pub(crate) fn checkpoint_parity_plan(
     mode: CheckpointParityMode,
     sink: &crate::pipeline::router::TableRouter,
 ) -> CheckpointParityPlan {
@@ -83,7 +83,7 @@ pub(super) fn checkpoint_parity_plan(
 /// `checkpoint_parity_mode = enabled`, and the sink does not support
 /// transactional checkpoint barriers.  Silently degrading in this scenario
 /// would violate the operator's expressed delivery guarantee.
-pub(super) fn validate_parity_contract(
+pub(crate) fn validate_parity_contract(
     mode: CheckpointParityMode,
     sink: &crate::pipeline::router::TableRouter,
     delivery_contract: DeliveryContract,
@@ -92,7 +92,7 @@ pub(super) fn validate_parity_contract(
         && !sink.transactional_checkpoint_barrier_capable()
         && delivery_contract == DeliveryContract::EffectivelyOnce
     {
-        return Err(AppError::Config(Box::new(ConfigError::InvalidState(
+        return Err(AppError::Config(Box::new(ConfigError::Invalid(
             "checkpoint_parity_mode = enabled requires a sink that supports \
              transactional checkpoint barriers for effectively_once delivery, \
              but the configured sink does not.  Either use a Kafka sink, \
@@ -102,10 +102,6 @@ pub(super) fn validate_parity_contract(
         ))));
     }
     Ok(())
-}
-
-enum PreparedEvent {
-    Event(rustcdc::core::Event),
 }
 
 #[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
@@ -121,14 +117,23 @@ pub async fn process_batch_events(
     dlq: Option<&tokio::sync::Mutex<crate::dlq::DeadLetterQueue>>,
 ) -> Result<BatchProcessingStats, AppError> {
     struct EventPrepareResult {
-        prepared_event: Option<PreparedEvent>,
-        correctness_sample: Option<CorrectnessSample>,
+        /// The transformed event and its correctness fingerprint, or `None` when a
+        /// transform dropped the event.
+        prepared: Option<(rustcdc::core::Event, CorrectnessSample)>,
         transform_latency_us: u64,
         prepare_latency_us: u64,
     }
 
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<PreparedEvent>(sink_delivery_queue_capacity.max(1));
+    // The sample travels *with* the event rather than being collected here.
+    //
+    // The producer used to push every sample into its own vector, and the caller recorded
+    // the lot once the batch was durable — under a comment saying correctness KPIs are
+    // post-durable. They were not: an event the consumer dead-lettered had already had its
+    // sample banked, so `rustcdc_data_events_total` and the duplicate/reorder rates counted
+    // events that were quarantined and never delivered. Carrying the sample and collecting
+    // it on the far side of a successful send makes the comment true.
+    type Delivery = (rustcdc::core::Event, CorrectnessSample);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Delivery>(sink_delivery_queue_capacity.max(1));
 
     // `move` + the explicit `drop(tx)` below are load-bearing. The consumer's exit
     // condition is `rx.recv() == None`, which only happens once every sender is
@@ -145,13 +150,13 @@ pub async fn process_batch_events(
             let transform_started = std::time::Instant::now();
             let transformed = transform_pipeline.apply(event).await?;
             let transform_latency_us = transform_started.elapsed().as_micros() as u64;
-            let correctness_sample = transformed.as_ref().map(CorrectnessSample::from_event);
-
-            let prepared_event = transformed.map(PreparedEvent::Event);
+            let prepared = transformed.map(|event| {
+                let sample = CorrectnessSample::from_event(&event);
+                (event, sample)
+            });
 
             Ok::<EventPrepareResult, AppError>(EventPrepareResult {
-                prepared_event,
-                correctness_sample,
+                prepared,
                 transform_latency_us,
                 prepare_latency_us: prepare_started.elapsed().as_micros() as u64,
             })
@@ -159,7 +164,6 @@ pub async fn process_batch_events(
         .buffered(prepare_parallelism.max(1));
 
         let mut stats = BatchPrepareStats::default();
-        let mut committed_correctness_samples = Vec::new();
         while let Some(event_result) = per_event_results.try_next().await? {
             stats.transform_ops_total = stats.transform_ops_total.saturating_add(1);
             stats.transform_latency_us_total = stats
@@ -181,14 +185,10 @@ pub async fn process_batch_events(
                 event_result.prepare_latency_us,
             );
 
-            if let Some(prepared_event) = event_result.prepared_event {
-                tx.send(prepared_event).await.map_err(|_| {
+            if let Some(delivery) = event_result.prepared {
+                tx.send(delivery).await.map_err(|_| {
                     AppError::Other("sink delivery queue closed unexpectedly".to_string())
                 })?;
-            }
-
-            if let Some(sample) = event_result.correctness_sample {
-                committed_correctness_samples.push(sample);
             }
         }
 
@@ -198,14 +198,12 @@ pub async fn process_batch_events(
         // release the sender would deadlock — the drop must be explicit.
         drop(tx);
 
-        Ok::<(BatchPrepareStats, Vec<CorrectnessSample>), AppError>((
-            stats,
-            committed_correctness_samples,
-        ))
+        Ok::<BatchPrepareStats, AppError>(stats)
     };
 
     let consumer = async {
         let mut stats = SinkDeliveryStats::default();
+        let mut committed_correctness_samples = Vec::new();
         let mut buffered_since_flush = 0usize;
         let flush_interval = flush_interval.max(1);
         let mut flush_ticker = sink.flush_tick_interval().map(tokio::time::interval);
@@ -232,15 +230,17 @@ pub async fn process_batch_events(
                 rx.recv().await
             };
 
-            let Some(prepared_event) = maybe_event else {
+            let Some((event, correctness_sample)) = maybe_event else {
                 break;
             };
 
             let sink_send_started = std::time::Instant::now();
-            let PreparedEvent::Event(event) = &prepared_event;
-            let event_for_dlq = event.clone();
-            match send_prepared_event_with_timeout(sink, prepared_event, sink_send_timeout_ms).await
-            {
+            // `event` is borrowed for the send and still owned here for the dead-letter
+            // path, so neither needs a copy. This used to clone the whole `Event` —
+            // including its `serde_json::Value` payload, so a deep heap walk — for *every*
+            // event, to serve a quarantine branch that fires only for permanently
+            // undeliverable records.
+            match send_event_with_timeout(sink, &event, sink_send_timeout_ms).await {
                 Ok(()) => {}
                 // A *recoverable* failure is the batch's problem, not the event's — the
                 // caller retries the whole batch under the recovery policy. Only a
@@ -268,8 +268,7 @@ pub async fn process_batch_events(
                         return Err(err);
                     };
 
-                    let record =
-                        crate::dlq::DeadLetterRecord::new(sink.name(), &event_for_dlq, &err);
+                    let record = crate::dlq::DeadLetterRecord::new(sink.name(), &event, &err);
                     tracing::warn!(
                         target: "rustcdc_audit",
                         action = "dead_letter",
@@ -286,6 +285,10 @@ pub async fn process_batch_events(
                     continue;
                 }
             }
+
+            // Reached only on a successful send, so a quarantined event contributes no
+            // correctness sample — it never became part of the stream the KPI describes.
+            committed_correctness_samples.push(correctness_sample);
 
             let sink_send_latency_us = sink_send_started.elapsed().as_micros() as u64;
             stats.sink_send_ops_total = stats.sink_send_ops_total.saturating_add(1);
@@ -317,10 +320,13 @@ pub async fn process_batch_events(
             record_sink_flush(&mut stats, sink_flush_latency_us);
         }
 
-        Ok::<SinkDeliveryStats, AppError>(stats)
+        Ok::<(SinkDeliveryStats, Vec<CorrectnessSample>), AppError>((
+            stats,
+            committed_correctness_samples,
+        ))
     };
 
-    let ((prepare_stats, committed_correctness_samples), delivery_stats) =
+    let (prepare_stats, (delivery_stats, committed_correctness_samples)) =
         tokio::try_join!(producer, consumer)?;
 
     Ok(BatchProcessingStats {
@@ -334,7 +340,7 @@ pub async fn process_batch_events(
 }
 
 #[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
-pub(super) async fn process_batch_events_with_optional_checkpoint_barrier(
+pub(crate) async fn process_batch_events_with_optional_checkpoint_barrier(
     sink: &mut crate::pipeline::router::TableRouter,
     events: impl IntoIterator<Item = rustcdc::core::Event>,
     transform_pipeline: &transform::TransformPipeline,
@@ -448,12 +454,11 @@ fn record_sink_flush(stats: &mut SinkDeliveryStats, sink_flush_latency_us: u64) 
     );
 }
 
-async fn send_prepared_event_with_timeout(
+async fn send_event_with_timeout(
     sink: &mut crate::pipeline::router::TableRouter,
-    prepared_event: PreparedEvent,
+    event: &rustcdc::core::Event,
     sink_send_timeout_ms: u64,
 ) -> Result<(), AppError> {
-    let PreparedEvent::Event(event) = prepared_event;
     // The size limit is enforced by `SinkBinding` against the *encoded* payload — see
     // `crate::sink::SinkBinding::max_event_bytes`. It used to be enforced here by
     // serialising the event to JSON and discarding the result, which cost a measured
@@ -461,7 +466,7 @@ async fn send_prepared_event_with_timeout(
     // transmitted.
     match tokio::time::timeout(
         std::time::Duration::from_millis(sink_send_timeout_ms),
-        sink.send(&event),
+        sink.send(event),
     )
     .await
     {
@@ -473,7 +478,7 @@ async fn send_prepared_event_with_timeout(
     }
 }
 
-pub(super) async fn flush_sink_with_timeout(
+pub(crate) async fn flush_sink_with_timeout(
     sink: &mut crate::pipeline::router::TableRouter,
     sink_flush_timeout_ms: u64,
 ) -> Result<(), AppError> {

@@ -7,16 +7,14 @@
 //! that table plus the duplicate `read` events downstream. That is why the Kafka ingress
 //! consumer uses `AutoOffsetReset::Latest` and why the file channel starts at EOF.
 //!
-//! Those defences only cover the *absence* of a committed offset. They do nothing for the
-//! ordinary at-least-once redelivery that any consumer must expect, and the only guard
-//! that did — deduplication against `audit_recent_entries` — holds 512 entries in memory
-//! and starts empty on every boot. So the Kafka ingress loop committed its offsets
-//! *before* the action had run, trading a duplicate for silent loss: a crash between the
-//! commit and the action executing lost the command permanently, with a `STARTED` audit
-//! entry and no terminal state, in a ring buffer that the restart then emptied.
+//! Those defences only cover the *absence* of a committed offset. Nothing there survives
+//! ordinary at-least-once redelivery: the in-memory `audit_recent_entries` dedupe holds
+//! 512 entries and starts empty on every boot. Without a durable key the consumer has to
+//! choose between committing before the action (a crash loses the command silently) and
+//! after it (a crash re-runs a full table scan).
 //!
-//! Neither trade is necessary. This ledger makes redelivery safe, which lets the consumer
-//! commit *after* the action reaches a terminal state instead of before it starts:
+//! This ledger removes the choice — redelivery becomes safe, so the consumer commits
+//! *after* the action reaches a terminal state:
 //!
 //! * crash before the terminal state → not ledgered, not committed → redelivered → runs;
 //! * crash after the terminal state, before the commit → ledgered → redelivered → skipped.
@@ -76,6 +74,31 @@ pub(super) struct ProcessedSignalLedger {
     /// A `HashSet` for the membership test plus a `Vec` for the order: the set is
     /// consulted once per ingress record and the order is only needed when rewriting.
     inner: Mutex<LedgerState>,
+}
+
+/// Take the ledger lock, recovering a poisoned one instead of panicking.
+///
+/// This was `.expect("signal ledger mutex")` at three call sites, which turned a single
+/// panic anywhere under the lock into a permanent outage of the whole signal-ingress path:
+/// the first panic poisons the mutex, and every subsequent `contains` and `record` then
+/// panics too. `catch_unwind` in the signal worker (added for the same defect class) keeps
+/// the *process* alive, so the result was a worker that stayed up and refused every command
+/// for the rest of the run.
+///
+/// Recovery is sound here because the state is two collections and a counter with no
+/// cross-field invariant that a half-finished mutation can break: `record` inserts into the
+/// set, pushes onto the order and bumps the count, and a duplicate key is a no-op by
+/// construction. The worst outcome of resuming from a poisoned guard is one entry counted
+/// but not appended — which re-runs one command that had already run, exactly the case
+/// at-least-once redelivery already tolerates.
+fn lock_ledger(inner: &Mutex<LedgerState>) -> std::sync::MutexGuard<'_, LedgerState> {
+    inner.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            "signal ledger mutex was poisoned by a panicking holder; recovering rather \
+             than failing every subsequent signal for the life of the process"
+        );
+        poisoned.into_inner()
+    })
 }
 
 struct LedgerState {
@@ -155,7 +178,7 @@ impl ProcessedSignalLedger {
         };
 
         {
-            let mut state = ledger.inner.lock().expect("signal ledger mutex");
+            let mut state = lock_ledger(&ledger.inner);
             for key in order {
                 if state.seen.insert(key.clone()) {
                     state.order.push(key);
@@ -171,11 +194,7 @@ impl ProcessedSignalLedger {
 
     /// Has this record's action already been decided?
     pub(super) fn contains(&self, key: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("signal ledger mutex")
-            .seen
-            .contains(key)
+        lock_ledger(&self.inner).seen.contains(key)
     }
 
     /// Record that this record's action reached a terminal state.
@@ -184,7 +203,7 @@ impl ProcessedSignalLedger {
     /// between the two must leave the ledger ahead, never behind. Ahead means a
     /// redelivered record is skipped; behind means it runs twice.
     pub(super) fn record(&self, key: &str) -> Result<(), AppError> {
-        let mut state = self.inner.lock().expect("signal ledger mutex");
+        let mut state = lock_ledger(&self.inner);
         if !state.seen.insert(key.to_string()) {
             return Ok(());
         }
