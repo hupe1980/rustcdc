@@ -2,7 +2,7 @@
 
 use futures_util::future::join_all;
 
-use crate::core::{Event, Result};
+use crate::core::{Error, Event, Result};
 use crate::sink::{BoxedSink, SinkAdapter, SinkDeliveryGuarantee};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ impl FanOutSinkAdapter {
     /// misconfiguration to report, not a reason to abort the embedder's process.
     pub fn new(sinks: Vec<BoxedSink>) -> Result<Self> {
         if sinks.is_empty() {
-            return Err(crate::core::Error::ConfigError(
+            return Err(Error::ConfigError(
                 "FanOutSinkAdapter requires at least one child sink; a fan-out with none \
                  would accept and discard every event while reporting success"
                     .into(),

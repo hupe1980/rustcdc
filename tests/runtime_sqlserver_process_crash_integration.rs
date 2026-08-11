@@ -31,7 +31,7 @@ async fn sql_exec(client: &mut SqlClient, sql: &str) -> rustcdc::Result<()> {
     client
         .execute(sql, &[])
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     Ok(())
 }
 
@@ -42,10 +42,10 @@ async fn query_min_lsn_hex(
     let rows = client
         .query("SELECT sys.fn_cdc_get_min_lsn(@P1)", &[&capture_instance])
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?
         .into_first_result()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     Ok(rows
         .into_iter()
@@ -108,7 +108,7 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
                 &[&id, &payload],
             )
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     sql_exec(
@@ -281,7 +281,7 @@ async fn run_sqlserver_process_kill_replay_scenario(
                 &[&id, &payload],
             )
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     sql_exec(&mut admin, "USE rustcdc_crash; EXEC sys.sp_cdc_scan").await?;

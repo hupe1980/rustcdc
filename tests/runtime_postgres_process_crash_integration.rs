@@ -62,24 +62,24 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
         ])
         .start()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     let host_text = host.to_string();
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -98,7 +98,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
             ",
         )
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let _lsn_text: String = admin_client
         .query_one(
@@ -106,7 +106,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
             &[&"rustcdc_runtime_crash_snapshot_slot"],
         )
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?
         .get(0);
 
     let total_rows = 600_i64;
@@ -117,7 +117,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
@@ -141,6 +141,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
 
     worker.kill().map_err(rustcdc::Error::IoError)?;
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
+    wait_for_slot_released(&admin_client, "rustcdc_runtime_crash_snapshot_slot").await?;
 
     // Read-only: a writer instance here would hold the owner lease that the runtime's
     // own checkpoint store needs a few lines below.
@@ -160,7 +161,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
             &[&"rustcdc_runtime_crash_snapshot_slot"],
         )
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let source_cfg = PostgresSourceConfig {
         host: host.to_string(),
@@ -274,24 +275,24 @@ async fn run_postgres_process_kill_replay_scenario(
         ])
         .start()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     let host_text = host.to_string();
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
     let (admin_client, admin_conn) = tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls)
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
@@ -310,7 +311,7 @@ async fn run_postgres_process_kill_replay_scenario(
             ",
         )
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     // Ensure the replication slot exists before inserts so stream events are
     // guaranteed to be visible to the crash worker.
@@ -320,7 +321,7 @@ async fn run_postgres_process_kill_replay_scenario(
             &[&"rustcdc_runtime_crash_slot"],
         )
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?
         .get(0);
     let baseline_lsn = parse_pg_lsn(&lsn_text)?;
 
@@ -347,7 +348,7 @@ async fn run_postgres_process_kill_replay_scenario(
                 &[&id, &format!("payload-{id}")],
             )
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     let mut worker = spawn_crash_worker(
@@ -367,6 +368,9 @@ async fn run_postgres_process_kill_replay_scenario(
     // External hard kill simulates real process termination without graceful shutdown.
     worker.kill().map_err(rustcdc::Error::IoError)?;
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
+    // The runtime below re-attaches to this same slot, and `START_REPLICATION` against a
+    // slot the server still considers active fails with SQLSTATE 55006.
+    wait_for_slot_released(&admin_client, "rustcdc_runtime_crash_slot").await?;
 
     // Read-only, for the same reason as above.
     let reader_before = FileCheckpoint::read_only(checkpoint_dir.path());
@@ -484,6 +488,46 @@ async fn run_postgres_process_kill_replay_scenario(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Block until PostgreSQL has released `slot`, or fail with a message that says why.
+///
+/// `Child::kill` + `Child::wait` reap the *local* process. They say nothing about the
+/// server: PostgreSQL keeps a replication slot marked `active` until the walsender backend
+/// notices its socket is gone, and until then every operation on that slot —
+/// `pg_replication_slot_advance`, `pg_drop_replication_slot`, a fresh `START_REPLICATION` —
+/// fails with SQLSTATE `55006`, *"replication slot is active for PID n"*.
+///
+/// The window is milliseconds on an idle developer machine and seconds on a loaded
+/// two-core CI runner, which is why this raced only in CI. It surfaced as
+/// `SourceError("db error")`, because that is what `tokio_postgres::Error` renders for any
+/// server-side error — the detail lives in its `source()` chain, which the suite was
+/// discarding.
+async fn wait_for_slot_released(client: &tokio_postgres::Client, slot: &str) -> rustcdc::Result<()> {
+    const ATTEMPTS: usize = 100;
+    for _ in 0..ATTEMPTS {
+        let row = client
+            .query_opt(
+                "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
+
+        match row {
+            // No such slot: nothing holds it, which is as released as it gets.
+            None => return Ok(()),
+            Some(row) if !row.get::<_, bool>(0) => return Ok(()),
+            Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+
+    Err(rustcdc::Error::SourceError(format!(
+        "replication slot '{slot}' was still active {}s after the worker was killed; the \
+         walsender has not noticed the dead client, so any operation on the slot would fail \
+         with SQLSTATE 55006",
+        ATTEMPTS / 10
+    )))
+}
+
 fn spawn_crash_worker(
     host: &str,
     port: u16,

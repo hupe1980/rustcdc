@@ -94,17 +94,17 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     let host_text = host.to_string();
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -112,7 +112,7 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
     sqlx::query("DROP TABLE IF EXISTS runtime_crash_snapshot_users")
         .execute(&admin_pool)
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     sqlx::query(
         "CREATE TABLE runtime_crash_snapshot_users (
@@ -122,7 +122,7 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let total_rows = 600_i64;
     for id in 1_i64..=total_rows {
@@ -130,7 +130,7 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
             .bind(format!("payload-{id}"))
             .execute(&admin_pool)
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
@@ -274,17 +274,17 @@ async fn run_mariadb_process_kill_replay_scenario(
         .with_env_var("MYSQL_DATABASE", "cdc")
         .start()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let host = container
         .get_host()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     let host_text = host.to_string();
     let port = container
         .get_host_port_ipv4(3306.tcp())
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let admin_dsn = format!("mysql://root:rootpass@{host}:{port}/cdc");
     let admin_pool = connect_admin_pool(&admin_dsn).await?;
@@ -292,7 +292,7 @@ async fn run_mariadb_process_kill_replay_scenario(
     sqlx::query("DROP TABLE IF EXISTS runtime_crash_users")
         .execute(&admin_pool)
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     sqlx::query(
         "CREATE TABLE runtime_crash_users (
@@ -302,12 +302,12 @@ async fn run_mariadb_process_kill_replay_scenario(
     )
     .execute(&admin_pool)
     .await
-    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
     let status: sqlx::mysql::MySqlRow = sqlx::query("SHOW MASTER STATUS")
         .fetch_one(&admin_pool)
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     let baseline_file: String = status.try_get(0).unwrap_or_default();
     let baseline_pos: u32 = status.try_get::<u64, _>(1).unwrap_or(4) as u32;
     let baseline_gtid: String = sqlx::query_scalar("SELECT @@GLOBAL.GTID_EXECUTED")
@@ -340,7 +340,7 @@ async fn run_mariadb_process_kill_replay_scenario(
             .bind(format!("payload-{id}"))
             .execute(&admin_pool)
             .await
-            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+            .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
     }
 
     let mut worker = spawn_crash_worker(
