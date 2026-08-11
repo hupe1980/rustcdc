@@ -5,6 +5,433 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.13.0
+
+Five further audit passes over the tree released as 0.12.0 — the third through seventh of this
+review — plus a new connector and the last open evidence condition closed.
+
+Nothing here was in 0.12.0. These entries lived under that heading while the work was in
+progress and were moved when the version was cut, because 0.12.0 had already been published:
+a changelog section describing features its release does not contain is worse than no section.
+
+It is a **breaking** release in three ways: `FanOutSinkAdapter::new` returns `Result<Self>`
+instead of panicking on an empty child list; table patterns now fold ASCII case in the sink
+router as well as in the connector filters, so a pattern that previously matched nothing may now
+match; and schema-change events are subject to `table_include_list` / `table_exclude_list`, so a
+pipeline relying on receiving DDL for tables it excluded will stop receiving it. Each is
+described below.
+
+**The `snowflake` feature is new**, and adds no dependencies.
+
+One condition remains open on a 1.0 release, and it is not a correctness defect: with the
+`sqlserver` feature enabled, `tiberius 0.12.3` pins `tokio-rustls 0.24`, pulling in a second,
+older rustls that carries three advisories. It is not fixable from this crate and needs either a
+`tiberius` release on rustls 0.23 or a native TDS client. `tiberius` has published nothing since
+July 2024, so this was re-checked and remains open.
+
+The other condition — no end-to-end throughput measurement — is **closed**, by
+`cargo bench --bench throughput`.
+
+### A seventh pass
+
+Ran the part of the container matrix the previous pass had named as unrun. Everything passed —
+checkpoint durability and PostgreSQL process-crash recovery over the orphaned-temp-file pruning
+added earlier in this release, MariaDB 10.5 and 10.6 end to end through the refactored
+connection path, and the data-loss and crash-recovery model suites.
+
+A genuine Docker Hub flake during the MariaDB run then exposed the finding.
+
+#### Fixed: the release-evidence gate counted a skipped suite as a passing suite
+
+An image-pull failure is correctly classified as CI infrastructure rather than a code
+regression and recorded as `STATUS: SKIP`. It also set `passed=1`, which kept the label out of
+`failed_labels` — the only thing the exit check consults.
+
+So a Docker Hub rate-limit during a release run could skip every container suite, and the
+script would still print *"Full integration matrix completed successfully"* and exit 0. The
+evidence artifact then certified a matrix in which nothing ran. A narrower exposure came from
+the same classifier grepping the whole log, so a suite that ran, genuinely failed, and happened
+to contain "failed to pull" anywhere in its output was reclassified from FAIL to a pass.
+
+Fixed in two halves, which belong together — failing on a skip without mitigating the transient
+would only trade a false green for a flaky red:
+
+- **Coverage is no longer overstated.** Skips are tracked separately, listed by name in the
+  report under a heading saying they produced no evidence, and fail the run.
+  `ALLOW_IMAGE_PULL_SKIPS=1` accepts a partial matrix for local iteration and the report
+  records that such a run is not release evidence.
+- **The transient is mitigated.** The release-gate job had no image pre-pull at all: 38
+  container suites fetching every image on demand from rate-limited Docker Hub, while
+  `scripts/ci-pull-relational-images.sh` warms them from a public mirror and the policy gate
+  keeps that script's list in step with the matrices. The drift check was guarding a script the
+  most exposed job never called. Both pre-pull steps are now wired into it.
+
+`reliability-testing.md` documents what the evidence artifact does and does not claim.
+
+### A sixth pass
+
+Docker was available, so this pass validated against live servers rather than reading more
+code — every connector change made earlier in this release had been made blind. All of it
+holds: MySQL 8.0 and 8.1 through the refactored connection path under streaming and snapshot
+load, PostgreSQL 16 stream/handoff/restart through the DDL-filter change, and SQL Server
+through the capture-instance filter, including the schema-change-on-metadata-refresh test that
+covers exactly the path that changed.
+
+Looking for evidence turned up the one finding.
+
+#### Fixed: forty of forty-one golden fixtures recorded an incomplete envelope
+
+Found by asking what `UPDATE_GOLDENS=1` does on a clean tree. It should do nothing; it rewrote
+every golden.
+
+The content was not wrong — one added field per event, 102 events. The goldens predated
+`before_is_key_only` and did not record it, and because `Event`'s fields carry
+`#[serde(default)]` each golden loaded with it defaulted to `false`, which happened to be
+correct for those fixtures. So the suite was not pinning the field; it was agreeing with
+itself. The one golden where the value is meaningful — `postgres_unchanged_toast_v1`, where it
+is `true` — had been regenerated at some point and did record it, which is why nothing ever
+failed. A future envelope field whose default is wrong for the existing corpus would have been
+silently mis-recorded by forty goldens reporting success.
+
+Three changes:
+
+- The loader compares each golden's recorded keys against what the event actually serializes
+  and fails with "golden is stale, regenerate". Fields with `skip_serializing_if` are
+  legitimately absent when empty, so the check is per event rather than against a fixed list.
+  Adding an envelope field now forces a conscious regeneration.
+- Envelope validation moved **above** the `UPDATE_GOLDENS` branch. Re-blessing previously wrote
+  the file and returned without validating anything — a run reporting `ok` having checked
+  nothing, at the moment a contributor is most likely to be wrong.
+- All forty goldens regenerated; the diff is exactly the missing field.
+
+The mechanism was also undocumented — `UPDATE_GOLDENS` appeared only in the test source, not in
+the docs, `CONTRIBUTING.md`, CI or the scripts. `reliability-testing.md` now covers how goldens
+are produced, when regenerating is legitimate ("not the way to make a failing test pass"), and
+that the golden diff is the entire review surface for the suite.
+
+### A fifth pass
+
+Two findings. Both are shapes earlier passes named, found by re-running the class rather than
+by reading new ground — which is the useful result: the classes generalise.
+
+#### Fixed: `SnapshotMetadata::is_last_chunk` promised something the incremental snapshot never delivers
+
+The field was documented as *"whether this chunk is the final one in the snapshot"*, without
+qualification. All three **bulk** snapshot paths set it. The **incremental** (DBLog) driver
+hardcodes `false` and never sets it — so a consumer that materialises a snapshot into a staging
+table and swaps it in on the last chunk works against a bulk snapshot and waits forever against
+an incremental one.
+
+Corrected in the documentation rather than the code, because setting the flag would be worse
+than leaving it unset. An incremental snapshot interleaves with the live stream, can be paused,
+resumed and stopped, and `request_incremental_snapshot` can add a table to one already running:
+flagging the chunk that drains the currently-known set is a claim the next request falsifies,
+and a consumer swapping on it would swap **early** and then keep receiving rows.
+
+`SnapshotMetadata::is_last_chunk` now states which path sets it and which does not, and names
+what to use instead — `IncrementalSnapshotState::is_complete()`, which survives a restart and
+tells "finished" apart from "paused" and "stopped". The API guide says the same where a reader
+looking for completion will be. A test pins the decision so changing it later is deliberate.
+
+#### Fixed: a Snowflake snapshot of an unconfigured table reported success and did nothing
+
+`start_snapshot(tables)` filtered the requested names against the configured-and-selectable set
+and used whatever survived; a name that survived nothing produced an empty snapshot that
+completed immediately and reported success. A typo — or a name in the wrong case, which
+Snowflake makes easy by folding unquoted identifiers to upper — looked like an instant,
+successful backfill of zero rows. Requesting an *excluded* table was equally silent, quietly
+turning an explicit request into an exemption from the include/exclude lists.
+
+Now refused, naming both the tables that cannot be satisfied and the ones that can.
+
+### A fourth pass
+
+Five findings. Three are one shape: a concept implemented more than once, where the copies
+drifted. The second audit closed a silent-corruption bug of exactly that shape; this pass went
+looking for the class rather than the instance.
+
+#### Fixed: table patterns folded case in the connector filter but not in the sink router
+
+**Breaking in behaviour.** The documentation said the two used one semantics. They shared the
+matcher but not the case rule: `table_is_allowed` lowered both sides before calling
+`glob::table_matches`, and the sink router called the identical function on unlowered input.
+
+Every supported server folds identifiers and they disagree about which way — PostgreSQL to
+lower, Snowflake to upper, MySQL depending on the host filesystem. So
+`table_include_list = ["PUBLIC.ORDERS"]` with `.route("public.orders", sink)` passed the filter
+and matched **no route**; `drop_unrouted` defaults to `true`, so those events were dropped with
+no error, no warning and no counter.
+
+Case folding now lives in the matcher, so there is one answer instead of two. ASCII folding,
+which is what every supported server's identifier rules are defined in terms of. The literal
+fast path (`!pattern.contains(['*','?'])`) needed the same treatment as the wildcard loop, or
+`public.orders` and `public.*` would have disagreed about the same table.
+
+The fix **removes** allocations: `table_is_allowed` was building four `String`s per call to
+lower its inputs, and comparing in place with `eq_ignore_ascii_case` needs none.
+
+Consequence worth knowing: on a case-sensitive MySQL (`lower_case_table_names = 0`), two tables
+differing only in case cannot be told apart by a pattern. That was already true of the include
+and exclude lists; it is now also true of routing.
+
+#### Fixed: the Snowflake connector stamped events with the decode time
+
+`Event::source.timestamp` was `now_millis()` at mapping time — and that field is what the
+`rustcdc_replication_lag_ms` metric, and therefore the runbook's "capture has fallen behind"
+alert, measures against `now()`. The metric read ~0 forever: a pipeline a full poll interval
+behind, or stalled outright, reported itself perfectly current.
+
+It is now the window's upper bound. `CHANGES` carries no per-row commit time, but a change
+reported in `(from, to]` provably happened at or before `to` — the tightest honest bound, and
+exactly the offset being committed.
+
+#### Fixed: the Snowflake snapshot never marked its final chunk
+
+`SnapshotMetadata::is_last_chunk` was hardcoded `false`, so a consumer that materialises a
+snapshot into a staging table and swaps it in on the last chunk waited for an event that could
+not arrive.
+
+#### Changed: one implementation each for two duplicated predicates
+
+`event_is_identifiable` in the idempotency guard walked the key columns itself, making three
+implementations of "does this event have a key" — the shape of a silent-corruption bug an
+earlier pass had already fixed. It now delegates to `Event::has_resolvable_key`.
+
+The CloudEvents `subject` joined `schema` and `table` by hand, so `Some("")` produced a subject
+beginning with a dot where `Event::qualified_table_name` — which every other consumer of that
+pair uses — treats an empty schema as absent. It now delegates too.
+
+### A third pass
+
+A further audit after the two above, against the 0.12.0 working set. Six defects, one new
+connector, and the last open evidence condition closed. As before, every fix carries a
+regression test **confirmed to fail with the fix reverted, by reverting it**.
+
+The pattern this time is narrower and more uncomfortable: four of the six were in code written
+to *prevent* a failure. A guard that fired on the wrong events, a guard whose documented remedy
+tripped the guard, a filter that governed row events but not the schema events beside them, and
+a marker the connectors maintain scrupulously that the transforms then invalidated. A safety
+mechanism that is wrong in the safe direction still costs an operator a stalled pipeline; one
+that is wrong in the other direction costs more than that.
+
+#### Fixed: a keyless table in the batch failed every poll, permanently
+
+`TransformPipeline::apply_batch` refuses a stage that detaches an event from its declared
+primary key — the accident that emits a record unkeyed and stops log compaction from collapsing
+a row's history. The check asked the wrong question. It captured whether **any** event in the
+batch had a resolvable key, then looked for **any** event that now lacked one. Those are two
+different events.
+
+So a batch mixing a keyed table with a keyless one — a table with no primary key, or one with
+`REPLICA IDENTITY NOTHING`, both of which this crate supports and warns about but does not
+refuse — failed on every poll, for any pipeline with a transform configured, forever. The
+per-event `had_key` vector the code computed for this was built, used only for its emptiness,
+and discarded.
+
+The guard is now evaluated per **table** — key columns are a property of the table, so "this
+table's events resolved a key before the stage and do not after it" is the right granularity —
+and recomputed per stage, so the error names the stage that actually did it rather than
+inheriting a judgement from before the first one.
+
+Both halves are pinned: `a_batch_mixing_keyed_and_keyless_tables_is_not_a_key_destruction` and
+`a_batch_stage_that_detaches_a_declared_key_still_fails`. Narrowing a guard must not disarm it.
+
+The same fix removed an allocation from the hottest path in the crate. Both the old check and
+the new one ask a yes/no question, and `primary_key_values()` answered it by cloning every key
+value into a fresh `serde_json::Map` — twice per event per stage. `Event::has_resolvable_key()`
+is the same predicate with two lookups and no allocation; `Event::declares_key()` is its
+companion. Both are public, because a sink writing its own guard needs them too.
+
+#### Fixed: the guard's documented remedy tripped the guard
+
+The error above ended with *"or clear `Event::primary_key` deliberately if the events are
+genuinely keyless"*. Following that advice produced the identical error, because "no key
+columns declared" and "key columns declared whose values are gone" were the same condition to
+the check.
+
+They are now distinguished, which is the distinction that was wanted all along: a stage that
+sets `Event::primary_key = None` has made a deliberate, visible choice and is allowed; a stage
+that leaves `primary_key` naming columns the payload no longer carries has detached the two by
+accident and is refused.
+
+#### Fixed: schema-change events bypassed the table include/exclude lists
+
+Every row event passes through `table_include_list` / `table_exclude_list`. Schema-change events
+did not, on any of the three relational connectors — they are built directly from connector
+metadata, and that path never consulted the lists.
+
+An operator who allow-listed one table therefore still received `ALTER TABLE` / `CREATE TABLE` /
+`DROP_TABLE` events for every other table the publication, binlog or `cdc.change_tables`
+carried, **including their full column lists**. An exclusion is an instruction about what may
+leave the database, so this is an operator-intent violation with a metadata-egress edge to it,
+not only noise.
+
+It was also unfixable downstream: a schema-change event is published under a synthetic
+`<table>__ddl_events` name, so no sink-side matcher on the real table name can see it. The
+filter has to be applied at the source, and now is:
+
+- **PostgreSQL** — a changed pgoutput `RELATION` message. The relation *cache* still tracks every
+  table, because the decoder needs it to attribute any row it later sees; only the event is
+  filtered.
+- **MySQL / MariaDB** — a captured DDL statement. The binlog position still advances for a
+  filtered statement, or the checkpoint would replay it forever.
+- **SQL Server** — capture-instance metadata, filtered at load. An excluded instance is not
+  polled at all now, which also stops billing a change-table query for a table nobody asked
+  for. `connect()`'s "no capture instances" error grew a branch that names the filters, because
+  with filtering at load the likeliest cause of an empty set is a pattern that matches nothing.
+
+#### Fixed: transforms invalidated `unavailable_columns`
+
+`Event::unavailable_columns` names columns the *source* could not supply — a PostgreSQL
+unchanged-TOAST value — and a sink reads it as "leave this column alone". The connectors
+maintain it carefully; the two column-manipulating transforms then rewrote the payload and left
+it stale.
+
+A `rename` moved `body` to `content` and left the marker on `body`: the renamed column now looks
+merely absent, which is exactly the overwrite the marker exists to prevent. A `set` or `copy`
+into an unavailable column produced an event that both carries a column and declares it
+unavailable — a contradiction `Event::validate` rejects, and whose dangerous reading (trust the
+payload) is the one a sink takes. A projection that dropped the column left the marker naming
+something the sink can no longer see.
+
+`FieldMappingTransform` and `FilterProjectionTransform` now keep both lists in step: a rename
+carries the marker to the new name, a removal or projection drops it, and giving the column a
+value clears it. Nested paths are untouched — `user.email` addresses a field inside a column's
+value and cannot change whether the *column* was supplied. A custom transform that adds or
+renames top-level columns owes the same bookkeeping, and the trait documentation now says so.
+
+#### Fixed: `FanOutSinkAdapter::new` panicked on caller data
+
+**Breaking.** It returns `Result<Self>` now. A child list is routinely assembled from
+configuration, and an empty one is a misconfiguration to report — not a reason to abort the
+embedder's process. The failure it catches is real: a fan-out with no children accepts every
+event, delivers none, and reports success.
+
+#### Fixed: crash-orphaned checkpoint temp files were never cleaned up
+
+Every durable checkpoint write is fsync-then-rename through a nanosecond-stamped temp file. A
+crash in that window leaves the temp file behind forever. Nothing was *incorrect* — `load`
+requires a `.json` suffix and ignored them — but the directory an operator inspects when a
+pipeline is misbehaving accumulated one dead file per crash, indefinitely.
+
+They are now discarded once, immediately after the owner lease is acquired: only a previous
+process can have orphaned one, and a `read_dir` on the commit path would put a directory scan in
+the hot loop.
+
+#### Fixed: six operator-facing error messages had collapsed line continuations
+
+Six multi-line string literals had lost their `\` continuations, so the source indentation
+became fourteen to twenty-two literal spaces in the middle of a sentence. All six are messages
+an operator reads under pressure: the PostgreSQL replication connect timeout, three checkpoint
+rewind refusals, and both incremental-snapshot control errors. Also one duplicated Markdown
+heading (`## Benchmark evidence## Benchmark evidence`) on the reliability-testing page.
+
+#### Fixed: MySQL could not refresh a short-lived credential (AWS RDS IAM)
+
+AWS RDS IAM database authentication already worked — `auth_mode = AwsIamToken` plus a
+`SecretString` callback that mints the token, with no AWS SDK dependency on this crate. On
+PostgreSQL it works indefinitely: the connection configuration, and therefore the secret, is
+resolved for every connection including each replication reconnect.
+
+On MySQL it stopped working after about fifteen minutes. `mysql_async::Opts` is immutable and
+the driver exposes no per-connection credential hook, so a pool authenticates every connection
+it ever opens with the password resolved when the pool was built. The token is only checked
+when a connection is *established*, so nothing looked wrong until the pool next opened one —
+after a server-side `wait_timeout`, a transient error, or a demand spike — at which point it
+read as an intermittent credentials problem rather than a design constraint.
+
+`MysqlConnections` replaces the bare pool and makes the trade explicit. Pooled by default,
+exactly as before; **per-connection when `auth_mode = AwsIamToken`**, opening a freshly
+authenticated connection per request with the secret re-resolved each time. `connect()` logs
+an INFO naming the mode.
+
+The switch keys on `auth_mode` rather than on whether the secret is deferred: a fixed password
+fetched from Vault is deferred and never expires, and dropping the pool for it would trade
+throughput for nothing. Giving up pooling is affordable on this path specifically — a CDC
+connector is one long-lived binlog connection, a handful of metadata queries at startup, one
+query per snapshot chunk (10 000 rows by default), and one heartbeat per interval, not a
+high-QPS request/response workload.
+
+`SecretString::is_deferred()` is new and public: the distinction between a credential fetched
+on demand and one held inline is one an embedder needs too.
+
+#### Added: an end-to-end throughput benchmark, closing the last evidence condition
+
+`cargo bench --bench throughput` drives the whole runtime — source poll, idempotency guard,
+transform pipeline, sink, ack token, commit barrier, durable checkpoint write — over a
+synthetic source, and reports events per second. No `required-features`: the point is a number
+for the default build.
+
+Database I/O is excluded deliberately. The figure is what the library costs *on top of* whatever
+the server and sink cost; a connector-inclusive number measured against a container on a laptop
+would be a property of the laptop.
+
+The result is more useful than a single number. On an Apple M-series laptop the runtime's CPU
+ceiling is ~1.33 M events/s with an in-memory checkpoint, and ~90 K events/s with
+`FileCheckpoint` at 1024 events per acknowledgement — falling to ~6.5 K at 64. A durable commit
+is two `fsync`s, so **batch size, not event rate, is the throughput knob** once the checkpoint
+is on disk: 13× between those two batch sizes, on the same runtime. The tuning lever is
+`max_buffer_size` and how often the driver calls `commit_ack`.
+
+#### Added: a Snowflake source, over `CHANGES` rather than Streams
+
+New feature `snowflake`, which adds **no dependencies**.
+
+Snowflake exposes two change-tracking mechanisms and only one of them is safe for an external
+reader. A *stream* advances its offset only when consumed inside a **DML transaction**: the
+reader must write to the source account to make progress, and that write commits *before*
+rustcdc's checkpoint is durable. A crash in between loses the changes permanently — gone from
+the stream, never in the checkpoint. That is at-most-once, silently, which is the opposite of
+what this crate guarantees. (Snowflake documents a sharper edge still: in some autocommit
+scenarios the offset advances even when the surrounding transaction rolls back.)
+
+The `CHANGES` clause has no server-side cursor at all. The caller supplies both ends of the
+interval, so the durable position lives in the checkpoint with every other connector's, the
+source is never written to, and a crash replays the window.
+
+**The transport is a trait you implement.** Snowflake speaks neither the PostgreSQL nor the
+MySQL wire protocol; reaching it needs HTTPS plus JWT, OAuth or workload identity federation —
+a dependency tree the default build does not carry, and one that could never be tested in CI,
+because there is no self-hostable Snowflake. `SnowflakeQueryExecutor` runs a statement and hands
+back text. A side effect worth naming: because the crate holds no credential type, **every**
+Snowflake authentication method works, including ones that do not exist yet — which matters
+while Snowflake is retiring single-factor passwords for service users.
+
+What the crate does own is the part that is both testable and easy to get wrong:
+
+- Statement construction and identifier quoting. Snowflake folds unquoted identifiers to upper
+  case, and the time markers are rendered from `u64` so the one interpolation point an
+  attacker-influenced value could reach cannot carry a quote.
+- Window arithmetic. The upper bound comes from the **server's** clock — a client running
+  milliseconds fast would ask for a window ending in the future and skip what lands in the gap
+  — and the offset is epoch **nanoseconds as an integer**, not a rendered timestamp, because one
+  instant has many spellings and none of them order lexicographically across a DST boundary. The
+  checkpoint's rewind guard needs a total order, and now has one for this source too.
+- Collapsing Snowflake's update representation. An update arrives as two rows, a `DELETE` and an
+  `INSERT` sharing a `METADATA$ROW_ID`, in no particular order. Passed through verbatim they
+  delete and re-insert the row — downstream a momentary absence, and on a compacted log a
+  tombstone that can outlive the re-insert.
+- A time-travel-consistent initial load. `AT(TIMESTAMP => T)` pins every keyset-paginated chunk
+  to one table version and the stream opens its first window at the same `T`, so the two phases
+  meet exactly: **no overlap window and no watermark bracket**, which every other connector here
+  needs because a chunk `SELECT` and a log position refer to different moments.
+- Retention-failure classification. A window whose start has fallen outside time travel fails
+  the query; that is data loss and terminal, and restarting from the current time would hide it.
+
+The limits are enumerated rather than glossed: `CHANGES` reports the net effect of a window, so
+intermediate row versions collapse; there is no transaction id, so `Event::transaction` is
+always `None`; there is no source order within a window (events are sorted by
+`METADATA$ROW_ID` so a re-read is byte-identical); no `TRUNCATE`; no DDL capture. And every poll
+runs queries on a warehouse that bills by the second, so the poll interval is a cost dial as
+much as a latency one.
+
+35 unit tests through a scripted transport. **What no test here establishes** is that a live
+Snowflake agrees with the statements — it has no self-hostable implementation, so unlike every
+other connector this one has no container behind it. That is stated in the module docs, on the
+documentation page, in the README status section, and in the parity matrix. `feature-policy.md`
+records the four terms on which the exception was granted, so the next connector to a
+service that cannot be run locally is judged against them rather than against this precedent.
+
 ## 0.12.0
 
 A second correctness pass over the whole tree, plus round-2 feedback from the `rustcdc-server`

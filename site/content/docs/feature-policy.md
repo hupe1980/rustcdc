@@ -28,6 +28,7 @@ Companion release-gating matrix:
 | PostgreSQL source | Supported and maintained | Implemented |
 | MySQL source | Supported and maintained | Implemented |
 | SQL Server source | Supported and maintained | Implemented |
+| Snowflake source (`CHANGES` clause) | Supported; transport supplied by the embedder, because no self-hostable server exists to test one against | Implemented, with the container-evidence exception below |
 | Snapshot + stream + handoff runtime | Core behavior, correctness-critical | Implemented |
 | Ack/commit barrier semantics | Core behavior, correctness-critical | Implemented |
 | Deterministic replay + fault-injection tests | Core reliability practice | Implemented |
@@ -44,6 +45,27 @@ A new connector family should meet all of the following:
 - clear source offset model with resume semantics
 - operational documentation (config, runbook, troubleshooting)
 - maintenance owner commitment for bugfix and version drift
+
+### The one standing exception, and its terms
+
+The Snowflake source meets every criterion except the first, and cannot meet it: Snowflake has
+no self-hostable implementation, so there is no container to test against. It was accepted on
+these terms, which are the general terms for any future connector to a service that cannot be
+run locally:
+
+1. **The untestable part is not in the crate.** The transport — HTTPS, JWT/OAuth/WIF — is a
+   trait the embedder implements. What ships is the part that *is* testable without the
+   service: statement construction, window arithmetic, row mapping, error classification.
+2. **The semantics are covered by unit tests through a scripted transport**, at the same
+   density as a connector with containers behind it.
+3. **The gap is stated wherever the connector is claimed** — in the module docs, on the
+   documentation page, in the README status section, and in the parity matrix's
+   "where the comparison still favours the alternatives" table. An unverified claim that
+   announces itself is a different thing from one that does not.
+4. **The event contract's weaker guarantees are enumerated rather than glossed** —
+   no transaction metadata, net-effect windows, no source order within a window.
+
+A connector that cannot satisfy all four does not get the exception.
 
 ## Change Classification
 

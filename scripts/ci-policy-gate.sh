@@ -510,6 +510,7 @@ run_config_docs_coverage_check() {
   check_struct_fields_documented "src/source/postgres.rs" "PostgresSourceConfig"
   check_struct_fields_documented "src/source/mysql.rs" "MysqlSourceConfig"
   check_struct_fields_documented "src/source/sqlserver.rs" "SqlServerSourceConfig"
+  check_struct_fields_documented "src/source/snowflake.rs" "SnowflakeSourceConfig"
 
   if [[ "$failed" -gt 0 ]]; then
     echo "config docs coverage check failed: $failed undocumented field(s)" >&2

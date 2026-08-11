@@ -891,6 +891,11 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             snapshot: Some(SnapshotMetadata {
                 snapshot_id: self.snapshot_id.clone(),
                 chunk_index,
+                // Never true here, and not an oversight — see `SnapshotMetadata::is_last_chunk`.
+                // An incremental snapshot can be paused, stopped, or have a table added to
+                // it while running, so "the last chunk" is a claim the next request would
+                // falsify. `incremental_snapshot_state()` is the completion signal for this
+                // path, and it distinguishes finished from paused and stopped.
                 is_last_chunk: false,
             }),
             transaction: None,
@@ -1817,6 +1822,33 @@ mod tests {
         let emitted = drain(&mut driver).await;
         assert_eq!(emitted.len(), 3, "every row must be emitted");
         assert!(emitted.iter().all(|event| event.op == Operation::Read));
+    }
+
+    #[tokio::test]
+    async fn the_incremental_driver_never_claims_a_last_chunk() {
+        // All three bulk snapshot paths set `is_last_chunk` on the final chunk, so the
+        // absence here reads like an oversight. It is not, and this pins the decision.
+        //
+        // An incremental snapshot interleaves with the live stream, can be paused, resumed
+        // and stopped, and can have a table added while it runs. Flagging the chunk that
+        // drains the currently-known set would be a claim the next `request_incremental_
+        // snapshot` falsifies — and a consumer that swapped in a staging table on it would
+        // swap early and then receive more rows. `incremental_snapshot_state()` is the
+        // completion signal for this path; it survives a restart and distinguishes
+        // finished from paused and stopped.
+        let rows = vec![json!({ "id": 1 }), json!({ "id": 2 })];
+        let (mut driver, _) = driver_with(rows, vec![], 0, 10).await;
+
+        let emitted = drain(&mut driver).await;
+        assert_eq!(emitted.len(), 2, "the snapshot ran to completion");
+        assert!(
+            emitted
+                .iter()
+                .filter_map(|event| event.snapshot.as_ref())
+                .all(|snapshot| !snapshot.is_last_chunk),
+            "changing this is a contract change, not a bug fix — see \
+             SnapshotMetadata::is_last_chunk"
+        );
     }
 
     #[tokio::test]

@@ -108,10 +108,13 @@ let boxed: BoxedSink = MemorySinkAdapter::new("mem").boxed();
 let boxed2: BoxedSink = BoxedSink::new(MemorySinkAdapter::new("mem2"));
 
 // Fan out to multiple sinks concurrently:
+// An empty child list is refused: a fan-out with no children accepts every event,
+// delivers none, and reports success.
 let fan = FanOutSinkAdapter::new(vec![
     MemorySinkAdapter::new("a").boxed(),
     MemorySinkAdapter::new("b").boxed(),
-]);
+])
+.expect("at least one child");
 // fan.send(event) drives all children concurrently; latency = max(children)
 
 // Route events by table name to heterogeneous sinks:

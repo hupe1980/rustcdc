@@ -128,6 +128,12 @@ jobs:
         run: cargo test --lib --features mysql,tls
       - name: cargo test --lib --features sqlserver,tls
         run: cargo test --lib --features sqlserver,tls
+      # `snowflake` alone, with no `tls` and no other connector: the feature adds no
+      # dependencies and must therefore build against the bare foundation. Testing it only
+      # under `--all-features` would hide a dependency it accidentally picked up from a
+      # sibling feature.
+      - name: cargo test --lib --features snowflake
+        run: cargo test --lib --features snowflake
 
   policy-gate:
     runs-on: ubuntu-latest
@@ -642,6 +648,20 @@ jobs:
 
       - name: benchmark policy gate
         run: bash scripts/ci-benchmark-gate.sh
+
+      # Warm every image the matrix instantiates, from the ECR public mirror rather than
+      # rate-limited Docker Hub.
+      #
+      # This job runs 38 container suites and had no pre-pull at all, so every image was
+      # fetched on demand from exactly the registry `ci-pull-relational-images.sh` exists to
+      # avoid — while the policy gate's `run_relational_image_drift_check` carefully kept
+      # that script's list in step with the matrices for a job that never called it. It
+      # matters more now that an image-pull failure fails the evidence gate instead of being
+      # silently counted as a pass.
+      - name: pre-pull relational images (MySQL, MariaDB)
+        run: bash scripts/ci-pull-relational-images.sh --relational-smoke
+      - name: pre-pull postgres images used by the version matrix
+        run: bash scripts/ci-pull-relational-images.sh 12-alpine 14-alpine 15-alpine 16-alpine
 
       - name: full integration matrix evidence
         run: bash scripts/run_full_integration_matrix_evidence.sh

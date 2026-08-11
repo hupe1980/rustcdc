@@ -187,13 +187,28 @@ impl MysqlStreamHandle {
 
                     self.stream.binlog_file = binlog_file;
                     self.stream.binlog_pos = binlog_pos;
-                    let offset = format_mysql_source_offset(
-                        &self.stream.binlog_file,
-                        self.stream.binlog_pos,
-                        &self.stream.gtid,
-                    );
-                    committed.push(captured.to_event(&self.source_name, offset, timestamp_ms));
-                    self.events_polled = self.events_polled.saturating_add(1);
+                    // The position advances whether or not the statement is emitted — a
+                    // filtered DDL still moved the binlog on, and a checkpoint that
+                    // pretended otherwise would replay it.
+                    //
+                    // The event itself is subject to the same include/exclude lists as
+                    // every row event. It used to bypass them, so an operator who
+                    // allow-listed `app.orders` still received `ALTER TABLE` statements —
+                    // full column lists included — for every other table on the server.
+                    if table_is_allowed(
+                        Some(captured.schema.as_str()),
+                        &captured.table,
+                        &self.table_include_list,
+                        &self.table_exclude_list,
+                    ) {
+                        let offset = format_mysql_source_offset(
+                            &self.stream.binlog_file,
+                            self.stream.binlog_pos,
+                            &self.stream.gtid,
+                        );
+                        committed.push(captured.to_event(&self.source_name, offset, timestamp_ms));
+                        self.events_polled = self.events_polled.saturating_add(1);
+                    }
                 }
                 MysqlBinlogMessage::Truncate {
                     schema,

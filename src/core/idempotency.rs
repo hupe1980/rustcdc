@@ -176,32 +176,17 @@ impl EventIdempotencyGuard {
 /// sequencing — is *not* identifiable, and [`EventIdempotencyGuard`] passes it
 /// through rather than risk dropping a distinct row.
 fn event_is_identifiable(event: &Event) -> bool {
-    if event.transaction.is_some() {
-        return true;
-    }
-    if matches!(
-        event.op,
-        crate::core::Operation::Truncate | crate::core::Operation::SchemaChange
-    ) {
-        return true;
-    }
-
-    let Some(key_columns) = event.primary_key.as_deref() else {
-        return false;
-    };
-    if key_columns.is_empty() {
-        return false;
-    }
-    let Some(row) = event
-        .after
-        .as_ref()
-        .or(event.before.as_ref())
-        .and_then(|value| value.as_object())
-    else {
-        return false;
-    };
-
-    key_columns.iter().all(|column| row.contains_key(column))
+    event.transaction.is_some()
+        || matches!(
+            event.op,
+            crate::core::Operation::Truncate | crate::core::Operation::SchemaChange
+        )
+        // Delegated rather than reimplemented. This function used to walk the key columns
+        // itself, which made it the *third* place in the crate answering "does this event
+        // have a usable key" — and a previous audit found a silent-corruption bug in
+        // exactly that shape, where two of those answers disagreed. One implementation
+        // means they cannot.
+        || event.has_resolvable_key()
 }
 
 /// Build a **transient** in-process fingerprint for the runtime idempotency guard.

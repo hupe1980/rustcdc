@@ -6,9 +6,9 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.94-blue)](https://blog.rust-lang.org/)
 [![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
-**Change data capture you embed, not deploy.** PostgreSQL, MySQL, MariaDB and SQL Server
-behind one `Source` trait, one event envelope and one checkpoint model — as an ordinary Rust
-crate that links into your binary and runs on your Tokio runtime.
+**Change data capture you embed, not deploy.** PostgreSQL, MySQL, MariaDB, SQL Server and
+Snowflake behind one `Source` trait, one event envelope and one checkpoint model — as an
+ordinary Rust crate that links into your binary and runs on your Tokio runtime.
 
 📖 **[Documentation](https://hupe1980.github.io/rustcdc/docs/)** ·
 🚀 **[Getting started](https://hupe1980.github.io/rustcdc/docs/getting-started/)** ·
@@ -39,12 +39,18 @@ server.
 
 ## Status
 
-**Pre-1.0.** Latest published release is 0.11.0; 0.12.0 is in development and is a breaking
+**Pre-1.0.** Latest published release is 0.12.0; 0.13.0 is in development and is a breaking
 release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are validated by
-1103 unit tests, 133 documentation samples compiled as doctests, 41 deterministic-replay golden
+1161 unit tests, 136 documentation samples compiled as doctests, 41 deterministic-replay golden
 fixtures, and 61 integration suites, the
 container-backed ones running against real PostgreSQL 12/14/15/16, MySQL 8.0/8.4,
 MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
+
+The Snowflake source is the one connector with **no container-backed evidence** — Snowflake
+has no self-hostable implementation. Its semantics are unit-tested through a scripted
+transport; what a live account actually does is
+[stated as a gap](https://hupe1980.github.io/rustcdc/docs/snowflake/#evidence-and-the-gap-in-it)
+rather than implied away.
 
 The public API may still change. Delivery is **at-least-once**; see
 [Delivery guarantees](#delivery-guarantees).
@@ -53,7 +59,7 @@ The public API may still change. Delivery is **at-least-once**; see
 
 ```toml
 [dependencies]
-rustcdc = { version = "0.12", features = ["postgres"] }
+rustcdc = { version = "0.13", features = ["postgres"] }
 ```
 
 The default profile is `postgres` + `tls`. WASM transforms and every non-PostgreSQL connector
@@ -272,6 +278,7 @@ as `rustcdc_runtime_health{verdict="stalled"} == 1`. See the
 | `tls` *(default)* | TLS transport surface |
 | `mysql` / `mariadb` | MySQL and MariaDB connectors (shared transport stack, distinct source identity) |
 | `sqlserver` | SQL Server connector. **Brings a second, older TLS stack** — see the note below |
+| `snowflake` | Snowflake source over the `CHANGES` clause. **No dependencies** — you supply the transport |
 | `wasm` | WASM transform sandbox via wasmtime (~15 MB release overhead; opt-in by design) |
 | `outbox` | Outbox pattern helpers and transforms |
 | `encryption` | Encryption-oriented transforms and helpers |
@@ -376,10 +383,39 @@ bash scripts/run_full_integration_matrix_evidence.sh
 bash scripts/ci-benchmark-gate.sh
 ```
 
-Benchmarks are in-process microbenchmarks with no connector I/O — a regression signal for the
-transform and codec paths, not a throughput claim. The evidence policy, including release-grade
-classification, is documented under
-[benchmark evidence](https://hupe1980.github.io/rustcdc/docs/reliability-testing/#benchmark-evidence).
+Most benchmarks are in-process microbenchmarks with no connector I/O — a regression signal for
+the transform and codec paths, not a throughput claim. One is not:
+
+```bash
+cargo bench --bench throughput
+```
+
+`throughput` drives the **whole runtime** — poll, idempotency guard, transforms, sink, ack
+token, commit barrier, durable checkpoint — over a synthetic source, and reports events per
+second. Database I/O is excluded on purpose: the number is what the library costs on top of
+whatever your server and sink cost, and a figure measured against a container on a laptop
+would be evidence of something else.
+
+On an Apple M-series laptop (Darwin, APFS on SSD, `--release`, one Tokio worker):
+
+| Checkpoint store | Batch size | Throughput |
+|---|---|---|
+| `InMemoryCheckpoint` | 1024 | **~1.33 M events/s** — the runtime's CPU ceiling |
+| `InMemoryCheckpoint` | 64 | ~1.17 M events/s |
+| `FileCheckpoint` | 1024 | **~90 K events/s** |
+| `FileCheckpoint` | 64 | ~6.5 K events/s |
+
+The interesting number is the ratio, not the absolutes. A durable commit is two `fsync`s —
+the record, then the directory holding the rename — so **batch size, not event rate, is the
+throughput knob** once the checkpoint is on disk: the same runtime moves 13× more events per
+second at 1024 events per acknowledgement than at 64. Tune `max_buffer_size` and how often
+you call `commit_ack`, not the poll loop. (`fsync` is unusually expensive on macOS; expect
+better absolute numbers on Linux and worse on network storage — re-run it on yours.)
+
+The evidence policy, including release-grade classification, is documented under
+[benchmark evidence](https://hupe1980.github.io/rustcdc/docs/reliability-testing/#benchmark-evidence);
+the throughput harness has its own
+[section](https://hupe1980.github.io/rustcdc/docs/reliability-testing/#end-to-end-runtime-throughput).
 
 The documentation site lives in [`site/`](site/) and is built with [Zola](https://www.getzola.org/):
 
@@ -403,6 +439,7 @@ zola --root site serve
 | [Troubleshooting](https://hupe1980.github.io/rustcdc/docs/troubleshooting/) | Symptom → diagnosis → resolution |
 | [Security](https://hupe1980.github.io/rustcdc/docs/security/) | Transport defaults, secret handling, known exposure |
 | [Reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/) | Replay, fault injection, conformance |
+| [Snowflake source](https://hupe1980.github.io/rustcdc/docs/snowflake/) | Reading Snowflake with `CHANGES`, and why Streams are unsafe for an external reader |
 | [Library parity matrix](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) | Scope-aware comparison against alternatives |
 
 ## MSRV

@@ -598,6 +598,21 @@ fn is_sqlserver_cdc_window_error(message: &str) -> bool {
     parser::is_sqlserver_cdc_window_error(message)
 }
 
+/// Whether a capture instance's source table is inside the configured filters.
+///
+/// Named separately from the row-event check so the two cannot drift: a capture instance
+/// the operator excluded must be invisible to *every* path — the change-table poll, the
+/// schema-change events derived from its metadata, and the capture-floor bookkeeping —
+/// not merely to the rows it produces.
+fn capture_instance_is_selected(config: &SqlServerSourceConfig, schema: &str, table: &str) -> bool {
+    crate::source::table_is_allowed(
+        Some(schema),
+        table,
+        &config.table_include_list,
+        &config.table_exclude_list,
+    )
+}
+
 async fn load_capture_metas_for_config(
     config: &SqlServerSourceConfig,
     error_prefix: &str,
@@ -644,6 +659,19 @@ async fn load_capture_metas_for_config(
             })?
             .to_string();
 
+        // Apply the include/exclude lists here rather than only to the row events.
+        //
+        // `cdc.change_tables` lists every capture instance in the database, which is not
+        // the same set the operator asked for. Reading them all meant a table the filter
+        // excluded was still polled every cycle — and, worse, still produced
+        // CREATE/ALTER/DROP_TABLE schema events carrying its full column list, because
+        // those are derived from this metadata and never saw the filter. An exclusion is
+        // an instruction about what may leave the database, so it has to bind the
+        // metadata path too.
+        if !capture_instance_is_selected(config, &schema, &table) {
+            continue;
+        }
+
         let captured_columns =
             load_captured_columns_for_instance(&mut client, capture_instance, error_prefix).await?;
         if require_non_empty_columns && captured_columns.is_empty() {
@@ -674,9 +702,20 @@ async fn load_capture_metas_for_config(
     }
 
     if require_non_empty_metas && metas.is_empty() {
-        return Err(Error::SourceError(
-            "sqlserver CDC has no capture instances; enable CDC on at least one table".into(),
-        ));
+        let filtered =
+            !config.table_include_list.is_empty() || !config.table_exclude_list.is_empty();
+        return Err(Error::SourceError(if filtered {
+            format!(
+                "sqlserver CDC has no capture instance matching the configured table \
+                 filters (include: {:?}, exclude: {:?}). Either CDC is not enabled on \
+                 those tables (sys.sp_cdc_enable_table), or the filter patterns do not \
+                 match — entries are case-insensitive globs matched against \
+                 'schema.table'.",
+                config.table_include_list, config.table_exclude_list
+            )
+        } else {
+            "sqlserver CDC has no capture instances; enable CDC on at least one table".into()
+        }));
     }
 
     Ok(metas)
@@ -1651,6 +1690,26 @@ mod tests {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_excluded_capture_instance_is_not_loaded_at_all() {
+        // Not merely filtered out of the row stream: `cdc.change_tables` lists every
+        // capture instance in the database, and the metadata drives the change-table
+        // poll *and* the CREATE/ALTER/DROP_TABLE schema events. Those events carry the
+        // table's full column list, so an excluded table that stayed in the metadata
+        // leaked its schema to the sink on every capture-instance refresh.
+        let mut cfg = config();
+        cfg.table_exclude_list = vec!["dbo.secrets".into()];
+        assert!(super::capture_instance_is_selected(&cfg, "dbo", "orders"));
+        assert!(!super::capture_instance_is_selected(&cfg, "dbo", "secrets"));
+
+        let mut allow = config();
+        allow.table_include_list = vec!["dbo.orders".into()];
+        assert!(super::capture_instance_is_selected(&allow, "dbo", "orders"));
+        assert!(!super::capture_instance_is_selected(
+            &allow, "dbo", "secrets"
+        ));
     }
 
     #[test]

@@ -27,3 +27,8 @@ REVIEW.md
 
 # Generated local benchmark summary.
 /BENCHMARK_REPORT.md
+
+# Zola build output. `.github/workflows/pages.yml` runs `zola build` with the deployment's
+# own base URL and publishes the artifact it produces, so a committed copy is never the one
+# served — it is stale build output that reads like the live site. It was, in fact, stale.
+/site/public/

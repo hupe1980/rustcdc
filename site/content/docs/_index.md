@@ -45,6 +45,7 @@ items = [
   "docs/reliability-testing.md",
   "docs/feature-policy.md",
   "docs/library-parity-matrix.md",
+  "docs/snowflake.md",
 ]
 +++
 

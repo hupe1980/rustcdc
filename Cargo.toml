@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.94"
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
@@ -57,6 +57,15 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
 # loading `.wasm` modules as event transforms. Safe to disable when WASM
 # transforms are not used to reduce the binary size significantly.
 wasm = ["dep:wasmtime", "dep:wasmparser"]
+# Enable the Snowflake source, reading changes through the `CHANGES` clause.
+#
+# Adds **no dependencies**. Snowflake speaks neither the PostgreSQL nor the MySQL wire
+# protocol, so the transport (HTTPS + key-pair JWT, or your existing driver) is a trait the
+# embedder implements — `source::snowflake::SnowflakeQueryExecutor`. What this crate supplies
+# is the part that is testable without a live account and the part that is easy to get wrong:
+# statement construction, window arithmetic, collapsing Snowflake's delete/insert update
+# pairs, and a time-travel-consistent initial load.
+snowflake = []
 # Enable outbox helpers and transforms.
 outbox = []
 # Enable encryption-oriented transforms and helpers.
@@ -161,6 +170,13 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 
 [[bench]]
 name = "quality_perf"
+harness = false
+
+[[bench]]
+# End-to-end runtime throughput. Deliberately free of `required-features`: the whole point
+# is a number for the default build, and gating it behind a connector would mean the one
+# benchmark an operator quotes is the one most builds cannot run.
+name = "throughput"
 harness = false
 
 [[bench]]

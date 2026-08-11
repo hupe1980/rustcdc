@@ -5,6 +5,8 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use mysql_async::{prelude::Queryable, Pool as MySqlPool};
+
+use connections::MysqlConnections;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn as MySqlBinlogConn};
 use mysql_common::{
     binlog::{
@@ -28,6 +30,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 mod config;
+mod connections;
 /// GTID sets, which the incremental snapshot brackets chunk reads with.
 ///
 /// A binlog file-and-position advances at the binlog *flush* stage, before the engine commit
@@ -1028,6 +1031,46 @@ pub struct MysqlConnection {
     max_events_per_poll: usize,
 }
 
+/// Record how connections will be obtained, and why.
+///
+/// `mysql_async::Opts` is immutable and the driver exposes no per-connection credential
+/// hook, so a pooled connector authenticates every connection it ever opens with the
+/// password resolved when the pool was built. That is correct for a static password and
+/// wrong for a short-lived one: an AWS RDS IAM token is valid for fifteen minutes, and the
+/// pool goes on opening connections long after that.
+///
+/// `auth_mode = AwsIamToken` is the operator declaring the credential short-lived, so it
+/// selects per-connection mode — a fresh connection with the secret re-resolved each time.
+/// A deferred secret alone does not: a fixed password fetched from Vault is deferred and
+/// never expires, and dropping the pool for it would cost throughput and buy nothing.
+fn log_connection_mode(config: &MysqlSourceConfig, connections: &MysqlConnections) {
+    let connector = config.server_flavor.source_name();
+
+    if connections.refreshes_credentials() {
+        tracing::info!(
+            target: "rustcdc::source::mysql",
+            connector,
+            mode = connections.mode_name(),
+            "auth_mode = AwsIamToken: connection pooling is disabled and every connection \
+             re-resolves the credential, because `mysql_async` fixes credentials when a pool \
+             is built and an RDS IAM token expires in 15 minutes. The cost is a handshake \
+             per connection, which is affordable at a CDC connector's request rate.",
+        );
+        return;
+    }
+
+    if config.password.is_deferred() {
+        tracing::debug!(
+            target: "rustcdc::source::mysql",
+            connector,
+            mode = connections.mode_name(),
+            "the password is resolved once, when the pool is built, and every connection the \
+             pool later opens reuses that value — correct for a long-lived secret. If it is \
+             short-lived, set auth_mode = AwsIamToken so each connection re-resolves it.",
+        );
+    }
+}
+
 impl MysqlConnection {
     /// Build a connection from configuration. Does not connect; call `connect()`.
     pub fn new(config: MysqlSourceConfig) -> Self {
@@ -1074,12 +1117,16 @@ impl MysqlConnection {
         #[cfg(feature = "tls")]
         {
             let opts = self.config.build_pool_opts()?;
-            let pool = MySqlPool::new(opts);
+            // Pool unless the operator declared the credential short-lived. See
+            // `connections::MysqlConnections`: `mysql_async::Opts` is immutable, so a pool
+            // authenticates every connection it ever opens with the password resolved here.
+            let connections = MysqlConnections::for_config(&self.config, MySqlPool::new(opts));
+            log_connection_mode(&self.config, &connections);
 
             // Verify the connection works before storing.
             tokio::time::timeout(
                 Duration::from_secs(self.config.conn_timeout_secs),
-                pool.get_conn(),
+                connections.get_conn(),
             )
             .await
             .map_err(|_| Error::SourceError("mysql connection timed out".into()))?
@@ -1090,13 +1137,13 @@ impl MysqlConnection {
                 ))
             })?;
 
-            let backend = LiveValidationBackend { pool: &pool };
+            let backend = LiveValidationBackend { pool: &connections };
             Self::validate_with_backend(&self.config, &backend).await?;
 
-            let heartbeat_task = self.start_heartbeat(pool.clone());
+            let heartbeat_task = self.start_heartbeat(connections.clone());
 
             let mut state = self.state.lock().await;
-            state.pool = Some(pool);
+            state.pool = Some(connections);
             state.heartbeat_task = Some(heartbeat_task);
             self.logger.source_connected();
             Ok(())
@@ -1138,9 +1185,10 @@ impl MysqlConnection {
             })?
         };
 
-        let mut connection = pool.get_conn().await.map_err(|error| {
-            Error::SourceError(format!("failed to acquire mysql connection: {error}"))
-        })?;
+        let mut connection = pool
+            .get_conn()
+            .await
+            .map_err(|error| error.context("failed to acquire mysql connection"))?;
 
         let setup_result =
             begin_snapshot_and_collect_table_states(&mut connection, tables, &self.config.database)
@@ -1293,7 +1341,7 @@ impl MysqlConnection {
         Ok(())
     }
 
-    fn start_heartbeat(&self, pool: MySqlPool) -> JoinHandle<()> {
+    fn start_heartbeat(&self, pool: MysqlConnections) -> JoinHandle<()> {
         let logger = self.logger.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
@@ -1664,10 +1712,11 @@ trait ValidationBackend: Send + Sync {
 /// support — notably `binlog_row_metadata` and `binlog_row_value_options`, which do
 /// not exist on MariaDB. Treating that as "not applicable" lets the same validation
 /// run against both flavors without failing MariaDB outright.
-async fn query_optional_global_var(pool: &MySqlPool, expr: &str) -> Result<Option<String>> {
-    let mut conn = pool.get_conn().await.map_err(|error| {
-        Error::SourceError(format!("failed to open connection for {expr}: {error}"))
-    })?;
+async fn query_optional_global_var(pool: &MysqlConnections, expr: &str) -> Result<Option<String>> {
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|error| error.context("failed to open connection for {expr}"))?;
     match conn
         .query_first::<Option<String>, _>(format!("SELECT {expr}"))
         .await
@@ -1682,16 +1731,17 @@ async fn query_optional_global_var(pool: &MySqlPool, expr: &str) -> Result<Optio
 }
 
 struct LiveValidationBackend<'a> {
-    pool: &'a MySqlPool,
+    pool: &'a MysqlConnections,
 }
 
 #[async_trait]
 impl ValidationBackend for LiveValidationBackend<'_> {
     async fn gtid_mode_enabled(&self) -> Result<bool> {
-        let mut conn =
-            self.pool.get_conn().await.map_err(|error| {
-                Error::SourceError(format!("failed to query GTID mode: {error}"))
-            })?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|error| error.context("failed to query GTID mode"))?;
         let mode: Option<String> = conn
             .query_first("SELECT @@GLOBAL.GTID_MODE")
             .await
@@ -1702,9 +1752,11 @@ impl ValidationBackend for LiveValidationBackend<'_> {
     }
 
     async fn binlog_format_row(&self) -> Result<bool> {
-        let mut conn = self.pool.get_conn().await.map_err(|error| {
-            Error::SourceError(format!("failed to query binlog format: {error}"))
-        })?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|error| error.context("failed to query binlog format"))?;
         let value: Option<String> = conn
             .query_first("SELECT @@GLOBAL.BINLOG_FORMAT")
             .await
@@ -1758,9 +1810,11 @@ impl ValidationBackend for LiveValidationBackend<'_> {
     }
 
     async fn master_position(&self) -> Result<(String, u64)> {
-        let mut conn = self.pool.get_conn().await.map_err(|error| {
-            Error::SourceError(format!("failed to query master status: {error}"))
-        })?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|error| error.context("failed to query master status"))?;
         let mut row: mysql_async::Row = match conn.query_first("SHOW MASTER STATUS").await {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -2004,6 +2058,16 @@ mod tests {
         let _ = config.build_pool_opts().unwrap();
 
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_deferred_secret_is_distinguishable_from_an_inline_one() {
+        // The distinction the pool-credential warning rests on. A provider-backed secret
+        // may be short-lived; an inline one cannot be.
+        use crate::core::SecretString;
+
+        assert!(!SecretString::new("static").is_deferred());
+        assert!(SecretString::from_callback("iam-token", || Ok("t".into())).is_deferred());
     }
 
     #[test]
@@ -2510,6 +2574,52 @@ mod tests {
         assert_eq!(events[0].source.timestamp, 2500);
         assert_eq!(events[0].schema.as_deref(), Some("default"));
         assert_eq!(events[0].table, "products__ddl_events");
+    }
+
+    #[tokio::test]
+    async fn a_ddl_statement_on_an_excluded_table_is_not_emitted_but_still_advances_the_position() {
+        // Two separable obligations. The statement carries the table's full column list,
+        // so an excluded table must not produce an event — this path used to bypass the
+        // include/exclude lists that every row event goes through. The binlog position
+        // moved regardless, so it must still be recorded, or the checkpoint would replay
+        // the DDL forever.
+        let mut captured = extract_captured_ddl(
+            DdlDialect::Mysql,
+            "CREATE TABLE app.secrets (id INT, ssn VARCHAR(11))",
+        )
+        .expect("expected mysql DDL extraction");
+        captured.ts = 2500;
+
+        let mut handle = MysqlStreamHandle::new(
+            "mysql".into(),
+            MysqlStream {
+                binlog_file: "mysql-bin.000001".into(),
+                binlog_pos: 4,
+                gtid: String::new(),
+                stream_state: StreamState::Streaming,
+            },
+            Box::new(MockBinlogProvider::new(vec![vec![
+                MysqlBinlogMessage::Ddl {
+                    captured,
+                    timestamp_ms: 2500,
+                    binlog_file: "mysql-bin.000010".into(),
+                    binlog_pos: 321,
+                },
+            ]])),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            Vec::new(),
+            vec!["app.secrets".into()],
+        );
+
+        let events = handle.next_events(20).await.unwrap();
+        assert!(
+            events.is_empty(),
+            "an excluded table's DDL must not reach a sink, got {:?}",
+            events.iter().map(|e| e.table.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(handle.stream.binlog_file, "mysql-bin.000010");
+        assert_eq!(handle.stream.binlog_pos, 321);
     }
 
     #[tokio::test]

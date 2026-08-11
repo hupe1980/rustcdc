@@ -307,6 +307,68 @@ impl Offset for SqlServerOffset {
     }
 }
 
+/// Concrete Snowflake checkpoint offset.
+///
+/// The position is the **exclusive lower bound of the next change window**, held as
+/// nanoseconds since the Unix epoch rather than as a rendered timestamp.
+///
+/// A string would have been the obvious choice — Snowflake's `CHANGES … AT(TIMESTAMP => …)`
+/// takes one — and it would have been wrong twice over. Rendered timestamps carry a session
+/// time zone and a format, so the same instant has many spellings and none of them order
+/// lexicographically across a DST boundary; and the checkpoint's rewind guard needs a total
+/// order to tell a legitimate resume from a connector that lost its place. An integer has
+/// exactly one spelling, orders trivially, and converts back with
+/// `TO_TIMESTAMP_LTZ(<nanos>, 9)` at the point of use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnowflakeOffset {
+    /// Upper bound of the last committed window, in nanoseconds since the Unix epoch.
+    ///
+    /// The next window opens **after** this instant: Snowflake's `END` marker is inclusive,
+    /// so re-using it as the next `AT` marker is what makes consecutive windows join
+    /// without a gap and without re-reading the boundary change.
+    pub window_end_nanos: u64,
+    /// Database the window was read from — part of the identity, so a checkpoint cannot be
+    /// carried to a different database and silently resumed there.
+    pub database: String,
+    /// Schema the window was read from.
+    pub schema: String,
+}
+
+impl SnowflakeOffset {
+    /// Construct an offset at a window boundary.
+    pub fn new(
+        window_end_nanos: u64,
+        database: impl Into<String>,
+        schema: impl Into<String>,
+    ) -> Self {
+        Self {
+            window_end_nanos,
+            database: database.into(),
+            schema: schema.into(),
+        }
+    }
+
+    /// Decode an offset from its [`Offset::encode`] representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SerializationError`](crate::core::Error::SerializationError) when
+    /// the bytes are not a Snowflake offset record.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
+impl Offset for SnowflakeOffset {
+    fn source_type(&self) -> &str {
+        "snowflake"
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
 /// Generic opaque offset for tests and runtime scaffolding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenericOffset {
@@ -597,7 +659,48 @@ impl FileCheckpointInner {
         }
 
         *lease = Some(acquired);
+        self.discard_orphaned_temp_files();
         Ok(())
+    }
+
+    /// Delete `*.tmp` files left behind by a process that died mid-write.
+    ///
+    /// Every durable write goes through a nanosecond-stamped temp file that is fsynced
+    /// and then renamed. A crash between those two steps leaves the temp file behind
+    /// forever: `load` ignores it (it requires a `.json` suffix), so nothing is
+    /// *incorrect* — the directory simply accumulates one dead file per crash, in the
+    /// one directory an operator inspects when a pipeline is misbehaving, forever.
+    ///
+    /// Run once, immediately after the owner lease is acquired, rather than per write:
+    /// only a *previous* process can have orphaned a temp file, and a `read_dir` on the
+    /// commit path would put a directory scan in the hot loop.
+    ///
+    /// Failures are logged, not propagated. Being unable to tidy up is not a reason to
+    /// refuse to checkpoint.
+    fn discard_orphaned_temp_files(&self) {
+        let Ok(entries) = fs::read_dir(&self.checkpoint_dir) else {
+            return;
+        };
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_temp = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("checkpoint_") && name.ends_with(".tmp"));
+            if is_temp && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                target: "rustcdc::checkpoint",
+                checkpoint_dir = %self.checkpoint_dir.display(),
+                removed,
+                "discarded checkpoint temp files orphaned by an earlier crash; each is a \
+                 write that never reached its rename, so none carried committed progress",
+            );
+        }
     }
 
     /// Confirm this process still owns the checkpoint directory before writing to it.
@@ -981,7 +1084,9 @@ pub fn validate_checkpoint_progress(
 
     if existing.committed_event_count > next.committed_event_count {
         return Err(crate::core::Error::CheckpointError(format!(
-            "refusing non-monotonic checkpoint write for source '{source_type}': existing              committed_event_count={} is greater than next committed_event_count={}",
+            "refusing non-monotonic checkpoint write for source '{source_type}': \
+             existing committed_event_count={} is greater than next \
+             committed_event_count={}",
             existing.committed_event_count, next.committed_event_count
         )));
     }
@@ -990,14 +1095,23 @@ pub fn validate_checkpoint_progress(
         && existing.offset != next.offset
     {
         return Err(crate::core::Error::CheckpointError(format!(
-            "refusing conflicting checkpoint write for source '{source_type}':              committed_event_count={} matches existing record but offset payload differs",
+            "refusing conflicting checkpoint write for source '{source_type}': \
+             committed_event_count={} matches the existing record but the offset \
+             payload differs",
             next.committed_event_count
         )));
     }
 
     if let Some(detail) = stream_position_regression(source_type, &existing.offset, &next.offset) {
         return Err(crate::core::Error::CheckpointError(format!(
-            "refusing checkpoint write for source '{source_type}': the stream position              moved backwards ({detail}). The committed-event count still advanced, so              this is not a replay — it means the connector handed the checkpoint a              position it cannot have reached, and writing it would make the next              restart resume before data that is already committed downstream. Either              the source was reset or repointed at a different server (clear the              checkpoint directory and re-snapshot), or this is a connector defect              worth reporting."
+            "refusing checkpoint write for source '{source_type}': the stream position \
+             moved backwards ({detail}). The committed-event count still advanced, so \
+             this is not a replay — it means the connector handed the checkpoint a \
+             position it cannot have reached, and writing it would make the next \
+             restart resume before data that is already committed downstream. Either \
+             the source was reset or repointed at a different server (clear the \
+             checkpoint directory and re-snapshot), or this is a connector defect \
+             worth reporting."
         )));
     }
 
@@ -1062,7 +1176,10 @@ impl StoredCheckpointRecord {
             Ok(value) => value,
             Err(error) if compares_stream_position(&source_type) => {
                 return Err(crate::core::Error::SerializationError(format!(
-                    "checkpoint offset for source type '{source_type}' is not JSON ({error}),                      but this crate compares that source's stream position for rewind                      detection and needs the named fields to do it. This is a defect in the                      offset's `encode`, not a configuration problem."
+                    "checkpoint offset for source type '{source_type}' is not JSON ({error}), \
+                     but this crate compares that source's stream position for rewind \
+                     detection and needs the named fields to do it. This is a defect \
+                     in the offset's `encode`, not a configuration problem."
                 )));
             }
             Err(_) => serde_json::Value::Null,
@@ -1089,7 +1206,8 @@ pub fn compares_stream_position(source_type: &str) -> bool {
 ///
 /// Kept as one list so this and the match in [`stream_position_regression`] cannot drift; a
 /// test asserts every entry is handled and that an unlisted type is left alone.
-const POSITION_COMPARED_SOURCE_TYPES: [&str; 4] = ["postgres", "mysql", "mariadb", "sqlserver"];
+const POSITION_COMPARED_SOURCE_TYPES: [&str; 5] =
+    ["postgres", "mysql", "mariadb", "sqlserver", "snowflake"];
 
 /// Describe how `next` moved *behind* `existing`, or `None` if it did not.
 ///
@@ -1185,6 +1303,25 @@ pub fn stream_position_regression(
             let before = cdc_cursor_lsn(existing)?;
             let after = cdc_cursor_lsn(next)?;
             (after < before).then(|| format!("sqlserver CDC commit LSN {before} → {after}"))
+        }
+        "snowflake" => {
+            // A window boundary in epoch nanoseconds, and unlike PostgreSQL's per-change
+            // LSN it is genuinely monotonic: it is the *end* of a closed interval, taken
+            // from `CURRENT_TIMESTAMP()` once per poll and advanced only by a commit. Any
+            // decrease means the connector lost its place, so this is compared outright
+            // rather than only against zero.
+            //
+            // A different database or schema is a different stream, not a regression —
+            // refusing that would turn "repoint at staging" into a wedged pipeline instead
+            // of the fresh start it is.
+            if existing.get("database") != next.get("database")
+                || existing.get("schema") != next.get("schema")
+            {
+                return None;
+            }
+            let before = existing.get("window_end_nanos")?.as_u64()?;
+            let after = next.get("window_end_nanos")?.as_u64()?;
+            (after < before).then(|| format!("snowflake window end {before}ns → {after}ns"))
         }
         _ => None,
     }
@@ -1521,6 +1658,38 @@ mod tests {
         let loaded = checkpoint.load().await.unwrap().unwrap();
         assert_eq!(loaded.source_type(), "postgres");
         assert_eq!(checkpoint.get_committed_count().await.unwrap(), 11);
+    }
+
+    #[tokio::test]
+    async fn a_temp_file_orphaned_by_a_crash_is_discarded_on_the_next_lease() {
+        // Every durable write is fsync-then-rename through a nanosecond-stamped temp
+        // file. A crash in that window leaves the temp behind forever — `load` ignores
+        // it, so nothing is wrong, and the directory an operator inspects under pressure
+        // grows one dead file per crash indefinitely.
+        let dir = tempdir().unwrap();
+        let orphan = dir.path().join("checkpoint_postgres.123456789.tmp");
+        std::fs::write(&orphan, b"{\"partial\":").unwrap();
+        let real = dir.path().join("keep_me.json");
+        std::fs::write(&real, b"{}").unwrap();
+
+        let mut checkpoint = FileCheckpoint::new(dir.path());
+        checkpoint
+            .save(
+                &PostgresOffset {
+                    lsn: 5,
+                    slot_name: "slot".into(),
+                    incremental_snapshot: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert!(!orphan.exists(), "the orphaned temp file must be removed");
+        assert!(
+            real.exists(),
+            "only `checkpoint_*.tmp` is temp state; nothing else may be deleted"
+        );
     }
 
     /// A MariaDB offset must checkpoint under `mariadb`, not `mysql`.

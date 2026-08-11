@@ -23,7 +23,10 @@ pub(crate) fn glob_segment_matches(pattern: &str, subject: &str) -> bool {
         return true;
     }
     if !pattern.contains(['*', '?']) {
-        return pattern == subject;
+        // ASCII case-insensitive, matching the wildcard path below. A literal fast path
+        // that compared case-sensitively while the wildcard path did not would make
+        // `public.orders` and `public.*` disagree about the same table.
+        return pattern.eq_ignore_ascii_case(subject);
     }
     glob_match(pattern.as_bytes(), subject.as_bytes())
 }
@@ -60,7 +63,17 @@ fn glob_match(pattern: &[u8], subject: &[u8]) -> bool {
                     s += 1;
                     continue;
                 }
-                byte if s < subject.len() && byte == subject[s] => {
+                // ASCII case-insensitive, and compared in place rather than by lowering
+                // both sides into fresh `String`s first.
+                //
+                // Case-insensitivity is not a nicety here: every supported server folds
+                // identifiers, and they do not agree on which way. PostgreSQL folds
+                // unquoted names to lower, Snowflake to upper, MySQL's case-sensitivity
+                // depends on the host filesystem. A pattern that matched the connector's
+                // include list and not the sink router's — which is exactly what happened
+                // while only the former lowered its inputs — routes an event nowhere, and
+                // `drop_unrouted` is on by default.
+                byte if s < subject.len() && byte.eq_ignore_ascii_case(&subject[s]) => {
                     p += 1;
                     s += 1;
                     continue;
@@ -85,6 +98,12 @@ fn glob_match(pattern: &[u8], subject: &[u8]) -> bool {
 
 /// Match `pattern` against `table_key`, where `table_key` is `"schema.table"` or a bare
 /// `"table"`.
+///
+/// Matching is **ASCII case-insensitive**, which is the rule every supported server's
+/// identifier folding is defined in terms of. It lives here rather than at the call sites
+/// deliberately: while only `table_is_allowed` lowered its inputs, the sink router called
+/// this same function on unlowered ones, and the two disagreed about a pattern the
+/// documentation promised was equivalent — routing a folded identifier nowhere.
 ///
 /// | Pattern          | Matches                                                        |
 /// |------------------|----------------------------------------------------------------|

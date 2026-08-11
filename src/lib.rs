@@ -72,6 +72,12 @@ mod markdown_doctests {
 
     #[doc = include_str!("../site/content/docs/wasm-transform-sdk.md")]
     mod wasm_transform_sdk {}
+
+    // Gated, because the page's samples name types the feature brings in. Under
+    // `--all-features` — which is what CI runs — it compiles like every other page.
+    #[cfg(feature = "snowflake")]
+    #[doc = include_str!("../site/content/docs/snowflake.md")]
+    mod snowflake_docs {}
 }
 
 pub mod checkpoint;
@@ -124,6 +130,11 @@ pub use crate::ddl_capture::{
     extract_qualified_name_with_default, normalize_identifier, CapturedDdl, DdlDialect,
     DdlExtractor, DdlOperation, MysqlDdlExtractor, ParsedDdlStatement, PostgresDdlExtractor,
     SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor,
+};
+#[cfg(feature = "snowflake")]
+pub use crate::source::snowflake::{
+    SnowflakeQueryExecutor, SnowflakeResultSet, SnowflakeSnapshotHandle, SnowflakeSource,
+    SnowflakeSourceConfig, SnowflakeStreamHandle,
 };
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
 pub use crate::source::IncrementalSnapshotConfig;

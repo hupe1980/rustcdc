@@ -331,6 +331,8 @@ impl MysqlSourceConfig {
 
         let opts = self.build_pool_opts()?;
         let pool = Pool::new(opts);
+        // A local pool, built and discarded per call, so its credential is always fresh —
+        // this path is unaffected by the pool-credential constraint in `connections.rs`.
         let mut conn = pool.get_conn().await.map_err(|e| {
             Error::SourceError(format!("check_is_primary: mysql connection failed: {e}"))
         })?;

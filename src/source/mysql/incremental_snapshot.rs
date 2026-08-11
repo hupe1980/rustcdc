@@ -8,7 +8,9 @@
 //! state inside the checkpoint record.
 
 use async_trait::async_trait;
-use mysql_async::{prelude::Queryable, Pool as MySqlPool};
+use mysql_async::prelude::Queryable;
+
+use super::connections::MysqlConnections;
 
 use crate::{
     core::{Error, Event, Offset, Result},
@@ -32,7 +34,7 @@ pub type MysqlIncrementalSnapshotHandle = IncrementalSnapshotDriver<MysqlSnapsho
 /// Build the MySQL incremental-snapshot handle.
 pub(super) async fn start(
     inner: Box<dyn StreamHandle>,
-    pool: MySqlPool,
+    pool: MysqlConnections,
     config: IncrementalSnapshotConfig,
     source_name: String,
     default_database: String,
@@ -128,7 +130,7 @@ fn default_bracket(
 
 /// MySQL/MariaDB half of the incremental snapshot.
 pub struct MysqlSnapshotBackend {
-    pool: MySqlPool,
+    pool: MysqlConnections,
     /// Schema applied to an unqualified table reference.
     default_database: String,
 }
@@ -155,9 +157,7 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
         let schema = schema_opt.unwrap_or_else(|| self.default_database.clone());
 
         let mut conn = self.pool.get_conn().await.map_err(|error| {
-            Error::SourceError(format!(
-                "incremental snapshot: failed to acquire mysql connection: {error}"
-            ))
+            error.context("incremental snapshot: failed to acquire mysql connection")
         })?;
         let pk_columns: Vec<String> = conn
             .exec(
@@ -226,11 +226,11 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
     /// available on a scale a binlog event shares — returning InnoDB ids would have looked
     /// plausible and matched nothing. The GTID set closes the same gap without needing one.
     async fn current_position(&mut self) -> Result<BinlogPos> {
-        let mut conn = self.pool.get_conn().await.map_err(|error| {
-            Error::SourceError(format!(
-                "incremental snapshot: failed to get mysql conn: {error}"
-            ))
-        })?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|error| error.context("incremental snapshot: failed to get mysql conn"))?;
         // `SHOW MASTER STATUS` was removed in MySQL 8.4 in favour of
         // `SHOW BINARY LOG STATUS`. Try the historical spelling first — it is what
         // every supported MariaDB and MySQL 8.0 understands — and fall back on error
@@ -537,11 +537,11 @@ mod gtid_bracket_tests {
     fn backend() -> MysqlSnapshotBackend {
         // `event_in_bracket` is pure over its arguments; the pool is never touched.
         MysqlSnapshotBackend {
-            pool: mysql_async::Pool::new(
+            pool: super::super::connections::MysqlConnections::pooled(mysql_async::Pool::new(
                 mysql_async::OptsBuilder::default()
                     .ip_or_hostname("127.0.0.1")
                     .tcp_port(1),
-            ),
+            )),
             default_database: "app".to_string(),
         }
     }

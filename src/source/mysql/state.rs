@@ -1,4 +1,4 @@
-use mysql_async::Pool as MySqlPool;
+use super::connections::MysqlConnections;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
@@ -6,7 +6,7 @@ use crate::ddl_capture::CapturedDdl;
 
 #[derive(Default)]
 pub(super) struct ConnectionState {
-    pub(super) pool: Option<MySqlPool>,
+    pub(super) pool: Option<MysqlConnections>,
     pub(super) heartbeat_task: Option<JoinHandle<()>>,
 }
 

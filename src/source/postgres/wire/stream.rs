@@ -188,7 +188,12 @@ impl ReplicationStream {
             .await
             .map_err(|_| {
                 Error::SourceError(format!(
-                    "timed out after {connect_timeout:?} establishing a replication stream to                      {endpoint}. The connection was not refused, so the server accepted it and                      then stopped responding — check for a firewall dropping the session                      mid-handshake, a saturated server, or a proxy pointed at a dead backend.                      Raise PostgresSourceConfig::conn_timeout_secs if the server is merely slow."
+                    "timed out after {connect_timeout:?} establishing a replication stream \
+                     to {endpoint}. The connection was not refused, so the server accepted \
+                     it and then stopped responding — check for a firewall dropping the \
+                     session mid-handshake, a saturated server, or a proxy pointed at a \
+                     dead backend. Raise PostgresSourceConfig::conn_timeout_secs if the \
+                     server is merely slow."
                 ))
             })?
     }

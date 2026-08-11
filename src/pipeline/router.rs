@@ -22,6 +22,13 @@ pub fn table_matches(pattern: &str, table_key: &str) -> bool {
     crate::core::glob::table_matches(pattern, table_key)
 }
 
+// Matching is ASCII case-insensitive, and that lives in the matcher rather than at either
+// call site. It used to live only in the connector filter, which meant this function — the
+// one the sink router uses — answered case-sensitively. A server that folds identifiers
+// (PostgreSQL to lower, Snowflake to upper, MySQL depending on the host filesystem) could
+// pass a table through the include list and then match no route, with `drop_unrouted` on by
+// default. See `the_router_and_the_connector_filter_agree_on_case`.
+
 /// A type alias for a [`TableRouter`] that accepts heterogeneous sink types.
 ///
 /// Every concrete sink is wrapped in a [`BoxedSink`] before being added via the
@@ -777,5 +784,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(router.routes()[0].sink.events().len(), 2);
+    }
+
+    /// The connector filter and the sink router must agree about the same pattern.
+    ///
+    /// The documentation says they share one semantics. They shared the *matcher* but not
+    /// the case handling: `table_is_allowed` lowered both sides before calling it and the
+    /// router did not. So a table whose server folds its identifiers — PostgreSQL to lower,
+    /// Snowflake to upper, MySQL depending on the host filesystem — could pass the include
+    /// list and then match no route, and `drop_unrouted` is on by default. Silently.
+    #[test]
+    fn the_router_and_the_connector_filter_agree_on_case() {
+        use crate::source::table_is_allowed;
+
+        let pattern = "public.orders";
+        let include = vec![pattern.to_string()];
+
+        for (schema, table) in [
+            ("public", "orders"),
+            ("PUBLIC", "ORDERS"),
+            ("Public", "Orders"),
+        ] {
+            let key = format!("{schema}.{table}");
+            assert_eq!(
+                table_is_allowed(Some(schema), table, &include, &[]),
+                super::table_matches(pattern, &key),
+                "the include list and the router disagree about {key:?}, which routes the \
+                 event nowhere while reporting nothing"
+            );
+            assert!(super::table_matches(pattern, &key), "{key} must route");
+        }
+    }
+
+    /// Wildcards and literals must fold identically, or `public.*` and `public.orders`
+    /// disagree about the same table.
+    #[test]
+    fn the_literal_and_wildcard_paths_fold_the_same_way() {
+        for pattern in ["public.orders", "public.*", "*.orders", "public.ord*"] {
+            assert!(
+                super::table_matches(pattern, "PUBLIC.ORDERS"),
+                "{pattern} must match an upper-cased key"
+            );
+        }
     }
 }

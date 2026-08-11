@@ -74,13 +74,14 @@ where
 ///
 /// ## Example
 ///
-/// ```rust,no_run
+/// ```rust
 /// use rustcdc::sink::{BoxedSink, FanOutSinkAdapter, MemorySinkAdapter};
 ///
 /// let fan = FanOutSinkAdapter::new(vec![
 ///     BoxedSink::new(MemorySinkAdapter::new("a")),
 ///     BoxedSink::new(MemorySinkAdapter::new("b")),
-/// ]);
+/// ])?;
+/// # Ok::<(), rustcdc::Error>(())
 /// ```
 pub struct FanOutSinkAdapter {
     sinks: Vec<BoxedSink>,
@@ -98,26 +99,35 @@ impl std::fmt::Debug for FanOutSinkAdapter {
 impl FanOutSinkAdapter {
     /// Create a fan-out adapter wrapping `sinks`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when `sinks` is empty.  A fan-out with zero children is always
-    /// a logic error.
-    pub fn new(sinks: Vec<BoxedSink>) -> Self {
-        assert!(
-            !sinks.is_empty(),
-            "FanOutSinkAdapter requires at least one child sink"
-        );
-        Self { sinks }
+    /// Returns [`Error::ConfigError`] when `sinks` is empty. A fan-out with no children
+    /// silently discards every event while reporting success on `send` and `flush` — the
+    /// shape of a pipeline that looks healthy and delivers nothing.
+    ///
+    /// This used to `assert!`, which is not an acceptable failure mode for a library: the
+    /// child list is frequently assembled from configuration, and an empty one is a
+    /// misconfiguration to report, not a reason to abort the embedder's process.
+    pub fn new(sinks: Vec<BoxedSink>) -> Result<Self> {
+        if sinks.is_empty() {
+            return Err(crate::core::Error::ConfigError(
+                "FanOutSinkAdapter requires at least one child sink; a fan-out with none \
+                 would accept and discard every event while reporting success"
+                    .into(),
+            ));
+        }
+        Ok(Self { sinks })
     }
 
-    /// Number of child sinks.
+    /// Number of child sinks. Always at least one — see [`FanOutSinkAdapter::new`].
     pub fn len(&self) -> usize {
         self.sinks.len()
     }
 
-    /// Returns `true` when the fan-out has no children.
+    /// Always `false`: construction rejects an empty child list.
     ///
-    /// In practice this is always `false` — construction panics on empty input.
+    /// Present because `len` without `is_empty` is a lint, and because a caller holding
+    /// the adapter behind a trait object should not have to know the invariant.
     pub fn is_empty(&self) -> bool {
         self.sinks.is_empty()
     }
@@ -319,7 +329,10 @@ mod tests {
             .iter()
             .map(|name| BoxedSink::new(MemorySinkAdapter::new(name.as_str())))
             .collect();
-        (FanOutSinkAdapter::new(sinks), names)
+        (
+            FanOutSinkAdapter::new(sinks).expect("the fixture always supplies children"),
+            names,
+        )
     }
 
     #[tokio::test]
@@ -401,9 +414,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "at least one child sink")]
-    fn panics_on_empty_sinks() {
-        FanOutSinkAdapter::new(vec![]);
+    fn an_empty_child_list_is_a_configuration_error_not_a_panic() {
+        // A fan-out with no children accepts every event and delivers none, while
+        // reporting success. That is a misconfiguration to report to the embedder, not a
+        // reason to abort its process.
+        let error = FanOutSinkAdapter::new(vec![]).expect_err("an empty fan-out is refused");
+        assert_eq!(error.kind(), crate::core::ErrorKind::Configuration);
     }
 
     #[test]

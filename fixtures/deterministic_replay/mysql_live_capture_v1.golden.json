@@ -18,7 +18,8 @@
     "primary_key": null,
     "snapshot": null,
     "transaction": null,
-    "envelope_version": 1
+    "envelope_version": 1,
+    "before_is_key_only": false
   },
   {
     "before": null,
@@ -44,7 +45,8 @@
       "total_events": 2,
       "event_index": 0
     },
-    "envelope_version": 1
+    "envelope_version": 1,
+    "before_is_key_only": false
   },
   {
     "before": {
@@ -73,7 +75,8 @@
       "total_events": 2,
       "event_index": 1
     },
-    "envelope_version": 1
+    "envelope_version": 1,
+    "before_is_key_only": false
   },
   {
     "before": null,
@@ -94,6 +97,7 @@
     "primary_key": null,
     "snapshot": null,
     "transaction": null,
-    "envelope_version": 1
+    "envelope_version": 1,
+    "before_is_key_only": false
   }
 ]

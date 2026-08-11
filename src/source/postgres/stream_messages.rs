@@ -549,7 +549,22 @@ impl PostgresStreamHandle {
 
                     self.relation_map.insert(rel.oid, rel.clone());
 
-                    if changed {
+                    // The cache above is updated for *every* relation, filtered or not:
+                    // the decoder needs it to attribute any row it later sees. The
+                    // schema-change **event** is a different matter — it carries the
+                    // table's full column list to the sink, so an excluded table must not
+                    // produce one. This path used to bypass the include/exclude lists
+                    // entirely, which meant an operator who allow-listed one table still
+                    // received the schema of every other table in the publication.
+                    let emit_schema_event = changed
+                        && table_is_allowed(
+                            Some(rel.namespace.as_str()),
+                            &rel.name,
+                            &self.table_include_list,
+                            &self.table_exclude_list,
+                        );
+
+                    if emit_schema_event {
                         let mut schema_event =
                             self.build_relation_schema_change_event(&rel, item.lsn);
                         if self.current_xid.is_some() {

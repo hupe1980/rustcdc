@@ -52,6 +52,32 @@ fn assert_matches_golden_with_expected_error(
 
     let golden_path = fixture_root().join(golden_name);
 
+    // A replayed event must satisfy the envelope contract, not merely match a recorded golden.
+    // Matching alone would let a fixture pin a *malformed* envelope in place: record the golden
+    // once, and the suite then defends the malformation forever. The partial-payload rules are
+    // the ones that matter here — a column may not be both listed as unavailable and present in
+    // the payload, and a key-only before-image may not also carry unavailable columns.
+    //
+    // Checked **before** the `UPDATE_GOLDENS` branch, deliberately. It used to run only on the
+    // comparison path, so re-blessing wrote the golden and returned without validating anything
+    // — a run that reported `ok` having checked nothing, and the one moment a contributor is
+    // most likely to be wrong about what the events should look like. CI caught it on the next
+    // run, so this was never a hole in the suite; it was a hole in the feedback.
+    for (index, event) in actual_events.iter().enumerate() {
+        if let Err(errors) = event.validate() {
+            panic!(
+                "replayed event #{index} of {fixture_name} violates the envelope contract: \
+                 {errors}\n  event: {event:?}"
+            );
+        }
+    }
+
+    // Regenerating goldens: `UPDATE_GOLDENS=1 cargo test --test deterministic_replay_golden_fixtures`.
+    //
+    // Legitimate when the fixture changed or the envelope changed on purpose. It is **not** the
+    // way to make a failing test pass: a golden is the recorded answer, so re-blessing a
+    // regression records the regression and the suite then defends it. Read the diff of the
+    // golden files before committing — that diff is the entire review surface for this suite.
     if std::env::var("UPDATE_GOLDENS").is_ok() {
         let json = serde_json::to_string_pretty(&actual_events)
             .expect("failed to serialize golden events");
@@ -64,7 +90,13 @@ fn assert_matches_golden_with_expected_error(
         return;
     }
 
-    let golden_events = load_golden(golden_path);
+    let golden_raw = fs::read_to_string(&golden_path).unwrap_or_else(|error| {
+        panic!(
+            "failed reading golden file '{}': {error}",
+            golden_path.display()
+        )
+    });
+    let golden_events = load_golden(golden_path.clone());
 
     assert_eq!(
         actual_events.len(),
@@ -73,19 +105,7 @@ fn assert_matches_golden_with_expected_error(
         fixture_name
     );
 
-    // A replayed event must satisfy the envelope contract, not merely match a recorded golden.
-    // Matching alone would let a fixture pin a *malformed* envelope in place: record the golden
-    // once, and the suite then defends the malformation forever. The partial-payload rules are
-    // the ones that matter here — a column may not be both listed as unavailable and present in
-    // the payload, and a key-only before-image may not also carry unavailable columns.
-    for (index, event) in actual_events.iter().enumerate() {
-        if let Err(errors) = event.validate() {
-            panic!(
-                "replayed event #{index} of {fixture_name} violates the envelope contract: \
-                 {errors}\n  event: {event:?}"
-            );
-        }
-    }
+    assert_golden_records_every_field(fixture_name, &golden_path, &golden_raw, &actual_events);
 
     for (index, (actual, expected)) in actual_events.iter().zip(golden_events.iter()).enumerate() {
         let diffs = semantic_diff(expected, actual);
@@ -105,6 +125,64 @@ fn assert_matches_golden_with_expected_error(
             actual, expected,
             "exact event mismatch for {} event #{}",
             fixture_name, index
+        );
+    }
+}
+
+/// Fail when a golden file omits a field the current envelope serializes.
+///
+/// # The hole this closes
+///
+/// `Event` fields carry `#[serde(default)]`, so a golden recorded before a field existed
+/// still deserializes — the missing field silently becomes `false`, `None` or empty. The
+/// comparison then passes whenever the default happens to be the right answer, which means
+/// the suite is not pinning that field at all: it is agreeing with itself.
+///
+/// This was live. Forty of the forty-one goldens predated `before_is_key_only` and did not
+/// record it; each loaded as `false`, which was correct for those fixtures, so nothing
+/// failed. Nothing would have failed either if a future field's default were *wrong* for
+/// them — the recorded answer would simply have been silently incomplete, which is the
+/// property a golden exists to not have.
+///
+/// Fields with `skip_serializing_if` are legitimately absent when empty, so the comparison
+/// is against what *this* event actually serializes rather than against a fixed field list.
+fn assert_golden_records_every_field(
+    fixture_name: &str,
+    golden_path: &std::path::Path,
+    golden_raw: &str,
+    actual_events: &[Event],
+) {
+    let recorded: Vec<serde_json::Value> =
+        serde_json::from_str(golden_raw).unwrap_or_else(|error| {
+            panic!(
+                "golden '{}' is not a JSON array: {error}",
+                golden_path.display()
+            )
+        });
+
+    for (index, (actual, recorded)) in actual_events.iter().zip(recorded.iter()).enumerate() {
+        let expected_value =
+            serde_json::to_value(actual).expect("an Event always serializes to JSON");
+        let (Some(expected_object), Some(recorded_object)) =
+            (expected_value.as_object(), recorded.as_object())
+        else {
+            panic!(
+                "golden '{}' event #{index} is not an object",
+                golden_path.display()
+            );
+        };
+
+        let missing: Vec<&String> = expected_object
+            .keys()
+            .filter(|key| !recorded_object.contains_key(*key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "golden for {fixture_name} is stale: event #{index} does not record {missing:?}, \
+             which the current envelope serializes. Those fields are `#[serde(default)]`, so \
+             they load as defaults and the comparison silently stops pinning them. \
+             Regenerate with `UPDATE_GOLDENS=1 cargo test --test \
+             deterministic_replay_golden_fixtures` and review the diff."
         );
     }
 }

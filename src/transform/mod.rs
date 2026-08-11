@@ -222,6 +222,24 @@ pub trait AsyncTransform: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// The error text for a stage that detached an event from its declared key.
+///
+/// One function rather than two copies: the batch path and the per-event path raise the
+/// identical condition, and the remedy has to stay true in both places.
+fn key_destroyed_message(stage: &str, event: &Event) -> String {
+    format!(
+        "{stage}: transform removed the event's primary-key values for table '{}'. The \
+         event had a resolvable key before this transform and does not after it, so it \
+         would be emitted unkeyed — breaking log compaction and upsert consumers \
+         downstream. Primary key columns are {:?}. Check whether this transform projects \
+         away, renames, or rewrites a key column; exclude the key columns from it, or set \
+         `Event::primary_key = None` in the transform if the events are genuinely keyless \
+         — declaring keylessness is allowed, silently losing a declared key is not.",
+        event.qualified_table_name(),
+        event.primary_key.as_deref().unwrap_or(&[]),
+    )
+}
+
 /// One stage of a [`TransformPipeline`], sync or async.
 enum Stage {
     Sync(Box<dyn Transform>),
@@ -334,21 +352,26 @@ impl TransformPipeline {
             return Ok(());
         }
 
-        // Which events arrived with a resolvable message key. Captured before any stage
-        // runs, because the guard below asks whether a stage *destroyed* one — an event
-        // that never had a key is not a regression.
-        let had_key: Vec<bool> = events
-            .iter()
-            .map(|event| event.op.is_data_change() && event.primary_key_values().is_some())
-            .collect();
-        let keyed_tables: Vec<String> = events
-            .iter()
-            .zip(&had_key)
-            .filter(|(_, keyed)| **keyed)
-            .map(|(event, _)| event.qualified_table_name())
-            .collect();
-
         for stage in &self.transforms {
+            // Which *tables* arrived at this stage with a resolvable message key.
+            //
+            // Recomputed per stage, and keyed by table rather than by position, because
+            // neither alternative works. A `Vec<bool>` captured once before the first
+            // stage cannot survive `apply_batch`, which is allowed to drop events, so the
+            // indices stop lining up; and a batch-wide "did anything have a key" flag —
+            // which is what this used to be — fires on an event that **never** had one.
+            // A batch mixing a keyed table with a keyless one (no primary key, or
+            // `REPLICA IDENTITY NOTHING`) then failed on every poll, permanently, for any
+            // pipeline with a transform configured.
+            //
+            // Key columns are a property of the table, so "this table's events resolve a
+            // key" is the right granularity and needs no per-event identity.
+            let keyed_tables: std::collections::HashSet<String> = events
+                .iter()
+                .filter(|event| event.op.is_data_change() && event.has_resolvable_key())
+                .map(Event::qualified_table_name)
+                .collect();
+
             match stage {
                 Stage::Sync(transform) => transform.apply_batch(events),
                 Stage::Async(transform) => transform.apply_batch(events).await,
@@ -357,25 +380,19 @@ impl TransformPipeline {
 
             // Key destruction is checked per stage, so the error names the stage that did
             // it rather than the last one to run.
-            if !keyed_tables.is_empty() {
-                if let Some(event) = events
-                    .iter()
-                    .find(|event| event.op.is_data_change() && event.primary_key_values().is_none())
-                {
-                    return Err(Error::TransformError(format!(
-                        "{}: transform removed the event's primary-key values for table \
-                         '{}'. The event had a resolvable key before this transform and does \
-                         not after it, so it would be emitted unkeyed — breaking log \
-                         compaction and upsert consumers downstream. Primary key columns \
-                         are {:?}. Check whether this transform projects away, renames, or \
-                         rewrites a key column; exclude the key columns from it, or clear \
-                         `Event::primary_key` deliberately if the events are genuinely \
-                         keyless.",
-                        stage.name(),
-                        event.qualified_table_name(),
-                        event.primary_key.as_deref().unwrap_or(&[]),
-                    )));
-                }
+            if keyed_tables.is_empty() {
+                continue;
+            }
+            if let Some(event) = events.iter().find(|event| {
+                event.op.is_data_change()
+                    && event.declares_key()
+                    && !event.has_resolvable_key()
+                    && keyed_tables.contains(&event.qualified_table_name())
+            }) {
+                return Err(Error::TransformError(key_destroyed_message(
+                    stage.name(),
+                    event,
+                )));
             }
         }
 
@@ -397,7 +414,7 @@ impl TransformPipeline {
         // Whether the event had a resolvable message key before any transform ran.
         // Only meaningful for data-change events; READ/SCHEMA_CHANGE/TRUNCATE carry no
         // row identity to preserve.
-        let key_before = event.op.is_data_change() && event.primary_key_values().is_some();
+        let key_before = event.op.is_data_change() && event.has_resolvable_key();
 
         for transform in &self.transforms {
             // Wrap with context rather than re-wrapping as `TransformError`.
@@ -435,19 +452,16 @@ impl TransformPipeline {
             //   * `FieldMappingTransform` renaming a PK column,
             //   * `MaskRule::Encrypt` on a PK column — a fresh nonce per call gives
             //     every event for the same row a different key.
-            if key_before && event.primary_key_values().is_none() {
-                return Err(Error::TransformError(format!(
-                    "{}: transform removed the event's primary-key values for table '{}'. \
-                     The event had a resolvable key before this transform and does not \
-                     after it, so it would be emitted unkeyed — breaking log compaction \
-                     and upsert consumers downstream. Primary key columns are {:?}. \
-                     Check whether this transform projects away, renames, or rewrites a \
-                     key column; exclude the key columns from it, or clear \
-                     `Event::primary_key` deliberately if the events are genuinely \
-                     keyless.",
+            //
+            // Clearing `Event::primary_key` is the documented escape hatch and must
+            // therefore *not* trip this: a stage that declares the events keyless has
+            // made a deliberate, visible choice, whereas one that leaves `primary_key`
+            // naming columns the payload no longer carries has detached the two by
+            // accident. `declares_key` is what separates the two.
+            if key_before && event.declares_key() && !event.has_resolvable_key() {
+                return Err(Error::TransformError(key_destroyed_message(
                     transform.name(),
-                    event.qualified_table_name(),
-                    event.primary_key.as_deref().unwrap_or(&[]),
+                    &event,
                 )));
             }
         }
@@ -576,5 +590,107 @@ mod tests {
         let pipeline = TransformPipeline::default();
         let output = pipeline.apply(event()).await.unwrap().unwrap();
         assert_eq!(output.table, "items");
+    }
+
+    /// A stage that drops the key column, which is the accident the guard exists for.
+    #[derive(Debug)]
+    struct DropKeyColumn;
+
+    impl Transform for DropKeyColumn {
+        fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
+            if let Some(serde_json::Value::Object(after)) = &mut event.after {
+                after.remove("id");
+            }
+            Ok(true)
+        }
+
+        fn name(&self) -> &str {
+            "drop_key_column"
+        }
+    }
+
+    /// A stage that declares the events keyless, which is the documented escape hatch.
+    #[derive(Debug)]
+    struct DeclareKeyless;
+
+    impl Transform for DeclareKeyless {
+        fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
+            event.primary_key = None;
+            Ok(true)
+        }
+
+        fn name(&self) -> &str {
+            "declare_keyless"
+        }
+    }
+
+    fn keyless_event() -> Event {
+        Event {
+            after: Some(json!({"payload": "x"})),
+            table: "audit_log".into(),
+            primary_key: None,
+            ..event()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_mixing_keyed_and_keyless_tables_is_not_a_key_destruction() {
+        // The guard used to ask "did *any* event in the batch have a key, and does *any*
+        // event now lack one" — two different events. A keyless table (no primary key, or
+        // REPLICA IDENTITY NOTHING) travelling in the same batch as a keyed one therefore
+        // failed every poll, permanently, for any pipeline with a transform configured.
+        let mut pipeline = TransformPipeline::default();
+        pipeline.add_transform(Box::new(AppendSuffix));
+
+        let mut batch = vec![event(), keyless_event()];
+        pipeline
+            .apply_batch(&mut batch)
+            .await
+            .expect("a table that never had a key is not a regression");
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_batch_stage_that_detaches_a_declared_key_still_fails() {
+        // The other half of the same fix: narrowing the guard must not disarm it.
+        let mut pipeline = TransformPipeline::default();
+        pipeline.add_transform(Box::new(DropKeyColumn));
+
+        let mut batch = vec![event(), keyless_event()];
+        let error = pipeline
+            .apply_batch(&mut batch)
+            .await
+            .expect_err("dropping a declared key column must fail");
+        assert!(
+            error.to_string().contains("drop_key_column"),
+            "the stage that did it must be named; got: {error}"
+        );
+        assert!(
+            error.to_string().contains("items"),
+            "the affected table must be named; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn declaring_the_events_keyless_is_allowed_in_both_paths() {
+        // The error message tells the operator to clear `Event::primary_key` when the
+        // events are genuinely keyless. That remedy used to trip the very guard that
+        // recommended it, because "no key columns" and "key columns whose values are
+        // gone" were the same condition.
+        let mut pipeline = TransformPipeline::default();
+        pipeline.add_transform(Box::new(DeclareKeyless));
+
+        let single = pipeline
+            .apply(event())
+            .await
+            .expect("clearing the key deliberately is allowed")
+            .expect("the event is kept");
+        assert!(single.primary_key.is_none());
+
+        let mut batch = vec![event()];
+        pipeline
+            .apply_batch(&mut batch)
+            .await
+            .expect("the batch path must agree with the per-event path");
     }
 }

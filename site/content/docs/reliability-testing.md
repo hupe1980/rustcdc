@@ -71,6 +71,38 @@ Deterministic replay verifies that canonical event interpretation stays stable a
 3. Compare against golden output using semantic diff.
 4. Fail CI on high-severity semantic drift.
 
+### Producing and regenerating goldens
+
+A golden is the recorded answer for a fixture, generated from the replay engine itself:
+
+```bash
+UPDATE_GOLDENS=1 cargo test --test deterministic_replay_golden_fixtures
+```
+
+Two rules make that safe rather than circular.
+
+**Regenerating is legitimate when the fixture changed or the envelope changed on purpose. It
+is not the way to make a failing test pass.** Re-blessing a regression records the regression,
+and the suite then defends it. The diff of the golden files is the entire review surface for
+this suite — read it.
+
+**A golden must record every field the envelope serializes.** `Event` fields carry
+`#[serde(default)]`, so a golden recorded before a field existed still loads: the missing
+field silently becomes `false`, `None` or empty, and the comparison passes whenever the
+default happens to be the right answer. The suite is then agreeing with itself rather than
+pinning anything.
+
+That was live until 0.13.0. Forty of the forty-one goldens predated `before_is_key_only` and
+did not record it; each loaded as `false`, which was correct for those fixtures, so nothing
+failed — and nothing would have failed if a later field's default had been *wrong* for them.
+The loader now compares each golden's keys against what the event actually serializes and
+fails with "golden is stale, regenerate", so adding an envelope field forces a conscious
+regeneration instead of a silent default. Fields with `skip_serializing_if` are legitimately
+absent when empty, so the comparison is per event rather than against a fixed field list.
+
+Envelope validation also runs **before** the regeneration branch, so a malformed event cannot
+be blessed in the first place.
+
 ### Why Semantic Diff
 
 Semantic diff intentionally ignores changes that differ every run and highlights behaviour
@@ -313,13 +345,74 @@ CDC_RS_RUN_DOCKER_TESTS=1 cargo test --features postgres \
   --test postgres_latency_evidence --test postgres_wal_transport_backlog_evidence -- --nocapture
 ```
 
-## Benchmark evidence## Benchmark evidence
+## Benchmark evidence
 
-Benchmarks are produced by `scripts/ci-benchmark-gate.sh`. They are Criterion microbenchmarks
+Benchmarks are produced by `scripts/ci-benchmark-gate.sh`. Most are Criterion microbenchmarks
 over the transform and codec paths with **no connector I/O**, so they are a regression signal
-for in-process work — not an end-to-end throughput or latency claim. End-to-end capture
-latency comes from the separate Docker-backed latency harness described under
-[Coverage Areas](#coverage-areas).
+for in-process work rather than a throughput claim. End-to-end capture latency comes from the
+separate Docker-backed latency harness described under [Coverage Areas](#coverage-areas).
+
+### End-to-end runtime throughput
+
+One benchmark is not a microbenchmark. `cargo bench --bench throughput` drives the **whole
+runtime** — source poll, idempotency guard, transform pipeline, sink, ack token, commit
+barrier, durable checkpoint write — over a synthetic source, and reports events per second.
+
+Database I/O is excluded deliberately. The figure is what the library costs *on top of*
+whatever the server and the sink cost; a connector-inclusive number measured against a
+container on a laptop would be a property of the laptop. This closes what previous audits
+recorded as the last open evidence condition: *no end-to-end throughput measurement*.
+
+Representative run — Apple M-series, Darwin, APFS on SSD, `--release`, one Tokio worker:
+
+| Checkpoint store | Events per acknowledgement | Throughput |
+|---|---|---|
+| `InMemoryCheckpoint` | 1024 | ~1.33 M events/s |
+| `InMemoryCheckpoint` | 64 | ~1.17 M events/s |
+| `FileCheckpoint` | 1024 | ~90 K events/s |
+| `FileCheckpoint` | 64 | ~6.5 K events/s |
+
+**Read the ratio, not the absolutes.** A durable commit is two `fsync`s — the record, then the
+directory holding the rename — so once the checkpoint is on disk, batch size rather than event
+rate is the throughput knob: the same runtime moves roughly 13× more events per second at 1024
+events per acknowledgement than at 64. The tuning lever is `max_buffer_size` and how often the
+driver calls `commit_ack`, not the poll loop.
+
+`fsync` is unusually expensive on macOS and cheaper on Linux; network storage is worse than
+both. Re-run it on the hardware you intend to deploy on rather than quoting the table.
+
+### The integration matrix, and what "evidence" means
+
+```bash
+bash scripts/run_full_integration_matrix_evidence.sh
+```
+
+Thirty-eight container suites across PostgreSQL, MySQL, MariaDB and SQL Server, plus the
+reliability and latency gates. It writes `target/integration-full-matrix-evidence.txt`, which
+is the artifact a release quotes.
+
+**A suite that did not run is not a suite that passed.** An image-pull failure — a Docker Hub
+rate-limit, a registry 404, a truncated layer — is CI infrastructure rather than a code
+regression, so it is recorded as `STATUS: SKIP` rather than `FAIL`. Until 0.13.0 a skip was
+also counted as a pass, which meant a registry outage during a release run could skip every
+container suite and still print *"Full integration matrix completed successfully"* and exit 0:
+the evidence artifact then certified a matrix that never ran.
+
+Skips are now listed by name in the report and **fail the run**:
+
+```text
+Skipped suites (image pull failed — these produced NO evidence):
+  - mariadb connection
+Full integration matrix is INCOMPLETE: 1 suite(s) never ran.
+```
+
+Set `ALLOW_IMAGE_PULL_SKIPS=1` to accept a partial run for local iteration. The report says
+plainly that such a run is not release evidence.
+
+The transient is also mitigated rather than merely detected: CI warms every image the matrices
+instantiate from a public mirror before the matrix starts, and the policy gate's
+`run_relational_image_drift_check` fails the build if that warm list drifts from the versions
+the tests actually use.
 
 A local run is classified as non-release evidence:
 

@@ -182,12 +182,71 @@ impl FieldMappingTransform {
 
         Ok(())
     }
+
+    /// Keep an unavailable-column list in step with the column names this stage rewrote.
+    ///
+    /// `Event::unavailable_columns` names top-level columns the *source* could not supply
+    /// — a PostgreSQL unchanged-TOAST value, say — and a sink reads it as "leave this
+    /// column alone". Renaming or removing a column without rewriting the list leaves the
+    /// event describing a column that no longer exists under that name, which is the same
+    /// failure the list was introduced to prevent: the renamed column is simply absent,
+    /// and a sink that merges present columns and skips unavailable ones has no reason to
+    /// leave it alone.
+    ///
+    /// Only single-segment paths are column names; a nested path addresses a field inside
+    /// a column's value and cannot change whether the column itself was supplied.
+    fn remap_unavailable(&self, columns: &mut Vec<String>) {
+        if columns.is_empty() {
+            return;
+        }
+
+        fn column_of(parts: &[String]) -> Option<&str> {
+            match parts {
+                [single] => Some(single.as_str()),
+                _ => None,
+            }
+        }
+
+        // A copy or a literal gives the destination column a value, so it is no longer
+        // unavailable — whatever it now holds, the sink is meant to write it.
+        let destinations = self
+            .copy_rules
+            .iter()
+            .map(|rule| &rule.to)
+            .chain(self.set_rules.iter().map(|rule| &rule.to));
+        for destination in destinations {
+            if let Some(name) = column_of(destination) {
+                columns.retain(|existing| existing != name);
+            }
+        }
+
+        // A rename carries the property with the column: the value was unavailable
+        // before the rename and is still unavailable after it, under the new name.
+        for rule in &self.rename_rules {
+            let (Some(from), Some(to)) = (column_of(&rule.from), column_of(&rule.to)) else {
+                continue;
+            };
+            if let Some(slot) = columns.iter_mut().find(|existing| *existing == from) {
+                *slot = to.to_string();
+            }
+        }
+
+        // A removed column is gone from the payload; saying it is unavailable describes
+        // a column the sink can no longer see.
+        for rule in &self.remove_rules {
+            if let Some(name) = column_of(&rule.parts) {
+                columns.retain(|existing| existing != name);
+            }
+        }
+    }
 }
 
 impl Transform for FieldMappingTransform {
     fn apply(&self, event: &mut Event) -> Result<bool> {
         self.apply_payload(&mut event.before)?;
         self.apply_payload(&mut event.after)?;
+        self.remap_unavailable(&mut event.before_unavailable_columns);
+        self.remap_unavailable(&mut event.unavailable_columns);
         Ok(true)
     }
 
@@ -501,5 +560,90 @@ mod tests {
         assert!(e.after.is_none(), "after must remain None for Delete");
         // set_literal IS applied to the before payload (it's present).
         assert_eq!(e.before.as_ref().unwrap()["_source"], "cdc");
+    }
+
+    #[tokio::test]
+    async fn a_rename_carries_the_unavailable_marker_to_the_new_column_name() {
+        // `unavailable_columns` names a column the *source* could not supply — a
+        // PostgreSQL unchanged-TOAST value — and a sink reads it as "leave this column
+        // alone". A rename that moves the payload key but leaves the marker behind
+        // describes a column that no longer exists under that name; the renamed column
+        // then looks merely absent, which is exactly the overwrite the marker prevents.
+        let transform = FieldMappingTransform::new(FieldMappingConfig {
+            rename: vec![("body".into(), "content".into())],
+            ..FieldMappingConfig::default()
+        })
+        .unwrap();
+
+        let mut event = event();
+        event.op = Operation::Update;
+        event.unavailable_columns = vec!["body".into()];
+        event.before_unavailable_columns = vec!["body".into()];
+
+        assert!(transform.apply(&mut event).unwrap());
+        assert_eq!(event.unavailable_columns, vec!["content".to_string()]);
+        assert_eq!(
+            event.before_unavailable_columns,
+            vec!["content".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn giving_an_unavailable_column_a_value_clears_its_marker() {
+        // An event may not both carry a column and declare it unavailable —
+        // `Event::validate` rejects that, and the dangerous reading (trust the payload)
+        // is the one a sink takes. A literal or a copy into that column resolves the
+        // contradiction in the only direction that is true: it now has a value.
+        let transform = FieldMappingTransform::new(FieldMappingConfig {
+            set_literals: vec![("body".into(), serde_json::json!("redacted"))],
+            copy: vec![("id".into(), "shadow_id".into())],
+            ..FieldMappingConfig::default()
+        })
+        .unwrap();
+
+        let mut event = event();
+        event.op = Operation::Update;
+        event.unavailable_columns = vec!["body".into(), "shadow_id".into()];
+
+        assert!(transform.apply(&mut event).unwrap());
+        assert!(event.unavailable_columns.is_empty());
+        event
+            .validate()
+            .expect("the event must not contradict itself");
+    }
+
+    #[tokio::test]
+    async fn removing_a_column_drops_its_unavailable_marker() {
+        let transform = FieldMappingTransform::new(FieldMappingConfig {
+            remove: vec!["body".into()],
+            ..FieldMappingConfig::default()
+        })
+        .unwrap();
+
+        let mut event = event();
+        event.op = Operation::Update;
+        event.unavailable_columns = vec!["body".into(), "other".into()];
+
+        assert!(transform.apply(&mut event).unwrap());
+        assert_eq!(event.unavailable_columns, vec!["other".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_nested_path_never_touches_a_column_marker() {
+        // `user.email` addresses a field inside a column's value. Whether the *column*
+        // was supplied is a different question, and rewriting the marker on this would
+        // be wrong in both directions.
+        let transform = FieldMappingTransform::new(FieldMappingConfig {
+            rename: vec![("user.email".into(), "user.mail".into())],
+            ..FieldMappingConfig::default()
+        })
+        .unwrap();
+
+        let mut event = event();
+        event.op = Operation::Update;
+        event.unavailable_columns = vec!["user".into()];
+
+        assert!(transform.apply(&mut event).unwrap());
+        assert_eq!(event.unavailable_columns, vec!["user".to_string()]);
     }
 }

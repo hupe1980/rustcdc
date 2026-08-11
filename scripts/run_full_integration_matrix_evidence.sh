@@ -20,6 +20,12 @@ mkdir -p target
 : > "$report_path"
 
 failed_labels=()
+# Suites that never ran because their container image could not be pulled. Tracked
+# separately from failures: a suite that did not run is not a suite that passed, and this
+# script's output is release evidence.
+skipped_labels=()
+# A developer on a flaky network can proceed past image-pull skips; a release run cannot.
+allow_image_pull_skips="${ALLOW_IMAGE_PULL_SKIPS:-0}"
 sqlserver_retry_attempts="${SQLSERVER_MATRIX_RETRY_ATTEMPTS:-3}"
 sqlserver_retry_delay_secs="${SQLSERVER_MATRIX_RETRY_DELAY_SECS:-2}"
 mysql_process_crash_retry_attempts="${MYSQL_PROCESS_CRASH_RETRY_ATTEMPTS:-2}"
@@ -109,6 +115,7 @@ run_case() {
 
   local passed=0
   local transient=0
+  local skipped=0
   local temp_log
   temp_log="$(mktemp)"
   while ((attempts <= max_attempts)); do
@@ -150,19 +157,30 @@ run_case() {
       fi
     fi
 
-    # Image-pull failures (Docker Hub rate-limit, registry 404, MCR block) are
-    # CI infrastructure issues, not code regressions.  Treat them as soft skips
-    # so a transient registry outage does not fail the release-evidence gate.
+    # Image-pull failures (Docker Hub rate-limit, registry 404, MCR block) are CI
+    # infrastructure issues rather than code regressions, so they are recorded as SKIP
+    # rather than FAIL.
+    #
+    # A skip is **not** a pass. This used to set `passed=1`, which kept the suite out of
+    # `failed_labels` — the only thing the exit check looks at — so a Docker Hub rate-limit
+    # during a release run skipped every container suite and the script still printed
+    # "Full integration matrix completed successfully" and exited 0. The release-evidence
+    # artifact then certified a matrix that never ran, which is the one thing this script
+    # exists to prevent.
     if is_image_pull_failure "$temp_log"; then
-      cat "$temp_log" | tee -a "$report_path"
       echo "STATUS: SKIP - $label (image pull failed — registry unavailable; not a code regression)" | tee -a "$report_path"
-      passed=1  # treat as non-failure so the gate is not blocked
+      skipped_labels+=("$label")
+      skipped=1
     fi
 
     break
   done
 
   rm -f "$temp_log"
+
+  if ((skipped == 1)); then
+    return
+  fi
 
   if ((passed == 0)); then
     if ((transient == 1)); then
@@ -284,8 +302,31 @@ if ((${#failed_labels[@]} > 0)); then
   for label in "${failed_labels[@]}"; do
     echo "  - $label" | tee -a "$report_path"
   done
+  if ((${#skipped_labels[@]} > 0)); then
+    echo "Additionally skipped (image pull failed): ${#skipped_labels[@]}" | tee -a "$report_path"
+  fi
   echo "Report written to $report_path"
   exit 1
+fi
+
+# A skipped suite produced no evidence, so the run is not release evidence even though
+# nothing failed. Recorded in the artifact either way, so a reader of the report can see
+# what was and was not covered rather than inferring coverage from the absence of failures.
+if ((${#skipped_labels[@]} > 0)); then
+  echo "Skipped suites (image pull failed — these produced NO evidence):" | tee -a "$report_path"
+  for label in "${skipped_labels[@]}"; do
+    echo "  - $label" | tee -a "$report_path"
+  done
+
+  if [[ "$allow_image_pull_skips" != "1" ]]; then
+    echo "Full integration matrix is INCOMPLETE: ${#skipped_labels[@]} suite(s) never ran." | tee -a "$report_path"
+    echo "This is not release evidence. Re-run once the registry is reachable, or set" | tee -a "$report_path"
+    echo "ALLOW_IMAGE_PULL_SKIPS=1 to accept a partial run for local iteration." | tee -a "$report_path"
+    echo "Report written to $report_path"
+    exit 1
+  fi
+
+  echo "ALLOW_IMAGE_PULL_SKIPS=1: continuing with a partial matrix. NOT release evidence." | tee -a "$report_path"
 fi
 
 validate_release_artifacts

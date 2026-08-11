@@ -3372,4 +3372,85 @@ mod tests {
             "confirm_lsn must be called with the new lsn_position to unblock next peek"
         );
     }
+
+    /// A schema change on an excluded table must not be emitted.
+    ///
+    /// The relation cache is still updated — the decoder needs it to attribute any row it
+    /// later sees — but the *event* carries the table's full column list to the sink, and
+    /// an exclusion is an instruction about what may leave the database. This path used
+    /// to bypass the include/exclude lists entirely, so an operator who allow-listed one
+    /// table still received the schema of every other table in the publication.
+    #[tokio::test]
+    async fn a_schema_change_on_an_excluded_table_is_not_emitted() {
+        const ALLOWED: u32 = 10;
+        const EXCLUDED: u32 = 11;
+
+        let provider = MockPgOutputProvider::new(vec![vec![
+            // First sighting of each relation: establishes the cache, emits nothing.
+            xlog(
+                100,
+                build_relation(ALLOWED, "public", "allowed_table", &[("id", true)]),
+            ),
+            xlog(
+                100,
+                build_relation(EXCLUDED, "public", "secret_table", &[("id", true)]),
+            ),
+            // Both tables gain a column. Only the allowed one may be reported.
+            xlog(
+                200,
+                build_relation(
+                    EXCLUDED,
+                    "public",
+                    "secret_table",
+                    &[("id", true), ("ssn", false)],
+                ),
+            ),
+            xlog(
+                300,
+                build_relation(
+                    ALLOWED,
+                    "public",
+                    "allowed_table",
+                    &[("id", true), ("note", false)],
+                ),
+            ),
+        ]]);
+
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            0,
+            vec!["public.allowed_table".into()],
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+
+        let events = handle.next_events(5).await.unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one schema change is inside the allowlist, got {:?}",
+            events.iter().map(|e| e.table.clone()).collect::<Vec<_>>()
+        );
+        // A schema-change event is published under a synthetic `<table>__ddl_events`
+        // name, which is exactly why the filter has to be applied at the source: no
+        // downstream matcher on the real table name can ever see it.
+        assert_eq!(events[0].table, "allowed_table__ddl_events");
+        assert!(
+            !format!("{:?}", events[0]).contains("ssn"),
+            "no column of an excluded table may reach a sink"
+        );
+        assert!(
+            handle.relation_map.contains_key(&EXCLUDED),
+            "the relation cache must still track excluded tables so rows stay attributable"
+        );
+    }
 }

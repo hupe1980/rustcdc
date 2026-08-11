@@ -13,6 +13,8 @@ pub mod incremental_snapshot;
 pub mod snapshot_progress;
 pub mod snapshot_tracker;
 pub mod snapshot_validator;
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
 
 pub use incremental_snapshot::{
     state_from_offset as incremental_snapshot_state_from_offset, IncrementalSnapshotState,
@@ -154,24 +156,20 @@ pub(crate) fn table_is_allowed(
         return true;
     }
 
-    // Glob matching is case-sensitive, and every supported server treats at least some
-    // identifiers case-insensitively, so both sides are lowered once here.
+    // The matcher is ASCII case-insensitive itself, so nothing is lowered here. That used
+    // to cost four `String` allocations per event — two for the key, two per pattern — and,
+    // more importantly, it was the *only* place the lowering happened: the sink router
+    // called the same matcher on unlowered input, so the two disagreed about a pattern the
+    // documentation promised was equivalent.
     let key = match schema {
-        Some(schema) if !schema.is_empty() => {
-            format!(
-                "{}.{}",
-                schema.to_ascii_lowercase(),
-                table.to_ascii_lowercase()
-            )
-        }
-        _ => table.to_ascii_lowercase(),
+        Some(schema) if !schema.is_empty() => format!("{schema}.{table}"),
+        _ => table.to_string(),
     };
 
     let matches = |list: &[String]| {
         list.iter().any(|entry| {
             let pattern = entry.trim();
-            !pattern.is_empty()
-                && crate::core::glob::table_matches(&pattern.to_ascii_lowercase(), &key)
+            !pattern.is_empty() && crate::core::glob::table_matches(pattern, &key)
         })
     };
 
@@ -584,7 +582,9 @@ pub trait StreamHandle: Send + Sync {
     /// accepting would report a pause that never happened.
     async fn set_snapshot_paused(&mut self, _paused: bool) -> Result<bool> {
         Err(crate::core::Error::NotImplemented(
-            "this stream is not running an incremental snapshot, so there is nothing to              pause or resume. Configure RuntimeConfig::with_incremental_snapshot to enable              on-demand snapshots."
+            "this stream is not running an incremental snapshot, so there is nothing to \
+             pause or resume. Configure RuntimeConfig::with_incremental_snapshot to \
+             enable on-demand snapshots."
                 .into(),
         ))
     }
@@ -608,7 +608,9 @@ pub trait StreamHandle: Send + Sync {
     /// The default returns [`Error::NotImplemented`](crate::core::Error::NotImplemented).
     async fn stop_snapshot(&mut self) -> Result<usize> {
         Err(crate::core::Error::NotImplemented(
-            "this stream is not running an incremental snapshot, so there is nothing to              stop. Configure RuntimeConfig::with_incremental_snapshot to enable on-demand              snapshots."
+            "this stream is not running an incremental snapshot, so there is nothing to \
+             stop. Configure RuntimeConfig::with_incremental_snapshot to enable \
+             on-demand snapshots."
                 .into(),
         ))
     }

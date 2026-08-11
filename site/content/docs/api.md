@@ -740,6 +740,15 @@ it runs, and driven from another task through `CdcRuntime::control_handle()`. Se
 snapshot id, and per table the keyset cursor, completion flag, chunk and row counters, plus
 whether it is paused. It is also on `RuntimeAdminSnapshot::incremental_snapshot`.
 
+> **This — not `SnapshotMetadata::is_last_chunk` — is how you detect completion here.** The
+> three bulk snapshot paths flag the final chunk; the incremental driver never does, and that
+> is deliberate. An incremental snapshot interleaves with the live stream, can be paused,
+> resumed and stopped, and `request_incremental_snapshot` can add a table to one already
+> running — so flagging the chunk that drains the currently-known set is a claim the next
+> request falsifies. A consumer that swapped in a staging table on it would swap early and
+> then keep receiving rows. `IncrementalSnapshotState::is_complete()` survives a restart and
+> tells "finished" apart from "paused" and "stopped", which one boolean on one event cannot.
+
 ```rust
 # use rustcdc::CdcRuntime;
 # fn example(runtime: &CdcRuntime) {
@@ -1300,14 +1309,44 @@ can amortise per-batch setup — the WASM stage uses it to take its instance loc
 batch rather than once per event, which matters because that lock serialises every caller
 for the duration of guest execution.
 
-**A transform must not destroy the message key.** `Event::primary_key` names the key
-*columns*; the values live in the row payload. Projecting away, renaming, or re-encrypting a
-key column detaches the two and the event is emitted unkeyed — log compaction stops
-collapsing it and upsert consumers start inserting duplicates. The pipeline rejects this
-rather than letting it through, but the realistic ways to hit it are all ordinary-looking
-config: an `include_columns` list that omits the PK, a `FieldMappingTransform` rename, or
-`MaskRule::Encrypt` on a key column (a fresh nonce per call gives every event for the same
-row a different key).
+### A transform must not destroy the message key
+
+`Event::primary_key` names the key *columns*; the values live in the row payload.
+Projecting away, renaming, or re-encrypting a key column detaches the two and the event is
+emitted unkeyed — log compaction stops collapsing it and upsert consumers start inserting
+duplicates. The pipeline rejects this rather than letting it through, but the realistic
+ways to hit it are all ordinary-looking config: an `include_columns` list that omits the
+PK, a `FieldMappingTransform` rename, or `MaskRule::Encrypt` on a key column (a fresh nonce
+per call gives every event for the same row a different key).
+
+**Declaring the events keyless is allowed.** The guard distinguishes two things that used
+to be one condition: an event whose `primary_key` still names columns the payload no longer
+carries (an accident — rejected), and one whose `primary_key` a stage set to `None` (a
+deliberate, visible choice — permitted). Before 0.13.0 the error message recommended
+clearing `Event::primary_key`, and doing so tripped the very guard that recommended it.
+
+**A keyless table does not trip it.** The batch-path guard is evaluated per *table*: a
+table whose events resolved a key before the stage and do not after it. Until 0.13.0 it
+asked the much weaker question "did any event in this batch have a key, and does any event
+now lack one" — two different events — so a batch mixing a keyed table with a keyless one
+(no primary key, or `REPLICA IDENTITY NOTHING`) failed on **every** poll, permanently, for
+any pipeline with a transform configured.
+
+### A transform that rewrites columns must keep `unavailable_columns` in step
+
+[`unavailable_columns`](#unavailable-columns-vec-string) names top-level columns the *source*
+could not supply, and a sink reads it as "leave this column alone". A stage that renames or
+removes a column, or gives an unavailable one a value, changes what that list means. The two
+column-manipulating transforms this crate ships now maintain it:
+
+| Stage does | Effect on the list |
+|---|---|
+| `rename` a top-level column | the marker moves to the new name — the value is still unavailable, under a different label |
+| `remove` a column, or project it away | the marker is dropped — an out-of-scope column is not "unavailable" |
+| `set` a literal, or `copy` into the column | the marker is dropped — it now has a value, and an event that both carries a column and declares it unavailable fails `Event::validate` |
+| rewrite a **nested** path (`user.email`) | nothing — that addresses a field inside a column's value, not whether the column was supplied |
+
+A custom transform that adds or renames top-level columns owes the same bookkeeping.
 
 ## Errors and what an operator sees
 

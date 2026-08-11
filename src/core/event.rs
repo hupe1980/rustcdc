@@ -186,7 +186,25 @@ pub struct SnapshotMetadata {
     pub snapshot_id: String,
     /// Zero-based snapshot chunk index.
     pub chunk_index: u32,
-    /// Whether this chunk is the final one in the snapshot.
+    /// Whether this chunk is the final one of a **bulk** snapshot.
+    ///
+    /// Set by the bulk snapshot path on every event of the last chunk, once the connector
+    /// knows no table has rows left. A consumer materialising a snapshot into a staging
+    /// table and swapping it in on completion watches this.
+    ///
+    /// # It is never set by the incremental (DBLog) snapshot, and that is deliberate
+    ///
+    /// An incremental snapshot has no last chunk to speak of. It interleaves with the live
+    /// stream, it can be paused, resumed and stopped mid-flight, and
+    /// [`CdcRuntime::request_incremental_snapshot`](crate::CdcRuntime::request_incremental_snapshot)
+    /// can add a table to one that is already running. Flagging the chunk that happens to
+    /// drain the currently-known table set would be a claim the next request falsifies —
+    /// and a consumer that swapped in a staging table on it would swap early and then
+    /// receive more rows, which is worse than never being told.
+    ///
+    /// Use [`CdcRuntime::incremental_snapshot_state`](crate::CdcRuntime::incremental_snapshot_state)
+    /// for that path: it survives a restart, and it distinguishes "finished" from "paused"
+    /// and "stopped", which one boolean on one event cannot.
     pub is_last_chunk: bool,
 }
 
@@ -884,6 +902,65 @@ impl Event {
     #[inline]
     pub fn has_full_before(&self) -> bool {
         self.before.is_some() && !self.before_is_key_only
+    }
+
+    /// Whether [`Event::primary_key_values`] would return a key, without building one.
+    ///
+    /// Same predicate, no allocation: `primary_key_values` clones every key value into a
+    /// fresh `serde_json::Map`, which is pure waste when the caller only wants to know
+    /// whether a key exists. The transform pipeline asks this question once per event per
+    /// stage on the hottest path in the crate, so the allocating form was a measurable
+    /// cost for an answer that is two lookups.
+    ///
+    /// ```
+    /// use rustcdc::{Event, Operation};
+    /// use serde_json::json;
+    ///
+    /// let keyed = Event::builder("", Operation::Insert)
+    ///     .after(json!({"id": 1}))
+    ///     .primary_key(["id"])
+    ///     .build();
+    /// assert!(keyed.has_resolvable_key());
+    ///
+    /// // Declared but not present: the same all-or-nothing rule as `primary_key_values`.
+    /// let partial = Event::builder("", Operation::Insert)
+    ///     .after(json!({"tenant_id": 7}))
+    ///     .primary_key(["tenant_id", "id"])
+    ///     .build();
+    /// assert!(!partial.has_resolvable_key());
+    /// ```
+    #[must_use]
+    pub fn has_resolvable_key(&self) -> bool {
+        let Some(keys) = self.primary_key.as_deref() else {
+            return false;
+        };
+        if keys.is_empty() {
+            return false;
+        }
+
+        let row = match self.op {
+            Operation::Delete => self.before.as_ref(),
+            _ => self.after.as_ref().or(self.before.as_ref()),
+        };
+
+        let Some(object) = row.and_then(serde_json::Value::as_object) else {
+            return false;
+        };
+        keys.iter().all(|key| object.contains_key(key))
+    }
+
+    /// Whether the event *declares* key columns at all.
+    ///
+    /// Distinct from [`Event::has_resolvable_key`]: this asks whether the event claims a
+    /// row identity, not whether the payload still carries one. The transform pipeline
+    /// needs both to tell a transform that **detached** a key from one that deliberately
+    /// declared the events keyless.
+    #[must_use]
+    #[inline]
+    pub fn declares_key(&self) -> bool {
+        self.primary_key
+            .as_deref()
+            .is_some_and(|keys| !keys.is_empty())
     }
 
     /// Extracts the primary-key column values from the most appropriate row image.

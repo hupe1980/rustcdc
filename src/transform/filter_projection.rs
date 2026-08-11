@@ -404,6 +404,25 @@ impl FilterProjectionTransform {
 
         Ok(())
     }
+
+    /// Project the unavailable-column list the same way the payload was projected.
+    ///
+    /// `Event::unavailable_columns` names columns of *this* row image, so a projection
+    /// that removes a column has to remove it here too. Left alone, the event told a sink
+    /// "column `body` is unavailable, do not overwrite it" about a column the sink can no
+    /// longer see and would never have written — noise at best, and a contradiction the
+    /// envelope validator rejects at worst.
+    fn project_unavailable(&self, columns: &mut Vec<String>) {
+        if columns.is_empty() {
+            return;
+        }
+        if let Some(include) = &self.include_set {
+            columns.retain(|name| include.contains(name.as_str()));
+        }
+        if let Some(exclude) = &self.exclude_set {
+            columns.retain(|name| !exclude.contains(name.as_str()));
+        }
+    }
 }
 
 /// Apply a [`FilterOperator`] to a resolved string left-hand side.
@@ -558,6 +577,8 @@ impl Transform for FilterProjectionTransform {
 
         self.project_payload(&mut event.before)?;
         self.project_payload(&mut event.after)?;
+        self.project_unavailable(&mut event.before_unavailable_columns);
+        self.project_unavailable(&mut event.unavailable_columns);
         Ok(true)
     }
 
@@ -1112,6 +1133,31 @@ mod tests {
         );
         assert_eq!(rule.describe(), r#"after.user.country eq "DE""#);
         assert_eq!(rule.describe(), rule.clone().describe());
+    }
+
+    #[test]
+    fn a_projection_drops_the_unavailable_marker_of_a_column_it_removed() {
+        // `unavailable_columns` names columns of *this* row image. A projection that
+        // removes a column and leaves the marker behind tells the sink "do not overwrite
+        // `secret`" about a column the sink can no longer see — and, if the projection
+        // keeps a column the marker names, leaves an event that contradicts itself and
+        // fails `Event::validate`.
+        let transform = FilterProjectionTransform::new(FilterProjectionConfig {
+            include_columns: Some(vec!["id".into(), "name".into()]),
+            ..FilterProjectionConfig::default()
+        })
+        .unwrap();
+
+        let mut event = event(Operation::Update);
+        event.unavailable_columns = vec!["secret".into()];
+        event.before_unavailable_columns = vec!["secret".into()];
+
+        assert!(transform.apply(&mut event).unwrap());
+        assert!(
+            event.unavailable_columns.is_empty(),
+            "a projected-away column is not 'unavailable', it is out of scope"
+        );
+        assert!(event.before_unavailable_columns.is_empty());
     }
 }
 

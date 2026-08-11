@@ -147,6 +147,25 @@ impl SecretString {
         }
     }
 
+    /// Whether the value is fetched on demand rather than held inline.
+    ///
+    /// `true` for a provider- or callback-backed secret. Connectors use this to tell a
+    /// credential that can change between connections from one that cannot: a deferred
+    /// secret is the mechanism behind AWS RDS IAM database authentication, where the
+    /// "password" is a signed token valid for fifteen minutes and a fresh one must be
+    /// minted for every new connection.
+    ///
+    /// It does **not** mean the value is short-lived — a static password read from Vault is
+    /// deferred and never expires. It means the connector must not cache the resolved value
+    /// past the connection it resolved it for.
+    #[must_use]
+    pub fn is_deferred(&self) -> bool {
+        matches!(
+            self.value,
+            SecretValue::Provider { .. } | SecretValue::Callback { .. }
+        )
+    }
+
     /// Whether the resolved secret is empty.
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.resolve()?.is_empty())

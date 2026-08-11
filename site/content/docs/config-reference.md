@@ -22,9 +22,10 @@ weight = 40
 9. [MySQL Source Configuration](#mysql-source-configuration)
 10. [MariaDB Source Configuration](#mariadb-source-configuration)
 11. [SQL Server Source Configuration](#sql-server-source-configuration)
-12. [Checkpoint Configuration](#checkpoint-configuration)
-13. [Observability Configuration](#observability-configuration)
-14. [Production Recommendations](#production-recommendations)
+12. [Snowflake Source Configuration](#snowflake-source-configuration)
+13. [Checkpoint Configuration](#checkpoint-configuration)
+14. [Observability Configuration](#observability-configuration)
+15. [Production Recommendations](#production-recommendations)
 
 ---
 
@@ -414,8 +415,20 @@ The runtime constructor enforces capability guards. For example, configuring `sn
 
 Every connector's `table_include_list` and `table_exclude_list` take the same **case-insensitive
 glob patterns**, matched against `"schema.table"` — or against the bare table name when the
-source reports no schema. The sink router's `table_matches` uses the identical implementation,
-so a pattern that routes an event also selects it.
+source reports no schema. The sink router's `table_matches` calls the same matcher on the same
+key, so a pattern that selects an event also routes it.
+
+> **That equivalence was not true before 0.13.0, and the gap was silent.** The matcher was
+> shared, but only the connector filter lowered its inputs; the router compared case-sensitively.
+> A server that folds identifiers — PostgreSQL to lower, Snowflake to upper, MySQL depending on
+> the host filesystem — could therefore pass a table through the include list and then match no
+> route, and `drop_unrouted` is on by default. Case folding now lives in the matcher, so there is
+> one answer rather than two. It is **ASCII** folding, which is what every supported server's
+> identifier rules are defined in terms of.
+>
+> The consequence worth knowing: on a case-sensitive MySQL (`lower_case_table_names = 0`), two
+> tables differing only in case cannot be told apart by a pattern. That was already true of the
+> include and exclude lists; it is now also true of routing.
 
 | Pattern | Matches |
 |---|---|
@@ -437,6 +450,25 @@ schema half against. Blank entries are ignored rather than treated as catch-alls
 > would make every pattern database-specific — but an allowlist exists to bound what leaves the
 > database, so `connect()` logs a WARN naming each unqualified include entry. Write
 > `"public.users"` when the schema matters.
+
+### What the lists cover
+
+Every event a connector can emit for a table, including its **schema-change events**. That
+was not true before 0.13.0: `ALTER TABLE` / `CREATE TABLE` / `DROP_TABLE` events were built
+straight from connector metadata and never consulted the lists, so an operator who
+allow-listed one table still received the full column list of every other table the
+publication, binlog or `cdc.change_tables` carried. All three connectors now apply the
+filter to that path:
+
+| Connector | Where the schema event comes from | Now filtered |
+|---|---|---|
+| PostgreSQL | a changed pgoutput `RELATION` message | yes — the relation *cache* still tracks every table, because the decoder needs it to attribute rows |
+| MySQL / MariaDB | a captured DDL statement in the binlog | yes — the binlog position still advances, or the statement would replay forever |
+| SQL Server | a capture-instance metadata refresh | yes, at load: an excluded instance is not polled either |
+
+Note that a schema-change event is published under a synthetic `<table>__ddl_events`
+name, which is why the filter has to be applied at the source — no downstream matcher on
+the real table name can see it.
 
 **These lists used to match exact strings only.** The globs are new in 0.12.0. Before that,
 `table_exclude_list = ["public.tmp_*"]` excluded nothing at all, which is indistinguishable from
@@ -1063,19 +1095,143 @@ window this connector had not yet read means changes were purged and is reported
 `Unrecoverable` error naming the affected capture instance. See
 [Troubleshooting](@/docs/troubleshooting.md).
 
-### AWS IAM Auth Mode (MySQL/PostgreSQL)
+### AWS IAM database authentication for RDS and Aurora
 
-For RDS-style IAM database auth, use connector `auth_mode = AwsIamToken` and
-resolve the token through `SecretString::from_callback` (or provider) so each
-new connection can fetch a fresh short-lived token.
+rustcdc does **not** depend on the AWS SDK. IAM auth works by supplying the token as a
+deferred secret: `SecretString::from_callback` (or a `SecretProvider`) mints one with
+`rds:generate-db-auth-token` — or `aws_config` + `aws_sdk_rds::auth` — and the connector
+resolves it when it needs a password.
 
-TLS is mandatory when `auth_mode = AwsIamToken`.
+```rust,ignore
+// The callback runs per connection, so each one gets a token minted moments earlier.
+let password = SecretString::from_callback("rds-iam", || {
+    Ok(generate_rds_auth_token(&host, port, &user)?)   // your AWS SDK call
+});
+```
+
+Set `auth_mode = AwsIamToken` as well. It is not decoration: it makes TLS mandatory —
+`connect()` refuses a plaintext transport — which RDS requires for IAM auth anyway, and
+which matters because the token is a bearer credential that a passive observer could
+otherwise replay for its remaining lifetime.
+
+> **The connectors reach the same guarantee by different means, and one of them costs you
+> the connection pool.**
+>
+> **PostgreSQL** builds its connection configuration — and so resolves the secret — for
+> *every* connection, including each replication reconnect. Nothing to configure.
+>
+> **MySQL / MariaDB** cannot do that through a pool. `mysql_async::Opts` is immutable and the
+> driver exposes no per-connection credential hook, so a pool authenticates every connection
+> it ever opens with the password resolved when it was built. A 15-minute token would work
+> until the pool next opened a connection — after a server-side `wait_timeout`, a transient
+> error, or a demand spike — and then fail in a way that reads like an intermittent
+> credentials problem.
+>
+> So `auth_mode = AwsIamToken` **disables pooling** on MySQL and opens a freshly
+> authenticated connection per request, re-resolving the token each time. `connect()` logs
+> an INFO line saying so. The cost is a handshake per connection, which is affordable at a
+> CDC connector's request rate: one long-lived binlog connection, a handful of metadata
+> queries at startup, one query per snapshot chunk (10 000 rows by default), and one
+> heartbeat per interval. It applies only when you opt in — a static password, including one
+> fetched from a secret manager, keeps the pool.
+>
+> **SQL Server** has no IAM mode. RDS for SQL Server does not offer IAM database
+> authentication, and Azure SQL's Entra ID tokens go in the password field as an ordinary
+> deferred secret, resolved per connection by that connector.
+
+The token is checked only when a connection is **established** — an open connection is not
+dropped when its token expires, so a stable pipeline can run for days on a token minted once.
+That is why the failure surfaces at reconnect rather than on a timer.
 
 ### SQL Server Connection String Format
 
 ```text
 sqlserver://user:password@host:port;database=dbname;TrustServerCertificate=no;Encrypt=yes
 ```
+
+---
+
+## Snowflake Source Configuration
+
+`SnowflakeSourceConfig` — feature `snowflake`. Reads through the **`CHANGES` clause**, not
+through Snowflake Streams; [the Snowflake page](@/docs/snowflake.md) has the reasoning, which
+comes down to Streams requiring a write to the source account to advance and turning a crash
+into silent data loss.
+
+Two things are unlike every other connector here.
+
+**You supply the transport.** Snowflake speaks no wire protocol this crate could implement,
+so `SnowflakeSource::new` takes an `Arc<dyn SnowflakeQueryExecutor>` — your HTTPS + key-pair
+JWT client, or an existing driver. The feature adds **no dependencies**.
+
+**There is no `RuntimeSourceConfig::Snowflake`.** That enum holds fully serializable
+configuration, and a transport object is not. Register the source instead, which is the same
+path a third-party connector takes and gets the same runtime guarantees:
+
+```rust,ignore
+// Needs a live Snowflake account and your own executor, so it cannot run as a doctest.
+let mut runtime = CdcRuntime::new(config)?;   // RuntimeSourceConfig::Disabled
+runtime.register_source(Box::new(SnowflakeSource::new(snowflake_config, executor)?));
+```
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `database` | `String` | — | Database holding the tracked tables. |
+| `schema` | `String` | — | Schema holding the tracked tables. |
+| `tables` | `Vec<String>` | `[]` | Tables to capture, named within `schema`. Each needs `CHANGE_TRACKING = TRUE`. |
+| `primary_keys` | `HashMap<String, Vec<String>>` | `{}` | Key columns per table. Required for a snapshot; without one, events carry no key. |
+| `append_only` | `bool` | `false` | Use `INFORMATION => APPEND_ONLY` — cheaper, but deletes and updates are silently absent. |
+| `poll_interval_ms` | `u64` | 30 000 | Window length. A **cost** dial as much as a latency one; see below. |
+| `max_events_per_poll` | `usize` | 10 000 | Soft cap: warns rather than truncating, because a truncated window would skip tables. |
+| `snapshot_chunk_size` | `usize` | 10 000 | Rows per keyset-paginated snapshot chunk. |
+| `table_include_list` | `Vec<String>` | `[]` | Allowlist of `"schema.table"` [glob patterns](#table-filter-patterns). An excluded table is never queried at all. |
+| `table_exclude_list` | `Vec<String>` | `[]` | Blocklist of `"schema.table"` [glob patterns](#table-filter-patterns). |
+| `source_name` | `String` | `"snowflake"` | `Event::source.source_name` for this connector's events. |
+
+### Identifiers are used exactly as written
+
+Snowflake folds an unquoted identifier to **upper** case, and this connector quotes whatever
+you configure. A table created as `orders` is `ORDERS` on the server, so `tables = ["ORDERS"]`
+finds it and `tables = ["orders"]` does not. The same applies to `primary_keys` columns, which
+are matched against result-set column names — also folded.
+
+### Prerequisites
+
+```sql
+ALTER TABLE analytics.public.orders SET CHANGE_TRACKING = TRUE;
+-- Retention must exceed the longest outage the pipeline has to survive.
+ALTER TABLE analytics.public.orders SET DATA_RETENTION_TIME_IN_DAYS = 7;
+```
+
+Change tracking only records changes made **after** it is enabled, and a window whose start
+has fallen outside retention makes the query fail. rustcdc reports that as data loss with the
+remedy named, rather than restarting from the current time and hiding it.
+
+### The poll interval is a cost and a fidelity dial
+
+Every poll runs queries on a warehouse that bills by the second it is awake — unlike the
+log-based connectors, where an idle stream costs nothing. The interval also decides how much
+detail survives: `CHANGES` reports the **net effect** of the window, so a row updated three
+times inside one window yields one event, and a row inserted and then deleted inside it yields
+none at all. Shorter windows report more; they also cost more.
+
+### What the event stream cannot carry
+
+| | |
+|---|---|
+| `Event::transaction` | always `None` — `CHANGES` has no transaction id and no commit grouping |
+| Intermediate row versions | collapsed within a window; see above |
+| Source order within a window | none exists; events are sorted by `METADATA$ROW_ID` so a re-read is byte-identical |
+| `Operation::Truncate` | not reported |
+| Schema-change events | not reported — this connector does no DDL capture |
+
+### Snapshot and handoff
+
+The initial load reads `SELECT … AT(TIMESTAMP => T)` in keyset-paginated chunks and the stream
+opens its first window at the same `T`. Because Snowflake's time travel serves every chunk from
+one table version, the two phases meet exactly: there is **no overlap window and no watermark
+bracket**, which every other connector in this crate needs. The trade is that `T` must stay
+inside retention for the whole snapshot.
 
 ---
 

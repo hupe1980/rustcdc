@@ -1,4 +1,6 @@
-use mysql_async::{prelude::Queryable, Pool as MySqlPool};
+use mysql_async::prelude::Queryable;
+
+use super::connections::MysqlConnections;
 
 use super::parser::decode_stream_resume_position;
 use crate::core::{Error, Offset, Result};
@@ -10,16 +12,15 @@ pub(super) struct MysqlStreamStartPosition {
 }
 
 pub(super) async fn resolve_stream_start_position(
-    pool: &MySqlPool,
+    pool: &MysqlConnections,
     source_type: &str,
     resume_from: Option<&dyn Offset>,
 ) -> Result<MysqlStreamStartPosition> {
     let (mut binlog_file, mut binlog_pos_u64): (String, u64) = {
-        let mut conn = pool.get_conn().await.map_err(|error| {
-            Error::SourceError(format!(
-                "failed to acquire mysql connection for stream: {error}"
-            ))
-        })?;
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|error| error.context("failed to acquire mysql connection for stream"))?;
         let mut row: mysql_async::Row = match conn.query_first("SHOW MASTER STATUS").await {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -44,11 +45,10 @@ pub(super) async fn resolve_stream_start_position(
         (row.take(0).unwrap_or_default(), row.take(1).unwrap_or(4))
     };
     let mut gtid: String = {
-        let mut conn = pool.get_conn().await.map_err(|error| {
-            Error::SourceError(format!(
-                "failed to acquire mysql connection for gtid query: {error}"
-            ))
-        })?;
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|error| error.context("failed to acquire mysql connection for gtid query"))?;
         conn.query_first("SELECT @@GLOBAL.GTID_EXECUTED")
             .await
             .ok()
@@ -98,11 +98,12 @@ pub(super) async fn resolve_stream_start_position(
 /// The inverted form — `GTID_SUBSET(my_position, gtid_executed)` — is the intuitive one
 /// and is wrong, because it **fails open**: it reports "available" in precisely the gap
 /// case. That is why this is a named function with a test rather than an inline query.
-async fn verify_gtid_position_still_available(pool: &MySqlPool, position: &str) -> Result<()> {
+async fn verify_gtid_position_still_available(
+    pool: &MysqlConnections,
+    position: &str,
+) -> Result<()> {
     let mut conn = pool.get_conn().await.map_err(|error| {
-        Error::SourceError(format!(
-            "failed to acquire mysql connection for GTID availability check: {error}"
-        ))
+        error.context("failed to acquire mysql connection for GTID availability check")
     })?;
 
     // MariaDB has neither GTID_SUBSET nor gtid_purged; its GTID model is

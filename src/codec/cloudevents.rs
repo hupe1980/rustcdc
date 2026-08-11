@@ -145,10 +145,12 @@ impl EventEncoder for CloudEventsEncoder {
         let time = unix_ms_to_rfc3339(event.ts);
 
         // CloudEvents `subject` — logical entity name.
-        let subject = match &event.schema {
-            Some(schema) => format!("{}.{}", schema, event.table),
-            None => event.table.clone(),
-        };
+        //
+        // Delegated rather than rebuilt: this used to join the two halves itself and so
+        // rendered `Some("")` as a subject beginning with a dot, where every other consumer
+        // of the same pair — routing, filtering, log lines — treats an empty schema as
+        // absent. `Event::qualified_table_name` is that one rule.
+        let subject = event.qualified_table_name();
 
         // Build the `data` payload (CDC-specific fields).
         let mut data = Map::new();
