@@ -487,7 +487,6 @@ async fn run_postgres_process_kill_replay_scenario(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Block until PostgreSQL has released `slot`, or fail with a message that says why.
 ///
 /// `Child::kill` + `Child::wait` reap the *local* process. They say nothing about the
@@ -531,6 +530,7 @@ async fn wait_for_slot_released(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_crash_worker(
     host: &str,
     port: u16,
