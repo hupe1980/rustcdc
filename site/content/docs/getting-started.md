@@ -37,10 +37,9 @@ server without TLS now fails rather than silently downgrading.
 
 ## 1. Add the dependency
 
-```toml
-[dependencies]
-rustcdc = { version = "0.13", features = ["postgres"] }
-tokio = { version = "1", features = ["full"] }
+```bash
+cargo add rustcdc --features postgres
+cargo add tokio --features full
 ```
 
 ## 2. Prepare the source database

@@ -57,9 +57,8 @@ The public API may still change. Delivery is **at-least-once**; see
 
 ## Install
 
-```toml
-[dependencies]
-rustcdc = { version = "0.13", features = ["postgres"] }
+```bash
+cargo add rustcdc --features postgres
 ```
 
 The default profile is `postgres` + `tls`. WASM transforms and every non-PostgreSQL connector

@@ -8,8 +8,8 @@ rustcdc reads Snowflake through the **`CHANGES` clause**: read-only, no server-s
 the durable position in your checkpoint with every other connector's. Feature `snowflake`,
 which adds **no dependencies**.
 
-```toml
-rustcdc = { version = "0.13", features = ["snowflake"] }
+```bash
+cargo add rustcdc --features snowflake
 ```
 
 ## Setup
