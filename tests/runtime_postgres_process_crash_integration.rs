@@ -501,7 +501,10 @@ async fn run_postgres_process_kill_replay_scenario(
 /// `SourceError("db error")`, because that is what `tokio_postgres::Error` renders for any
 /// server-side error — the detail lives in its `source()` chain, which the suite was
 /// discarding.
-async fn wait_for_slot_released(client: &tokio_postgres::Client, slot: &str) -> rustcdc::Result<()> {
+async fn wait_for_slot_released(
+    client: &tokio_postgres::Client,
+    slot: &str,
+) -> rustcdc::Result<()> {
     const ATTEMPTS: usize = 100;
     for _ in 0..ATTEMPTS {
         let row = client
