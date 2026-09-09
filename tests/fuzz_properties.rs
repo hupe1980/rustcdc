@@ -86,7 +86,7 @@ fn adversarial_values() -> Vec<String> {
         format!("kafka+ssl://u:{SENTINEL}@broker:9093"),
         format!("not-a-url-just-an-@-sign-{SENTINEL}"),
         format!("mailto:someone@example.com {SENTINEL}"),
-        format!("{SENTINEL}"),
+        SENTINEL.to_string(),
         format!("  {SENTINEL}  "),
         format!("{SENTINEL}\n{SENTINEL}"),
         format!("://{SENTINEL}@host"),

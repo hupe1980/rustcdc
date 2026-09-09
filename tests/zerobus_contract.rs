@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use databricks_zerobus_ingest_sdk::databricks::zerobus::{
     CreateIngestStreamResponse, EphemeralStreamRequest, EphemeralStreamResponse,
-    IngestRecordResponse, ephemeral_stream_request, ephemeral_stream_response,
+    IngestRecordResponse, PersistentStreamRequest, PersistentStreamResponse, RetireStreamRequest,
+    RetireStreamResponse, ephemeral_stream_request, ephemeral_stream_response,
     zerobus_server::{Zerobus, ZerobusServer},
 };
 use futures::StreamExt as _;
@@ -134,6 +135,39 @@ impl Zerobus for FakeZerobus {
 
         Ok(Response::new(
             Box::pin(ReceiverStream::new(rx)) as Self::EphemeralStreamStream
+        ))
+    }
+
+    // ── Persistent streams ──────────────────────────────────────────────────
+    //
+    // Both RPCs below are marked `IN DEVELOPMENT: may change or be removed` in
+    // `zerobus_service.proto`, and the sink never calls either: `src/sink/zerobus.rs`
+    // drives the ephemeral stream, whose want of a resumable offset is precisely why the
+    // sink reports `at_least_once`.
+    //
+    // They answer `UNIMPLEMENTED`, which is what a workspace without the feature returns.
+    // Serving them for real would be a fake asserting a contract nothing here exercises,
+    // and would let a sink that quietly started using a persistent stream pass this suite
+    // on the strength of the fake's cooperation rather than a workspace's.
+
+    type PersistentStreamStream =
+        Pin<Box<dyn futures::Stream<Item = Result<PersistentStreamResponse, Status>> + Send>>;
+
+    async fn persistent_stream(
+        &self,
+        _request: Request<Streaming<PersistentStreamRequest>>,
+    ) -> Result<Response<Self::PersistentStreamStream>, Status> {
+        Err(Status::unimplemented(
+            "the fake serves ephemeral streams only",
+        ))
+    }
+
+    async fn retire_stream(
+        &self,
+        _request: Request<RetireStreamRequest>,
+    ) -> Result<Response<RetireStreamResponse>, Status> {
+        Err(Status::unimplemented(
+            "the fake serves ephemeral streams only",
         ))
     }
 }

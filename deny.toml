@@ -243,9 +243,25 @@ skip = [
     { name = "lz4_flex" },
     { name = "wasm-encoder" },
     { name = "whoami" },
+    # miniz_oxide: apache-avro 0.21 depends on 0.8 directly for its deflate codec, while
+    # every other DEFLATE user in the tree — krafka, parquet, mysql_common, schemreg, zip
+    # — reaches 0.9 through flate2 1.1. One pure-Rust implementation of one format at two
+    # minors. Resolves when apache-avro follows flate2.
+    { name = "miniz_oxide" },
     # syn 2.x vs 3.x: proc-macro ecosystem mid-transition; both versions are
     # compile-time only.
     { name = "syn" },
+    # prettyplease: the same transition one layer up. 0.2 arrives through prost-build and
+    # tonic-build, which run in the Zerobus SDK's build script; 0.3 through bon-macros via
+    # apache-avro. It pretty-prints generated code at build time and no part of either
+    # copy is linked into the binary.
+    { name = "prettyplease" },
+    # num-bigint: redis 1.7 — reached through opendal's `services-redis`, which backs the
+    # Redis state store — moved to 0.5 while the rest of the tree is still on 0.4:
+    # arrow-buffer and parquet, apache-avro through bigdecimal, mysql_common, and
+    # jsonschema through schemreg. Arbitrary-precision integer arithmetic, no unsafe
+    # surface on either side. Resolves when those follow redis.
+    { name = "num-bigint" },
 ]
 
 # ── Sources ───────────────────────────────────────────────────────────────────
