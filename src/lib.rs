@@ -117,8 +117,8 @@ pub use crate::core::{
     RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions,
     RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
     SourceErrorKind, SourceMetadata, StructuredLogger, TransactionBoundaryPolicy,
-    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError, ValidationErrors,
-    EVENT_ENVELOPE_VERSION,
+    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError,
+    ValidationErrorPolicy, ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "tls")]
 pub use crate::core::{rustls_client_config, RustlsClientConfig};
