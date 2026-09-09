@@ -687,10 +687,12 @@ pub struct Event {
     /// Empty for every event whose `after` image is complete.
     ///
     /// This list describes **`after` only**. The before-image has its own holes, tracked
-    /// separately by [`Event::before_unavailable_columns`] — they are not the same set. A
-    /// TOASTed column that *was* modified arrives present in `after` and `'u'` in
-    /// `before`, so merging the two lists would mark a column that genuinely changed as
-    /// unwritable and silently drop the update.
+    /// separately by [`BeforeImage::Full::unavailable_columns`](BeforeImage::Full) — they
+    /// are not the same set. A TOASTed column that *was* modified arrives present in
+    /// `after` and `'u'` in `before`, so merging the two lists would mark a column that
+    /// genuinely changed as unwritable and silently drop the update. Keeping the
+    /// before-image's list inside its own variant is what makes merging them impossible
+    /// rather than merely discouraged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_columns: Vec<String>,
 }

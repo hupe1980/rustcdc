@@ -171,9 +171,9 @@ impl EventEncoder for CloudEventsEncoder {
         // The partial-payload contract, in full. All three fields or none of them: a consumer
         // that receives `unavailable_columns` but not `before_unavailable_columns` cannot tell
         // a before-image column that is absent *because it was TOASTed* from one that was
-        // genuinely NULL — which is exactly the distinction
-        // [`Event::before_unavailable_columns`] exists to make, and the one a diff or a
-        // compensating write depends on.
+        // genuinely NULL — which is exactly the distinction `BeforeImage::Full`'s own
+        // `unavailable_columns` exists to make, and the one a diff or a compensating write
+        // depends on.
         //
         // `before_unavailable_columns` was omitted here when it was added to the envelope, so
         // CloudEvents consumers silently had a weaker contract than JSON, Avro and Protobuf
