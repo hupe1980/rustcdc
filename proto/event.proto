@@ -79,7 +79,12 @@ message TransactionMetadata {
 
 // A single captured CDC event.
 message Event {
-  // JSON-encoded before-image of the row. Absent for INSERT events.
+  // JSON-encoded before-image of the row.
+  //
+  // Absent for INSERT, and for an UPDATE whose source supplied no pre-image — the ordinary
+  // case on PostgreSQL under REPLICA IDENTITY DEFAULT when no key column changed. Read
+  // together with before_is_key_only: absent, key-only and complete are three different
+  // states, and only the third is a row.
   optional bytes before = 1;
   // JSON-encoded after-image of the row. Absent for DELETE events.
   optional bytes after = 2;

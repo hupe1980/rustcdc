@@ -798,10 +798,37 @@ impl CdcRuntime {
         }
     }
 
-    fn buffer_and_deliver(&mut self, events: Vec<Event>) -> Result<EventBatch> {
+    pub(super) fn buffer_and_deliver(&mut self, events: Vec<Event>) -> Result<EventBatch> {
         for event in events {
             if self.config.options.validate_events {
-                event.validate_or_error()?;
+                if let Err(error) = event.validate_or_error() {
+                    // Validation runs upstream of every sink, so under `Halt` a permanently
+                    // invalid event is unreachable by the dead-letter handler *and*
+                    // unskippable: the source position cannot advance past an event that was
+                    // never accepted, so a restart replays it and stops again. `Quarantine`
+                    // is the way out of that loop.
+                    if self.config.options.validation_error_policy
+                        != ValidationErrorPolicy::Quarantine
+                    {
+                        self.record_runtime_error("runtime.validation.halt", &error);
+                        return Err(error);
+                    }
+
+                    self.total_events_skipped = self.total_events_skipped.saturating_add(1);
+                    self.record_runtime_error("runtime.validation.quarantine", &error);
+                    tracing::warn!(
+                        target: "rustcdc::core::runtime",
+                        table = %event.table,
+                        offset = %event.source.offset,
+                        error = %error.report(),
+                        "event failed envelope validation; quarantining and advancing past it",
+                    );
+                    // Config validation guarantees the handler exists under this policy.
+                    if let Some(handler) = self.config.options.dead_letter_handler.as_ref() {
+                        handler(event, error);
+                    }
+                    continue;
+                }
             }
             if event.snapshot.is_some() {
                 // A snapshot row carries a chunk cursor, not a log position, so it has
@@ -1235,7 +1262,7 @@ fn estimate_event_bytes(event: &Event) -> usize {
         })
     }
 
-    payload_len(event.before.as_ref())
+    payload_len(event.before.row())
         + payload_len(event.after.as_ref())
         + event.table.len()
         + event.schema.as_deref().map_or(0, str::len)

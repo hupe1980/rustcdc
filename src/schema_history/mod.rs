@@ -719,7 +719,7 @@ where
 
         let mut errors = Vec::new();
         for (field_name, payload) in [
-            ("before", event.before.as_ref()),
+            ("before", event.before.row()),
             ("after", event.after.as_ref()),
         ] {
             if let Some(serde_json::Value::Object(object)) = payload {
@@ -798,6 +798,7 @@ fn matches_type(value: &serde_json::Value, data_type: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::sync::Arc;
 
     use serde_json::json;
@@ -842,7 +843,7 @@ mod tests {
 
     fn event(after: serde_json::Value) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(after),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -857,9 +858,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

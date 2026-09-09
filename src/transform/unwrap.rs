@@ -60,8 +60,8 @@ impl UnwrapTransform {
             return Ok(());
         }
 
-        flatten_payload(&mut event.before, &self.config)?;
-        flatten_payload(&mut event.after, &self.config)?;
+        flatten_payload(event.before.row_mut(), &self.config)?;
+        flatten_payload(event.after.as_mut(), &self.config)?;
         Ok(())
     }
 }
@@ -77,8 +77,11 @@ impl Transform for UnwrapTransform {
     }
 }
 
-fn flatten_payload(payload: &mut Option<Value>, config: &UnwrapConfig) -> Result<()> {
-    let Some(Value::Object(object)) = payload else {
+fn flatten_payload(payload: Option<&mut Value>, config: &UnwrapConfig) -> Result<()> {
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    let Value::Object(object) = &*payload else {
         return Ok(());
     };
 
@@ -91,7 +94,7 @@ fn flatten_payload(payload: &mut Option<Value>, config: &UnwrapConfig) -> Result
     for (key, value) in flat {
         out.insert(key, value);
     }
-    *payload = Some(Value::Object(out));
+    *payload = Value::Object(out);
     Ok(())
 }
 
@@ -140,6 +143,7 @@ fn flatten_into(
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use serde_json::json;
 
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -148,7 +152,7 @@ mod tests {
 
     fn event(after: serde_json::Value) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(after),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -163,9 +167,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

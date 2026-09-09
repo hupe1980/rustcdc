@@ -223,7 +223,7 @@ pub fn fingerprint_event_transient(event: &Event) -> std::result::Result<u64, Fi
 
     // Hash JSON payloads without allocating an intermediate String.
     // serde_json::to_writer writes directly into the hasher's byte sink.
-    if let Some(before) = &event.before {
+    if let Some(before) = event.before.row() {
         hash_json_value(before, &mut hasher);
     }
     if let Some(after) = &event.after {
@@ -288,7 +288,7 @@ pub fn fingerprint_event_stable(event: &Event) -> std::result::Result<String, Fi
         digest.update(0u8.to_le_bytes());
     }
 
-    if let Some(before) = &event.before {
+    if let Some(before) = event.before.row() {
         digest.update(1u8.to_le_bytes());
         // Deterministic because `serde_json::Map` is a `BTreeMap` here — the
         // `preserve_order` feature is deliberately **not** enabled — so keys serialise in
@@ -382,6 +382,7 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::thread;
     use std::time::Duration;
 
@@ -395,7 +396,7 @@ mod tests {
 
     fn make_event(offset: &str, tx_event_index: Option<u32>) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1, "name": "alice"})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -414,9 +415,7 @@ mod tests {
                 event_index,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

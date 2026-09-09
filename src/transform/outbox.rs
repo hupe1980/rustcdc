@@ -132,6 +132,7 @@ impl Transform for OutboxTransform {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use serde_json::json;
 
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -141,7 +142,7 @@ mod tests {
 
     fn event(table: &str, after: serde_json::Value) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(after),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -156,9 +157,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -255,7 +254,9 @@ mod tests {
         let transform = OutboxTransform::new("outbox");
         // Cleanup worker deletes a processed row — after = None.
         let mut e = Event {
-            before: Some(json!({"aggregate_id": "u1", "event_type": "x", "payload": {}})),
+            before: BeforeImage::full(
+                json!({"aggregate_id": "u1", "event_type": "x", "payload": {}}),
+            ),
             after: None,
             op: Operation::Delete,
             source: SourceMetadata {
@@ -270,9 +271,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         // Must not error — cleanup rows must be passed through (or filtered upstream).
         assert!(
@@ -286,7 +285,7 @@ mod tests {
     async fn truncate_on_outbox_table_passes_through_without_error() {
         let transform = OutboxTransform::new("outbox");
         let mut e = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: None,
             op: Operation::Truncate,
             source: SourceMetadata {
@@ -301,9 +300,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         assert!(
             transform.apply(&mut e).unwrap(),
@@ -320,7 +317,7 @@ mod tests {
         let transform = OutboxTransform::new("outbox");
         // Update represents marking a row as processed — should not be re-emitted.
         let mut e = Event {
-            before: Some(
+            before: BeforeImage::full(
                 json!({"aggregate_id": "u1", "event_type": "user.created", "payload": {}}),
             ),
             after: Some(
@@ -339,9 +336,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());
         // Table must NOT be rewritten — Update should pass through unchanged.

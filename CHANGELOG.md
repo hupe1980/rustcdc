@@ -5,6 +5,113 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.14.0
+
+A bug report against 0.12.0 found that **any UPDATE to a table with PostgreSQL's factory
+`REPLICA IDENTITY DEFAULT` that does not change the primary key terminated the pipeline** — and
+that restarting replayed the same WAL record and terminated again. That is the most common shape
+of UPDATE on the most common table configuration, so a stock PostgreSQL database stopped the
+connector on its first write. This release fixes it, and closes the two gaps that let it happen.
+
+It is a **breaking** release: the `Event` pre-image fields are replaced by one typed field. See
+*Migrating* below.
+
+### Fixed: an UPDATE with no before-image halted the pipeline
+
+Under `REPLICA IDENTITY DEFAULT`, pgoutput sends neither an `O` nor a `K` old tuple when the
+statement changes no key column, so there is genuinely no before-image. The PostgreSQL source
+built `before: None` for exactly that case and was right to. `Event::validate` then rejected the
+same event with *"update events must include before"*, and `CdcRuntime::poll` propagated it as a
+fatal error.
+
+Because a replication slot cannot advance past a record that was never accepted, the failure was
+unrecoverable: restarting replayed it, `ALTER TABLE … REPLICA IDENTITY FULL` does not apply
+retroactively, and the only exit that made progress was dropping the slot — losing every change
+in between.
+
+Two halves of the crate had disagreed about whether a pre-image was optional. `Event::validate`
+required one on UPDATE; `Event::has_full_before` and its tests already treated its absence as a
+legitimate state. The validator's rule was written for the `FULL` case and never revisited. An
+absent pre-image is now valid on UPDATE — as it is in Debezium, which emits `"before": null`
+here. DELETE still requires one.
+
+### Breaking: the pre-image is one type, not three fields
+
+`Event::before: Option<Value>`, `Event::before_is_key_only: bool` and
+`Event::before_unavailable_columns: Vec<String>` are replaced by a single
+`Event::before: BeforeImage`:
+
+```rust
+pub enum BeforeImage {
+    Unavailable,                                              // no pre-image at all
+    KeyOnly { key: Value },                                   // primary-key columns only
+    Full { row: Value, unavailable_columns: Vec<String> },    // the whole prior row
+}
+```
+
+The old triple could express states no source can produce, and two of them needed runtime
+validation rules to reject: a key-only image with no row, and a key-only image carrying TOAST
+holes. Neither can be constructed now — the rules are gone because the states are. The third
+combination, `before: None` with `before_is_key_only: false`, was ambiguous between *"no
+pre-image"* and *"not populated yet"*, and it was that ambiguity the validator was guarding
+against when it rejected the legitimate case.
+
+`unavailable_columns` hangs off `Full` alone, which is where it was always meaningful: a
+key-only image omits non-key columns by design, not by TOAST, and the two kinds of absence must
+never be conflated.
+
+**The wire format is unchanged.** JSON, Avro, Protobuf and CloudEvents still carry `before`,
+`before_is_key_only` and `before_unavailable_columns` exactly as before, in the same field order,
+so existing consumers, stored streams and replay goldens are unaffected. Nesting the row under a
+variant tag would have broken every JSON path over the stream to express something the Rust type
+system now enforces on this side of the boundary. Every decoder reassembles the pre-image through
+one shared constructor, `BeforeImage::from_wire_parts`, so a self-contradictory envelope is
+refused identically whichever codec carried it — previously each codec accepted it and left the
+contradiction for a later validation pass.
+
+#### Migrating
+
+| Before | Now |
+|---|---|
+| `event.before.as_ref()` | `event.before.row()` |
+| `event.before.is_some()` | `event.before.is_present()` |
+| `event.before.is_none()` | `event.before.is_unavailable()` |
+| `event.before_is_key_only` | `event.before.is_key_only()` |
+| `event.before_unavailable_columns` | `event.before.unavailable_columns()` |
+| `event.before = Some(row)` | `event.before = BeforeImage::full(row)` |
+| `.before(row).before_is_key_only(true)` | `.before_key_only(key)` |
+| `.before(row).before_unavailable_columns(cols)` | `.before_image(BeforeImage::full_with_holes(row, cols))` |
+
+`has_full_before()` is unchanged and is still the right predicate when only a complete row will
+do. Reach for `row()` when any prior values will do — resolving a key, say — and `full_row()`
+when a partial image must yield nothing rather than a row with holes in it.
+
+### Added: validation failures can reach the dead-letter queue
+
+The dead-letter handler covered transform errors only. Envelope validation runs upstream of it,
+so a permanently-invalid event could reach no handler *and* could not be skipped — the source
+position never advances past an event that was never accepted, so a restart replayed it and
+halted again. The DLQ was configured, and the pipeline still stopped.
+
+`ValidationErrorPolicy::Quarantine` routes such an event to the dead-letter handler and advances
+past it, turning an unrecoverable halt into one quarantined row. It requires a
+`dead_letter_handler` — the same rule `TransformErrorPolicy::Skip` follows, because the
+checkpoint advances past the event and it is never replayed. The default stays `Halt`: an invalid
+envelope is usually a connector bug worth stopping for, and quarantining by default would turn
+one into silent data loss.
+
+### Fixed: the test suite could not have caught this
+
+Every PostgreSQL integration test that drives a `Runtime` forced `REPLICA IDENTITY FULL` in its
+fixture, so `old_tuple` was always `Some`. The one test covering `DEFAULT` identity drove the
+`Source` directly and drained the stream, never constructing a `Runtime` — so
+`validate_or_error` was never reached — and guarded its before-image assertion behind
+`if let Some(before)`, which the failing case skips. It passed vacuously.
+
+`postgres_replica_identity_default_runtime_integration` now drives a `CdcRuntime` against a
+`REPLICA IDENTITY DEFAULT` table and updates a non-key column. It reproduces the original halt
+when the fix is reverted.
+
 ## 0.13.0
 
 Five further audit passes over the tree released as 0.12.0 — the third through seventh of this

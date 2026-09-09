@@ -198,10 +198,11 @@ pub struct ValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::BeforeImage;
 
     fn create_test_event(id: u64) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": id})),
             op: crate::core::Operation::Insert,
             source: crate::core::SourceMetadata {
@@ -216,9 +217,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

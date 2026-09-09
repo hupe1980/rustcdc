@@ -297,12 +297,13 @@ impl SinkAdapter for FanOutSinkAdapter {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
     use crate::sink::{BoxedSink, FanOutSinkAdapter, MemorySinkAdapter, SinkAdapter};
 
     fn make_event(table: &str) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -317,9 +318,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

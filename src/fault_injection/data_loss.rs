@@ -161,13 +161,14 @@ fn event_has_corruption_marker(event: &Event) -> bool {
         .is_some()
         || event
             .before
-            .as_ref()
+            .row()
             .and_then(|row| row.get("__fault_corrupted"))
             .is_some()
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use crate::{
         core::{SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
         SnapshotMetadata,
@@ -177,7 +178,7 @@ mod tests {
 
     fn event(id: i64) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": id})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -200,9 +201,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

@@ -433,7 +433,7 @@ async fn mysql_update_and_delete_carry_full_row_images() -> rustcdc::Result<()> 
         .expect("update captured");
     let before = update
         .before
-        .as_ref()
+        .row()
         .expect("FULL row image must supply a before image");
     assert_eq!(before.get("name").and_then(|v| v.as_str()), Some("alice"));
     assert_eq!(
@@ -442,7 +442,7 @@ async fn mysql_update_and_delete_carry_full_row_images() -> rustcdc::Result<()> 
         "an unchanged column must still appear in the before image under FULL"
     );
     assert!(
-        !update.before_is_key_only,
+        !update.before.is_key_only(),
         "MySQL under binlog_row_image=FULL never produces a key-only before image"
     );
     let after = update.after.as_ref().expect("after image");
@@ -459,7 +459,7 @@ async fn mysql_update_and_delete_carry_full_row_images() -> rustcdc::Result<()> 
         .expect("delete captured");
     let deleted = delete
         .before
-        .as_ref()
+        .row()
         .expect("delete must carry the removed row");
     assert_eq!(
         deleted.get("name").and_then(|v| v.as_str()),

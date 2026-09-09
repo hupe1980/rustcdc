@@ -184,7 +184,7 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
             rustcdc::core::Operation::Update => {
                 update_count += 1;
                 assert!(
-                    event.before.is_some(),
+                    event.before.is_present(),
                     "UPDATE event must have before field"
                 );
                 assert!(event.after.is_some(), "UPDATE event must have after field");
@@ -192,7 +192,7 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
             rustcdc::core::Operation::Delete => {
                 delete_count += 1;
                 assert!(
-                    event.before.is_some(),
+                    event.before.is_present(),
                     "DELETE event must have before field"
                 );
             }
@@ -500,7 +500,7 @@ async fn mysql_stream_binlog_rotation() -> rustcdc::Result<()> {
     for event in &pre_events {
         assert_eq!(event.op, rustcdc::core::Operation::Insert);
         assert!(event.after.is_some(), "Insert must have after");
-        assert!(event.before.is_none(), "Insert must not have before");
+        assert!(event.before.is_unavailable(), "Insert must not have before");
     }
 
     // All post-rotation events are valid INSERTs and arrived (stream survived rotation)

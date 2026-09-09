@@ -41,11 +41,7 @@ pub(super) fn mysql_event_pk_fingerprint(event: &Event) -> Option<String> {
         return None;
     }
 
-    let row = event
-        .after
-        .as_ref()
-        .or(event.before.as_ref())?
-        .as_object()?;
+    let row = event.after.as_ref().or(event.before.row())?.as_object()?;
 
     let mut fingerprint = String::with_capacity(64);
     fingerprint.push_str(&event.table);

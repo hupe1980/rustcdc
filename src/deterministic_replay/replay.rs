@@ -4,7 +4,9 @@ use super::fixtures::{Fixture, FixtureMessage};
 /// Converts protocol-level fixtures into canonical CDC events and validates
 /// that protocol message interpretation remains consistent across versions.
 use crate::{
-    core::{Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
+    core::{
+        BeforeImage, Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+    },
     ddl_capture::{extract_captured_ddl, DdlDialect},
 };
 use serde::{Deserialize, Serialize};
@@ -322,7 +324,7 @@ impl ReplaySession {
     fn create_marker_event(&self, seq: usize, marker_type: &str, source_message: &str) -> Event {
         let ts = self.fixture_timestamp(seq);
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({
                 "marker_type": marker_type,
                 "fixture_seq": seq,
@@ -341,9 +343,7 @@ impl ReplaySession {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -367,9 +367,7 @@ impl ReplaySession {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: payload.before_is_key_only,
             unavailable_columns: payload.unavailable_columns,
-            before_unavailable_columns: payload.before_unavailable_columns,
         })
     }
 
@@ -435,15 +433,40 @@ impl ReplaySession {
         let unavailable_columns = parse_column_list(&payload, "unavailable_columns")?;
         let before_unavailable_columns = parse_column_list(&payload, "before_unavailable_columns")?;
 
+        // A fixture that describes a pre-image no source could produce is rejected rather
+        // than normalised: a golden is evidence, and silently reinterpreting one would
+        // freeze the wrong contract in place.
+        let before = match (before, before_is_key_only) {
+            (None, false) => BeforeImage::Unavailable,
+            (None, true) => {
+                return Err(
+                    "data payload sets 'before_is_key_only' but has no 'before': a \
+                            key-only pre-image must carry the primary-key columns"
+                        .to_string(),
+                )
+            }
+            (Some(key), true) => {
+                if !before_unavailable_columns.is_empty() {
+                    return Err("data payload sets both 'before_is_key_only' and \
+                                'before_unavailable_columns': a key-only pre-image omits \
+                                non-key columns by design, not by TOAST"
+                        .to_string());
+                }
+                BeforeImage::KeyOnly { key }
+            }
+            (Some(row), false) => BeforeImage::Full {
+                row,
+                unavailable_columns: before_unavailable_columns,
+            },
+        };
+
         Ok(ReplayDataPayload {
             before,
             after,
             schema,
             table,
             primary_key,
-            before_is_key_only,
             unavailable_columns,
-            before_unavailable_columns,
         })
     }
 
@@ -549,14 +572,12 @@ impl ReplaySession {
 /// reconciled, so the highest-risk field in the envelope had the appearance of replay coverage
 /// and none of the substance.
 struct ReplayDataPayload {
-    before: Option<serde_json::Value>,
+    before: BeforeImage,
     after: Option<serde_json::Value>,
     schema: Option<String>,
     table: String,
     primary_key: Option<Vec<String>>,
-    before_is_key_only: bool,
     unavailable_columns: Vec<String>,
-    before_unavailable_columns: Vec<String>,
 }
 
 /// Read an optional array-of-strings field, rejecting a wrong shape rather than ignoring it.

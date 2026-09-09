@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::core::{Event, Operation, SourceMetadata};
+use crate::core::{BeforeImage, Event, Operation, SourceMetadata};
 use crate::schema_history::{ColumnDef, DDLEvent, TableSchema};
 
 pub mod mysql;
@@ -255,7 +255,7 @@ impl CapturedDdl {
         }
 
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(after),
             op: Operation::SchemaChange,
             source: SourceMetadata {
@@ -270,9 +270,7 @@ impl CapturedDdl {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 }

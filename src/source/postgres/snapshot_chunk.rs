@@ -1,6 +1,7 @@
 use crate::{
     core::{
-        Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+        BeforeImage, Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
+        EVENT_ENVELOPE_VERSION,
     },
     source::helpers::now_millis,
 };
@@ -93,7 +94,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     handle.emitted_in_run += 1;
 
                     events.push(Event {
-                        before: None,
+                        before: BeforeImage::Unavailable,
                         after: Some(row),
                         op: Operation::Read,
                         source: SourceMetadata {
@@ -112,9 +113,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                         }),
                         transaction: None,
                         envelope_version: EVENT_ENVELOPE_VERSION,
-                        before_is_key_only: false,
                         unavailable_columns: Vec::new(),
-                        before_unavailable_columns: Vec::new(),
                     });
                 }
 
@@ -156,7 +155,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                 handle.emitted_in_run += 1;
 
                 events.push(Event {
-                    before: None,
+                    before: BeforeImage::Unavailable,
                     after: Some(row),
                     op: Operation::Read,
                     source: SourceMetadata {
@@ -175,9 +174,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    before_is_key_only: false,
                     unavailable_columns: Vec::new(),
-                    before_unavailable_columns: Vec::new(),
                 });
             }
         } else {
@@ -193,7 +190,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                 handle.emitted_in_run += 1;
 
                 events.push(Event {
-                    before: None,
+                    before: BeforeImage::Unavailable,
                     after: Some(row),
                     op: Operation::Read,
                     source: SourceMetadata {
@@ -212,9 +209,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    before_is_key_only: false,
                     unavailable_columns: Vec::new(),
-                    before_unavailable_columns: Vec::new(),
                 });
             }
 

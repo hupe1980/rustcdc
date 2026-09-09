@@ -1,6 +1,6 @@
 use crate::{
     core::{
-        Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
+        BeforeImage, Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
         EVENT_ENVELOPE_VERSION,
     },
     source::table_is_allowed,
@@ -534,7 +534,9 @@ fn build_sqlserver_event(
     after: Option<serde_json::Value>,
 ) -> Event {
     Event {
-        before,
+        // A CDC change table stores every captured column, so a pre-image is complete
+        // whenever the operation produces one at all.
+        before: before.map_or(BeforeImage::Unavailable, BeforeImage::full),
         after,
         op,
         source: SourceMetadata {
@@ -557,9 +559,7 @@ fn build_sqlserver_event(
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
         unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
     }
 }
 
@@ -642,7 +642,7 @@ impl SqlServerStreamHandle {
 
 fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
     Event {
-        before: None,
+        before: BeforeImage::Unavailable,
         after: None,
         op: Operation::Truncate,
         source: SourceMetadata {
@@ -657,9 +657,7 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
-        before_is_key_only: false,
         unavailable_columns: Vec::new(),
-        before_unavailable_columns: Vec::new(),
     }
 }
 

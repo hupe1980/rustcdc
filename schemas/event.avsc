@@ -8,7 +8,7 @@
       "name": "before",
       "type": ["null", "bytes"],
       "default": null,
-      "doc": "JSON-encoded before-image. null for INSERT events."
+      "doc": "JSON-encoded before-image. null for INSERT events, and for UPDATE events whose source supplied no pre-image (PostgreSQL REPLICA IDENTITY DEFAULT when no key column changed). Read with before_is_key_only: absent, key-only and complete are three different states, and only the third is a row."
     },
     {
       "name": "after",

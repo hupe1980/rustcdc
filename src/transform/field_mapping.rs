@@ -119,7 +119,7 @@ impl FieldMappingTransform {
         })
     }
 
-    fn apply_payload(&self, payload: &mut Option<Value>) -> Result<()> {
+    fn apply_payload(&self, payload: Option<&mut Value>) -> Result<()> {
         // Do NOT create a synthetic payload for None values.
         // Insert.before, Delete.after, and all Truncate payloads are intentionally
         // None per the canonical event envelope contract.  Creating an object here
@@ -243,9 +243,11 @@ impl FieldMappingTransform {
 
 impl Transform for FieldMappingTransform {
     fn apply(&self, event: &mut Event) -> Result<bool> {
-        self.apply_payload(&mut event.before)?;
-        self.apply_payload(&mut event.after)?;
-        self.remap_unavailable(&mut event.before_unavailable_columns);
+        self.apply_payload(event.before.row_mut())?;
+        self.apply_payload(event.after.as_mut())?;
+        if let Some(columns) = event.before.unavailable_columns_mut() {
+            self.remap_unavailable(columns);
+        }
         self.remap_unavailable(&mut event.unavailable_columns);
         Ok(true)
     }
@@ -346,6 +348,7 @@ fn remove_path(root: &mut Value, parts: &[String]) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use serde_json::json;
 
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -355,7 +358,7 @@ mod tests {
 
     fn event() -> Event {
         Event {
-            before: Some(json!({
+            before: BeforeImage::full(json!({
                 "user": {"name": "old", "email": "old@example.com"},
                 "legacy": true
             })),
@@ -377,9 +380,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -503,7 +504,7 @@ mod tests {
         .unwrap();
 
         let mut e = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: None,
             op: Operation::Truncate,
             source: SourceMetadata {
@@ -518,12 +519,13 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());
-        assert!(e.before.is_none(), "before must remain None for Truncate");
+        assert!(
+            e.before.is_unavailable(),
+            "before must remain None for Truncate"
+        );
         assert!(e.after.is_none(), "after must remain None for Truncate");
     }
 
@@ -537,7 +539,7 @@ mod tests {
         .unwrap();
 
         let mut e = Event {
-            before: Some(json!({"id": 5})),
+            before: BeforeImage::full(json!({"id": 5})),
             after: None,
             op: Operation::Delete,
             source: SourceMetadata {
@@ -552,14 +554,12 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());
         assert!(e.after.is_none(), "after must remain None for Delete");
         // set_literal IS applied to the before payload (it's present).
-        assert_eq!(e.before.as_ref().unwrap()["_source"], "cdc");
+        assert_eq!(e.before.row().unwrap()["_source"], "cdc");
     }
 
     #[tokio::test]
@@ -578,12 +578,19 @@ mod tests {
         let mut event = event();
         event.op = Operation::Update;
         event.unavailable_columns = vec!["body".into()];
-        event.before_unavailable_columns = vec!["body".into()];
+        event.before = BeforeImage::full_with_holes(
+            event
+                .before
+                .row()
+                .cloned()
+                .expect("fixture has a before-image"),
+            ["body"],
+        );
 
         assert!(transform.apply(&mut event).unwrap());
         assert_eq!(event.unavailable_columns, vec!["content".to_string()]);
         assert_eq!(
-            event.before_unavailable_columns,
+            event.before.unavailable_columns(),
             vec!["content".to_string()]
         );
     }

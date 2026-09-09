@@ -2230,8 +2230,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].op, crate::core::Operation::Update);
         assert_eq!(
-            events[0].before,
-            Some(serde_json::json!({"id": "1", "name": "alice"}))
+            events[0].before.row(),
+            Some(&serde_json::json!({"id": "1", "name": "alice"}))
         );
         assert_eq!(
             events[0].after,
@@ -2256,7 +2256,7 @@ mod tests {
         let events = handle.next_events(100).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].op, crate::core::Operation::Delete);
-        assert!(events[0].before.is_some());
+        assert!(events[0].before.is_present());
         assert!(events[0].after.is_none());
     }
 

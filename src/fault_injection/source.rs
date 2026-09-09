@@ -187,7 +187,7 @@ impl FaultController {
                         if let Some(obj) = after.as_object_mut() {
                             obj.insert("__fault_corrupted".into(), serde_json::json!(true));
                         }
-                    } else if let Some(before) = event.before.as_mut() {
+                    } else if let Some(before) = event.before.row_mut() {
                         if let Some(obj) = before.as_object_mut() {
                             obj.insert("__fault_corrupted".into(), serde_json::json!(true));
                         }
@@ -328,6 +328,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::collections::VecDeque;
 
     use async_trait::async_trait;
@@ -354,7 +355,7 @@ mod tests {
 
     fn event(id: i64) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": id})),
             op: crate::Operation::Insert,
             source: SourceMetadata {
@@ -377,9 +378,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

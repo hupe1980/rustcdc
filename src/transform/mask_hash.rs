@@ -296,7 +296,7 @@ impl MaskHashTransform {
         }
     }
 
-    fn apply_payload(&self, payload: &mut Option<Value>, table: &str) -> Result<()> {
+    fn apply_payload(&self, payload: Option<&mut Value>, table: &str) -> Result<()> {
         if let Some(value) = payload {
             let mut path_buf = String::new();
             self.walk_value(value, &mut path_buf, table)?;
@@ -416,8 +416,8 @@ impl Transform for MaskHashTransform {
     fn apply(&self, event: &mut Event) -> Result<bool> {
         // Bind ciphertexts to the table they came from — see `field_aad`.
         let table = event.qualified_table_name();
-        self.apply_payload(&mut event.before, &table)?;
-        self.apply_payload(&mut event.after, &table)?;
+        self.apply_payload(event.before.row_mut(), &table)?;
+        self.apply_payload(event.after.as_mut(), &table)?;
         Ok(true)
     }
 
@@ -652,6 +652,7 @@ fn parse_encrypted_payload(input: &str) -> Result<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use ahash::AHashMap as HashMap;
 
     #[cfg(feature = "encryption")]
@@ -724,7 +725,7 @@ mod tests {
 
     fn event() -> Event {
         Event {
-            before: Some(json!({"email": "old@example.com"})),
+            before: BeforeImage::full(json!({"email": "old@example.com"})),
             after: Some(json!({
                 "id": 1,
                 "email": "alice@example.com",
@@ -743,16 +744,14 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
     /// An event whose `after` payload is exactly `payload`, with no `before` image.
     fn event_with(payload: serde_json::Value) -> Event {
         let mut event = event();
-        event.before = None;
+        event.before = BeforeImage::Unavailable;
         event.after = Some(payload);
         event
     }
@@ -964,7 +963,7 @@ mod tests {
         });
 
         let mut source_event = event();
-        source_event.before = None;
+        source_event.before = BeforeImage::Unavailable;
         encrypt.apply(&mut source_event).unwrap();
         let ciphertext = source_event
             .after
@@ -984,7 +983,7 @@ mod tests {
 
         // Same field, same table: decrypts.
         let mut same = event();
-        same.before = None;
+        same.before = BeforeImage::Unavailable;
         same.after = Some(json!({"id": 1, "email": ciphertext.clone()}));
         decrypt.apply(&mut same).unwrap();
         assert_eq!(
@@ -994,7 +993,7 @@ mod tests {
 
         // Relocated to a different column: must fail authentication.
         let mut moved_field = event();
-        moved_field.before = None;
+        moved_field.before = BeforeImage::Unavailable;
         moved_field.after = Some(json!({"id": 1, "phone": ciphertext.clone()}));
         let error = decrypt
             .apply(&mut moved_field)
@@ -1003,7 +1002,7 @@ mod tests {
 
         // Same column, different table: must also fail.
         let mut moved_table = event();
-        moved_table.before = None;
+        moved_table.before = BeforeImage::Unavailable;
         moved_table.table = "audit".into();
         moved_table.after = Some(json!({"id": 1, "email": ciphertext}));
         decrypt
