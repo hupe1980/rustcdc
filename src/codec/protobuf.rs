@@ -24,7 +24,7 @@
 use prost::Message;
 
 use crate::codec::{EncodedOutput, EventEncoder};
-use crate::core::{Error, Event, Operation, Result};
+use crate::core::{BeforeImage, Error, Event, Operation, Result};
 
 const CONTENT_TYPE: &str = "application/x-protobuf";
 
@@ -267,7 +267,7 @@ impl ProtoEvent {
     pub fn from_event(event: &Event) -> Result<Self> {
         let before = event
             .before
-            .as_ref()
+            .row()
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|e| Error::SerializationError(format!("protobuf before encode: {e}")))?;
@@ -313,9 +313,9 @@ impl ProtoEvent {
                     event_index: t.event_index,
                 }),
             envelope_version: event.envelope_version as u32,
-            before_is_key_only: event.before_is_key_only,
+            before_is_key_only: event.before.is_key_only(),
             unavailable_columns: event.unavailable_columns.clone(),
-            before_unavailable_columns: event.before_unavailable_columns.clone(),
+            before_unavailable_columns: event.before.unavailable_columns().to_vec(),
         })
     }
 
@@ -368,8 +368,17 @@ impl ProtoEvent {
             )
         })?;
 
+        // The flat protobuf triple is reassembled through the one shared constructor, so a
+        // self-contradictory message is refused here exactly as it would be over JSON.
+        let before = BeforeImage::from_wire_parts(
+            decode_payload(self.before, "before")?,
+            self.before_is_key_only,
+            self.before_unavailable_columns,
+        )
+        .map_err(Error::SerializationError)?;
+
         Ok(Event {
-            before: decode_payload(self.before, "before")?,
+            before,
             after: decode_payload(self.after, "after")?,
             op,
             source: SourceMetadata {
@@ -394,9 +403,7 @@ impl ProtoEvent {
                 event_index: t.event_index,
             }),
             envelope_version: self.envelope_version as u16,
-            before_is_key_only: self.before_is_key_only,
             unavailable_columns: self.unavailable_columns,
-            before_unavailable_columns: self.before_unavailable_columns,
         })
     }
 }
@@ -411,7 +418,7 @@ mod tests {
 
     fn full_event() -> Event {
         Event {
-            before: Some(serde_json::json!({"id": 1, "name": "alice"})),
+            before: BeforeImage::full(serde_json::json!({"id": 1, "name": "alice"})),
             after: Some(serde_json::json!({"id": 1, "name": "alice-v2"})),
             op: Operation::Update,
             source: SourceMetadata {
@@ -434,15 +441,13 @@ mod tests {
                 event_index: 1,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
     fn insert_event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -457,9 +462,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -542,7 +545,13 @@ mod tests {
     #[test]
     fn before_is_key_only_round_trips_through_proto() {
         let mut event = full_event();
-        event.before_is_key_only = true;
+        event.before = BeforeImage::key_only(
+            event
+                .before
+                .row()
+                .cloned()
+                .expect("fixture has a before-image"),
+        );
         let proto = ProtoEvent::from_event(&event).unwrap();
         let bytes = proto.encode_to_vec();
         let decoded = ProtoEvent::from_bytes(&bytes).unwrap();

@@ -11,7 +11,9 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
-use crate::core::{Error, Event, Operation, Result, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use crate::core::{
+    BeforeImage, Error, Event, Operation, Result, SourceMetadata, EVENT_ENVELOPE_VERSION,
+};
 
 /// Epoch nanoseconds to the epoch milliseconds the event envelope carries.
 ///
@@ -231,7 +233,8 @@ pub(super) fn events_from_changes(
         };
 
         events.push(Event {
-            before,
+            // A CHANGES window reports the net effect as whole rows.
+            before: before.map_or(BeforeImage::Unavailable, BeforeImage::full),
             after,
             op,
             source: SourceMetadata {
@@ -250,11 +253,9 @@ pub(super) fn events_from_changes(
             // that never existed.
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             // Every column of the row image is present or explicitly NULL. Snowflake has
             // no equivalent of PostgreSQL's unchanged-TOAST omission.
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         });
     }
 
@@ -323,7 +324,7 @@ pub(super) fn events_from_snapshot_rows(
         }
 
         events.push(Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(Value::Object(payload)),
             op: Operation::Read,
             source: SourceMetadata {
@@ -342,9 +343,7 @@ pub(super) fn events_from_snapshot_rows(
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         });
     }
 
@@ -399,7 +398,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].op, Operation::Update);
-        assert_eq!(events[0].before.as_ref().unwrap()["NAME"], "old");
+        assert_eq!(events[0].before.row().unwrap()["NAME"], "old");
         assert_eq!(events[0].after.as_ref().unwrap()["NAME"], "new");
         assert_eq!(events[0].source.offset, "42");
     }
@@ -424,7 +423,7 @@ mod tests {
             ],
         ]);
         let events = events_from_changes(&set, "s", "PUBLIC", "T", None, 1).expect("maps");
-        assert_eq!(events[0].before.as_ref().unwrap()["NAME"], "old");
+        assert_eq!(events[0].before.row().unwrap()["NAME"], "old");
         assert_eq!(events[0].after.as_ref().unwrap()["NAME"], "new");
     }
 
@@ -449,7 +448,7 @@ mod tests {
         let events = events_from_changes(&set, "s", "PUBLIC", "T", None, 1).expect("maps");
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].op, Operation::Insert);
-        assert!(events[0].before.is_none());
+        assert!(events[0].before.is_unavailable());
         assert_eq!(events[1].op, Operation::Delete);
         assert!(events[1].after.is_none());
     }

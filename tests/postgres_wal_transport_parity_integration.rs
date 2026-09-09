@@ -152,7 +152,7 @@ fn capture(event: &Event) -> Captured {
         op: event.op,
         schema: event.schema.clone(),
         table: event.table.clone(),
-        before: event.before.as_ref().map(ToString::to_string),
+        before: event.before.row().map(ToString::to_string),
         after: event.after.as_ref().map(ToString::to_string),
         primary_key: event.primary_key.clone(),
         // The LSN must agree too: both transports report the change's own WAL position, and

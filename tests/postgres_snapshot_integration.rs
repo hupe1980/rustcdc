@@ -152,7 +152,7 @@ async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
                 "snapshot events must have after field"
             );
             assert!(
-                event.before.is_none(),
+                event.before.is_unavailable(),
                 "snapshot events must not have before"
             );
 

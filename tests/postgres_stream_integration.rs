@@ -196,7 +196,7 @@ async fn postgres_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
     // Validate UPDATE structure
     if let Some(update_event) = updates.first() {
         assert!(
-            update_event.before.is_some(),
+            update_event.before.is_present(),
             "UPDATE must have before field"
         );
         assert!(update_event.after.is_some(), "UPDATE must have after field");
@@ -238,7 +238,7 @@ async fn postgres_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
     // Validate DELETE structure
     if let Some(delete_event) = deletes.first() {
         assert!(
-            delete_event.before.is_some(),
+            delete_event.before.is_present(),
             "DELETE must have before field"
         );
         // after is typically None for DELETE (depends on replica identity)

@@ -1,5 +1,7 @@
 use crate::{
-    core::{Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
+    core::{
+        BeforeImage, Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+    },
     source::table_is_allowed,
 };
 
@@ -40,7 +42,11 @@ impl MysqlStreamHandle {
 
     fn build_event(&self, op: Operation, change: MysqlRowChange) -> Event {
         Event {
-            before: change.before,
+            // A row-based binlog event carries the whole prior row or none of it — MySQL
+            // has no key-only pre-image, so there is no third case to distinguish here.
+            before: change
+                .before
+                .map_or(BeforeImage::Unavailable, BeforeImage::full),
             after: change.after,
             op,
             source: self.source_meta(),
@@ -51,9 +57,7 @@ impl MysqlStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -243,7 +247,7 @@ impl MysqlStreamHandle {
                     ) {
                         let source = self.source_meta_at(&binlog_file, binlog_pos, timestamp_ms);
                         committed.push(Event {
-                            before: None,
+                            before: BeforeImage::Unavailable,
                             after: None,
                             op: Operation::Truncate,
                             source,
@@ -254,9 +258,7 @@ impl MysqlStreamHandle {
                             snapshot: None,
                             transaction: None,
                             envelope_version: EVENT_ENVELOPE_VERSION,
-                            before_is_key_only: false,
                             unavailable_columns: Vec::new(),
-                            before_unavailable_columns: Vec::new(),
                         });
                         self.events_polled = self.events_polled.saturating_add(1);
                     }

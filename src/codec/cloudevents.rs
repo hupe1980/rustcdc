@@ -154,7 +154,10 @@ impl EventEncoder for CloudEventsEncoder {
 
         // Build the `data` payload (CDC-specific fields).
         let mut data = Map::new();
-        data.insert("before".into(), event.before.clone().unwrap_or(Value::Null));
+        data.insert(
+            "before".into(),
+            event.before.row().cloned().unwrap_or(Value::Null),
+        );
         data.insert("after".into(), event.after.clone().unwrap_or(Value::Null));
         if let Some(pk) = &event.primary_key {
             data.insert("primary_key".into(), json!(pk));
@@ -168,22 +171,22 @@ impl EventEncoder for CloudEventsEncoder {
         // The partial-payload contract, in full. All three fields or none of them: a consumer
         // that receives `unavailable_columns` but not `before_unavailable_columns` cannot tell
         // a before-image column that is absent *because it was TOASTed* from one that was
-        // genuinely NULL — which is exactly the distinction
-        // [`Event::before_unavailable_columns`] exists to make, and the one a diff or a
-        // compensating write depends on.
+        // genuinely NULL — which is exactly the distinction `BeforeImage::Full`'s own
+        // `unavailable_columns` exists to make, and the one a diff or a compensating write
+        // depends on.
         //
         // `before_unavailable_columns` was omitted here when it was added to the envelope, so
         // CloudEvents consumers silently had a weaker contract than JSON, Avro and Protobuf
         // consumers of the same stream. Only the emptiness check is conditional — the three
         // fields are written by one loop so a fourth cannot be forgotten the same way.
-        if event.before_is_key_only {
+        if event.before.is_key_only() {
             data.insert("before_is_key_only".into(), json!(true));
         }
         for (field, columns) in [
-            ("unavailable_columns", &event.unavailable_columns),
+            ("unavailable_columns", event.unavailable_columns.as_slice()),
             (
                 "before_unavailable_columns",
-                &event.before_unavailable_columns,
+                event.before.unavailable_columns(),
             ),
         ] {
             if !columns.is_empty() {
@@ -286,6 +289,7 @@ fn is_leap_year(year: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::BeforeImage;
     use crate::core::{
         Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
     };
@@ -352,7 +356,7 @@ mod tests {
 
     fn insert_event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1, "name": "alice"})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -371,9 +375,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -510,7 +512,7 @@ mod tests {
         let enc = CloudEventsEncoder::default();
         let mut ev = insert_event();
         ev.op = Operation::Update;
-        ev.before = Some(serde_json::json!({"id": 1, "name": "alice"}));
+        ev.before = BeforeImage::full(serde_json::json!({"id": 1, "name": "alice"}));
         ev.after = Some(serde_json::json!({"id": 1, "name": "alice-v2"}));
         let out = enc.encode(&ev).unwrap();
         let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
@@ -522,6 +524,7 @@ mod tests {
 #[cfg(test)]
 mod partial_payload_contract_tests {
     use super::*;
+    use crate::core::BeforeImage;
     use crate::core::{Event, Operation, SourceMetadata};
 
     /// An UPDATE with a hole in **each** image, which is the shape that separates the two
@@ -532,11 +535,13 @@ mod partial_payload_contract_tests {
             .schema("public")
             .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
             .ts(1_716_595_200_000)
-            .before(serde_json::json!({ "id": "1", "title": "draft" }))
+            .before_image(BeforeImage::full_with_holes(
+                serde_json::json!({ "id": "1", "title": "draft" }),
+                ["summary"],
+            ))
             .after(serde_json::json!({ "id": "1", "title": "final" }))
             .primary_key(["id"])
             .unavailable_columns(["body"])
-            .before_unavailable_columns(["summary"])
             .build()
     }
 
@@ -574,7 +579,7 @@ mod partial_payload_contract_tests {
     #[test]
     fn no_envelope_field_is_silently_dropped() {
         let mut event = event_with_holes();
-        event.before_is_key_only = false;
+
         event.transaction = Some(crate::core::TransactionMetadata::new(42, 1, Some(2)));
         event.snapshot = Some(crate::core::SnapshotMetadata::new("snap-1", 0, false));
 
@@ -628,9 +633,9 @@ mod partial_payload_contract_tests {
     #[test]
     fn before_is_key_only_appears_when_set() {
         let mut event = event_with_holes();
-        event.before_unavailable_columns.clear(); // validation forbids both together
-        event.before_is_key_only = true;
-        event.before = Some(serde_json::json!({ "id": "1" }));
+        // A key-only pre-image cannot carry TOAST holes, and now cannot even be built
+        // with them: one constructor call replaces the clear-then-set dance.
+        event.before = BeforeImage::key_only(serde_json::json!({ "id": "1" }));
         event
             .validate()
             .expect("a well-formed key-only before-image");

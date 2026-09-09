@@ -1594,6 +1594,7 @@ impl Source for SqlServerConnection {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2071,7 +2072,10 @@ mod tests {
 
         // INSERT
         assert_eq!(events[0].op, Operation::Insert);
-        assert!(events[0].before.is_none(), "INSERT before should be None");
+        assert!(
+            events[0].before.is_unavailable(),
+            "INSERT before should be None"
+        );
         assert_eq!(
             events[0].after,
             Some(serde_json::json!({"id": "1", "name": "alice"}))
@@ -2080,8 +2084,8 @@ mod tests {
         // UPDATE — before=old values (op=3), after=new values (op=4)
         assert_eq!(events[1].op, Operation::Update);
         assert_eq!(
-            events[1].before,
-            Some(serde_json::json!({"id": "1", "name": "alice"})),
+            events[1].before.row(),
+            Some(&serde_json::json!({"id": "1", "name": "alice"})),
             "UPDATE before should hold the OLD row (op=3)"
         );
         assert_eq!(
@@ -2093,8 +2097,8 @@ mod tests {
         // DELETE
         assert_eq!(events[2].op, Operation::Delete);
         assert_eq!(
-            events[2].before,
-            Some(serde_json::json!({"id": "1", "name": "alice-v2"}))
+            events[2].before.row(),
+            Some(&serde_json::json!({"id": "1", "name": "alice-v2"}))
         );
         assert!(events[2].after.is_none(), "DELETE after should be None");
 
@@ -2160,8 +2164,8 @@ mod tests {
         assert_eq!(events2.len(), 1);
         assert_eq!(events2[0].op, Operation::Update);
         assert_eq!(
-            events2[0].before,
-            Some(serde_json::json!({"id": "1", "name": "alice"}))
+            events2[0].before.row(),
+            Some(&serde_json::json!({"id": "1", "name": "alice"}))
         );
         assert_eq!(
             events2[0].after,
@@ -2675,7 +2679,7 @@ mod tests {
     #[test]
     fn dedup_overlap_events_by_pk_keeps_last_event_per_pk() {
         let base = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1, "v": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -2690,14 +2694,12 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
 
         let mut updated = base.clone();
         updated.op = Operation::Update;
-        updated.before = Some(serde_json::json!({"id": 1, "v": 1}));
+        updated.before = BeforeImage::full(serde_json::json!({"id": 1, "v": 1}));
         updated.after = Some(serde_json::json!({"id": 1, "v": 2}));
         updated.source.offset = "0x000000230000015A0002".into();
 

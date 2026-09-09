@@ -295,6 +295,7 @@ impl ConformanceTest for NotImplementedConformanceTest {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::io::Write;
 
     use serde_json::json;
@@ -313,7 +314,7 @@ mod tests {
 
     fn event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -328,9 +329,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

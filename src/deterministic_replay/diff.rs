@@ -2,7 +2,7 @@
 ///
 /// Compares events at the semantic level (table, operation, key fields)
 /// rather than raw JSON comparison, which reduces noise and highlights real regressions.
-use crate::core::Event;
+use crate::core::{BeforeImage, Event};
 use serde::{Deserialize, Serialize};
 
 /// Diff level: what kind of change was detected.
@@ -180,23 +180,27 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
     }
 
     // Data field diffs (after, before)
-    let after_diff = compare_json_fields(&old.after, &new.after, "after");
+    let after_diff = compare_json_fields(old.after.as_ref(), new.after.as_ref(), "after");
     diffs.extend(after_diff);
 
-    let before_diff = compare_json_fields(&old.before, &new.before, "before");
+    let before_diff = compare_json_fields(old.before.row(), new.before.row(), "before");
     diffs.extend(before_diff);
 
-    if old.before_is_key_only != new.before_is_key_only {
+    // The *shape* of the pre-image, not just its contents. A golden that recorded a
+    // complete pre-image and now replays a key-only one has silently lost every non-key
+    // column, and comparing the rows alone would report that as an ordinary value change.
+    if before_shape(&old.before) != before_shape(&new.before) {
         diffs.push(
             EventDiff::new(
                 DiffLevel::Semantic,
                 format!(
-                    "before_is_key_only changed from {} to {}",
-                    old.before_is_key_only, new.before_is_key_only
+                    "before-image shape changed from {} to {}",
+                    before_shape(&old.before),
+                    before_shape(&new.before)
                 ),
                 vec![],
             )
-            .with_path("before_is_key_only"),
+            .with_path("before"),
         );
     }
 
@@ -223,13 +227,13 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
     for (field, old_columns, new_columns) in [
         (
             "unavailable_columns",
-            &old.unavailable_columns,
-            &new.unavailable_columns,
+            old.unavailable_columns.as_slice(),
+            new.unavailable_columns.as_slice(),
         ),
         (
             "before_unavailable_columns",
-            &old.before_unavailable_columns,
-            &new.before_unavailable_columns,
+            old.before.unavailable_columns(),
+            new.before.unavailable_columns(),
         ),
     ] {
         if old_columns != new_columns {
@@ -305,10 +309,19 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
     diffs
 }
 
+/// The variant name of a pre-image, for reporting a change of shape.
+fn before_shape(image: &BeforeImage) -> &'static str {
+    match image {
+        BeforeImage::Unavailable => "unavailable",
+        BeforeImage::KeyOnly { .. } => "key_only",
+        BeforeImage::Full { .. } => "full",
+    }
+}
+
 /// Compare two optional JSON values semantically.
 fn compare_json_fields(
-    old: &Option<serde_json::Value>,
-    new: &Option<serde_json::Value>,
+    old: Option<&serde_json::Value>,
+    new: Option<&serde_json::Value>,
     field_name: &str,
 ) -> Vec<EventDiff> {
     let mut diffs = Vec::new();
@@ -395,7 +408,7 @@ mod tests {
     #[test]
     fn semantic_diff_detects_operation_changes() {
         let old = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -410,9 +423,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
 
         let mut new = old.clone();
@@ -426,7 +437,7 @@ mod tests {
     #[test]
     fn semantic_diff_detects_table_changes() {
         let old = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -441,9 +452,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
 
         let mut new = old.clone();
@@ -466,6 +475,7 @@ mod tests {
 #[cfg(test)]
 mod field_coverage_tests {
     use super::{semantic_diff, DiffLevel};
+    use crate::core::BeforeImage;
     use crate::core::{
         Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
         EVENT_ENVELOPE_VERSION,
@@ -478,7 +488,6 @@ mod field_coverage_tests {
             .ts(1)
             .before(serde_json::json!({ "id": "1" }))
             .after(serde_json::json!({ "id": "1", "total": "10" }))
-            .before_is_key_only(true)
             .primary_key(["id"])
             .transaction(TransactionMetadata::new(42, 0, None))
             .snapshot(SnapshotMetadata::new("incremental-1", 3, false))
@@ -514,8 +523,17 @@ mod field_coverage_tests {
             (
                 "before_unavailable_columns",
                 Box::new(|event: &mut Event| {
-                    event.before_is_key_only = true;
-                    event.before_unavailable_columns = vec!["body".into()];
+                    event.before =
+                        BeforeImage::full_with_holes(serde_json::json!({ "id": "1" }), ["body"]);
+                }),
+            ),
+            (
+                // The shape of the pre-image is its own contract. A golden that recorded a
+                // complete row and now replays a key-only one has lost every non-key column,
+                // and comparing only the rows would report that as an ordinary value change.
+                "before",
+                Box::new(|event: &mut Event| {
+                    event.before = BeforeImage::key_only(serde_json::json!({ "id": "1" }));
                 }),
             ),
             (

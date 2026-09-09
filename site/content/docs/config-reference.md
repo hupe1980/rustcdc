@@ -56,10 +56,11 @@ failure visible rather than to keep the pipeline running through one.
 | `max_poll_wait_ms` | `u64` | 5 000 | How long `poll_event_batch` waits before returning an empty batch. |
 | `max_event_bytes` | `Option<usize>` | `None` | Upper bound on serialized bytes per batch. `None` relies on `max_buffer_size` alone — which is a poor proxy when row sizes vary by orders of magnitude. |
 | `transform_error_policy` | `TransformErrorPolicy` | `Halt` | What a failing transform does. `Halt` preserves failure visibility; `Skip` requires a `dead_letter_handler`. |
-| `dead_letter_handler` | `Option<Arc<dyn Fn(Event, Error)>>` | `None` | Invoked for events discarded under `Skip`. Mandatory with that policy — a skipped event is otherwise unrecoverable. |
+| `dead_letter_handler` | `Option<Arc<dyn Fn(Event, Error)>>` | `None` | Invoked for events discarded under `TransformErrorPolicy::Skip` or `ValidationErrorPolicy::Quarantine`. Mandatory with either — a discarded event is otherwise unrecoverable. |
 | `post_commit_source_confirm_policy` | `PostCommitSourceConfirmPolicy` | `FailFast` | Behaviour when source confirmation fails *after* the durable checkpoint commit. `FailFast` surfaces the divergence; `Continue` is the availability-biased opt-in. |
 | `idempotency` | `Option<IdempotencyOptions>` | on, 100 000 keys | Runtime duplicate suppression. Disable with `with_idempotency_disabled()`. |
 | `validate_events` | `bool` | `true` | Enforce the event envelope contract on every event. |
+| `validation_error_policy` | `ValidationErrorPolicy` | `Halt` | What an event failing envelope validation does. `Halt` stops the pipeline; `Quarantine` routes it to the `dead_letter_handler` and advances past it, and requires that handler. |
 | `schema_history_retention` | `Option<SchemaHistoryRetention>` | `keep_last(256)` | Bounds unbounded schema-history growth. |
 | `connection_retry` | `Option<ConnectionRetryPolicy>` | enabled | Jittered exponential back-off for recoverable source connection errors. `None` propagates immediately. |
 | `sink_close_timeout_ms` | `Option<u64>` | `None` | Timeout applied to a registered sink's `close` during orderly shutdown. |

@@ -1102,6 +1102,7 @@ fn validate_export_signature(
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1159,7 +1160,7 @@ mod tests {
 
     fn minimal_event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1, "name": "alice"})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -1174,9 +1175,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

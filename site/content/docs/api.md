@@ -374,41 +374,63 @@ out-of-band would race concurrent writes and return a value from a different poi
 
 > ⚠️ **`REPLICA IDENTITY FULL` does not avoid this.** Replica identity governs the *old*
 > tuple only. The after-image still omits unmodified TOASTed values under every replica
-> identity setting. `FULL` gives you a complete before-image (see `before_is_key_only`
-> below); it does not make `after` complete.
+> identity setting. `FULL` gives you a `BeforeImage::Full` (see `before` below); it does not
+> make `after` complete.
 
 This is also why the failure mode is so late-breaking: it only begins once rows cross the
 TOAST threshold, typically long after the pipeline was validated against small test rows.
 
-##### `before_unavailable_columns: Vec<String>`
+##### `before: BeforeImage`
 
-The same thing for the `before` image, tracked **separately**, because the two sets are not
-the same. A TOASTed column that *was* modified arrives present in `after` and absent from
-`before`. Merging the lists would mark a column that genuinely changed as unwritable and
-silently drop the update — so they are never merged.
+The pre-image is one typed field, not a nullable row plus two descriptors. It has exactly three
+shapes:
 
-**Every codec carries all three fields.** JSON, Avro, Protobuf and CloudEvents each emit
-`before_is_key_only`, `unavailable_columns` and `before_unavailable_columns`, and the Avro and
-Protobuf decoders read them back, so a consumer's contract does not depend on which output format
-it reads. Until 0.12.0 the CloudEvents encoder omitted `before_unavailable_columns`, which left its
-consumers unable to tell a TOASTed before-image column from a genuine `NULL` while consumers of the
-same stream in another format could.
+| Variant | Meaning | When you get it |
+|---|---|---|
+| `BeforeImage::Unavailable` | No pre-image at all | PostgreSQL `UPDATE` under `REPLICA IDENTITY DEFAULT` when no key column changed — the ordinary case on a stock table |
+| `BeforeImage::KeyOnly { key }` | Primary-key columns only | `REPLICA IDENTITY DEFAULT` when the key *did* change, and on `DELETE` |
+| `BeforeImage::Full { row, unavailable_columns }` | The complete prior row | `REPLICA IDENTITY FULL`; always on MySQL, MariaDB and SQL Server |
 
-Only relevant if you consume the before-image (computing diffs, building compensating
-writes). A column listed here had *some* prior value; the source could not report it. Do not
-read its absence as "was NULL".
+`Unavailable` is not an error path. Under the factory replica identity, an `UPDATE` that changes
+no key column genuinely has no before-image, and the envelope says so rather than failing. Do not
+read it as "the row did not exist" — it says nothing about the row.
 
-##### `before_is_key_only: bool`
+Read it with:
 
-`true` when `before` holds only the primary-key columns rather than a complete pre-image.
-Occurs on PostgreSQL `UPDATE`/`DELETE` when the table's `REPLICA IDENTITY` is `DEFAULT` (the
-PostgreSQL default). Code that computes row diffs or needs full prior state must check this —
-when `true`, `before` is not a row snapshot. Set `REPLICA IDENTITY FULL` on the table to get a
-complete before-image, at the cost of larger WAL volume and therefore more replication-slot
-retention pressure.
+- **`row()`** — any prior column values, complete or not. Correct for resolving a key.
+- **`full_row()`** — `Some` only for a complete row; `None` for both other variants. Correct for
+  computing a diff or emitting a pre-image downstream. `Event::has_full_before()` is the same
+  predicate as a bool.
 
-`before_unavailable_columns` is always empty when this is `true`: a key-only before-image
-omits its non-key columns by design, not because of TOAST.
+The difference is the bug this type exists to prevent: treating a key-only image as a whole row
+reads every absent column as a deletion.
+
+Set `REPLICA IDENTITY FULL` on a table to get complete before-images, at the cost of larger WAL
+volume and therefore more replication-slot retention pressure.
+
+###### `Full { unavailable_columns }`
+
+The `unavailable_columns` of a `Full` pre-image is the before-image equivalent of
+[`Event::unavailable_columns`](#unavailable-columns-vec-string), tracked **separately**, because
+the two sets are not the same. A TOASTed column that *was* modified arrives present in `after` and
+absent from `before`. Merging the lists would mark a column that genuinely changed as unwritable
+and silently drop the update — so they are never merged.
+
+It hangs off `Full` alone, which is where it was ever meaningful: a key-only image omits its
+non-key columns *by design*, not because of TOAST, and the two kinds of absence must not be
+conflated. Under the previous representation that was a validation rule; now it is unrepresentable.
+
+Only relevant if you consume the before-image (computing diffs, building compensating writes). A
+column listed here had *some* prior value; the source could not report it. Do not read its absence
+as "was NULL".
+
+**The wire format is unchanged and every codec carries all three fields.** JSON, Avro, Protobuf
+and CloudEvents each emit `before`, `before_is_key_only` and `before_unavailable_columns`, and the
+decoders read them back through one shared constructor, so a consumer's contract does not depend
+on which output format it reads — and a self-contradictory envelope is refused identically
+whichever codec carried it. Until 0.12.0 the CloudEvents encoder omitted
+`before_unavailable_columns`, which left its consumers unable to tell a TOASTed before-image column
+from a genuine `NULL` while consumers of the same stream in another format could.
 
 ## Delivery And Acknowledgement Semantics
 

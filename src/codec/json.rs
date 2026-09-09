@@ -84,11 +84,12 @@ pub type JsonCodec = EncoderCodec<JsonEncoder>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::BeforeImage;
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
 
     fn event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1, "name": "alice"})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -103,9 +104,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

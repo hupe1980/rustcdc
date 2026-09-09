@@ -234,6 +234,7 @@ impl Transform for RouteTransform {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use ahash::AHashMap as HashMap;
 
     use serde_json::json;
@@ -245,7 +246,7 @@ mod tests {
 
     fn event(table: &str) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -260,9 +261,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -475,7 +474,7 @@ mod tests {
         .unwrap();
 
         let mut e = crate::core::Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: None,
             op: crate::core::Operation::Truncate,
             source: crate::core::SourceMetadata {
@@ -490,9 +489,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());
         assert!(

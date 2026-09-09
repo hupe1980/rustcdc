@@ -1838,6 +1838,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::{
         collections::VecDeque,
         sync::{
@@ -3000,7 +3001,7 @@ mod tests {
 
     fn handoff_event(offset: &str, id: i64) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": id, "v": format!("value-{id}")})),
             op: crate::core::Operation::Update,
             source: crate::core::SourceMetadata {
@@ -3019,9 +3020,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

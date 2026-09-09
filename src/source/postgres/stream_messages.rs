@@ -1,6 +1,6 @@
 use crate::{
     core::{
-        Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
+        BeforeImage, Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
         EVENT_ENVELOPE_VERSION,
     },
     ddl_capture::CapturedDdl,
@@ -239,10 +239,9 @@ impl PostgresStreamHandle {
         let (after, unavailable_columns) =
             self.tuple_to_json(insert.relation_oid, &insert.new_tuple)?;
         Ok(Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(after),
             op: Operation::Insert,
-            before_unavailable_columns: Vec::new(),
             source: self.source_meta(lsn),
             ts: self.current_commit_ts,
             schema: self.relation_schema(insert.relation_oid),
@@ -251,7 +250,6 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns,
         })
     }
@@ -260,43 +258,43 @@ impl PostgresStreamHandle {
         let (after, unavailable_columns) =
             self.tuple_to_json(update.relation_oid, &update.new_tuple)?;
 
-        // If `old_tuple` is present we have the full pre-image (REPLICA IDENTITY FULL).
-        // Otherwise fall back to `key_tuple` which contains only PK columns
-        // (REPLICA IDENTITY DEFAULT). In the fallback case we set `before_is_key_only`
-        // so consumers know not to treat the before image as a complete row.
-        let (before, before_is_key_only, mut before_unavailable_columns) =
-            match update.old_tuple.as_deref() {
+        // The three shapes pgoutput can send map one-to-one onto `BeforeImage`, so the
+        // replica identity of the table is read straight off the message rather than
+        // inferred downstream from a nullable row plus a flag.
+        let before = match update.old_tuple.as_deref() {
+            // `O`: REPLICA IDENTITY FULL — a complete pre-image.
+            //
+            // It has TOAST holes of its own, and they are NOT the same set as the
+            // after-image's. A TOASTed column that *was* modified arrives present in
+            // `after` and `'u'` in `before`. Merging the two lists would mark that column
+            // unavailable, and a correct sink would then skip writing a value that
+            // genuinely changed — silent data loss. `BeforeImage` keeps them separate by
+            // construction: only `Full` carries a hole list at all.
+            Some(tuple) => {
+                let (row, unavailable) = self.tuple_to_json(update.relation_oid, tuple)?;
+                BeforeImage::full_with_holes(row, unavailable)
+            }
+            None => match update.key_tuple.as_deref() {
+                // `K`: REPLICA IDENTITY DEFAULT and the statement changed a key column.
+                // A key-only pre-image omits non-key columns by design, so it carries no
+                // hole list — reporting them as TOAST holes would conflate two different
+                // kinds of absence.
                 Some(tuple) => {
-                    // With REPLICA IDENTITY FULL the before-image has TOAST holes of its
-                    // own, and they are NOT the same set as the after-image's. A TOASTed
-                    // column that *was* modified arrives present in `after` and `'u'` in
-                    // `before`. Merging the two lists would mark that column unavailable,
-                    // and a correct sink would then skip writing a value that genuinely
-                    // changed — silent data loss. Keep them separate.
-                    let (before, before_unavailable) =
-                        self.tuple_to_json(update.relation_oid, tuple)?;
-                    (Some(before), false, before_unavailable)
+                    BeforeImage::key_only(self.tuple_to_json(update.relation_oid, tuple)?.0)
                 }
-                None => match update.key_tuple.as_deref() {
-                    // A key-only before-image omits non-key columns by design. Reporting
-                    // them as TOAST holes would conflate two different kinds of absence.
-                    Some(tuple) => (
-                        Some(self.tuple_to_json(update.relation_oid, tuple)?.0),
-                        true,
-                        Vec::new(),
-                    ),
-                    None => (None, false, Vec::new()),
-                },
-            };
-        before_unavailable_columns.sort_unstable();
-        before_unavailable_columns.dedup();
+                // Neither: REPLICA IDENTITY DEFAULT with no key column in the SET list.
+                // There is genuinely no pre-image. This is the ordinary shape of an UPDATE
+                // on a stock PostgreSQL table, not a defect — the envelope must be able to
+                // say so without the runtime rejecting it.
+                None => BeforeImage::Unavailable,
+            },
+        };
 
         Ok(Event {
             before,
             after: Some(after),
             op: Operation::Update,
             unavailable_columns,
-            before_unavailable_columns,
             source: self.source_meta(lsn),
             ts: self.current_commit_ts,
             schema: self.relation_schema(update.relation_oid),
@@ -305,7 +303,6 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only,
         })
     }
 
@@ -313,27 +310,26 @@ impl PostgresStreamHandle {
         // A DELETE carries no after-image, so every TOAST hole here belongs to `before`.
         // Reporting them in `unavailable_columns` would describe a payload that does not
         // exist, and hide the gap from the consumers that actually read the pre-image.
-        let (before, before_is_key_only, before_unavailable_columns) =
-            match delete.old_tuple.as_deref() {
+        let before = match delete.old_tuple.as_deref() {
+            Some(tuple) => {
+                let (row, unavailable) = self.tuple_to_json(delete.relation_oid, tuple)?;
+                BeforeImage::full_with_holes(row, unavailable)
+            }
+            None => match delete.key_tuple.as_deref() {
                 Some(tuple) => {
-                    let (before, unavailable) = self.tuple_to_json(delete.relation_oid, tuple)?;
-                    (Some(before), false, unavailable)
+                    BeforeImage::key_only(self.tuple_to_json(delete.relation_oid, tuple)?.0)
                 }
-                None => match delete.key_tuple.as_deref() {
-                    Some(tuple) => (
-                        Some(self.tuple_to_json(delete.relation_oid, tuple)?.0),
-                        true,
-                        Vec::new(),
-                    ),
-                    None => (None, false, Vec::new()),
-                },
-            };
+                // PostgreSQL refuses UPDATE and DELETE on a published table with
+                // REPLICA IDENTITY NOTHING, so this arm is unreachable in practice —
+                // but the envelope models it rather than inventing a pre-image.
+                None => BeforeImage::Unavailable,
+            },
+        };
         Ok(Event {
             before,
             after: None,
             op: Operation::Delete,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns,
             source: self.source_meta(lsn),
             ts: self.current_commit_ts,
             schema: self.relation_schema(delete.relation_oid),
@@ -342,7 +338,6 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only,
         })
     }
 
@@ -351,7 +346,7 @@ impl PostgresStreamHandle {
             .relation_oids
             .iter()
             .map(|&oid| Event {
-                before: None,
+                before: BeforeImage::Unavailable,
                 after: None,
                 op: Operation::Truncate,
                 source: self.source_meta(lsn),
@@ -362,9 +357,7 @@ impl PostgresStreamHandle {
                 snapshot: None,
                 transaction: self.tx_meta(),
                 envelope_version: EVENT_ENVELOPE_VERSION,
-                before_is_key_only: false,
                 unavailable_columns: Vec::new(),
-                before_unavailable_columns: Vec::new(),
             })
             .collect()
     }

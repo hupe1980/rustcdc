@@ -18,7 +18,8 @@
 //! avoids by forcing `FULL`.
 
 use rustcdc::{
-    core::Operation, source::Source, PostgresConnection, PostgresSourceConfig, RowWrite,
+    core::Operation, source::Source, BeforeImage, PostgresConnection, PostgresSourceConfig,
+    RowWrite,
 };
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -338,19 +339,21 @@ async fn postgres_replica_identity_default_reports_key_only_before_image() -> ru
     assert_eq!(after.get("name").and_then(|v| v.as_str()), Some("alice-v2"));
     assert_eq!(after.get("notes").and_then(|v| v.as_str()), Some("first"));
 
-    // Under DEFAULT the before-image is key-only (or absent when the key did not
-    // change). Whenever it IS present, the envelope must say it is not a full row —
-    // otherwise a consumer computing a diff silently treats missing columns as changes.
-    if let Some(before) = update.before.as_ref() {
-        assert!(
-            update.before_is_key_only,
-            "a key-only before-image must be flagged: {before}"
-        );
-        assert!(
-            before.get("id").is_some(),
-            "a key-only before-image must still carry the key: {before}"
-        );
-    }
+    // This UPDATE changes `name`, not the key, so under DEFAULT pgoutput sends neither an
+    // `O` nor a `K` old tuple and there is genuinely no pre-image.
+    //
+    // Asserted unconditionally. This was previously guarded behind `if let Some(before)`,
+    // which meant the case it was written to cover — an absent pre-image — skipped the
+    // block entirely and the test passed while the runtime rejected the very same event.
+    assert_eq!(
+        update.before,
+        BeforeImage::Unavailable,
+        "an update that leaves the key untouched has no before-image under DEFAULT"
+    );
+    assert!(
+        !update.has_full_before(),
+        "an absent pre-image is never a full row"
+    );
 
     // The event key must resolve in both phases regardless of replica identity —
     // this is what downstream compaction and upserts depend on.
@@ -371,7 +374,7 @@ async fn postgres_replica_identity_default_reports_key_only_before_image() -> ru
     assert!(
         delete
             .before
-            .as_ref()
+            .row()
             .and_then(|before| before.get("id"))
             .is_some(),
         "a DELETE must identify the row it removed"

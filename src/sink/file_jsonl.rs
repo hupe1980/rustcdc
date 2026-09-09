@@ -406,6 +406,7 @@ impl SinkAdapter for FileJsonlSink {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use std::io::BufRead;
 
     use tempfile::NamedTempFile;
@@ -417,7 +418,7 @@ mod tests {
 
     fn make_event(table: &str) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -432,9 +433,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

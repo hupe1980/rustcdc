@@ -91,7 +91,7 @@ use async_trait::async_trait;
 use crate::{
     checkpoint::Checkpoint,
     core::{
-        Error, Event, Offset, Operation, Result, SnapshotMetadata, SourceMetadata,
+        BeforeImage, Error, Event, Offset, Operation, Result, SnapshotMetadata, SourceMetadata,
         EVENT_ENVELOPE_VERSION,
     },
     source::{
@@ -456,7 +456,7 @@ fn event_fingerprint(event: &Event) -> Option<String> {
     if pk_columns.is_empty() {
         return None;
     }
-    let payload = event.after.as_ref().or(event.before.as_ref())?;
+    let payload = event.after.as_ref().or(event.before.row())?;
     Some(fingerprint_from_payload(&event.table, pk_columns, payload))
 }
 
@@ -866,7 +866,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         let table = &self.tables[table_idx].spec;
         let now = crate::source::helpers::now_millis();
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(row),
             op: Operation::Read,
             source: SourceMetadata {
@@ -900,9 +900,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -1076,11 +1074,11 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         // Read the shadow *before* folding this event in: the before-image's holes describe
         // the state prior to the event, which is what the shadow currently holds.
         let mut unfilled = Vec::new();
-        let mut fill = |columns: &mut Vec<String>, image: &mut Option<serde_json::Value>| {
+        let mut fill = |columns: &mut Vec<String>, image: Option<&mut serde_json::Value>| {
             if columns.is_empty() {
                 return;
             }
-            let Some(object) = image.as_mut().and_then(serde_json::Value::as_object_mut) else {
+            let Some(object) = image.and_then(serde_json::Value::as_object_mut) else {
                 return;
             };
             columns.retain(|column| match shadow.get(column) {
@@ -1097,8 +1095,12 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                 }
             });
         };
-        fill(&mut event.before_unavailable_columns, &mut event.before);
-        fill(&mut event.unavailable_columns, &mut event.after);
+        // One borrow for the pair: only a `Full` pre-image has holes to fill, and its row
+        // and hole list must be edited together or the event ends up self-contradictory.
+        if let Some((row, columns)) = event.before.full_parts_mut() {
+            fill(columns, Some(row));
+        }
+        fill(&mut event.unavailable_columns, event.after.as_mut());
 
         // Fold this event's values into the shadow so a later in-bracket event that omits a
         // column this one wrote is repaired to the new value rather than the chunk's.
@@ -1462,7 +1464,7 @@ mod tests {
 
     fn event_with_key(table: &str, id: i64) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({ "id": id, "name": "x" })),
             op: Operation::Update,
             source: SourceMetadata {
@@ -1477,9 +1479,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -1542,7 +1542,10 @@ mod tests {
     #[test]
     fn a_delete_event_fingerprints_from_its_before_image() {
         let mut event = event_with_key("users", 5);
-        event.before = event.after.take();
+        event.before = event
+            .after
+            .take()
+            .map_or(BeforeImage::Unavailable, BeforeImage::full);
         event.op = Operation::Delete;
         assert_eq!(
             event_fingerprint(&event).expect("delete carries a before image"),
@@ -1878,7 +1881,7 @@ mod tests {
                 let id = event
                     .after
                     .as_ref()
-                    .or(event.before.as_ref())
+                    .or(event.before.row())
                     .and_then(|row| row["id"].as_i64())
                     .unwrap_or_default();
                 format!("{}:{id}", event.op)
@@ -2962,8 +2965,7 @@ mod partial_payload_repair_tests {
         // `a_repaired_event_still_validates` tests the repair rather than the fixture.
         event.ts = 1;
         event.source.timestamp = 1;
-        event.before = Some(json!({ "id": id }));
-        event.before_is_key_only = true;
+        event.before = BeforeImage::key_only(json!({ "id": id }));
         // `body` is the unchanged-TOAST column: absent, not null.
         event.after = Some(json!({ "id": id, "title": title }));
         event.unavailable_columns = vec!["body".to_string()];
@@ -3033,8 +3035,7 @@ mod partial_payload_repair_tests {
     async fn a_later_event_is_filled_from_an_earlier_events_value_not_the_chunks() {
         let mut wrote_body = stream_event_at("users", 1, 104);
         wrote_body.op = Operation::Update;
-        wrote_body.before = Some(json!({ "id": 1 }));
-        wrote_body.before_is_key_only = true;
+        wrote_body.before = BeforeImage::key_only(json!({ "id": 1 }));
         wrote_body.after = Some(json!({ "id": 1, "title": "mid", "body": "rewritten" }));
 
         let (mut driver, _reads) = driver_with(
@@ -3064,9 +3065,8 @@ mod partial_payload_repair_tests {
     async fn a_partial_before_image_is_filled_from_the_pre_event_state() {
         let mut event = stream_event_at("users", 1, 105);
         event.op = Operation::Update;
-        event.before = Some(json!({ "id": 1, "title": "old" }));
+        event.before = BeforeImage::full_with_holes(json!({ "id": 1, "title": "old" }), ["body"]);
         event.after = Some(json!({ "id": 1, "title": "new", "body": "fresh" }));
-        event.before_unavailable_columns = vec!["body".to_string()];
 
         let (mut driver, _reads) = driver_with(
             vec![json!({ "id": 1, "title": "old", "body": "prior" })],
@@ -3078,9 +3078,9 @@ mod partial_payload_repair_tests {
 
         let emitted = drain(&mut driver).await;
         let update = delivered_update(&emitted, 1);
-        assert!(update.before_unavailable_columns.is_empty());
+        assert!(update.before.unavailable_columns().is_empty());
         assert_eq!(
-            update.before.as_ref().unwrap()["body"],
+            update.before.row().unwrap()["body"],
             json!("prior"),
             "the before-image must be filled from the state before the event, not after it"
         );

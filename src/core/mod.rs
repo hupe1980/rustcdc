@@ -22,8 +22,8 @@ pub use error::{
     SourceErrorKind,
 };
 pub use event::{
-    Event, EventBuilder, NoRowWrite, Operation, RowWrite, SnapshotMetadata, SourceMetadata,
-    TransactionMetadata, ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
+    BeforeImage, Event, EventBuilder, NoRowWrite, Operation, RowWrite, SnapshotMetadata,
+    SourceMetadata, TransactionMetadata, ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
 pub use idempotency::{
     fingerprint_event_stable, fingerprint_event_transient, EventIdempotencyGuard,
@@ -36,7 +36,7 @@ pub use runtime::{
     AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, HealthVerdict,
     IdempotencyOptions, PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig,
     RuntimeControl, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
-    TransactionBoundaryPolicy, TransformErrorPolicy,
+    TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
 #[cfg(feature = "tls")]

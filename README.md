@@ -39,7 +39,7 @@ server.
 
 ## Status
 
-**Pre-1.0.** Latest published release is 0.12.0; 0.13.0 is in development and is a breaking
+**Pre-1.0.** Latest published release is 0.12.0; 0.14.0 is in development and is a breaking
 release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are validated by
 1161 unit tests, 136 documentation samples compiled as doctests, 41 deterministic-replay golden
 fixtures, and 61 integration suites, the

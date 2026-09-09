@@ -99,6 +99,8 @@ pub struct RuntimeOptions {
     pub idempotency: Option<IdempotencyOptions>,
     /// Whether to enforce canonical event-envelope validation before buffering.
     pub validate_events: bool,
+    /// What to do with an event that fails envelope validation at runtime ingress.
+    pub validation_error_policy: ValidationErrorPolicy,
     /// Optional schema-history retention policy applied after DDL persistence.
     pub schema_history_retention: Option<SchemaHistoryRetention>,
     /// Optional retry policy applied when a recoverable source error occurs during streaming.
@@ -201,6 +203,7 @@ impl Default for RuntimeOptions {
             max_buffer_size: 10_000,
             max_poll_wait_ms: 5_000,
             transform_error_policy: TransformErrorPolicy::Halt,
+            validation_error_policy: ValidationErrorPolicy::Halt,
             // Correctness-first default: fail fast if source confirmation fails
             // after durable checkpoint commit so operators see divergence immediately.
             post_commit_source_confirm_policy: PostCommitSourceConfirmPolicy::FailFast,
@@ -292,6 +295,12 @@ impl RuntimeOptions {
     /// Enable or disable canonical event-envelope validation at runtime ingress.
     pub fn with_event_validation(mut self, enabled: bool) -> Self {
         self.validate_events = enabled;
+        self
+    }
+
+    /// Choose what happens to an event that fails envelope validation.
+    pub fn with_validation_error_policy(mut self, policy: ValidationErrorPolicy) -> Self {
+        self.validation_error_policy = policy;
         self
     }
 
@@ -1182,13 +1191,13 @@ impl EventBatch {
         self.events().iter().map(|e| e.ts).max()
     }
 
-    /// Returns `true` if any event in this batch has `before_is_key_only == true`.
+    /// Returns `true` if any event in this batch carries a key-only pre-image.
     ///
     /// Use this to decide whether to fetch full pre-images from the source before
     /// computing row diffs. When this returns `true`, at least one UPDATE or DELETE
     /// event in the batch carries only primary-key columns in `before`.
     pub fn has_key_only_befores(&self) -> bool {
-        self.events().iter().any(|e| e.before_is_key_only)
+        self.events().iter().any(|e| e.before.is_key_only())
     }
 
     /// Returns an iterator over references to events in this batch.
@@ -1330,6 +1339,48 @@ pub enum TransformErrorPolicy {
     Skip,
 }
 
+/// What the runtime does with an event that fails envelope validation at ingress.
+///
+/// Validation runs *before* a sink ever sees the event, so a permanently invalid event was
+/// previously unreachable by the dead-letter handler: the poll returned `Err` and the
+/// pipeline stopped. Because the source's durable position cannot advance past an event
+/// that was never accepted, a restart replayed the same record and stopped again — an
+/// unrecoverable loop whose only exits were data loss or disabling validation entirely.
+///
+/// [`Quarantine`](ValidationErrorPolicy::Quarantine) closes that: the offending event is
+/// routed to the dead-letter handler and the pipeline advances past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ValidationErrorPolicy {
+    /// Surface the error to the caller and stop. The default, and the safe choice.
+    ///
+    /// Correct when an invalid envelope means a connector bug you want to catch loudly.
+    /// It does mean a single permanently-invalid record halts the pipeline for good.
+    #[default]
+    Halt,
+    /// Route the failing event to the dead-letter handler and continue.
+    ///
+    /// **This loses the event from the stream.** It never reaches the commit barrier, so
+    /// it gets no offset — but the events after it do, and the checkpoint persists the
+    /// last accepted offset, which is *past* the quarantined one. It is therefore never
+    /// replayed.
+    ///
+    /// Selecting this requires a `dead_letter_handler`, so the loss is a deliberate,
+    /// captured routing decision rather than a `warn!` line, and every quarantine
+    /// increments `RuntimeAdminSnapshot::total_events_skipped`. Alert on any increase.
+    Quarantine,
+}
+
+impl ValidationErrorPolicy {
+    /// Human-readable description of the policy.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Halt => "halt on envelope validation error and return to caller",
+            Self::Quarantine => "route invalid event to the dead-letter handler and continue",
+        }
+    }
+}
+
 impl TransformErrorPolicy {
     /// Human-readable description of the policy.
     pub fn description(&self) -> &'static str {
@@ -1457,6 +1508,12 @@ impl RuntimeConfig {
     ///
     /// Errors during transform execution include the transform's name and the event ID,
     /// enabling quick diagnosis. All failed events are logged regardless of policy.
+    pub fn with_validation_error_policy(mut self, policy: ValidationErrorPolicy) -> Self {
+        self.options = self.options.with_validation_error_policy(policy);
+        self
+    }
+
+    /// Runtime behaviour when a transform stage returns an error.
     pub fn with_transform_error_policy(mut self, policy: TransformErrorPolicy) -> Self {
         self.options = self.options.with_transform_error_policy(policy);
         self
@@ -1835,6 +1892,24 @@ impl CdcRuntime {
             ));
         }
 
+        // Same reasoning as `TransformErrorPolicy::Skip` above: the checkpoint advances
+        // past a quarantined event, so without a handler it is lost permanently.
+        if matches!(
+            config.options.validation_error_policy,
+            ValidationErrorPolicy::Quarantine
+        ) && config.options.dead_letter_handler.is_none()
+        {
+            return Err(Error::ConfigError(
+                "ValidationErrorPolicy::Quarantine requires a dead-letter handler. An \
+                 invalid event is dropped *and* the checkpoint advances past it, so it is \
+                 never replayed — without a handler the event is lost permanently with only \
+                 a log line. Configure RuntimeOptions::with_dead_letter_handler(...) to \
+                 capture quarantined events, or use ValidationErrorPolicy::Halt to stop on \
+                 validation errors."
+                    .into(),
+            ));
+        }
+
         let capabilities = config.source.capabilities();
         // Skip capability checks for Disabled sources (used in tests with mock sources).
         if !matches!(config.source, RuntimeSourceConfig::Disabled) {
@@ -2014,6 +2089,7 @@ pub use control::RuntimeControl;
 
 #[cfg(test)]
 mod tests {
+    use crate::core::{BeforeImage, ValidationErrorPolicy};
     #[cfg(feature = "encryption")]
     use ahash::AHashMap as HashMap;
     use async_trait::async_trait;
@@ -2053,7 +2129,7 @@ mod tests {
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or_default();
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1})),
             op: Operation::Read,
             source: SourceMetadata {
@@ -2068,9 +2144,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -2834,6 +2908,89 @@ mod tests {
             "the transform failure must reach the caller with its cause intact; got: {error:?}"
         );
         assert!(error.to_string().contains("fail_transform"));
+    }
+
+    /// The gap this closes: envelope validation runs upstream of every sink, so under the
+    /// default `Halt` a permanently-invalid event could reach no dead-letter handler *and*
+    /// could not be skipped — the source position never advances past an event that was
+    /// never accepted, so a restart replays it and halts again, forever.
+    #[tokio::test]
+    async fn validation_error_policy_quarantine_routes_to_dead_letter_and_advances() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::clone(&captured);
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
+                .with_validation_error_policy(ValidationErrorPolicy::Quarantine);
+        config.options = config
+            .options
+            .with_dead_letter_handler(move |_event, _error| {
+                sink.fetch_add(1, Ordering::Relaxed);
+            });
+        let mut runtime = CdcRuntime::new(config).unwrap();
+
+        // An INSERT carrying a before-image violates the envelope contract.
+        let mut invalid = event();
+        invalid.op = Operation::Insert;
+        invalid.before = BeforeImage::full(json!({"id": 1}));
+
+        let batch = runtime.buffer_and_deliver(vec![invalid, event()]).unwrap();
+
+        assert_eq!(
+            captured.load(Ordering::Relaxed),
+            1,
+            "quarantined exactly once"
+        );
+        assert_eq!(
+            batch.len(),
+            1,
+            "the valid event is still delivered; the pipeline advanced past the invalid one"
+        );
+        assert_eq!(runtime.admin_snapshot().total_events_skipped, 1);
+    }
+
+    /// The default stays `Halt`: an invalid envelope is a connector bug worth stopping for,
+    /// and quarantining by default would turn one into silent, unreviewed data loss.
+    #[tokio::test]
+    async fn validation_errors_halt_by_default() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+
+        let mut invalid = event();
+        invalid.op = Operation::Insert;
+        invalid.before = BeforeImage::full(json!({"id": 1}));
+
+        let error = runtime
+            .buffer_and_deliver(vec![invalid])
+            .expect_err("an invalid envelope must halt under the default policy");
+        assert!(matches!(
+            error.root_cause(),
+            crate::core::Error::ValidationError(_)
+        ));
+    }
+
+    /// Quarantine without a dead-letter handler is silent data loss, and is rejected —
+    /// the same rule `TransformErrorPolicy::Skip` follows, for the same reason.
+    #[tokio::test]
+    async fn validation_error_policy_quarantine_requires_a_dead_letter_handler() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history)
+            .with_validation_error_policy(ValidationErrorPolicy::Quarantine);
+
+        let error = match CdcRuntime::new(config) {
+            Err(error) => error,
+            Ok(_) => panic!("Quarantine without a dead-letter handler must be rejected"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("dead-letter handler"), "{message}");
+        assert!(message.contains("never replayed"), "{message}");
     }
 
     /// `Skip` without a dead-letter handler is silent data loss, and is rejected.
@@ -4186,7 +4343,7 @@ mod tests {
         let mut ddl_event = event();
         ddl_event.op = Operation::SchemaChange;
         ddl_event.table = "users".into();
-        ddl_event.before = None;
+        ddl_event.before = BeforeImage::Unavailable;
         // Shape matches what the connectors actually emit: the synthesized
         // schema-change payload carries `result_schema` alongside the statement.
         ddl_event.after = Some(serde_json::json!({
@@ -5983,7 +6140,7 @@ mod tests {
                 table: "orders".into(),
                 schema: Some("public".into()),
                 op: Operation::Update,
-                before: Some(json!({"id": 2})),
+                before: BeforeImage::full(json!({"id": 2})),
                 after: Some(json!({"id": 2, "name": "bob"})),
                 ts: 2,
                 source: SourceMetadata {

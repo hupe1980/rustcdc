@@ -2856,6 +2856,7 @@ pub mod glue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::BeforeImage;
 
     // ─── wire format ─────────────────────────────────────────────────────────
 
@@ -3677,7 +3678,7 @@ mod tests {
         let original = Event {
             after: Some(serde_json::json!({"id": 7, "name": "alice"})),
             op: Operation::Update,
-            before: Some(serde_json::json!({"id": 7, "name": "bob"})),
+            before: BeforeImage::full(serde_json::json!({"id": 7, "name": "bob"})),
             source: SourceMetadata {
                 source_name: "postgres".into(),
                 offset: "0/16B6A70".into(),
@@ -3761,6 +3762,7 @@ mod tests {
 #[cfg(test)]
 mod event_json_schema_tests {
     use super::EVENT_JSON_SCHEMA;
+    use crate::core::BeforeImage;
     use crate::core::{Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata};
     use serde_json::json;
 
@@ -3807,10 +3809,12 @@ mod event_json_schema_tests {
         // exactly the events whose correct handling this crate emphasises most.
         let event = Event::builder("users", Operation::Update)
             .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
-            .before(json!({ "id": 1 }))
+            .before_image(BeforeImage::full_with_holes(
+                json!({ "id": 1 }),
+                ["big_changed"],
+            ))
             .after(json!({ "id": 1, "name": "x" }))
             .unavailable_columns(["big_kept"])
-            .before_unavailable_columns(["big_changed"])
             .ts(1)
             .build();
         validate(&event).expect("a partial-payload event must validate");
@@ -3821,12 +3825,11 @@ mod event_json_schema_tests {
         let event = Event::builder("users", Operation::Read)
             .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
             .schema("public")
-            .before(json!({ "id": 1 }))
+            .before_key_only(json!({ "id": 1 }))
             .after(json!({ "id": 1 }))
             .primary_key(["id"])
             .snapshot(SnapshotMetadata::new("snap-1", 0, false))
             .transaction(TransactionMetadata::new(7, 1, Some(3)))
-            .before_is_key_only(true)
             .ts(1)
             .build();
         validate(&event).expect("a fully populated event must validate");

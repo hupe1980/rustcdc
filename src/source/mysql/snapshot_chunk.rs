@@ -1,5 +1,5 @@
 use crate::core::{
-    Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    BeforeImage, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
 };
 use crate::source::helpers::now_millis;
 
@@ -55,7 +55,7 @@ pub(super) async fn next_snapshot_chunk(
 
                 let ts = now_millis();
                 events.push(Event {
-                    before: None,
+                    before: BeforeImage::Unavailable,
                     after: Some(row_json),
                     op: Operation::Read,
                     source: SourceMetadata {
@@ -77,9 +77,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    before_is_key_only: false,
                     unavailable_columns: Vec::new(),
-                    before_unavailable_columns: Vec::new(),
                 });
             }
         } else {
@@ -95,7 +93,7 @@ pub(super) async fn next_snapshot_chunk(
                 let ts = now_millis();
 
                 events.push(Event {
-                    before: None,
+                    before: BeforeImage::Unavailable,
                     after: Some(row),
                     op: Operation::Read,
                     source: SourceMetadata {
@@ -117,9 +115,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    before_is_key_only: false,
                     unavailable_columns: Vec::new(),
-                    before_unavailable_columns: Vec::new(),
                 });
             }
 

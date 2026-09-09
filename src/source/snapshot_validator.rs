@@ -290,11 +290,12 @@ fn hash_json_value(value: &Value, hasher: &mut AHasher) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::BeforeImage;
     use crate::{SnapshotMetadata, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION};
 
     fn read_event(table: &str, pk_id: i64) -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": pk_id, "data": format!("row_{pk_id}")})),
             op: Operation::Read,
             source: SourceMetadata {
@@ -317,9 +318,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

@@ -2,7 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::core::{Error, Result};
@@ -336,6 +336,274 @@ impl From<ValidationErrors> for Error {
     }
 }
 
+/// The pre-image of a row, and how complete it is.
+///
+/// A CDC pre-image has exactly three shapes, and conflating them is the classic
+/// source of silent data loss. Modelling them as one enum makes the invalid
+/// combinations unrepresentable rather than merely rejected:
+///
+/// | Shape | Meaning |
+/// |---|---|
+/// | [`Unavailable`](BeforeImage::Unavailable) | The source supplied no pre-image at all |
+/// | [`KeyOnly`](BeforeImage::KeyOnly) | Only the primary-key columns are known |
+/// | [`Full`](BeforeImage::Full) | The complete prior row, minus any columns the source could not supply |
+///
+/// This replaces the earlier `Option<Value>` + `before_is_key_only` +
+/// `before_unavailable_columns` triple, in which `before: None` with
+/// `before_is_key_only: true` and a key-only image carrying TOAST holes were both
+/// expressible and had to be rejected at runtime. Neither can be built now.
+///
+/// # Which one you get
+///
+/// `Unavailable` is not an error path — it is the **ordinary** shape of a PostgreSQL
+/// UPDATE under the factory `REPLICA IDENTITY DEFAULT` when the statement changed no
+/// key column: pgoutput emits neither an `O` nor a `K` old tuple, so there is genuinely
+/// nothing to report. `KeyOnly` arrives under the same replica identity when the key
+/// *did* change, and on DELETE. `Full` needs `REPLICA IDENTITY FULL` on PostgreSQL, and
+/// is what MySQL, MariaDB and SQL Server always provide.
+///
+/// # Reading one
+///
+/// Use [`row`](BeforeImage::row) when any prior column values will do (computing a key,
+/// say) and [`full_row`](BeforeImage::full_row) when only a complete row is correct
+/// (computing a diff, or emitting a pre-image downstream). The difference is the bug:
+/// treating a key-only image as a whole row reads every absent column as a deletion.
+///
+/// ```
+/// use rustcdc::BeforeImage;
+/// use serde_json::json;
+///
+/// let full = BeforeImage::full(json!({"id": 1, "name": "alice"}));
+/// assert!(full.full_row().is_some());
+///
+/// let key_only = BeforeImage::key_only(json!({"id": 1}));
+/// assert!(key_only.row().is_some());   // the key is there
+/// assert!(key_only.full_row().is_none()); // but it is not a row
+///
+/// assert!(BeforeImage::Unavailable.row().is_none());
+/// ```
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
+pub enum BeforeImage {
+    /// The source supplied no pre-image.
+    ///
+    /// Consumers that need prior state cannot recover it from the event, and must not
+    /// read this as "the row did not exist" — it says nothing about the row.
+    #[default]
+    Unavailable,
+    /// Only the primary-key columns of the prior row.
+    ///
+    /// Enough to address the row, never enough to reconstruct it. Non-key columns are
+    /// absent **by design**, which is why this variant carries no unavailable-column
+    /// list: that list describes columns missing by accident (TOAST), and merging the
+    /// two kinds of absence loses the distinction.
+    KeyOnly {
+        /// The primary-key columns and their prior values.
+        key: Value,
+    },
+    /// The complete prior row, except for columns the source could not supply.
+    Full {
+        /// The prior row.
+        row: Value,
+        /// Columns that exist on the table but whose prior value the source could not
+        /// supply — **absent** from `row`, not null. See
+        /// [`Event::unavailable_columns`] for why the two are not the same and why a
+        /// whole-row write must exclude them.
+        unavailable_columns: Vec<String>,
+    },
+}
+
+impl BeforeImage {
+    /// A complete pre-image with no missing columns.
+    pub fn full(row: Value) -> Self {
+        Self::Full {
+            row,
+            unavailable_columns: Vec::new(),
+        }
+    }
+
+    /// A complete pre-image whose listed columns the source could not supply.
+    ///
+    /// The list is sorted and deduplicated so two images of the same row compare equal
+    /// regardless of the order the source discovered the holes in.
+    pub fn full_with_holes<I, S>(row: Value, unavailable_columns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut unavailable_columns: Vec<String> =
+            unavailable_columns.into_iter().map(Into::into).collect();
+        unavailable_columns.sort_unstable();
+        unavailable_columns.dedup();
+        Self::Full {
+            row,
+            unavailable_columns,
+        }
+    }
+
+    /// A pre-image carrying only the primary-key columns.
+    pub fn key_only(key: Value) -> Self {
+        Self::KeyOnly { key }
+    }
+
+    /// Rebuild a pre-image from the flat wire triple, rejecting the combinations this
+    /// type makes unrepresentable.
+    ///
+    /// Every decoder — JSON, Avro, Protobuf, and the replay fixture reader — funnels
+    /// through here, so a stream that contradicts itself is refused identically whichever
+    /// codec carried it. Normalising instead of refusing would let one codec accept an
+    /// envelope that another rejects, which is the class of divergence the partial-payload
+    /// contract exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the triple is not a pre-image: `is_key_only` set with no row, or
+    /// a key-only row carrying TOAST holes.
+    pub fn from_wire_parts(
+        row: Option<Value>,
+        is_key_only: bool,
+        unavailable_columns: Vec<String>,
+    ) -> std::result::Result<Self, String> {
+        match (row, is_key_only) {
+            (None, false) => Ok(Self::Unavailable),
+            (None, true) => Err("before_is_key_only is set but before is absent; \
+                                 a key-only pre-image must carry at least the \
+                                 primary-key columns"
+                .to_string()),
+            (Some(key), true) => {
+                if !unavailable_columns.is_empty() {
+                    return Err("before_unavailable_columns must be empty when \
+                                before_is_key_only is set; a key-only pre-image omits \
+                                non-key columns by design, not by TOAST"
+                        .to_string());
+                }
+                Ok(Self::KeyOnly { key })
+            }
+            (Some(row), false) => Ok(Self::Full {
+                row,
+                unavailable_columns,
+            }),
+        }
+    }
+
+    /// The prior column values, complete or not — `None` only when
+    /// [`Unavailable`](BeforeImage::Unavailable).
+    ///
+    /// Correct for reading key columns. **Not** correct for reconstructing a row: use
+    /// [`full_row`](BeforeImage::full_row) for that.
+    #[inline]
+    pub fn row(&self) -> Option<&Value> {
+        match self {
+            Self::Unavailable => None,
+            Self::KeyOnly { key } => Some(key),
+            Self::Full { row, .. } => Some(row),
+        }
+    }
+
+    /// Mutable access to the prior column values, for transforms that rewrite payloads.
+    #[inline]
+    pub fn row_mut(&mut self) -> Option<&mut Value> {
+        match self {
+            Self::Unavailable => None,
+            Self::KeyOnly { key } => Some(key),
+            Self::Full { row, .. } => Some(row),
+        }
+    }
+
+    /// Consume the image and yield its prior column values.
+    #[inline]
+    pub fn into_row(self) -> Option<Value> {
+        match self {
+            Self::Unavailable => None,
+            Self::KeyOnly { key } => Some(key),
+            Self::Full { row, .. } => Some(row),
+        }
+    }
+
+    /// The prior row, but only when it is a **complete** one.
+    ///
+    /// Returns `None` for both `Unavailable` and `KeyOnly`, which is the point: a
+    /// consumer computing a diff or writing a pre-image downstream gets nothing rather
+    /// than a partial row it would mistake for a whole one.
+    #[inline]
+    pub fn full_row(&self) -> Option<&Value> {
+        match self {
+            Self::Full { row, .. } => Some(row),
+            _ => None,
+        }
+    }
+
+    /// Columns whose prior value the source could not supply. Always empty unless
+    /// [`Full`](BeforeImage::Full).
+    #[inline]
+    pub fn unavailable_columns(&self) -> &[String] {
+        match self {
+            Self::Full {
+                unavailable_columns,
+                ..
+            } => unavailable_columns,
+            _ => &[],
+        }
+    }
+
+    /// Mutable access to the unavailable-column list, for transforms that rename or
+    /// project columns and must keep the list describing the row it annotates.
+    ///
+    /// `None` for every variant but [`Full`](BeforeImage::Full) — the others have no such
+    /// list to keep in step, which is the invariant this type exists to hold.
+    #[inline]
+    pub fn unavailable_columns_mut(&mut self) -> Option<&mut Vec<String>> {
+        match self {
+            Self::Full {
+                unavailable_columns,
+                ..
+            } => Some(unavailable_columns),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a complete pre-image and its unavailable-column list together.
+    ///
+    /// The two are one borrow because they are edited as a pair: filling a hole means
+    /// inserting the value **and** striking the column off the list, and a caller holding
+    /// only one of them can leave the event in the contradictory state — a column both
+    /// listed as unavailable and present in the row — that the envelope contract rejects.
+    #[inline]
+    pub fn full_parts_mut(&mut self) -> Option<(&mut Value, &mut Vec<String>)> {
+        match self {
+            Self::Full {
+                row,
+                unavailable_columns,
+            } => Some((row, unavailable_columns)),
+            _ => None,
+        }
+    }
+
+    /// Whether the source supplied no pre-image at all.
+    #[inline]
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+
+    /// Whether this image carries only primary-key columns.
+    #[inline]
+    pub fn is_key_only(&self) -> bool {
+        matches!(self, Self::KeyOnly { .. })
+    }
+
+    /// Whether this image is a complete prior row.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        matches!(self, Self::Full { .. })
+    }
+
+    /// Whether any prior column values are present, complete or not.
+    #[inline]
+    pub fn is_present(&self) -> bool {
+        !self.is_unavailable()
+    }
+}
+
 /// Canonical event envelope used across all sources.
 ///
 /// # Examples
@@ -357,11 +625,18 @@ impl From<ValidationErrors> for Error {
 /// assert_eq!(decoded.table, "users");
 /// assert!(decoded.validate().is_ok());
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "EventWire")]
 #[non_exhaustive]
 pub struct Event {
-    /// Row state before the operation, when available.
-    pub before: Option<Value>,
+    /// Row state before the operation, and how complete it is.
+    ///
+    /// The three shapes a pre-image can take — absent, key-only, and complete — are
+    /// distinguished by [`BeforeImage`] rather than inferred from a nullable row plus
+    /// side flags. [`BeforeImage::Unavailable`] is an ordinary, expected state, not a
+    /// failure: a PostgreSQL UPDATE under `REPLICA IDENTITY DEFAULT` that changes no key
+    /// column genuinely has no pre-image.
+    pub before: BeforeImage,
     /// Row state after the operation, when available.
     pub after: Option<Value>,
     /// CRUD operation represented by this event.
@@ -382,20 +657,6 @@ pub struct Event {
     pub transaction: Option<TransactionMetadata>,
     /// Canonical envelope version for compatibility checks.
     pub envelope_version: u16,
-    /// Advisory flag — set to `true` when the `before` field contains only
-    /// primary-key columns rather than the full pre-image row.
-    ///
-    /// This occurs on PostgreSQL UPDATE and DELETE events when the table's
-    /// `REPLICA IDENTITY` is `DEFAULT` (the factory default). In that mode,
-    /// PostgreSQL only includes the old primary key values in the WAL record
-    /// rather than the complete before-image. Applications that compute row diffs
-    /// or need the full prior state must check this flag; when it is `true`,
-    /// `before` cannot be used as a complete row snapshot.
-    ///
-    /// Always `false` for INSERT, READ, SCHEMA_CHANGE, and TRUNCATE events, and
-    /// for all MySQL / MariaDB / SQL Server events.
-    #[serde(default)]
-    pub before_is_key_only: bool,
     /// Columns that exist on the table but whose value the source could not supply.
     ///
     /// These columns are **absent** from `before`/`after` — not `null`. Without this
@@ -426,23 +687,109 @@ pub struct Event {
     /// Empty for every event whose `after` image is complete.
     ///
     /// This list describes **`after` only**. The before-image has its own holes, tracked
-    /// separately by [`Event::before_unavailable_columns`] — they are not the same set. A
-    /// TOASTed column that *was* modified arrives present in `after` and `'u'` in
-    /// `before`, so merging the two lists would mark a column that genuinely changed as
-    /// unwritable and silently drop the update.
+    /// separately by [`BeforeImage::Full::unavailable_columns`](BeforeImage::Full) — they
+    /// are not the same set. A TOASTed column that *was* modified arrives present in
+    /// `after` and `'u'` in `before`, so merging the two lists would mark a column that
+    /// genuinely changed as unwritable and silently drop the update. Keeping the
+    /// before-image's list inside its own variant is what makes merging them impossible
+    /// rather than merely discouraged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_columns: Vec<String>,
-    /// Columns absent from `before` for the same reason as [`Event::unavailable_columns`].
-    ///
-    /// Only relevant to consumers that use the before-image — computing diffs, or
-    /// building compensating writes. A column listed here had *some* prior value; the
-    /// source simply could not report it. Do not read its absence as "was NULL".
-    ///
-    /// Always empty when [`Event::before_is_key_only`] is `true`: a key-only before-image
-    /// is already known to be incomplete, and its non-key columns are absent by design
-    /// rather than by TOAST.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub before_unavailable_columns: Vec<String>,
+}
+
+/// Flat wire form of [`Event`].
+///
+/// The envelope on the wire carries the row image directly under `before`, described by
+/// the two adjacent fields `before_is_key_only` and `before_unavailable_columns`. That
+/// shape is deliberate rather than inherited: consumers read `before` as the row, and
+/// nesting it under a variant tag would break every JSON path over the stream to express
+/// something the Rust type system already enforces on this side of the boundary.
+///
+/// Decoding is the boundary where the flat form can still be self-contradictory, so the
+/// combinations [`BeforeImage`] makes unrepresentable are rejected here rather than
+/// silently normalised — a stream that disagrees with itself is a bug upstream, and
+/// quietly picking an interpretation would hide it.
+#[derive(Deserialize)]
+struct EventWire {
+    before: Option<Value>,
+    after: Option<Value>,
+    op: Operation,
+    source: SourceMetadata,
+    ts: u64,
+    schema: Option<String>,
+    table: String,
+    primary_key: Option<Vec<String>>,
+    snapshot: Option<SnapshotMetadata>,
+    transaction: Option<TransactionMetadata>,
+    envelope_version: u16,
+    #[serde(default)]
+    before_is_key_only: bool,
+    #[serde(default)]
+    unavailable_columns: Vec<String>,
+    #[serde(default)]
+    before_unavailable_columns: Vec<String>,
+}
+
+impl TryFrom<EventWire> for Event {
+    type Error = String;
+
+    fn try_from(wire: EventWire) -> std::result::Result<Self, Self::Error> {
+        let before = BeforeImage::from_wire_parts(
+            wire.before,
+            wire.before_is_key_only,
+            wire.before_unavailable_columns,
+        )?;
+
+        Ok(Self {
+            before,
+            after: wire.after,
+            op: wire.op,
+            source: wire.source,
+            ts: wire.ts,
+            schema: wire.schema,
+            table: wire.table,
+            primary_key: wire.primary_key,
+            snapshot: wire.snapshot,
+            transaction: wire.transaction,
+            envelope_version: wire.envelope_version,
+            unavailable_columns: wire.unavailable_columns,
+        })
+    }
+}
+
+impl Serialize for Event {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let before_unavailable_columns = self.before.unavailable_columns();
+        // Twelve always-present fields, plus the two lists that are omitted when empty.
+        let len = 12
+            + usize::from(!self.unavailable_columns.is_empty())
+            + usize::from(!before_unavailable_columns.is_empty());
+
+        let mut state = serializer.serialize_struct("Event", len)?;
+        state.serialize_field("before", &self.before.row())?;
+        state.serialize_field("after", &self.after)?;
+        state.serialize_field("op", &self.op)?;
+        state.serialize_field("source", &self.source)?;
+        state.serialize_field("ts", &self.ts)?;
+        state.serialize_field("schema", &self.schema)?;
+        state.serialize_field("table", &self.table)?;
+        state.serialize_field("primary_key", &self.primary_key)?;
+        state.serialize_field("snapshot", &self.snapshot)?;
+        state.serialize_field("transaction", &self.transaction)?;
+        state.serialize_field("envelope_version", &self.envelope_version)?;
+        state.serialize_field("before_is_key_only", &self.before.is_key_only())?;
+        if self.unavailable_columns.is_empty() {
+            state.skip_field("unavailable_columns")?;
+        } else {
+            state.serialize_field("unavailable_columns", &self.unavailable_columns)?;
+        }
+        if before_unavailable_columns.is_empty() {
+            state.skip_field("before_unavailable_columns")?;
+        } else {
+            state.serialize_field("before_unavailable_columns", before_unavailable_columns)?;
+        }
+        state.end()
+    }
 }
 
 /// Why an [`Event`] yields no row write.
@@ -530,7 +877,7 @@ impl Default for Event {
     /// other required fields before passing the event to validation or encoding.
     fn default() -> Self {
         Self {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: None,
             op: Operation::default(),
             source: SourceMetadata::default(),
@@ -541,9 +888,7 @@ impl Default for Event {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 }
@@ -711,7 +1056,7 @@ impl Event {
                         "insert events must include after",
                     ));
                 }
-                if self.before.is_some() {
+                if self.before.is_present() {
                     errors.push(ValidationError::new(
                         "before",
                         "insert events must not include before",
@@ -725,15 +1070,18 @@ impl Event {
                         "update events must include after",
                     ));
                 }
-                if self.before.is_none() {
-                    errors.push(ValidationError::new(
-                        "before",
-                        "update events must include before",
-                    ));
-                }
+                // `before` is deliberately NOT required here. Under PostgreSQL's factory
+                // `REPLICA IDENTITY DEFAULT`, an UPDATE that does not touch a key column
+                // makes pgoutput emit neither an `O` nor a `K` old tuple, so there is
+                // genuinely no before-image to carry — the most common UPDATE shape on the
+                // most common table configuration. Requiring it here rejected an event the
+                // source was correct to build, and because the replication slot cannot
+                // advance past a rejected record, the pipeline could not restart past it.
+                // Consumers that need a pre-image must test `has_full_before()` rather than
+                // assume an UPDATE has one.
             }
             Operation::Delete => {
-                if self.before.is_none() {
+                if self.before.is_unavailable() {
                     errors.push(ValidationError::new(
                         "before",
                         "delete events must include before",
@@ -763,7 +1111,7 @@ impl Event {
                 }
             }
             Operation::Truncate => {
-                if self.before.is_some() {
+                if self.before.is_present() {
                     errors.push(ValidationError::new(
                         "before",
                         "truncate events must not include before",
@@ -795,18 +1143,13 @@ impl Event {
             }
         }
 
-        if self.before_is_key_only && self.op != Operation::Update && self.op != Operation::Delete {
+        // Still reachable: `BeforeImage` constrains the *shape* of a pre-image, not which
+        // operations may carry one. A key-only image on an INSERT remains a contradiction.
+        if self.before.is_key_only() && self.op != Operation::Update && self.op != Operation::Delete
+        {
             errors.push(ValidationError::new(
-                "before_is_key_only",
-                "before_is_key_only can only be true for UPDATE or DELETE events",
-            ));
-        }
-
-        if self.before_is_key_only && self.before.is_none() {
-            errors.push(ValidationError::new(
-                "before_is_key_only",
-                "before_is_key_only is true but before is None; \
-                 key-only before-images must carry at least the primary-key columns in before",
+                "before",
+                "a key-only before-image is only meaningful on UPDATE or DELETE events",
             ));
         }
 
@@ -814,14 +1157,14 @@ impl Event {
         // contradiction, and the dangerous reading wins: a sink that trusts the payload
         // writes whatever placeholder is sitting there. Each list is checked against its
         // own image — they describe different sets and must never be merged.
-        let contradicts = |columns: &[String], row: &Option<serde_json::Value>| {
-            let Some(object) = row.as_ref().and_then(serde_json::Value::as_object) else {
+        let contradicts = |columns: &[String], row: Option<&serde_json::Value>| {
+            let Some(object) = row.and_then(serde_json::Value::as_object) else {
                 return false;
             };
             columns.iter().any(|column| object.contains_key(column))
         };
 
-        if contradicts(&self.unavailable_columns, &self.after) {
+        if contradicts(&self.unavailable_columns, self.after.as_ref()) {
             errors.push(ValidationError::new(
                 "unavailable_columns",
                 "a column listed in unavailable_columns must be absent from after; \
@@ -829,7 +1172,7 @@ impl Event {
             ));
         }
 
-        if contradicts(&self.before_unavailable_columns, &self.before) {
+        if contradicts(self.before.unavailable_columns(), self.before.row()) {
             errors.push(ValidationError::new(
                 "before_unavailable_columns",
                 "a column listed in before_unavailable_columns must be absent from before; \
@@ -837,16 +1180,9 @@ impl Event {
             ));
         }
 
-        if self.before_is_key_only && !self.before_unavailable_columns.is_empty() {
-            errors.push(ValidationError::new(
-                "before_unavailable_columns",
-                "before_unavailable_columns must be empty when before_is_key_only is true; \
-                 a key-only before-image omits non-key columns by design, not by TOAST",
-            ));
-        }
-
         if matches!(self.op, Operation::Truncate | Operation::SchemaChange)
-            && !(self.unavailable_columns.is_empty() && self.before_unavailable_columns.is_empty())
+            && !(self.unavailable_columns.is_empty()
+                && self.before.unavailable_columns().is_empty())
         {
             errors.push(ValidationError::new(
                 "unavailable_columns",
@@ -869,39 +1205,37 @@ impl Event {
         self.validate().map_err(Error::from)
     }
 
-    /// Returns `true` when a full pre-image row is available in `before`.
+    /// Returns `true` when a **complete** pre-image row is available.
     ///
-    /// This is `true` iff `before` is `Some` **and** `before_is_key_only` is `false`.
-    ///
-    /// Use this instead of checking `before.is_some()` alone when you need the
-    /// complete prior row state — for example, when computing row diffs or emitting
-    /// before-images to a downstream store. A `before` field that is `Some` but
-    /// `before_is_key_only == true` contains only primary-key columns and cannot
-    /// be used as a complete row snapshot.
+    /// Shorthand for [`BeforeImage::is_full`]. Use it, rather than testing that a
+    /// pre-image merely exists, whenever only a whole row is correct — computing a diff,
+    /// or emitting a before-image downstream. A key-only image carries the primary key
+    /// and nothing else, and reading it as a row turns every absent column into an
+    /// apparent deletion.
     ///
     /// # Example
     ///
     /// ```
-    /// use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    /// use rustcdc::{BeforeImage, Event, Operation, SourceMetadata};
     /// use serde_json::json;
     ///
     /// let mut event = Event::builder("users", Operation::Update)
-    ///     .before(json!({"id": 1}))
+    ///     .before_key_only(json!({"id": 1}))
     ///     .after(json!({"id": 1, "name": "bob"}))
-    ///     .before_is_key_only(true)
     ///     .source(SourceMetadata::new("pg", "0/1", 1))
     ///     .ts(1)
     ///     .build();
     ///
-    /// // Key-only before: `before` is present but partial.
+    /// // Key-only: a pre-image is present, but it is not a row.
+    /// assert!(event.before.row().is_some());
     /// assert!(!event.has_full_before());
     ///
-    /// event.before_is_key_only = false;
+    /// event.before = BeforeImage::full(json!({"id": 1, "name": "alice"}));
     /// assert!(event.has_full_before());
     /// ```
     #[inline]
     pub fn has_full_before(&self) -> bool {
-        self.before.is_some() && !self.before_is_key_only
+        self.before.is_full()
     }
 
     /// Whether [`Event::primary_key_values`] would return a key, without building one.
@@ -938,9 +1272,11 @@ impl Event {
             return false;
         }
 
+        // `row()`, not `full_row()`: a key-only pre-image is exactly enough to address
+        // the row, which is the whole question being asked here.
         let row = match self.op {
-            Operation::Delete => self.before.as_ref(),
-            _ => self.after.as_ref().or(self.before.as_ref()),
+            Operation::Delete => self.before.row(),
+            _ => self.after.as_ref().or_else(|| self.before.row()),
         };
 
         let Some(object) = row.and_then(serde_json::Value::as_object) else {
@@ -1021,9 +1357,11 @@ impl Event {
             return None;
         }
 
+        // `row()`, not `full_row()`: a key-only pre-image is exactly enough to address
+        // the row, which is the whole question being asked here.
         let row = match self.op {
-            Operation::Delete => self.before.as_ref(),
-            _ => self.after.as_ref().or(self.before.as_ref()),
+            Operation::Delete => self.before.row(),
+            _ => self.after.as_ref().or_else(|| self.before.row()),
         };
 
         let obj = row?.as_object()?;
@@ -1039,6 +1377,7 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use serde_json::json;
 
     use crate::core::Error;
@@ -1050,7 +1389,7 @@ mod tests {
 
     fn valid_event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1, "name": "alice"})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -1073,9 +1412,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -1095,7 +1432,7 @@ mod tests {
     #[test]
     fn invalid_insert_reports_multiple_errors() {
         let mut event = valid_event();
-        event.before = Some(json!({"id": 1}));
+        event.before = BeforeImage::full(json!({"id": 1}));
         event.after = None;
         event.table.clear();
         event.ts = 0;
@@ -1137,13 +1474,13 @@ mod tests {
     fn update_delete_read_validation_paths_enforce_contract() {
         let mut update = valid_event();
         update.op = Operation::Update;
-        update.before = None;
+        update.after = None;
         let update_errors = update.validate().unwrap_err();
-        assert!(update_errors.iter().any(|error| error.field == "before"));
+        assert!(update_errors.iter().any(|error| error.field == "after"));
 
         let mut delete = valid_event();
         delete.op = Operation::Delete;
-        delete.before = None;
+        delete.before = BeforeImage::Unavailable;
         delete.after = Some(json!({"id": 1}));
         let delete_errors = delete.validate().unwrap_err();
         assert!(delete_errors.iter().any(|error| error.field == "before"));
@@ -1162,6 +1499,27 @@ mod tests {
         assert!(schema_change_errors
             .iter()
             .any(|error| error.field == "after"));
+    }
+
+    /// Under `REPLICA IDENTITY DEFAULT` an UPDATE that leaves the key alone carries no
+    /// before-image at all, so requiring one halted the pipeline on the most ordinary
+    /// write against the most ordinary table. Debezium emits `"before": null` here too.
+    #[test]
+    fn an_update_without_a_before_image_is_valid() {
+        let mut update = valid_event();
+        update.op = Operation::Update;
+        update.before = BeforeImage::Unavailable;
+        update.after = Some(json!({"id": 1, "status": "b"}));
+
+        assert!(
+            update.validate().is_ok(),
+            "an update with no before-image must validate: {:?}",
+            update.validate()
+        );
+        assert!(
+            !update.has_full_before(),
+            "an absent before-image is not a full row"
+        );
     }
 
     #[test]
@@ -1188,8 +1546,10 @@ mod tests {
             .any(|error| error.field == "transaction.event_index"));
     }
 
+    /// `BeforeImage` constrains the shape of a pre-image, not which operations may carry
+    /// one, so this contradiction is still expressible and still has to be rejected.
     #[test]
-    fn before_is_key_only_rejected_on_non_update_delete_events() {
+    fn a_key_only_before_image_is_rejected_on_non_update_delete_events() {
         for op in [
             Operation::Insert,
             Operation::Read,
@@ -1198,76 +1558,71 @@ mod tests {
         ] {
             let mut event = valid_event();
             event.op = op;
-            event.before_is_key_only = true;
-            // Adjust before/after to satisfy per-op contract so only the flag fires.
-            match op {
-                Operation::Insert | Operation::Read | Operation::SchemaChange => {
-                    event.before = None;
-                    event.after = Some(json!({"id": 1}));
-                }
-                Operation::Truncate => {
-                    event.before = None;
-                    event.after = None;
-                }
-                _ => {}
-            }
+            event.before = BeforeImage::key_only(json!({"id": 1}));
+            // Set `after` to satisfy the per-op contract so only the pre-image shape fires.
+            event.after = match op {
+                Operation::Truncate => None,
+                _ => Some(json!({"id": 1})),
+            };
             let errors = event.validate().unwrap_err();
             assert!(
-                errors.iter().any(|e| e.field == "before_is_key_only"),
-                "expected before_is_key_only error for op={op:?}"
+                errors.iter().any(|e| e.field == "before"),
+                "expected a before-image error for op={op:?}; got: {errors}"
             );
         }
     }
 
     #[test]
-    fn before_is_key_only_accepted_on_update_and_delete_events() {
-        // UPDATE with key-only before
+    fn a_key_only_before_image_is_accepted_on_update_and_delete_events() {
         let mut update = valid_event();
         update.op = Operation::Update;
-        update.before = Some(json!({"id": 1}));
+        update.before = BeforeImage::key_only(json!({"id": 1}));
         update.after = Some(json!({"id": 1, "name": "bob"}));
-        update.before_is_key_only = true;
         assert!(
             update.validate().is_ok(),
-            "UPDATE should allow before_is_key_only=true"
+            "UPDATE should allow a key-only before-image"
         );
 
-        // DELETE with key-only before
         let mut delete = valid_event();
         delete.op = Operation::Delete;
-        delete.before = Some(json!({"id": 1}));
+        delete.before = BeforeImage::key_only(json!({"id": 1}));
         delete.after = None;
-        delete.before_is_key_only = true;
         assert!(
             delete.validate().is_ok(),
-            "DELETE should allow before_is_key_only=true"
+            "DELETE should allow a key-only before-image"
         );
     }
 
+    /// The combinations that used to need a validation rule are now unrepresentable:
+    /// there is no way to build a key-only pre-image without a row, or one carrying TOAST
+    /// holes. Both were runtime errors; the constructor is the only way in, so they cannot
+    /// be constructed to test — what remains testable is that decoding refuses them.
     #[test]
-    fn before_is_key_only_true_requires_before_to_be_some() {
-        // before_is_key_only = true with before = None is always invalid, regardless of op.
-        for op in [Operation::Update, Operation::Delete] {
-            let mut event = valid_event();
-            event.op = op;
-            event.before = None; // ← no before image at all
-            event.before_is_key_only = true;
-            if op == Operation::Update {
-                event.after = Some(json!({"id": 1}));
-            }
-            let errors = event.validate().unwrap_err();
-            assert!(
-                errors.iter().any(|e| e.field == "before_is_key_only"),
-                "expected before_is_key_only error when before=None for op={op:?}; got: {errors}"
-            );
-        }
+    fn contradictory_wire_pre_images_are_refused_at_the_boundary() {
+        let missing_row = BeforeImage::from_wire_parts(None, true, Vec::new());
+        assert!(
+            missing_row.is_err(),
+            "before_is_key_only with no row must be refused, not normalised"
+        );
+
+        let key_only_with_holes =
+            BeforeImage::from_wire_parts(Some(json!({"id": 1})), true, vec!["body".to_string()]);
+        assert!(
+            key_only_with_holes.is_err(),
+            "a key-only pre-image carrying TOAST holes must be refused"
+        );
+
+        assert_eq!(
+            BeforeImage::from_wire_parts(None, false, Vec::new()).unwrap(),
+            BeforeImage::Unavailable
+        );
     }
 
     #[test]
     fn event_default_has_correct_envelope_version() {
         let event = Event::default();
         assert_eq!(event.envelope_version, EVENT_ENVELOPE_VERSION);
-        assert!(!event.before_is_key_only);
+        assert!(event.before.is_unavailable());
         assert_eq!(event.op, Operation::Insert);
     }
 
@@ -1289,20 +1644,17 @@ mod tests {
     #[test]
     fn has_full_before_distinguishes_key_only_from_full() {
         let base = Event {
-            before: Some(json!({"id": 1, "name": "alice"})),
+            before: BeforeImage::full(json!({"id": 1, "name": "alice"})),
             after: Some(json!({"id": 1, "name": "bob"})),
             op: Operation::Update,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
             ..Event::default()
         };
         assert!(base.has_full_before(), "full before should return true");
 
         let key_only = Event {
-            before_is_key_only: true,
+            before: BeforeImage::key_only(json!({"id": 1})),
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
             ..base.clone()
         };
         assert!(
@@ -1311,10 +1663,8 @@ mod tests {
         );
 
         let no_before = Event {
-            before: None,
-            before_is_key_only: false,
+            before: BeforeImage::Unavailable,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
             ..base
         };
         assert!(
@@ -1330,8 +1680,7 @@ mod tests {
         event.op = Operation::Update;
         event.primary_key = Some(vec!["id".into()]);
         // `body` is a TOASTed column PostgreSQL did not ship. It is absent, not null.
-        event.before = Some(json!({"id": 1}));
-        event.before_is_key_only = true;
+        event.before = BeforeImage::key_only(json!({"id": 1}));
         event.after = Some(json!({"id": 1, "title": "new title"}));
         event.unavailable_columns = vec!["body".into()];
         event
@@ -1399,7 +1748,7 @@ mod tests {
         delete.op = Operation::Delete;
         delete.primary_key = Some(vec!["id".into()]);
         delete.after = None;
-        delete.before = Some(json!({"id": 7}));
+        delete.before = BeforeImage::full(json!({"id": 7}));
         assert_eq!(
             delete.row_write(),
             RowWrite::Delete {
@@ -1442,7 +1791,7 @@ mod tests {
     fn truncate_events_may_not_carry_unavailable_columns() {
         let mut event = valid_event();
         event.op = Operation::Truncate;
-        event.before = None;
+        event.before = BeforeImage::Unavailable;
         event.after = None;
         event.unavailable_columns = vec!["body".into()];
 
@@ -1468,7 +1817,7 @@ mod tests {
     #[test]
     fn primary_key_values_extracts_from_before_on_delete() {
         let event = Event {
-            before: Some(json!({"id": 7, "name": "bob"})),
+            before: BeforeImage::full(json!({"id": 7, "name": "bob"})),
             after: None,
             op: Operation::Delete,
             primary_key: Some(vec!["id".into()]),
@@ -1522,7 +1871,7 @@ mod tests {
     #[test]
     fn a_partial_composite_key_yields_no_row_write_rather_than_a_wide_delete() {
         let delete = Event {
-            before: Some(json!({"tenant_id": 7})),
+            before: BeforeImage::full(json!({"tenant_id": 7})),
             after: None,
             op: Operation::Delete,
             primary_key: Some(vec!["tenant_id".into(), "user_id".into()]),
@@ -1750,10 +2099,28 @@ pub struct EventBuilder {
 }
 
 impl EventBuilder {
-    /// Row state before the operation.
+    /// A complete pre-image row.
+    ///
+    /// For a partial one use [`before_key_only`](Self::before_key_only), or
+    /// [`before_image`](Self::before_image) with
+    /// [`BeforeImage::full_with_holes`] when the source could not supply every column.
     #[must_use]
     pub fn before(mut self, before: Value) -> Self {
-        self.event.before = Some(before);
+        self.event.before = BeforeImage::full(before);
+        self
+    }
+
+    /// A pre-image carrying only the primary-key columns.
+    #[must_use]
+    pub fn before_key_only(mut self, key: Value) -> Self {
+        self.event.before = BeforeImage::key_only(key);
+        self
+    }
+
+    /// The pre-image in full generality.
+    #[must_use]
+    pub fn before_image(mut self, before: BeforeImage) -> Self {
+        self.event.before = before;
         self
     }
 
@@ -1813,14 +2180,6 @@ impl EventBuilder {
         self
     }
 
-    /// Mark `before` as containing only primary-key columns rather than a full
-    /// pre-image. See [`Event::before_is_key_only`].
-    #[must_use]
-    pub fn before_is_key_only(mut self, key_only: bool) -> Self {
-        self.event.before_is_key_only = key_only;
-        self
-    }
-
     /// Columns absent from `after` because the source could not supply them.
     ///
     /// See [`Event::unavailable_columns`] — a consumer that writes whole rows must
@@ -1832,19 +2191,6 @@ impl EventBuilder {
         S: Into<String>,
     {
         self.event.unavailable_columns = columns.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Columns absent from `before`. Tracked separately from
-    /// [`unavailable_columns`](Self::unavailable_columns): the two sets are not the same,
-    /// and merging them marks genuinely changed columns as unwritable.
-    #[must_use]
-    pub fn before_unavailable_columns<I, S>(mut self, columns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.event.before_unavailable_columns = columns.into_iter().map(Into::into).collect();
         self
     }
 
@@ -1937,9 +2283,9 @@ mod builder_tests {
         // dropping the update.
         let event = Event::builder("t", Operation::Update)
             .unavailable_columns(["blob_a"])
-            .before_unavailable_columns(["blob_b"])
+            .before_image(BeforeImage::full_with_holes(json!({"id": 1}), ["blob_b"]))
             .build();
         assert_eq!(event.unavailable_columns, vec!["blob_a".to_string()]);
-        assert_eq!(event.before_unavailable_columns, vec!["blob_b".to_string()]);
+        assert_eq!(event.before.unavailable_columns(), ["blob_b".to_string()]);
     }
 }

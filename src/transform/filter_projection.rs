@@ -368,7 +368,7 @@ impl FilterProjectionTransform {
                 apply_operator(&value_str, &rule.operator, &rule.value, regex)
             }
             FilterField::BeforeField(path) => {
-                let Some(payload) = event.before.as_ref() else {
+                let Some(payload) = event.before.row() else {
                     return false; // No before payload → rule cannot match.
                 };
                 let Some(value) = extract_json_field(payload, path) else {
@@ -383,7 +383,7 @@ impl FilterProjectionTransform {
         }
     }
 
-    fn project_payload(&self, payload: &mut Option<Value>) -> Result<()> {
+    fn project_payload(&self, payload: Option<&mut Value>) -> Result<()> {
         let Some(Value::Object(object)) = payload else {
             return Ok(());
         };
@@ -575,9 +575,11 @@ impl Transform for FilterProjectionTransform {
             return Ok(false);
         }
 
-        self.project_payload(&mut event.before)?;
-        self.project_payload(&mut event.after)?;
-        self.project_unavailable(&mut event.before_unavailable_columns);
+        self.project_payload(event.before.row_mut())?;
+        self.project_payload(event.after.as_mut())?;
+        if let Some(columns) = event.before.unavailable_columns_mut() {
+            self.project_unavailable(columns);
+        }
         self.project_unavailable(&mut event.unavailable_columns);
         Ok(true)
     }
@@ -614,6 +616,7 @@ impl Transform for FilterProjectionTransform {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use serde_json::json;
 
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -626,7 +629,7 @@ mod tests {
 
     fn event(op: Operation) -> Event {
         Event {
-            before: Some(json!({"id": 1, "secret": "x"})),
+            before: BeforeImage::full(json!({"id": 1, "secret": "x"})),
             after: Some(json!({"id": 1, "name": "alice", "secret": "x"})),
             op,
             source: SourceMetadata {
@@ -641,9 +644,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -980,7 +981,7 @@ mod tests {
         .unwrap();
 
         let mut e = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: None,
             op: Operation::Truncate,
             source: SourceMetadata {
@@ -995,9 +996,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         assert!(
             transform.apply(&mut e).unwrap(),
@@ -1022,7 +1021,7 @@ mod tests {
         .unwrap();
 
         let mut e = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: None,
             op: Operation::Truncate,
             source: SourceMetadata {
@@ -1037,9 +1036,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
         assert!(
             !transform.apply(&mut e).unwrap(),
@@ -1150,14 +1147,21 @@ mod tests {
 
         let mut event = event(Operation::Update);
         event.unavailable_columns = vec!["secret".into()];
-        event.before_unavailable_columns = vec!["secret".into()];
+        event.before = BeforeImage::full_with_holes(
+            event
+                .before
+                .row()
+                .cloned()
+                .expect("fixture has a before-image"),
+            ["secret"],
+        );
 
         assert!(transform.apply(&mut event).unwrap());
         assert!(
             event.unavailable_columns.is_empty(),
             "a projected-away column is not 'unavailable', it is out of scope"
         );
-        assert!(event.before_unavailable_columns.is_empty());
+        assert!(event.before.unavailable_columns().is_empty());
     }
 }
 

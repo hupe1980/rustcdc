@@ -31,7 +31,7 @@
 use apache_avro::{schema::Schema, to_avro_datum, types::Value as AvroValue};
 
 use crate::codec::{EncodedOutput, EventEncoder};
-use crate::core::{Error, Event, Operation, Result};
+use crate::core::{BeforeImage, Error, Event, Operation, Result};
 
 const CONTENT_TYPE: &str = "avro/binary";
 
@@ -136,7 +136,7 @@ impl EventEncoder for AvroEncoder {
 
 fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
     // Helper: optional JSON → Avro ["null","bytes"] union.
-    let json_opt_to_avro = |v: &Option<serde_json::Value>| -> Result<AvroValue> {
+    let json_opt_to_avro = |v: Option<&serde_json::Value>| -> Result<AvroValue> {
         match v {
             Some(json) => {
                 let bytes = serde_json::to_vec(json)
@@ -210,8 +210,8 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
     };
 
     Ok(AvroValue::Record(vec![
-        ("before".into(), json_opt_to_avro(&event.before)?),
-        ("after".into(), json_opt_to_avro(&event.after)?),
+        ("before".into(), json_opt_to_avro(event.before.row())?),
+        ("after".into(), json_opt_to_avro(event.after.as_ref())?),
         ("op".into(), op),
         ("source".into(), source),
         ("ts".into(), AvroValue::Long(event.ts as i64)),
@@ -226,7 +226,7 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
         ),
         (
             "before_is_key_only".into(),
-            AvroValue::Boolean(event.before_is_key_only),
+            AvroValue::Boolean(event.before.is_key_only()),
         ),
         (
             "unavailable_columns".into(),
@@ -242,7 +242,8 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
             "before_unavailable_columns".into(),
             AvroValue::Array(
                 event
-                    .before_unavailable_columns
+                    .before
+                    .unavailable_columns()
                     .iter()
                     .map(|column| AvroValue::String(column.clone()))
                     .collect(),
@@ -262,7 +263,7 @@ mod tests {
 
     fn update_event() -> Event {
         Event {
-            before: Some(serde_json::json!({"id": 1, "name": "alice"})),
+            before: BeforeImage::full(serde_json::json!({"id": 1, "name": "alice"})),
             after: Some(serde_json::json!({"id": 1, "name": "alice-v2"})),
             op: Operation::Update,
             source: SourceMetadata {
@@ -281,15 +282,13 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
     fn insert_event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 2})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -308,9 +307,7 @@ mod tests {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 
@@ -403,7 +400,7 @@ mod tests {
             let mut ev = insert_event();
             ev.op = op;
             if op == Operation::Delete || op == Operation::Update {
-                ev.before = Some(serde_json::json!({"id": 2}));
+                ev.before = BeforeImage::full(serde_json::json!({"id": 2}));
             }
             if op == Operation::Delete {
                 ev.after = None;
@@ -429,7 +426,14 @@ mod tests {
         let enc = AvroEncoder::new().unwrap();
         let mut event = update_event();
         event.unavailable_columns = vec!["big_kept".into()];
-        event.before_unavailable_columns = vec!["big_changed".into()];
+        event.before = BeforeImage::full_with_holes(
+            event
+                .before
+                .row()
+                .cloned()
+                .expect("fixture has a before-image"),
+            ["big_changed"],
+        );
         let out = enc.encode(&event).unwrap();
 
         let mut reader = out.bytes.as_slice();
@@ -462,7 +466,13 @@ mod tests {
     fn before_is_key_only_flag_round_trips() {
         let enc = AvroEncoder::new().unwrap();
         let mut event = update_event();
-        event.before_is_key_only = true;
+        event.before = BeforeImage::key_only(
+            event
+                .before
+                .row()
+                .cloned()
+                .expect("fixture has a before-image"),
+        );
         let out = enc.encode(&event).unwrap();
 
         let mut reader = out.bytes.as_slice();
@@ -681,16 +691,22 @@ pub fn avro_value_to_event(value: &AvroValue) -> Result<Event> {
         .source(source)
         .ts(long_field(required("ts")?, "ts")? as u64)
         .primary_key(string_array(get("primary_key")))
-        .unavailable_columns(string_array(get("unavailable_columns")))
-        .before_unavailable_columns(string_array(get("before_unavailable_columns")))
-        .before_is_key_only(matches!(
-            get("before_is_key_only").and_then(unwrap_union),
-            Some(AvroValue::Boolean(true))
-        ));
+        .unavailable_columns(string_array(get("unavailable_columns")));
 
-    if let Some(before) = json_field(required("before")?, "before")? {
-        builder = builder.before(before);
-    }
+    // Reassembled through the one shared constructor so Avro cannot accept an envelope
+    // JSON and Protobuf reject.
+    builder = builder.before_image(
+        BeforeImage::from_wire_parts(
+            json_field(required("before")?, "before")?,
+            matches!(
+                get("before_is_key_only").and_then(unwrap_union),
+                Some(AvroValue::Boolean(true))
+            ),
+            string_array(get("before_unavailable_columns")),
+        )
+        .map_err(Error::SerializationError)?,
+    );
+
     if let Some(after) = json_field(required("after")?, "after")? {
         builder = builder.after(after);
     }
@@ -808,7 +824,7 @@ mod decoder_tests {
             .build();
         let decoded = round_trip(&event);
         assert!(decoded.after.is_none(), "absent must not become null");
-        assert_eq!(decoded.before, Some(json!({ "id": 9 })));
+        assert_eq!(decoded.before.row(), Some(&json!({ "id": 9 })));
         assert_eq!(decoded.op, Operation::Delete);
     }
 
@@ -923,16 +939,18 @@ mod decoder_tests {
         // Merging them marks a genuinely changed column as unwritable and drops the update.
         let event = Event::builder("t", Operation::Update)
             .source(SourceMetadata::new("s", "1", 1))
-            .before(json!({ "id": 1 }))
+            .before_image(BeforeImage::full_with_holes(
+                json!({ "id": 1 }),
+                ["big_changed"],
+            ))
             .after(json!({ "id": 1 }))
             .unavailable_columns(["big_kept"])
-            .before_unavailable_columns(["big_changed"])
             .ts(1)
             .build();
         let decoded = round_trip(&event);
         assert_eq!(decoded.unavailable_columns, vec!["big_kept".to_string()]);
         assert_eq!(
-            decoded.before_unavailable_columns,
+            decoded.before.unavailable_columns(),
             vec!["big_changed".to_string()]
         );
     }

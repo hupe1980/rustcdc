@@ -212,6 +212,7 @@ pub struct SnapshotTrackerReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::BeforeImage;
 
     #[test]
     fn test_parallel_snapshot_state_creation() {
@@ -261,7 +262,7 @@ mod tests {
 
         // Create mock events
         let events = vec![Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: crate::core::Operation::Read,
             source: crate::core::SourceMetadata {
@@ -276,9 +277,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }];
 
         state
@@ -293,7 +292,7 @@ mod tests {
         let state = SnapshotProgressTracker::new("snap1".into(), 1000, tables, Default::default());
 
         let events = vec![Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: crate::core::Operation::Read,
             source: crate::core::SourceMetadata {
@@ -308,9 +307,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }];
 
         state.record_chunk_events("users", events, None).unwrap();

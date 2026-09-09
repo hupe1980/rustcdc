@@ -110,14 +110,15 @@ pub use tokio_util::sync::CancellationToken;
 
 pub use crate::core::{
     fingerprint_event_stable, fingerprint_event_transient, render_error_chain, AckMode, AckToken,
-    CdcRuntime, ConnectionRetryPolicy, Error, ErrorChain, ErrorKind, ErrorReport, Event,
-    EventBatch, EventBuilder, EventIdempotencyGuard, EventTracer, FingerprintError, HealthVerdict,
-    IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector, NoRowWrite,
-    Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite, RuntimeAdminSnapshot,
-    RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig,
-    RuntimeState, SecretProvider, SecretString, SnapshotMetadata, SourceErrorKind, SourceMetadata,
-    StructuredLogger, TransactionBoundaryPolicy, TransactionMetadata, TransformErrorPolicy,
-    TransportConfig, ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
+    BeforeImage, CdcRuntime, ConnectionRetryPolicy, Error, ErrorChain, ErrorKind, ErrorReport,
+    Event, EventBatch, EventBuilder, EventIdempotencyGuard, EventTracer, FingerprintError,
+    HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
+    NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite,
+    RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions,
+    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
+    SourceErrorKind, SourceMetadata, StructuredLogger, TransactionBoundaryPolicy,
+    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError,
+    ValidationErrorPolicy, ValidationErrors, EVENT_ENVELOPE_VERSION,
 };
 #[cfg(feature = "tls")]
 pub use crate::core::{rustls_client_config, RustlsClientConfig};

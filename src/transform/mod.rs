@@ -471,6 +471,7 @@ impl TransformPipeline {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use serde_json::json;
 
     use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
@@ -521,7 +522,7 @@ mod tests {
 
     fn event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1})),
             op: Operation::Insert,
             source: SourceMetadata {
@@ -536,9 +537,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

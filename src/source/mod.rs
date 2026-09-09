@@ -807,6 +807,7 @@ pub use sqlserver::incremental_snapshot::SqlServerIncrementalSnapshotHandle;
 
 #[cfg(test)]
 mod tests {
+    use crate::core::BeforeImage;
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -822,7 +823,7 @@ mod tests {
 
     fn sample_event() -> Event {
         Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(json!({"id": 1})),
             op: Operation::Read,
             source: SourceMetadata {
@@ -837,9 +838,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         }
     }
 

@@ -1066,7 +1066,7 @@ impl OTelEventTracer {
 
         if let Some(before) = event
             .before
-            .as_mut()
+            .row_mut()
             .and_then(|value| value.as_object_mut())
         {
             before.insert(
@@ -1132,6 +1132,7 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::BeforeImage;
 
     #[test]
     fn test_otel_metrics_collector_creation() {
@@ -1247,7 +1248,7 @@ mod tests {
         tracer.trace_event_start("event-123");
 
         let mut event = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: Operation::Insert,
             source: crate::core::SourceMetadata {
@@ -1262,9 +1263,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
 
         let propagated = tracer.propagate_baggage_to_event("event-123", &mut event);
@@ -1384,7 +1383,7 @@ mod tests {
         tracer.trace_event_start("event-before");
 
         let mut event = Event {
-            before: Some(serde_json::json!({"id": 7})),
+            before: BeforeImage::full(serde_json::json!({"id": 7})),
             after: None,
             op: Operation::Delete,
             source: crate::core::SourceMetadata {
@@ -1399,13 +1398,11 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
 
         assert!(tracer.propagate_baggage_to_event("event-before", &mut event));
-        let payload = event.before.as_ref().expect("before payload present");
+        let payload = event.before.row().expect("before payload present");
         assert!(payload.get("_otel_trace_id").is_some());
         assert!(payload.get("_otel_span_id").is_some());
     }
@@ -1414,7 +1411,7 @@ mod tests {
     fn test_baggage_propagation_returns_false_for_unknown_event() {
         let tracer = OTelEventTracer::new();
         let mut event = Event {
-            before: None,
+            before: BeforeImage::Unavailable,
             after: Some(serde_json::json!({"id": 1})),
             op: Operation::Insert,
             source: crate::core::SourceMetadata {
@@ -1429,9 +1426,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
-            before_is_key_only: false,
             unavailable_columns: Vec::new(),
-            before_unavailable_columns: Vec::new(),
         };
 
         assert!(!tracer.propagate_baggage_to_event("missing-event", &mut event));
