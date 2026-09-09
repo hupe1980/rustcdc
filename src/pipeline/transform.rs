@@ -2,8 +2,8 @@ use rustcdc::outbox::OutboxTransform;
 use rustcdc::transform::UnmatchedRule;
 use rustcdc::wasm::{TransformResult, WasmConfig as RustcdcWasmConfig, WasmRuntime};
 use rustcdc::{
-    Error, Event, FieldMappingConfig, FieldMappingTransform, MaskHashConfig, MaskHashTransform,
-    MaskRule, Operation, Result, fingerprint_event_stable,
+    BeforeImage, Error, Event, FieldMappingConfig, FieldMappingTransform, MaskHashConfig,
+    MaskHashTransform, MaskRule, Operation, Result, fingerprint_event_stable,
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -510,12 +510,16 @@ fn finalize_transformed(mut event: Event) -> Result<Event> {
 
 /// Drop availability-list entries for columns a transform has materialized.
 ///
-/// `unavailable_columns` / `before_unavailable_columns` are the source's claim that a
-/// column's value could not be supplied (PostgreSQL unchanged-TOAST). A transform that
-/// inserts or renames a column into the payload supersedes that claim — the payload now
-/// carries a value, and `Event::validate()` (rustcdc ≥ 0.7.0) rejects the
-/// present-*and*-listed contradiction because the dangerous reading (trust the payload)
-/// is the one a sink takes.
+/// `unavailable_columns` — on the event for the after-image, and inside
+/// `BeforeImage::Full` for the pre-image — is the source's claim that a column's value
+/// could not be supplied (PostgreSQL unchanged-TOAST). A transform that inserts or
+/// renames a column into the payload supersedes that claim — the payload now carries a
+/// value, and `Event::validate()` (rustcdc ≥ 0.7.0) rejects the present-*and*-listed
+/// contradiction because the dangerous reading (trust the payload) is the one a sink
+/// takes.
+///
+/// Only `BeforeImage::Full` carries such a list: a key-only image omits its non-key
+/// columns by design rather than by TOAST, so there is nothing there to reconcile.
 fn reconcile_availability_lists(event: &mut Event) {
     if !event.unavailable_columns.is_empty()
         && let Some(Value::Object(after)) = event.after.as_ref()
@@ -524,12 +528,13 @@ fn reconcile_availability_lists(event: &mut Event) {
             .unavailable_columns
             .retain(|column| !after.contains_key(column));
     }
-    if !event.before_unavailable_columns.is_empty()
-        && let Some(Value::Object(before)) = event.before.as_ref()
+    if let BeforeImage::Full {
+        row: Value::Object(before),
+        unavailable_columns,
+    } = &mut event.before
+        && !unavailable_columns.is_empty()
     {
-        event
-            .before_unavailable_columns
-            .retain(|column| !before.contains_key(column));
+        unavailable_columns.retain(|column| !before.contains_key(column));
     }
 }
 
@@ -1241,7 +1246,7 @@ mod tests {
     fn finalize_rejects_envelope_contract_violations() {
         let mut event = sample_event();
         event.op = Operation::Truncate;
-        event.before = None;
+        event.before = BeforeImage::Unavailable;
         event.after = None;
         event.primary_key = None;
         event.unavailable_columns = vec!["ghost".to_string()];

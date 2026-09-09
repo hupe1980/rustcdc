@@ -254,7 +254,7 @@ impl KafkaTransactionHandle {
             })?;
         }
 
-        let result = self.producer.send(topic, Some(key), payload).await;
+        let result = self.producer.send(topic, Some(key), Some(payload)).await;
 
         let metadata = match result {
             Ok(metadata) => metadata,

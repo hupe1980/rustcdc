@@ -3716,9 +3716,9 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.19.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99f3dcca3be8210128a17c0fe56e30f9c251ef68a25a8bf824bf8debd1c09974"
+checksum = "a5708df34867da7feb7e296457debb61c74fcd1c1f6e159dcdff788639ff3a00"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -5974,9 +5974,9 @@ dependencies = [
 
 [[package]]
 name = "rustcdc"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f38a9e0a99b8fedc7f4b54b77209383e3917a7b15ba3aeba08cba6ed8c26327"
+checksum = "910c5128618390840a55e4263845c2fbff164e77bab0f380935a308cf08bcb0c"
 dependencies = [
  "aes-gcm 0.11.0",
  "ahash",
@@ -6018,7 +6018,7 @@ dependencies = [
 
 [[package]]
 name = "rustcdc-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",

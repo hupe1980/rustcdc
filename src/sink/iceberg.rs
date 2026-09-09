@@ -223,11 +223,7 @@ impl IcebergSink {
             .as_ref()
             .map(|v| v.to_string().len())
             .unwrap_or(0);
-        let before_bytes = event
-            .before
-            .as_ref()
-            .map(|v| v.to_string().len())
-            .unwrap_or(0);
+        let before_bytes = event.before.row().map(|v| v.to_string().len()).unwrap_or(0);
         let event_byte_estimate =
             std::mem::size_of::<Event>() + event.table.len() + after_bytes + before_bytes;
 

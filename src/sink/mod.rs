@@ -455,10 +455,9 @@ fn build(
                     child_metrics.push(child.metrics_handle());
                     children.push(BoxedSink::new(child));
                 }
-                Ok(BuiltSink::Fan(
-                    Box::new(FanOutSink::new(children)),
-                    child_metrics,
-                ))
+                let fan = FanOutSink::new(children)
+                    .map_err(|e| AppError::Other(format!("failed to build fan-out sink: {e}")))?;
+                Ok(BuiltSink::Fan(Box::new(fan), child_metrics))
             }
         }
     })

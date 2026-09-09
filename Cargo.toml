@@ -1,6 +1,6 @@
 [package]
 name = "rustcdc-server"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 # The AWS SDK sets this floor; wasmtime is the next constraint at 1.94.0. Declaring the
 # lower number would hand anyone a resolver error instead of a documented requirement.
@@ -76,7 +76,7 @@ sqlserver = ["rustcdc/sqlserver"]
 # default set — arrives through *our* `postgres` feature and nowhere else. Without it,
 # `--no-default-features` here would still drag the PostgreSQL connector in, and the
 # feature split would be decorative.
-rustcdc = { version = "0.12.0", default-features = false, features = [
+rustcdc = { version = "0.14.0", default-features = false, features = [
     "tls",
     "metrics",
     "avro",
@@ -153,7 +153,7 @@ tokio-postgres = "0.7"
 # One crypto backend for the process (aws-lc-rs, matching main.rs), and `compression-all`
 # because zstd is outside krafka's default set — without it a documented `compression =
 # "zstd"` fails validation at startup.
-krafka = { version = "0.19.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
+krafka = { version = "0.22.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
 
 # AWS credential chain. Not optional: `iceberg-catalog-s3tables` pulls it unconditionally
 # and the SQS dead-letter target needs it by name.
@@ -225,14 +225,14 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
 # test-harnesses: rustcdc's `testkit::AdapterConformanceSuite`, so the sinks are
 # checked against the library's own adapter contract instead of a local restatement.
-rustcdc = { version = "0.12.0", features = ["test-harnesses"] }
+rustcdc = { version = "0.14.0", features = ["test-harnesses"] }
 wat = "1"
 # The Zerobus contract fake is a real tonic server; `tokio-stream` adapts the listener and
 # the response channel into the streams the generated service signature wants.
 tokio-stream = { version = "0.1", features = ["net"] }
 # test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
 # in unit tests without Docker.
-krafka = { version = "0.19.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
+krafka = { version = "0.22.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
 
 # `rustcdc/test-harnesses` refuses to build with `debug_assertions` off, so benches keep them
 # on while retaining `opt-level = 3`. Compare only against baselines from this same profile.

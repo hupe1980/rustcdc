@@ -38,7 +38,7 @@ pub const HEADER_EXCEPTION_MESSAGE: &str = "__rustcdc.dlq.exception.message";
 /// a broker rejecting the whole record for an oversized header would lose the dead letter
 /// entirely — which is the one outcome a dead-letter queue exists to prevent. The full
 /// text is always in the body.
-fn dead_letter_headers(record: &DeadLetterRecord) -> Vec<(String, Bytes)> {
+fn dead_letter_headers(record: &DeadLetterRecord) -> Vec<(String, Option<Bytes>)> {
     /// Generous enough for any realistic error chain, small enough that the headers
     /// cannot approach a default `message.max.bytes`.
     const MAX_ERROR_HEADER_BYTES: usize = 2048;
@@ -48,19 +48,25 @@ fn dead_letter_headers(record: &DeadLetterRecord) -> Vec<(String, Bytes)> {
     // every consumer of a diagnostic header.
     let error = crate::text::truncate_utf8(&record.error, MAX_ERROR_HEADER_BYTES, "… [truncated]");
 
+    // Every value is `Some`: krafka 0.20 distinguishes a null header value from a
+    // zero-length one, and each of these is diagnostic text a consumer reads. A `None`
+    // would be a different header on the wire.
     vec![
         (
             HEADER_SOURCE_TABLE.to_string(),
-            Bytes::from(record.table.clone()),
+            Some(Bytes::from(record.table.clone())),
         ),
         (
             HEADER_SOURCE_OFFSET.to_string(),
-            Bytes::from(record.source_offset.clone()),
+            Some(Bytes::from(record.source_offset.clone())),
         ),
-        (HEADER_SINK.to_string(), Bytes::from(record.sink.clone())),
+        (
+            HEADER_SINK.to_string(),
+            Some(Bytes::from(record.sink.clone())),
+        ),
         (
             HEADER_EXCEPTION_MESSAGE.to_string(),
-            Bytes::from(error.into_owned()),
+            Some(Bytes::from(error.into_owned())),
         ),
     ]
 }
@@ -107,7 +113,7 @@ impl KafkaDlq {
             .send_with_headers(
                 &self.topic,
                 Some(record.table.as_bytes()),
-                payload.as_bytes(),
+                Some(payload.as_bytes()),
                 dead_letter_headers(record),
             )
             .await
@@ -145,12 +151,16 @@ mod tests {
         DeadLetterRecord::new("kafka", &event, &AppError::Other(error.to_string()))
     }
 
-    fn header<'a>(headers: &'a [(String, Bytes)], name: &str) -> &'a str {
+    /// Panics on an absent *and* on a null-valued header: every triage header carries
+    /// diagnostic text, and krafka 0.20 makes a null value a distinct thing on the wire
+    /// that a text-assuming consumer would read as missing.
+    fn header<'a>(headers: &'a [(String, Option<Bytes>)], name: &str) -> &'a str {
         let value = headers
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_ref())
-            .unwrap_or_else(|| panic!("header {name} must be present"));
+            .unwrap_or_else(|| panic!("header {name} must be present"))
+            .unwrap_or_else(|| panic!("header {name} must carry a value, not null"));
         std::str::from_utf8(value).expect("header values must be valid UTF-8")
     }
 
@@ -197,7 +207,7 @@ mod tests {
         let value = headers
             .iter()
             .find(|(key, _)| key == HEADER_EXCEPTION_MESSAGE)
-            .map(|(_, value)| value.clone())
+            .and_then(|(_, value)| value.clone())
             .expect("exception header");
 
         std::str::from_utf8(value.as_ref()).expect("a truncated header must still be valid UTF-8");

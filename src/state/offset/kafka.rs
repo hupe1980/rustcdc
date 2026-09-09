@@ -220,7 +220,7 @@ impl KafkaTopicStateWriter {
                     AppError::Other(format!("failed to begin kafka state transaction: {e}"))
                 })?;
 
-                let send_result = producer.send(&self.topic, Some(key), payload).await;
+                let send_result = producer.send(&self.topic, Some(key), Some(payload)).await;
 
                 let record_metadata = match send_result {
                     Ok(metadata) => metadata,
