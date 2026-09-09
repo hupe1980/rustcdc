@@ -294,6 +294,13 @@ jobs:
           # BIGINT + TEXT, and that gap is what let a silent null-decoding defect survive
           # in the SQL Server connector.
           - postgres_type_fidelity_integration
+          # A Runtime driven against REPLICA IDENTITY DEFAULT, updating a non-key column.
+          # Every other Runtime-level suite forces REPLICA IDENTITY FULL in its fixture, so
+          # the pre-image was always present and the envelope contract for its absence went
+          # unexercised — an UPDATE on a stock table halted the pipeline unrecoverably and
+          # the suite stayed green. Source-level tests cannot cover it: validation runs at
+          # runtime ingress, not in the source.
+          - postgres_replica_identity_default_runtime_integration
           - postgres_handoff_integration
           - checkpoint_file_integration
           - runtime_postgres_process_crash_integration

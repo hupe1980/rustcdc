@@ -126,15 +126,37 @@ run_schema_contract_check() {
   trap 'rm -rf "$tmp_dir"' RETURN
 
   local rust_event_fields="$tmp_dir/rust_event_fields.txt"
+  local rust_serialized_fields="$tmp_dir/rust_serialized_fields.txt"
   local rust_operation_symbols="$tmp_dir/rust_operation_symbols.txt"
   local proto_event_fields="$tmp_dir/proto_event_fields.txt"
   local proto_operation_symbols="$tmp_dir/proto_operation_symbols.txt"
   local avro_event_fields="$tmp_dir/avro_event_fields.txt"
   local avro_operation_symbols="$tmp_dir/avro_operation_symbols.txt"
 
-  sed -n '/pub struct Event {/,/^}/p' src/core/event.rs \
-    | sed -nE 's/^[[:space:]]*pub[[:space:]]+([a-z_][a-z0-9_]*)[[:space:]]*:.*/\1/p' \
+  # The Rust side of this comparison is `EventWire`, not `Event`.
+  #
+  # `Event` is the in-memory shape and `EventWire` is the canonical statement of the
+  # envelope *on the wire* — they stopped being field-for-field identical when the
+  # pre-image became one `BeforeImage` field spanning the three wire fields `before`,
+  # `before_is_key_only` and `before_unavailable_columns`. Comparing `Event` to Protobuf
+  # after that compares an in-memory shape against a wire shape and reports a difference
+  # that is by design, which would leave only two ways out: nest the row under a variant
+  # tag in every codec (breaking every JSON path over the stream), or exempt the two
+  # highest-risk fields in the envelope from the gate entirely.
+  #
+  # Comparing wire to wire is what this check always meant, and it is now four-way rather
+  # than three: `EventWire` (what the JSON decoder reads) is also checked against the
+  # hand-written `Serialize` (what the JSON encoder writes). That seam did not exist while
+  # both directions were derived, and a field written but never read — or read but never
+  # written — is exactly the silent envelope divergence this gate exists to catch.
+  sed -n '/^struct EventWire {/,/^}/p' src/core/event.rs \
+    | sed -nE 's/^[[:space:]]*([a-z_][a-z0-9_]*)[[:space:]]*:.*/\1/p' \
     | sort -u > "$rust_event_fields"
+
+  sed -n '/^impl Serialize for Event {/,/^}/p' src/core/event.rs \
+    | grep -oE '(serialize_field|skip_field)\("[a-z_]+"' \
+    | sed -E 's/.*\("([a-z_]+)"/\1/' \
+    | sort -u > "$rust_serialized_fields"
 
   sed -n '/pub enum Operation {/,/^}/p' src/core/event.rs \
     | sed -nE 's/^[[:space:]]*([A-Z][A-Za-z0-9_]*)[[:space:]]*,.*/\1/p' \
@@ -164,6 +186,8 @@ run_schema_contract_check() {
     | tr '[:upper:]' '[:lower:]' \
     | sort -u > "$avro_operation_symbols"
 
+  check_equal_sets "event fields (EventWire vs Serialize impl)" \
+    "$rust_event_fields" "$rust_serialized_fields"
   check_equal_sets "event fields (Rust vs Protobuf)" "$rust_event_fields" "$proto_event_fields"
   check_equal_sets "event fields (Rust vs Avro)" "$rust_event_fields" "$avro_event_fields"
   check_equal_sets "operation symbols (Rust vs Protobuf)" "$rust_operation_symbols" "$proto_operation_symbols"
