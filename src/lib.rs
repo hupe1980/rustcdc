@@ -23,6 +23,18 @@
 //! anything: every config would be rejected by `reject_uncompiled_source_driver`, and the
 //! failure would arrive at startup in production rather than at build time. Refusing to
 //! compile is the earlier and louder of the two.
+// The default trait-solver depth of 128 is not enough to prove that the admin Kafka
+// signal-ingress worker's `tokio::spawn` future is `Send`. The obligation unwinds through
+// krafka 0.22's `Consumer::poll` — task-local lock tracking wrapping a `poll_fn` over a
+// `JoinAll` of per-broker fetches — and overflows before it lands.
+//
+// Nightly's `recursion_depth_exceeding_limit` lint reports that overflow, and CI's
+// `RUSTFLAGS: -D warnings` makes it fatal in the fuzz job, the only job on nightly. 256 is
+// the compiler's own suggestion, and it *proves* the bound rather than muting the report:
+// `#[allow]` would leave the future unproven and the failure waiting for the day the lint
+// stops being future-compat (rust-lang/rust#159228).
+#![recursion_limit = "256"]
+
 #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlserver")))]
 compile_error!(
     "rustcdc-server needs at least one source connector, and this build has none. \
