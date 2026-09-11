@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # rustcdc-server — multi-stage, multi-arch container image
 #
-# Built from the workspace root: the binary lives in `server/` and depends on the
+# Built from the workspace root: the binary lives in `crates/rustcdc-server/` and depends on the
 # library at `.`, so the build context has to span both.
 #
 # Stages
@@ -42,7 +42,7 @@ WORKDIR /build
 # so it stays cached across every source change that does not touch a dependency.
 #
 # `COPY . .` rather than an enumerated list. This is a workspace now, and
-# `cargo chef prepare` has to resolve three members (`.`, `server`, `xtask`) plus
+# `cargo chef prepare` has to resolve every member under `crates/` plus
 # every target each manifest declares: `cargo metadata` silently drops a target whose
 # source file is absent, so a missed directory produces a recipe that omits a
 # `[[bench]]` the cook stage then cannot reconstruct ("can't find `pipeline` bench").

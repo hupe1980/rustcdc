@@ -1,0 +1,223 @@
+[package]
+name = "rustcdc-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# The binary ships as a container image, not on crates.io. The library at the workspace
+# root is the published artefact.
+publish = false
+description = "Change-data-capture server powered by rustcdc"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rustcdc"
+path = "src/main.rs"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Features
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# **Connectors are opt-in, and the default is PostgreSQL alone.**
+#
+# They used to be compiled unconditionally, which meant a PostgreSQL-only deployment
+# still linked `tiberius` — and with it a *second* TLS stack (rustls 0.21, its own
+# webpki, its own X.509 verifier) carrying four suppressed RUSTSEC advisories that the
+# admin listener and every sink, on rustls 0.23, do not have. Each suppression in
+# `deny.toml` carries a real reachability analysis showing the path is unreachable in a
+# PostgreSQL deployment, and that is still true — but "unreachable in your configuration"
+# is not an answer any scanner, auditor or procurement questionnaire accepts, and it
+# makes a minimal-attack-surface claim unarguable.
+#
+# The published container image builds with `--all-features`, so the shipped artifact
+# carries every connector and loses nothing. Only a source build narrows.
+#
+# A config naming a connector that was not compiled in is rejected at load with a message
+# naming the feature to rebuild with — see `reject_uncompiled_source_driver`. It is never
+# a serde "unknown variant" error, and it never silently loads.
+[features]
+default = ["postgres"]
+
+# PostgreSQL logical replication. The default, and the only connector most deployments
+# need. Adds no TLS stack of its own beyond rustls 0.23, which is already present.
+postgres = ["rustcdc/postgres"]
+
+# MySQL and MariaDB binlog. One feature, because MariaDB's connector is a thin layer over
+# MySQL's upstream (`rustcdc/mariadb` implies `rustcdc/mysql`) and splitting them would
+# offer a build that cannot exist.
+mysql = ["rustcdc/mysql", "rustcdc/mariadb"]
+
+# SQL Server CDC. **This is the one that costs.** `tiberius 0.12` pins rustls 0.21, so
+# enabling it re-adds the second TLS stack and the four suppressed advisories documented
+# in `deny.toml`. Enable it when you capture SQL Server; the analysis says it is safe, and
+# a deployment that does not need it should not have to rely on that analysis.
+sqlserver = ["rustcdc/sqlserver"]
+
+[dependencies]
+# `default-features = false` so that `rustcdc/postgres` — which is in rustcdc's own
+# default set — arrives through *our* `postgres` feature and nowhere else. Without it,
+# `--no-default-features` here would still drag the PostgreSQL connector in, and the
+# feature split would be decorative.
+rustcdc = { workspace = true, features = [
+    "tls",
+    "metrics",
+    "avro",
+    "schemreg",
+    "apicurio",
+    "protobuf",
+    "wasm",
+    "cloudevents",
+    "glue",
+    "encryption",
+    "outbox",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "process"] }
+futures = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Layered configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Web / admin API
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "catch-panic"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls = "0.23"
+# PEM parsing comes from rustls-pki-types, not the unmaintained `rustls-pemfile`
+# (RUSTSEC-2025-0134) — `PemObject` is the same implementation that crate's final
+# release wrapped, and it keeps one PEM parser in the tree alongside rustcdc 0.8.
+rustls-pki-types = { version = "1", features = ["std"] }
+url = "2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { workspace = true }
+# `reqwest-blocking-client` is deliberate: the OTLP/HTTP exporter runs on the SDK's own
+# batch-processor thread with no tokio reactor, where the async client panics on first
+# export. Pinned by `the_http_protocol_actually_speaks_otlp_over_http`.
+opentelemetry-otlp = { workspace = true, default-features = false, features = [
+    "grpc-tonic",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+    "trace",
+    "metrics",
+    "internal-logs",
+] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "metrics"] }
+tracing-opentelemetry = "0.33"
+
+# Error handling
+thiserror = "2"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = { workspace = true }
+hex = "0.4"
+ed25519-dalek = "2"
+zip = "2"
+async-trait = "0.1"
+dashmap = "6"
+bytes = { workspace = true }
+tokio-postgres = "0.7"
+# One crypto backend for the process (aws-lc-rs, matching main.rs), and `compression-all`
+# because zstd is outside krafka's default set — without it a documented `compression =
+# "zstd"` fails validation at startup.
+krafka = { version = "0.22.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5"] }
+
+# AWS credential chain. Not optional: `iceberg-catalog-s3tables` pulls it unconditionally
+# and the SQS dead-letter target needs it by name.
+#
+# No `rustls` feature — that name selects `legacy-rustls-ring`, i.e. rustls 0.21, a second
+# TLS stack.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+aws-sdk-glue = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+
+# Snowflake key-pair auth. `jsonwebtoken` was dropped: every one of its crypto backends adds
+# a stack the graph does not already have. `rsa` is needed anyway for the `RSA_PUBLIC_KEY_FP`
+# fingerprint and signs PKCS#1 v1.5 over SHA-256 — which is RS256. See `mint_jwt`.
+rsa = { version = "0.9", features = ["sha2", "pkcs5"] }
+base64 = { workspace = true }
+
+# Amazon SQS dead-letter target. `aws-config` is already unconditional, so this costs one
+# thin SDK client rather than the AWS runtime.
+# No `rustls` feature: it maps to `legacy-rustls-ring` (rustls 0.21), a second TLS stack the
+# architecture guard rejects. `default-https-client` is the modern hyper client.
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+# AWS S3 Tables — a managed Iceberg catalog. Same version line as `iceberg` and
+# `iceberg-catalog-rest`: all three share the `Catalog` trait.
+#
+# Worth it for this sink specifically — the Iceberg destination is an append-only change log,
+# and S3 Tables runs the compaction and unreferenced-file removal that otherwise falls to the
+# operator.
+iceberg-catalog-s3tables = "0.10.1"
+iceberg-storage-opendal = { version = "0.10.1", features = ["opendal-fs", "opendal-s3", "opendal-gcs", "opendal-azdls"] }
+arrow-array = "58"
+arrow-schema = "58"
+parquet = "58"
+
+# Storage abstraction (E02-S03) — pinned to the same major as iceberg-storage-opendal
+# so the state backends and the Iceberg sink share one opendal in the graph.
+opendal = { version = "0.57", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
+# Databricks Zerobus Ingest — protocol, OAuth, back-pressure and stream recovery are all
+# upstream; `src/sink/zerobus.rs` owns only the durability decision.
+#
+# `testing` is on in the *normal* dependency because it gates `no_tls()` and
+# `NoAuthHeadersProvider`, which `tests/zerobus_contract.rs` needs to drive the sink through
+# its production path. Gating it behind a cargo feature of our own would make that suite
+# silently skip. Exposure is bounded by validation instead: the loader refuses `no_auth` and
+# plaintext for anything but loopback.
+databricks-zerobus-ingest-sdk = { version = "2.6", default-features = false, features = ["testing"] }
+# Already in the graph via the OTLP exporter and the Zerobus SDK. Named directly so the sink
+# classifies a `tonic::Code` rather than matching error prose.
+tonic = { version = "0.14", default-features = false }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[dev-dependencies]
+# Drives the real axum router in-process, so the security suite probes the same
+# middleware, extractors and handlers a network client would hit — not a
+# hand-called function that skips the layers where a bypass would live.
+tower = { version = "0.5", features = ["util"] }
+# `default-features = false` drops the unmaintained `plotters` tree that cargo-deny flags;
+# the HTML report is not what CI consumes. `async_tokio` for `benches/throughput.rs`.
+criterion = { workspace = true, default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
+# test-harnesses: rustcdc's `testkit::AdapterConformanceSuite`, so the sinks are
+# checked against the library's own adapter contract instead of a local restatement.
+rustcdc = { workspace = true, features = ["test-harnesses"] }
+wat = "1"
+# The Zerobus contract fake is a real tonic server; `tokio-stream` adapts the listener and
+# the response channel into the streams the generated service signature wants.
+tokio-stream = { version = "0.1", features = ["net"] }
+# test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
+# in unit tests without Docker.
+krafka = { version = "0.22.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }

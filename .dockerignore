@@ -1,8 +1,8 @@
 # ── build artefacts ──────────────────────────────────────────────────────────
 target/
-server/fuzz/target/
-server/fuzz/corpus/
-server/fuzz/artifacts/
+crates/rustcdc-server/fuzz/target/
+crates/rustcdc-server/fuzz/corpus/
+crates/rustcdc-server/fuzz/artifacts/
 
 # ── version control ──────────────────────────────────────────────────────────
 .git/
@@ -17,22 +17,32 @@ rust-toolchain.toml
 
 # ── documentation ─────────────────────────────────────────────────────────────
 #
-# `site/` is excluded **except** `site/content/library/`, and `README.md` is not
-# excluded at all. Both are load-bearing for the build, not just for the website:
-# `src/lib.rs` embeds them with `include_str!`, so a context without them fails to
-# compile the library the server links against — with an error that points at
-# rustdoc rather than at this file. The server image is built from the workspace
-# root, so that now applies here.
+# `site/` is excluded **except** `site/content/docs/`, and `README.md` is not excluded at
+# all. Both are load-bearing for the build rather than only for the website:
+# `crates/rustcdc/src/lib.rs` embeds them with `include_str!`, so a context without them
+# fails to compile the library the server links against.
+#
+# Keep the negation pointed at a directory that exists. A stale one silently excludes the
+# files instead, and `build.rs` then sets no `rustcdc_markdown_doctests` cfg — so the image
+# still builds and the Markdown doctests simply vanish from it.
 site/*
 !site/content/
 site/content/*
-!site/content/library/
+!site/content/docs/
 REVIEW.md
 FINDINGS.md
 CHANGELOG.md
 CONTRIBUTING.md
 # LICENSE-MIT / LICENSE-APACHE are deliberately NOT excluded — they are copied
 # into the runtime image.
+
+# ── not part of the repository, and not part of the image ────────────────────
+#
+# Both are gitignored, which `.dockerignore` does not inherit: a local working copy would
+# otherwise push internal notes and megabytes of third-party specifications into the build
+# context on every build.
+concepts/
+specs/
 
 # ── things the binary does not need ──────────────────────────────────────────
 monitoring/

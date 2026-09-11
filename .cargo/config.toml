@@ -1,3 +1,11 @@
+# `cargo xtask <task>` — the repository's automation entry point.
+#
+# An alias rather than a shell wrapper, so it works from any directory in the tree and
+# needs nothing installed that `cargo` does not already provide. `cargo xtask` with no
+# arguments lists the tasks.
+[alias]
+xtask = "run --package xtask --bin xtask --"
+
 [env]
 # Stack size for spawned threads, which is what libtest gives each test.
 #
@@ -26,7 +34,7 @@ RUST_MIN_STACK = "16777216"
 #
 # Merged here from the former `rustcdc-server` repository's own `.cargo/config.toml`.
 # Cargo reads the config from the invocation directory upwards, so a file under
-# `server/` would only apply when a developer happened to `cd server` first — and the
+# `crates/rustcdc-server/` would only apply when a developer happened to `cd` there — and the
 # suite would fail from the workspace root for reasons that look nothing like the cause.
 CDC_TEST_SOURCE_PASSWORD = "test-only-not-a-real-credential"
 

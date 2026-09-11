@@ -1,0 +1,32 @@
+[package]
+name = "crash-workers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# Crash-worker binaries the process-crash integration suites spawn as separate
+# processes; a test cannot SIGKILL itself. Never published.
+#
+# This was called `xtask`, which it never was: an xtask is a task *runner* reached
+# through a `cargo xtask` alias, and this crate has no dispatcher, no alias, and four
+# binaries that only the test suite ever launches. The name promised a build-automation
+# entry point that did not exist, and sent anyone looking for one to the wrong place —
+# the repository's automation is in `scripts/`, run through `cargo xtask` since 0.15.0.
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+tls = ["rustcdc/tls"]
+postgres = ["rustcdc/postgres"]
+mysql = ["rustcdc/mysql"]
+mariadb = ["rustcdc/mariadb"]
+sqlserver = ["rustcdc/sqlserver", "tls"]
+
+[dependencies]
+rustcdc = { workspace = true }
+tokio = { version = "1.48.0", features = ["macros", "rt", "time"] }

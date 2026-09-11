@@ -1,9 +1,8 @@
 # Zola configuration for the rustcdc documentation site.
 #
-# One site for one repository. `/docs/` is the server — the product most readers came
-# for — and `/library/` is the `rustcdc` crate for embedders. They were two sites in two
-# repositories publishing to two Pages targets, which meant two search indexes, two
-# navigation trees and a cross-reference that could only be a bare URL.
+# One site, one documentation section. The server and the library are one product at one
+# version, so the pages are grouped by task rather than by artefact — a reader should not
+# have to pick a side before knowing which one they want.
 #
 # Build:  zola --root site build
 # Serve:  zola --root site serve
@@ -37,7 +36,7 @@ build_search_index = true
 #
 # Skipping the pass for all content restores what 0.22 did. Nothing here wants Tera in
 # prose: the one former shortcode had a single call site, and the number it inserted is
-# now checked against the manifest by `server/tests/architecture.rs`, which is a stronger
+# now checked against the manifest by `crates/rustcdc-server/tests/architecture.rs`, which is a stronger
 # guarantee than an indirection that merely moved where the number was written.
 skip_content_templating = ["**/*.md"]
 
@@ -80,7 +79,7 @@ crate_url = "https://crates.io/crates/rustcdc"
 docs_rs_url = "https://docs.rs/rustcdc"
 license = "MIT OR Apache-2.0"
 # Shown in the header and in the structured data. Checked against the workspace
-# manifest by `server/tests/architecture.rs`, so it cannot drift.
+# manifest by `crates/rustcdc-server/tests/architecture.rs`, so it cannot drift.
 version = "0.15.0"
 rust_version = "1.94.1"
 # Used for the Open Graph and Twitter card images.
@@ -88,28 +87,31 @@ og_image = "/og.png"
 author = "hupe1980"
 
 # Left-hand documentation navigation. Declared here rather than derived from the
-# filesystem so the order is editorial — "getting started" before "reference" — instead
-# of alphabetical.
+# filesystem so the order is editorial — what a reader needs first, not alphabetical.
+#
+# One section, not two. The library and the server are one product at one version, and
+# splitting the documentation by *artefact* made a reader pick a side before they knew
+# which one they wanted — then re-read the same concepts in whichever half they landed in.
+# Pages are grouped by the task instead, and each says at the top which surface it applies
+# to when that is not both.
+
 [[extra.nav]]
-title = "Introduction"
+title = "Start"
 [[extra.nav.pages]]
 title = "Getting started"
 path = "/docs/getting-started/"
 [[extra.nav.pages]]
+title = "Embedding the library"
+path = "/docs/embedding/"
+[[extra.nav.pages]]
 title = "Core concepts"
 path = "/docs/concepts/"
+[[extra.nav.pages]]
+title = "Architecture"
+path = "/docs/architecture/"
 
 [[extra.nav]]
-title = "Reference"
-[[extra.nav.pages]]
-title = "Configuration"
-path = "/docs/configuration/"
-[[extra.nav.pages]]
-title = "WASM transforms"
-path = "/docs/transforms/"
-
-[[extra.nav]]
-title = "Connectors"
+title = "Connect a source"
 [[extra.nav.pages]]
 title = "PostgreSQL"
 path = "/docs/connectors/postgres/"
@@ -119,75 +121,72 @@ path = "/docs/connectors/mysql/"
 [[extra.nav.pages]]
 title = "SQL Server"
 path = "/docs/connectors/sqlserver/"
+[[extra.nav.pages]]
+title = "Snowflake"
+path = "/docs/snowflake/"
 
 [[extra.nav]]
-title = "Running it"
+title = "Configure"
+[[extra.nav.pages]]
+title = "Server configuration"
+path = "/docs/configuration/"
+[[extra.nav.pages]]
+title = "Library options"
+path = "/docs/config-reference/"
+[[extra.nav.pages]]
+title = "Schema evolution"
+path = "/docs/schema-evolution/"
+[[extra.nav.pages]]
+title = "Feature flags"
+path = "/docs/feature-policy/"
+
+[[extra.nav]]
+title = "Build on it"
+[[extra.nav.pages]]
+title = "API guide"
+path = "/docs/api/"
+[[extra.nav.pages]]
+title = "Transforms"
+path = "/docs/transforms/"
+[[extra.nav.pages]]
+title = "WASM transform SDK"
+path = "/docs/wasm-transform-sdk/"
+[[extra.nav.pages]]
+title = "WASM conformance"
+path = "/docs/wasm-conformance-contract/"
+[[extra.nav.pages]]
+title = "Writing a connector"
+path = "/docs/adapter-sdk/"
+
+[[extra.nav]]
+title = "Run it"
+[[extra.nav.pages]]
+title = "Deployment"
+path = "/docs/deployment/"
 [[extra.nav.pages]]
 title = "Operations"
 path = "/docs/operations/"
 [[extra.nav.pages]]
-title = "Runbook"
+title = "Incident runbook"
 path = "/docs/runbook/"
+[[extra.nav.pages]]
+title = "Embedded pipelines"
+path = "/docs/embedded-operations/"
+[[extra.nav.pages]]
+title = "Troubleshooting"
+path = "/docs/troubleshooting/"
+[[extra.nav.pages]]
+title = "Security"
+path = "/docs/security/"
 
 [[extra.nav]]
-title = "Engineering"
+title = "Evidence"
 [[extra.nav.pages]]
 title = "How defects are prevented"
 path = "/docs/engineering/"
-
-# The `rustcdc` crate. Separate group rather than mixed into the server pages: an
-# operator configuring a container and an engineer embedding the runtime in their own
-# binary want different documents, and interleaving them serves neither.
-[[extra.nav]]
-title = "Library"
-[[extra.nav.pages]]
-title = "Overview"
-path = "/library/"
-[[extra.nav.pages]]
-title = "Getting started"
-path = "/library/getting-started/"
-[[extra.nav.pages]]
-title = "Architecture"
-path = "/library/architecture/"
-[[extra.nav.pages]]
-title = "API guide"
-path = "/library/api/"
-[[extra.nav.pages]]
-title = "Config reference"
-path = "/library/config-reference/"
-[[extra.nav.pages]]
-title = "Schema evolution"
-path = "/library/schema-evolution/"
-[[extra.nav.pages]]
-title = "Adapter SDK"
-path = "/library/adapter-sdk/"
-[[extra.nav.pages]]
-title = "WASM transform SDK"
-path = "/library/wasm-transform-sdk/"
-[[extra.nav.pages]]
-title = "WASM conformance"
-path = "/library/wasm-conformance-contract/"
-[[extra.nav.pages]]
-title = "Snowflake source"
-path = "/library/snowflake/"
-[[extra.nav.pages]]
-title = "Deployment"
-path = "/library/deployment/"
-[[extra.nav.pages]]
-title = "Runbook"
-path = "/library/runbook/"
-[[extra.nav.pages]]
-title = "Troubleshooting"
-path = "/library/troubleshooting/"
 [[extra.nav.pages]]
 title = "Reliability testing"
-path = "/library/reliability-testing/"
+path = "/docs/reliability-testing/"
 [[extra.nav.pages]]
-title = "Security"
-path = "/library/security/"
-[[extra.nav.pages]]
-title = "Feature policy"
-path = "/library/feature-policy/"
-[[extra.nav.pages]]
-title = "Parity matrix"
-path = "/library/library-parity-matrix/"
+title = "Comparison"
+path = "/docs/library-parity-matrix/"

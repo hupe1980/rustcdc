@@ -21,9 +21,20 @@ target
 #.idea/
 
 # Custom
-FINDINGS.md
-REVIEW.md
 .DS_Store
+
+# ── Internal notes and third-party specifications ────────────────────────────
+
+# Architecture notes. Not published with the crates and not part of the repository's
+# public surface: they cite decisions and risks by identifiers that mean nothing outside
+# the folder, and a `(D12)` leaking into a doc comment renders on docs.rs as a reference
+# to a document the reader cannot open.
+/concepts/
+
+# Protocol specifications and papers — third-party copyrighted publications, so local
+# copies are not redistributed here. `concepts/REFERENCES.md` indexes every one with its
+# retrieval URL, so the folder can be rebuilt from scratch.
+/specs/
 
 # Generated local benchmark summary.
 /BENCHMARK_REPORT.md
@@ -44,9 +55,9 @@ REVIEW.md
 
 # cargo-fuzz artefacts. The corpus and crash inputs are reproduction data for a
 # specific build, not source, and the target directory is measured in gigabytes.
-/server/fuzz/target/
-/server/fuzz/corpus/
-/server/fuzz/artifacts/
+/crates/rustcdc-server/fuzz/target/
+/crates/rustcdc-server/fuzz/corpus/
+/crates/rustcdc-server/fuzz/artifacts/
 
 # Editor noise the server repo also ignored.
 .vscode/

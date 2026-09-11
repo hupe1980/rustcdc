@@ -290,7 +290,7 @@ groups:
             checkpoint after fixing it.
 
       - alert: RUSTCDCReplicationSlotLagHigh
-        expr: rustcdc_runtime_replication_slot_lag_bytes > 1073741824
+        expr: rustcdc_replication_slot_lag_bytes > 1073741824
         for: 15m
         labels:
           severity: warning

@@ -381,7 +381,7 @@ tls_reload_interval_ms  = 300000   # 0 = never re-read the certificate (KIP-1288
 socks5_proxy            = "bastion.internal:1080"   # omit for a direct connection
 ```
 
-`max_in_flight` **moved here from `[sink.kafka]`, and its cap is gone.** It used to be
+`max_in_flight` lives here rather than under `[sink.kafka]`, and has no cap. It would be
 rejected above 5, on the usual reasoning that an idempotent producer preserves ordering
 only up to `max.in.flight.requests.per.connection = 5` (KIP-679) and that a retried batch
 could otherwise land after one produced later.
@@ -535,7 +535,7 @@ event becomes a row carrying `operation`, `source_offset`, `fingerprint_hex` and
 image; nothing merges updates or deletes into a current-state view. Answering "what does
 `public.orders` look like now?" is a `MERGE`/window query the consumer writes.
 
-There is no `write_mode` setting. There used to be one whose only legal value was
+There is no `write_mode` setting. A setting whose only legal value is
 `"append"` — a knob with a single value is documentation pretending to be configuration,
 and it invited the belief that an upsert mode existed. Upsert via Iceberg v2 equality
 deletes is the tracked gap; when it lands the setting returns with two real values.
@@ -695,7 +695,7 @@ before a single connection is opened:
 | Mistake | Why it is refused |
 |---|---|
 | A route names a sink that no `[[sinks]]` entry declares | A typo would otherwise send that table's events to the default `[sink]` |
-| A `[[sinks]]` entry that no route references | It is built — a Kafka producer, an HTTP client, a TLS handshake — and then never receives an event. This is what a mistyped route name leaves behind, and it used to start cleanly |
+| A `[[sinks]]` entry that no route references | It is built — a Kafka producer, an HTTP client, a TLS handshake — and then never receives an event. This is what a mistyped route name leaves behind, and it would otherwise start cleanly |
 | Two routes referencing the same named sink | One binding cannot be owned by two routes. Give the second route its own `[[sinks]]` entry, or merge the patterns |
 
 `rustcdc validate-config` reports all three without contacting anything.
@@ -839,7 +839,7 @@ second writer shares the channel name), `…_commit_wait_ms_total`, and
 filtering, NDJSON framing — is asserted against a local fake of the API in
 `tests/snowflake_contract.rs`, which runs on every build. What the fake cannot prove is that
 the request shapes match the live service; there is no account-backed suite yet, and the
-[maturity table](https://github.com/hupe1980/rustcdc/blob/main/server/README.md#connector-maturity) says so.
+[maturity table](https://github.com/hupe1980/rustcdc/blob/main/crates/rustcdc-server/README.md#connector-maturity) says so.
 
 [sf-api]: https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-rest-api
 
@@ -900,7 +900,7 @@ duplicate source.
 are asserted in `tests/zerobus_contract.rs` against an in-process fake built from the SDK's
 **own generated server trait** — the same protobuf a real server implements, so a contract
 change stops it compiling. There is no workspace-backed suite; the
-[maturity table](https://github.com/hupe1980/rustcdc/blob/main/server/README.md#connector-maturity) says so.
+[maturity table](https://github.com/hupe1980/rustcdc/blob/main/crates/rustcdc-server/README.md#connector-maturity) says so.
 
 [zb]: https://docs.databricks.com/aws/en/ingestion/zerobus-overview
 
@@ -1926,11 +1926,10 @@ The plaintext guard is about the **transport**, not the protocol: `http://` to a
 non-loopback host is refused for either protocol unless `otlp_allow_insecure = true`.
 `otlp_protocol = "http"` against an `https://` endpoint is the normal production shape.
 
-That override used to be the environment variable `OTLP_ALLOW_INSECURE=1`, read inside the
-telemetry validator and declared nowhere. A security-relevant switch that lives outside the
-configuration file cannot be seen by `validate-config`, does not appear in `GET /config`,
-and is invisible to the review that reads the rest of these settings. It is a field now,
-like everything else here.
+It is a configuration field rather than an environment variable, deliberately. A
+security-relevant switch outside the configuration file cannot be seen by
+`validate-config`, does not appear in `GET /config`, and is invisible to the review that
+reads the rest of these settings.
 
 
 ## 9. Environment variables

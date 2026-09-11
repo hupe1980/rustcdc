@@ -428,7 +428,7 @@ Alert when `retained_wal` exceeds a threshold (e.g., 10 GiB).
    When the limit is exceeded, PostgreSQL **invalidates the slot** rather than
    filling the disk. Treat that as a data-loss event: the retained WAL is gone,
    and the pipeline must re-snapshot. Alert well before the cap using the
-   `rustcdc_runtime_replication_slot_lag_bytes` gauge (see
+   `rustcdc_replication_slot_lag_bytes` gauge (see
    `RUSTCDCReplicationSlotLagHigh` in the shipped alert rules).
 3. **Drop idle slots** if a pipeline is permanently retired:
    ```sql
@@ -530,7 +530,7 @@ metrics:
 | `rustcdc_runtime_stall_cause{cause=…}` | gauge | Present only while stalled: `unconfirmed_source_position` \| `poll_loop_not_turning` \| `consumer_not_acknowledging`. Route the page on this |
 | `rustcdc_runtime_poll_age_ms` | gauge | Milliseconds since the last poll returned, empty batches included — the poll loop's own liveness |
 | `rustcdc_runtime_delivery_age_ms` | gauge | Milliseconds since events last arrived. High on its own just means the source is quiet — do not alert on it |
-| `rustcdc_runtime_replication_slot_lag_bytes` | gauge | Slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). Unbounded growth risks slot invalidation |
+| `rustcdc_replication_slot_lag_bytes` | gauge | Slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). Unbounded growth risks slot invalidation |
 | `rustcdc_runtime_events_skipped_total` | counter | Events permanently dropped by `transform_error_policy = "skip"`. **Any increase is data loss** |
 | `rustcdc_source_consecutive_poll_errors` | gauge | Replication stream errors since last success; resets on reconnect |
 | `rustcdc_runtime_checkpoint_age_ms` | gauge | Age of the last durable checkpoint (milliseconds) |

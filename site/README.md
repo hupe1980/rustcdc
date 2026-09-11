@@ -19,7 +19,7 @@ could only ever be a bare URL.
 > The practical consequence for writers: **Tera syntax does nothing in these pages.**
 > There are no shortcodes, `{% raw %}` is not needed and would render literally, and a
 > value that must stay in step with the code (the MSRV, say) is written as a literal and
-> checked by `server/tests/architecture.rs` rather than interpolated.
+> checked by `crates/rustcdc-server/tests/architecture.rs` rather than interpolated.
 
 ```bash
 zola --root site serve    # http://127.0.0.1:1111, live reload
@@ -59,7 +59,7 @@ Link between pages with Zola's internal syntax, never a bare relative path:
 
 ```markdown
 See [delivery contracts](@/docs/concepts.md#3-delivery-contracts).
-See [the API guide](@/library/api.md).
+See [the API guide](@/docs/api.md).
 ```
 
 `@/…md` links are resolved at build time, so a renamed page or a heading that no longer
@@ -83,12 +83,17 @@ first. For a custom domain, also add `static/CNAME`.
 
 ## The library pages are compiled, not just published
 
-`src/lib.rs` embeds `content/library/*.md` with `include_str!`, so every Rust code block
-on those pages is compiled by `cargo test --doc`. A sample that stops compiling fails the
-build rather than rotting quietly on the site.
+`crates/rustcdc/src/lib.rs` embeds `content/library/*.md` with `include_str!`, so every
+Rust code block on those pages is compiled by `cargo test --doc`. A sample that stops
+compiling fails the build rather than rotting quietly on the site.
 
 Two consequences when editing under `content/library/`:
 
 - A Rust block that cannot compile here needs ` ```rust,ignore ` and a comment saying why.
-- The files cannot move without updating `src/lib.rs`, and they must stay inside the
-  package root — `cargo package` collects nothing above it, so docs.rs would lose the book.
+- The files cannot move without updating `crates/rustcdc/src/lib.rs`.
+
+The module is gated on `rustcdc_markdown_doctests`, a cfg `crates/rustcdc/build.rs` sets
+only when these files are present. `site/` lives above the crate, so `cargo package`
+cannot collect it — in the repository the guides are compiled and run, and from a
+published `.crate` the module does not exist rather than failing to expand an
+`include_str!` on a path that cannot be there.

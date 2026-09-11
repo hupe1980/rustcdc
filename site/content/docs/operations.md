@@ -128,6 +128,15 @@ curl -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" http://localhost:8080/metric
 curl http://localhost:8080/openapi.json
 ```
 
+> [!NOTE]
+> **Every runtime metric carries a `source_type` label** — `postgres`, `mysql`,
+> `sqlserver` and so on. PromQL label matchers select a subset, so existing rules such as
+> `rustcdc_runtime_health{verdict="stalled"} == 1` keep working unchanged; the label is
+> there to tell pipelines apart when more than one is scraped into the same Prometheus.
+>
+> These families are rendered by the library, so an embedder and this server export the
+> same names with the same labels, because one implementation renders them.
+
 ### What the probes actually decide
 
 The three answer different questions, and the difference is the whole design:
@@ -185,7 +194,7 @@ Two metrics make it visible:
 | `rustcdc_admin_signal_worker_alive` | `0` means the worker is gone. Nothing recovers short of a process restart — alert on it |
 | `rustcdc_admin_signal_worker_panics_total` | A signal action panicked and was **recovered**. Not an outage: the worker caught it, released the signal's in-flight guard so it can be retried, and carried on. Treat it as a defect report |
 
-A panicking action used to terminate the worker for the process lifetime. It now unwinds
+A panicking action unwinds
 into the worker's recovery path, which writes the panic message to the audit trail under
 `action=signal_action_panicked` with the signal id, increments the counter, and continues.
 
@@ -233,8 +242,10 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | `rustcdc_runtime_stall_cause{cause=…}` | present | Which signal stalled: `unconfirmed_source_position` (the database is retaining log), `poll_loop_not_turning` (this process or the source socket), `consumer_not_acknowledging` (the sink). Emitted only while stalled, so presence is the condition — route pages on this rather than fanning one alert out to every team |
 | `rustcdc_runtime_poll_age_ms` | see runbook | Milliseconds since `poll_event_batch` last returned, empty batches included. Stays low on an idle source; growth means the loop itself has stopped turning |
 | `rustcdc_runtime_delivery_age_ms` | **do not alert** | Milliseconds since events last arrived. High on its own is a quiet database. A diagnostic to read beside the poll age, never a condition |
+| `rustcdc_runtime_idempotency_evictions_total` | sustained growth | The dedup window is too small for this deployment's replay distance, so duplicates older than the window stop being suppressed. Raise `runtime.idempotency.capacity` |
+| `rustcdc_runtime_idempotency_unidentifiable_total` | growth on a keyed table | Events with neither transaction metadata nor a resolvable primary key are deliberately **not** deduplicated. Expected for keyless tables; unexpected growth means a key is missing from the row image |
 | `rustcdc_runtime_events_skipped_total` | any increase | Events permanently dropped by `transform_error_policy = "skip"` — the checkpoint advances past them, so **any increase is confirmed data loss** |
-| `rustcdc_runtime_replication_slot_lag_bytes` | > 1 GiB sustained | PostgreSQL slot WAL retention; growth risks slot invalidation (`max_slot_wal_keep_size`) or a full WAL volume |
+| `rustcdc_replication_slot_lag_bytes` | > 1 GiB sustained | PostgreSQL slot WAL retention; growth risks slot invalidation (`max_slot_wal_keep_size`) or a full WAL volume |
 | `rustcdc_slo_checkpoint_age_seconds` | > 300 s | Checkpoint has not advanced — sink or source issue |
 | `rustcdc_source_consecutive_poll_errors` | > 0 | Source connection degraded |
 | `rustcdc_runtime_recoverable_breaker_open_total` | increasing | Circuit breaker firing repeatedly |
@@ -767,17 +778,16 @@ after which every asynchronous signal was accepted, answered `STARTED`, and neve
 
 `transport.mode = "tls"` is enforced on **every** connection the server opens to the
 source, including the replication-slot lag sampler behind
-`rustcdc_runtime_replication_slot_lag_bytes`.
+`rustcdc_replication_slot_lag_bytes`.
 
-That sampler used to connect with TLS disabled regardless of the configured
-transport, so a TLS-configured PostgreSQL deployment put its replication password on
-the wire in the clear once every 15 seconds for the life of the process, with nothing
-in the logs to say so. It now builds its TLS client from the same
-`ca_cert_path` / `client_cert_path` / `client_key_path` as the capture connection, and
-a transport it cannot honour fails the sample rather than downgrading it.
+That inclusion matters: a sampler exempt from the transport setting would put the
+replication password on the wire in the clear every 15 seconds for the life of the
+process, with nothing in the logs to say so. It builds its TLS client from the same
+`ca_cert_path` / `client_cert_path` / `client_key_path` as the capture connection, and a
+transport it cannot honour fails the sample rather than downgrading it.
 
-The connector itself no longer accepts `sslmode=prefer` semantics either: a TLS
-transport against a server with `ssl = off` fails to connect. If you need plaintext,
+The connector does not accept `sslmode=prefer` semantics either: a TLS transport
+against a server with `ssl = off` fails to connect. If you need plaintext,
 say so — the configuration is the audit record.
 
 ### Metric units
@@ -785,20 +795,10 @@ say so — the configuration is the audit record.
 Every duration and latency family is exported in **seconds**, per the Prometheus
 base-unit convention, and captured at microsecond resolution.
 
-This was not always true. Latency was previously captured with millisecond truncation
-against histogram bounds starting at 1 ms — so per-event work, which is measured in
-microseconds, truncated to `0`, landed entirely in the `le="1"` bucket, and made every
-quantile identical. A tenfold regression produced no visible change. If you have
-dashboards predating this, the families were renamed:
-
-| Old | New |
-|---|---|
-| `rustcdc_*_latency_ms` / `_ms_avg` / `_ms_last` | `rustcdc_*_latency_seconds` / `_seconds_avg` / `_seconds_last` |
-| `rustcdc_end_to_end_ack_lag_ms_*` | `rustcdc_end_to_end_ack_lag_seconds_*` |
-| `rustcdc_sink_http_retry_delay_ms_*` | `rustcdc_sink_http_retry_delay_seconds_*` |
-| `rustcdc_sink_http_batch_retry_duration_ms_*` | `rustcdc_sink_http_batch_retry_duration_seconds_*` |
-| `rustcdc_slo_admin_api_latency_ms_histogram` | `rustcdc_slo_admin_api_latency_seconds_histogram` |
-| `rustcdc_admin_rate_limiter_*_decision_latency_ms_*` | `..._decision_latency_seconds_*` |
+Microsecond resolution matters because per-event work is measured in microseconds: capture
+it with millisecond truncation against bounds starting at 1 ms and every sample lands in
+the same bucket, making all quantiles identical — a tenfold regression would produce no
+visible change at all.
 
 `rustcdc_runtime_checkpoint_age_ms` is deliberately unchanged; use
 `rustcdc_slo_checkpoint_age_seconds` for alerting, which is what the shipped rules do.
@@ -1090,8 +1090,8 @@ instances starting inside the same millisecond-scale window can both see a free 
 converts the common silent interleave — two writers, last-write-wins, the durable position
 sliding backwards — into a loud refusal. It is not a substitute for a store with real CAS,
 and on a filesystem that does not honour write visibility across hosts it guarantees
-nothing. `strategy: Recreate` and `ReadWriteOnce` remain the right things to configure;
-they are simply no longer the *only* thing standing between you and a corrupted checkpoint.
+nothing. `strategy: Recreate` and `ReadWriteOnce` are still the right things to configure — the
+lease is a second line of defence, not a replacement for them.
 
 Deleting `owner_lease.json` by hand forces a takeover. Do that only when you are certain no
 other process is running, because it is exactly the safety this file provides.

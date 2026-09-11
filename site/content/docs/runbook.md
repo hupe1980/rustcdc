@@ -44,11 +44,10 @@ curl -sk -H "Authorization: Bearer $READ_TOKEN" https://<host>:8080/metrics \
 | `idle` | Connected, no changes upstream | **No.** A quiet database is not an incident |
 | `stalled` | Running but not progressing | **Yes.** Go to §3 |
 
-There is no `degraded` verdict. This table used to list one, and an operator waiting for
-`rustcdc_runtime_health{verdict="degraded"}` would have waited forever: the gauge has
-exactly the four series above and the enum has exactly four variants. Accumulating
-recoverable errors show up as `rustcdc_source_consecutive_poll_errors` and
-`rustcdc_runtime_recoverable_breaker_open_consecutive` instead — see §7.
+There are exactly these four — the gauge has four series and the enum has four variants.
+There is no `degraded`. Accumulating recoverable errors show up as
+`rustcdc_source_consecutive_poll_errors` and
+`rustcdc_runtime_recoverable_breaker_open_consecutive` instead; see §7.
 
 `idle` is reachable at any point in a run, not only before the first event: a pipeline that
 delivered a million rows this morning and has been quiet since lunch reports `idle`.
@@ -73,10 +72,9 @@ from a dead one:
 | low | high | `idle` — normal. **Never page on delivery age alone** |
 | high | any | `stalled`, cause `poll_loop_not_turning` |
 
-The server logs one WARN on entry to a stall — `runtime health degraded to stalled`, with
-`cause=` and the measurements — and one INFO on recovery. If you are seeing that line
-repeat several times a second, you are on a build before 0.15.0, where the change guard
-compared a reason string containing the elapsed milliseconds and so never matched.
+The server logs **one** WARN on entry to a stall — `runtime health degraded to stalled`,
+carrying `cause=` and the measurements — and one INFO on recovery. A stall that changes
+cause logs again, because that is a different problem with a different owner.
 
 `last_terminal_reason_code` in `/status` is the single most useful field after a crash:
 it names the subsystem that ended the run (`batch_delivery_error`,
@@ -221,7 +219,7 @@ there.
 
 ## 4. Replication slot growth (PostgreSQL)
 
-**Symptom:** `rustcdc_runtime_replication_slot_lag_bytes` growing steadily.
+**Symptom:** `rustcdc_replication_slot_lag_bytes` growing steadily.
 
 This is the failure that takes the **source database** down, so it outranks almost
 everything else. An unconsumed slot pins WAL forever; the disk fills; PostgreSQL stops

@@ -17,7 +17,7 @@ RUN apt-get update \
 WORKDIR /build
 
 # The whole workspace: the server binary links the library at the workspace root, and
-# the library embeds `README.md` and `site/content/library/*.md` with `include_str!`.
+# the library embeds `README.md` and `site/content/docs/*.md` with `include_str!`.
 #
 # No dependency-only pre-build stage here. The stub-`main.rs` trick cannot work across a
 # workspace — cargo would need a skeleton for every member and every declared target —

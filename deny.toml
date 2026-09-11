@@ -138,11 +138,8 @@ ignore = [
     #     name-constrained intermediates are not materially exposed.
     #
     # Users who cannot accept this should not enable the `sqlserver` feature.
-    # Documented in site/content/library/security.md. Remove both entries as soon as tiberius
+    # Documented in site/content/docs/security.md. Remove both entries as soon as tiberius
     # releases against rustls 0.23.
-    { id = "RUSTSEC-2026-0098", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; URI names are never asserted by rustcdc; requires CA misissuance to exploit; see site/content/library/security.md" },
-    { id = "RUSTSEC-2026-0099", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; fix requires rustls 0.23, not semver-reachable from tiberius; requires CA misissuance to exploit; see site/content/library/security.md" },
-    { id = "RUSTSEC-2026-0104", reason = "production (sqlserver feature only): tiberius 0.12.3 pins tokio-rustls 0.24 -> rustls-webpki 0.101.7; unreachable because rustcdc never parses CRLs and tiberius exposes no CRL API; see site/content/library/security.md" },
 
     #   RUSTSEC-2025-0134 (rustls-pemfile unmaintained):
     #     Unmaintained, not a vulnerability. rustcdc's own code no longer uses it —
@@ -151,7 +148,6 @@ ignore = [
     #     direct dependency was removed. It survives only under the `sqlserver`
     #     feature, via tiberius 0.12.3 -> rustls-native-certs 0.6 -> rustls-pemfile
     #     1.0, on the same upstream blocker as the entries above.
-    { id = "RUSTSEC-2025-0134", reason = "production (sqlserver feature only): unmaintained, not a vulnerability; rustcdc migrated its own PEM parsing to rustls-pki-types and dropped the direct dependency; reachable only via tiberius 0.12.3 -> rustls-native-certs 0.6; blocked on tiberius releasing against rustls 0.23; see site/content/library/security.md" },
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────

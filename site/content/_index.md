@@ -8,28 +8,27 @@ template = "index.html"
 api_version       = "v1"
 delivery_contract = "at_least_once"
 
-[source]
-type = "postgres"
+[source.postgres]
+host                  = "db.internal"
+port                  = 5432
+user                  = "cdc_user"
+password              = { env = "POSTGRES_PASSWORD" }   # a literal here is rejected at load
+database              = "app"
+publication_name      = "cdc_pub"
+replication_slot_name = "cdc_slot"
+table_include_list    = ["public.orders", "public.customers"]
+table_exclude_list    = []
+conn_timeout_secs     = 10
+max_events_per_poll   = 1000
+stream_poll_interval_ms = 100
 
-  [source.postgres]
-  host     = "db.internal"
-  user     = "cdc_user"
-  password = { env = "POSTGRES_PASSWORD" }   # a literal here is rejected at load
-  database = "app"
-  publication_name      = "cdc_pub"
-  replication_slot_name = "cdc_slot"
-  table_include_list    = ["public.orders", "public.customers"]
+[source.postgres.transport]
+mode = "tls"
 
 [sink]
 type    = "kafka"
 brokers = "broker1:9092,broker2:9092"
 topic   = "cdc.orders"
-delivery_mode       = "at_least_once_idempotent"
-max_pipelined_sends = 128
-
-  [sink.codec]
-  type         = "avro_confluent"
-  registry_ref = "prod"
 
 # Mask before the data ever leaves the process.
 [[pipeline.transforms]]
@@ -41,10 +40,12 @@ name = "redact_pii"
     [pipeline.transforms.actions.rules]
     email = { type = "hmac_sha256", key = { env = "PII_HMAC_KEY" } }
 
-[state]
-backend = "kafka_topic"
+[state.backend.kafka_topic]
+brokers            = "broker1:9092,broker2:9092"
+topic              = "__rustcdc_state"
+durability_profile = "production"
 
 [admin]
-enabled = true
-bind    = "127.0.0.1:8080"
+bind            = "127.0.0.1:8080"
+probe_auth_mode = "allow_unauthenticated_loopback"
 ```

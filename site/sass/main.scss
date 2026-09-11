@@ -278,6 +278,48 @@ img, svg { max-width: 100%; height: auto; }
 .section-sub { color: var(--fg-muted); max-width: 62ch; margin: 0 0 2rem; }
 
 .flow, .features, .config-demo, .cta-final { padding: clamp(3rem, 6vw, 5rem) 0; }
+// ── The two surfaces ─────────────────────────────────────────────────────────
+// The landing page's first job is telling a reader which of the two artefacts they
+// want, so this sits directly under the hero.
+
+.lede-sub {
+  margin-top: -1.2rem;
+  font-size: clamp(0.95rem, 1.3vw, 1.02rem);
+  strong { color: var(--fg); font-weight: 650; }
+}
+
+.paths { text-align: center; }
+
+.path-grid {
+  display: grid; gap: 1.1rem; margin-top: 2rem; text-align: left;
+  // Two side by side while there is room; one column below, rather than squeezing
+  // a code line that must not wrap.
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+}
+
+.path {
+  display: flex; flex-direction: column;
+  background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 1.6rem;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+  &:hover { border-color: var(--border-strong); transform: translateY(-2px); }
+
+  h3 {
+    margin: 0 0 0.35rem; font-family: var(--mono);
+    font-size: 1.02rem; letter-spacing: -0.01em;
+  }
+  p { margin: 0 0 0.9rem; color: var(--fg-muted); font-size: 0.94rem; }
+  // The one-line answer to "is this the one I want?", before the prose.
+  .path-for {
+    margin-bottom: 0.9rem; color: var(--fg); font-size: 0.96rem;
+    strong { font-weight: 650; }
+  }
+  // `margin: auto 0 1rem` pushes the command to the bottom, so both cards line their
+  // commands up whatever the prose above measures.
+  .hero-run { margin: auto 0 1rem; width: 100%; }
+  a { font-size: 0.9rem; font-weight: 600; text-decoration: none; &:hover { text-decoration: underline; } }
+}
+
 .flow { text-align: center; .section-title { margin-bottom: 2rem; } }
 
 .flow-grid {
@@ -616,4 +658,35 @@ pre {
   .page-nav, .edit-link, .skip-link { display: none !important; }
   .docs-layout { grid-template-columns: 1fr; }
   body { color: #000; background: #fff; }
+}
+
+// ── Diagrams ────────────────────────────────────────────────────────────────
+// Inline SVG rather than a client-side renderer. Mermaid would be 3.4 MB of
+// JavaScript to draw four boxes, and the reader pays it on first paint; an SVG the
+// markdown already contains renders instantly, prints, and survives with JS off.
+//
+// Colours come from the theme tokens via `currentColor` and the `.dg-*` classes, so a
+// diagram follows light and dark without a second copy.
+.diagram {
+  margin: 1.75rem 0;
+  padding: 1.25rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  // A wide diagram scrolls inside its own box; the page never scrolls sideways.
+  overflow-x: auto;
+
+  svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+
+  figcaption {
+    margin-top: 0.9rem; color: var(--fg-muted);
+    font-size: 0.88rem; text-align: center;
+  }
+
+  .dg-box   { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.5; }
+  .dg-accent{ fill: var(--bg); stroke: var(--brand); stroke-width: 2; }
+  .dg-label { fill: var(--fg); font-size: 13px; font-weight: 600; }
+  .dg-sub   { fill: var(--fg-muted); font-size: 11px; }
+  .dg-flow  { stroke: var(--border-strong); stroke-width: 1.5; fill: none; }
+  .dg-text  { font-family: var(--sans, system-ui, sans-serif); }
 }

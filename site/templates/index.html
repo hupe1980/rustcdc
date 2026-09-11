@@ -13,7 +13,7 @@
     "@graph": [
       {
         "@type": "SoftwareSourceCode",
-        "name": "rustcdc-server",
+        "name": "rustcdc",
         "description": {{ config.description | json_encode | safe }},
         "url": {{ config.base_url | json_encode | safe }},
         "codeRepository": {{ config.extra.repo | json_encode | safe }},
@@ -23,7 +23,28 @@
         "author": { "@type": "Person", "name": {{ config.extra.author | json_encode | safe }} },
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Linux, macOS",
-        "softwareVersion": {{ config.extra.version | json_encode | safe }}
+        "softwareVersion": {{ config.extra.version | json_encode | safe }},
+        {# The repository ships two artefacts from one version. Describing only the
+           server made the crate invisible to anything reading this graph. #}
+        "hasPart": [
+          {
+            "@type": "SoftwareApplication",
+            "name": "rustcdc-server",
+            "applicationCategory": "DeveloperApplication",
+            "operatingSystem": "Linux",
+            "softwareVersion": {{ config.extra.version | json_encode | safe }},
+            "url": {{ (config.base_url ~ "/docs/") | json_encode | safe }},
+            "description": "A configured change-data-capture server and distroless container image: TOML in, Kafka, Iceberg, Snowflake, HTTP or files out."
+          },
+          {
+            "@type": "SoftwareSourceCode",
+            "name": "rustcdc (library)",
+            "programmingLanguage": "Rust",
+            "codeRepository": {{ config.extra.repo | json_encode | safe }},
+            "url": {{ config.extra.crate_url | json_encode | safe }},
+            "description": "An embeddable Rust crate that runs change data capture inside your own process, on your own Tokio runtime."
+          }
+        ]
       },
       {
         "@type": "WebSite",
@@ -60,6 +81,14 @@
           },
           {
             "@type": "Question",
+            "name": "Is rustcdc a server or a library?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Both, from one repository at one version. rustcdc-server is a configured binary and container image you run. rustcdc is a Rust crate you embed in your own process, where you own the poll loop and the sink. The server is the library plus configuration, sinks, state backends and an operational surface \u2014 not a separate implementation."
+            }
+          },
+          {
+            "@type": "Question",
             "name": "Does rustcdc require Kafka Connect or a JVM?",
             "acceptedAnswer": {
               "@type": "Answer",
@@ -86,19 +115,18 @@
       contracts that say exactly what they guarantee, a sandboxed WASM transform pipeline,
       and a signed audit trail.
     </p>
+    <p class="lede lede-sub">
+      Run it as a <strong>server</strong>, or embed it as a <strong>Rust library</strong>.
+      Same runtime, same version, one repository.
+    </p>
 
     <div class="cta-row">
       <a class="btn btn-primary" href="{{ get_url(path='/docs/getting-started/') }}">
-        Get started
+        Run the server
       </a>
-      <a class="btn btn-ghost" href="{{ config.extra.repo }}" rel="noopener">
-        View on GitHub
+      <a class="btn btn-ghost" href="{{ get_url(path='/docs/embedding/') }}">
+        Embed the crate
       </a>
-    </div>
-
-    <div class="hero-run">
-      <code>docker run ghcr.io/hupe1980/rustcdc-server:latest run --config-file cdc.toml</code>
-      <button class="copy-btn" type="button" data-copy="docker run ghcr.io/hupe1980/rustcdc-server:latest run --config-file cdc.toml" aria-label="Copy command">Copy</button>
     </div>
 
     <ul class="hero-badges">
@@ -107,6 +135,49 @@
       <li>Single binary</li>
       <li>Distroless image</li>
     </ul>
+  </div>
+</section>
+
+<section class="paths" aria-labelledby="paths-h">
+  <div class="wrap">
+    <h2 id="paths-h" class="section-title">Two ways to run it</h2>
+    <p class="section-sub">
+      Both are built and tested from the same commit, against each other, at one version.
+      The server <em>is</em> the library plus configuration, sinks, state backends and an
+      operational surface — not a second implementation.
+    </p>
+
+    <div class="path-grid">
+      <article class="path">
+        <h3>rustcdc-server</h3>
+        <p class="path-for">You want change data capture <strong>running</strong>.</p>
+        <p>
+          A configured binary and distroless container image. TOML in; Kafka, Iceberg,
+          Snowflake, HTTP or files out. Admin API, Prometheus, OTLP traces, dead-letter
+          queue, signed audit trail.
+        </p>
+        <div class="hero-run">
+          <code>docker run ghcr.io/hupe1980/rustcdc-server:latest run --config-file cdc.toml</code>
+          <button class="copy-btn" type="button" data-copy="docker run ghcr.io/hupe1980/rustcdc-server:latest run --config-file cdc.toml" aria-label="Copy command">Copy</button>
+        </div>
+        <a href="{{ get_url(path='/docs/getting-started/') }}">Server quickstart →</a>
+      </article>
+
+      <article class="path">
+        <h3>rustcdc</h3>
+        <p class="path-for">You want it <strong>inside something you are building</strong>.</p>
+        <p>
+          An ordinary crate that links into your binary and runs on your Tokio runtime.
+          You own the poll loop, the sink and the process. No sidecar to supervise, no
+          control plane to operate.
+        </p>
+        <div class="hero-run">
+          <code>cargo add rustcdc --features postgres</code>
+          <button class="copy-btn" type="button" data-copy="cargo add rustcdc --features postgres" aria-label="Copy command">Copy</button>
+        </div>
+        <a href="{{ get_url(path='/docs/embedding/') }}">Embedding guide →</a>
+      </article>
+    </div>
   </div>
 </section>
 
@@ -208,10 +279,13 @@
         <h3>Observability that resolves</h3>
         <p>
           Prometheus and OTLP, latency histograms in seconds at microsecond resolution, and a
-          one-hot health verdict that tells a quiet database apart from a dead socket. Shipped
-          alert rules are tested against the metrics that actually exist.
+          health verdict that tells a quiet database apart from a dead socket — with a stable
+          stall <em>cause</em> to route the page, because an unconfirmed replication slot, a
+          wedged poll loop and a sink that stopped draining go to three different people.
+          <code>/livez</code> restarts the pod for exactly one of them. Shipped alert rules are
+          tested against the metrics that actually exist.
         </p>
-        <a href="{{ get_url(path='/docs/operations/') }}">Operations guide →</a>
+        <a href="{{ get_url(path='/docs/runbook/') }}#1-first-response">Health verdict →</a>
       </article>
 
       <article class="feature">
@@ -266,9 +340,13 @@
 <section class="cta-final">
   <div class="wrap">
     <h2>Stream your first change in ten minutes</h2>
-    <p>A self-contained Docker Compose demo runs a Postgres pipeline with no configuration at all.</p>
+    <p>
+      A self-contained Docker Compose demo runs a Postgres pipeline with no configuration at
+      all — or start from an empty Rust project and own the loop yourself.
+    </p>
     <div class="cta-row">
-      <a class="btn btn-primary" href="{{ get_url(path='/docs/getting-started/') }}">Getting started</a>
+      <a class="btn btn-primary" href="{{ get_url(path='/docs/getting-started/') }}">Run the server</a>
+      <a class="btn btn-ghost" href="{{ get_url(path='/docs/embedding/') }}">Embed the crate</a>
       <a class="btn btn-ghost" href="{{ get_url(path='/docs/concepts/') }}">How it works</a>
     </div>
   </div>

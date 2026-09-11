@@ -231,7 +231,7 @@ produced by the same producer.
 
 Any other state backend is a second durability domain. The batch and the position would
 commit separately, and a crash between the two would replay the batch — the window this
-contract exists to avoid. That combination used to be accepted with the residual window
+contract exists to avoid. That combination is rejected rather than accepted with the residual window
 documented as a caveat; it is now a configuration error, because a guarantee an operator
 has to read a paragraph to qualify is not a guarantee.
 
@@ -433,7 +433,7 @@ After `max_open_cycles` open cycles, the pipeline transitions to `Error` state.
 
 **These parameters govern both halves of the pipeline.** Source poll failures and sink
 delivery failures share one policy and one breaker. That was not always true: sink
-failures used to be unconditionally terminal, so a few-second broker leader election
+treating such failures as unconditionally terminal would make a few-second broker leader election
 became a process exit and a full replay from the last checkpoint while these settings
 looked like they applied.
 

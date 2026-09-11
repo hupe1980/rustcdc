@@ -26,7 +26,7 @@ jobs:
   # hardcode `1.94.0` while the manifest said `1.94`: two sources of truth for one number,
   # and exactly how they drift. A dependency raised its own requirement, the pinned job
   # started failing, and nothing said which of the two values was wrong.
-  # `server/tests/architecture.rs` asserts this job derives rather than restates.
+  # `crates/rustcdc-server/tests/architecture.rs` asserts this job derives rather than restates.
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -111,7 +111,7 @@ jobs:
       - uses: ./.github/actions/build-deps
         if: runner.os == 'Linux'
       # `--all`, not the default: without it `cargo fmt` formats only the package in the
-      # current directory, so every file under `server/` and `xtask/` went unchecked.
+      # current directory, so every file under `crates/rustcdc-server/` and `crates/crash-workers/` went unchecked.
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
       # Workspace-wide on purpose. Both members are the product; linting only the library
@@ -723,100 +723,281 @@ jobs:
             target/benchmark-ci-env.txt
             target/criterion
             BENCHMARK_REPORT.md
-
-  release-evidence-verify:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # ── The published artefact, built on every pull request ──────────────────────
+  #
+  # `cargo package` is not `cargo build`. It collects the files the `.crate` will
+  # actually contain and then builds *from that copy*, so it is the only thing that
+  # catches a crate which compiles in the repository and not from the registry: a file
+  # outside the package root, an `include_str!` reaching for something `exclude` removed,
+  # a `build.rs` input nobody packaged.
+  #
+  # Running it only at release time means discovering that on the tag, with the version
+  # already burned. Running it here means a broken package fails the pull request that
+  # broke it.
+  package:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: install verification dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      - name: verify tag matches Cargo.toml version
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "rustcdc") | .version')
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
-            exit 1
-          fi
-
-      - name: verify successful release-evidence run exists for this commit
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const workflowId = '.github/workflows/ci.yml';
-            const headSha = context.sha;
-
-            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
-              owner,
-              repo,
-              workflow_id: workflowId,
-              per_page: 100,
-              head_sha: headSha,
-            });
-
-            const candidates = runs.filter((run) =>
-              run.id !== context.runId &&
-              !run.head_branch?.startsWith('v') &&
-              run.event !== 'workflow_dispatch' &&
-              run.conclusion === 'success'
-            );
-
-            if (candidates.length === 0) {
-              core.setFailed(`No successful non-tag CI run found for commit ${headSha}.`);
-              return;
-            }
-
-            let evidenceFound = false;
-            for (const run of candidates) {
-              const jobsResp = await github.rest.actions.listJobsForWorkflowRun({
-                owner,
-                repo,
-                run_id: run.id,
-                per_page: 100,
-              });
-
-              const releaseEvidenceJob = jobsResp.data.jobs.find((job) => job.name === 'release-evidence');
-              if (!releaseEvidenceJob || releaseEvidenceJob.conclusion !== 'success') {
-                continue;
-              }
-
-              const artifactsResp = await github.rest.actions.listWorkflowRunArtifacts({
-                owner,
-                repo,
-                run_id: run.id,
-                per_page: 100,
-              });
-
-              const hasEvidenceArtifact = artifactsResp.data.artifacts.some((artifact) => artifact.name === 'release-gate-evidence');
-              if (hasEvidenceArtifact) {
-                core.info(`Using validated evidence from run ${run.id}.`);
-                evidenceFound = true;
-                break;
-              }
-            }
-
-            if (!evidenceFound) {
-              core.setFailed('No successful release-evidence job with release-gate-evidence artifact found for this commit.');
-            }
-
-  publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: release-evidence-verify
-    runs-on: ubuntu-latest
-    environment: crates-io
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo publish
-        run: cargo publish --no-verify
+      - uses: ./.github/actions/build-deps
+      # Verification build included — that is the whole point of the job.
+      - name: cargo package -p rustcdc
+        run: cargo package -p rustcdc --locked
+      # A `.crate` that quietly grew by an order of magnitude is a packaging mistake
+      # (a fixture tree, a corpus, a `target/` escape), and crates.io rejects above 10 MiB.
+      - name: report the packaged size
+        run: |
+          set -euo pipefail
+          crate="$(ls target/package/rustcdc-*.crate)"
+          bytes="$(wc -c < "$crate")"
+          echo "$crate is $((bytes / 1024)) KiB"
+          if [ "$bytes" -gt 9437184 ]; then
+            echo "::error::the packaged crate is within 1 MiB of the crates.io 10 MiB limit"
+            exit 1
+          fi
+
+  # ── The image builds, checked on every pull request ─────────────────────────
+  #
+  # Nothing built the container outside a release, so a Dockerfile that stopped working —
+  # a renamed directory, a `.dockerignore` entry that removed a file the build needs, a
+  # base image that moved — was discovered on the tag, after the crate had published.
+  #
+  # `push: false`: this proves the image *builds*. Publishing it is `release.yml`, which
+  # runs only on a tag. One platform is enough for a smoke test; the release matrix
+  # covers both natively.
+  container-smoke:
+    name: Container image builds
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: docker build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha,scope=container-smoke
+          cache-to: type=gha,scope=container-smoke,mode=max
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # rustcdc-server
+  # ───────────────────────────────────────────────────────────────────────────
+  #
+  # Merged in from a separate `server-ci.yml`. Two workflows could not express the thing
+  # that matters most: **a job cannot `needs:` a job in another workflow**, so the
+  # release gate could never wait for the server's tests — and a branch-protection rule
+  # naming a path-filtered workflow blocks forever on pull requests that skip it.
+  #
+  # Prefixed `server-` so a red check names which half of the workspace broke.
+  # ── Check (all targets, all features) ───────────────────────────────────────
+  server-check:
+    name: Check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo check -p rustcdc-server --all-targets --all-features --locked
+
+  # ── Connector feature matrix ────────────────────────────────────────────────
+  #
+  # Connectors are opt-in cargo features so a PostgreSQL-only deployment does not link
+  # tiberius and its rustls 0.21 stack. That only holds if every combination keeps
+  # compiling, and nothing else in CI would notice a `#[cfg]` arm that stopped matching:
+  # the other jobs all build `--all-features`, where every variant exists.
+  #
+  # `cargo check` rather than `--all-targets` on purpose. The property is that a narrow
+  # *binary* builds; the test fixtures are PostgreSQL-shaped throughout, and gating each
+  # one to compile under a MySQL-only build would be churn that asserts nothing.
+  #
+  # `--no-default-features` alone is deliberately absent: it is a `compile_error!` (see
+  # `crates/rustcdc-server/src/lib.rs`), because a binary with no connector rejects every configuration.
+  server-connector-matrix:
+    name: Check (${{ matrix.features }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - postgres
+          - mysql
+          - sqlserver
+          - postgres,mysql,sqlserver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo check -p rustcdc-server --no-default-features --features ${{ matrix.features }} --locked
+
+  # ── Test ────────────────────────────────────────────────────────────────────
+  server-test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo test -p rustcdc-server --all-features --locked
+      # State compatibility runs on its own line so a failure is unmistakable in the log:
+      # it means this build cannot read state a previous one wrote, which is an upgrade
+      # that breaks every existing pipeline rather than an ordinary test failure.
+      - run: cargo test -p rustcdc-server --all-features --locked --test state_compatibility
+      # The default feature set is PostgreSQL-only, which is what most deployments build
+      # and what every test fixture here is shaped for. `--no-default-features` is not run:
+      # it has no connector and is a `compile_error!` by design; `connector-matrix` covers
+      # the narrow combinations.
+      - run: cargo test -p rustcdc-server --locked
+
+  # ── Integration (real databases and brokers) ────────────────────────────────
+  #
+  # The test manages its own container, so this job and a developer's local run are the
+  # same command against the same fixture. `--test-threads=1` because the tests share one
+  # container name and one host port on purpose: a killed run leaves exactly one thing to
+  # clean up.
+  #
+  # `crates/rustcdc-server/tests/architecture.rs::every_integration_suite_is_run_by_ci` enumerates
+  # `crates/rustcdc-server/tests/integration_*.rs` from disk and asserts each one is named here. Adding a
+  # suite and forgetting to wire it up fails the unit suite rather than silently reporting
+  # success — which is what an env-gated test that nobody runs does.
+  server-integration:
+    name: Integration (${{ matrix.suite }}${{ matrix.broker && format(' / {0}', matrix.broker) || '' }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: integration_postgres
+            container: rustcdc-integration-postgres
+          - suite: integration_mysql
+            container: rustcdc-integration-mysql
+          # Two brokers, one suite. Redpanda is an independent reimplementation of the
+          # Kafka wire protocol, so a green run against one says nothing about the other —
+          # and this matrix proved it on its first run: Apache Kafka propagates new-topic
+          # metadata asynchronously and elects a group coordinator lazily, neither of which
+          # Redpanda does. A Redpanda-only suite would have shipped a harness incapable of
+          # testing Kafka.
+          - suite: integration_kafka
+            broker: redpanda
+            container: rustcdc-integration-kafka
+          - suite: integration_kafka
+            broker: kafka
+            container: rustcdc-integration-kafka
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - name: Run the ${{ matrix.suite }} suite
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RUSTCDC_INTEGRATION: "1"
+          RUSTCDC_TEST_BROKER: ${{ matrix.broker }}
+        run: cargo test -p rustcdc-server --all-features --locked --test ${{ matrix.suite }} -- --test-threads=1
+      # Removes the container **this** job started. It used to remove
+      # `rustcdc-integration-postgres` unconditionally, so the MySQL job cleaned up a
+      # container it had never started and left its own running.
+      - name: Clean up the container
+        if: always()
+        run: docker rm -f ${{ matrix.container }} || true
+
+  # ── Fuzz targets (build + short smoke run) ──────────────────────────────────
+  #
+  # The invariants these targets check also run on stable, every build, in
+  # `crates/rustcdc-server/tests/fuzz_properties.rs` — that suite is the continuous guarantee. This job
+  # exists so the libFuzzer targets cannot silently stop compiling: an uncompilable fuzz
+  # target is indistinguishable from a fuzz target nobody ever ran.
+  #
+  # 60 seconds each is a smoke test, not a campaign. Deep fuzzing is an on-demand
+  # `cargo +nightly fuzz run <target>` with a corpus, not something on the pull-request
+  # path.
+  #
+  # `crates/rustcdc-server/fuzz` is excluded from the workspace (it needs nightly and `cargo fuzz`), so
+  # this runs from that directory rather than the repository root.
+  server-fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/build-deps
+        with:
+          packages: protobuf-compiler cmake clang perl pkg-config
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build
+      - run: cargo +nightly fuzz run redact_secrets -- -max_total_time=60
+      - run: cargo +nightly fuzz run config_loader -- -max_total_time=60
+
+  # ── The one required status check ───────────────────────────────────────────
+  #
+  # Branch protection should require **this job and nothing else**.
+  #
+  # Requiring the individual jobs does not work. GitHub leaves a required check
+  # `Pending` forever when its job never runs — and jobs here legitimately do not run (an
+  # `if:` on the ref, a skipped matrix leg) — so a pull request would block on a check
+  # that is never coming. Requiring one aggregator also means the protection rule does
+  # not have to be edited every time a job is added or renamed.
+  #
+  # `if: always()` is essential: without it this job is skipped the moment any dependency
+  # fails, and GitHub reads a *skipped* required check as success — the exact inversion
+  # the rule exists to prevent.
+  #
+  # A skipped dependency is accepted; a failed or cancelled one is not.
+  required-checks-passed:
+    name: CI
+    if: always()
+    needs:
+      - msrv
+      - check
+      - quality
+      - transport-security
+      - policy-gate
+      - docs-site
+      - correctness-smoke
+      - reliability-core
+      - latency-core
+      - integration-postgres
+      - integration-postgres-encryption
+      - integration-reliability
+      - integration-schema-registry
+      - integration-mysql
+      - integration-mysql-encryption
+      - integration-mariadb
+      - integration-mariadb-encryption
+      - integration-sqlserver
+      - integration-sqlserver-encryption
+      - release-evidence
+      - package
+      - container-smoke
+      - server-check
+      - server-connector-matrix
+      - server-test
+      - server-integration
+      - server-fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - name: every required job succeeded or was skipped
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          failed="$(printf '%s' "$NEEDS_JSON" | jq -r '
+            to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | "\(.key): \(.value.result)"
+          ')"
+          if [ -n "$failed" ]; then
+            echo "::error::these jobs did not pass:"
+            printf '%s\n' "$failed"
+            exit 1
+          fi
+          echo "all required jobs passed"
