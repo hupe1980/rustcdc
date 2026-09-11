@@ -303,7 +303,7 @@ mod tests {
 
     use crate::{
         checkpoint::InMemoryCheckpoint,
-        core::{Event, Operation, RuntimeConfig, SourceMetadata, EVENT_ENVELOPE_VERSION},
+        core::{EVENT_ENVELOPE_VERSION, Event, Operation, RuntimeConfig, SourceMetadata},
         schema_history::InMemorySchemaHistory,
         testkit::{
             AdapterConformanceSuite, AdapterGoldenFixture, BasicAdapterConformance,

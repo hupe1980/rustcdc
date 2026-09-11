@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rustcdc::transform::{Transform, TransformPipeline};
 use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata, WasmConfig, WasmRuntime};
 use serde_json::json;
@@ -90,10 +90,9 @@ impl Transform for NormalizeNameTransform {
             .and_then(|value| value.as_object_mut())
             .and_then(|row| row.get_mut("name"))
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            && let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut())
         {
-            if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
-                after.insert("name".to_string(), json!(name.to_ascii_uppercase()));
-            }
+            after.insert("name".to_string(), json!(name.to_ascii_uppercase()));
         }
         Ok(true)
     }
@@ -374,7 +373,7 @@ fn wasm_tempfile(wasm: &[u8]) -> tempfile::NamedTempFile {
 }
 
 /// Benchmark the WASM pass-through transform (event in → same event out).
-/// Documents per-invocation overhead against the <1ms target in site/content/docs/wasm-transform-sdk.md.
+/// Documents per-invocation overhead against the <1ms target in site/content/library/wasm-transform-sdk.md.
 fn bench_wasm_transform_pass_through(c: &mut Criterion) {
     let wasm_bytes = compile_wat("pass_through.wat");
     let wasm_file = wasm_tempfile(&wasm_bytes);

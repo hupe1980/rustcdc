@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf, time::Duration};
 
 use rustcdc::{
+    EVENT_ENVELOPE_VERSION, Event,
     checkpoint::{Checkpoint, FileCheckpoint, MysqlOffset},
-    Event, EVENT_ENVELOPE_VERSION,
 };
 use tempfile::tempdir;
 

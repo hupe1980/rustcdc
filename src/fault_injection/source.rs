@@ -335,7 +335,7 @@ mod tests {
 
     use crate::{
         core::SnapshotMetadata,
-        core::{Offset, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
+        core::{EVENT_ENVELOPE_VERSION, Offset, SourceMetadata, TransactionMetadata},
     };
 
     use super::*;

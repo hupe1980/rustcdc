@@ -16,7 +16,7 @@
 //! requires a trusted CA to have misissued a certificate.
 //!
 //! The per-advisory reachability analysis, the mitigations, and the `cargo deny`
-//! suppressions live in `site/content/docs/security.md` and `deny.toml`. Deployments that
+//! suppressions live in `site/content/library/security.md` and `deny.toml`. Deployments that
 //! cannot accept the exposure should leave the feature disabled — it is not a default.
 
 use std::{sync::Arc, time::Duration};
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, sync::Mutex};
 
 #[cfg(test)]
-use crate::core::{Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+use crate::core::{EVENT_ENVELOPE_VERSION, Operation, SourceMetadata};
 use crate::source::helpers::now_millis;
 use crate::{
     checkpoint::GenericOffset,
@@ -865,20 +865,20 @@ impl StreamHandle for SqlServerStreamHandle {
                 // A full page means `TOP` cut the result set — unread rows remain in
                 // this window. Advancing past them would lose them permanently, and
                 // silently: `events_polled` would report a plausible count.
-                if changes.len() >= self.max_events_per_poll {
-                    if let Some(last) = changes.last() {
-                        let candidate = SqlServerCdcCursor {
-                            lsn_hex: last.start_lsn_hex.clone(),
-                            seqval_hex: last.seqval_hex.clone(),
-                            operation: last.operation,
-                        };
-                        truncation_cursor = Some(match truncation_cursor {
-                            Some(existing) if cursor_ordering(&existing, &candidate).is_le() => {
-                                existing
-                            }
-                            _ => candidate,
-                        });
-                    }
+                if changes.len() >= self.max_events_per_poll
+                    && let Some(last) = changes.last()
+                {
+                    let candidate = SqlServerCdcCursor {
+                        lsn_hex: last.start_lsn_hex.clone(),
+                        seqval_hex: last.seqval_hex.clone(),
+                        operation: last.operation,
+                    };
+                    truncation_cursor = Some(match truncation_cursor {
+                        Some(existing) if cursor_ordering(&existing, &candidate).is_le() => {
+                            existing
+                        }
+                        _ => candidate,
+                    });
                 }
                 if !changes.is_empty() {
                     all_changes.push((meta.clone(), changes));
@@ -1512,10 +1512,10 @@ impl Source for SqlServerConnection {
 
         if !handoff.has_no_gap() {
             return Err(Error::StateError(format!(
-				"sqlserver handoff detected a gap: stream start LSN {} is after snapshot start LSN {}",
-				lsn_bytes_to_hex(&handoff.stream_lsn_start),
-				lsn_bytes_to_hex(&handoff.snapshot_lsn_start)
-			)));
+                "sqlserver handoff detected a gap: stream start LSN {} is after snapshot start LSN {}",
+                lsn_bytes_to_hex(&handoff.stream_lsn_start),
+                lsn_bytes_to_hex(&handoff.snapshot_lsn_start)
+            )));
         }
 
         let snapshot_end = snapshot.finish().await?.snapshot_end_ts;
@@ -1597,8 +1597,8 @@ mod tests {
     use crate::core::BeforeImage;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use crate::checkpoint::{Checkpoint, InMemoryCheckpoint};
@@ -2225,9 +2225,11 @@ mod tests {
 
         let events = handle.compute_schema_events_for_meta_refresh(&refreshed);
         assert_eq!(events.len(), 2);
-        assert!(events
-            .iter()
-            .any(|event| event.op == Operation::SchemaChange));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.op == Operation::SchemaChange)
+        );
         assert!(events.iter().any(|event| {
             event
                 .after

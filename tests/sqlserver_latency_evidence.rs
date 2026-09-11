@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, RuntimeConfig,
-    RuntimeSourceConfig,
+    CdcRuntime, RuntimeConfig, RuntimeSourceConfig, checkpoint::FileCheckpoint,
+    schema_history::InMemorySchemaHistory,
 };
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;
@@ -13,8 +13,8 @@ mod sqlserver_testkit;
 mod latency_evidence_common;
 
 use latency_evidence_common::{
-    assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder, ProgressDeadline, WriterStatus,
+    LatencyRecorder, ProgressDeadline, WriterStatus, assert_sample_is_meaningful, now_micros,
+    stamped_payload, write_latency_artifacts,
 };
 
 async fn sql_exec(client: &mut sqlserver_testkit::SqlClient, sql: &str) -> rustcdc::Result<()> {

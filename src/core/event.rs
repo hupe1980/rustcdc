@@ -2,7 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::Value;
 
 use crate::core::{Error, Result};
@@ -1126,20 +1126,20 @@ impl Event {
             }
         }
 
-        if let Some(transaction) = &self.transaction {
-            if let Some(total) = transaction.total_events {
-                if total == 0 {
-                    errors.push(ValidationError::new(
-                        "transaction.total_events",
-                        "total_events must be greater than zero when set",
-                    ));
-                }
-                if transaction.event_index >= total {
-                    errors.push(ValidationError::new(
-                        "transaction.event_index",
-                        "event_index must be lower than total_events",
-                    ));
-                }
+        if let Some(transaction) = &self.transaction
+            && let Some(total) = transaction.total_events
+        {
+            if total == 0 {
+                errors.push(ValidationError::new(
+                    "transaction.total_events",
+                    "total_events must be greater than zero when set",
+                ));
+            }
+            if transaction.event_index >= total {
+                errors.push(ValidationError::new(
+                    "transaction.event_index",
+                    "event_index must be lower than total_events",
+                ));
             }
         }
 
@@ -1383,8 +1383,8 @@ mod tests {
     use crate::core::Error;
 
     use super::{
-        Event, NoRowWrite, Operation, RowWrite, SnapshotMetadata, SourceMetadata,
-        TransactionMetadata, EVENT_ENVELOPE_VERSION,
+        EVENT_ENVELOPE_VERSION, Event, NoRowWrite, Operation, RowWrite, SnapshotMetadata,
+        SourceMetadata, TransactionMetadata,
     };
 
     fn valid_event() -> Event {
@@ -1496,9 +1496,11 @@ mod tests {
         schema_change.op = Operation::SchemaChange;
         schema_change.after = None;
         let schema_change_errors = schema_change.validate().unwrap_err();
-        assert!(schema_change_errors
-            .iter()
-            .any(|error| error.field == "after"));
+        assert!(
+            schema_change_errors
+                .iter()
+                .any(|error| error.field == "after")
+        );
     }
 
     /// Under `REPLICA IDENTITY DEFAULT` an UPDATE that leaves the key alone carries no
@@ -1531,9 +1533,11 @@ mod tests {
             event_index: 0,
         });
         let errors = event.validate().unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|error| error.field == "transaction.total_events"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "transaction.total_events")
+        );
 
         event.transaction = Some(TransactionMetadata {
             tx_id: 9,
@@ -1541,9 +1545,11 @@ mod tests {
             event_index: 2,
         });
         let errors = event.validate().unwrap_err();
-        assert!(errors
-            .iter()
-            .any(|error| error.field == "transaction.event_index"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "transaction.event_index")
+        );
     }
 
     /// `BeforeImage` constrains the shape of a pre-image, not which operations may carry
@@ -1633,9 +1639,11 @@ mod tests {
         let error = event.validate_or_error().unwrap_err();
         match error {
             Error::ValidationError(messages) => {
-                assert!(messages
-                    .iter()
-                    .any(|message| message.contains("source.source_name")));
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| message.contains("source.source_name"))
+                );
             }
             other => panic!("expected ValidationError, got {other}"),
         }
@@ -1782,9 +1790,11 @@ mod tests {
         event.unavailable_columns = vec!["body".into()];
 
         let errors = event.validate().expect_err("this must not validate");
-        assert!(errors
-            .iter()
-            .any(|error| error.field == "unavailable_columns"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "unavailable_columns")
+        );
     }
 
     #[test]
@@ -1796,9 +1806,11 @@ mod tests {
         event.unavailable_columns = vec!["body".into()];
 
         let errors = event.validate().expect_err("this must not validate");
-        assert!(errors
-            .iter()
-            .any(|error| error.field == "unavailable_columns"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "unavailable_columns")
+        );
     }
 
     #[test]

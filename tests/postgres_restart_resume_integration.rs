@@ -18,11 +18,11 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::source::Source;
-use rustcdc::{checkpoint::PostgresOffset, PostgresConnection, PostgresSourceConfig, WalTransport};
+use rustcdc::{PostgresConnection, PostgresSourceConfig, WalTransport, checkpoint::PostgresOffset};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 async fn run(transport: WalTransport, slot: &str) -> rustcdc::Result<usize> {
@@ -158,7 +158,10 @@ async fn streaming_replication_restart_delivers_nothing_new() -> rustcdc::Result
         return Ok(());
     }
     let n = run(WalTransport::StreamingReplication, "resume_stream").await?;
-    assert_eq!(n, 0, "a clean restart with no new writes must deliver nothing; the resume position must sit past the last delivered transaction's commit record");
+    assert_eq!(
+        n, 0,
+        "a clean restart with no new writes must deliver nothing; the resume position must sit past the last delivered transaction's commit record"
+    );
     Ok(())
 }
 
@@ -168,6 +171,9 @@ async fn sql_peek_restart_delivers_nothing_new() -> rustcdc::Result<()> {
         return Ok(());
     }
     let n = run(WalTransport::SqlPeek, "resume_peek").await?;
-    assert_eq!(n, 0, "a clean restart with no new writes must deliver nothing; the resume position must sit past the last delivered transaction's commit record");
+    assert_eq!(
+        n, 0,
+        "a clean restart with no new writes must deliver nothing; the resume position must sit past the last delivered transaction's commit record"
+    );
     Ok(())
 }

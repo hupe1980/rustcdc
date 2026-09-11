@@ -7,10 +7,10 @@ use std::{
 };
 
 use rustcdc::{
+    CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
     core::Operation,
     schema_history::InMemorySchemaHistory,
-    CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
 };
 #[cfg(feature = "encryption")]
 use rustcdc::{
@@ -18,9 +18,9 @@ use rustcdc::{
     transform::{MaskHashConfig, MaskHashTransform, MaskRule},
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 mod process_crash_marker;
@@ -34,8 +34,8 @@ async fn runtime_postgres_process_kill_replays_uncommitted_batch() -> rustcdc::R
 }
 
 #[tokio::test]
-async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
-) -> rustcdc::Result<()> {
+async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch()
+-> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres snapshot crash-resume integration test (set CDC_RS_RUN_DOCKER_TESTS=1)"
@@ -241,8 +241,8 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch(
 
 #[cfg(feature = "encryption")]
 #[tokio::test]
-async fn runtime_postgres_process_kill_replays_uncommitted_batch_with_encryption_transform(
-) -> rustcdc::Result<()> {
+async fn runtime_postgres_process_kill_replays_uncommitted_batch_with_encryption_transform()
+-> rustcdc::Result<()> {
     run_postgres_process_kill_replay_scenario(true).await
 }
 

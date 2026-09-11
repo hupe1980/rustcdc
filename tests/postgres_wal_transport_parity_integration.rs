@@ -23,12 +23,12 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
-    source::Source, Event, Operation, PostgresConnection, PostgresSourceConfig, WalTransport,
+    Event, Operation, PostgresConnection, PostgresSourceConfig, WalTransport, source::Source,
 };
 use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
 };
 
 /// Start a logical-replication-capable PostgreSQL with a given password encryption.

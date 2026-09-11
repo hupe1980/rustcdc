@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::core::{Error, Result, SecretString, TransportConfig};
 
 use super::{
-    SqlServerSourceConfig, DEFAULT_POOL_SIZE, DEFAULT_STREAM_POLL_INTERVAL_MS, MAX_EVENTS_PER_POLL,
+    DEFAULT_POOL_SIZE, DEFAULT_STREAM_POLL_INTERVAL_MS, MAX_EVENTS_PER_POLL, SqlServerSourceConfig,
 };
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
@@ -99,12 +99,12 @@ impl SqlServerSourceConfig {
                 "sqlserver user must not be empty".into(),
             ));
         }
-        if let Ok(pw) = self.password.expose_secret() {
-            if pw.trim().is_empty() {
-                return Err(Error::ConfigError(
-                    "sqlserver password must not be empty".into(),
-                ));
-            }
+        if let Ok(pw) = self.password.expose_secret()
+            && pw.trim().is_empty()
+        {
+            return Err(Error::ConfigError(
+                "sqlserver password must not be empty".into(),
+            ));
         }
         if self.database.trim().is_empty() {
             return Err(Error::ConfigError(
@@ -170,12 +170,11 @@ impl SqlServerSourceConfig {
                 .as_deref()
                 .map(str::trim)
                 .filter(|path| !path.is_empty())
+                && !Path::new(ca_path).exists()
             {
-                if !Path::new(ca_path).exists() {
-                    return Err(Error::ConfigError(format!(
-                        "sqlserver tls_ca_cert_path does not exist: {ca_path}"
-                    )));
-                }
+                return Err(Error::ConfigError(format!(
+                    "sqlserver tls_ca_cert_path does not exist: {ca_path}"
+                )));
             }
         }
         Ok(())

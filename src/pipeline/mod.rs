@@ -37,5 +37,5 @@
 pub mod router;
 
 pub use router::{
-    table_matches, HeterogeneousTableRouter, TableRoute, TableRouter, TableRouterBuilder,
+    HeterogeneousTableRouter, TableRoute, TableRouter, TableRouterBuilder, table_matches,
 };

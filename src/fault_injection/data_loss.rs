@@ -1,11 +1,11 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashSet},
+    collections::{HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
 };
 
 use crate::{
-    core::{Error, Event, Result},
     Operation,
+    core::{Error, Event, Result},
 };
 
 /// Data-loss validation report for a captured event batch.
@@ -170,8 +170,8 @@ fn event_has_corruption_marker(event: &Event) -> bool {
 mod tests {
     use crate::core::BeforeImage;
     use crate::{
-        core::{SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION},
         SnapshotMetadata,
+        core::{EVENT_ENVELOPE_VERSION, SourceMetadata, TransactionMetadata},
     };
 
     use super::*;

@@ -5,7 +5,7 @@ use tokio::task::JoinHandle;
 use crate::core::{Error, Result, StructuredLogger};
 
 use super::{
-    query, SqlServerConnection, SqlServerPrereqProbe, SqlServerSourceConfig, HEARTBEAT_SECS,
+    HEARTBEAT_SECS, SqlServerConnection, SqlServerPrereqProbe, SqlServerSourceConfig, query,
 };
 
 pub(super) async fn connect_sqlserver_with_probe(connection: &SqlServerConnection) -> Result<()> {

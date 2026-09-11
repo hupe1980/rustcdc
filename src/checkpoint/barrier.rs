@@ -259,17 +259,16 @@ impl CommitBarrier {
             .rev()
             .find_map(|record| record.offset.as_ref());
 
-        if let Some(last_committable) = last_persistable {
-            if let Err(error) = checkpoint
+        if let Some(last_committable) = last_persistable
+            && let Err(error) = checkpoint
                 .save(last_committable.as_ref(), new_committed_count)
                 .await
-            {
-                // Leaving the barrier in `Flushing` would reject every subsequent
-                // `add_event`, turning one transient checkpoint-store failure into a
-                // permanently dead runtime.
-                self.barrier_state = restore_state;
-                return Err(error);
-            }
+        {
+            // Leaving the barrier in `Flushing` would reject every subsequent
+            // `add_event`, turning one transient checkpoint-store failure into a
+            // permanently dead runtime.
+            self.barrier_state = restore_state;
+            return Err(error);
         }
         self.committed_event_count = new_committed_count;
         let _ = self.pending_records.drain(..commit_len);

@@ -291,7 +291,7 @@ fn hash_json_value(value: &Value, hasher: &mut AHasher) {
 mod tests {
     use super::*;
     use crate::core::BeforeImage;
-    use crate::{SnapshotMetadata, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::{EVENT_ENVELOPE_VERSION, SnapshotMetadata, SourceMetadata, TransactionMetadata};
 
     fn read_event(table: &str, pk_id: i64) -> Event {
         Event {

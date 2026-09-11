@@ -1,22 +1,92 @@
 [package]
 name = "rustcdc"
-version = "0.14.0"
-edition = "2021"
-rust-version = "1.94"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Embeddable Rust CDC library focused on correctness-first capture primitives"
-authors      = ["hupe1980"]
-license = "MIT OR Apache-2.0"
-repository   = "https://github.com/hupe1980/rustcdc"
-homepage     = "https://github.com/hupe1980/rustcdc"
 documentation = "https://docs.rs/rustcdc"
 readme       = "README.md"
 keywords     = ["cdc", "change-data-capture"]
 categories   = ["database", "asynchronous", "data-structures"]
+# `cargo package` collects everything under the package root that git does not ignore —
+# which, for a workspace root, is the entire repository. Without this the published
+# `.crate` carried the server, its fuzz corpus, the demo stack and the CI scripts.
+#
+# `site/content/library/` is deliberately *not* excluded: `src/lib.rs` embeds those pages
+# with `include_str!`, so docs.rs cannot build the crate without them.
+exclude = [
+    "/server",
+    "/xtask",
+    "/docker",
+    "/scripts",
+    "/examples",
+    "/benches",
+    "/fixtures",
+    "/.github",
+    "/site/sass",
+    "/site/static",
+    "/site/templates",
+    "/site/content/docs",
+    "/site/README.md",
+    "/demo",
+    "/monitoring",
+    "/site/config.toml",
+    "/Dockerfile",
+    "/deny.toml",
+]
 
 [workspace]
-members = [".", "xtask"]
-default-members = ["."]
+# One repository, two surfaces: the `rustcdc` library (this package, at the workspace
+# root) and the `rustcdc-server` binary under `server/`.
+#
+# The library stays at the root rather than moving to `crates/rustcdc/` because its
+# rustdoc embeds the published documentation with `include_str!("site/content/...")`,
+# and `cargo package` only collects files beneath the package root. Moving it would
+# either break `cargo package` or strip the book out of docs.rs.
+members = [".", "server", "xtask"]
+# `cargo build` builds the product: library *and* server binary. CI addresses packages
+# explicitly with `-p`, because a bare `--features …` is ambiguous across members.
+default-members = [".", "server"]
+# The libFuzzer targets need a nightly toolchain and `cargo fuzz`. Excluding them keeps
+# `cargo build` on stable from depending on either; `server/tests/fuzz_properties.rs`
+# carries the same invariants on stable so CI still checks them on every commit.
+exclude = ["server/fuzz"]
 resolver = "2"
+
+# One version for the repository. The library and the server ship from the same commit
+# and are tested only against each other, so a split version line would encode a
+# compatibility question that does not exist.
+[workspace.package]
+version = "0.15.0"
+edition = "2024"
+# The AWS SDK sets this floor; wasmtime is the next constraint at 1.94.0. Declaring the
+# lower number would hand anyone a resolver error instead of a documented requirement.
+rust-version = "1.94.1"
+authors = ["hupe1980"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hupe1980/rustcdc"
+homepage = "https://github.com/hupe1980/rustcdc"
+
+[workspace.lints.rust]
+# The escape hatch in `src/fault_injection/mod.rs`, declared so `unexpected_cfgs` does not
+# warn on it. Set via RUSTFLAGS when benchmarking code that needs `test-harnesses` in an
+# optimised build; never set in a shipped binary.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rustcdc_optimised_test_harnesses)"] }
+# `deny`, not `forbid`: the Windows PID-liveness probe in `checkpoint::owner_lease` needs
+# one tightly-scoped `unsafe` block for the Win32 `OpenProcess`/`GetExitCodeProcess` FFI,
+# and the server's `test_env` needs `std::env::set_var`, which Rust 2024 makes unsafe.
+# `forbid` cannot be locally overridden, so it made the library impossible to compile for
+# `*-pc-windows-*` targets. Every exception carries an explicit `#[allow(unsafe_code)]`
+# with a safety comment, and `server/tests/architecture.rs` holds the allowlist.
+unsafe_code = "deny"
+
+
+[lints]
+workspace = true
 
 [features]
 # Default production profile: PostgreSQL source with TLS. Lean by design — no JIT runtime in the
@@ -49,7 +119,7 @@ mariadb = ["mysql"]
 # carrying RUSTSEC-2026-0098, -0099 and -0104, plus the unmaintained rustls-pemfile 1.0
 # via rustls-native-certs 0.6. Not deduplicable and not fixable from here: it needs a
 # tiberius release built against rustls 0.23. Per-advisory reachability analysis and
-# mitigations are in site/content/docs/security.md; the suppressions are in deny.toml.
+# mitigations are in site/content/library/security.md; the suppressions are in deny.toml.
 sqlserver = ["dep:tiberius", "tls"]
 # Enable TLS-related transport support for source connectors.
 tls = ["dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
@@ -99,7 +169,7 @@ apicurio = ["schemreg", "schemreg/apicurio"]
 #
 # EVIDENCE: Glue has no self-hostable implementation, so this is the one registry backend
 # with no live-service test. Everything rustcdc owns is covered against an in-memory fake;
-# the AWS transport itself belongs to `schemreg`. See site/content/docs/api.md.
+# the AWS transport itself belongs to `schemreg`. See site/content/library/api.md.
 glue = ["schemreg", "schemreg/glue"]
 
 [dependencies]
@@ -144,7 +214,7 @@ prost = { version = "0.14", optional = true }
 prost-reflect = { version = "0.16", optional = true }
 apache-avro = { version = "0.21", optional = true }
 bytes = { version = "1", optional = true }
-schemreg = { version = "0.4", default-features = false, features = ["confluent", "json"], optional = true }
+schemreg = { version = "0.6", default-features = false, features = ["confluent", "json"], optional = true }
 
 [build-dependencies]
 # Pure-Rust protobuf compiler: builds the descriptor set for Confluent Protobuf framing

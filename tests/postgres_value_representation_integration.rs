@@ -17,13 +17,13 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, IncrementalSnapshotConfig,
-    Operation, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    IncrementalSnapshotConfig, Operation, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 const SLOT: &str = "value_repr_slot";
@@ -131,7 +131,7 @@ async fn snapshot_and_stream_agree_on_the_json_type_of_every_column() -> rustcdc
             InMemorySchemaHistory::default(),
         )
         .with_incremental_snapshot(IncrementalSnapshotConfig::new(vec![
-            "public.repr".to_string()
+            "public.repr".to_string(),
         ]))
         .with_max_buffer_size(500)
         .with_max_poll_wait_ms(300),

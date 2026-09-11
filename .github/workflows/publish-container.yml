@@ -1,0 +1,168 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# A publish run should never be cancelled mid-flight.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Pinned rather than `${{ github.repository }}`. Since the server moved into the
+  # `rustcdc` repository that expression resolves to `hupe1980/rustcdc`, which is the
+  # *library's* name — an image called after the crate you cannot run. Naming it here
+  # keeps `ghcr.io/hupe1980/rustcdc-server` stable across the move, so every existing
+  # `docker pull`, Kubernetes manifest and documented command keeps working.
+  IMAGE_NAME: ${{ github.repository_owner }}/rustcdc-server
+
+permissions:
+  contents: read
+  packages: write    # push to GHCR
+  id-token: write    # OIDC token for SLSA provenance attestation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1 of 2 — build one platform image per native runner
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # linux/amd64 → linux-amd64 (used for cache scope + artefact names)
+      - name: Derive platform slug
+        id: slug
+        run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generates OCI labels and semver tags (e.g. :1.2.3, :1.2, :1, :latest)
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest
+
+      # Build for this runner's native platform and push by digest.
+      # The merge job below assembles the final multi-arch manifest index.
+      - name: Build and push platform image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: >-
+            type=image,
+            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
+            push-by-digest=true,
+            name-canonical=true,
+            push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          # SLSA provenance (mode=max) and SBOM are stored inline with the manifest.
+          provenance: mode=max
+          sbom: true
+          # Per-platform GHA cache avoids cross-arch cache pollution.
+          cache-from: type=gha,scope=${{ steps.slug.outputs.slug }}
+          cache-to:   type=gha,scope=${{ steps.slug.outputs.slug }},mode=max
+
+      # Save the pushed digest so the merge job can reference this image.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+          echo "Pushed ${{ matrix.platform }} digest: $digest"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.slug.outputs.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2 of 2 — merge per-platform digests into a single multi-arch manifest
+  # ─────────────────────────────────────────────────────────────────────────────
+  merge:
+    name: Merge multi-arch manifest
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download amd64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-linux-amd64
+          path: /tmp/digests
+
+      - name: Download arm64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-linux-arm64
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (final tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest
+
+      # Combine the two per-platform digests into one manifest index under all tags.
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}')
+          eval docker buildx imagetools create $TAGS \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      # Print the final manifest to the job summary for auditability.
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"

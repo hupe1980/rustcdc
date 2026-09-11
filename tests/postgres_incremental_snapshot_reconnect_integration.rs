@@ -25,13 +25,14 @@
 use std::collections::BTreeSet;
 
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, ConnectionRetryPolicy,
-    IncrementalSnapshotConfig, Operation, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    ConnectionRetryPolicy, IncrementalSnapshotConfig, Operation, PostgresSourceConfig,
+    RuntimeConfig, RuntimeSourceConfig, checkpoint::FileCheckpoint,
+    schema_history::InMemorySchemaHistory,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 const SLOT: &str = "incremental_reconnect_slot";

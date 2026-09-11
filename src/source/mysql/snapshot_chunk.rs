@@ -1,9 +1,9 @@
 use crate::core::{
-    BeforeImage, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
 };
 use crate::source::helpers::now_millis;
 
-use super::{MysqlSnapshotHandle, DEFAULT_SNAPSHOT_CHUNK_SIZE};
+use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, MysqlSnapshotHandle};
 
 pub(super) async fn next_snapshot_chunk(
     handle: &mut MysqlSnapshotHandle,
@@ -128,12 +128,11 @@ pub(super) async fn next_snapshot_chunk(
 
     if !events.is_empty() {
         let final_chunk = handle.is_complete();
-        if final_chunk {
-            if let Some(last) = events.last_mut() {
-                if let Some(snapshot) = last.snapshot.as_mut() {
-                    snapshot.is_last_chunk = true;
-                }
-            }
+        if final_chunk
+            && let Some(last) = events.last_mut()
+            && let Some(snapshot) = last.snapshot.as_mut()
+        {
+            snapshot.is_last_chunk = true;
         }
         handle.next_chunk_index += 1;
     }

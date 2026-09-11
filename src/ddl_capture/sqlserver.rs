@@ -1,8 +1,8 @@
 //! SQL Server DDL extraction from CDC events.
 
 use super::{
-    extract_captured_ddl, parse_create_table_schema_for_dialect, parse_schema_table_for_dialect,
-    CapturedDdl, DdlDialect, DdlExtractor,
+    CapturedDdl, DdlDialect, DdlExtractor, extract_captured_ddl,
+    parse_create_table_schema_for_dialect, parse_schema_table_for_dialect,
 };
 use crate::schema_history::TableSchema;
 

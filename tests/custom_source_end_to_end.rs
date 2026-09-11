@@ -29,8 +29,8 @@ use rustcdc::{
     RuntimeSourceConfig, SourceMetadata, TransactionBoundaryPolicy, TransactionMetadata,
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 // ─── A minimal but honest custom source ───────────────────────────────────────
@@ -375,19 +375,19 @@ async fn preserve_transactions_never_delivers_a_partial_transaction() -> Result<
             // Every non-empty batch must end on a transaction boundary: the last event of
             // a batch must be the last event of its transaction.
             let last = events.last().expect("non-empty");
-            if let Some(transaction) = last.transaction.as_ref() {
-                if let Some(total) = transaction.total_events {
-                    assert_eq!(
-                        transaction.event_index + 1,
-                        total,
-                        "a batch ended mid-transaction (tx {} at index {} of {}): a sink \
+            if let Some(transaction) = last.transaction.as_ref()
+                && let Some(total) = transaction.total_events
+            {
+                assert_eq!(
+                    transaction.event_index + 1,
+                    total,
+                    "a batch ended mid-transaction (tx {} at index {} of {}): a sink \
                          applying this batch would commit a state that never existed \
                          upstream",
-                        transaction.tx_id,
-                        transaction.event_index,
-                        total
-                    );
-                }
+                    transaction.tx_id,
+                    transaction.event_index,
+                    total
+                );
             }
         }
         runtime.commit_ack(batch.ack_mode()).await?;

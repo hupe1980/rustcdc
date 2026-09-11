@@ -12,8 +12,8 @@ use crate::{
     checkpoint::PostgresOffset,
     core::{Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig},
     source::{
-        helpers::now_millis, ConnectorCapabilities, DatabaseAuthMode, HandoffResult,
-        IncrementalSnapshotConfig, SnapshotHandle, Source, StreamHandle,
+        ConnectorCapabilities, DatabaseAuthMode, HandoffResult, IncrementalSnapshotConfig,
+        SnapshotHandle, Source, StreamHandle, helpers::now_millis,
     },
 };
 
@@ -1152,11 +1152,11 @@ impl StreamHandle for PostgresStreamHandle {
             // events — so it has to be current precisely when the pipeline is *behind*.
             // Sampling it only from the idle-advance branch meant it refreshed only when
             // the pipeline was caught up, and not at all when idle advance was disabled.
-            if self.slot_lag_sample_due() {
-                if let Some(lag_bytes) = self.provider.measure_slot_lag().await? {
-                    self.last_slot_lag_bytes = lag_bytes;
-                    self.last_slot_lag_at = Some(std::time::Instant::now());
-                }
+            if self.slot_lag_sample_due()
+                && let Some(lag_bytes) = self.provider.measure_slot_lag().await?
+            {
+                self.last_slot_lag_bytes = lag_bytes;
+                self.last_slot_lag_at = Some(std::time::Instant::now());
             }
 
             if !had_data && slot_is_caught_up && self.slot_idle_advance_interval_ms > 0 {
@@ -1343,8 +1343,8 @@ where
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     fn reconcile_stream_resume_lsn(
@@ -1361,18 +1361,18 @@ mod tests {
     use crate::checkpoint::{Checkpoint, InMemoryCheckpoint, PostgresOffset};
     use crate::source::{SnapshotHandle, Source, StreamHandle};
 
+    use super::PostgresSourceConfig;
     use super::decoder::{
-        decode_pgoutput_message, PgOutputMessage, PgOutputXLogData, PgValue, PollOutcome,
+        PgOutputMessage, PgOutputXLogData, PgValue, PollOutcome, decode_pgoutput_message,
     };
     use super::parser::map_pgoutput_poll_error;
-    use super::validation::{validate_with_backend, ValidationBackend};
-    use super::PostgresSourceConfig;
+    use super::validation::{ValidationBackend, validate_with_backend};
     use super::{
-        PgOutputMessageProvider, PostgresConnection, PostgresSnapshotHandle, PostgresStream,
-        PostgresStreamHandle, StreamState, TableSnapshot, TableSnapshotState, MAX_EVENTS_PER_POLL,
-        STREAM_POLL_INTERVAL_MS,
+        MAX_EVENTS_PER_POLL, PgOutputMessageProvider, PostgresConnection, PostgresSnapshotHandle,
+        PostgresStream, PostgresStreamHandle, STREAM_POLL_INTERVAL_MS, StreamState, TableSnapshot,
+        TableSnapshotState,
     };
-    use crate::{core::TransportConfig, SecretString};
+    use crate::{SecretString, core::TransportConfig};
 
     // ─── Validation backend mock ─────────────────────────────────────────────
 

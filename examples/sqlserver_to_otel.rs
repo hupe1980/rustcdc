@@ -18,10 +18,10 @@ use std::{
 
 #[cfg(all(feature = "sqlserver", feature = "metrics"))]
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, EventTracer,
-    MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector, RuntimeConfig,
-    RuntimeObservability, RuntimeSourceConfig, SqlServerSourceConfig, StructuredLogger,
-    TransportConfig,
+    CdcRuntime, EventTracer, MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector,
+    RuntimeConfig, RuntimeObservability, RuntimeSourceConfig, SqlServerSourceConfig,
+    StructuredLogger, TransportConfig, checkpoint::FileCheckpoint,
+    schema_history::InMemorySchemaHistory,
 };
 #[cfg(all(feature = "sqlserver", feature = "metrics"))]
 use serde_json::json;
@@ -122,11 +122,11 @@ async fn main() -> rustcdc::Result<()> {
     };
 
     loop {
-        if let Some(deadline) = runtime_deadline {
-            if Instant::now() >= deadline {
-                emit_log("max_runtime_reached", None, None, "runtime budget reached");
-                break;
-            }
+        if let Some(deadline) = runtime_deadline
+            && Instant::now() >= deadline
+        {
+            emit_log("max_runtime_reached", None, None, "runtime budget reached");
+            break;
         }
 
         tokio::select! {

@@ -6,13 +6,13 @@ use std::{
 use async_trait::async_trait;
 
 use rustcdc::{
+    Event, Operation, SourceMetadata,
     checkpoint::{Checkpoint, GenericOffset, InMemoryCheckpoint},
     fault_injection::{
         CheckpointFault, DataLossValidator, FaultInjectingCheckpoint, FaultInjectingSource,
         SourceFault,
     },
     source::{HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle},
-    Event, Operation, SourceMetadata,
 };
 
 const SOAK_TOTAL_EVENTS: usize = 5_000;

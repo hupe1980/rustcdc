@@ -9,11 +9,11 @@ use tokio::net::TcpStream;
 use crate::core::{Error, Result, TransportConfig};
 
 use super::auth::{
-    md5_password_response, parse_sasl_mechanisms, select_sasl_mechanism, ScramExchange,
+    ScramExchange, md5_password_response, parse_sasl_mechanisms, select_sasl_mechanism,
 };
 use super::framing::{
-    render_error_response, render_tag, request_tls, startup_packet, take_i64, take_u8,
-    write_message, write_untagged, BackendMessage, MessageReader,
+    BackendMessage, MessageReader, render_error_response, render_tag, request_tls, startup_packet,
+    take_i64, take_u8, write_message, write_untagged,
 };
 use super::now_pg_timestamp;
 

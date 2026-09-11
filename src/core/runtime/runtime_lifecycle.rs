@@ -60,29 +60,28 @@ impl CdcRuntime {
         }
 
         let mut checkpoint_offset = self.config.checkpoint.load().await?;
-        if let Some(offset) = checkpoint_offset.as_ref() {
-            if self.is_snapshot_checkpoint(offset.as_ref()) {
-                if self.config.incremental_snapshot.is_some() {
-                    return Err(Error::ConfigError(
-                        "cannot resume incremental snapshot startup from a snapshot checkpoint"
-                            .into(),
-                    ));
-                }
-                if !self.source_capabilities().snapshot_checkpoint_resume {
-                    tracing::warn!(
-                        target: "rustcdc::runtime",
-                        source = self.config.source.source_type().unwrap_or("unknown"),
-                        "snapshot checkpoint resume is unsupported by connector; restarting snapshot from scratch"
-                    );
-                    checkpoint_offset = None;
-                }
+        if let Some(offset) = checkpoint_offset.as_ref()
+            && self.is_snapshot_checkpoint(offset.as_ref())
+        {
+            if self.config.incremental_snapshot.is_some() {
+                return Err(Error::ConfigError(
+                    "cannot resume incremental snapshot startup from a snapshot checkpoint".into(),
+                ));
+            }
+            if !self.source_capabilities().snapshot_checkpoint_resume {
+                tracing::warn!(
+                    target: "rustcdc::runtime",
+                    source = self.config.source.source_type().unwrap_or("unknown"),
+                    "snapshot checkpoint resume is unsupported by connector; restarting snapshot from scratch"
+                );
+                checkpoint_offset = None;
+            }
 
-                if checkpoint_offset.is_some() && self.config.snapshot_tables.is_empty() {
-                    return Err(Error::ConfigError(
-                        "snapshot_tables must not be empty when resuming from a snapshot checkpoint"
-                            .into(),
-                    ));
-                }
+            if checkpoint_offset.is_some() && self.config.snapshot_tables.is_empty() {
+                return Err(Error::ConfigError(
+                    "snapshot_tables must not be empty when resuming from a snapshot checkpoint"
+                        .into(),
+                ));
             }
         }
 
@@ -168,6 +167,7 @@ impl CdcRuntime {
     fn reset_run_counters(&mut self) {
         self.started_at_ms = Some(now_millis());
         self.last_poll_at_ms = None;
+        self.last_delivery_at_ms = None;
         self.last_source_event_ts_ms = None;
         self.last_commit_at_ms = None;
         self.total_events_polled = 0;

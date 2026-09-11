@@ -1,17 +1,17 @@
 #![cfg(feature = "mariadb")]
 
 use rustcdc::{
+    MariaDbConnection, MariaDbSourceConfig, MysqlSourceConfig, TransportConfig,
     checkpoint::{Checkpoint, FileCheckpoint},
     source::Source,
-    MariaDbConnection, MariaDbSourceConfig, MysqlSourceConfig, TransportConfig,
 };
 use std::collections::HashSet;
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[path = "rustls_provider_common.rs"]
 mod rustls_provider_common;

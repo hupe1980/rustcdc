@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rustcdc::transform::{Transform, TransformPipeline};
 use rustcdc::{Event, Operation, SnapshotValidator, SourceMetadata};
 use serde_json::json;
@@ -71,10 +71,10 @@ struct NormalizeNameTransform;
 
 impl Transform for NormalizeNameTransform {
     fn apply(&self, event: &mut Event) -> rustcdc::Result<bool> {
-        if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
-            if let Some(serde_json::Value::String(name)) = after.get_mut("name") {
-                name.make_ascii_uppercase();
-            }
+        if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut())
+            && let Some(serde_json::Value::String(name)) = after.get_mut("name")
+        {
+            name.make_ascii_uppercase();
         }
         Ok(true)
     }

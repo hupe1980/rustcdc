@@ -46,7 +46,7 @@
 //! }
 //! ```
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::codec::{EncodedOutput, EventEncoder};
 use crate::core::{Event, Result};
@@ -291,7 +291,7 @@ mod tests {
     use super::*;
     use crate::core::BeforeImage;
     use crate::core::{
-        Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+        EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
     };
 
     /// CloudEvents 1.0 requires `source` + `id` to be unique per distinct event.

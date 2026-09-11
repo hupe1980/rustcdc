@@ -106,6 +106,38 @@ impl CdcRuntime {
             return Err(error);
         }
 
+        let outcome = self.poll_event_batch_inner().await;
+
+        // Record the poll **here**, on every return, rather than where a batch is
+        // handed over.
+        //
+        // This timestamp answers exactly one question — "is the poll loop turning?" —
+        // and `derive_health` check 2 reports a stall when it goes stale. It used to be
+        // written only on the path that delivered at least one event, which made it mean
+        // "last poll that produced events" instead. An idle source polls on schedule and
+        // legitimately returns empty every time, so the field froze at the last event and
+        // any pipeline that went quiet for longer than the stall threshold was reported
+        // as `Stalled { "the poll loop is blocked, not idle" }` — the precise opposite of
+        // what was happening, on the one verdict that pages an operator.
+        //
+        // Every return counts, including an error: a source that fails fast in a retry
+        // loop is a pipeline in trouble, but it is *not* a blocked poll loop, and saying
+        // so would send an operator to the wrong place. Source failures have their own
+        // signals (`record_error`, the consecutive-error counter, and readiness).
+        //
+        // `last_delivery_at_ms` — written in `deliver_buffered_batch` — is the separate
+        // "when did events last arrive" signal, and is what separates `Healthy` from
+        // `Idle`.
+        self.last_poll_at_ms = Some(now_millis());
+
+        outcome
+    }
+
+    /// The body of [`poll_event_batch`](Self::poll_event_batch).
+    ///
+    /// Split out so the caller-visible wrapper can stamp `last_poll_at_ms` on every
+    /// return path without threading that through a dozen `?`s.
+    async fn poll_event_batch_inner(&mut self) -> Result<EventBatch> {
         if let Some(batch) = self.current_pending_batch() {
             return Ok(batch);
         }
@@ -800,35 +832,34 @@ impl CdcRuntime {
 
     pub(super) fn buffer_and_deliver(&mut self, events: Vec<Event>) -> Result<EventBatch> {
         for event in events {
-            if self.config.options.validate_events {
-                if let Err(error) = event.validate_or_error() {
-                    // Validation runs upstream of every sink, so under `Halt` a permanently
-                    // invalid event is unreachable by the dead-letter handler *and*
-                    // unskippable: the source position cannot advance past an event that was
-                    // never accepted, so a restart replays it and stops again. `Quarantine`
-                    // is the way out of that loop.
-                    if self.config.options.validation_error_policy
-                        != ValidationErrorPolicy::Quarantine
-                    {
-                        self.record_runtime_error("runtime.validation.halt", &error);
-                        return Err(error);
-                    }
-
-                    self.total_events_skipped = self.total_events_skipped.saturating_add(1);
-                    self.record_runtime_error("runtime.validation.quarantine", &error);
-                    tracing::warn!(
-                        target: "rustcdc::core::runtime",
-                        table = %event.table,
-                        offset = %event.source.offset,
-                        error = %error.report(),
-                        "event failed envelope validation; quarantining and advancing past it",
-                    );
-                    // Config validation guarantees the handler exists under this policy.
-                    if let Some(handler) = self.config.options.dead_letter_handler.as_ref() {
-                        handler(event, error);
-                    }
-                    continue;
+            if self.config.options.validate_events
+                && let Err(error) = event.validate_or_error()
+            {
+                // Validation runs upstream of every sink, so under `Halt` a permanently
+                // invalid event is unreachable by the dead-letter handler *and*
+                // unskippable: the source position cannot advance past an event that was
+                // never accepted, so a restart replays it and stops again. `Quarantine`
+                // is the way out of that loop.
+                if self.config.options.validation_error_policy != ValidationErrorPolicy::Quarantine
+                {
+                    self.record_runtime_error("runtime.validation.halt", &error);
+                    return Err(error);
                 }
+
+                self.total_events_skipped = self.total_events_skipped.saturating_add(1);
+                self.record_runtime_error("runtime.validation.quarantine", &error);
+                tracing::warn!(
+                    target: "rustcdc::core::runtime",
+                    table = %event.table,
+                    offset = %event.source.offset,
+                    error = %error.report(),
+                    "event failed envelope validation; quarantining and advancing past it",
+                );
+                // Config validation guarantees the handler exists under this policy.
+                if let Some(handler) = self.config.options.dead_letter_handler.as_ref() {
+                    handler(event, error);
+                }
+                continue;
             }
             if event.snapshot.is_some() {
                 // A snapshot row carries a chunk cursor, not a log position, so it has
@@ -1000,7 +1031,11 @@ impl CdcRuntime {
 
         let now_ms = now_millis();
         self.total_events_polled = self.total_events_polled.saturating_add(events.len() as u64);
-        self.last_poll_at_ms = Some(now_ms);
+        // "Events actually arrived", not "a poll happened" — the poll timestamp is
+        // stamped by `poll_event_batch` on every return, empty batches included. Keeping
+        // the two apart is what lets `derive_health` tell a quiet source (`Idle`) from a
+        // poll loop that has stopped turning (`Stalled`).
+        self.last_delivery_at_ms = Some(now_ms);
         // `event_trace_id` costs two String allocations per event; skip it entirely
         // when the tracer discards what it is given (the default).
         let tracing_enabled = self.observability().tracer.is_enabled();
@@ -1120,10 +1155,10 @@ impl CdcRuntime {
         };
 
         let mut event = captured.to_event(source_name, offset, ts_ms);
-        if let Some(version) = schema_version {
-            if let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut()) {
-                after.insert("schema_version".into(), serde_json::json!(version));
-            }
+        if let Some(version) = schema_version
+            && let Some(after) = event.after.as_mut().and_then(|value| value.as_object_mut())
+        {
+            after.insert("schema_version".into(), serde_json::json!(version));
         }
 
         self.enqueue_event(event.clone())?;

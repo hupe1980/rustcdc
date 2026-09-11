@@ -619,7 +619,7 @@ mod tests {
     use crate::core::BeforeImage;
     use serde_json::json;
 
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
 
     use super::{
         FilterField, FilterMode, FilterOperator, FilterProjectionConfig, FilterProjectionTransform,
@@ -1169,7 +1169,7 @@ mod tests {
 mod decimal_comparison_tests {
     use std::cmp::Ordering;
 
-    use super::{apply_operator, compare_decimal, FilterOperator};
+    use super::{FilterOperator, apply_operator, compare_decimal};
 
     /// The whole reason this crate emits column values as text: `f64` cannot tell these
     /// two integers apart, so an `f64`-based filter answered `9007199254740993 >

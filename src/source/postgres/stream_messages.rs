@@ -1,7 +1,7 @@
 use crate::{
     core::{
-        BeforeImage, Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
-        EVENT_ENVELOPE_VERSION,
+        BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SourceMetadata,
+        TransactionMetadata,
     },
     ddl_capture::CapturedDdl,
     schema_history::{ColumnDef, TableSchema},
@@ -9,10 +9,10 @@ use crate::{
 };
 
 use super::decoder::{
-    decode_pgoutput_message, PgDelete, PgInsert, PgOutputMessage, PgOutputXLogData, PgRelation,
-    PgTruncate, PgUpdate, PgValue,
+    PgDelete, PgInsert, PgOutputMessage, PgOutputXLogData, PgRelation, PgTruncate, PgUpdate,
+    PgValue, decode_pgoutput_message,
 };
-use super::{format_pg_lsn, pg_timestamp_to_millis, PostgresStreamHandle};
+use super::{PostgresStreamHandle, format_pg_lsn, pg_timestamp_to_millis};
 
 /// Resolve a PostgreSQL built-in type OID to its canonical type name.
 ///
@@ -212,11 +212,7 @@ impl PostgresStreamHandle {
             .filter(|c| c.is_key())
             .map(|c| c.name.clone())
             .collect();
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys)
-        }
+        if keys.is_empty() { None } else { Some(keys) }
     }
 
     fn tx_meta(&self) -> Option<TransactionMetadata> {

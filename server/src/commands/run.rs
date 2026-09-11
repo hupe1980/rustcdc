@@ -194,6 +194,14 @@ async fn run_with_runtime_state(
                 .then_some(app_config.runtime.sink_close_timeout_ms),
         );
 
+    // Optional, so it is applied outside the builder chain: leaving it unset is what
+    // makes the runtime derive the threshold from the poll budget, which is the
+    // documented default rather than a number restated here.
+    let options = match app_config.runtime.health_stall_threshold_ms {
+        Some(threshold_ms) => options.with_health_stall_threshold_ms(threshold_ms),
+        None => options,
+    };
+
     let options = if app_config.runtime.idempotency.enabled {
         let idempotency = IdempotencyOptions::new(app_config.runtime.idempotency.capacity)
             .map_err(|e| AppError::Other(format!("runtime.idempotency.capacity: {e}")))?;

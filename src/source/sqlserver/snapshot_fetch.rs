@@ -6,8 +6,8 @@ use tokio::sync::Mutex;
 use crate::core::{Error, Result};
 
 use super::{
-    build_snapshot_fetch_sql, qualified_table_name, sqlserver_json_value_to_param, SqlClient,
-    TableSnapshotState,
+    SqlClient, TableSnapshotState, build_snapshot_fetch_sql, qualified_table_name,
+    sqlserver_json_value_to_param,
 };
 
 #[async_trait]
@@ -60,26 +60,33 @@ impl SqlServerSnapshotRowFetcher for LiveSqlServerSnapshotRowFetcher {
 
         let mut cursor_params = Vec::new();
         let has_cursor = if let Some(raw_cursor) = cursor {
-            let parsed_cursor: Vec<serde_json::Value> =
-                match serde_json::from_str::<serde_json::Value>(raw_cursor).map_err(|error| {
-                    Error::CheckpointError(format!(
-                        "sqlserver snapshot cursor decode failed for table '{}.{}': {error}",
+            let parsed_cursor: Vec<serde_json::Value> = match serde_json::from_str::<
+                serde_json::Value,
+            >(raw_cursor)
+            .map_err(|error| {
+                Error::CheckpointError(format!(
+                    "sqlserver snapshot cursor decode failed for table '{}.{}': {error}",
+                    table.schema, table.table
+                ))
+            })? {
+                serde_json::Value::Array(values) => values,
+                serde_json::Value::Object(values) => table
+                    .primary_key_columns
+                    .iter()
+                    .map(|column| {
+                        values
+                            .get(column)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect(),
+                _ => {
+                    return Err(Error::CheckpointError(format!(
+                        "sqlserver snapshot cursor decode failed for table '{}.{}': expected JSON array or object",
                         table.schema, table.table
-                    ))
-                })? {
-                    serde_json::Value::Array(values) => values,
-                    serde_json::Value::Object(values) => table
-                        .primary_key_columns
-                        .iter()
-                        .map(|column| values.get(column).cloned().unwrap_or(serde_json::Value::Null))
-                        .collect(),
-                    _ => {
-                        return Err(Error::CheckpointError(format!(
-                            "sqlserver snapshot cursor decode failed for table '{}.{}': expected JSON array or object",
-                            table.schema, table.table
-                        )))
-                    }
-                };
+                    )));
+                }
+            };
             if parsed_cursor.len() != table.primary_key_columns.len() {
                 return Err(Error::CheckpointError(format!(
                     "sqlserver snapshot cursor width mismatch for table '{}.{}'",

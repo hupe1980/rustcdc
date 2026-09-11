@@ -380,9 +380,11 @@ async fn the_startup_packet_and_replication_command_reach_the_server_intact() {
         observed.startup_params
     );
     assert!(observed.startup_params.contains(&"user=cdc".to_string()));
-    assert!(observed
-        .startup_params
-        .contains(&"database=app".to_string()));
+    assert!(
+        observed
+            .startup_params
+            .contains(&"database=app".to_string())
+    );
 
     let query = &observed.replication_query;
     assert!(

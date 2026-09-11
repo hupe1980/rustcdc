@@ -474,11 +474,11 @@ mod tests {
 
 #[cfg(test)]
 mod field_coverage_tests {
-    use super::{semantic_diff, DiffLevel};
+    use super::{DiffLevel, semantic_diff};
     use crate::core::BeforeImage;
     use crate::core::{
-        Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
-        EVENT_ENVELOPE_VERSION,
+        EVENT_ENVELOPE_VERSION, Event, Operation, SnapshotMetadata, SourceMetadata,
+        TransactionMetadata,
     };
 
     fn baseline() -> Event {

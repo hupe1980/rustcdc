@@ -15,8 +15,8 @@
 //! were one of those. It is not, and the audit flagged the name as misleading evidence.
 
 use rustcdc::{
-    fault_injection::{CrashSimulationState, CrashSimulationValidator},
     Event, Operation, SourceMetadata, StructuredLogger,
+    fault_injection::{CrashSimulationState, CrashSimulationValidator},
 };
 use serde_json::json;
 use std::collections::HashSet;

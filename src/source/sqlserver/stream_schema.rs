@@ -6,7 +6,7 @@ use crate::{
 };
 
 use super::{
-    load_capture_metas_for_config, lsn_bytes_to_hex, CaptureInstanceMeta, SqlServerStreamHandle,
+    CaptureInstanceMeta, SqlServerStreamHandle, load_capture_metas_for_config, lsn_bytes_to_hex,
 };
 
 impl SqlServerStreamHandle {

@@ -5,6 +5,228 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.15.0
+
+Two changes, and one of them is a repository move.
+
+`rustcdc-server` is now a workspace member of this repository rather than a separate project.
+The library and the binary already could only be released together and tested against each
+other; keeping them apart meant two CI configurations, two `deny.toml` policies, two
+documentation sites and a cross-reference between them that could only ever be a bare URL. A
+single-crate fix now lands in one pull request instead of two plus a version bump.
+
+The other change fixes a health verdict that reported the opposite of what was happening.
+
+It is a **breaking** release. See *Migrating* below.
+
+### Fixed: an idle source was reported as stalled
+
+`HealthVerdict::Stalled` is the one alertable verdict, and any pipeline that delivered at least
+one event and then went quiet for 30 seconds reported it — with the reason
+*"the poll loop is blocked, not idle"*, which was precisely backwards.
+
+`last_poll_at_ms` was written in `deliver_buffered_batch`, **after** its early return on an
+empty batch, so it recorded "the last poll that produced events" while its own documentation,
+the runbook and the stall check all read it as "the last poll". On an idle source every poll
+legitimately returns empty, so the field froze at the last event while the loop kept turning on
+schedule.
+
+It is now stamped by `poll_event_batch` on **every** return — empty batches and errors included
+— which is what makes it a liveness signal for the loop rather than a traffic counter. A source
+that fails fast in a retry loop is a pipeline in trouble, but it is not a blocked poll loop, and
+saying so sent an operator to the wrong place.
+
+A second field, `last_delivery_at_ms`, carries what the old one actually measured. It is
+recorded on the local clock at delivery rather than taken from the source's own timestamp, which
+is subject to clock skew and absent on sources that do not stamp events.
+
+### Fixed: `Idle` was unreachable after the first event
+
+The fall-through was `Some(_) if total_events_polled > 0 => Healthy`, with no notion of recency,
+and neither field resets within a run. One delivered event therefore pinned the verdict to
+`Healthy` for the life of the process, so `Idle` was reachable only by a pipeline that had never
+delivered anything — the state it is least useful for. It now compares `last_delivery_at_ms`
+against the same threshold the stall check uses, so a pipeline that delivered a million rows
+this morning and has been quiet since lunch reports `Idle`, which is the distinction the verdict
+exists to make.
+
+### Fixed: a runtime nobody polls reported `Idle`
+
+With `last_poll_at_ms` at `None` the poll-loop check did not run at all, so a runtime that was
+started and then never polled — a wedged supervisor, a task that panicked before its loop —
+reported `Idle` indefinitely. It now falls back to `started_at_ms`.
+
+### Fixed: one stalled pipeline logged ten warnings a second, forever
+
+`rustcdc-server` logs the health verdict only when it changes. `Stalled` carried a `reason`
+string with the elapsed milliseconds inside it, so `PartialEq` on the whole verdict was never
+true twice in a row for one continuous stall: the guard never matched, and every health tick
+emitted a fresh WARN — at the poll rate, indefinitely, with `previous="stalled"` in the line,
+the code believing it was reporting a transition into a state it was already in. Observed in the
+field at roughly ten a second on a healthy pipeline.
+
+The volatile detail is now split out of the enum. `Stalled` carries a `StallCause` — a stable,
+`Copy`, low-cardinality discriminant — beside the prose, and `HealthVerdict::change_key()` is
+the identity a change-detecting caller compares. A stall logs once on entry and once on
+recovery; a stall that changes *cause* logs again, because that is a different problem with a
+different owner.
+
+### Fixed: a wedged pipeline was never restarted
+
+`/livez` and `/readyz` did not consult the health verdict at all. Both of their conditions
+were driven by *errors* — a terminal `InstanceState`, or accumulated poll errors — and **a
+poll blocked inside the source produces none.** A TCP connection that was accepted and then
+went silent, a database that stopped answering mid-query, a future that never completes:
+nothing fails, nothing changes state, `source_consecutive_errors` stays at zero, and
+`/livez` answered `200 alive` for the life of the process. The pipeline was dead and every
+signal Kubernetes had said it was fine.
+
+That is precisely the failure the health verdict exists to detect — it measures the absence
+of progress rather than the presence of failure — and nothing was acting on it.
+
+| `StallCause` | `/livez` | `/readyz` |
+|---|---|---|
+| `poll_loop_not_turning` | **503** after 120 s | 503 |
+| `unconfirmed_source_position` | 200 | 503 |
+| `consumer_not_acknowledging` | 200 | 503 |
+
+**The exclusions are the point, and they are why `StallCause` is a stable enum rather than
+prose.** Restarting on `unconfirmed_source_position` replays from the same checkpoint and
+fails identically while the source keeps retaining log — a crash-loop there makes a full
+`pg_wal` volume arrive *sooner*. `consumer_not_acknowledging` means the sink is not
+draining, where a restart thrashes against an already-unhealthy downstream. Readiness
+excludes no cause because it costs nothing: it takes the pod out of rotation rather than
+destroying in-flight work, and a stalled replica reporting itself ready is how a broken
+deploy reaches every pod. Its body names the cause (`stalled:poll_loop_not_turning`), which
+is what `kubectl describe` surfaces.
+
+An **idle** pipeline is ready and alive. A quiet source is the most common reason for a
+pipeline to be producing nothing, and treating it as a fault would take every healthy
+deployment out of rotation the moment its database went quiet.
+
+### Added: `/status` reports the verdict
+
+The runbook opens by telling an operator to `curl /status`, and the verdict was not in it —
+it was reachable only by scraping `/metrics` and grepping a one-hot gauge, for the single
+field that says whether the pipeline is working. `/status` now carries
+`health.verdict`, `health.stall_cause` and `health.stalled_for_seconds`, the last being
+what decides whether `/livez` is about to restart the pod.
+
+### Added: `health_stall_threshold_ms`
+
+The stall threshold was derived as `max_poll_wait_ms × 6` with a 30-second floor, which
+scales *up* with the poll budget and has no ceiling. At `max_poll_wait_ms = 60_000` it is
+six minutes — a pipeline could be wedged for six minutes before anything said so, and
+nothing could shorten the window.
+
+`RuntimeOptions::health_stall_threshold_ms` (TOML: `runtime.health_stall_threshold_ms`)
+states the detection window directly. Unset, the derived default is unchanged.
+
+Two values are rejected at construction and at config load, both guarding the same failure
+from opposite ends — reporting a healthy pipeline as stalled: below
+`HEALTH_MIN_CONFIGURABLE_STALL_MS` (1 000 ms), where the verdict measures the health-check
+interval rather than the pipeline; and at or below `max_poll_wait_ms`, where a merely slow
+poll reads as a stall.
+
+### Fixed: the runbook documented a verdict that cannot exist
+
+The server runbook listed a fourth verdict, `degraded`. There has never been one — the
+enum has four variants and the gauge has four series — so an operator alerting on
+`rustcdc_runtime_health{verdict="degraded"}` would have waited forever. Accumulating
+recoverable errors surface as `rustcdc_source_consecutive_poll_errors` and
+`rustcdc_runtime_recoverable_breaker_open_consecutive`, and the runbook now says so.
+
+### Added: the signals behind the verdict are observable
+
+The verdict was derived from timestamps nothing exported, so an operator could see *that* it
+flipped but never *why*.
+
+| Metric | What it says |
+|---|---|
+| `rustcdc_runtime_poll_age_ms` | Milliseconds since a poll returned, empty batches included — the poll loop's own liveness |
+| `rustcdc_runtime_delivery_age_ms` | Milliseconds since events last arrived. High on its own is a quiet database; **do not alert on it** |
+| `rustcdc_runtime_stall_cause{cause=…}` | Which of the three signals fired. Emitted only while stalled, so presence is the condition |
+
+`rustcdc_runtime_health` is unchanged and still one-hot over four fixed series, so
+`rustcdc_runtime_health{verdict="stalled"} == 1` remains a complete alert rule. The cause is
+what lets it *route*: an unconfirmed source position is a disk-fill risk on the database, a
+non-turning poll loop is a process problem, and a consumer that stopped acknowledging is the
+embedder's. `monitoring/rustcdc_slo_alerts.yml` now has one rule per cause.
+
+### Fixed: `RuntimeAdminSnapshot` could not deserialise an older snapshot
+
+The type is `#[non_exhaustive]` and documents that fields may be added in minor releases, but
+its `Deserialize` did not keep that promise: serde requires a field unless told otherwise,
+`Option` included, so every field ever added broke every stored, proxied or replayed snapshot
+with a missing-field error. Every additive field now carries `#[serde(default)]`. The identity
+fields — `state`, `capabilities`, `health` — are deliberately still required: a snapshot that
+cannot say what state the runtime was in is the wrong document, not a document with a gap.
+
+### Changed: one workspace, one toolchain, one policy
+
+* **Edition 2024** for both members, with the MSRV at **1.94.1** (the server's floor, set by the
+  AWS SDK). `#[no_mangle]` in the WASM guest sample is now `#[unsafe(no_mangle)]`, which is the
+  2024 spelling; a guest crate on edition 2021 still writes the old form.
+* **One `deny.toml`.** The two policies checked two different graphs against two different
+  allowlists — a crate banned for the server was merely warned about for the library, and the
+  `all-features = true` that makes the library's optional subtrees visible at all was absent
+  from the server's.
+* **`cargo fmt --all` and `cargo clippy --workspace`** in CI. Neither had covered both trees.
+* **Zola 0.23.** Zola 0.23 removed shortcodes entirely and made every content file a
+  Tera template rendered before the markdown parser, with no protection for fenced code
+  blocks — so any sample containing `{{` failed the build with a template error in a file
+  containing no template (getzola/zola#3263, closed upstream as intended). The site sets
+  `skip_content_templating = ["**/*.md"]`, which turns that pass off for all content, and
+  the one former shortcode's value is now a literal checked against the manifest by
+  `server/tests/architecture.rs` — a stronger guarantee than an indirection that only
+  moved where the number was written.
+* **The Cargo-profile gate actually runs.** `scripts/ci-policy-gate.sh` used gawk's
+  three-argument `match()`, which is a syntax error on BSD awk: on macOS the whole awk
+  program aborted, `|| true` swallowed it, and the check printed "passed" having examined
+  nothing. It was silently vacuous for every developer on a Mac. Rewritten in POSIX awk,
+  and it now scans every member's manifest rather than only the workspace root.
+* **One documentation site.** `/docs/` is the server, `/library/` is the crate. The library's
+  pages moved from `site/content/docs/` to `site/content/library/`; they are still embedded into
+  rustdoc by `include_str!`, so every Rust block on them is still compiled by
+  `cargo test --doc`.
+* **`cargo package` excludes the rest of the repository.** The workspace root package would
+  otherwise collect the server, its fuzz corpus, the demo stack and the CI scripts into the
+  published `.crate`.
+* The container image is still published as `ghcr.io/hupe1980/rustcdc-server`. Every existing
+  `docker pull` and Kubernetes manifest keeps working.
+
+### Migrating
+
+**`HealthVerdict::Stalled` gained a field.**
+
+```rust,ignore
+// Before
+HealthVerdict::Stalled { reason } => log::warn!("stalled: {reason}"),
+
+// After
+HealthVerdict::Stalled { cause, reason } => log::warn!("stalled ({cause}): {reason}"),
+```
+
+**Replace verdict equality in change detection.** If you compared `HealthVerdict` values to
+decide whether to log, alert or annotate, compare `change_key()` instead — equality on the
+verdict includes prose that moves on every evaluation:
+
+```rust,ignore
+// Before: never equal twice for one ongoing stall
+if last.as_ref() == Some(&snapshot.health) { return; }
+
+// After
+if last == Some(snapshot.health.change_key()) { return; }
+```
+
+**`last_poll_at_ms` changed meaning.** It is now "the last poll that returned" rather than "the
+last poll that produced events". If you were using it as a proxy for traffic, switch to
+`last_delivery_at_ms`, which is the old behaviour under its accurate name.
+
+**Build commands take a package.** `cargo build` builds both members; `cargo build -p rustcdc`
+and `cargo build -p rustcdc-server` address one. The server's own commands run from the
+repository root, not from `server/`.
+
 ## 0.14.0
 
 A bug report against 0.12.0 found that **any UPDATE to a table with PostgreSQL's factory
@@ -1419,7 +1641,7 @@ indistinguishable from an idle database. Debezium's equivalents take regexes, so
 arrive expecting patterns to work.
 
 There is now one matcher, shared by routing and connector filtering, with the pattern table
-documented in the [configuration reference](site/content/docs/config-reference.md). `*` and `?`
+documented in the [configuration reference](site/content/library/config-reference.md). `*` and `?`
 work inside a segment and do not cross the `.`; blank entries are ignored rather than treated as
 catch-alls.
 
@@ -2258,7 +2480,7 @@ universally a defect:
 
 **What breaks:** a deployment that was silently writing rewound positions now fails loudly at
 `save`. That is the intended outcome, but it is a new error where there was none.
-[Troubleshooting](site/content/docs/troubleshooting.md) covers how to tell a migration or
+[Troubleshooting](site/content/library/troubleshooting.md) covers how to tell a migration or
 failover apart from a defect.
 
 ## 0.9.0
@@ -2471,7 +2693,7 @@ would have compiled and silently done nothing.
 Everything else in the crate is on `rustls 0.23`. `tiberius 0.12.3` hard-pins
 `tokio-rustls 0.24`, so enabling `sqlserver` links `rustls 0.21` / `rustls-webpki 0.101.7`,
 carrying RUSTSEC-2026-0098, -0099 and -0104 plus the unmaintained `rustls-pemfile 1.0`. The
-per-advisory reachability analysis was already in `site/content/docs/security.md` and
+per-advisory reachability analysis was already in `site/content/library/security.md` and
 `deny.toml` — but nothing in the README feature table, the Cargo feature list or the connector's
 own rustdoc said the feature changed the TLS stack, so a reader choosing features never saw it.
 All three now do.
@@ -2777,7 +2999,7 @@ comment said only "registry base URL".
 
 **AWS Glue remains untested against a live service.** Its framing and identity are
 unit-tested, but there is no self-hostable implementation to point a container at, so the
-absence of live coverage is stated in `site/content/docs/api.md` rather than left for a reader
+absence of live coverage is stated in `site/content/library/api.md` rather than left for a reader
 to infer from a green suite.
 
 ### Evidence labelling
@@ -3097,7 +3319,7 @@ that warning — which is how a genuinely stale exception survives.
 
 * **`docs/` is now `site/` — a Zola static site**, published to GitHub Pages by
   `.github/workflows/pages.yml` and built + link-checked on every PR by the `docs-site`
-  CI job. The fifteen guides moved to `site/content/docs/` with TOML front matter and
+  CI job. The fifteen guides moved to `site/content/library/` with TOML front matter and
   kebab-case names, behind a landing page and a task-oriented sidebar (Start / Build /
   Extend / Operate / Verify). SEO scaffolding is per-page rather than site-wide: page-first
   `<title>`, per-page description, canonical URL, Open Graph and Twitter cards, a
@@ -3131,7 +3353,7 @@ that warning — which is how a genuinely stale exception survives.
   doctests).
 * **`#![deny(missing_docs)]`**, gated in CI. The backfill covered **416 items**; roughly a
   fifth were places where the behaviour needed explaining rather than the signature restated.
-* Every Rust block in `README.md` and `site/content/docs/{api,config-reference,
+* Every Rust block in `README.md` and `site/content/library/{api,config-reference,
   getting-started,adapter-sdk,schema-evolution}.md` is compiled and run by
   `cargo test --doc --all-features`, gated in CI.
   Turning it on immediately failed **36 of 96 samples** — `FilterProjectionConfig::filter`

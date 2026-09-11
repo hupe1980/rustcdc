@@ -8,9 +8,9 @@ use crate::{
 };
 
 use super::{
-    now_millis, parse_table_reference, qualified_table_name, query_current_wal_lsn,
-    query_primary_key_columns_and_types, PostgresConnection, PostgresSnapshot,
-    PostgresSnapshotHandle, TableSnapshot, TableSnapshotState,
+    PostgresConnection, PostgresSnapshot, PostgresSnapshotHandle, TableSnapshot,
+    TableSnapshotState, now_millis, parse_table_reference, qualified_table_name,
+    query_current_wal_lsn, query_primary_key_columns_and_types,
 };
 
 pub(super) async fn start_postgres_snapshot_internal(
@@ -72,13 +72,13 @@ pub(super) async fn start_postgres_snapshot_from_checkpoint(
     tables: &[&str],
     resume_from: Option<&dyn Offset>,
 ) -> Result<Box<dyn SnapshotHandle>> {
-    if let Some(offset) = resume_from {
-        if offset.source_type() != "postgres_snapshot" {
-            return Err(Error::CheckpointError(format!(
-                "cannot resume postgres snapshot from source type '{}'",
-                offset.source_type()
-            )));
-        }
+    if let Some(offset) = resume_from
+        && offset.source_type() != "postgres_snapshot"
+    {
+        return Err(Error::CheckpointError(format!(
+            "cannot resume postgres snapshot from source type '{}'",
+            offset.source_type()
+        )));
     }
 
     let mut handle = start_postgres_snapshot_internal(connection, tables).await?;

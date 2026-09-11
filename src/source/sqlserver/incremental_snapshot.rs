@@ -18,12 +18,12 @@ use crate::{
 };
 
 use super::{
+    SqlClient, SqlServerSourceConfig,
     parser::{
         build_snapshot_fetch_sql, compare_lsn, lsn_bytes_to_hex, lsn_from_source_offset,
         parse_schema_table, qualified_table_name,
     },
     query::connect_client,
-    SqlClient, SqlServerSourceConfig,
 };
 
 /// A [`StreamHandle`] that interleaves SQL Server chunk reads with the live CDC stream.

@@ -256,8 +256,8 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
 mod tests {
     use super::*;
     use crate::core::{
-        Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
-        EVENT_ENVELOPE_VERSION,
+        EVENT_ENVELOPE_VERSION, Event, Operation, SnapshotMetadata, SourceMetadata,
+        TransactionMetadata,
     };
     use apache_avro::from_avro_datum;
 
@@ -551,7 +551,7 @@ pub fn avro_value_to_event(value: &AvroValue) -> Result<Event> {
             other => {
                 return Err(Error::SerializationError(format!(
                     "avro → Event: field '{name}' must be bytes holding JSON, got {other:?}"
-                )))
+                )));
             }
         };
         serde_json::from_slice(bytes).map(Some).map_err(|error| {

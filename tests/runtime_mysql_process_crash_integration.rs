@@ -7,10 +7,10 @@ use std::{
 };
 
 use rustcdc::{
+    CdcRuntime, MysqlSourceConfig, RuntimeConfig, RuntimeSourceConfig, TransportConfig,
     checkpoint::{Checkpoint, FileCheckpoint, MysqlOffset},
     core::Operation,
     schema_history::InMemorySchemaHistory,
-    CdcRuntime, MysqlSourceConfig, RuntimeConfig, RuntimeSourceConfig, TransportConfig,
 };
 #[cfg(feature = "encryption")]
 use rustcdc::{
@@ -19,9 +19,9 @@ use rustcdc::{
 };
 use sqlx::Row;
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 mod process_crash_marker;
@@ -239,8 +239,8 @@ async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> 
 
 #[cfg(feature = "encryption")]
 #[tokio::test]
-async fn runtime_mysql_process_kill_replays_uncommitted_batch_with_encryption_transform(
-) -> rustcdc::Result<()> {
+async fn runtime_mysql_process_kill_replays_uncommitted_batch_with_encryption_transform()
+-> rustcdc::Result<()> {
     install_rustls_provider();
     run_mysql_process_kill_replay_scenario(true).await
 }

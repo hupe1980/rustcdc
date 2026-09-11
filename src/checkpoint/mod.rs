@@ -1531,7 +1531,7 @@ impl Checkpoint for InMemoryCheckpoint {
 
 #[cfg(test)]
 mod rewind_guard_scope_tests {
-    use super::{compares_stream_position, stream_position_regression, StoredCheckpointRecord};
+    use super::{StoredCheckpointRecord, compares_stream_position, stream_position_regression};
     use crate::core::{Offset, Result};
 
     /// An `Offset` whose encoding is deliberately not JSON — what the trait allows and a
@@ -1596,12 +1596,14 @@ mod rewind_guard_scope_tests {
             "an unadvertised source type must be left alone rather than guessed at"
         );
         // And a listed one is genuinely compared, so the advertisement is not empty.
-        assert!(stream_position_regression(
-            "postgres",
-            &serde_json::json!({ "lsn": 100, "slot_name": "s" }),
-            &serde_json::json!({ "lsn": 0, "slot_name": "s" }),
-        )
-        .is_some());
+        assert!(
+            stream_position_regression(
+                "postgres",
+                &serde_json::json!({ "lsn": 100, "slot_name": "s" }),
+                &serde_json::json!({ "lsn": 0, "slot_name": "s" }),
+            )
+            .is_some()
+        );
     }
 }
 
@@ -1611,8 +1613,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        stream_position_regression, Checkpoint, FileCheckpoint, FileCheckpointRecord,
-        InMemoryCheckpoint, MysqlOffset, PostgresOffset, FILE_CHECKPOINT_FORMAT_VERSION,
+        Checkpoint, FILE_CHECKPOINT_FORMAT_VERSION, FileCheckpoint, FileCheckpointRecord,
+        InMemoryCheckpoint, MysqlOffset, PostgresOffset, stream_position_regression,
     };
 
     #[tokio::test]

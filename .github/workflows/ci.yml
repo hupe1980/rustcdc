@@ -18,20 +18,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # `rust-version` in Cargo.toml is a promise to downstream consumers. Without a job
+  # pinned to it, the promise is only ever tested against whatever `stable` happens to be,
+  # and a newer-than-MSRV feature ships unnoticed.
+  #
+  # The toolchain is **read from the manifest** rather than written here. This job used to
+  # hardcode `1.94.0` while the manifest said `1.94`: two sources of truth for one number,
+  # and exactly how they drift. A dependency raised its own requirement, the pinned job
+  # started failing, and nothing said which of the two values was wrong.
+  # `server/tests/architecture.rs` asserts this job derives rather than restates.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "$version" || { echo "no rust-version in [workspace.package]"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $version"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.94.0
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check --no-default-features (msrv)
-        run: cargo check --no-default-features
-      - name: cargo check --features default (msrv)
-        run: cargo check --features default
-      - name: cargo test --lib --features default (msrv)
-        run: cargo test --lib --features default
+      - uses: ./.github/actions/build-deps
+      - name: cargo check -p rustcdc --no-default-features (msrv)
+        run: cargo check -p rustcdc --no-default-features
+      - name: cargo check -p rustcdc --features default (msrv)
+        run: cargo check -p rustcdc --features default
+      - name: cargo test -p rustcdc --lib --features default (msrv)
+        run: cargo test -p rustcdc --lib --features default
+      # The server is the other half of the MSRV promise, and it has the higher floor
+      # (the AWS SDK). Checking only the library would let the shipped binary need a
+      # newer toolchain than the manifest declares.
+      - name: cargo check -p rustcdc-server --all-targets --all-features (msrv)
+        run: cargo check -p rustcdc-server --all-targets --all-features --locked
 
   check:
     strategy:
@@ -56,10 +79,10 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check (${{ matrix.profile.name }})
-        run: cargo check ${{ matrix.profile.args }}
-      - name: cargo test --lib (${{ matrix.profile.name }})
-        run: cargo test --lib ${{ matrix.profile.args }}
+      - name: cargo check -p rustcdc (${{ matrix.profile.name }})
+        run: cargo check -p rustcdc ${{ matrix.profile.args }}
+      - name: cargo test -p rustcdc --lib (${{ matrix.profile.name }})
+        run: cargo test -p rustcdc --lib ${{ matrix.profile.args }}
       - name: cargo build --example suite (stable ubuntu)
         if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
         run: |
@@ -83,15 +106,24 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt --check
-        run: cargo fmt --check
-      - name: cargo clippy --all-targets --all-features -- -D warnings
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      # Clippy is workspace-wide and therefore compiles the server, whose dependency
+      # graph (aws-lc-rs, parquet, wasmtime) needs a C toolchain.
+      - uses: ./.github/actions/build-deps
+        if: runner.os == 'Linux'
+      # `--all`, not the default: without it `cargo fmt` formats only the package in the
+      # current directory, so every file under `server/` and `xtask/` went unchecked.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+      # Workspace-wide on purpose. Both members are the product; linting only the library
+      # would leave the shipped binary's code unchecked, which is what two repositories
+      # with two CI configurations had already achieved by accident.
+      - name: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # `missing_docs` is `deny` at the crate root, so this also fails on any
       # undocumented public item. The backfill that made it pass covered 416 items;
       # leaving the lint off would let that decay immediately.
-      - name: cargo doc --all-features --no-deps
-        run: cargo doc --all-features --no-deps
+      - name: cargo doc -p rustcdc --all-features --no-deps
+        run: cargo doc -p rustcdc --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
       # The all-features build cannot see a broken link *into* a feature-gated item,
@@ -103,16 +135,16 @@ jobs:
       #
       # `--no-default-features` is the complementary extreme; between the two, an ungated
       # item cannot link to a gated one without one of the lanes failing.
-      - name: cargo doc --no-default-features --no-deps
-        run: cargo doc --no-default-features --no-deps
+      - name: cargo doc -p rustcdc --no-default-features --no-deps
+        run: cargo doc -p rustcdc --no-default-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
       # Compiles every Rust block in README.md and docs/*.md as well as the rustdoc
       # examples. Published samples that no longer compile are integration failures
       # waiting to happen; before this ran, 36 of 96 documented samples were broken.
       # See `markdown_doctests` in src/lib.rs.
-      - name: cargo test --doc --all-features (rustdoc + Markdown samples)
-        run: cargo test --doc --all-features
+      - name: cargo test -p rustcdc --doc --all-features (rustdoc + Markdown samples)
+        run: cargo test -p rustcdc --doc --all-features
 
   transport-security:
     runs-on: ubuntu-latest
@@ -122,18 +154,18 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --lib --features postgres,tls
-        run: cargo test --lib --features postgres,tls
-      - name: cargo test --lib --features mysql,tls
-        run: cargo test --lib --features mysql,tls
-      - name: cargo test --lib --features sqlserver,tls
-        run: cargo test --lib --features sqlserver,tls
+      - name: cargo test -p rustcdc --lib --features postgres,tls
+        run: cargo test -p rustcdc --lib --features postgres,tls
+      - name: cargo test -p rustcdc --lib --features mysql,tls
+        run: cargo test -p rustcdc --lib --features mysql,tls
+      - name: cargo test -p rustcdc --lib --features sqlserver,tls
+        run: cargo test -p rustcdc --lib --features sqlserver,tls
       # `snowflake` alone, with no `tls` and no other connector: the feature adds no
       # dependencies and must therefore build against the bare foundation. Testing it only
       # under `--all-features` would hide a dependency it accidentally picked up from a
       # sibling feature.
-      - name: cargo test --lib --features snowflake
-        run: cargo test --lib --features snowflake
+      - name: cargo test -p rustcdc --lib --features snowflake
+        run: cargo test -p rustcdc --lib --features snowflake
 
   policy-gate:
     runs-on: ubuntu-latest
@@ -151,7 +183,7 @@ jobs:
             | sudo tar -xz -C /usr/local/bin zola
           zola --version
         env:
-          ZOLA_VERSION: 0.22.1
+          ZOLA_VERSION: 0.23.4
       - name: policy gates (schema + deprecated + workflow drift)
         run: bash scripts/ci-policy-gate.sh
       - uses: dtolnay/rust-toolchain@master
@@ -172,7 +204,7 @@ jobs:
             | sudo tar -xz -C /usr/local/bin zola
           zola --version
         env:
-          ZOLA_VERSION: 0.22.1
+          ZOLA_VERSION: 0.23.4
       # `zola check` resolves every internal `@/...` link and fetches external ones.
       # A broken cross-reference fails here rather than shipping to the published site.
       - name: check documentation site
@@ -200,25 +232,25 @@ jobs:
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: contract compatibility smoke
-        run: cargo test --test compatibility_contract --all-features
+        run: cargo test -p rustcdc --test compatibility_contract --all-features
       - name: postgres checkpoint durability smoke
-        run: cargo test --test checkpoint_file_integration --features postgres
+        run: cargo test -p rustcdc --test checkpoint_file_integration --features postgres
       - name: postgres process-crash replay smoke
-        run: cargo test --test runtime_postgres_process_crash_integration --features postgres --bins
+        run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres --bins
       - name: reliability data-loss smoke
-        run: cargo test --test data_loss_detection --features postgres,test-harnesses
+        run: cargo test -p rustcdc --test data_loss_detection --features postgres,test-harnesses
       - name: mysql connection integration smoke
-        run: cargo test --test mysql_connection_integration --features mysql
+        run: cargo test -p rustcdc --test mysql_connection_integration --features mysql
       - name: mariadb connection integration smoke
-        run: cargo test --test mariadb_connection_integration --features mariadb
+        run: cargo test -p rustcdc --test mariadb_connection_integration --features mariadb
       - name: sqlserver connection integration smoke
-        run: cargo test --test sqlserver_connection_integration --features sqlserver
+        run: cargo test -p rustcdc --test sqlserver_connection_integration --features sqlserver
       - name: mysql process-crash replay smoke
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql --bins
+        run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql --bins
       - name: mariadb process-crash replay smoke
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb --bins
+        run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb --bins
       - name: sqlserver process-crash replay smoke
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
+        run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
   reliability-core:
     runs-on: ubuntu-latest
@@ -237,7 +269,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: reliability core suite (${{ matrix.suite }})
-        run: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   latency-core:
     runs-on: ubuntu-latest
@@ -321,22 +353,22 @@ jobs:
             tags="12-alpine 14-alpine 15-alpine 16-alpine"
           fi
           bash scripts/ci-pull-relational-images.sh ${tags}
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration' && matrix.suite != 'example_pg_to_stdout'
-        run: cargo test --test ${{ matrix.suite }} --features postgres
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres
       # The test builds the example itself (`cargo build --example pg_to_stdout`) before spawning
       # it, so no extra target selection is needed. It used to pass `--examples --tests`, and
       # `--tests` selects *every* test target — so this matrix entry ran the whole integration
       # suite and reported unrelated failures under this job's name.
-      - name: cargo test --test example_pg_to_stdout
+      - name: cargo test -p rustcdc --test example_pg_to_stdout
         if: matrix.suite == 'example_pg_to_stdout'
-        run: cargo test --test example_pg_to_stdout --features postgres
-      - name: cargo test --test ${{ matrix.suite }} (metrics)
+        run: cargo test -p rustcdc --test example_pg_to_stdout --features postgres
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }} (metrics)
         if: matrix.suite == 'otel_metrics_integration' || matrix.suite == 'otel_tracing_integration'
-        run: cargo test --test ${{ matrix.suite }} --features postgres,metrics
-      - name: cargo test --test runtime_postgres_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,metrics
+      - name: cargo test -p rustcdc --test runtime_postgres_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_postgres_process_crash_integration'
-        run: cargo test --test runtime_postgres_process_crash_integration --features postgres --bins
+        run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres --bins
 
   integration-postgres-encryption:
     runs-on: ubuntu-latest
@@ -350,8 +382,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
         run: bash scripts/ci-pull-relational-images.sh 16-alpine
-      - name: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
-        run: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
+        run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
 
   integration-reliability:
     runs-on: ubuntu-latest
@@ -381,8 +413,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
-        run: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   integration-schema-registry:
     runs-on: ubuntu-latest
@@ -398,8 +430,8 @@ jobs:
       # so a single container exercises both client paths. "Compiles" is not evidence for
       # a network-facing client: this suite found an Avro decoder that had never decoded
       # an event and a JSON Schema that rejected every INSERT.
-      - name: cargo test --test schema_registry_live_integration
-        run: cargo test --test schema_registry_live_integration --features schemreg,apicurio,avro -- --test-threads=1
+      - name: cargo test -p rustcdc --test schema_registry_live_integration
+        run: cargo test -p rustcdc --test schema_registry_live_integration --features schemreg,apicurio,avro -- --test-threads=1
 
   integration-mysql:
     runs-on: ubuntu-latest
@@ -434,16 +466,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mysql_process_crash_integration' && matrix.suite != 'mysql_restart_resume_integration'
-        run: cargo test --test ${{ matrix.suite }} --features mysql
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features mysql
       # Covers MySQL and MariaDB in one suite, so it needs both features.
-      - name: cargo test --test mysql_restart_resume_integration (mysql + mariadb)
+      - name: cargo test -p rustcdc --test mysql_restart_resume_integration (mysql + mariadb)
         if: matrix.suite == 'mysql_restart_resume_integration'
-        run: cargo test --test mysql_restart_resume_integration --features mysql,mariadb -- --test-threads=1
-      - name: cargo test --test runtime_mysql_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test mysql_restart_resume_integration --features mysql,mariadb -- --test-threads=1
+      - name: cargo test -p rustcdc --test runtime_mysql_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_mysql_process_crash_integration'
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql --bins
+        run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql --bins
 
   integration-mysql-encryption:
     runs-on: ubuntu-latest
@@ -457,8 +489,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
+        run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
 
   integration-mariadb:
     runs-on: ubuntu-latest
@@ -479,12 +511,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mariadb_process_crash_integration'
-        run: cargo test --test ${{ matrix.suite }} --features mariadb
-      - name: cargo test --test runtime_mariadb_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features mariadb
+      - name: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_mariadb_process_crash_integration'
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb --bins
+        run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb --bins
 
   integration-mariadb-encryption:
     runs-on: ubuntu-latest
@@ -498,8 +530,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
+        run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
 
   integration-sqlserver:
     runs-on: ubuntu-latest
@@ -529,19 +561,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
         run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
-        run: cargo test --test ${{ matrix.suite }} --features sqlserver
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features sqlserver
       # The test builds the example itself (`cargo build --example sqlserver_to_otel`) before
       # spawning it, so no extra target selection is needed here. It used to pass
       # `--examples --tests`, and `--tests` selects *every* test target — so this matrix entry ran
       # the whole integration suite, and a PostgreSQL failure was reported as a SQL Server one.
-      - name: cargo test --test sqlserver_to_otel_example_integration
+      - name: cargo test -p rustcdc --test sqlserver_to_otel_example_integration
         if: matrix.suite == 'sqlserver_to_otel_example_integration'
-        run: cargo test --test sqlserver_to_otel_example_integration --features sqlserver,metrics
-      - name: cargo test --test runtime_sqlserver_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test sqlserver_to_otel_example_integration --features sqlserver,metrics
+      - name: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_sqlserver_process_crash_integration'
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
+        run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
   integration-sqlserver-encryption:
     runs-on: ubuntu-latest
@@ -555,8 +587,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
         run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
-      - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
+        run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 
   release-evidence:
     if: ${{ !startsWith(github.ref, 'refs/tags/v') }}

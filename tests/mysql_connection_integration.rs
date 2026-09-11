@@ -1,13 +1,13 @@
 #![cfg(feature = "mysql")]
 
 use rustcdc::TransportConfig;
-use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
+use rustcdc::{MysqlConnection, MysqlSourceConfig, source::Source};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 async fn connect_with_retry(connection: &MysqlConnection) -> rustcdc::Result<()> {
     let mut last_error = None;

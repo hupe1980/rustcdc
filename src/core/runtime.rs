@@ -2,12 +2,12 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use futures_util::{stream, stream::BoxStream, StreamExt};
+use futures_util::{StreamExt, stream, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     checkpoint::{CommitBarrier, GenericOffset},
-    ddl_capture::{parse_ddl_statement, DdlDialect},
+    ddl_capture::{DdlDialect, parse_ddl_statement},
     schema_history::{SchemaHistory, SchemaHistoryRetention},
     sink::{BoxedSink, SinkAdapter},
     source::{
@@ -91,6 +91,27 @@ pub struct RuntimeOptions {
     pub max_buffer_size: usize,
     /// Poll wait budget in milliseconds.
     pub max_poll_wait_ms: u64,
+    /// Explicit stall threshold for [`HealthVerdict`], in milliseconds.
+    ///
+    /// `None` derives it from the poll budget: `max_poll_wait_ms × 6`, with a 30-second
+    /// floor so scheduling jitter cannot trip it. That default is right for the common
+    /// case and wrong in one direction — a large poll budget scales it up with no way
+    /// back down. At `max_poll_wait_ms = 60_000` the derived threshold is six minutes, so
+    /// a pipeline could be wedged for six minutes before anything said so, and nothing
+    /// could shorten it.
+    ///
+    /// Set this to state the detection window directly. It is also what to raise when a
+    /// source's normal poll latency is genuinely long and the derived value is too tight.
+    ///
+    /// # The trade-off, in one sentence
+    ///
+    /// This is the window before `Stalled` is reported, so a value close to the real poll
+    /// interval turns normal scheduling variance into a page — and an alert that fires on
+    /// healthy pipelines is one operators learn to ignore, which costs more than the
+    /// slower detection did. [`CdcRuntime::new`] rejects anything below
+    /// [`HEALTH_MIN_CONFIGURABLE_STALL_MS`] and anything at or below `max_poll_wait_ms`,
+    /// because a threshold inside the poll budget fires on a poll that is merely slow.
+    pub health_stall_threshold_ms: Option<u64>,
     /// Runtime behavior when transform execution fails.
     pub transform_error_policy: TransformErrorPolicy,
     /// Runtime behavior when source confirmation fails after durable checkpoint commit.
@@ -202,6 +223,7 @@ impl Default for RuntimeOptions {
             observability: RuntimeObservability::default(),
             max_buffer_size: 10_000,
             max_poll_wait_ms: 5_000,
+            health_stall_threshold_ms: None,
             transform_error_policy: TransformErrorPolicy::Halt,
             validation_error_policy: ValidationErrorPolicy::Halt,
             // Correctness-first default: fail fast if source confirmation fails
@@ -259,6 +281,15 @@ impl RuntimeOptions {
     /// Override the poll wait budget in milliseconds.
     pub fn with_max_poll_wait_ms(mut self, max_poll_wait_ms: u64) -> Self {
         self.max_poll_wait_ms = max_poll_wait_ms;
+        self
+    }
+
+    /// Set the stall threshold explicitly instead of deriving it from the poll budget.
+    ///
+    /// See [`health_stall_threshold_ms`](RuntimeOptions::health_stall_threshold_ms) for
+    /// the trade-off; the value is checked by [`CdcRuntime::new`].
+    pub fn with_health_stall_threshold_ms(mut self, threshold_ms: u64) -> Self {
+        self.health_stall_threshold_ms = Some(threshold_ms);
         self
     }
 
@@ -812,23 +843,85 @@ pub enum RuntimeState {
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum HealthVerdict {
-    /// Running and making progress: events polled and committed recently.
+    /// Running and making progress: the poll loop is turning and events have arrived
+    /// within the health threshold.
     Healthy,
     /// Running correctly with nothing to do — the source genuinely has no changes.
     ///
     /// Distinguished from [`Stalled`](HealthVerdict::Stalled) by the poll loop still
-    /// completing on schedule and source-side lag not growing.
+    /// completing on schedule, and from [`Healthy`](HealthVerdict::Healthy) by no event
+    /// having been delivered within the health threshold.
+    ///
+    /// Reachable at any point in a run, not only before the first event: a pipeline that
+    /// delivered a million rows this morning and has been quiet since lunch is `Idle`.
     Idle,
     /// Running, but something is wrong and progress has stopped or is degrading.
     ///
-    /// `reason` names which signal fired, so an alert can route without a human first
-    /// correlating three metrics by hand.
+    /// Carries two things, and the split matters. `cause` is a stable, low-cardinality
+    /// discriminant an alert can route on and a consumer can compare; `reason` is prose
+    /// for a human, and **contains measurements that change on every evaluation** —
+    /// elapsed milliseconds, event counts, log positions.
+    ///
+    /// Compare `cause`, never `reason`. `PartialEq` on the whole variant is a
+    /// `String` comparison of that prose, so two evaluations one tick apart of the
+    /// *same* ongoing stall are never equal. Every "log only when the verdict changes"
+    /// guard written against the whole value therefore fires on every tick, which is
+    /// how a single stalled pipeline turns into ten warnings a second, forever.
+    /// [`stall_cause`](HealthVerdict::stall_cause) is the accessor for that comparison.
     Stalled {
-        /// Human-readable description of the specific stall condition detected.
+        /// Which signal fired. Stable across evaluations of the same ongoing stall.
+        cause: StallCause,
+        /// Human-readable description, including the measurements that fired the check.
+        ///
+        /// Not stable across evaluations — see the variant docs.
         reason: String,
     },
     /// Not running: never started, stopping, or stopped.
     NotRunning,
+}
+
+/// Which signal produced a [`HealthVerdict::Stalled`].
+///
+/// A stable discriminant, deliberately separate from the human-readable reason string:
+/// alert routing, dashboards and "has this changed?" comparisons all need a value that
+/// does not move while the underlying condition is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StallCause {
+    /// A position was durably checkpointed but could not be confirmed to the source.
+    ///
+    /// The source keeps replaying committed events and retains its log — WAL on a
+    /// PostgreSQL primary — until it clears. This is the one that ends in a full disk.
+    UnconfirmedSourcePosition,
+    /// [`poll_event_batch`](CdcRuntime::poll_event_batch) has stopped returning.
+    ///
+    /// Either a poll is blocked inside the source or the caller has stopped polling.
+    /// **Not** source idleness: a quiet source still returns empty batches on schedule,
+    /// and those keep this signal fresh.
+    PollLoopNotTurning,
+    /// Events were delivered but not acknowledged, and no commit has happened recently.
+    ///
+    /// A *consumer* stall: the source and the poll loop are both fine and the embedder
+    /// has stopped calling [`commit_ack`](CdcRuntime::commit_ack).
+    ConsumerNotAcknowledging,
+}
+
+impl StallCause {
+    /// Short stable label for metrics, dashboards and log fields.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnconfirmedSourcePosition => "unconfirmed_source_position",
+            Self::PollLoopNotTurning => "poll_loop_not_turning",
+            Self::ConsumerNotAcknowledging => "consumer_not_acknowledging",
+        }
+    }
+}
+
+impl std::fmt::Display for StallCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl HealthVerdict {
@@ -850,6 +943,40 @@ impl HealthVerdict {
             Self::NotRunning => "not_running",
         }
     }
+
+    /// The stall signal that fired, or `None` for any other verdict.
+    pub fn stall_cause(&self) -> Option<StallCause> {
+        match self {
+            Self::Stalled { cause, .. } => Some(*cause),
+            _ => None,
+        }
+    }
+
+    /// A stable identity for "is this the same verdict as before?".
+    ///
+    /// This is what a change-detecting caller — a log-on-transition guard, a state
+    /// machine, a dashboard annotation — must compare, rather than the verdict itself.
+    /// `PartialEq` on [`Stalled`](HealthVerdict::Stalled) includes the `reason` prose,
+    /// which embeds elapsed milliseconds and therefore differs on every evaluation of
+    /// one continuous stall.
+    ///
+    /// ```
+    /// # use rustcdc::core::{HealthVerdict, StallCause};
+    /// let first = HealthVerdict::Stalled {
+    ///     cause: StallCause::PollLoopNotTurning,
+    ///     reason: "no poll has returned for 32279ms".into(),
+    /// };
+    /// let a_tick_later = HealthVerdict::Stalled {
+    ///     cause: StallCause::PollLoopNotTurning,
+    ///     reason: "no poll has returned for 32381ms".into(),
+    /// };
+    ///
+    /// assert_ne!(first, a_tick_later, "the prose moved");
+    /// assert_eq!(first.change_key(), a_tick_later.change_key(), "the condition did not");
+    /// ```
+    pub fn change_key(&self) -> (&'static str, Option<StallCause>) {
+        (self.as_str(), self.stall_cause())
+    }
 }
 
 impl std::fmt::Display for RuntimeState {
@@ -867,10 +994,25 @@ impl std::fmt::Display for RuntimeState {
 ///
 /// This struct is `#[non_exhaustive]`: new fields may be added in minor releases.
 /// Use `..` in struct patterns and do not rely on exhaustive construction.
+///
+/// # Wire compatibility
+///
+/// Every additive field — the `Option`s, the collections and the counters — carries
+/// `#[serde(default)]`, so a snapshot serialised by an older build still deserialises
+/// here. `#[non_exhaustive]` promises additive change is non-breaking, and without those
+/// defaults the `Deserialize` impl did not keep that promise: serde requires a field
+/// unless it is told otherwise, `Option` included, so every field added to this struct
+/// broke every stored, proxied or replayed snapshot with a missing-field error.
+///
+/// The identity fields (`state`, `capabilities`, `health`) are deliberately still
+/// required. A snapshot that cannot say what state the runtime was in is not a snapshot
+/// with a missing field, it is the wrong document, and defaulting it would turn a parse
+/// error into a plausible-looking lie.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RuntimeAdminSnapshot {
     /// Connector type name (e.g. `"postgres"`, `"mysql"`). `None` when source is disabled.
+    #[serde(default)]
     pub source_type: Option<String>,
     /// Current lifecycle state: `"idle"`, `"running"`, `"stopping"`, or `"stopped"`.
     pub state: String,
@@ -881,8 +1023,10 @@ pub struct RuntimeAdminSnapshot {
     /// Set of capabilities reported by the active connector.
     pub capabilities: ConnectorCapabilities,
     /// Number of events currently held in the in-memory event buffer.
+    #[serde(default)]
     pub buffer_depth: usize,
     /// Number of events delivered to the caller but not yet acknowledged via `commit_ack`.
+    #[serde(default)]
     pub in_flight_events: usize,
     /// `true` while a snapshot phase is active (initial bulk copy in progress).
     pub snapshot_active: bool,
@@ -894,16 +1038,20 @@ pub struct RuntimeAdminSnapshot {
     ///
     /// Read from the live driver, not from a persisted checkpoint, so it is current as of
     /// this snapshot rather than as of the last commit.
+    #[serde(default)]
     pub incremental_snapshot: Option<crate::source::IncrementalSnapshotState>,
     /// `true` while a CDC change-stream connection is open.
     pub stream_active: bool,
     /// `true` once the snapshot-to-stream handoff has been completed at least once.
     pub handoff_complete: bool,
     /// Cumulative count of events polled from the source since `start()`. Never resets.
+    #[serde(default)]
     pub total_events_polled: u64,
     /// Cumulative count of events committed (acknowledged) since `start()`. Never resets.
+    #[serde(default)]
     pub total_events_committed: u64,
     /// Cumulative count of events suppressed by the idempotency guard since `start()`. Never resets.
+    #[serde(default)]
     pub total_events_deduplicated: u64,
     /// Fingerprints the idempotency guard evicted because its window filled.
     ///
@@ -911,6 +1059,7 @@ pub struct RuntimeAdminSnapshot {
     /// distance: older duplicates stop being suppressed. Delivery stays at-least-once,
     /// but a sink relying on the guard will begin seeing repeats. Raise
     /// `IdempotencyOptions::capacity`. `None` when the guard is disabled.
+    #[serde(default)]
     pub idempotency_evictions: Option<u64>,
     /// Events the idempotency guard passed through because it could not identify them.
     ///
@@ -918,11 +1067,13 @@ pub struct RuntimeAdminSnapshot {
     /// intra-transaction sequencing. The guard deliberately does not deduplicate them
     /// — dropping a distinct row is unrecoverable, whereas a duplicate is the
     /// documented at-least-once contract. `None` when the guard is disabled.
+    #[serde(default)]
     pub idempotency_unidentifiable_passthrough: Option<u64>,
     /// Events permanently dropped by [`TransformErrorPolicy::Skip`].
     ///
     /// **Any non-zero value means data was lost.** A skipped event is dropped *and* the
     /// checkpoint advances past it, so it is never replayed. Alert on any increase.
+    #[serde(default)]
     pub total_events_skipped: u64,
     /// Transform rules that have never matched anything since `start()`.
     ///
@@ -932,6 +1083,7 @@ pub struct RuntimeAdminSnapshot {
     /// real traffic** — every rule is unmatched before the first event.
     ///
     /// See [`UnmatchedRule`](crate::transform::UnmatchedRule).
+    #[serde(default)]
     pub unmatched_transform_rules: Vec<crate::transform::UnmatchedRule>,
     /// Derived health verdict.
     ///
@@ -940,20 +1092,41 @@ pub struct RuntimeAdminSnapshot {
     /// one. See [`HealthVerdict::is_alertable`].
     pub health: HealthVerdict,
     /// Unix epoch milliseconds when `start()` was last called. `None` before first start.
+    #[serde(default)]
     pub started_at_ms: Option<u64>,
-    /// Unix epoch milliseconds of the last successful `poll_event_batch` call. `None` if never polled.
+    /// Unix epoch milliseconds of the last returned `poll_event_batch` call, whether or
+    /// not it produced events. `None` if never polled.
+    ///
+    /// This is the "is the poll loop turning?" signal, and the one
+    /// [`HealthVerdict::Stalled`] check 2 measures. Pair it with
+    /// [`last_delivery_at_ms`](Self::last_delivery_at_ms): a fresh poll timestamp and a
+    /// stale delivery timestamp is a quiet source, which is
+    /// [`HealthVerdict::Idle`] and not a fault.
+    #[serde(default)]
     pub last_poll_at_ms: Option<u64>,
+    /// Unix epoch milliseconds of the last `poll_event_batch` call that handed over at
+    /// least one event. `None` if no event has been delivered in this run.
+    ///
+    /// Measured on the local clock at delivery, so it is comparable with
+    /// [`last_poll_at_ms`](Self::last_poll_at_ms) and unaffected by source clock skew.
+    /// This is what separates [`HealthVerdict::Healthy`] from [`HealthVerdict::Idle`].
+    #[serde(default)]
+    pub last_delivery_at_ms: Option<u64>,
     /// Unix epoch milliseconds of the last successful `commit_ack` call. `None` if never committed.
+    #[serde(default)]
     pub last_commit_at_ms: Option<u64>,
     /// Age of the last durable checkpoint in milliseconds (None if never committed).
+    #[serde(default)]
     pub checkpoint_age_ms: Option<u64>,
     /// Estimated replication lag from source in milliseconds (None if not available).
+    #[serde(default)]
     pub replication_lag_ms: Option<u64>,
     /// Replication slot WAL lag in bytes (`pg_current_wal_lsn - confirmed_flush_lsn`).
     ///
     /// Only populated for PostgreSQL sources after the first idle-advance call.
     /// `None` means the lag has not yet been measured (the slot may still be behind).
     /// `Some(0)` means the slot is fully caught up to the current WAL write position.
+    #[serde(default)]
     pub replication_slot_lag_bytes: Option<u64>,
 }
 
@@ -1754,6 +1927,14 @@ pub struct CdcRuntime {
     handoff_complete: bool,
     started_at_ms: Option<u64>,
     last_poll_at_ms: Option<u64>,
+    /// Local clock at the last poll that handed over at least one event.
+    ///
+    /// Deliberately distinct from `last_poll_at_ms` (every poll) and from
+    /// `last_source_event_ts_ms` (the *source's* own timestamp, which is subject to clock
+    /// skew and is absent on sources that do not stamp events). Health uses this one to
+    /// separate `Healthy` from `Idle`, because "have events arrived recently" has to be
+    /// measured on the clock that also produces `now_ms`.
+    last_delivery_at_ms: Option<u64>,
     last_source_event_ts_ms: Option<u64>,
     last_commit_at_ms: Option<u64>,
     total_events_polled: u64,
@@ -1805,9 +1986,18 @@ pub(crate) const UNCONFIRMED_STALL_POLL_LIMIT: u32 = 3;
 /// the verdict becomes noise and operators stop trusting it.
 const HEALTH_POLL_STALL_MULTIPLIER: u64 = 6;
 
-/// Floor for the stall threshold, so a very small `max_poll_wait_ms` cannot produce a
-/// threshold short enough to fire on normal scheduling jitter.
+/// Floor for the *derived* stall threshold, so a very small `max_poll_wait_ms` cannot
+/// produce a threshold short enough to fire on normal scheduling jitter.
 const HEALTH_MIN_POLL_STALL_MS: u64 = 30_000;
+
+/// Floor for an *explicitly configured* stall threshold.
+///
+/// Lower than the derived floor on purpose. An operator who names a number has made a
+/// judgement about their own source's latency, and a high-throughput pipeline with a
+/// sub-second poll interval can legitimately want five-second detection. The floor that
+/// remains is only there to reject values no deployment can satisfy: below this, the
+/// verdict is measuring the health-check interval rather than the pipeline.
+pub const HEALTH_MIN_CONFIGURABLE_STALL_MS: u64 = 1_000;
 
 impl CdcRuntime {
     fn observability(&self) -> &RuntimeObservability {
@@ -1859,6 +2049,26 @@ impl CdcRuntime {
             return Err(Error::ConfigError(
                 "max_buffer_size must be greater than zero".into(),
             ));
+        }
+
+        // An explicit stall threshold is checked here, at construction, rather than left
+        // to fire as a mystery page at 3am. Both bounds reject the same failure from
+        // opposite ends: a threshold that reports a healthy pipeline as stalled.
+        if let Some(threshold_ms) = config.options.health_stall_threshold_ms {
+            if threshold_ms < HEALTH_MIN_CONFIGURABLE_STALL_MS {
+                return Err(Error::ConfigError(format!(
+                    "health_stall_threshold_ms ({threshold_ms}) is below the {HEALTH_MIN_CONFIGURABLE_STALL_MS}ms \
+                     minimum; below that the verdict measures the health-check interval rather than the pipeline, \
+                     and Stalled is the verdict that pages someone"
+                )));
+            }
+            if threshold_ms <= config.options.max_poll_wait_ms {
+                return Err(Error::ConfigError(format!(
+                    "health_stall_threshold_ms ({threshold_ms}) must be greater than max_poll_wait_ms ({}); \
+                     a threshold inside the poll budget reports a poll that is merely slow as a stalled pipeline",
+                    config.options.max_poll_wait_ms
+                )));
+            }
         }
 
         if !config.snapshot_tables.is_empty() && config.incremental_snapshot.is_some() {
@@ -1949,6 +2159,7 @@ impl CdcRuntime {
             handoff_complete: false,
             started_at_ms: None,
             last_poll_at_ms: None,
+            last_delivery_at_ms: None,
             last_source_event_ts_ms: None,
             last_commit_at_ms: None,
             total_events_polled: 0,
@@ -2089,6 +2300,7 @@ pub use control::RuntimeControl;
 
 #[cfg(test)]
 mod tests {
+    use super::{HEALTH_MIN_CONFIGURABLE_STALL_MS, HEALTH_MIN_POLL_STALL_MS, StallCause};
     use crate::core::{BeforeImage, ValidationErrorPolicy};
     #[cfg(feature = "encryption")]
     use ahash::AHashMap as HashMap;
@@ -2103,9 +2315,8 @@ mod tests {
     use crate::{
         checkpoint::{Checkpoint, InMemoryCheckpoint},
         core::{
-            Event, EventTracer, HealthVerdict, MetricsCollector, NoOpEventTracer,
-            NoOpMetricsCollector, Operation, SnapshotMetadata, SourceMetadata,
-            EVENT_ENVELOPE_VERSION,
+            EVENT_ENVELOPE_VERSION, Event, EventTracer, HealthVerdict, MetricsCollector,
+            NoOpEventTracer, NoOpMetricsCollector, Operation, SnapshotMetadata, SourceMetadata,
         },
         ddl_capture::DdlDialect,
         schema_history::{InMemorySchemaHistory, SchemaHistoryRetention},
@@ -2803,18 +3014,24 @@ mod tests {
         assert_eq!(tracer.event_ends.len(), 1);
         assert_eq!(tracer.event_ends[0].1, "committed");
         assert!(tracer.checkpoint_states.iter().any(|state| state == "open"));
-        assert!(tracer
-            .checkpoint_states
-            .iter()
-            .any(|state| state == "accepting"));
-        assert!(tracer
-            .checkpoint_states
-            .iter()
-            .any(|state| state == "flushing"));
-        assert!(tracer
-            .checkpoint_states
-            .iter()
-            .any(|state| state == "committed"));
+        assert!(
+            tracer
+                .checkpoint_states
+                .iter()
+                .any(|state| state == "accepting")
+        );
+        assert!(
+            tracer
+                .checkpoint_states
+                .iter()
+                .any(|state| state == "flushing")
+        );
+        assert!(
+            tracer
+                .checkpoint_states
+                .iter()
+                .any(|state| state == "committed")
+        );
     }
 
     #[tokio::test]
@@ -2837,10 +3054,12 @@ mod tests {
         let metrics = metrics_state
             .lock()
             .expect("recording metrics mutex should not be poisoned");
-        assert!(metrics
-            .error_contexts
-            .iter()
-            .any(|context| context == "runtime.poll.state"));
+        assert!(
+            metrics
+                .error_contexts
+                .iter()
+                .any(|context| context == "runtime.poll.state")
+        );
     }
 
     #[tokio::test]
@@ -4962,6 +5181,198 @@ mod tests {
         assert_eq!(runtime.admin_snapshot().health, HealthVerdict::NotRunning);
     }
 
+    /// A source that goes quiet after delivering events is `Idle`, never `Stalled`.
+    ///
+    /// This is the regression that made the whole verdict untrustworthy. `last_poll_at_ms`
+    /// was written only on the path that handed over at least one event, so on an idle
+    /// source — where every poll legitimately returns empty — it froze at the last event
+    /// while the poll loop kept turning perfectly. Thirty seconds of quiet was then
+    /// reported as `Stalled { "the poll loop is blocked, not idle" }`: the alertable
+    /// verdict, with a reason that stated the exact opposite of what was happening.
+    ///
+    /// Two things are asserted here, because fixing only the first leaves the feature
+    /// half-built: empty polls keep the poll timestamp fresh, *and* a quiet source falls
+    /// through to `Idle` rather than being pinned to `Healthy` by one long-past event.
+    #[tokio::test]
+    async fn health_verdict_reports_a_quiet_source_as_idle_not_stalled() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        runtime.enqueue_event(event()).unwrap();
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+        assert_eq!(runtime.admin_snapshot().health, HealthVerdict::Healthy);
+
+        // Backdate both timestamps by a full minute — well past the 30s stall threshold —
+        // so the next poll's effect on each is unambiguous at millisecond resolution.
+        // Wall-clock sleeps would make this slow and flaky; the fields are what the
+        // health check reads, so moving them *is* the passage of time.
+        let long_ago = runtime.last_poll_at_ms.expect("a poll has happened") - 60_000;
+        runtime.last_poll_at_ms = Some(long_ago);
+        runtime.last_delivery_at_ms = Some(long_ago);
+
+        // An idle source: this poll legitimately returns an empty batch.
+        let empty = runtime.poll_event_batch().await.unwrap();
+        assert!(
+            empty.is_empty(),
+            "a disabled source has nothing to hand over"
+        );
+
+        // The poll happened, so the poll timestamp must have moved. This is the defect:
+        // it was written only on the path that delivered events, so an idle source left
+        // it frozen at the last event while the loop kept turning.
+        let polled_at = runtime.last_poll_at_ms.expect("polls have happened");
+        assert!(
+            polled_at > long_ago,
+            "an empty poll must still record a poll: {polled_at} is not later than {long_ago}",
+        );
+        assert_eq!(
+            runtime.last_delivery_at_ms,
+            Some(long_ago),
+            "an empty poll must NOT count as a delivery; the two signals stay separate",
+        );
+
+        // Now ask for the verdict at a moment well past the stall threshold since the
+        // last *event*, but current as of the last *poll*.
+        let now_ms = polled_at + 1;
+        assert!(
+            now_ms.saturating_sub(long_ago) > HEALTH_MIN_POLL_STALL_MS,
+            "the source must be quiet for longer than the stall threshold",
+        );
+
+        let verdict = runtime.derive_health(now_ms);
+        assert_eq!(
+            verdict,
+            HealthVerdict::Idle,
+            "a quiet source with a live poll loop is idle, not stalled: {verdict:?}",
+        );
+        assert!(
+            !verdict.is_alertable(),
+            "a quiet database must never page anyone",
+        );
+
+        // …and the moment the poll loop itself stops turning, it is stalled.
+        runtime.last_poll_at_ms = Some(long_ago);
+        let verdict = runtime.derive_health(now_ms);
+        let HealthVerdict::Stalled { cause, reason } = &verdict else {
+            panic!("a poll loop that stopped turning must be stalled, got {verdict:?}");
+        };
+        assert_eq!(*cause, StallCause::PollLoopNotTurning);
+        assert!(
+            reason.contains("no poll has returned"),
+            "the reason must name the signal that fired: {reason}",
+        );
+        assert!(
+            verdict.is_alertable(),
+            "a genuinely stalled poll loop must page",
+        );
+    }
+
+    /// A runtime that is `Running` but never polled at all is stalled, not idle.
+    ///
+    /// With `last_poll_at_ms` at `None` the poll-loop check simply did not run, so an
+    /// embedder that started the runtime and then never called `poll_event_batch` —
+    /// a wedged supervisor, a task that panicked before its loop — reported `Idle`
+    /// indefinitely. `started_at_ms` is the reference point when no poll has happened yet.
+    #[tokio::test]
+    async fn health_verdict_reports_a_runtime_that_was_never_polled() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        let started_at = runtime.started_at_ms.expect("start() stamps this");
+        assert!(runtime.last_poll_at_ms.is_none(), "no poll has been made");
+
+        // Just after start: nothing to report yet.
+        assert_eq!(runtime.derive_health(started_at + 10), HealthVerdict::Idle);
+
+        let now_ms = started_at + HEALTH_MIN_POLL_STALL_MS + 1_000;
+        let verdict = runtime.derive_health(now_ms);
+        let HealthVerdict::Stalled { cause, reason } = &verdict else {
+            panic!("a runtime nobody polls must be stalled, got {verdict:?}");
+        };
+        assert_eq!(*cause, StallCause::PollLoopNotTurning);
+        assert!(
+            reason.contains("no poll has been made since the runtime started"),
+            "the reason must distinguish 'never polled' from 'stopped polling': {reason}",
+        );
+    }
+
+    /// The stall threshold can be named explicitly, and bad values are rejected at build.
+    ///
+    /// The derived threshold is `max_poll_wait_ms × 6` with a 30s floor, which scales up
+    /// with the poll budget and has no way back down: at `max_poll_wait_ms = 60_000` a
+    /// pipeline could be wedged for six minutes before anything said so. An operator has
+    /// to be able to state the detection window they need.
+    ///
+    /// Both rejections guard the same failure from opposite ends — a threshold that
+    /// reports a *healthy* pipeline as stalled, which is the verdict that pages someone.
+    #[tokio::test]
+    async fn the_health_stall_threshold_can_be_set_and_is_validated() {
+        fn config_with(poll_wait_ms: u64, threshold_ms: Option<u64>) -> RuntimeConfig {
+            let mut config = RuntimeConfig::new(
+                RuntimeSourceConfig::Disabled,
+                InMemoryCheckpoint::default(),
+                InMemorySchemaHistory::default(),
+            );
+            config.options.max_poll_wait_ms = poll_wait_ms;
+            config.options.health_stall_threshold_ms = threshold_ms;
+            config
+        }
+
+        // Below the floor: the verdict would be measuring the health-check interval.
+        let Err(error) = CdcRuntime::new(config_with(
+            5_000,
+            Some(HEALTH_MIN_CONFIGURABLE_STALL_MS - 1),
+        )) else {
+            panic!("a sub-minimum threshold must be rejected");
+        };
+        assert!(
+            error.to_string().contains("health_stall_threshold_ms"),
+            "the error must name the setting: {error}"
+        );
+
+        // Inside the poll budget: a merely-slow poll would read as a stalled pipeline.
+        let Err(error) = CdcRuntime::new(config_with(60_000, Some(30_000))) else {
+            panic!("a threshold inside the poll budget must be rejected");
+        };
+        assert!(
+            error.to_string().contains("max_poll_wait_ms"),
+            "the error must explain the relationship: {error}"
+        );
+
+        // A long poll budget with a deliberately tighter window than the derived six
+        // minutes — the case the setting exists for.
+        let mut runtime = CdcRuntime::new(config_with(60_000, Some(90_000))).unwrap();
+        runtime.start().await.unwrap();
+        runtime.enqueue_event(event()).unwrap();
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+
+        let polled_at = runtime.last_poll_at_ms.unwrap();
+        // Past the configured 90s window, but far inside the 360s the default would have
+        // derived from this poll budget.
+        runtime.last_poll_at_ms = Some(polled_at - 100_000);
+        let verdict = runtime.derive_health(polled_at);
+        let HealthVerdict::Stalled { cause, reason } = &verdict else {
+            panic!("the configured threshold must be the one that applies, got {verdict:?}");
+        };
+        assert_eq!(*cause, StallCause::PollLoopNotTurning);
+        assert!(
+            reason.contains("threshold 90000ms"),
+            "the reason must quote the threshold actually in force: {reason}"
+        );
+
+        // …and the default still derives, so nothing changes for anyone who sets nothing.
+        let runtime = CdcRuntime::new(config_with(60_000, None)).unwrap();
+        assert!(runtime.config.options.health_stall_threshold_ms.is_none());
+    }
+
     /// A consumer that stops acknowledging is a stall, and must say so.
     ///
     /// This is the case that looks identical to source idleness in the raw counters:
@@ -4993,7 +5404,8 @@ mod tests {
 
         let health = runtime.admin_snapshot().health;
         match &health {
-            HealthVerdict::Stalled { reason } => {
+            HealthVerdict::Stalled { cause, reason } => {
+                assert_eq!(*cause, StallCause::ConsumerNotAcknowledging);
                 assert!(
                     reason.contains("commit_ack"),
                     "the reason must name the remedy: {reason}"
@@ -5045,10 +5457,13 @@ mod tests {
 
         let health = runtime.admin_snapshot().health;
         match &health {
-            HealthVerdict::Stalled { reason } => assert!(
-                reason.contains("could not be confirmed"),
-                "the reason must name the unconfirmed position: {reason}"
-            ),
+            HealthVerdict::Stalled { cause, reason } => {
+                assert_eq!(*cause, StallCause::UnconfirmedSourcePosition);
+                assert!(
+                    reason.contains("could not be confirmed"),
+                    "the reason must name the unconfirmed position: {reason}"
+                );
+            }
             other => panic!("expected a stall verdict, got {other:?}"),
         }
     }
@@ -5770,10 +6185,12 @@ mod tests {
             .expect("alter should preserve schema history");
         assert_eq!(schema.version, 2);
         assert!(schema.columns.iter().any(|column| column.name == "email"));
-        assert!(schema
-            .columns
-            .iter()
-            .any(|column| column.name == "full_name"));
+        assert!(
+            schema
+                .columns
+                .iter()
+                .any(|column| column.name == "full_name")
+        );
         assert!(!schema.columns.iter().any(|column| column.name == "name"));
     }
 
@@ -5869,9 +6286,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("unsupported clause 'REPLICA IDENTITY FULL'"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported clause 'REPLICA IDENTITY FULL'")
+        );
 
         let schema = runtime
             .config
@@ -6119,7 +6538,7 @@ mod tests {
     // ── EventBatch accessor tests ─────────────────────────────────────────────
 
     fn make_batch_events() -> Arc<Vec<Event>> {
-        use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+        use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
         use serde_json::json;
         Arc::new(vec![
             Event {

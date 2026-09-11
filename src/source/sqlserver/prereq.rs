@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::core::{Error, Result};
 
-use super::{query, SqlServerSourceConfig};
+use super::{SqlServerSourceConfig, query};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SqlServerPrereqSnapshot {

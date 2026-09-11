@@ -16,9 +16,9 @@ use std::{env, path::PathBuf, sync::Arc};
 
 #[cfg(feature = "mariadb")]
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, sink::StdoutSink,
     CdcRuntime, MariaDbSourceConfig, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
-    StructuredLogger,
+    StructuredLogger, checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
+    sink::StdoutSink,
 };
 
 #[cfg(feature = "mariadb")]

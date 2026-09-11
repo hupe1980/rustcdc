@@ -33,17 +33,17 @@ use apache_avro::Schema;
 
 pub use ::schemreg::confluent::ConfluentSchemaRegistry;
 pub use ::schemreg::wire::{decode_wire_format, encode_wire_format};
-pub use ::schemreg::{detect_wire_format, SchemaRegError};
 pub use ::schemreg::{
-    AnySchemaCache, DynSchemaRegistryClient, SchemaDecoder, SchemaEncoder, SchemaReference,
+    AnySchemaCache, DynSchemaRegistryClient, PayloadDecoder, PayloadEncoder, SchemaReference,
     SchemaVersion,
 };
 pub use ::schemreg::{
-    CachedSchemaRegistry, CompatibilityLevel, EncodeTarget, RetryPolicy, SchemaId,
-    SchemaRegistryClient, SchemaType, SubjectNameStrategy, DEFAULT_BASE_BACKOFF,
-    DEFAULT_MAX_BACKOFF, DEFAULT_MAX_RETRIES,
+    CachedSchemaRegistry, CompatibilityLevel, DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF,
+    DEFAULT_MAX_RETRIES, EncodeTarget, RetryPolicy, SchemaId, SchemaRegistryClient, SchemaType,
+    SubjectNameStrategy,
 };
 pub use ::schemreg::{DecodedMessage, DetectedWireFormat, SchemaFormat, WireFormatDecoder};
+pub use ::schemreg::{SchemaRegError, detect_wire_format};
 
 use crate::codec::avro::AvroEncoder;
 use crate::codec::{AsyncCodec, CodecOutput, EncodedOutput, EventEncoder};
@@ -491,9 +491,29 @@ fn schema_set_for(schema_type: SchemaType) -> Result<SchemaSet> {
             return Err(Error::ConfigError(format!(
                 "rustcdc has no schemas for schema type {other:?}: it encodes Avro, JSON \
                  Schema and Protobuf only."
-            )))
+            )));
         }
     })
+}
+
+/// Map rustcdc's `auto_register` flag onto schemreg's resolution policy.
+///
+/// `auto_register = false` used to be a half-measure on the JSON Schema and Protobuf
+/// encoders. schemreg had no lookup-only mode, so its resolution path was
+/// `register_schema` unconditionally, and the setting was **silently ignored** by both:
+/// an operator who turned it off got schemas registered anyway. rustcdc worked around it
+/// by asserting the subjects already existed at construction, which restored the identity
+/// check but could not stop the later registration call.
+///
+/// schemreg 0.5 closed it. `LookupOnly` resolves the id without writing, needs only
+/// `Subject:Read`, and reports a drifted local schema as a non-retryable not-found at
+/// startup rather than quietly creating a production version from a producer process.
+fn resolution_for(auto_register: bool) -> ::schemreg::SchemaResolution {
+    if auto_register {
+        ::schemreg::SchemaResolution::AutoRegister
+    } else {
+        ::schemreg::SchemaResolution::LookupOnly
+    }
 }
 
 /// Enforce `auto_register = false` for an encoder whose subject resolution registers.
@@ -503,21 +523,24 @@ fn schema_set_for(schema_type: SchemaType) -> Result<SchemaSet> {
 /// `SchemaRegistryConfig::auto_register = false` means *"require the schemas to already
 /// exist"*. [`ConfluentAvroEncoder`] has always honoured it, because it resolves both
 /// subjects itself at construction. The JSON Schema and Protobuf encoders delegate subject
-/// resolution to `schemreg`, whose resolution path is `register_schema` — with no
-/// lookup-only mode — so through 0.8 the setting was **silently ignored** by both. An
-/// operator who set it got schemas registered anyway, and none of the schema-identity
-/// checking that setting exists to buy.
+/// resolution to `schemreg`, which through 0.4 had no lookup-only mode — its resolution
+/// path was `register_schema` unconditionally — so the setting was **silently ignored** by
+/// both. An operator who set it got schemas registered anyway, and none of the
+/// schema-identity checking the setting exists to buy.
 ///
-/// This closes it as far as the dependency allows: at construction, both subjects must
-/// already exist *and* carry exactly the schema rustcdc will write. That converts a
-/// missing-subject or a permissions problem into a startup failure, and restores the
-/// identity check.
+/// **schemreg 0.5 closed the registration half.** Both encoders are now built with
+/// [`SchemaResolution::LookupOnly`](::schemreg::SchemaResolution::LookupOnly), so no
+/// registration is attempted at all and the encoder needs only `Subject:Read`. A
+/// read-only producer principal is now a supported configuration rather than something
+/// the setting merely appeared to offer.
 ///
-/// **The one thing it cannot do** is prevent the later `register_schema` call. Because the
-/// content is verified identical first, that call is a content-identical re-registration,
-/// which a Confluent-compatible registry answers with the existing id rather than a new
-/// version. A registry that rejects registration outright for this principal will still
-/// fail — but now at startup, with this error, rather than on the first event.
+/// This check remains, and is deliberately *stronger* than lookup-only resolution. Lookup
+/// asks the registry "is this content registered?" and takes the id it reports; this
+/// additionally asserts that the schema stored under the subject is byte-identical to the
+/// one rustcdc will write. That is the silent-corruption path worth closing: Avro binary
+/// is positional and untagged, so a consumer resolving a stamped id to a *different*
+/// schema does not get an error — it gets shifted fields and plausible-looking wrong
+/// values. Failing at startup, naming the subject, is the whole point.
 async fn assert_subjects_preregistered<C>(
     registry: &C,
     config: &SchemaRegistryConfig,
@@ -633,8 +656,11 @@ where
 
     for (subject, expected) in [(&value_subject, value_schema), (&key_subject, key_schema)] {
         if config.auto_register {
+            // `check_compatible` was removed in schemreg 0.5; the reference list is
+            // empty because rustcdc's envelope is self-contained — it names no type from
+            // another subject.
             match registry
-                .check_compatible(subject, expected, schema_type)
+                .check_compatibility(subject, expected, schema_type, &[])
                 .await
             {
                 Ok(true) => {}
@@ -767,7 +793,7 @@ fn assert_registry_schema_matches(
             return Err(Error::ConfigError(format!(
                 "cannot compare schemas of type {other:?}: rustcdc encodes Avro, JSON \
                  Schema and Protobuf only."
-            )))
+            )));
         }
     };
 
@@ -934,7 +960,35 @@ impl ConfluentAvroEncoder {
                 SchemaType::Avro,
             )?;
 
-            (vs.id, ks.id)
+            // `Schema::id` became `Option<SchemaId>` in schemreg 0.5, and the `None` is
+            // load-bearing rather than a nuisance: a GUID-addressed lookup establishes no
+            // numeric id, and Apicurio v3 removed the response headers its v2 client read
+            // ids from. The old client filled that gap with **`0`** — a valid-looking
+            // identifier a producer would then stamp on every record, pointing consumers
+            // at whatever schema happens to be registered as 1.
+            //
+            // Refusing here is the only safe answer. Confluent wire format v0 carries a
+            // four-byte id and nothing else, so an encoder with no id has nothing true to
+            // write, and Avro binary is positional and untagged — a consumer resolving a
+            // wrong id gets shifted fields and plausible values, not an error.
+            let require_id = |subject: &str, id: Option<SchemaId>| {
+                id.ok_or_else(|| {
+                    Error::ConfigError(format!(
+                        "subject '{subject}' resolved to a schema with no numeric id, so \
+                         there is nothing valid to stamp on the wire. Confluent wire \
+                         format v0 carries a four-byte id; writing a placeholder would \
+                         point every consumer at the wrong schema, and Avro binary is \
+                         positional, so they would decode shifted fields rather than \
+                         fail. This is normally an Apicurio registry reached through a \
+                         path that reports no id — check the artifact exists and that \
+                         the client is talking to the v3 API."
+                    ))
+                })
+            };
+            (
+                require_id(&value_subject, vs.id)?,
+                require_id(&key_subject, ks.id)?,
+            )
         };
 
         let key_schema = Arc::new(
@@ -1092,20 +1146,28 @@ impl<R: SchemaRegistryClient> ConfluentAvroDecoder<R> {
         // previously a `SourceError`, which classifies as `Transient` ("safe to retry with
         // backoff"), so an embedder following the crate's own guidance retried a message
         // that cannot succeed, forever.
-        let (schema_id, avro_bytes) = decode_wire_format(bytes).map_err(|e| {
+        // `decode_wire_format` reports a `SchemaKey`, not an id: Confluent Platform 8
+        // introduced wire format v1, whose magic byte `0x01` is followed by a 16-byte
+        // schema GUID rather than a 4-byte id. Both are accepted here, and
+        // `get_schema_by_key` dispatches on whichever the producer wrote — so a stream
+        // framed by a CP8 serialiser decodes without the decoder needing to know which
+        // format it will meet.
+        let (schema_key, avro_bytes) = decode_wire_format(bytes).map_err(|e| {
             Error::SerializationError(format!(
                 "confluent wire format decode: {e}. The payload does not carry a valid \
-                 5-byte Confluent header, so it was not produced by a Confluent-framed \
-                 serialiser. Retrying will not change the bytes."
+                 Confluent header — neither the v0 5-byte id form nor the v1 17-byte \
+                 GUID form — so it was not produced by a Confluent-framed serialiser. \
+                 Retrying will not change the bytes."
             ))
         })?;
 
-        let schemreg_schema = SchemaRegistryClient::get_schema_by_id(&*self.registry, schema_id)
-            .await
-            .map_err(|e| map_registry_error(&format!("get_schema_by_id({schema_id})"), e))?;
+        let schemreg_schema =
+            SchemaRegistryClient::get_schema_by_key(&*self.registry, schema_key)
+                .await
+                .map_err(|e| map_registry_error(&format!("get_schema_by_key({schema_key})"), e))?;
 
         let writer_schema = Schema::parse_str(&schemreg_schema.schema).map_err(|e| {
-            Error::SchemaError(format!("avro schema parse (schema_id={schema_id}): {e}"))
+            Error::SchemaError(format!("avro schema parse ({schema_key}): {e}"))
         })?;
 
         let value = apache_avro::from_avro_datum(
@@ -1114,7 +1176,7 @@ impl<R: SchemaRegistryClient> ConfluentAvroDecoder<R> {
             Some(&self.reader_schema),
         )
         .map_err(|e| {
-            Error::SerializationError(format!("avro decode (schema_id={schema_id}): {e}"))
+            Error::SerializationError(format!("avro decode ({schema_key}): {e}"))
         })?;
 
         // Not `apache_avro::from_value::<Event>`: `before`/`after` are Avro `bytes`
@@ -1123,7 +1185,7 @@ impl<R: SchemaRegistryClient> ConfluentAvroDecoder<R> {
         // against a real registry is what exposed it.
         crate::codec::avro::avro_value_to_event(&value).map_err(|e| {
             Error::SerializationError(format!(
-                "avro → Event deserialize (schema_id={schema_id}): {e}"
+                "avro → Event deserialize ({schema_key}): {e}"
             ))
         })
     }
@@ -1380,6 +1442,7 @@ where
             // types cannot be resolved — the failure `references` exists to prevent.
             .references(config.references.clone())
             .validate_on_encode(validate)
+            .resolution(resolution_for(config.auto_register))
             .build()
             .map_err(|e| Error::ConfigError(format!("json schema value encoder build: {e}")))?;
 
@@ -1391,6 +1454,7 @@ where
             .record_name("io.rustcdc.EventKey")
             .strategy(config.strategy.clone())
             .validate_on_encode(validate)
+            .resolution(resolution_for(config.auto_register))
             .build()
             .map_err(|e| Error::ConfigError(format!("json schema key encoder build: {e}")))?;
 
@@ -1797,6 +1861,7 @@ where
             .strategy(config.strategy.clone())
             .references(config.references.clone())
             .max_subject_cache_entries(config.max_cache_entries.unwrap_or(1_000))
+            .resolution(resolution_for(config.auto_register))
             .build()
             .map_err(|error| {
                 Error::ConfigError(format!("confluent protobuf encoder build: {error}"))
@@ -1825,7 +1890,11 @@ where
     }
 
     /// The message-index path this encoder writes into every header.
-    pub fn message_indexes(&self) -> &[i32] {
+    ///
+    /// `u32` since schemreg 0.5: a position within a descriptor is never negative, and
+    /// the signed type let an encoder emit a ZigZag-negative index that the decoder then
+    /// rejected — a frame this crate produced and could not read back.
+    pub fn message_indexes(&self) -> &[u32] {
         self.inner.message_indexes()
     }
 
@@ -2278,9 +2347,9 @@ pub mod glue {
     use crate::core::{Error, Event, Result};
 
     pub use ::schemreg::glue::{
-        decode_glue_wire_format, decode_glue_wire_format_borrowed, encode_glue_wire_format,
         AwsGlueSchemaRegistry, AwsGlueSchemaRegistryBuilder, CachedGlueSchemaRegistry,
         GlueCompression, GlueDataFormat, GlueSchema, GlueSchemaRegistryClient, GlueSchemaVersionId,
+        decode_glue_wire_format, decode_glue_wire_format_borrowed, encode_glue_wire_format,
     };
 
     /// Content type for Glue-framed Avro, distinct from the Confluent one because the
@@ -2793,10 +2862,12 @@ pub mod glue {
                 .source(SourceMetadata::new("postgres", "0/9", 1))
                 .ts(1)
                 .build();
-            assert!(encoder
-                .encode_event_key(&keyless)
-                .expect("encode")
-                .is_none());
+            assert!(
+                encoder
+                    .encode_event_key(&keyless)
+                    .expect("encode")
+                    .is_none()
+            );
         }
 
         #[tokio::test]
@@ -2869,8 +2940,11 @@ mod tests {
         assert_eq!(u32::from_be_bytes(id_bytes), 42);
         assert_eq!(&framed[5..], payload);
 
-        let (id, rest) = decode_wire_format(&framed).unwrap();
-        assert_eq!(id.as_u32(), 42);
+        let (key, rest) = decode_wire_format(&framed).unwrap();
+        // v0 framing must report an *id*, not a GUID: the two are different wire formats
+        // and a decoder that conflated them would look the wrong schema up.
+        assert_eq!(key.as_id().expect("v0 framing carries an id").as_u32(), 42);
+        assert!(key.as_guid().is_none());
         assert_eq!(rest, payload);
     }
 
@@ -2890,16 +2964,16 @@ mod tests {
     #[test]
     fn encode_with_zero_schema_id() {
         let framed = encode_wire_format(0u32, b"");
-        let (id, rest) = decode_wire_format(&framed).unwrap();
-        assert_eq!(id.as_u32(), 0);
+        let (key, rest) = decode_wire_format(&framed).unwrap();
+        assert_eq!(key.as_id().expect("v0 framing carries an id").as_u32(), 0);
         assert!(rest.is_empty());
     }
 
     #[test]
     fn encode_with_max_schema_id() {
         let framed = encode_wire_format(u32::MAX, b"payload");
-        let (id, rest) = decode_wire_format(&framed).unwrap();
-        assert_eq!(id.as_u32(), u32::MAX);
+        let (key, rest) = decode_wire_format(&framed).unwrap();
+        assert_eq!(key.as_id().expect("v0 framing carries an id").as_u32(), u32::MAX);
         assert_eq!(rest, b"payload");
     }
 

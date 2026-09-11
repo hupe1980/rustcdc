@@ -340,14 +340,14 @@ impl MaskHashTransform {
         //
         // Checking here first means a container rule masks the whole subtree; without a
         // container rule the walk descends as before, so per-leaf rules still work.
-        if !path.is_empty() && matches!(value, Value::Object(_) | Value::Array(_)) {
-            if let Some(rule) = self.config.mask_rules.get(path.as_str()) {
-                if !matches!(rule, MaskRule::Passthrough) {
-                    *value = apply_rule(value, rule, &field_aad(table, path))?;
-                    self.record_rule_hit(path.as_str());
-                    return Ok(());
-                }
-            }
+        if !path.is_empty()
+            && matches!(value, Value::Object(_) | Value::Array(_))
+            && let Some(rule) = self.config.mask_rules.get(path.as_str())
+            && !matches!(rule, MaskRule::Passthrough)
+        {
+            *value = apply_rule(value, rule, &field_aad(table, path))?;
+            self.record_rule_hit(path.as_str());
+            return Ok(());
         }
 
         match value {
@@ -494,10 +494,10 @@ fn value_as_hash_input(value: &Value) -> std::borrow::Cow<'_, str> {
 #[cfg(feature = "encryption")]
 fn encrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Value> {
     use aes_gcm::{
-        aead::{Aead, AeadCore, Generate as _, KeyInit},
         Aes256Gcm, Nonce,
+        aead::{Aead, AeadCore, Generate as _, KeyInit},
     };
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let key = derive_encryption_key(secret)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
@@ -539,10 +539,10 @@ fn encrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Valu
 #[cfg(feature = "encryption")]
 fn decrypt_value(value: &Value, secret: &SecretString, aad: &str) -> Result<Value> {
     use aes_gcm::{
-        aead::{Aead, AeadCore},
         Aes256Gcm, KeyInit, Nonce,
+        aead::{Aead, AeadCore},
     };
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let encoded = value.as_str().ok_or_else(|| {
         Error::TransformError("decrypt rule requires a string ciphertext payload".into())
@@ -657,7 +657,7 @@ mod tests {
 
     #[cfg(feature = "encryption")]
     use crate::core::SecretString;
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
     use crate::transform::Transform;
     use serde_json::json;
 

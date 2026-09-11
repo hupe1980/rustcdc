@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 
 use async_trait::async_trait;
 use rustcdc::{
+    Event, Offset, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
     fault_injection::{CrashSimulationState, DataLossValidator, FaultInjectingSource, SourceFault},
     source::{HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle},
-    Event, Offset, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
 };
 
 #[derive(Debug, Clone)]

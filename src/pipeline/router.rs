@@ -291,10 +291,10 @@ impl<S: SinkAdapter> TableRouter<S> {
                 failures.push((format!("route '{}'", route.pattern), e));
             }
         }
-        if let Some(ref mut d) = self.default {
-            if let Err(e) = d.flush().await {
-                failures.push(("default".to_string(), e));
-            }
+        if let Some(ref mut d) = self.default
+            && let Err(e) = d.flush().await
+        {
+            failures.push(("default".to_string(), e));
         }
         Error::aggregate(failures)
     }
@@ -310,10 +310,10 @@ impl<S: SinkAdapter> TableRouter<S> {
                 failures.push((format!("route '{}'", route.pattern), e));
             }
         }
-        if let Some(ref mut d) = self.default {
-            if let Err(e) = d.close().await {
-                failures.push(("default".to_string(), e));
-            }
+        if let Some(ref mut d) = self.default
+            && let Err(e) = d.close().await
+        {
+            failures.push(("default".to_string(), e));
         }
         self.closed = true;
         Error::aggregate(failures)
@@ -413,17 +413,13 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
                 any = true;
             }
         }
-        if let Some(ref d) = self.default {
-            if let Some(depth) = d.queue_depth() {
-                total = total.saturating_add(depth);
-                any = true;
-            }
+        if let Some(ref d) = self.default
+            && let Some(depth) = d.queue_depth()
+        {
+            total = total.saturating_add(depth);
+            any = true;
         }
-        if any {
-            Some(total)
-        } else {
-            None
-        }
+        if any { Some(total) } else { None }
     }
 
     fn flush_tick_interval(&self) -> Option<std::time::Duration> {
@@ -443,17 +439,13 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
                 any = true;
             }
         }
-        if let Some(ref d) = self.default {
-            if let Some(m) = d.delivery_metrics() {
-                agg.merge(&m);
-                any = true;
-            }
+        if let Some(ref d) = self.default
+            && let Some(m) = d.delivery_metrics()
+        {
+            agg.merge(&m);
+            any = true;
         }
-        if any {
-            Some(agg)
-        } else {
-            None
-        }
+        if any { Some(agg) } else { None }
     }
 
     // ── Checkpoint barrier (2PC semantics) ────────────────────────────────────
@@ -471,13 +463,13 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
                 return Err(e);
             }
         }
-        if let Some(ref mut d) = self.default {
-            if let Err(e) = d.begin_checkpoint_barrier().await {
-                for j in (0..n).rev() {
-                    let _ = self.routes[j].sink.abort_checkpoint_barrier().await;
-                }
-                return Err(e);
+        if let Some(ref mut d) = self.default
+            && let Err(e) = d.begin_checkpoint_barrier().await
+        {
+            for j in (0..n).rev() {
+                let _ = self.routes[j].sink.abort_checkpoint_barrier().await;
             }
+            return Err(e);
         }
         Ok(())
     }
@@ -539,9 +531,9 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::glob::glob_segment_matches;
     use crate::core::BeforeImage;
-    use crate::core::{Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::glob::glob_segment_matches;
+    use crate::core::{EVENT_ENVELOPE_VERSION, Operation, SourceMetadata};
     use crate::sink::MemorySinkAdapter;
 
     fn make_event(schema: Option<&str>, table: &str) -> Event {

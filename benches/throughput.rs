@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 use rustcdc::checkpoint::{Checkpoint, FileCheckpoint, InMemoryCheckpoint};
 use rustcdc::schema_history::InMemorySchemaHistory;

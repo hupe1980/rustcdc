@@ -23,14 +23,14 @@
 #![cfg(feature = "mysql")]
 
 use rustcdc::{
-    checkpoint::MysqlOffset, source::Source, MysqlConnection, MysqlSourceConfig, TransportConfig,
+    MysqlConnection, MysqlSourceConfig, TransportConfig, checkpoint::MysqlOffset, source::Source,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[path = "rustls_provider_common.rs"]
 mod rustls_provider_common;

@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlserver")]
 
-use rustcdc::{source::Source, SqlServerConnection, SqlServerSourceConfig};
+use rustcdc::{SqlServerConnection, SqlServerSourceConfig, source::Source};
 use std::time::Duration;
 use tokio::time::sleep;
 

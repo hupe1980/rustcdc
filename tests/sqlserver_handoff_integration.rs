@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlserver")]
 
 use rustcdc::{
-    checkpoint::Checkpoint, checkpoint::InMemoryCheckpoint, source::Source, SqlServerConnection,
+    SqlServerConnection, checkpoint::Checkpoint, checkpoint::InMemoryCheckpoint, source::Source,
 };
 
 #[path = "sqlserver_testkit.rs"]

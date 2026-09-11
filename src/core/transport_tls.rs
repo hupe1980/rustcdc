@@ -12,7 +12,7 @@
 //! happens whenever a dependency graph links more than one provider — and a panic on a
 //! background task takes out a worker thread.
 
-use rustls::pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 
 use crate::core::{Error, Result};
 

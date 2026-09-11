@@ -1716,7 +1716,18 @@ pub(crate) struct RuntimeLoopMetricsAccumulator {
     pipeline_started: Instant,
     wasm_metrics: transform::WasmRuntimeMetricsSnapshot,
     unmatched_transform_rules: Vec<rustcdc::transform::UnmatchedRule>,
-    last_health_verdict: Option<rustcdc::core::HealthVerdict>,
+    // The *identity* of the last verdict, not the verdict itself.
+    //
+    // `HealthVerdict::Stalled` carries a `reason` string with the elapsed milliseconds
+    // baked into it, so equality on the whole value is never true twice in a row for one
+    // continuous stall. Storing the value here and comparing it made the
+    // change-detection below unconditional: every health tick logged a fresh WARN — at
+    // the poll rate, indefinitely, for a pipeline in a single unchanging state. It also
+    // cloned that string on every tick.
+    //
+    // `HealthVerdict::change_key()` is the library's stable identity for exactly this:
+    // the verdict label plus the `StallCause`. It is `Copy`, so nothing is allocated.
+    last_health_verdict: Option<(&'static str, Option<rustcdc::core::StallCause>)>,
 }
 
 impl RuntimeLoopMetricsAccumulator {
@@ -1833,22 +1844,30 @@ impl RuntimeLoopMetricsAccumulator {
     pub(crate) fn observe_health_transition(&mut self, admin: &RuntimeAdminSnapshot) {
         use rustcdc::core::HealthVerdict;
 
-        if self.last_health_verdict.as_ref() == Some(&admin.health) {
+        // Compare identities, never values — see `last_health_verdict`. A stall that
+        // *changes cause* (an unconfirmed source position becoming a consumer stall) is a
+        // genuine transition and still logs; the same stall ticking over is not.
+        let key = admin.health.change_key();
+        if self.last_health_verdict == Some(key) {
             return;
         }
-        let previous = self.last_health_verdict.replace(admin.health.clone());
+        let previous = self.last_health_verdict.replace(key);
+        let previous_verdict = previous.map(|(verdict, _)| verdict);
 
         match &admin.health {
-            HealthVerdict::Stalled { reason } => {
+            HealthVerdict::Stalled { cause, reason } => {
                 tracing::warn!(
                     verdict = admin.health.as_str(),
-                    previous = previous.as_ref().map(HealthVerdict::as_str),
+                    previous = previous_verdict,
+                    // The stable discriminant, so a log pipeline can route and count on
+                    // it without parsing prose whose measurements change every tick.
+                    cause = cause.as_str(),
                     reason = %reason,
                     "runtime health degraded to stalled"
                 );
             }
             verdict => {
-                if matches!(previous, Some(HealthVerdict::Stalled { .. })) {
+                if previous_verdict == Some("stalled") {
                     tracing::info!(
                         verdict = verdict.as_str(),
                         "runtime health recovered from stalled"
@@ -1856,7 +1875,7 @@ impl RuntimeLoopMetricsAccumulator {
                 } else {
                     tracing::debug!(
                         verdict = verdict.as_str(),
-                        previous = previous.as_ref().map(HealthVerdict::as_str),
+                        previous = previous_verdict,
                         "runtime health verdict changed"
                     );
                 }
@@ -2540,6 +2559,58 @@ fn runtime_admin_metrics_prometheus(admin: &RuntimeAdminSnapshot) -> String {
         );
     }
 
+    // The stall *cause*, present only while stalled. `rustcdc_runtime_health` stays
+    // one-hot over four fixed series and remains a complete alert rule on its own; this
+    // is what lets the alert *route*. An unconfirmed source position is a disk-fill risk
+    // on the database, a poll loop that stopped turning is a process problem, and a
+    // consumer that stopped acknowledging is the pipeline's — three different pagers.
+    //
+    // Absent when healthy: the missing series is the healthy state, so alert on presence
+    // rather than carrying three permanent zeroes on every scrape.
+    if let Some(cause) = admin.health.stall_cause() {
+        out.push_str("# HELP rustcdc_runtime_stall_cause Which signal produced the current stalled verdict. Emitted only while rustcdc_runtime_health{verdict=\"stalled\"} is 1.\n");
+        out.push_str("# TYPE rustcdc_runtime_stall_cause gauge\n");
+        let _ = writeln!(
+            out,
+            "rustcdc_runtime_stall_cause{{cause=\"{}\"}} 1",
+            cause.as_str()
+        );
+    }
+
+    // The two raw signals the verdict is derived from, so an operator can see *why* it
+    // flipped rather than inferring it:
+    //
+    //   poll_age low  + delivery_age high → idle. Normal. Never alert on this alone.
+    //   poll_age high                     → stalled. The loop itself is not turning.
+    //
+    // Both are ages against the scrape clock, so they are comparable with
+    // `rustcdc_runtime_checkpoint_age_ms` and need no absolute-timestamp arithmetic in a
+    // dashboard query.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+
+    if let Some(last_poll_at_ms) = admin.last_poll_at_ms {
+        out.push_str("# HELP rustcdc_runtime_poll_age_ms Milliseconds since poll_event_batch last returned, empty batches included. Stays low on an idle source; it only grows when a poll is blocked in the source or nothing is polling.\n");
+        out.push_str("# TYPE rustcdc_runtime_poll_age_ms gauge\n");
+        let _ = writeln!(
+            out,
+            "rustcdc_runtime_poll_age_ms {}",
+            now_ms.saturating_sub(last_poll_at_ms.min(now_ms))
+        );
+    }
+
+    if let Some(last_delivery_at_ms) = admin.last_delivery_at_ms {
+        out.push_str("# HELP rustcdc_runtime_delivery_age_ms Milliseconds since a poll last handed over at least one event. High on its own only means the source is quiet, which is normal.\n");
+        out.push_str("# TYPE rustcdc_runtime_delivery_age_ms gauge\n");
+        let _ = writeln!(
+            out,
+            "rustcdc_runtime_delivery_age_ms {}",
+            now_ms.saturating_sub(last_delivery_at_ms.min(now_ms))
+        );
+    }
+
     if let Some(checkpoint_age_ms) = admin.checkpoint_age_ms {
         out.push_str(
             "# HELP rustcdc_runtime_checkpoint_age_ms Age of last durable checkpoint in milliseconds.\n",
@@ -2631,10 +2702,175 @@ mod tests {
     use rustcdc::core::{Event, Operation, SourceMetadata};
     use serde_json::json;
 
+    use super::RuntimeAdminSnapshot;
     use super::RuntimeLoopMetricsAccumulator;
     use super::{CorrectnessSample, parse_numeric_offset_component, parse_postgres_lsn};
     use super::{MetricLabel, PrometheusTextEncoder};
     use std::borrow::Cow;
+
+    /// Counts `tracing` events by level, so a "logs only on change" claim can be tested
+    /// against the thing it is actually about — the log stream.
+    #[derive(Clone, Default)]
+    struct LevelCounts {
+        warn: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        info: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct CountingLayer(LevelCounts);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use std::sync::atomic::Ordering;
+            match *event.metadata().level() {
+                tracing::Level::WARN => self.0.warn.fetch_add(1, Ordering::Relaxed),
+                tracing::Level::INFO => self.0.info.fetch_add(1, Ordering::Relaxed),
+                _ => 0,
+            };
+        }
+    }
+
+    fn stalled_snapshot(elapsed_ms: u64) -> RuntimeAdminSnapshot {
+        serde_json::from_value(json!({
+            "source_type": "postgres",
+            "state": "running",
+            "readiness": true,
+            "liveness": true,
+            "capabilities": {
+                "snapshot": true,
+                "snapshot_checkpoint_resume": true,
+                "handoff": true,
+                "ddl_capture": true,
+                "heartbeat": true,
+                "tls": false,
+                "schema_introspection": true,
+                "truncate": true,
+                "incremental_snapshot": true
+            },
+            "buffer_depth": 0,
+            "in_flight_events": 0,
+            "snapshot_active": false,
+            "stream_active": true,
+            "handoff_complete": true,
+            "health": {
+                "status": "stalled",
+                "cause": "poll_loop_not_turning",
+                // The part that moves on every evaluation, and the whole bug.
+                "reason": format!("no poll has returned for {elapsed_ms}ms (threshold 30000ms)"),
+            },
+        }))
+        .expect("snapshot deserializes")
+    }
+
+    fn healthy_snapshot() -> RuntimeAdminSnapshot {
+        let mut value = serde_json::to_value(stalled_snapshot(0)).unwrap();
+        value["health"] = json!({"status": "healthy"});
+        serde_json::from_value(value).expect("snapshot deserializes")
+    }
+
+    /// One unchanging stall must log once, not once per health tick.
+    ///
+    /// `observe_health_transition` runs on every poll of the event loop. Its guard
+    /// compared the whole `HealthVerdict`, and `Stalled` carries a `reason` string with
+    /// the elapsed milliseconds inside it — so two evaluations of the *same* stall a tick
+    /// apart were never equal, the guard never matched, and a single stalled pipeline
+    /// emitted a WARN on every tick forever. Observed in the field at roughly ten a
+    /// second, with `previous="stalled"` in the line: the code believed it was reporting
+    /// a transition into a state it was already in.
+    #[test]
+    fn an_unchanging_stall_logs_once_not_once_per_tick() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let counts = LevelCounts::default();
+        let subscriber =
+            tracing_subscriber::registry().with(CountingLayer(LevelCounts::clone(&counts)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut accumulator = RuntimeLoopMetricsAccumulator::new(
+                "kafka",
+                "at_least_once",
+                true,
+                "at_least_once",
+                false,
+                false,
+                16,
+                16,
+            );
+
+            // The same stall, evaluated 50 times as the elapsed counter climbs.
+            for tick in 0..50 {
+                accumulator.observe_health_transition(&stalled_snapshot(30_100 + tick * 100));
+            }
+
+            assert_eq!(
+                counts.warn.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "entering a stall logs once; the same stall ticking over must stay silent",
+            );
+
+            // Recovery is a real transition and must be visible.
+            accumulator.observe_health_transition(&healthy_snapshot());
+            assert_eq!(
+                counts.info.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "recovery from a stall must log exactly once",
+            );
+
+            // Relapsing is another real transition.
+            accumulator.observe_health_transition(&stalled_snapshot(31_000));
+            assert_eq!(
+                counts.warn.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "re-entering a stall after recovery must log again",
+            );
+        });
+    }
+
+    /// A stall whose *cause* changes is a different stall, and must be reported.
+    ///
+    /// The fix must not overcorrect into "log only when the verdict label changes": an
+    /// unconfirmed source position becoming a consumer stall is a different problem with
+    /// a different remedy and a different owner, and both render as `verdict="stalled"`.
+    #[test]
+    fn a_stall_that_changes_cause_logs_again() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let counts = LevelCounts::default();
+        let subscriber =
+            tracing_subscriber::registry().with(CountingLayer(LevelCounts::clone(&counts)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut accumulator = RuntimeLoopMetricsAccumulator::new(
+                "kafka",
+                "at_least_once",
+                true,
+                "at_least_once",
+                false,
+                false,
+                16,
+                16,
+            );
+            accumulator.observe_health_transition(&stalled_snapshot(30_100));
+
+            let mut other = serde_json::to_value(stalled_snapshot(30_200)).unwrap();
+            other["health"] = json!({
+                "status": "stalled",
+                "cause": "consumer_not_acknowledging",
+                "reason": "3 event(s) delivered but not committed",
+            });
+            let other: RuntimeAdminSnapshot = serde_json::from_value(other).unwrap();
+
+            accumulator.observe_health_transition(&other);
+            assert_eq!(
+                counts.warn.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "a different stall cause is a different problem and must be reported",
+            );
+        });
+    }
 
     fn sample_event(source_name: &str, offset: &str, source_timestamp: u64, ts: u64) -> Event {
         Event::builder("orders", Operation::Insert)
@@ -2780,9 +3016,14 @@ mod tests {
             "total_events_committed": 7,
             "total_events_deduplicated": 0,
             "total_events_skipped": 3,
-            "health": {"status": "stalled", "reason": "no successful poll in 120s"},
+            "health": {
+                "status": "stalled",
+                "cause": "poll_loop_not_turning",
+                "reason": "no poll has returned for 120000ms"
+            },
             "started_at_ms": 1,
             "last_poll_at_ms": 2,
+            "last_delivery_at_ms": 2,
             "last_commit_at_ms": 3,
             "checkpoint_age_ms": 5,
             "replication_lag_ms": 7,

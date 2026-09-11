@@ -1,14 +1,16 @@
 [package]
 name = "rustcdc-server"
-version = "0.6.0"
-edition = "2024"
-# The AWS SDK sets this floor; wasmtime is the next constraint at 1.94.0. Declaring the
-# lower number would hand anyone a resolver error instead of a documented requirement.
-rust-version = "1.94.1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# The binary ships as a container image, not on crates.io. The library at the workspace
+# root is the published artefact.
 publish = false
 description = "Change-data-capture server powered by rustcdc"
-repository = "https://github.com/hupe1980/rustcdc-server"
-license = "MIT OR Apache-2.0"
 
 [lints]
 workspace = true
@@ -17,20 +19,6 @@ workspace = true
 name = "rustcdc"
 path = "src/main.rs"
 
-
-[workspace]
-resolver = "2"
-# The libFuzzer targets need a nightly toolchain and `cargo fuzz`. Excluding them keeps
-# `cargo build` on stable from depending on either; `tests/fuzz_properties.rs` carries the
-# same invariants on stable so CI still checks them on every commit.
-exclude = ["fuzz"]
-
-[workspace.lints.rust]
-# `deny`, not `forbid`: `test_env` needs `std::env::set_var`, which Rust 2024 makes unsafe.
-# `tests/architecture.rs::unsafe_code_appears_only_where_the_allowlist_says_it_may` holds the
-# exemption list to that one site. `src/main.rs` carries `forbid`, so the shipped binary has
-# none at all.
-unsafe_code = "deny"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Features
@@ -76,7 +64,7 @@ sqlserver = ["rustcdc/sqlserver"]
 # default set — arrives through *our* `postgres` feature and nowhere else. Without it,
 # `--no-default-features` here would still drag the PostgreSQL connector in, and the
 # feature split would be decorative.
-rustcdc = { version = "0.14.0", default-features = false, features = [
+rustcdc = { path = "..", default-features = false, features = [
     "tls",
     "metrics",
     "avro",
@@ -225,7 +213,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process", "test-util"] }
 # test-harnesses: rustcdc's `testkit::AdapterConformanceSuite`, so the sinks are
 # checked against the library's own adapter contract instead of a local restatement.
-rustcdc = { version = "0.14.0", features = ["test-harnesses"] }
+rustcdc = { path = "..", features = ["test-harnesses"] }
 wat = "1"
 # The Zerobus contract fake is a real tonic server; `tokio-stream` adapts the listener and
 # the response channel into the streams the generated service signature wants.
@@ -233,8 +221,3 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
 # in unit tests without Docker.
 krafka = { version = "0.22.0", default-features = false, features = ["compression-all", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "socks5", "test-broker"] }
-
-# `rustcdc/test-harnesses` refuses to build with `debug_assertions` off, so benches keep them
-# on while retaining `opt-level = 3`. Compare only against baselines from this same profile.
-[profile.bench]
-debug-assertions = true

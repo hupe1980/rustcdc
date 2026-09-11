@@ -1,0 +1,435 @@
+groups:
+  - name: rustcdc_slo_alerts
+    rules:
+      - alert: RUSTCDCReadinessRateLow
+        expr: >
+          rate(rustcdc_slo_readiness_ready_total[5m])
+          / rate(rustcdc_slo_readiness_checks_total[5m]) < 0.999
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: rustcdc readiness rate is below SLO threshold (99.9%)
+          description: >
+            The ratio of ready probes to total probes over the last 5 minutes
+            has dropped below 99.9%.  Check source connectivity and circuit
+            breaker state.
+
+      - alert: RUSTCDCCheckpointAgeHigh
+        expr: rustcdc_slo_checkpoint_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC checkpoint age is too high
+
+      - alert: RUSTCDCAdminAPILatencyHigh
+        expr: histogram_quantile(0.99, rustcdc_slo_admin_api_latency_seconds_histogram_bucket) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC admin API latency is high
+
+      - alert: RUSTCDCRestartRecoverySlow
+        expr: rustcdc_slo_restart_recovery_seconds > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC restart recovery is taking too long
+
+      - alert: RUSTCDCAdminManifestReloadFailed
+        expr: rustcdc_admin_auth_manifest_reload_ok == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin manifest reload failed
+
+      - alert: RUSTCDCAdminControlPlaneDown
+        expr: rustcdc_admin_control_plane_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin control plane is down
+
+      - alert: RUSTCDCAdminManifestStaleBlocked
+        expr: rustcdc_admin_auth_manifest_stale_blocked == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin manifest is stale and blocked
+
+      - alert: RUSTCDCAdminRevokedTokenUseDetected
+        expr: increase(rustcdc_admin_auth_revoked_token_hits_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Revoked token use detected on CDC admin API
+
+      - alert: RUSTCDCAdminShutdownCompletionErrors
+        expr: rustcdc_admin_shutdown_completions_error_total > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC admin shutdown completed with errors
+
+      - alert: RUSTCDCReconciliationRecoveryDetected
+        expr: rustcdc_admin_reconciliation_recoveries_total > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC reconciliation recovery was triggered
+
+      - alert: RUSTCDCReconciliationRecoveryProofFailed
+        expr: rustcdc_admin_reconciliation_recovery_proof_last_ok == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC reconciliation recovery proof failed
+
+      - alert: RUSTCDCAdminAuthAbuse
+        expr: increase(rustcdc_admin_rate_limited_metrics_total[5m])
+          + increase(rustcdc_admin_rate_limited_status_total[5m])
+          + increase(rustcdc_admin_rate_limited_readyz_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC admin auth abuse detected
+
+      - alert: RUSTCDCAdminRateLimiterContentionHigh
+        expr: rustcdc_admin_rate_limiter_metrics_decision_latency_seconds_max > 0.005
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC admin rate limiter contention is high
+
+      - alert: RUSTCDCDataCorrectnessDegradation
+        expr: rustcdc_data_duplicate_rate > 0 or rustcdc_data_reorder_rate > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CDC data correctness degradation detected
+
+      - alert: RUSTCDCHttpBatchOldestEventAgeHigh
+        expr: rustcdc_sink_http_batch_oldest_event_age_ms > 300000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC HTTP batch oldest event age is too high
+
+      - alert: RUSTCDCRuntimeRecoverableBreakerOpen
+        expr: rustcdc_runtime_recoverable_breaker_open_consecutive > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC runtime recoverable circuit breaker is open
+
+      - alert: RUSTCDCRuntimeRecoverableBreakerEscalationRisk
+        expr: rustcdc_runtime_recoverable_breaker_open_consecutive > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CDC runtime recoverable breaker escalation risk detected
+
+      - alert: CDCIcebergOrphanedFiles
+        expr: rustcdc_iceberg_orphaned_data_files_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Iceberg orphaned data files detected — storage cleanup required.
+            Files were written to the object store but never committed to a
+            snapshot (due to a terminal commit failure).  Run a compaction or
+            manual cleanup pass before they accumulate and inflate storage costs.
+
+      - alert: CDCEventDeliveryLatencyHigh
+        expr: histogram_quantile(0.99, rate(rustcdc_runtime_batch_delivery_latency_seconds_bucket[5m])) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            CDC event delivery P99 latency exceeds 30 s — sink back-pressure,
+            slow catalog commits, or network congestion suspected.
+
+      - alert: RUSTCDCEventsQuarantined
+        expr: increase(rustcdc_dlq_events_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Events are being quarantined to the dead-letter queue. Each one was NOT
+            delivered to the sink and the checkpoint advanced past it — this is
+            recorded data loss, not a retry. Drain the DLQ, establish why the events
+            were undeliverable (oversized payload, codec/schema mismatch), and replay
+            them with `rustcdc replay` once the cause is fixed.
+
+      - alert: RUSTCDCAuditLogDropDetected
+        expr: increase(rustcdc_audit_log_drop_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Audit log entries are being dropped because the write channel is
+            full.  This means the filesystem is too slow to keep up with the
+            audit write rate.  Check disk I/O and consider reducing audit
+            write volume or increasing the audit log channel capacity.
+
+      - alert: RUSTCDCSourceDegradedLiveness
+        expr: >
+          rustcdc_source_consecutive_poll_errors >= 3
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Source consecutive errors have been at-or-above threshold for 5
+            minutes.  The pipeline may be stuck in indefinite circuit-breaker
+            backoff.  Check /livez and consider restarting the pod.
+
+      - alert: RUSTCDCRuntimeStalled
+        expr: rustcdc_runtime_health{verdict="stalled"} == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            The rustcdc runtime reports a Stalled health verdict — running,
+            but progress has stopped or is degrading.  The gauge is one-hot
+            (verdict="idle" is deliberately NOT alertable: a quiet database is
+            not an incident, and it is a verdict a healthy pipeline reaches
+            every time its source goes quiet).  Join with
+            rustcdc_runtime_stall_cause for which signal fired, and read the
+            server's one WARN line ("runtime health degraded to stalled"),
+            which carries cause= and the measurements.
+
+      # The stall cause, split out so each goes to the team that can act on it.
+      # `rustcdc_runtime_stall_cause` is emitted only while stalled, so presence
+      # is the condition; there is nothing to compare against zero.
+      - alert: RUSTCDCStallUnconfirmedSourcePosition
+        expr: rustcdc_runtime_stall_cause{cause="unconfirmed_source_position"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          team: database
+        annotations:
+          summary: >
+            A position was durably checkpointed but could not be confirmed to
+            the source.  The source keeps replaying committed events AND keeps
+            retaining its log — WAL on a PostgreSQL primary — until this
+            clears, so the failure mode is a full pg_wal volume on the
+            *database*, not a stopped pipeline.  Pair with
+            rustcdc_replication_slot_lag_bytes.
+
+      - alert: RUSTCDCStallPollLoopNotTurning
+        expr: rustcdc_runtime_stall_cause{cause="poll_loop_not_turning"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: >
+            poll_event_batch has stopped returning — either a poll is blocked
+            inside the source (a wedged socket, a database that accepted the
+            connection and went silent) or nothing is polling at all.  This is
+            NOT source idleness: a quiet source returns empty batches on
+            schedule and keeps rustcdc_runtime_poll_age_ms low.  Check
+            rustcdc_runtime_poll_age_ms for how long, and the source-side
+            connection.
+
+      - alert: RUSTCDCStallConsumerNotAcknowledging
+        expr: rustcdc_runtime_stall_cause{cause="consumer_not_acknowledging"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: >
+            Events were delivered but never acknowledged, and no commit has
+            happened recently.  The source and the poll loop are both fine —
+            the sink or the commit path is not draining.  Check sink delivery
+            errors and rustcdc_runtime_checkpoint_age_ms.
+
+      # Deliberately absent: an alert on rustcdc_runtime_delivery_age_ms.
+      #
+      # A high delivery age on its own means the source is quiet, which is the
+      # single most common cause of "no events" and is not an incident.  It is
+      # here as a *diagnostic* to pair with poll age, not as a condition:
+      # paging on a quiet database is how an alert gets muted, and a muted
+      # stall alert is worse than no stall alert.
+
+      - alert: RUSTCDCEventsSkippedDataLoss
+        expr: increase(rustcdc_runtime_events_skipped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            Events were permanently dropped by TransformErrorPolicy::Skip.
+            A skipped event is dropped AND the checkpoint advances past it,
+            so it will never be replayed — any increase of this counter is
+            confirmed data loss.  Identify the failing transform from the
+            server logs and decide whether to replay from an earlier
+            checkpoint after fixing it.
+
+      - alert: RUSTCDCReplicationSlotLagHigh
+        expr: rustcdc_runtime_replication_slot_lag_bytes > 1073741824
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            The PostgreSQL replication slot is retaining more than 1 GiB of
+            WAL.  Sustained growth risks hitting max_slot_wal_keep_size (slot
+            invalidation = unrecoverable data loss) or filling the WAL
+            volume.  Check sink throughput and the RUSTCDCRuntimeStalled
+            alert.
+
+      - alert: RUSTCDCKafkaOAuthTokenFetchFailing
+        expr: increase(rustcdc_sink_kafka_oauth_token_fetch_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            SASL/OAUTHBEARER token fetches to the identity provider are
+            failing.  krafka resolves a token on every new broker connection,
+            so a persistent failure stops the sink reconnecting after any
+            broker restart or rebalance — and without this counter it is
+            indistinguishable from an unreachable broker, because both
+            surface only as connection failures.  Check
+            sink.kafka.security.sasl.oidc.token_endpoint, the client
+            credentials, and network egress to the provider.
+
+      - alert: RUSTCDCKafkaOAuthTokenNearExpiry
+        expr: >
+          rustcdc_sink_kafka_oauth_token_expiry_epoch_ms > 0
+          and (rustcdc_sink_kafka_oauth_token_expiry_epoch_ms / 1000) - time() < 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            The cached OAUTHBEARER token expires in under 5 minutes and has
+            not been refreshed.  Paired with
+            RUSTCDCKafkaOAuthTokenFetchFailing this is a refresh loop that is
+            failing before the current token runs out; alone it can mean the
+            provider is issuing very short-lived tokens.  Once the token
+            expires every new broker connection is rejected.
+
+      - alert: RUSTCDCTransformRuleUnmatched
+        expr: rustcdc_transform_rules_unmatched > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Transform rule "{{ $labels.rule }}" ({{ $labels.kind }}) in
+            "{{ $labels.transform }}" has never matched.  Transform rules match
+            by pattern against a permissive default, so a typo or a renamed
+            column disables one silently and nothing errors.  The consequence
+            depends on the kind: a "mask" rule that never fires means that
+            column is shipping in CLEAR TEXT; a "route" rule that never fires
+            means events are going to the default destination; a "filter" rule
+            that never fires means nothing is being dropped.  Check the rule's
+            path against the current source schema.  This metric is emitted only
+            for unmatched rules, so its absence is the healthy state.
+
+      - alert: RUSTCDCEndToEndLagHigh
+        expr: >
+          histogram_quantile(
+            0.95,
+            sum by (le, sink) (rate(rustcdc_end_to_end_ack_lag_seconds_bucket[5m]))
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            95th-percentile end-to-end lag for sink "{{ $labels.sink }}" is above
+            30 s.  This is the number a data consumer actually experiences: the
+            time from the source committing a row to that change being durable at
+            the sink.  It is deliberately a percentile and not the
+            rustcdc_end_to_end_ack_lag_seconds_avg gauge, because a pipeline
+            delivering 99% of events in 200 ms and 1% ten minutes late reports a
+            healthy average and pages nobody.  Check replication slot lag, sink
+            throughput, and whether the pipeline is working through a backlog
+            after a restart -- a recovering pipeline breaches this legitimately
+            and should clear on its own.
+
+      - alert: RUSTCDCSnapshotRequestsRefused
+        expr: increase(rustcdc_snapshot_requests_refused_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            An on-demand incremental snapshot request was refused in the last
+            15 minutes.
+          description: >
+            `POST /signals` with action_type=execute_snapshot did not reach the
+            pipeline.  The usual causes are a config with no
+            [incremental_snapshot] section (there is no snapshot for the
+            requested tables to join), a table name that does not resolve or has
+            no primary key, or a pipeline too busy to answer within the request
+            budget.  This matters because the request is *asynchronous*: the
+            caller was answered STARTED and the refusal only appears on the
+            notification stream, so an operator who fired the request and moved
+            on has no reason to think the backfill is not running.  The
+            corresponding terminal audit entry names the exact reason.
+
+      - alert: RUSTCDCSignalWorkerDown
+        expr: rustcdc_admin_signal_worker_alive == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            The signal-action worker is not running; the control plane is dead
+            while the process looks healthy.
+          description: >
+            Every control signal — execute_snapshot, pause/resume/stop_snapshot
+            — is executed by one background task.  If it exits, the pipeline
+            keeps capturing and `/status` keeps reporting
+            snapshot_requests_available=true, and `POST /signals` keeps
+            answering STARTED, while every queued action is silently never
+            executed.  Nothing recovers short of a process restart.
+            RUSTCDCSignalWithoutTerminalNotification also fires eventually, but
+            it names a symptom ("actions are not reaching a terminal state")
+            that a merely slow pipeline produces too; this names the cause.
+            Restart the process.  A panic that was *recovered* shows up as
+            rustcdc_admin_signal_worker_panics_total instead and does not
+            trigger this alert — the worker survived.
+
+      - alert: RUSTCDCSignalActionPanicked
+        expr: increase(rustcdc_admin_signal_worker_panics_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            A signal action panicked and was recovered in the last hour.
+          description: >
+            The worker caught the panic, released the signal's in-flight guard
+            so it can be retried, and carried on — so this is not an outage.
+            It is a bug that reached production: an action panicked rather than
+            returning an error.  The audit trail carries the panic message under
+            action=signal_action_panicked with the signal id.  Treat it as a
+            defect report, not an incident.

@@ -44,8 +44,8 @@ async fn file_checkpoint_survives_checkpoint_store_restart() {
 #[tokio::test]
 async fn incremental_snapshot_cursors_survive_a_checkpoint_round_trip() {
     use rustcdc::source::{
-        incremental_snapshot_state_from_offset, IncrementalSnapshotState,
-        IncrementalSnapshotTableState,
+        IncrementalSnapshotState, IncrementalSnapshotTableState,
+        incremental_snapshot_state_from_offset,
     };
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -228,7 +228,9 @@ async fn a_second_writable_handle_is_still_refused() {
         .load()
         .await
         .expect_err("a second writable instance must be refused");
-    assert!(error
-        .to_string()
-        .contains("already held by another instance in this process"));
+    assert!(
+        error
+            .to_string()
+            .contains("already held by another instance in this process")
+    );
 }

@@ -3,11 +3,11 @@
 use rustcdc::TransportConfig;
 use rustcdc::{MariaDbConnection, MariaDbSourceConfig, MysqlSourceConfig};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[path = "rustls_provider_common.rs"]
 mod rustls_provider_common;

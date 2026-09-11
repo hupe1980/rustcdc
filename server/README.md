@@ -7,13 +7,22 @@
 Capture every row-level change from your databases and stream it anywhere,  
 with configurable delivery semantics, a pluggable WASM transform pipeline, and a cryptographically signed audit trail.
 
-[![CI](https://github.com/hupe1980/rustcdc-server/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc-server/actions/workflows/ci.yml)
-[![Docker](https://github.com/hupe1980/rustcdc-server/actions/workflows/publish.yml/badge.svg)](https://github.com/hupe1980/rustcdc-server/actions/workflows/publish.yml)
-[![GHCR](https://img.shields.io/badge/ghcr.io-hupe1980%2Frustcdc--server-blue?logo=docker)](https://github.com/hupe1980/rustcdc-server/pkgs/container/rustcdc-server)
+[![CI](https://github.com/hupe1980/rustcdc/actions/workflows/server-ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/server-ci.yml)
+[![Docker](https://github.com/hupe1980/rustcdc/actions/workflows/publish-container.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/publish-container.yml)
+[![GHCR](https://img.shields.io/badge/ghcr.io-hupe1980%2Frustcdc--server-blue?logo=docker)](https://github.com/hupe1980/rustcdc/pkgs/container/rustcdc-server)
 [![Rust 1.94.1+](https://img.shields.io/badge/rust-1.94.1%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License: Apache 2.0 / MIT](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-green)](#-license)
 
 </div>
+
+---
+
+> [!NOTE]
+> **This is a workspace member, not a standalone repository.** `rustcdc-server` is the
+> configured binary; [`rustcdc`](../README.md) at the workspace root is the library it is
+> built from. They share one version, one CI configuration and one dependency policy, and
+> every command below is run from the **repository root** — `cargo run -p rustcdc-server`,
+> not `cd server`.
 
 ---
 
@@ -27,7 +36,7 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 | 🌊 **Non-blocking backfill** | DBLog watermark incremental snapshots interleave with the live stream and resume mid-chunk after a restart — no held replication slot, no re-read from row zero |
 | 🧩 **Transform pipeline** | Native rules — masking (redact / HMAC / AES-GCM), field mapping, transactional outbox, routing — plus sandboxed WASM modules in any language. A rule that never matches is a metric, not a silent no-op |
 | 📦 **Pluggable state** | Checkpoint anywhere: local FS · Kafka topic · Redis · PostgreSQL |
-| ☠️ **Sink-agnostic dead-letter queue** | Permanently undeliverable events are quarantined to a file, a Kafka topic or **Amazon SQS** with their source offset and cause, so a poison record cannot crash-loop the pipeline. SQS brings redrive-to-source and broker-level age alarms; it is offered as a DLQ and deliberately *not* as a sink, [with the reasoning written down](https://hupe1980.github.io/rustcdc-server/docs/configuration/). Opt-in, because advancing past an undelivered event is data loss and should be a decision |
+| ☠️ **Sink-agnostic dead-letter queue** | Permanently undeliverable events are quarantined to a file, a Kafka topic or **Amazon SQS** with their source offset and cause, so a poison record cannot crash-loop the pipeline. SQS brings redrive-to-source and broker-level age alarms; it is offered as a DLQ and deliberately *not* as a sink, [with the reasoning written down](https://hupe1980.github.io/rustcdc/docs/configuration/). Opt-in, because advancing past an undelivered event is data loss and should be a decision |
 | 🧮 **Failures classified on two axes** | Permanent and *this record's fault* (`MessageTooLarge`) is quarantined; permanent and *environmental* (a revoked ACL) halts the pipeline instead of draining the change stream into the DLQ one event at a time; transient is retried. Conflating the first two is how a dead-letter queue becomes the data loss it exists to prevent |
 | 🎯 **End-to-end exactly-once, two ways** | `effectively_once` writes the checkpoint *inside* the sink's Kafka transaction, so the data and the position commit together. The **Snowflake** sink reaches the same guarantee with no Kafka at all: a Snowpipe Streaming channel's offset token is a destination-side record of what is durable, and `flush` does not return until it has advanced. Plus `at_least_once`, and an optional `preserve_transactions` boundary so a sink never commits half a source transaction |
 | 🔭 **First-class observability** | Prometheus `/metrics` + OTLP traces & metrics (gRPC/HTTP), a one-hot runtime health verdict (`healthy · idle · stalled · not_running`) that distinguishes a quiet database from a dead socket, and a data-loss tripwire counter |
@@ -78,20 +87,20 @@ The gap is closing in the order above. Until it does, these tables are the hones
 
 ## 📚 Documentation
 
-**📖 [hupe1980.github.io/rustcdc-server](https://hupe1980.github.io/rustcdc-server)** — full documentation, searchable.
+**📖 [hupe1980.github.io/rustcdc/docs](https://hupe1980.github.io/rustcdc/docs/)** — full documentation, searchable.
 
 | Guide | Description |
 |---|---|
-| [🚀 Getting started](https://hupe1980.github.io/rustcdc-server/docs/getting-started/) | Up and running in 10 minutes |
-| [💡 Core concepts](https://hupe1980.github.io/rustcdc-server/docs/concepts/) | Event model, delivery contracts, circuit breaker |
-| [⚙️ Configuration reference](https://hupe1980.github.io/rustcdc-server/docs/configuration/) | Every TOML field, with examples |
-| [🛠️ Operations guide](https://hupe1980.github.io/rustcdc-server/docs/operations/) | CLI, health checks, replay, K8s deployment |
-| [🚨 Runbook](https://hupe1980.github.io/rustcdc-server/docs/runbook/) | Incident procedures, disaster recovery, upgrade and rollback |
-| [🧩 WASM transforms](https://hupe1980.github.io/rustcdc-server/docs/transforms/) | Rust + AssemblyScript walkthroughs |
-| [🔌 PostgreSQL connector](https://hupe1980.github.io/rustcdc-server/docs/connectors/postgres/) | WAL, replication slots, cloud databases |
-| [🔌 MySQL / MariaDB connector](https://hupe1980.github.io/rustcdc-server/docs/connectors/mysql/) | Binlog, GTID, schema history |
-| [🔌 SQL Server connector](https://hupe1980.github.io/rustcdc-server/docs/connectors/sqlserver/) | CDC change tables, Always On AG |
-| [🧪 How defects are prevented](https://hupe1980.github.io/rustcdc-server/docs/engineering/) | The structural guards in the test suite — what each caught, and where each is blind |
+| [🚀 Getting started](https://hupe1980.github.io/rustcdc/docs/getting-started/) | Up and running in 10 minutes |
+| [💡 Core concepts](https://hupe1980.github.io/rustcdc/docs/concepts/) | Event model, delivery contracts, circuit breaker |
+| [⚙️ Configuration reference](https://hupe1980.github.io/rustcdc/docs/configuration/) | Every TOML field, with examples |
+| [🛠️ Operations guide](https://hupe1980.github.io/rustcdc/docs/operations/) | CLI, health checks, replay, K8s deployment |
+| [🚨 Runbook](https://hupe1980.github.io/rustcdc/docs/runbook/) | Incident procedures, disaster recovery, upgrade and rollback |
+| [🧩 WASM transforms](https://hupe1980.github.io/rustcdc/docs/transforms/) | Rust + AssemblyScript walkthroughs |
+| [🔌 PostgreSQL connector](https://hupe1980.github.io/rustcdc/docs/connectors/postgres/) | WAL, replication slots, cloud databases |
+| [🔌 MySQL / MariaDB connector](https://hupe1980.github.io/rustcdc/docs/connectors/mysql/) | Binlog, GTID, schema history |
+| [🔌 SQL Server connector](https://hupe1980.github.io/rustcdc/docs/connectors/sqlserver/) | CDC change tables, Always On AG |
+| [🧪 How defects are prevented](https://hupe1980.github.io/rustcdc/docs/engineering/) | The structural guards in the test suite — what each caught, and where each is blind |
 
 The site is built with [Zola](https://www.getzola.org) from `site/`; edit the Markdown
 under `site/content/` and open a pull request.
@@ -105,12 +114,12 @@ under `site/content/` and open a pull request.
 A self-contained Docker Compose demo that streams PostgreSQL changes to your terminal in under two minutes — no config required:
 
 ```bash
-git clone https://github.com/hupe1980/rustcdc-server
-cd rustcdc-server/demo
+git clone https://github.com/hupe1980/rustcdc
+cd rustcdc/demo
 docker compose up
 ```
 
-See [demo/README.md](demo/README.md) for what to expect and how to explore the admin API.
+See [demo/README.md](../demo/README.md) for what to expect and how to explore the admin API.
 
 The admin API describes itself: `GET /openapi.json` serves an OpenAPI 3.1 document —
 unauthenticated, since it describes the shape of the API rather than any state — that a
@@ -134,7 +143,7 @@ docker run --rm \
 
 ```bash
 # Requires Rust 1.94.1+ and cmake / clang / perl (for aws-lc-sys)
-git clone https://github.com/hupe1980/rustcdc-server
+git clone https://github.com/hupe1980/rustcdc
 cd rustcdc-server
 cargo build --release --all-features
 
@@ -182,7 +191,7 @@ type = "stdout"
 dir = "./state"
 ```
 
-> 📖 See the [getting started guide](https://hupe1980.github.io/rustcdc-server/docs/getting-started/) for PostgreSQL setup steps, Docker Compose, and a production checklist.
+> 📖 See the [getting started guide](https://hupe1980.github.io/rustcdc/docs/getting-started/) for PostgreSQL setup steps, Docker Compose, and a production checklist.
 
 ---
 
@@ -337,7 +346,7 @@ delivery_contract = "effectively_once"  # at_least_once | effectively_once
 | Contract | Guarantee | Kafka | HTTP |
 |---|---|---|---|
 | `at_least_once` | Delivered ≥ 1×; checkpoint advances only after durable delivery | ✅ | ✅ |
-| `effectively_once` | **Exactly-once, end to end.** The batch's records and its checkpoint are written in one Kafka transaction, so a crash discards both or keeps both — never one. Requires a transactional Kafka sink and `state.offset.backend = "kafka_topic"` on the same cluster; any other combination is rejected at load rather than silently degraded. [How it works](https://hupe1980.github.io/rustcdc-server/docs/concepts/#3-delivery-contracts). | ✅ | ❌ |
+| `effectively_once` | **Exactly-once, end to end.** The batch's records and its checkpoint are written in one Kafka transaction, so a crash discards both or keeps both — never one. Requires a transactional Kafka sink and `state.offset.backend = "kafka_topic"` on the same cluster; any other combination is rejected at load rather than silently degraded. [How it works](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts). | ✅ | ❌ |
 
 ---
 
@@ -419,7 +428,7 @@ mode = "wasm"
 
 Every module runs in a **deterministic sandbox** — no network, no filesystem, no side effects. A configurable fuel budget prevents runaway transforms from stalling the pipeline.
 
-→ [WASM transforms guide](https://hupe1980.github.io/rustcdc-server/docs/transforms/)
+→ [WASM transforms guide](https://hupe1980.github.io/rustcdc/docs/transforms/)
 
 ---
 
@@ -458,7 +467,7 @@ docker pull ghcr.io/hupe1980/rustcdc-server:latest
 docker pull ghcr.io/hupe1980/rustcdc-server:1.2.3
 ```
 
-Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](Dockerfile) for build details.
+Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](../Dockerfile) for build details.
 
 ---
 
@@ -470,7 +479,7 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 | **OTLP traces** | `otlp_endpoint` in `[observability]` (gRPC or HTTP) |
 | **OTLP metrics** | Same or separate `otlp_metrics_endpoint` |
 | **Structured logs** | `log_format = "json"` → ships to any log aggregator |
-| **SLO alert rules** | [monitoring/rustcdc_slo_alerts.yml](monitoring/rustcdc_slo_alerts.yml) — 26 rules, `promtool`-validated |
+| **SLO alert rules** | [monitoring/rustcdc_slo_alerts.yml](../monitoring/rustcdc_slo_alerts.yml) — 26 rules, `promtool`-validated |
 | **Kafka OAuth health** | `rustcdc_sink_kafka_oauth_token_fetch_failures_total` and `..._expiry_epoch_ms` — a failing OIDC refresh loop is otherwise indistinguishable from an unreachable broker |
 
 ---
@@ -488,7 +497,7 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 - **`GET /config`** — the configuration this instance is *actually* running, after env-var layering and migration, with three independent redaction rules: enumerated paths, secret-looking key names (separator-insensitive, so `x-api-key` matches), and a value-driven URL rule that strips userinfo *and* secret-named query parameters under any key. Held by a property test that generates names rather than listing them
 - **Control-plane panic guard** — a panic in any admin handler becomes a logged `500`, not a bare connection reset; the payload never reaches the caller
 - **TLS everywhere** — admin API and all outbound connections use rustls (no OpenSSL). A TLS-configured source is TLS on *every* connection, including the replication-slot lag sampler; a server with `ssl = off` fails the connection rather than silently downgrading it
-- **No `unsafe` in the shipped binary** — `src/main.rs` carries `#![forbid(unsafe_code)]`, which no inner `#[allow]` can override. The library is `deny` with exactly one allowlisted site (`test_env`, for the `std::env::set_var` a few tests need), held to that one entry by [an architecture guard](https://hupe1980.github.io/rustcdc-server/docs/engineering/). This line previously claimed the lint was "enforced workspace-wide" while it was applied to nothing
+- **No `unsafe` in the shipped binary** — `src/main.rs` carries `#![forbid(unsafe_code)]`, which no inner `#[allow]` can override. The library is `deny` with exactly one allowlisted site (`test_env`, for the `std::env::set_var` a few tests need), held to that one entry by [an architecture guard](https://hupe1980.github.io/rustcdc/docs/engineering/). This line previously claimed the lint was "enforced workspace-wide" while it was applied to nothing
 
 ---
 

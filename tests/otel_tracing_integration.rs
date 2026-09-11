@@ -5,9 +5,9 @@ use std::{collections::HashMap, time::Duration};
 use rustcdc::{OTelConfig, OTelEventTracer};
 use serde_json::Value;
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 #[tokio::test]

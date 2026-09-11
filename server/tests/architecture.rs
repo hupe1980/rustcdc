@@ -14,6 +14,20 @@ fn read_src(relative: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {relative}: {e}"))
 }
 
+/// Read a file relative to the **workspace root**, not this package.
+///
+/// The manifest, the Dockerfile, the documentation site, the README and the CI workflows
+/// are repository-level artefacts and live one directory up. They used to sit beside this
+/// crate, when the server was its own repository; the guards below check the same files
+/// in their new home rather than being deleted for being inconvenient.
+fn read_repo(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the server package is not the filesystem root")
+        .join(relative);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {relative}: {e}"))
+}
+
 fn glob_src(dir: &str) -> Vec<(String, String)> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
     let mut result = Vec::new();
@@ -742,7 +756,7 @@ fn no_tool_generated_fixme_survives_in_the_tree() {
 
 /// Every place that restates the release version must agree with `Cargo.toml`.
 ///
-/// `site/zola.toml` carries `version`, shown in the site header and in the page's
+/// `site/config.toml` carries `version`, shown in the site header and in the page's
 /// structured data, with a comment telling a human to "bump with the release". That is
 /// exactly the arrangement the MSRV was in before it drifted — the manifest said `1.94`
 /// while CI pinned `1.94.0`, and when a dependency raised its requirement the build broke
@@ -757,28 +771,44 @@ fn no_tool_generated_fixme_survives_in_the_tree() {
 /// obviously-fake `0.0.0-test` rather than a literal that would invite a reflex bump.
 #[test]
 fn every_statement_of_the_release_version_matches_cargo_toml() {
-    let version = read_src("Cargo.toml")
-        .lines()
-        .find_map(|line| line.strip_prefix("version = "))
-        .and_then(|rest| rest.split('"').nth(1).map(str::to_owned))
-        .expect("Cargo.toml must declare a version");
+    let version = workspace_package_key("version");
 
-    let site_config = read_src("site/zola.toml");
+    let site_config = read_repo("site/config.toml");
     assert!(
         site_config.contains(&format!(r#"version = "{version}""#)),
-        "site/zola.toml: expected `version = \"{version}\"` to match Cargo.toml. It is \
+        "site/config.toml: expected `version = \"{version}\"` to match Cargo.toml. It is \
          rendered in the site header and structured data, so a stale value misreports which \
          release the documentation describes."
     );
 }
 
-/// Extract the MSRV from `Cargo.toml`.
-fn declared_msrv() -> String {
-    read_src("Cargo.toml")
+/// Read a string key from the workspace manifest's `[workspace.package]` table.
+///
+/// Scoped to that table on purpose. Both members now inherit with
+/// `rust-version.workspace = true`, and a scan of the whole file matches that line first
+/// — `strip_prefix("rust-version")` succeeds on it, `find_map` short-circuits, and the
+/// value comes back empty. Anchoring to the table is also what makes the answer
+/// unambiguous: `xtask` declares an MSRV of its own, and it is not the one this
+/// repository promises.
+fn workspace_package_key(key: &str) -> String {
+    let manifest = read_repo("Cargo.toml");
+    let table = manifest
+        .split("[workspace.package]")
+        .nth(1)
+        .expect("Cargo.toml must declare a [workspace.package] table");
+    table
         .lines()
-        .find_map(|line| line.strip_prefix("rust-version"))
+        // Stop at the next table header, or a key from a later table would match.
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .find_map(|line| line.trim().strip_prefix(key))
+        .and_then(|rest| rest.trim_start().strip_prefix('='))
         .and_then(|rest| rest.split('"').nth(1).map(str::to_owned))
-        .expect("Cargo.toml must declare rust-version")
+        .unwrap_or_else(|| panic!("[workspace.package] must declare {key}"))
+}
+
+/// Extract the MSRV from the workspace manifest.
+fn declared_msrv() -> String {
+    workspace_package_key("rust-version")
 }
 
 /// Every place that restates the MSRV must agree with `Cargo.toml`.
@@ -796,26 +826,43 @@ fn every_statement_of_the_msrv_matches_cargo_toml() {
     let msrv = declared_msrv();
     let mut wrong = Vec::new();
 
-    let dockerfile = read_src("Dockerfile");
+    let dockerfile = read_repo("Dockerfile");
     if !dockerfile.contains(&format!("ARG RUST_VERSION={msrv}")) {
         wrong.push(format!("Dockerfile: expected `ARG RUST_VERSION={msrv}`"));
     }
 
-    let site_config = read_src("site/zola.toml");
+    let site_config = read_repo("site/config.toml");
     if !site_config.contains(&format!(r#"rust_version = "{msrv}""#)) {
         wrong.push(format!(
-            "site/zola.toml: expected `rust_version = \"{msrv}\"`"
+            "site/config.toml: expected `rust_version = \"{msrv}\"`"
         ));
     }
 
-    let readme = read_src("README.md");
+    let readme = read_repo("README.md");
     if !readme.contains(&format!("Rust {msrv}+")) {
         wrong.push(format!("README.md: badge/text should say `Rust {msrv}+`"));
     }
 
+    // The getting-started page states the number in prose. It used to interpolate a Zola
+    // shortcode instead, which Zola 0.23 removed along with every other shortcode — so the
+    // literal is now the only option. That is not a downgrade: an indirection only moved
+    // where the number was written, whereas this check is what actually prevents drift.
+    let getting_started = read_repo("site/content/docs/getting-started.md");
+    if !getting_started.contains(&format!("Requires Rust {msrv} or later")) {
+        wrong.push(format!(
+            "site/content/docs/getting-started.md: expected `Requires Rust {msrv} or later`"
+        ));
+    }
+
+    // The contributing guide tells a new contributor which toolchain to install.
+    let contributing = read_repo("CONTRIBUTING.md");
+    if !contributing.contains(&format!("Rust {msrv}+")) {
+        wrong.push(format!("CONTRIBUTING.md: expected `Rust {msrv}+`"));
+    }
+
     // The CI job must *derive* the toolchain rather than restate it, or this test would
     // have to be updated in lockstep with a value it is supposed to be policing.
-    let ci = read_src(".github/workflows/ci.yml");
+    let ci = read_repo(".github/workflows/ci.yml");
     if !ci.contains("steps.msrv.outputs.version") {
         wrong.push(
             ".github/workflows/ci.yml: the MSRV job must read rust-version from Cargo.toml \
@@ -1370,7 +1417,7 @@ fn every_configuration_setting_is_read_by_something() {
 /// workflow. Adding a suite and forgetting to wire it up now fails the unit suite.
 #[test]
 fn every_integration_suite_is_run_by_ci() {
-    let workflow = read_src(".github/workflows/ci.yml");
+    let workflow = read_repo(".github/workflows/server-ci.yml");
 
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut suites: Vec<String> = fs::read_dir(&tests_dir)

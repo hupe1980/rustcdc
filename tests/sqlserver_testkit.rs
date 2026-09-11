@@ -3,7 +3,7 @@
 use rustcdc::{SqlServerSourceConfig, TransportConfig};
 use std::time::Duration;
 use testcontainers::{
-    core::IntoContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+    ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort, runners::AsyncRunner,
 };
 use tokio::net::TcpStream;
 use tokio::time::sleep;

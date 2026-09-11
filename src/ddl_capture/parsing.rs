@@ -425,46 +425,46 @@ pub fn extract_primary_keys(sql: &str) -> Vec<String> {
     if let Some(pk_start) = upper.find("PRIMARY KEY") {
         let after_pk = &sql[pk_start + 11..];
         let after_pk_trimmed = after_pk.trim_start();
-        if after_pk_trimmed.starts_with('(') {
-            if let Some(paren_end) = after_pk_trimmed.find(')') {
-                let pk_cols = &after_pk_trimmed[1..paren_end];
-                for col in pk_cols.split(',') {
-                    let col_name = normalize_identifier(col.trim());
-                    if !col_name.is_empty() {
-                        pks.push(col_name);
-                    }
+        if after_pk_trimmed.starts_with('(')
+            && let Some(paren_end) = after_pk_trimmed.find(')')
+        {
+            let pk_cols = &after_pk_trimmed[1..paren_end];
+            for col in pk_cols.split(',') {
+                let col_name = normalize_identifier(col.trim());
+                if !col_name.is_empty() {
+                    pks.push(col_name);
                 }
-                return pks;
             }
+            return pks;
         }
     }
 
-    if let Some(start) = sql.find('(') {
-        if let Some(end) = sql.rfind(')') {
-            let col_defs = &sql[start + 1..end];
-            let mut depth = 0;
-            let mut current = String::new();
+    if let Some(start) = sql.find('(')
+        && let Some(end) = sql.rfind(')')
+    {
+        let col_defs = &sql[start + 1..end];
+        let mut depth = 0;
+        let mut current = String::new();
 
-            for ch in col_defs.chars() {
-                match ch {
-                    '(' => {
-                        depth += 1;
-                        current.push(ch);
-                    }
-                    ')' => {
-                        depth -= 1;
-                        current.push(ch);
-                    }
-                    ',' if depth == 0 => {
-                        maybe_push_inline_primary_key(&current, &mut pks);
-                        current.clear();
-                    }
-                    _ => current.push(ch),
+        for ch in col_defs.chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
                 }
+                ')' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    maybe_push_inline_primary_key(&current, &mut pks);
+                    current.clear();
+                }
+                _ => current.push(ch),
             }
-
-            maybe_push_inline_primary_key(&current, &mut pks);
         }
+
+        maybe_push_inline_primary_key(&current, &mut pks);
     }
 
     pks
@@ -512,17 +512,17 @@ pub fn extract_columns_from_create(sql: &str) -> Vec<ColumnDef> {
     let mut columns = Vec::new();
 
     // Find content between first ( and last )
-    if let Some(start) = sql.find('(') {
-        if let Some(end) = sql.rfind(')') {
-            let content = &sql[start + 1..end];
+    if let Some(start) = sql.find('(')
+        && let Some(end) = sql.rfind(')')
+    {
+        let content = &sql[start + 1..end];
 
-            for clause in split_sql_clauses(content) {
-                let trimmed = clause.trim();
-                if is_column_clause_candidate(trimmed) {
-                    if let Some(col) = parse_enhanced_column(trimmed) {
-                        columns.push(col);
-                    }
-                }
+        for clause in split_sql_clauses(content) {
+            let trimmed = clause.trim();
+            if is_column_clause_candidate(trimmed)
+                && let Some(col) = parse_enhanced_column(trimmed)
+            {
+                columns.push(col);
             }
         }
     }

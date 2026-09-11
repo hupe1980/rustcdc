@@ -28,7 +28,7 @@
 /// Gated on `cfg(doctest)` so the text is never embedded into the crate's own
 /// rendered documentation; only the code blocks are compiled and run.
 ///
-/// The pages live under `site/content/docs/` and are published by Zola to the project
+/// The pages live under `site/content/library/` and are published by Zola to the project
 /// site. Compiling them here is what keeps the published site and the crate in step.
 ///
 /// Blocks that genuinely cannot run in a doctest (they need a live database, or show
@@ -40,43 +40,43 @@ mod markdown_doctests {
     #[doc = include_str!("../README.md")]
     mod readme {}
 
-    #[doc = include_str!("../site/content/docs/api.md")]
+    #[doc = include_str!("../site/content/library/api.md")]
     mod api {}
 
-    #[doc = include_str!("../site/content/docs/config-reference.md")]
+    #[doc = include_str!("../site/content/library/config-reference.md")]
     mod config_reference {}
 
-    #[doc = include_str!("../site/content/docs/getting-started.md")]
+    #[doc = include_str!("../site/content/library/getting-started.md")]
     mod getting_started {}
 
-    #[doc = include_str!("../site/content/docs/adapter-sdk.md")]
+    #[doc = include_str!("../site/content/library/adapter-sdk.md")]
     mod adapter_sdk {}
 
-    #[doc = include_str!("../site/content/docs/schema-evolution.md")]
+    #[doc = include_str!("../site/content/library/schema-evolution.md")]
     mod schema_evolution {}
 
     // Every remaining page that carries a Rust block. The set used to be the five pages
     // above, which meant a sample in the runbook or the deployment guide could rot
     // silently — and those are the pages an operator copies from under pressure.
-    #[doc = include_str!("../site/content/docs/deployment.md")]
+    #[doc = include_str!("../site/content/library/deployment.md")]
     mod deployment {}
 
-    #[doc = include_str!("../site/content/docs/runbook.md")]
+    #[doc = include_str!("../site/content/library/runbook.md")]
     mod runbook {}
 
-    #[doc = include_str!("../site/content/docs/troubleshooting.md")]
+    #[doc = include_str!("../site/content/library/troubleshooting.md")]
     mod troubleshooting {}
 
-    #[doc = include_str!("../site/content/docs/reliability-testing.md")]
+    #[doc = include_str!("../site/content/library/reliability-testing.md")]
     mod reliability_testing {}
 
-    #[doc = include_str!("../site/content/docs/wasm-transform-sdk.md")]
+    #[doc = include_str!("../site/content/library/wasm-transform-sdk.md")]
     mod wasm_transform_sdk {}
 
     // Gated, because the page's samples name types the feature brings in. Under
     // `--all-features` — which is what CI runs — it compiles like every other page.
     #[cfg(feature = "snowflake")]
-    #[doc = include_str!("../site/content/docs/snowflake.md")]
+    #[doc = include_str!("../site/content/library/snowflake.md")]
     mod snowflake_docs {}
 }
 
@@ -109,33 +109,29 @@ pub mod wasm;
 pub use tokio_util::sync::CancellationToken;
 
 pub use crate::core::{
-    fingerprint_event_stable, fingerprint_event_transient, render_error_chain, AckMode, AckToken,
-    BeforeImage, CdcRuntime, ConnectionRetryPolicy, Error, ErrorChain, ErrorKind, ErrorReport,
-    Event, EventBatch, EventBuilder, EventIdempotencyGuard, EventTracer, FingerprintError,
+    AckMode, AckToken, BeforeImage, CdcRuntime, ConnectionRetryPolicy, EVENT_ENVELOPE_VERSION,
+    Error, ErrorChain, ErrorKind, ErrorReport, Event, EventBatch, EventBuilder,
+    EventIdempotencyGuard, EventTracer, FingerprintError, HEALTH_MIN_CONFIGURABLE_STALL_MS,
     HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
     NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite,
     RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions,
     RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
-    SourceErrorKind, SourceMetadata, StructuredLogger, TransactionBoundaryPolicy,
+    SourceErrorKind, SourceMetadata, StallCause, StructuredLogger, TransactionBoundaryPolicy,
     TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError,
-    ValidationErrorPolicy, ValidationErrors, EVENT_ENVELOPE_VERSION,
+    ValidationErrorPolicy, ValidationErrors, fingerprint_event_stable, fingerprint_event_transient,
+    render_error_chain,
 };
-#[cfg(feature = "tls")]
-pub use crate::core::{rustls_client_config, RustlsClientConfig};
 #[cfg(feature = "metrics")]
 pub use crate::core::{
     MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord,
 };
+#[cfg(feature = "tls")]
+pub use crate::core::{RustlsClientConfig, rustls_client_config};
 pub use crate::ddl_capture::{
+    CapturedDdl, DdlDialect, DdlExtractor, DdlOperation, MysqlDdlExtractor, ParsedDdlStatement,
+    PostgresDdlExtractor, SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor,
     extract_columns_from_create, extract_primary_keys, extract_qualified_name,
-    extract_qualified_name_with_default, normalize_identifier, CapturedDdl, DdlDialect,
-    DdlExtractor, DdlOperation, MysqlDdlExtractor, ParsedDdlStatement, PostgresDdlExtractor,
-    SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor,
-};
-#[cfg(feature = "snowflake")]
-pub use crate::source::snowflake::{
-    SnowflakeQueryExecutor, SnowflakeResultSet, SnowflakeSnapshotHandle, SnowflakeSource,
-    SnowflakeSourceConfig, SnowflakeStreamHandle,
+    extract_qualified_name_with_default, normalize_identifier,
 };
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
 pub use crate::source::IncrementalSnapshotConfig;
@@ -145,13 +141,18 @@ pub use crate::source::IncrementalSnapshotHandle;
 pub use crate::source::MysqlIncrementalSnapshotHandle;
 #[cfg(feature = "sqlserver")]
 pub use crate::source::SqlServerIncrementalSnapshotHandle;
+#[cfg(feature = "snowflake")]
+pub use crate::source::snowflake::{
+    SnowflakeQueryExecutor, SnowflakeResultSet, SnowflakeSnapshotHandle, SnowflakeSource,
+    SnowflakeSourceConfig, SnowflakeStreamHandle,
+};
 pub use crate::source::{
-    incremental_snapshot_state_from_offset, BracketPosition, ChunkRow, ConnectorCapabilities,
-    DatabaseAuthMode, HandoffResult, IncrementalSnapshotBackend, IncrementalSnapshotDriver,
-    IncrementalSnapshotState, IncrementalSnapshotTableState, SnapshotCheckpointHelper, SnapshotEnd,
-    SnapshotProgress, SnapshotProgressTracker, SnapshotRequest, SnapshotTable,
-    SnapshotTrackerConfig, SnapshotTrackerReport, SnapshotValidationResult, SnapshotValidator,
-    TableProgress,
+    BracketPosition, ChunkRow, ConnectorCapabilities, DatabaseAuthMode, HandoffResult,
+    IncrementalSnapshotBackend, IncrementalSnapshotDriver, IncrementalSnapshotState,
+    IncrementalSnapshotTableState, SnapshotCheckpointHelper, SnapshotEnd, SnapshotProgress,
+    SnapshotProgressTracker, SnapshotRequest, SnapshotTable, SnapshotTrackerConfig,
+    SnapshotTrackerReport, SnapshotValidationResult, SnapshotValidator, TableProgress,
+    incremental_snapshot_state_from_offset,
 };
 #[cfg(feature = "mariadb")]
 pub use crate::source::{
@@ -174,8 +175,8 @@ pub use crate::transform::{
 pub use crate::transform::{OutboxResult, OutboxTransform};
 #[cfg(feature = "wasm")]
 pub use crate::wasm::{
-    TransformResult as WasmTransformResult, WasmConfig, WasmModule, WasmRuntime,
-    WasmRuntimeMetrics, WasmTransform, DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS,
+    DEFAULT_WASM_MEMORY_LIMIT_MB, DEFAULT_WASM_TIMEOUT_MS, TransformResult as WasmTransformResult,
+    WasmConfig, WasmModule, WasmRuntime, WasmRuntimeMetrics, WasmTransform,
 };
 
 #[cfg(feature = "apicurio")]
@@ -183,19 +184,19 @@ pub use crate::codec::ApicurioRegistryConfig;
 #[cfg(feature = "cloudevents")]
 pub use crate::codec::CloudEventsEncoder;
 #[cfg(feature = "avro")]
-pub use crate::codec::{avro_value_to_event, AvroDecoder, AvroEncoder, AVRO_SCHEMA};
+pub use crate::codec::{AVRO_SCHEMA, AvroDecoder, AvroEncoder, avro_value_to_event};
 #[cfg(feature = "schemreg")]
 pub use crate::codec::{
-    decode_wire_format, detect_wire_format, encode_wire_format, preflight_schema_registry,
-    warm_schema_cache, AnySchemaCache, CachedSchemaRegistry, CompatibilityLevel,
-    ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
+    AnySchemaCache, CachedSchemaRegistry, CompatibilityLevel, ConfluentAvroCodec,
+    ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
     ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentProtobufDecoder,
-    ConfluentProtobufEncoder, ConfluentSchemaRegistry, DecodedMessage, DetectedWireFormat,
-    DynSchemaRegistryClient, EncodeTarget, RetryPolicy, SchemaDecoder, SchemaEncoder, SchemaFormat,
-    SchemaId, SchemaReference, SchemaRegError, SchemaRegistryAuth, SchemaRegistryClient,
-    SchemaRegistryConfig, SchemaType, SchemaVersion, SubjectNameStrategy, WireFormatDecoder,
-    DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_RETRIES, EVENT_JSON_SCHEMA,
-    KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA, KEY_PROTO_SCHEMA,
+    ConfluentProtobufEncoder, ConfluentSchemaRegistry, DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF,
+    DEFAULT_MAX_RETRIES, DecodedMessage, DetectedWireFormat, DynSchemaRegistryClient,
+    EVENT_JSON_SCHEMA, EncodeTarget, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA, KEY_PROTO_SCHEMA,
+    PayloadDecoder, PayloadEncoder, RetryPolicy, SchemaFormat, SchemaId, SchemaReference,
+    SchemaRegError, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType,
+    SchemaVersion, SubjectNameStrategy, WireFormatDecoder, decode_wire_format, detect_wire_format,
+    encode_wire_format, preflight_schema_registry, warm_schema_cache,
 };
 pub use crate::codec::{
     AsyncCodec, BoxedAsyncCodec, BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec,
@@ -206,7 +207,7 @@ pub use crate::codec::{GlueAvroConfig, GlueAvroDecoder, GlueAvroEncoder};
 #[cfg(feature = "protobuf")]
 pub use crate::codec::{ProtoEventKey, ProtobufEncoder};
 pub use crate::pipeline::{
-    table_matches, HeterogeneousTableRouter, TableRoute, TableRouter, TableRouterBuilder,
+    HeterogeneousTableRouter, TableRoute, TableRouter, TableRouterBuilder, table_matches,
 };
 pub use crate::sink::{
     BoxedSink, FanOutSinkAdapter, FileJsonlSink, FileJsonlSinkConfig, MemorySinkAdapter,

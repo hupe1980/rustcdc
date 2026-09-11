@@ -9,7 +9,7 @@ use mysql_async::SslOpts;
 use crate::core::{Error, Result, SecretString, TransportConfig};
 
 use super::{
-    DatabaseAuthMode, MysqlSourceConfig, ServerFlavor, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS,
+    DatabaseAuthMode, MAX_EVENTS_PER_POLL, MysqlSourceConfig, STREAM_POLL_INTERVAL_MS, ServerFlavor,
 };
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
@@ -133,12 +133,12 @@ impl MysqlSourceConfig {
         }
         // For inline secrets we can check emptiness without triggering provider I/O.
         // Deferred secrets (provider/callback) are validated at connect time.
-        if let Ok(pw) = self.password.expose_secret() {
-            if pw.trim().is_empty() {
-                return Err(Error::ConfigError(
-                    "mysql password must not be empty".into(),
-                ));
-            }
+        if let Ok(pw) = self.password.expose_secret()
+            && pw.trim().is_empty()
+        {
+            return Err(Error::ConfigError(
+                "mysql password must not be empty".into(),
+            ));
         }
         if matches!(self.auth_mode, DatabaseAuthMode::AwsIamToken) && !self.transport.is_tls() {
             return Err(Error::ConfigError(
@@ -212,12 +212,11 @@ impl MysqlSourceConfig {
                     .as_deref()
                     .map(str::trim)
                     .filter(|path| !path.is_empty())
+                    && !Path::new(ca_path).exists()
                 {
-                    if !Path::new(ca_path).exists() {
-                        return Err(Error::ConfigError(format!(
-                            "mysql tls_ca_cert_path does not exist: {ca_path}"
-                        )));
-                    }
+                    return Err(Error::ConfigError(format!(
+                        "mysql tls_ca_cert_path does not exist: {ca_path}"
+                    )));
                 }
                 match (client_cert_path.as_deref(), client_key_path.as_deref()) {
                     (Some(_), None) => {
@@ -327,7 +326,7 @@ impl MysqlSourceConfig {
     ///
     /// Returns [`Error::SourceError`] if the connection or query fails.
     pub async fn check_is_primary(&self) -> Result<bool> {
-        use mysql_async::{prelude::Queryable as _, Pool};
+        use mysql_async::{Pool, prelude::Queryable as _};
 
         let opts = self.build_pool_opts()?;
         let pool = Pool::new(opts);

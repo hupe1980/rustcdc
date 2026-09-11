@@ -4,8 +4,8 @@ use crate::{
 };
 
 use super::{
-    lsn_hex_to_bytes, now_millis, query, SqlServerConnection, SqlServerSnapshot,
-    SqlServerSnapshotHandle,
+    SqlServerConnection, SqlServerSnapshot, SqlServerSnapshotHandle, lsn_hex_to_bytes, now_millis,
+    query,
 };
 
 pub(super) async fn start_sqlserver_snapshot_internal(
@@ -13,13 +13,13 @@ pub(super) async fn start_sqlserver_snapshot_internal(
     tables: &[&str],
     resume_from: Option<&dyn Offset>,
 ) -> Result<Box<dyn SnapshotHandle>> {
-    if let Some(offset) = resume_from {
-        if offset.source_type() != "sqlserver_snapshot" {
-            return Err(Error::CheckpointError(format!(
-                "cannot resume sqlserver snapshot from source type '{}'",
-                offset.source_type()
-            )));
-        }
+    if let Some(offset) = resume_from
+        && offset.source_type() != "sqlserver_snapshot"
+    {
+        return Err(Error::CheckpointError(format!(
+            "cannot resume sqlserver snapshot from source type '{}'",
+            offset.source_type()
+        )));
     }
 
     connection.ensure_connected().await?;

@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use rustcdc::{MetricsCollector, OTelConfig, OTelMetricsCollector, Operation};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 const OTEL_COLLECTOR_CONFIG: &str = r#"

@@ -1,13 +1,13 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
-    PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 /// Test complete snapshot-to-stream handoff cycle

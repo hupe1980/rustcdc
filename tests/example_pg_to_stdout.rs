@@ -13,9 +13,9 @@ use std::{
 };
 
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 #[tokio::test]

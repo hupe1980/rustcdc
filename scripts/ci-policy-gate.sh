@@ -18,6 +18,7 @@ need_cmd sed
 need_cmd jq
 
 CI_WORKFLOW=".github/workflows/ci.yml"
+SERVER_WORKFLOW=".github/workflows/server-ci.yml"
 
 run_markdown_link_check() {
   local failed=0
@@ -199,7 +200,7 @@ run_schema_contract_check() {
 run_deprecated_usage_check() {
   local pattern='\#\[\s*deprecated|deprecated\('
   local matches
-  matches="$(rg -n --hidden --glob '!.git' --glob '!target' "$pattern" src tests site/content scripts .github xtask Cargo.toml README.md || true)"
+  matches="$(rg -n --hidden --glob '!.git' --glob '!target' --glob '!server/fuzz/target' "$pattern" src tests server/src server/tests site/content scripts .github xtask Cargo.toml server/Cargo.toml README.md server/README.md || true)"
 
   if [[ -n "$matches" ]]; then
     echo "Deprecated marker/usage gate failed. Remove deprecated APIs/usages before merging." >&2
@@ -243,19 +244,33 @@ run_cargo_profile_safety_check() {
 
   # Walk Cargo.toml: track the current [profile.<name>] section and report any
   # debug-assertions = true that appears outside the allowed set (dev, test).
+  # POSIX awk only. The three-argument `match($0, re, arr)` that this used is a GNU
+  # extension: on BSD awk (macOS) it is a syntax error, the whole program aborts, `|| true`
+  # swallows the failure, and the check prints "passed" having examined nothing. It was
+  # silently vacuous for every developer on a Mac — including through a change that added a
+  # `[profile.bench] debug-assertions = true` the gate is meant to reject.
+  #
+  # `substr`/`index` do the same extraction and run everywhere. `\s` is also a GNU
+  # extension, so the whitespace class is spelled out.
   local bad_profiles
   bad_profiles="$(awk '
     /^\[profile\./ {
-      # Extract profile name from "[profile.foo]" or "[profile.foo.bar]"
-      match($0, /\[profile\.([^.\]]+)/, arr)
-      current_profile = arr[1]
+      # "[profile.foo]" or "[profile.foo.bar]" -> "foo"
+      rest = substr($0, index($0, "[profile.") + 9)
+      name = ""
+      for (i = 1; i <= length(rest); i++) {
+        c = substr(rest, i, 1)
+        if (c == "." || c == "]") break
+        name = name c
+      }
+      current_profile = name
     }
-    /debug-assertions\s*=\s*true/ {
+    /debug-assertions[ \t]*=[ \t]*true/ {
       if (current_profile != "dev" && current_profile != "test") {
         print "[profile." current_profile "]: " $0
       }
     }
-  ' Cargo.toml || true)"
+  ' Cargo.toml server/Cargo.toml xtask/Cargo.toml)"
 
   if [[ -n "$bad_profiles" ]]; then
     echo "FAIL: debug-assertions = true found in non-dev/non-test Cargo profile:" >&2
@@ -328,6 +343,15 @@ require_file_absent() {
   fi
 }
 
+require_file_present() {
+  local file="$1"
+
+  if [[ ! -f "$file" ]]; then
+    echo "FAIL: required workflow file is missing: ${file}" >&2
+    exit 1
+  fi
+}
+
 run_workflow_drift_check() {
   require_file_absent ".github/workflows/publish.yml"
   require_file_absent ".github/workflows/nightly-evidence.yml"
@@ -346,8 +370,8 @@ run_workflow_drift_check() {
   # Anchored on `run:` rather than on the bare command: a step's `name:` usually repeats
   # the command, so an unanchored pattern is satisfied by the label alone and would still
   # match after the command itself was changed.
-  require_match "^ +run: cargo doc --all-features --no-deps$" "$CI_WORKFLOW" "all-features doc build"
-  require_match "^ +run: cargo doc --no-default-features --no-deps$" "$CI_WORKFLOW" "no-default-features doc build"
+  require_match "^ +run: cargo doc -p rustcdc --all-features --no-deps$" "$CI_WORKFLOW" "all-features doc build"
+  require_match "^ +run: cargo doc -p rustcdc --no-default-features --no-deps$" "$CI_WORKFLOW" "no-default-features doc build"
   require_match "bash scripts/ci-pull-relational-images.sh --relational-smoke" "$CI_WORKFLOW" "relational smoke image pull mode"
   require_match "bash scripts/ci-benchmark-gate.sh" "$CI_WORKFLOW" "benchmark policy gate"
   require_match "bash scripts/run_full_integration_matrix_evidence.sh" "$CI_WORKFLOW" "full matrix evidence run"
@@ -356,6 +380,25 @@ run_workflow_drift_check() {
   require_match "  release-evidence-verify:" "$CI_WORKFLOW" "release evidence verification job"
   require_match "  publish:" "$CI_WORKFLOW" "publish job"
   require_match "needs: release-evidence-verify" "$CI_WORKFLOW" "publish dependency on release evidence verification"
+
+  # Repository-level gates must cover *both* workspace members. Scoping either to one
+  # package is how the server's 50k lines went unlinted for as long as it was a separate
+  # repository with its own, narrower, CI.
+  require_match "^ +run: cargo fmt --all --check$" "$CI_WORKFLOW" "workspace-wide formatting"
+  require_match "^ +run: cargo clippy --workspace --all-targets --all-features -- -D warnings$" \
+    "$CI_WORKFLOW" "workspace-wide clippy"
+  # The MSRV job must *derive* the toolchain from the manifest rather than restate it.
+  # Two sources of truth for one number is exactly how the previous pin drifted.
+  require_match "steps.msrv.outputs.version" "$CI_WORKFLOW" "MSRV derived from the manifest"
+
+  # The server's own matrix lives in its own workflow. Without this, deleting that file
+  # would silently remove every server build, test and integration gate while `ci.yml`
+  # stayed green.
+  require_file_present ".github/workflows/server-ci.yml"
+  require_match "^name: server-ci$" "$SERVER_WORKFLOW" "server workflow name"
+  require_match "  connector-matrix:" "$SERVER_WORKFLOW" "server connector feature matrix"
+  require_match "  integration:" "$SERVER_WORKFLOW" "server integration job"
+  require_match "  fuzz:" "$SERVER_WORKFLOW" "server fuzz smoke job"
 
   require_match "mysql_snapshot_integration" "$CI_WORKFLOW" "mysql depth suite"
   require_match "mariadb_e2e_integration" "$CI_WORKFLOW" "mariadb depth suite"
@@ -491,7 +534,7 @@ run_test_suite_coverage_check() {
 # drifted silently: eleven fields existed in code and were documented nowhere. A field
 # nobody can find is a field nobody sets, and the defaults here are load-bearing.
 run_config_docs_coverage_check() {
-  local doc="site/content/docs/config-reference.md"
+  local doc="site/content/library/config-reference.md"
   local failed=0
 
   check_struct_fields_documented() {

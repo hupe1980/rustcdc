@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlserver")]
 
 use rustcdc::checkpoint::{Checkpoint, InMemoryCheckpoint};
-use rustcdc::{source::Source, SqlServerConnection};
+use rustcdc::{SqlServerConnection, source::Source};
 
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;
@@ -179,8 +179,8 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
 }
 
 #[tokio::test]
-async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
-) -> rustcdc::Result<()> {
+async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content()
+-> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver snapshot resume integration test") {
         return Ok(());
     }

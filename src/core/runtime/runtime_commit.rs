@@ -98,22 +98,22 @@ impl CdcRuntime {
         // source confirmation failures are handled by policy.
         let mut post_commit_failures = Vec::new();
 
-        if let Some(lsn) = confirmation_lsn {
-            if let Some(stream) = self.stream.as_mut() {
-                match stream.confirm_lsn(lsn).await {
-                    Ok(()) => {
-                        // Confirmed: any earlier unconfirmed position is now superseded.
-                        self.pending_confirmation_lsn = None;
-                        self.unconfirmed_stall_polls = 0;
-                    }
-                    Err(error) => {
-                        // Retain the LSN so the next poll can retry *before* the
-                        // idempotency guard suppresses the replayed events. Without
-                        // this the runtime stalls silently and forever.
-                        self.pending_confirmation_lsn = Some(lsn);
-                        self.record_runtime_error("runtime.commit.confirm_lsn", &error);
-                        post_commit_failures.push(("stream confirm_lsn", error));
-                    }
+        if let Some(lsn) = confirmation_lsn
+            && let Some(stream) = self.stream.as_mut()
+        {
+            match stream.confirm_lsn(lsn).await {
+                Ok(()) => {
+                    // Confirmed: any earlier unconfirmed position is now superseded.
+                    self.pending_confirmation_lsn = None;
+                    self.unconfirmed_stall_polls = 0;
+                }
+                Err(error) => {
+                    // Retain the LSN so the next poll can retry *before* the
+                    // idempotency guard suppresses the replayed events. Without
+                    // this the runtime stalls silently and forever.
+                    self.pending_confirmation_lsn = Some(lsn);
+                    self.record_runtime_error("runtime.commit.confirm_lsn", &error);
+                    post_commit_failures.push(("stream confirm_lsn", error));
                 }
             }
         }

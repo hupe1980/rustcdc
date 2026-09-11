@@ -287,10 +287,29 @@ pub(crate) fn document(version: &str) -> Value {
                 "get": {
                     "tags": ["health"],
                     "summary": "Liveness — the pipeline task has not wedged.",
+                    "description": concat!(
+                        "Restart the pod on 503. The body names the condition: `error` ",
+                        "(terminal state), `source-degraded-timeout` (consecutive poll ",
+                        "errors sustained past the timeout) or `poll-loop-stalled` (the ",
+                        "runtime has reported `poll_loop_not_turning` continuously for ",
+                        "longer than the stall timeout).\n\n",
+                        "Two stall causes deliberately do **not** fail liveness. ",
+                        "`unconfirmed_source_position` is made worse by restarting — the ",
+                        "replay fails identically while the source keeps retaining log — ",
+                        "and `consumer_not_acknowledging` means the sink is not draining, ",
+                        "where a restart thrashes against an already-unhealthy ",
+                        "downstream. Both are reported by `/readyz` and by ",
+                        "`rustcdc_runtime_stall_cause` instead."
+                    ),
                     "security": [],
                     "responses": {
                         "200": { "description": "Alive." },
-                        "503": { "description": "The instance has entered a terminal state." }
+                        "503": {
+                            "description": concat!(
+                                "Terminal state, sustained source degradation, or a poll ",
+                                "loop that has not turned for longer than the stall timeout."
+                            )
+                        }
                     }
                 }
             },
@@ -300,13 +319,26 @@ pub(crate) fn document(version: &str) -> Value {
                     "summary": "Readiness — connected to the source and able to deliver.",
                     "description": concat!(
                         "Authentication depends on `admin.probe_auth_mode`: `open`, ",
-                        "`loopback` (unauthenticated from loopback only) or `token`."
+                        "`loopback` (unauthenticated from loopback only) or `token`.\n\n",
+                        "503 while any stall is in progress, with the body `stalled:<cause>` ",
+                        "naming which of `unconfirmed_source_position`, ",
+                        "`poll_loop_not_turning` or `consumer_not_acknowledging` fired. ",
+                        "Unlike liveness this excludes no cause: taking a stalled replica ",
+                        "out of rotation costs nothing, and a stalled replica reporting ",
+                        "itself ready is how a broken deploy reaches every pod.\n\n",
+                        "An **idle** pipeline is ready. A quiet source is not a fault, and ",
+                        "is the most common reason for a pipeline to be producing nothing."
                     ),
                     "responses": {
                         "200": { "description": "Ready." },
                         "401": { "$ref": "#/components/responses/Unauthorized" },
                         "429": { "$ref": "#/components/responses/RateLimited" },
-                        "503": { "description": "Not ready." }
+                        "503": {
+                            "description": concat!(
+                                "Not ready: not running, source degraded, or stalled ",
+                                "(body `stalled:<cause>`)."
+                            )
+                        }
                     }
                 }
             },

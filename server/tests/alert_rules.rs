@@ -15,8 +15,20 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// The **workspace** root, which is where `monitoring/` lives.
+///
+/// One level up from this package: the alert rules describe the deployed server but are a
+/// repository-level artefact, like the Dockerfile and the documentation site.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the server package is not the filesystem root")
+        .to_path_buf()
+}
+
+/// The server crate's own source tree, which is what emits the metric names.
+fn server_src() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
 /// Every `rustcdc_*` identifier appearing in the alert rules, with Prometheus'
@@ -92,7 +104,12 @@ fn every_alert_rule_references_a_metric_the_server_emits() {
         referenced.len()
     );
 
+    // Both crates: the server renders most of the surface, but several runtime gauges
+    // (the health verdict, the stall cause, the poll and delivery ages) are defined by the
+    // library and re-exported through the server's `/metrics` handler. Scanning only one
+    // tree would report the other's metrics as dangling.
     let mut emitted = BTreeSet::new();
+    metric_names_in_source(&server_src(), &mut emitted);
     metric_names_in_source(&root.join("src"), &mut emitted);
 
     let dangling: Vec<&String> = referenced

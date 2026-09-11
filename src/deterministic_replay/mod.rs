@@ -11,6 +11,6 @@ pub mod fixtures;
 /// The replay driver.
 pub mod replay;
 
-pub use diff::{semantic_diff, DiffLevel, EventDiff};
+pub use diff::{DiffLevel, EventDiff, semantic_diff};
 pub use fixtures::{Fixture, FixtureMetadata};
 pub use replay::{ReplayEvent, ReplayResult, ReplaySession};

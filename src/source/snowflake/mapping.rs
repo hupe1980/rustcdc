@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value};
 
 use crate::core::{
-    BeforeImage, Error, Event, Operation, Result, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SourceMetadata,
 };
 
 /// Epoch nanoseconds to the epoch milliseconds the event envelope carries.

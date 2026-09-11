@@ -91,8 +91,8 @@ use async_trait::async_trait;
 use crate::{
     checkpoint::Checkpoint,
     core::{
-        BeforeImage, Error, Event, Offset, Operation, Result, SnapshotMetadata, SourceMetadata,
-        EVENT_ENVELOPE_VERSION,
+        BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Offset, Operation, Result,
+        SnapshotMetadata, SourceMetadata,
     },
     source::{
         IncrementalSnapshotConfig, IncrementalSnapshotState, IncrementalSnapshotTableState,
@@ -557,18 +557,18 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             // position and the real one, permanently and without an error. Checked
             // here so every backend gets it, rather than in each backend's chunk read
             // where two of the three used to forget.
-            if let Some(cursor) = persisted.and_then(|entry| entry.pk_cursor.as_ref()) {
-                if cursor.len() != spec.pk_columns.len() {
-                    return Err(Error::CheckpointError(format!(
-                        "incremental snapshot: persisted keyset cursor for '{key}' has {} \
+            if let Some(cursor) = persisted.and_then(|entry| entry.pk_cursor.as_ref())
+                && cursor.len() != spec.pk_columns.len()
+            {
+                return Err(Error::CheckpointError(format!(
+                    "incremental snapshot: persisted keyset cursor for '{key}' has {} \
                          value(s) but the table's primary key has {} column(s). The primary key \
                          changed since the checkpoint was written; restart the snapshot with a \
                          fresh checkpoint directory rather than resuming from an incompatible \
                          cursor",
-                        cursor.len(),
-                        spec.pk_columns.len()
-                    )));
-                }
+                    cursor.len(),
+                    spec.pk_columns.len()
+                )));
             }
             tables.push(TableProgress {
                 pk_cursor: persisted.and_then(|entry| entry.pk_cursor.clone()),
@@ -754,10 +754,10 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             // would make this request vanish on the next restart for the same reason a stop
             // used to.
             self.stopped = false;
-            if let Some(table_idx) = self.next_incomplete_table() {
-                if matches!(self.phase, Phase::Done) {
-                    self.phase = Phase::ChunkPrepare { table_idx };
-                }
+            if let Some(table_idx) = self.next_incomplete_table()
+                && matches!(self.phase, Phase::Done)
+            {
+                self.phase = Phase::ChunkPrepare { table_idx };
             }
         }
 
@@ -794,10 +794,11 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         // `enqueue_tables` does — the driver parks in `Done` whenever it has no work, and
         // a paused driver reaches `ChunkPrepare` and stops there rather than parking, so
         // this is only needed when everything genuinely finished while paused.
-        if !paused && matches!(self.phase, Phase::Done) {
-            if let Some(table_idx) = self.next_incomplete_table() {
-                self.phase = Phase::ChunkPrepare { table_idx };
-            }
+        if !paused
+            && matches!(self.phase, Phase::Done)
+            && let Some(table_idx) = self.next_incomplete_table()
+        {
+            self.phase = Phase::ChunkPrepare { table_idx };
         }
         previous
     }
@@ -3341,13 +3342,15 @@ mod row_filter_tests {
             .request_snapshot_tables(SnapshotRequest::new(["public.users"]))
             .await
             .expect("request succeeds");
-        assert!(driver
-            .incremental_snapshot_state()
-            .and_then(|state| state
-                .tables
-                .first()
-                .and_then(|table| table.condition.clone()))
-            .is_none());
+        assert!(
+            driver
+                .incremental_snapshot_state()
+                .and_then(|state| state
+                    .tables
+                    .first()
+                    .and_then(|table| table.condition.clone()))
+                .is_none()
+        );
     }
 }
 

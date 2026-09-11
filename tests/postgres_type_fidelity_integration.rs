@@ -18,13 +18,13 @@
 //! avoids by forcing `FULL`.
 
 use rustcdc::{
-    core::Operation, source::Source, BeforeImage, PostgresConnection, PostgresSourceConfig,
-    RowWrite,
+    BeforeImage, PostgresConnection, PostgresSourceConfig, RowWrite, core::Operation,
+    source::Source,
 };
 use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
 };
 
 fn skip() -> bool {
@@ -392,8 +392,8 @@ async fn postgres_replica_identity_default_reports_key_only_before_image() -> ru
 /// `after` and absent from `before` — if the two lists were merged, a correct sink would
 /// skip writing a value that genuinely changed.
 #[tokio::test]
-async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_identity_full(
-) -> rustcdc::Result<()> {
+async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_identity_full()
+-> rustcdc::Result<()> {
     if skip() {
         return Ok(());
     }

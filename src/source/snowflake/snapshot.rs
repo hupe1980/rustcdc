@@ -18,12 +18,13 @@ use async_trait::async_trait;
 use crate::{
     checkpoint::{Checkpoint, SnowflakeOffset},
     core::{Error, Result},
-    source::{helpers::now_millis, SnapshotEnd, SnapshotHandle},
+    source::{SnapshotEnd, SnapshotHandle, helpers::now_millis},
 };
 
 use super::{
-    mapping::{events_from_snapshot_rows, SnapshotRowContext},
-    sql, SnowflakeQueryExecutor, SnowflakeSourceConfig,
+    SnowflakeQueryExecutor, SnowflakeSourceConfig,
+    mapping::{SnapshotRowContext, events_from_snapshot_rows},
+    sql,
 };
 
 /// Keyset-paginated read of every selected table, pinned to one instant.

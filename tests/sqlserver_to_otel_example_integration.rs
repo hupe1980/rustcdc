@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde_json::Value;
-use testcontainers::{core::IntoContainerPort, runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{GenericImage, ImageExt, core::IntoContainerPort, runners::AsyncRunner};
 
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;
@@ -229,10 +229,10 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
             continue;
         }
 
-        if let Some(op) = parsed.get("op").and_then(Value::as_str) {
-            if op == "read" {
-                saw_read = true;
-            }
+        if let Some(op) = parsed.get("op").and_then(Value::as_str)
+            && op == "read"
+        {
+            saw_read = true;
         }
     }
 

@@ -9,7 +9,7 @@ use crate::{
 use super::{
     parser::parse_mysql_source_offset,
     query::dedup_overlap_events_by_pk,
-    state::{compare_binlog_position, MysqlHandoff},
+    state::{MysqlHandoff, compare_binlog_position},
 };
 use crate::source::helpers::now_millis;
 
@@ -56,19 +56,19 @@ pub(super) async fn mysql_handoff_result(
 
     while !overlap_phase_complete {
         // Check wall-clock budget before each poll.
-        if let Some(deadline) = drain_deadline {
-            if Instant::now() >= deadline {
-                tracing::warn!(
-                    target: "rustcdc::source::mysql",
-                    polls,
-                    budget_ms = overlap_drain_budget_ms,
-                    overlap_events_so_far = overlap_events.len(),
-                    "mysql handoff overlap drain budget exhausted; residual overlap events may \
-                     contain duplicates — increase handoff_overlap_drain_budget_ms or verify \
-                     traffic volume at handoff time",
-                );
-                break;
-            }
+        if let Some(deadline) = drain_deadline
+            && Instant::now() >= deadline
+        {
+            tracing::warn!(
+                target: "rustcdc::source::mysql",
+                polls,
+                budget_ms = overlap_drain_budget_ms,
+                overlap_events_so_far = overlap_events.len(),
+                "mysql handoff overlap drain budget exhausted; residual overlap events may \
+                 contain duplicates — increase handoff_overlap_drain_budget_ms or verify \
+                 traffic volume at handoff time",
+            );
+            break;
         }
         polls += 1;
         let batch = stream.next_events(0).await?;

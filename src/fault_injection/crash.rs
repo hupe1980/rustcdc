@@ -58,12 +58,12 @@ impl CrashSimulationState {
 
     /// Check if we should crash at this event count.
     pub fn should_crash_at(&self, event_count: u64) -> Result<bool> {
-        if let Ok(crashes) = self.crash_points.lock() {
-            if let Ok(cycle) = self.current_cycle.lock() {
-                let cycle_idx = *cycle as usize;
-                if cycle_idx < crashes.len() && crashes[cycle_idx] == event_count {
-                    return Ok(true);
-                }
+        if let Ok(crashes) = self.crash_points.lock()
+            && let Ok(cycle) = self.current_cycle.lock()
+        {
+            let cycle_idx = *cycle as usize;
+            if cycle_idx < crashes.len() && crashes[cycle_idx] == event_count {
+                return Ok(true);
             }
         }
         Ok(false)

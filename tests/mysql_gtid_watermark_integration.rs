@@ -31,11 +31,11 @@
 
 #![cfg(feature = "mysql")]
 
-use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig, Operation};
+use rustcdc::{MysqlConnection, MysqlSourceConfig, Operation, source::Source};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 #[path = "rustls_provider_common.rs"]
@@ -75,10 +75,11 @@ fn set_contains(set: &str, gtid: &str) -> bool {
                 Some((start, end)) => (start.parse::<u64>(), end.parse::<u64>()),
                 None => (interval.parse::<u64>(), interval.parse::<u64>()),
             };
-            if let (Ok(start), Ok(end)) = (start, end) {
-                if want_seq >= start && want_seq <= end {
-                    return true;
-                }
+            if let (Ok(start), Ok(end)) = (start, end)
+                && want_seq >= start
+                && want_seq <= end
+            {
+                return true;
             }
         }
     }

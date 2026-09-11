@@ -14,13 +14,13 @@
 use std::collections::BTreeSet;
 
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, IncrementalSnapshotConfig,
-    Operation, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    IncrementalSnapshotConfig, Operation, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 const SLOT: &str = "snapshot_filter_slot";

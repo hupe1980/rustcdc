@@ -124,10 +124,12 @@ fn parallel_snapshot_stress_resume_after_chunk_5_for_10_tables() {
         TABLE_COUNT
     );
     assert_eq!(resumed.progress_percent().expect("progress_percent"), 100);
-    assert!(resumed
-        .get_pending_tables()
-        .expect("pending tables")
-        .is_empty());
+    assert!(
+        resumed
+            .get_pending_tables()
+            .expect("pending tables")
+            .is_empty()
+    );
     assert_eq!(
         resumed.total_rows_processed().expect("total rows"),
         (TABLE_COUNT * ROWS_PER_TABLE) as u64

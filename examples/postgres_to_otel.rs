@@ -20,9 +20,10 @@ use std::{
 
 #[cfg(all(feature = "postgres", feature = "metrics"))]
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, EventTracer,
-    MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector, PostgresSourceConfig,
-    RuntimeConfig, RuntimeObservability, RuntimeSourceConfig, StructuredLogger, TransportConfig,
+    CdcRuntime, EventTracer, MetricsCollector, OTelConfig, OTelEventTracer, OTelMetricsCollector,
+    PostgresSourceConfig, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
+    StructuredLogger, TransportConfig, checkpoint::FileCheckpoint,
+    schema_history::InMemorySchemaHistory,
 };
 #[cfg(all(feature = "postgres", feature = "metrics"))]
 use serde_json::json;
@@ -123,11 +124,11 @@ async fn main() -> rustcdc::Result<()> {
     };
 
     loop {
-        if let Some(deadline) = runtime_deadline {
-            if Instant::now() >= deadline {
-                emit_log("max_runtime_reached", None, None, "runtime budget reached");
-                break;
-            }
+        if let Some(deadline) = runtime_deadline
+            && Instant::now() >= deadline
+        {
+            emit_log("max_runtime_reached", None, None, "runtime budget reached");
+            break;
         }
 
         tokio::select! {

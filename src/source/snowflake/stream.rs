@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use crate::{
     checkpoint::{Checkpoint, SnowflakeOffset},
     core::{Error, Event, Offset, Result},
-    source::{table_is_allowed, StreamHandle},
+    source::{StreamHandle, table_is_allowed},
 };
 
-use super::{mapping::events_from_changes, sql, SnowflakeQueryExecutor, SnowflakeSourceConfig};
+use super::{SnowflakeQueryExecutor, SnowflakeSourceConfig, mapping::events_from_changes, sql};
 
 /// Reads consecutive `CHANGES` windows and emits canonical events.
 ///

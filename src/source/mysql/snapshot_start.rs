@@ -6,9 +6,9 @@ use crate::{
 };
 
 use super::{
+    MysqlSnapshot, TableSnapshot,
     parser::{mysql_qualified_table_name_from_reference, split_table_reference},
     state::TableSnapshotState,
-    MysqlSnapshot, TableSnapshot,
 };
 
 pub(super) async fn begin_snapshot_and_collect_table_states(

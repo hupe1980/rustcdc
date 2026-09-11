@@ -474,7 +474,7 @@ mod tests {
     use crate::core::BeforeImage;
     use serde_json::json;
 
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
 
     use super::{Transform, TransformPipeline};
 

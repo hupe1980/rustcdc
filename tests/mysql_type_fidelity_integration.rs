@@ -20,14 +20,14 @@
 //! these.
 
 use rustcdc::{
-    core::Operation, source::Source, MysqlConnection, MysqlSourceConfig, TransportConfig,
+    MysqlConnection, MysqlSourceConfig, TransportConfig, core::Operation, source::Source,
 };
 use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[path = "rustls_provider_common.rs"]
 mod rustls_provider_common;

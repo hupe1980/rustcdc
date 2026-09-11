@@ -503,7 +503,7 @@ mod tests {
 
 #[cfg(test)]
 mod gtid_bracket_tests {
-    use super::{event_gtid, BinlogPos, MysqlSnapshotBackend};
+    use super::{BinlogPos, MysqlSnapshotBackend, event_gtid};
     use crate::core::{Event, Operation, SourceMetadata, TransactionMetadata};
     use crate::source::{BracketPosition, IncrementalSnapshotBackend};
 

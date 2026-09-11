@@ -412,8 +412,8 @@ impl ProtoEvent {
 mod tests {
     use super::*;
     use crate::core::{
-        Event, Operation, SnapshotMetadata, SourceMetadata, TransactionMetadata,
-        EVENT_ENVELOPE_VERSION,
+        EVENT_ENVELOPE_VERSION, Event, Operation, SnapshotMetadata, SourceMetadata,
+        TransactionMetadata,
     };
 
     fn full_event() -> Event {

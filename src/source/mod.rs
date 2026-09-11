@@ -17,11 +17,11 @@ pub mod snapshot_validator;
 pub mod snowflake;
 
 pub use incremental_snapshot::{
-    state_from_offset as incremental_snapshot_state_from_offset, IncrementalSnapshotState,
-    IncrementalSnapshotTableState,
+    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable,
 };
 pub use incremental_snapshot::{
-    BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable,
+    IncrementalSnapshotState, IncrementalSnapshotTableState,
+    state_from_offset as incremental_snapshot_state_from_offset,
 };
 pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TableProgress};
 pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
@@ -791,15 +791,15 @@ pub use mariadb::{
     MariaDbSourceConfig, MariaDbStreamHandle,
 };
 #[cfg(feature = "mysql")]
-pub use mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
-#[cfg(feature = "mysql")]
 pub use mysql::MysqlConnection;
+#[cfg(feature = "mysql")]
+pub use mysql::incremental_snapshot::MysqlIncrementalSnapshotHandle;
 #[cfg(feature = "mysql")]
 pub use mysql::{MysqlSourceConfig, ServerFlavor};
 #[cfg(feature = "postgres")]
-pub use postgres::incremental_snapshot::IncrementalSnapshotHandle;
-#[cfg(feature = "postgres")]
 pub use postgres::PostgresConnection;
+#[cfg(feature = "postgres")]
+pub use postgres::incremental_snapshot::IncrementalSnapshotHandle;
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresSourceConfig, WalTransport};
 #[cfg(feature = "sqlserver")]
@@ -813,12 +813,12 @@ mod tests {
 
     use crate::{
         checkpoint::{Checkpoint, InMemoryCheckpoint},
-        core::{Event, Offset, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION},
+        core::{EVENT_ENVELOPE_VERSION, Event, Offset, Operation, SourceMetadata},
     };
 
     use super::{
-        table_is_allowed, ConnectorCapabilities, HandoffResult, SnapshotEnd, SnapshotHandle,
-        Source, StreamHandle,
+        ConnectorCapabilities, HandoffResult, SnapshotEnd, SnapshotHandle, Source, StreamHandle,
+        table_is_allowed,
     };
 
     fn sample_event() -> Event {

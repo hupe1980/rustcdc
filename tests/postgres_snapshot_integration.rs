@@ -1,16 +1,16 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
+    PostgresConnection, PostgresSourceConfig,
     checkpoint::{Checkpoint, FileCheckpoint},
     source::{IncrementalSnapshotConfig, Source},
-    PostgresConnection, PostgresSourceConfig,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 /// Test large-table snapshot chunking (100K rows → 10K chunks)
 /// Validates: chunking behavior, checkpoint persistence, and resumable snapshot handling
@@ -157,16 +157,16 @@ async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
             );
 
             // Extract primary key for duplicate detection
-            if let Some(after) = &event.after {
-                if let Some(id) = after.get("id") {
-                    let id_str = id.to_string();
-                    let already_seen = !pks.insert(id_str.clone());
-                    assert!(
-                        !already_seen,
-                        "duplicate primary key in snapshot: {}",
-                        id_str
-                    );
-                }
+            if let Some(after) = &event.after
+                && let Some(id) = after.get("id")
+            {
+                let id_str = id.to_string();
+                let already_seen = !pks.insert(id_str.clone());
+                assert!(
+                    !already_seen,
+                    "duplicate primary key in snapshot: {}",
+                    id_str
+                );
             }
         }
 
@@ -1110,11 +1110,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
 
     println!(
         "✓ Table-boundary resume completed without duplicates: phase1(a={}, b={}) phase2(a={}, b={}) total_unique={}",
-        phase1_a,
-        phase1_b,
-        resumed_a,
-        resumed_b,
-        total_unique
+        phase1_a, phase1_b, resumed_a, resumed_b, total_unique
     );
 
     resumed_connection.close().await;
@@ -1454,8 +1450,8 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::R
 /// that the resumed run re-reads far fewer than the whole table. A run that re-read
 /// everything would still deliver every row, and would still pass a completeness check.
 #[tokio::test]
-async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_restart(
-) -> rustcdc::Result<()> {
+async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_restart()
+-> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres incremental resume test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());

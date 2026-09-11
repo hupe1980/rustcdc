@@ -3,22 +3,22 @@
 use std::time::Instant;
 
 use rustcdc::{
+    CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
     schema_history::InMemorySchemaHistory,
-    CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 #[path = "latency_evidence_common.rs"]
 mod latency_evidence_common;
 
 use latency_evidence_common::{
-    assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder, ProgressDeadline, WriterStatus,
+    LatencyRecorder, ProgressDeadline, WriterStatus, assert_sample_is_meaningful, now_micros,
+    stamped_payload, write_latency_artifacts,
 };
 
 #[tokio::test]

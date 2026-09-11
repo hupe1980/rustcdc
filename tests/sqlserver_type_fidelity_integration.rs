@@ -16,7 +16,7 @@
 //! Every assertion below is about an **exact decoded value**, and the NULL-vs-value
 //! distinction is asserted explicitly rather than inferred.
 
-use rustcdc::{source::Source, Operation, SqlServerConnection};
+use rustcdc::{Operation, SqlServerConnection, source::Source};
 
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;

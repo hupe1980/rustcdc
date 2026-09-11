@@ -10,18 +10,18 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime, Operation,
-    PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    CdcRuntime, Operation, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 #[tokio::test]
-async fn runtime_accepts_update_without_before_image_under_replica_identity_default(
-) -> rustcdc::Result<()> {
+async fn runtime_accepts_update_without_before_image_under_replica_identity_default()
+-> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres replica-identity runtime test (set CDC_RS_RUN_DOCKER_TESTS=1)"

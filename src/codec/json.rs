@@ -85,7 +85,7 @@ pub type JsonCodec = EncoderCodec<JsonEncoder>;
 mod tests {
     use super::*;
     use crate::core::BeforeImage;
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
 
     fn event() -> Event {
         Event {

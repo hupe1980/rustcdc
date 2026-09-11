@@ -4,9 +4,9 @@ use crate::{
 };
 
 use super::{
-    compare_lsn, lsn_bytes_to_hex, lsn_hex_to_bytes, query, sqlserver_cursor_from_offset_bytes,
-    sqlserver_resume_lsn_from_offset_bytes, SqlServerCdcCursor, SqlServerConnection,
-    SqlServerStream, SqlServerStreamHandle,
+    SqlServerCdcCursor, SqlServerConnection, SqlServerStream, SqlServerStreamHandle, compare_lsn,
+    lsn_bytes_to_hex, lsn_hex_to_bytes, query, sqlserver_cursor_from_offset_bytes,
+    sqlserver_resume_lsn_from_offset_bytes,
 };
 
 pub(super) async fn start_sqlserver_stream(

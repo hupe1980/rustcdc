@@ -1,202 +1,276 @@
 {% extends "base.html" %}
 
-{% block content %}
+{% block head %}
+  {% set description = section.description %}
+  {% set og_type = "website" %}
+  {% include "partials/head.html" %}
+  {# Structured data is emitted per template rather than from the shared head partial:
+     each page type needs a different schema.org shape, and Tera has no block-scoped
+     `set` to hand one down. #}
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareSourceCode",
+        "name": "rustcdc-server",
+        "description": {{ config.description | json_encode | safe }},
+        "url": {{ config.base_url | json_encode | safe }},
+        "codeRepository": {{ config.extra.repo | json_encode | safe }},
+        "programmingLanguage": "Rust",
+        "runtimePlatform": "Rust {{ config.extra.rust_version }}+",
+        "license": "https://spdx.org/licenses/Apache-2.0.html",
+        "author": { "@type": "Person", "name": {{ config.extra.author | json_encode | safe }} },
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Linux, macOS",
+        "softwareVersion": {{ config.extra.version | json_encode | safe }}
+      },
+      {
+        "@type": "WebSite",
+        "name": {{ config.title | json_encode | safe }},
+        "url": {{ config.base_url | json_encode | safe }},
+        "description": {{ config.description | json_encode | safe }}
+      },
+      {
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "Which databases does rustcdc capture from?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "PostgreSQL via logical replication, MySQL and MariaDB via the binary log with GTID positioning, and SQL Server via CDC change tables."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Where can rustcdc deliver change events?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Apache Kafka, Apache Iceberg, any HTTP endpoint, newline-delimited JSON files, or stdout. Events can be encoded as JSON, CloudEvents, Avro or Protobuf, using Confluent, Apicurio or AWS Glue schema registries."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Does rustcdc support exactly-once delivery?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. With effectively_once the batch\u2019s records and its checkpoint are written in a single Kafka transaction, so a crash discards both or keeps both and there is no window in which one survives without the other. It requires a transactional Kafka sink and a Kafka checkpoint topic on the same cluster; any other combination is rejected at startup rather than silently degraded."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Does rustcdc require Kafka Connect or a JVM?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "No. It is a single binary with no JVM and no Kafka Connect runtime, and it also ships as a distroless multi-architecture container image."
+            }
+          }
+        ]
+      }
+    ]
+  }
+  </script>
+{% endblock head %}
 
+{% block body_class %}page-home{% endblock body_class %}
+
+{% block content %}
 <section class="hero">
   <div class="wrap">
-    <p class="eyebrow">Change data capture · Rust library</p>
-    <h1>CDC you can embed, not deploy.</h1>
+    <p class="eyebrow">Open source · Apache-2.0 / MIT · Rust {{ config.extra.rust_version }}+</p>
+    <h1>Change data capture<br><span class="grad">built in Rust</span></h1>
     <p class="lede">
-      PostgreSQL, MySQL, MariaDB and SQL Server in one crate. No JVM, no sidecar,
-      no control plane — <code>cargo add rustcdc</code> and your process is the pipeline.
+      Stream every <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code> from PostgreSQL,
+      MySQL, MariaDB and SQL Server into Kafka, Iceberg, HTTP or files — with delivery
+      contracts that say exactly what they guarantee, a sandboxed WASM transform pipeline,
+      and a signed audit trail.
     </p>
 
     <div class="cta-row">
-      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
-      <a class="btn btn-secondary" href="{{ get_url(path='@/docs/_index.md') }}">Read the docs</a>
-      <a class="btn btn-secondary" href="{{ config.extra.repo_url }}" rel="noopener">GitHub</a>
+      <a class="btn btn-primary" href="{{ get_url(path='/docs/getting-started/') }}">
+        Get started
+      </a>
+      <a class="btn btn-ghost" href="{{ config.extra.repo }}" rel="noopener">
+        View on GitHub
+      </a>
     </div>
 
-    <p class="install"><span aria-hidden="true">$ </span>cargo add rustcdc</p>
+    <div class="hero-run">
+      <code>docker run ghcr.io/hupe1980/rustcdc-server:latest run --config-file cdc.toml</code>
+      <button class="copy-btn" type="button" data-copy="docker run ghcr.io/hupe1980/rustcdc-server:latest run --config-file cdc.toml" aria-label="Copy command">Copy</button>
+    </div>
+
+    <ul class="hero-badges">
+      <li>No JVM</li>
+      <li>No Kafka Connect</li>
+      <li>Single binary</li>
+      <li>Distroless image</li>
+    </ul>
   </div>
 </section>
 
-<section class="section">
+<section class="flow" aria-labelledby="flow-h">
   <div class="wrap">
-    <h2 class="section-title">The gap this fills</h2>
-    <p class="section-lede">
-      Embedding multi-database CDC today means embedding a JVM. Debezium's engine is a Java
-      library; Materialize and RisingWave are platforms, not crates. The Rust options are
-      single-database primitives, and the most complete of them cannot be published to
-      crates.io at all because it depends on a fork of a fork of <code>rust-postgres</code>.
-    </p>
-    <p class="section-lede">
-      rustcdc writes its own pgoutput parser against stock <code>tokio-postgres</code>. That
-      is why it ships as an ordinary crate.
-    </p>
-
-    <div class="grid">
-      <div class="card">
-        <h3>Four databases, one API</h3>
-        <p>PostgreSQL logical replication, MySQL and MariaDB binlog, SQL Server CDC —
-        behind one <code>Source</code> trait, one event envelope, one checkpoint model.</p>
+    <h2 id="flow-h" class="section-title">One binary, end to end</h2>
+    <div class="flow-grid">
+      <div class="flow-col">
+        <h3>Sources</h3>
+        <ul>
+          <li>PostgreSQL <span>logical replication</span></li>
+          <li>MySQL <span>binlog + GTID</span></li>
+          <li>MariaDB <span>binlog + GTID</span></li>
+          <li>SQL Server <span>CDC tables</span></li>
+        </ul>
       </div>
-      <div class="card">
-        <h3>Bring your own source</h3>
-        <p><code>register_source</code> drives the runtime from any <code>impl Source</code>.
-        The commit barrier, checkpointing, transforms and health verdicts all still apply.</p>
+      <div class="flow-arrow" aria-hidden="true">→</div>
+      <div class="flow-col flow-col-mid">
+        <h3>Pipeline</h3>
+        <ul>
+          <li>Masking <span>redact · HMAC · AES-GCM</span></li>
+          <li>WASM transforms <span>any language</span></li>
+          <li>Routing <span>table → sink</span></li>
+          <li>Outbox <span>transactional</span></li>
+        </ul>
       </div>
-      <div class="card">
-        <h3>No JVM, no sidecar</h3>
-        <p>It is a crate. It links into your binary, uses your Tokio runtime, and has no
-        process to supervise or control plane to operate.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="section">
-  <div class="wrap">
-    <h2 class="section-title">Correctness you can't opt out of by accident</h2>
-    <p class="section-lede">
-      The failure mode that matters in CDC is not a crash — it is a wrong answer delivered
-      as an authentic one. Where the type system can make that unrepresentable, it does.
-    </p>
-
-    <div class="grid">
-      <div class="card">
-        <h3>Partial rows can't corrupt</h3>
-        <p>Not every event carries a complete row. <code>Event::row_write()</code> returns a
-        <code>Merge</code> holding <em>only</em> the columns the source supplied — so there is
-        no placeholder left to write <code>NULL</code> with by mistake.</p>
-      </div>
-      <div class="card">
-        <h3>Checkpoints need an ack token</h3>
-        <p><code>AckToken</code> is <code>#[must_use]</code>. The durable position cannot
-        advance past what the consumer acknowledged, because the API gives you no way to say
-        it did.</p>
-      </div>
-      <div class="card">
-        <h3>Silent misconfiguration fails loud</h3>
-        <p>MySQL's <code>binlog_row_metadata</code> defaults to a value under which column
-        names vanish and updates arrive partial but complete-looking. <code>connect()</code>
-        rejects it with the remedy.</p>
-      </div>
-      <div class="card">
-        <h3>Honest guarantees</h3>
-        <p>At-least-once, stated plainly, with duplicates documented. No exactly-once claim
-        appears anywhere — which is more than the reference implementation's embedded mode
-        can say.</p>
-      </div>
-      <div class="card">
-        <h3>Transaction-atomic delivery</h3>
-        <p>Opt into <code>PreserveTransactions</code> and no delivered batch ever ends
-        mid-transaction — so a sink never commits a state that never existed upstream.</p>
-      </div>
-      <div class="card">
-        <h3>Idempotency that won't drop rows</h3>
-        <p>The dedup guard suppresses only events it can <em>identify</em>. Two identical
-        rows from a keyless table pass through rather than risk discarding a distinct one.</p>
+      <div class="flow-arrow" aria-hidden="true">→</div>
+      <div class="flow-col">
+        <h3>Sinks</h3>
+        <ul>
+          <li>Apache Kafka <span>idempotent · transactional</span></li>
+          <li>Apache Iceberg <span>REST catalog</span></li>
+          <li>HTTP <span>batched + retry</span></li>
+          <li>Files <span>rotating JSONL</span></li>
+        </ul>
       </div>
     </div>
   </div>
 </section>
 
-<section class="section">
+<section class="features" aria-labelledby="features-h">
   <div class="wrap">
-    <h2 class="section-title">Measured, not asserted</h2>
-    <p class="section-lede">
-      Capture latency is the wall-clock time from a row committing in the source to the event
-      reaching the consumer — measured under concurrent writes, against a single clock, so
-      clock skew cannot flatter it. These are numbers from the gated CI harness.
+    <h2 id="features-h" class="section-title">Built for people who get paged</h2>
+    <p class="section-sub">
+      Every guarantee below is either enforced by a test or documented as a limitation.
+      Nothing is claimed twice.
     </p>
 
-    <div class="grid">
-      <div class="card">
-        <h3>PostgreSQL 16</h3>
-        <p><strong>p50 12 ms · p95 18 ms · p99 19 ms</strong><br>
-        ~586 events/sec sustained on a 2,000-row workload.</p>
-      </div>
-      <div class="card">
-        <h3>MySQL 8</h3>
-        <p><strong>p50 55 ms · p95 99 ms · p99 117 ms</strong><br>
-        ~375 events/sec sustained on the same workload.</p>
-      </div>
-      <div class="card">
-        <h3>Why it's trustworthy</h3>
-        <p>The previous harness timed an in-memory buffer drain and could not fail. Fixing it
-        immediately exposed a connector defect worth <strong>15.8×</strong> on p95 — which is
-        the argument for measuring the right thing.</p>
-      </div>
-    </div>
+    <div class="feature-grid">
+      <article class="feature">
+        <h3>Exactly-once, end to end</h3>
+        <p>
+          <code>effectively_once</code> writes the checkpoint <em>inside</em> the sink's Kafka
+          transaction, so a batch's data and the position describing it commit together. A crash
+          discards both or keeps both — there is no window where one survives without the other.
+        </p>
+        <a href="{{ get_url(path='/docs/concepts/') }}#3-delivery-contracts">Delivery contracts →</a>
+      </article>
 
-    <p class="section-lede" style="margin-top: 2rem">
-      Throughput is not a defensible marketing axis in this field: published third-party
-      figures for Debezium alone span a 30× range.
-      <a href="{{ get_url(path='@/docs/library-parity-matrix.md') }}">See the comparison</a>
-      for what is and is not verifiable.
-    </p>
+      <article class="feature">
+        <h3>Failures classified on two axes</h3>
+        <p>
+          A record the broker will reject forever is quarantined. A revoked ACL halts the
+          pipeline instead of draining your change stream into the dead-letter queue one event
+          at a time. Conflating those is how a DLQ becomes the data loss it exists to prevent.
+        </p>
+        <a href="{{ get_url(path='/docs/configuration/') }}#5b-dead-letter-queue-dlq">Dead-letter queue →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Non-blocking backfill</h3>
+        <p>
+          DBLog watermark incremental snapshots interleave with the live stream and resume
+          mid-chunk after a restart. No held replication slot, no re-read from row zero.
+        </p>
+        <a href="{{ get_url(path='/docs/configuration/') }}#6b-snapshots">Snapshots →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Sandboxed WASM transforms</h3>
+        <p>
+          Run your own logic in-process with epoch interruption, fuel metering and no host
+          imports. Write it in Rust, AssemblyScript, or anything that targets WASM. A masking
+          rule that never matches is a metric, not a silent no-op.
+        </p>
+        <a href="{{ get_url(path='/docs/transforms/') }}">Writing transforms →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Partial-image safety</h3>
+        <p>
+          PostgreSQL unchanged-TOAST holes are tracked per image and survive transforms, sinks
+          and the Iceberg schema. <em>Absent</em> is never quietly turned into <code>NULL</code>.
+        </p>
+        <a href="{{ get_url(path='/docs/concepts/') }}#partial-row-images-unchanged-toast">Partial images →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Observability that resolves</h3>
+        <p>
+          Prometheus and OTLP, latency histograms in seconds at microsecond resolution, and a
+          one-hot health verdict that tells a quiet database apart from a dead socket. Shipped
+          alert rules are tested against the metrics that actually exist.
+        </p>
+        <a href="{{ get_url(path='/docs/operations/') }}">Operations guide →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Security by default</h3>
+        <p>
+          TLS is mandatory on any non-loopback bind. Kafka SASL including OAUTHBEARER and AWS
+          MSK IAM, mTLS with hot certificate reload, Ed25519-signed audit trail, and source
+          passwords that the config loader refuses to accept as literals.
+        </p>
+        <a href="{{ get_url(path='/docs/configuration/') }}#7-admin-api-admin">Security →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Pluggable state</h3>
+        <p>
+          Checkpoint to the local filesystem, a Kafka topic, Redis or PostgreSQL. Network-shared
+          backends are fenced — a Kafka topic by producer epoch, Redis and Postgres by a
+          heartbeat lease — so two writers cannot move the durable position backwards.
+        </p>
+        <a href="{{ get_url(path='/docs/configuration/') }}#4-state-backends-state">State backends →</a>
+      </article>
+    </div>
   </div>
 </section>
 
-<section class="section">
+<section class="config-demo" aria-labelledby="config-h">
+  <div class="wrap config-demo-inner">
+    <div>
+      <h2 id="config-h" class="section-title">A whole pipeline is one file</h2>
+      <p class="section-sub">
+        TOML with a declared <code>api_version</code>. Unknown keys are rejected at load rather
+        than ignored, so a typo is a startup error instead of a setting that silently never
+        applied.
+      </p>
+      <ul class="tick-list">
+        <li>Validate before you deploy: <code>rustcdc validate-config</code></li>
+        <li>See real events without writing any: <code>rustcdc dry-run</code></li>
+        <li>Secrets by reference, never literals in the file</li>
+      </ul>
+      <a class="btn btn-ghost" href="{{ get_url(path='/docs/configuration/') }}">Configuration reference</a>
+    </div>
+
+    <div class="code-card">
+      <div class="code-card-bar"><span></span><span></span><span></span><em>cdc.toml</em></div>
+      {# The sample lives in `content/_index.md` so Zola's syntax highlighter renders it,
+         rather than being hand-marked-up here and drifting from the real schema. #}
+      {{ section.content | safe }}
+    </div>
+  </div>
+</section>
+
+<section class="cta-final">
   <div class="wrap">
-    <h2 class="section-title">Built to be verified</h2>
-    <div class="grid">
-      <div class="card">
-        <h3>Deterministic replay</h3>
-        <p>Replay a captured stream inside <em>your</em> test suite. Turns CDC from an
-        untestable dependency into a testable one — no competitor meaningfully offers this.</p>
-      </div>
-      <div class="card">
-        <h3>Fault injection</h3>
-        <p>Drop events, corrupt payloads, fail checkpoint writes, stall the source. If your
-        pipeline does not notice, that is a finding.</p>
-      </div>
-      <div class="card">
-        <h3>Real-database CI</h3>
-        <p>Integration suites run against PostgreSQL 16, MySQL 8.0/8.1, MariaDB 10.5/10.6,
-        SQL Server 2022 and Apicurio Registry 3 containers, plus process-kill crash tests.</p>
-      </div>
-      <div class="card">
-        <h3>Docs that compile</h3>
-        <p>Every Rust block on this site is compiled and run in CI. When that was switched on
-        it failed 36 of 96 samples; all were fixed. The examples here work.</p>
-      </div>
+    <h2>Stream your first change in ten minutes</h2>
+    <p>A self-contained Docker Compose demo runs a Postgres pipeline with no configuration at all.</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="{{ get_url(path='/docs/getting-started/') }}">Getting started</a>
+      <a class="btn btn-ghost" href="{{ get_url(path='/docs/concepts/') }}">How it works</a>
     </div>
   </div>
 </section>
-
-<section class="section">
-  <div class="wrap">
-    <h2 class="section-title">Start here</h2>
-    <div class="grid">
-      <a class="card card-link" href="{{ get_url(path='@/docs/getting-started.md') }}">
-        <h3>Getting started →</h3>
-        <p>Your first pipeline, from an empty project to committed events.</p>
-      </a>
-      <a class="card card-link" href="{{ get_url(path='@/docs/api.md') }}">
-        <h3>API guide →</h3>
-        <p>The embedding model: runtime lifecycle, acknowledgement, transforms, codecs.</p>
-      </a>
-      <a class="card card-link" href="{{ get_url(path='@/docs/architecture.md') }}">
-        <h3>Architecture →</h3>
-        <p>How capture, the commit barrier and checkpointing fit together, and why.</p>
-      </a>
-      <a class="card card-link" href="{{ get_url(path='@/docs/config-reference.md') }}">
-        <h3>Configuration →</h3>
-        <p>Every option, with the failure it prevents rather than just its type.</p>
-      </a>
-      <a class="card card-link" href="{{ get_url(path='@/docs/runbook.md') }}">
-        <h3>Operations runbook →</h3>
-        <p>Alert thresholds, recovery procedures, and what each metric actually means.</p>
-      </a>
-      <a class="card card-link" href="{{ get_url(path='@/docs/security.md') }}">
-        <h3>Security →</h3>
-        <p>TLS posture, secret handling, the WASM sandbox, and the advisories we carry.</p>
-      </a>
-    </div>
-  </div>
-</section>
-
-{% endblock %}
+{% endblock content %}

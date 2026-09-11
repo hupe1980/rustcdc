@@ -1,11 +1,16 @@
 mod auth;
 mod notify;
 mod openapi;
+mod probes;
 mod prometheus;
 mod rate_limit;
 mod signal_ledger;
 mod signals;
 mod tls;
+
+// The probe handlers live in `probes` but are referenced unqualified by `router()`
+// and by the test modules, which is how they were written when they sat in this file.
+use probes::{healthz, livez, readyz};
 
 use auth::{
     AdminScope, AuthSource, AuthState, bearer_token, constant_time_eq_str, load_auth_state,
@@ -29,6 +34,7 @@ use krafka::producer::{Acks, Producer, ProducerRecord};
 use notify::*;
 use prometheus::*;
 use rate_limit::{AbuseLimitScope, AdminAbuseGuard, RATE_LIMIT_STALE_CLIENT_TTL};
+use rustcdc::core::StallCause;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signals::*;
@@ -108,6 +114,20 @@ pub struct AdminStateData {
     /// Used by `/livez` to detect pipelines stuck in indefinite backoff.
     #[serde(skip)]
     pub degraded_since: Option<std::time::Instant>,
+    /// The runtime's latest health verdict, as its stable label.
+    ///
+    /// Kept structured rather than only rendered into `runtime_metrics`: the probes below
+    /// have to *act* on this, and a Prometheus text blob is not something to parse in a
+    /// liveness handler.
+    pub health_verdict: Option<String>,
+    /// Which signal produced a `stalled` verdict, or `None` for any other verdict.
+    pub health_stall_cause: Option<String>,
+    /// Instant at which the runtime first reported the *current* stall.
+    ///
+    /// Reset whenever the verdict or its cause changes, so the elapsed time below always
+    /// describes one continuous condition rather than an accumulation of unrelated ones.
+    #[serde(skip)]
+    pub stalled_since: Option<std::time::Instant>,
     pub shutdown_requests_os_signal_total: u64,
     pub shutdown_completions_stopped_total: u64,
     pub shutdown_completions_error_total: u64,
@@ -305,6 +325,34 @@ enum SignalIngressSource {
     File,
     Kafka,
     Source,
+}
+
+impl AdminStateData {
+    /// Latch the runtime's verdict, tracking how long the *current* stall has lasted.
+    ///
+    /// `stalled_since` restarts whenever the verdict or its cause changes, because the
+    /// probes below ask "has this one condition persisted?" — not "how long has something
+    /// been wrong?". A pipeline flapping between two different stalls is a different
+    /// situation from one wedged in a single state, and only the second is a restart
+    /// candidate.
+    fn record_health_verdict(&mut self, health: &rustcdc::core::HealthVerdict) {
+        let verdict = health.as_str();
+        let cause = health.stall_cause().map(|cause| cause.as_str());
+
+        let unchanged = self.health_verdict.as_deref() == Some(verdict)
+            && self.health_stall_cause.as_deref() == cause;
+        if !unchanged {
+            self.stalled_since = cause.map(|_| std::time::Instant::now());
+        }
+
+        self.health_verdict = Some(verdict.to_owned());
+        self.health_stall_cause = cause.map(str::to_owned);
+    }
+
+    /// How long the current stall has lasted, or `None` when not stalled.
+    fn stalled_for(&self) -> Option<Duration> {
+        self.stalled_since.map(|since| since.elapsed())
+    }
 }
 
 impl SignalIngressSource {
@@ -667,6 +715,9 @@ impl AdminState {
                 restart_recovery_seconds: None,
                 source_consecutive_errors: 0,
                 degraded_since: None,
+                health_verdict: None,
+                health_stall_cause: None,
+                stalled_since: None,
                 shutdown_requests_os_signal_total: 0,
                 shutdown_completions_stopped_total: 0,
                 shutdown_completions_error_total: 0,
@@ -2194,6 +2245,9 @@ impl AdminState {
         // avoids allocation when the /metrics endpoint is not polled every batch.
         // The generation counter signals that `runtime_metrics` is stale.
         d.runtime_metrics_generation = d.batches_processed;
+        // Latch the verdict *before* the snapshot is consumed by the renderer, so
+        // `/livez` and `/readyz` can act on it. See `AdminStateData::health_verdict`.
+        d.record_health_verdict(&runtime_metrics.runtime_admin.health);
         d.runtime_metrics = runtime_metrics.render_prometheus();
         d.checkpoint_age_seconds = checkpoint_age_seconds;
         d.last_terminal_reason_code = None;
@@ -3041,6 +3095,25 @@ fn slo_reasons(data: &AdminStateData) -> Vec<String> {
     reasons
 }
 
+/// The runtime's health verdict, for the top level of `/status`.
+///
+/// Deliberately not inside the `slo` object: a verdict is not a service-level indicator,
+/// it is the headline answer, and §1 of the runbook opens by telling an operator to curl
+/// this endpoint. Until it was added, the verdict was reachable only by scraping
+/// `/metrics` and grepping a one-hot gauge — for the single field that says whether the
+/// pipeline is working.
+///
+/// `stall_cause` is the stable discriminant rather than the prose: it is what routes a
+/// page and what `/readyz` reports. `stalled_for_seconds` is how long *this* condition
+/// has held, which is what decides whether `/livez` is about to restart the pod.
+pub(crate) fn health_json(data: &AdminStateData) -> serde_json::Value {
+    serde_json::json!({
+        "verdict": data.health_verdict,
+        "stall_cause": data.health_stall_cause,
+        "stalled_for_seconds": data.stalled_for().map(|elapsed| elapsed.as_secs_f64()),
+    })
+}
+
 pub(crate) fn slo_json(data: &AdminStateData) -> serde_json::Value {
     let cold_start_to_ready_ms = elapsed_ms(data.started_at, data.first_ready_at);
     let cold_start_to_checkpoint_advance_ms =
@@ -3150,100 +3223,6 @@ pub(crate) fn runtime_metrics_prometheus(data: &AdminStateData) -> String {
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn healthz(State(_admin): State<AdminState>, _headers: HeaderMap) -> Response {
-    (StatusCode::OK, "ok").into_response()
-}
-
-/// Kubernetes `livenessProbe` endpoint.
-///
-/// Returns `200 ok` when the process should continue running, `503` when it
-/// should be restarted.  Unlike `/readyz` (which signals traffic readiness),
-/// `/livez` signals process health:
-///
-/// - Returns `503` when `InstanceState::Error` (unrecoverable failure).
-/// - Returns `503` when `source_consecutive_errors` has been at-or-above the
-///   readiness threshold for longer than `LIVEZ_DEGRADED_TIMEOUT`.  This
-///   catches pipelines stuck in indefinite circuit-breaker backoff that will
-///   never self-heal.
-///
-/// Kubernetes recommended configuration:
-/// ```yaml
-/// livenessProbe:
-///   httpGet:
-///     path: /livez
-///     port: <admin_port>
-///   failureThreshold: 3
-///   periodSeconds: 10
-/// ```
-const LIVEZ_DEGRADED_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
-
-async fn livez(State(admin): State<AdminState>) -> Response {
-    let (state, source_consecutive_errors, degraded_since) = {
-        let d = admin.data.read().await;
-        (
-            d.state.clone(),
-            d.source_consecutive_errors,
-            d.degraded_since,
-        )
-    };
-
-    if matches!(state, InstanceState::Error) {
-        return (StatusCode::SERVICE_UNAVAILABLE, "error").into_response();
-    }
-
-    if source_consecutive_errors >= READYZ_SOURCE_CONSECUTIVE_ERROR_THRESHOLD
-        && let Some(since) = degraded_since
-        && since.elapsed() > LIVEZ_DEGRADED_TIMEOUT
-    {
-        return (StatusCode::SERVICE_UNAVAILABLE, "source-degraded-timeout").into_response();
-    }
-
-    (StatusCode::OK, "alive").into_response()
-}
-
-async fn readyz(
-    State(admin): State<AdminState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    let (allowed, decision_latency) =
-        admin.allow_abuse_scope(AbuseLimitScope::Readyz, &headers, Some(peer_addr));
-    admin
-        .record_rate_limiter_decision(AbuseLimitScope::Readyz, decision_latency)
-        .await;
-    if !allowed {
-        admin
-            .record_rate_limited_request(AbuseLimitScope::Readyz)
-            .await;
-        return rate_limited_response("readyz");
-    }
-
-    if !admin.authorize_readyz(&headers) {
-        return unauthorized_response();
-    }
-
-    let start = std::time::Instant::now();
-    let (state, source_consecutive_errors) = {
-        let d = admin.data.read().await;
-        (d.state.clone(), d.source_consecutive_errors)
-    };
-    // Degraded: still Running but source poll errors have accumulated beyond the
-    // readiness threshold.  Report 503 so Kubernetes removes us from the
-    // load balancer before the circuit-breaker escalates to a terminal failure.
-    let sink_degraded = matches!(state, InstanceState::Running)
-        && source_consecutive_errors >= READYZ_SOURCE_CONSECUTIVE_ERROR_THRESHOLD;
-    let ready = matches!(state, InstanceState::Running | InstanceState::Stopping) && !sink_degraded;
-    admin.record_readiness_probe(ready, start.elapsed()).await;
-    match state {
-        InstanceState::Running if sink_degraded => {
-            (StatusCode::SERVICE_UNAVAILABLE, "source-degraded").into_response()
-        }
-        InstanceState::Running => (StatusCode::OK, "ready").into_response(),
-        InstanceState::Stopping => (StatusCode::OK, "stopping").into_response(),
-        _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response(),
-    }
-}
-
 /// The running configuration, with every credential redacted.
 ///
 /// `AdminState` has built and redacted this snapshot on every startup since the beginning
@@ -3328,6 +3307,10 @@ async fn status_authed(
     let snapshot = serde_json::json!({
         "api_version": "v1",
         "state": data.state,
+        // `state` says the runtime is running; `health` says whether it is working. The
+        // pair is the point — `state = "running"` covers a quiet database and a dead
+        // socket equally.
+        "health": health_json(&data),
         "started_at": data.started_at,
         "first_ready_at": data.first_ready_at,
         "first_checkpoint_advanced_at": data.first_checkpoint_advanced_at,
@@ -3587,6 +3570,8 @@ pub async fn serve(
 
 #[cfg(test)]
 mod auth_tests;
+#[cfg(test)]
+mod probe_tests;
 #[cfg(test)]
 mod tests;
 

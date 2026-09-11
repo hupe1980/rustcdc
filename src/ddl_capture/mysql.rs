@@ -1,8 +1,8 @@
 //! MySQL DDL extraction from binlog events.
 
 use super::{
-    extract_captured_ddl, parse_create_table_schema_for_dialect, parse_schema_table_for_dialect,
-    CapturedDdl, DdlDialect, DdlExtractor,
+    CapturedDdl, DdlDialect, DdlExtractor, extract_captured_ddl,
+    parse_create_table_schema_for_dialect, parse_schema_table_for_dialect,
 };
 use crate::schema_history::TableSchema;
 
@@ -40,8 +40,7 @@ mod tests {
     #[test]
     fn mysql_ddl_extractor_parses_create_table() {
         let extractor = MysqlDdlExtractor::new();
-        let sql =
-            "CREATE TABLE `mydb`.`users` (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB";
+        let sql = "CREATE TABLE `mydb`.`users` (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL) ENGINE=InnoDB";
 
         let ddl = extractor.extract_ddl(sql);
         assert!(ddl.is_some());

@@ -330,6 +330,7 @@ impl CdcRuntime {
             health: self.derive_health(now_ms),
             started_at_ms: self.started_at_ms,
             last_poll_at_ms: self.last_poll_at_ms,
+            last_delivery_at_ms: self.last_delivery_at_ms,
             last_commit_at_ms: self.last_commit_at_ms,
             checkpoint_age_ms,
             replication_lag_ms: self.estimate_replication_lag_ms(),
@@ -354,6 +355,7 @@ impl CdcRuntime {
         //    PostgreSQL primary that grows WAL until the disk fills.
         if let Some(lsn) = self.pending_confirmation_lsn {
             return HealthVerdict::Stalled {
+                cause: StallCause::UnconfirmedSourcePosition,
                 reason: format!(
                     "source position {lsn} was durably checkpointed but could not be \
                      confirmed to the source; the source keeps replaying committed events \
@@ -362,21 +364,49 @@ impl CdcRuntime {
             };
         }
 
-        // 2. The poll loop itself is not completing. Compared against the configured
-        //    wait plus a generous multiple, so a slow-but-working poll is not flagged.
+        // 2. The poll loop itself is not turning. Compared against the configured wait
+        //    plus a generous multiple, so a slow-but-working poll is not flagged.
+        //
+        //    `last_poll_at_ms` is stamped by `poll_event_batch` on **every** return, so
+        //    an empty batch from a quiet source keeps it fresh and this check stays
+        //    silent. What makes it go stale is a poll that never returns (blocked inside
+        //    the source) or an embedder that stopped calling — and the reason names both,
+        //    because from here they are genuinely indistinguishable.
+        //
+        //    Falling back to `started_at_ms` closes the case where `poll_event_batch` was
+        //    never called at all: with `None` this check simply did not run, and a runtime
+        //    that had been `Running` for an hour without a single poll reported `Idle`.
+        // An explicit threshold wins; otherwise derive it from the poll budget. The
+        // derived value scales *up* with the budget and has a floor but no ceiling, so a
+        // deployment with a long poll wait could not shorten its own detection window —
+        // at `max_poll_wait_ms = 60_000` it is six minutes. `CdcRuntime::new` has already
+        // rejected an explicit value that is too small to be meaningful.
         let stall_threshold_ms = self
             .config
             .options
-            .max_poll_wait_ms
-            .saturating_mul(HEALTH_POLL_STALL_MULTIPLIER)
-            .max(HEALTH_MIN_POLL_STALL_MS);
-        if let Some(last_poll) = self.last_poll_at_ms {
-            let since_poll = now_ms.saturating_sub(last_poll);
+            .health_stall_threshold_ms
+            .unwrap_or_else(|| {
+                self.config
+                    .options
+                    .max_poll_wait_ms
+                    .saturating_mul(HEALTH_POLL_STALL_MULTIPLIER)
+                    .max(HEALTH_MIN_POLL_STALL_MS)
+            });
+        if let Some(reference) = self.last_poll_at_ms.or(self.started_at_ms) {
+            let since_poll = now_ms.saturating_sub(reference);
             if since_poll > stall_threshold_ms {
+                let what = if self.last_poll_at_ms.is_some() {
+                    "no poll has returned"
+                } else {
+                    "no poll has been made since the runtime started"
+                };
                 return HealthVerdict::Stalled {
+                    cause: StallCause::PollLoopNotTurning,
                     reason: format!(
-                        "no poll has completed for {since_poll}ms (threshold \
-                         {stall_threshold_ms}ms); the poll loop is blocked, not idle"
+                        "{what} for {since_poll}ms (threshold {stall_threshold_ms}ms); \
+                         either a poll is blocked inside the source or the caller has \
+                         stopped calling poll_event_batch. This is not source idleness: a \
+                         quiet source still returns empty batches on schedule."
                     ),
                 };
             }
@@ -395,6 +425,7 @@ impl CdcRuntime {
                 .unwrap_or(u64::MAX);
             if since_commit > stall_threshold_ms {
                 return HealthVerdict::Stalled {
+                    cause: StallCause::ConsumerNotAcknowledging,
                     reason: format!(
                         "{uncommitted} event(s) delivered but not committed, and no commit \
                          in {}ms; the consumer has stopped acknowledging (call commit_ack)",
@@ -408,10 +439,22 @@ impl CdcRuntime {
             }
         }
 
-        // Polling on schedule with nothing outstanding. If events have flowed recently
-        // this is healthy; otherwise the source genuinely has no changes.
-        match self.last_source_event_ts_ms {
-            Some(_) if self.total_events_polled > 0 => HealthVerdict::Healthy,
+        // 4. Polling on schedule with nothing outstanding. Whether that is `Healthy` or
+        //    `Idle` turns on whether events have *arrived* recently.
+        //
+        //    Measured against `last_delivery_at_ms` — the local clock at the last
+        //    delivery — and not against `last_source_event_ts_ms`, which is the source's
+        //    own stamp: comparing a remote timestamp with a local `now_ms` makes the
+        //    verdict a function of clock skew, and sources that do not stamp events have
+        //    none at all.
+        //
+        //    The `Some(_) if total_events_polled > 0` test this replaces had no notion of
+        //    recency, and neither field is reset within a run. One delivered event
+        //    therefore pinned the verdict to `Healthy` for the life of the process, so
+        //    `Idle` was reachable only by a pipeline that had never delivered anything —
+        //    which is the state it is least useful for.
+        match self.last_delivery_at_ms {
+            Some(at) if now_ms.saturating_sub(at) <= stall_threshold_ms => HealthVerdict::Healthy,
             _ => HealthVerdict::Idle,
         }
     }
@@ -574,6 +617,58 @@ impl CdcRuntime {
                 w,
                 "rustcdc_runtime_health{{source_type=\"{source_type}\",verdict=\"{verdict}\"}} {}",
                 u8::from(admin.health.as_str() == verdict)
+            )?;
+        }
+
+        // The stall *cause* as its own series, present only while stalled.
+        //
+        // `rustcdc_runtime_health` stays one-hot over four fixed series, so it remains a
+        // complete alert rule on its own. Routing, though, needs to know *which* stall:
+        // an unconfirmed source position is a disk-fill risk on the database, a
+        // non-turning poll loop is a process problem, and a consumer that stopped
+        // acknowledging is the embedder's. Those go to three different people.
+        //
+        // Absent when healthy, following the same convention as
+        // `rustcdc_transform_rules_unmatched`: the missing series *is* the healthy state,
+        // so alert on presence and do not add three permanent zeroes to every scrape.
+        if let Some(cause) = admin.health.stall_cause() {
+            writeln!(
+                w,
+                "# HELP rustcdc_runtime_stall_cause Which signal produced the current stalled verdict. Emitted only while rustcdc_runtime_health{{verdict=\"stalled\"}} is 1; the absent series is the healthy state.\n\
+                 # TYPE rustcdc_runtime_stall_cause gauge\n\
+                 rustcdc_runtime_stall_cause{{source_type=\"{source_type}\",cause=\"{}\"}} 1",
+                cause.as_str()
+            )?;
+        }
+
+        // The two raw signals `rustcdc_runtime_health` is derived from, exposed so an
+        // operator can see *why* a verdict flipped instead of inferring it. They are the
+        // pair that separates a quiet database from a dead one:
+        //
+        //   poll_age_ms low  + delivery_age_ms high → idle. Normal. Do not alert.
+        //   poll_age_ms high                        → stalled. The loop is not turning.
+        //
+        // Absent before the first poll (and, for delivery, before the first event), which
+        // is why they are emitted conditionally rather than as a misleading zero.
+        let now_ms = now_millis();
+
+        if let Some(last_poll_at_ms) = admin.last_poll_at_ms {
+            writeln!(
+                w,
+                "# HELP rustcdc_runtime_poll_age_ms Milliseconds since poll_event_batch last returned, empty batches included. This is the liveness signal for the poll loop itself: it stays low on an idle source and only grows when a poll is blocked in the source or the caller has stopped polling.\n\
+                 # TYPE rustcdc_runtime_poll_age_ms gauge\n\
+                 rustcdc_runtime_poll_age_ms{{source_type=\"{source_type}\"}} {}",
+                now_ms.saturating_sub(last_poll_at_ms.min(now_ms))
+            )?;
+        }
+
+        if let Some(last_delivery_at_ms) = admin.last_delivery_at_ms {
+            writeln!(
+                w,
+                "# HELP rustcdc_runtime_delivery_age_ms Milliseconds since a poll last handed over at least one event. High on its own means the source is quiet, which is normal; it is only a fault when rustcdc_runtime_poll_age_ms is high too.\n\
+                 # TYPE rustcdc_runtime_delivery_age_ms gauge\n\
+                 rustcdc_runtime_delivery_age_ms{{source_type=\"{source_type}\"}} {}",
+                now_ms.saturating_sub(last_delivery_at_ms.min(now_ms))
             )?;
         }
 

@@ -1,8 +1,8 @@
 #![cfg(feature = "sqlserver")]
 
 use rustcdc::{
-    checkpoint::Checkpoint, checkpoint::InMemoryCheckpoint, source::Source, Operation,
-    SqlServerConnection,
+    Operation, SqlServerConnection, checkpoint::Checkpoint, checkpoint::InMemoryCheckpoint,
+    source::Source,
 };
 
 #[path = "sqlserver_testkit.rs"]
@@ -263,8 +263,8 @@ async fn sqlserver_stream_emits_schema_change_for_capture_metadata_refresh() -> 
     })?
 }
 
-async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh(
-) -> rustcdc::Result<()> {
+async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh()
+-> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver schema-change integration test") {
         return Ok(());
     }

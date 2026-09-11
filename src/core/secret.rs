@@ -268,8 +268,8 @@ impl<'de> Deserialize<'de> for SecretString {
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::{SecretProvider, SecretString};

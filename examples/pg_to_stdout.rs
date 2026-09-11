@@ -11,9 +11,8 @@ use std::{env, io::Write, path::PathBuf, sync::Arc};
 
 #[cfg(feature = "postgres")]
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
-    PostgresSourceConfig, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
-    StructuredLogger,
+    CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeObservability, RuntimeSourceConfig,
+    StructuredLogger, checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
 };
 
 #[cfg(feature = "postgres")]

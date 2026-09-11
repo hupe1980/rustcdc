@@ -34,13 +34,13 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
-    schema_history::InMemorySchemaHistory, IncrementalSnapshotConfig, PostgresSourceConfig,
-    RuntimeConfig, RuntimeSourceConfig,
+    IncrementalSnapshotConfig, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
+    schema_history::InMemorySchemaHistory,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 const SLOT: &str = "snapshot_visibility_slot";

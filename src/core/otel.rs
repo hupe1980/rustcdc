@@ -3,21 +3,20 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use opentelemetry::{
-    global,
+    Context, KeyValue, global,
     metrics::{Counter, Gauge, Histogram, MeterProvider as _},
     trace::{Span as _, Status, TraceContextExt, Tracer as _},
-    Context, KeyValue,
 };
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::PeriodicReader;
-use opentelemetry_sdk::{metrics::SdkMeterProvider, trace as sdktrace, Resource};
+use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider, trace as sdktrace};
 
 use crate::core::{Error, Event, EventTracer, MetricsCollector, Operation, Result};
 
@@ -827,14 +826,14 @@ impl OTelEventTracer {
     ///
     /// Call before process exit: the batch exporter buffers spans that are otherwise lost.
     pub fn shutdown(&self) {
-        if let Some(provider) = &self.provider {
-            if let Err(error) = provider.shutdown() {
-                tracing::warn!(
-                    target: "rustcdc::core::otel",
-                    error = %error,
-                    "tracer provider shutdown failed; buffered spans may be lost",
-                );
-            }
+        if let Some(provider) = &self.provider
+            && let Err(error) = provider.shutdown()
+        {
+            tracing::warn!(
+                target: "rustcdc::core::otel",
+                error = %error,
+                "tracer provider shutdown failed; buffered spans may be lost",
+            );
         }
     }
 
@@ -895,32 +894,32 @@ impl OTelEventTracer {
     ///
     /// Unknown `span_id` values are ignored — ending a span twice is not an error.
     pub fn end_span_with_status(&self, span_id: &str, status: &str, error_type: Option<&str>) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(mut active) = state.active_spans.remove(span_id) {
-                if status != "ok" {
-                    active.span.set_status(Status::error(status.to_string()));
-                    let kind = error_type.unwrap_or(status).to_string();
-                    active
-                        .span
-                        .set_attribute(KeyValue::new("error.type", kind.clone()));
-                    active.attributes.insert("error.type".to_string(), kind);
-                }
-
-                if let Some(parent_span_id) = &active.parent_span_id {
-                    active
-                        .attributes
-                        .insert("parent.span_id".to_string(), parent_span_id.clone());
-                }
-
-                active.span.end();
-                state.completed_spans.push(SpanRecord {
-                    span_id: span_id.to_string(),
-                    name: active.name,
-                    start_time_ms: active.start_time_ms,
-                    end_time_ms: now_millis(),
-                    attributes: active.attributes,
-                });
+        if let Ok(mut state) = self.state.lock()
+            && let Some(mut active) = state.active_spans.remove(span_id)
+        {
+            if status != "ok" {
+                active.span.set_status(Status::error(status.to_string()));
+                let kind = error_type.unwrap_or(status).to_string();
+                active
+                    .span
+                    .set_attribute(KeyValue::new("error.type", kind.clone()));
+                active.attributes.insert("error.type".to_string(), kind);
             }
+
+            if let Some(parent_span_id) = &active.parent_span_id {
+                active
+                    .attributes
+                    .insert("parent.span_id".to_string(), parent_span_id.clone());
+            }
+
+            active.span.end();
+            state.completed_spans.push(SpanRecord {
+                span_id: span_id.to_string(),
+                name: active.name,
+                start_time_ms: active.start_time_ms,
+                end_time_ms: now_millis(),
+                attributes: active.attributes,
+            });
         }
     }
 
@@ -1084,11 +1083,11 @@ impl OTelEventTracer {
     }
 
     fn parent_context(&self, parent_span_id: &str) -> Option<Context> {
-        if let Ok(state) = self.state.lock() {
-            if let Some(parent) = state.active_spans.get(parent_span_id) {
-                let parent_span_context = parent.span.span_context().clone();
-                return Some(Context::new().with_remote_span_context(parent_span_context));
-            }
+        if let Ok(state) = self.state.lock()
+            && let Some(parent) = state.active_spans.get(parent_span_id)
+        {
+            let parent_span_context = parent.span.span_context().clone();
+            return Some(Context::new().with_remote_span_context(parent_span_context));
         }
         None
     }
@@ -1298,9 +1297,11 @@ mod tests {
             report.get_histogram_percentile("rustcdc.runtime.event_processing_duration_ms", 50.0),
             Some(29)
         );
-        assert!(report
-            .counters
-            .contains_key("rustcdc.runtime.errors[context=runtime.poll]"));
+        assert!(
+            report
+                .counters
+                .contains_key("rustcdc.runtime.errors[context=runtime.poll]")
+        );
     }
 
     #[test]
@@ -1338,12 +1339,16 @@ mod tests {
         tracer.end_span("handoff-1");
 
         let spans = tracer.export_spans().unwrap();
-        assert!(spans
-            .iter()
-            .any(|span| span.name == "rustcdc.event.transform"));
-        assert!(spans
-            .iter()
-            .any(|span| span.name == "rustcdc.checkpoint.commit"));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.name == "rustcdc.event.transform")
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.name == "rustcdc.checkpoint.commit")
+        );
         assert!(spans.iter().any(|span| span.name == "rustcdc.handoff"));
 
         let transform = spans

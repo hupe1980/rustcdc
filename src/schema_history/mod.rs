@@ -90,7 +90,7 @@ pub trait SchemaHistory: Send + Sync {
     async fn record_ddl(&mut self, ddl_id: &str, ddl: DDLEvent) -> Result<u32>;
     /// Look up a schema by version.
     async fn get_schema_at_version(&self, table: &str, version: u32)
-        -> Result<Option<TableSchema>>;
+    -> Result<Option<TableSchema>>;
     /// Look up the most recent schema at or before a timestamp.
     async fn get_schema_at_timestamp(&self, table: &str, ts: u64) -> Result<Option<TableSchema>>;
     /// Return the latest known schema for a table.
@@ -803,7 +803,7 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::core::{Error, Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Error, Event, Operation, SourceMetadata};
     use crate::ddl_capture::{SchemaDiff, SchemaDiffOperation};
 
     use super::{
@@ -903,10 +903,12 @@ mod tests {
             .await
             .unwrap();
         let validator = SchemaValidator::new(Arc::new(history));
-        assert!(validator
-            .validate_event(&event(json!({"id": 1, "name": "alice"})))
-            .await
-            .is_ok());
+        assert!(
+            validator
+                .validate_event(&event(json!({"id": 1, "name": "alice"})))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -944,11 +946,13 @@ mod tests {
         assert_eq!(loaded.version, 2);
         assert!(loaded.columns.iter().any(|column| column.name == "email"));
 
-        assert!(history
-            .get_schema_at_timestamp("public.users", 0)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            history
+                .get_schema_at_timestamp("public.users", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         assert_eq!(
             history
@@ -963,11 +967,13 @@ mod tests {
                 .unwrap(),
             3
         );
-        assert!(history
-            .latest_schema("public.users")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            history
+                .latest_schema("public.users")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1084,14 +1090,18 @@ mod tests {
             .expect("schema should still exist after alter diff");
         assert_eq!(loaded.version, 2);
         assert!(loaded.columns.iter().any(|column| column.name == "email"));
-        assert!(loaded
-            .columns
-            .iter()
-            .any(|column| column.name == "full_name"));
-        assert!(!loaded
-            .columns
-            .iter()
-            .any(|column| column.name == "nickname"));
+        assert!(
+            loaded
+                .columns
+                .iter()
+                .any(|column| column.name == "full_name")
+        );
+        assert!(
+            !loaded
+                .columns
+                .iter()
+                .any(|column| column.name == "nickname")
+        );
     }
 
     #[tokio::test]
@@ -1118,9 +1128,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("unsupported clause 'REPLICA IDENTITY FULL'"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported clause 'REPLICA IDENTITY FULL'")
+        );
 
         let loaded = history
             .latest_schema("public.users")
@@ -1156,9 +1168,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("source column 'missing' does not exist"));
+        assert!(
+            error
+                .to_string()
+                .contains("source column 'missing' does not exist")
+        );
 
         let loaded = history
             .latest_schema("public.users")
@@ -1261,9 +1275,11 @@ mod tests {
         std::fs::write(&path, b"{not-json").unwrap();
 
         let error = FileSchemaHistory::new(&path).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("failed to parse schema history file"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse schema history file")
+        );
     }
 
     #[tokio::test]
@@ -1304,16 +1320,20 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 1);
 
-        assert!(history
-            .get_schema_at_version("public.users", 1)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(history
-            .get_schema_at_version("public.users", 2)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            history
+                .get_schema_at_version("public.users", 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            history
+                .get_schema_at_version("public.users", 2)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             history
                 .latest_schema("public.users")
@@ -1368,16 +1388,20 @@ mod tests {
 
         drop(history);
         let reloaded = FileSchemaHistory::new(&path).await.unwrap();
-        assert!(reloaded
-            .get_schema_at_version("public.users", 1)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(reloaded
-            .get_schema_at_version("public.users", 2)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            reloaded
+                .get_schema_at_version("public.users", 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reloaded
+                .get_schema_at_version("public.users", 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             reloaded
                 .latest_schema("public.users")

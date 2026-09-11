@@ -1,14 +1,14 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
+    AckMode, CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
     schema_history::InMemorySchemaHistory,
-    AckMode, CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 #[tokio::test]

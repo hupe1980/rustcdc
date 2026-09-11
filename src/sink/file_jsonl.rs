@@ -149,15 +149,15 @@ impl FileJsonlSink {
     pub fn open_with(path: impl AsRef<Path>, config: FileJsonlSinkConfig) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    Error::StateError(format!(
-                        "FileJsonlSink: could not create parent directory '{}': {e}",
-                        parent.display()
-                    ))
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Error::StateError(format!(
+                    "FileJsonlSink: could not create parent directory '{}': {e}",
+                    parent.display()
+                ))
+            })?;
         }
 
         let std_file = std::fs::OpenOptions::new()
@@ -411,7 +411,7 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
     use crate::sink::SinkAdapter;
 
     use super::{FileJsonlSink, FileJsonlSinkConfig};

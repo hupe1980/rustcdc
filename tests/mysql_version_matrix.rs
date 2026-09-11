@@ -1,13 +1,13 @@
 #![cfg(feature = "mysql")]
 
 use rustcdc::TransportConfig;
-use rustcdc::{source::Source, MysqlConnection, MysqlSourceConfig};
+use rustcdc::{MysqlConnection, MysqlSourceConfig, source::Source};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 fn skip_mysql_version_matrix_case(case_label: &str) -> bool {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {

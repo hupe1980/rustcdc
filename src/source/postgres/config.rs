@@ -8,7 +8,7 @@ use tokio_postgres::Config as PgConnectConfig;
 use crate::core::{Error, Result, SecretString, TransportConfig};
 
 use super::WalTransport;
-use super::{DatabaseAuthMode, PostgresSourceConfig, MAX_EVENTS_PER_POLL, STREAM_POLL_INTERVAL_MS};
+use super::{DatabaseAuthMode, MAX_EVENTS_PER_POLL, PostgresSourceConfig, STREAM_POLL_INTERVAL_MS};
 
 const MAX_CONN_TIMEOUT_SECS: u64 = 300;
 const MAX_STREAM_POLL_INTERVAL_MS: u64 = 60_000;
@@ -124,12 +124,12 @@ impl PostgresSourceConfig {
         if self.user.trim().is_empty() {
             return Err(Error::ConfigError("postgres user must not be empty".into()));
         }
-        if let Ok(pw) = self.password.expose_secret() {
-            if pw.trim().is_empty() {
-                return Err(Error::ConfigError(
-                    "postgres password must not be empty".into(),
-                ));
-            }
+        if let Ok(pw) = self.password.expose_secret()
+            && pw.trim().is_empty()
+        {
+            return Err(Error::ConfigError(
+                "postgres password must not be empty".into(),
+            ));
         }
         if matches!(self.auth_mode, DatabaseAuthMode::AwsIamToken) && !self.transport.is_tls() {
             return Err(Error::ConfigError(
@@ -204,12 +204,11 @@ impl PostgresSourceConfig {
                     .as_deref()
                     .map(str::trim)
                     .filter(|path| !path.is_empty())
+                    && !Path::new(ca_path).exists()
                 {
-                    if !Path::new(ca_path).exists() {
-                        return Err(Error::ConfigError(format!(
-                            "postgres tls_ca_cert_path does not exist: {ca_path}"
-                        )));
-                    }
+                    return Err(Error::ConfigError(format!(
+                        "postgres tls_ca_cert_path does not exist: {ca_path}"
+                    )));
                 }
                 match (client_cert_path.as_deref(), client_key_path.as_deref()) {
                     (Some(_), None) => {

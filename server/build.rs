@@ -1,6 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
 
     // Git commit SHA (best-effort; absent in release tarballs)
     let sha = std::process::Command::new("git")

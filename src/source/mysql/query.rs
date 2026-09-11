@@ -223,11 +223,7 @@ pub(super) fn primary_key_columns_from_row(row: &MysqlRow) -> Option<Vec<String>
         .map(|column| column.name_str().to_string())
         .collect::<Vec<_>>();
 
-    if keys.is_empty() {
-        None
-    } else {
-        Some(keys)
-    }
+    if keys.is_empty() { None } else { Some(keys) }
 }
 
 pub(super) fn mysql_row_to_json(row: &MysqlRow) -> serde_json::Value {
@@ -298,10 +294,10 @@ pub(super) fn mysql_value_to_json_for_column(
     column_type: ColumnType,
     charset: u16,
 ) -> serde_json::Value {
-    if let MysqlValue::Bytes(bytes) = value {
-        if is_binary_column(column_type, charset) {
-            return serde_json::Value::String(hex_encode(bytes));
-        }
+    if let MysqlValue::Bytes(bytes) = value
+        && is_binary_column(column_type, charset)
+    {
+        return serde_json::Value::String(hex_encode(bytes));
     }
     mysql_value_to_json_typed(value, Some(column_type))
 }

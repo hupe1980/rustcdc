@@ -4,8 +4,8 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -1104,13 +1104,13 @@ fn validate_export_signature(
 mod tests {
     use crate::core::BeforeImage;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use serde_json::json;
 
-    use crate::{Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::{EVENT_ENVELOPE_VERSION, Operation, SourceMetadata};
 
     use super::*;
 

@@ -151,11 +151,7 @@ impl SinkAdapter for FanOutSinkAdapter {
                 any = true;
             }
         }
-        if any {
-            Some(agg)
-        } else {
-            None
-        }
+        if any { Some(agg) } else { None }
     }
 
     /// Send `event` to every child sink **concurrently**.
@@ -228,11 +224,7 @@ impl SinkAdapter for FanOutSinkAdapter {
                 d
             })
             .sum();
-        if any {
-            Some(total)
-        } else {
-            None
-        }
+        if any { Some(total) } else { None }
     }
 
     /// Minimum flush tick interval across all children.
@@ -298,7 +290,7 @@ impl SinkAdapter for FanOutSinkAdapter {
 #[cfg(test)]
 mod tests {
     use crate::core::BeforeImage;
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
     use crate::sink::{BoxedSink, FanOutSinkAdapter, MemorySinkAdapter, SinkAdapter};
 
     fn make_event(table: &str) -> Event {

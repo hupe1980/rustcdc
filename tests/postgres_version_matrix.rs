@@ -1,11 +1,11 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::TransportConfig;
-use rustcdc::{source::Source, PostgresConnection, PostgresSourceConfig};
+use rustcdc::{PostgresConnection, PostgresSourceConfig, source::Source};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 use tokio_postgres::NoTls;
 

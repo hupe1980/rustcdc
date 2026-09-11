@@ -32,15 +32,15 @@
 //! called out here so this file does not silently imply it covers that path.
 
 use rustcdc::codec::{
-    detect_wire_format, preflight_schema_registry, warm_schema_cache, ApicurioRegistryConfig,
-    AsyncCodec, BoxedAsyncCodec, ConfluentAvroDecoder, ConfluentAvroEncoder,
-    ConfluentJsonSchemaEncoder, ConfluentProtobufDecoder, ConfluentProtobufEncoder,
-    DynSchemaRegistryClient, EventEncoder, SchemaRegistryConfig, SchemaType,
+    ApicurioRegistryConfig, AsyncCodec, BoxedAsyncCodec, ConfluentAvroDecoder,
+    ConfluentAvroEncoder, ConfluentJsonSchemaEncoder, ConfluentProtobufDecoder,
+    ConfluentProtobufEncoder, DynSchemaRegistryClient, EventEncoder, SchemaRegistryConfig,
+    SchemaType, detect_wire_format, preflight_schema_registry, warm_schema_cache,
 };
 use rustcdc::{Event, Operation, SourceMetadata};
 use std::sync::Arc;
 use testcontainers::{
-    core::IntoContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+    ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort, runners::AsyncRunner,
 };
 
 fn skip() -> bool {
@@ -84,13 +84,12 @@ async fn start_registry() -> rustcdc::Result<(ContainerAsync<GenericImage>, Stri
         .with_request_timeout_ms(1_000);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
-        if let Ok(registry) = probe.build() {
-            if preflight_schema_registry(&registry, &probe, SchemaType::Avro)
+        if let Ok(registry) = probe.build()
+            && preflight_schema_registry(&registry, &probe, SchemaType::Avro)
                 .await
                 .is_ok()
-            {
-                return Ok((container, base));
-            }
+        {
+            return Ok((container, base));
         }
         if std::time::Instant::now() >= deadline {
             return Err(rustcdc::Error::SourceError(
@@ -497,11 +496,13 @@ async fn auto_register_off_is_enforced_by_the_lazy_encoders() -> rustcdc::Result
     let encoder = ConfluentJsonSchemaEncoder::new(Arc::clone(&lenient_registry), &strict_seeded)
         .await
         .expect("subjects exist and carry rustcdc's schema");
-    assert!(!encoder
-        .encode_event(&sample_event(42))
-        .await?
-        .bytes
-        .is_empty());
+    assert!(
+        !encoder
+            .encode_event(&sample_event(42))
+            .await?
+            .bytes
+            .is_empty()
+    );
 
     Ok(())
 }

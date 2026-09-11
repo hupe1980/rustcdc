@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use rustcdc::{source::Source, Operation, SqlServerConnection};
+use rustcdc::{Operation, SqlServerConnection, source::Source};
 
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;

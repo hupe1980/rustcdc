@@ -5,9 +5,9 @@ use super::fixtures::{Fixture, FixtureMessage};
 /// that protocol message interpretation remains consistent across versions.
 use crate::{
     core::{
-        BeforeImage, Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+        BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
     },
-    ddl_capture::{extract_captured_ddl, DdlDialect},
+    ddl_capture::{DdlDialect, extract_captured_ddl},
 };
 use serde::{Deserialize, Serialize};
 
@@ -168,14 +168,14 @@ impl ReplaySession {
             }
         }
 
-        if let Some(transaction) = active_transaction.take() {
-            if !transaction.buffered.is_empty() {
-                errors.push(format!(
+        if let Some(transaction) = active_transaction.take()
+            && !transaction.buffered.is_empty()
+        {
+            errors.push(format!(
                     "Transaction {} was not committed before end of fixture; discarded {} buffered events",
                     transaction.tx_id,
                     transaction.buffered.len()
                 ));
-            }
         }
 
         ReplayResult {
@@ -443,7 +443,7 @@ impl ReplaySession {
                     "data payload sets 'before_is_key_only' but has no 'before': a \
                             key-only pre-image must carry the primary-key columns"
                         .to_string(),
-                )
+                );
             }
             (Some(key), true) => {
                 if !before_unavailable_columns.is_empty() {
@@ -1170,9 +1170,11 @@ mod tests {
             session.events()[0].event.table,
             "__marker__transaction_begin"
         );
-        assert!(result
-            .errors
-            .iter()
-            .any(|error| error.contains("not committed")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("not committed"))
+        );
     }
 }

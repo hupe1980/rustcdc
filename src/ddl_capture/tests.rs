@@ -176,18 +176,24 @@ fn extract_columns_handles_not_null_constraint() {
 
 #[test]
 fn extract_columns_handles_mysql_generated_columns() {
-    let cols = extract_columns_from_create("CREATE TABLE t (id INT, age INT GENERATED ALWAYS AS (YEAR(now()) - birth_year) STORED, birth_year INT)");
-    assert!(cols
-        .iter()
-        .any(|c| c.name == "age" && c.data_type == "COMPUTED"));
+    let cols = extract_columns_from_create(
+        "CREATE TABLE t (id INT, age INT GENERATED ALWAYS AS (YEAR(now()) - birth_year) STORED, birth_year INT)",
+    );
+    assert!(
+        cols.iter()
+            .any(|c| c.name == "age" && c.data_type == "COMPUTED")
+    );
 }
 
 #[test]
 fn extract_columns_handles_sqlserver_persisted_computed() {
-    let cols = extract_columns_from_create("CREATE TABLE t (id INT, full_name AS first_name + ' ' + last_name PERSISTED, first_name VARCHAR(50), last_name VARCHAR(50))");
-    assert!(cols
-        .iter()
-        .any(|c| c.name == "full_name" && c.data_type == "COMPUTED"));
+    let cols = extract_columns_from_create(
+        "CREATE TABLE t (id INT, full_name AS first_name + ' ' + last_name PERSISTED, first_name VARCHAR(50), last_name VARCHAR(50))",
+    );
+    assert!(
+        cols.iter()
+            .any(|c| c.name == "full_name" && c.data_type == "COMPUTED")
+    );
 }
 
 #[test]

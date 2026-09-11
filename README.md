@@ -3,16 +3,29 @@
 [![crates.io](https://img.shields.io/crates/v/rustcdc.svg)](https://crates.io/crates/rustcdc)
 [![docs.rs](https://img.shields.io/docsrs/rustcdc)](https://docs.rs/rustcdc)
 [![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue)](https://blog.rust-lang.org/)
+[![Rust 1.94.1+](https://img.shields.io/badge/rust-1.94.1%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
 **Change data capture you embed, not deploy.** PostgreSQL, MySQL, MariaDB, SQL Server and
 Snowflake behind one `Source` trait, one event envelope and one checkpoint model — as an
 ordinary Rust crate that links into your binary and runs on your Tokio runtime.
 
-📖 **[Documentation](https://hupe1980.github.io/rustcdc/docs/)** ·
-🚀 **[Getting started](https://hupe1980.github.io/rustcdc/docs/getting-started/)** ·
+📖 **[Documentation](https://hupe1980.github.io/rustcdc/library/)** ·
+🚀 **[Getting started](https://hupe1980.github.io/rustcdc/library/getting-started/)** ·
 🔧 **[API reference](https://docs.rs/rustcdc)**
+
+## Two ways to run it
+
+This repository holds both, built and tested from the same commit against each other.
+
+| | | |
+|---|---|---|
+| **`rustcdc`** — this crate | A library you link into your own binary. You own the loop, the sink and the process. | [Getting started](https://hupe1980.github.io/rustcdc/library/getting-started/) |
+| **`rustcdc-server`** — [`server/`](server/) | A configured binary and distroless container image: TOML in, Kafka / Iceberg / Snowflake / HTTP / files out, with an admin API, Prometheus metrics and OTLP traces. | [Server docs](https://hupe1980.github.io/rustcdc/docs/) · [`server/README.md`](server/README.md) |
+
+If you want change data capture *running*, take the server. If you want it *inside
+something you are building*, take the crate. The server is the crate plus configuration,
+sinks, state backends and an operational surface — it is not a different implementation.
 
 ## Why this exists
 
@@ -28,7 +41,7 @@ That is not a mistake on their part; it is the consequence of a real constraint.
 client or implements the wire protocol. rustcdc implements it — `START_REPLICATION ... LOGICAL`
 and its own pgoutput parser against stock `tokio-postgres` — which is why it installs as an
 ordinary dependency, with no sidecar to supervise and no control plane to operate. The
-[comparison page](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) has the
+[comparison page](https://hupe1980.github.io/rustcdc/library/library-parity-matrix/) has the
 side-by-side, including where `etl` is the better pick.
 
 That replication client speaks the streaming replication protocol PostgreSQL's own subscribers
@@ -39,17 +52,21 @@ server.
 
 ## Status
 
-**Pre-1.0.** Latest published release is 0.12.0; 0.14.0 is in development and is a breaking
-release — see [CHANGELOG.md](CHANGELOG.md). Core connector and runtime paths are validated by
-1161 unit tests, 136 documentation samples compiled as doctests, 41 deterministic-replay golden
-fixtures, and 61 integration suites, the
-container-backed ones running against real PostgreSQL 12/14/15/16, MySQL 8.0/8.4,
-MariaDB 10.5/10.6, SQL Server 2022 and Apicurio Registry 3.
+**Pre-1.0.** 0.15.0 is in development and is a breaking release — see
+[CHANGELOG.md](CHANGELOG.md). It is also the release in which `rustcdc-server` moved into
+this repository as a workspace member, so the library and the binary now share one version,
+one CI configuration, one dependency policy and one documentation site.
+
+Core connector and runtime paths are validated by 1167 library unit tests, 439 server unit
+tests, 138 documentation samples compiled as doctests, 41 deterministic-replay golden
+fixtures, and 61 integration suites, the container-backed ones running against real
+PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6, SQL Server 2022 and Apicurio
+Registry 3.
 
 The Snowflake source is the one connector with **no container-backed evidence** — Snowflake
 has no self-hostable implementation. Its semantics are unit-tested through a scripted
 transport; what a live account actually does is
-[stated as a gap](https://hupe1980.github.io/rustcdc/docs/snowflake/#evidence-and-the-gap-in-it)
+[stated as a gap](https://hupe1980.github.io/rustcdc/library/snowflake/#evidence-and-the-gap-in-it)
 rather than implied away.
 
 The public API may still change. Delivery is **at-least-once**; see
@@ -116,7 +133,7 @@ simply missing.
 Drive `poll_event_batch` and `commit_ack` yourself when the write has to be coordinated with
 something the runtime cannot see — your own transaction, a two-phase commit, a fan-out with
 per-branch error handling. The full loop, and why the acknowledgement is a separate step, is in
-the **[getting started guide](https://hupe1980.github.io/rustcdc/docs/getting-started/)**.
+the **[getting started guide](https://hupe1980.github.io/rustcdc/library/getting-started/)**.
 
 ## Read this before writing a sink
 
@@ -156,7 +173,7 @@ consumers see it — `numeric(38,4)` and `bigint` past 2^53 do not survive one. 
 Binary columns are encoded rather than transcoded, and the encoding is a property of the
 **connector**, not of the value — so you pick one decoder per source and never inspect a value to
 decide. The three forms are tabulated in the
-[configuration reference](https://hupe1980.github.io/rustcdc/docs/config-reference/#binary-column-encoding-per-connector).
+[configuration reference](https://hupe1980.github.io/rustcdc/library/config-reference/#binary-column-encoding-per-connector).
 
 `Merge` hands you only the columns the source actually supplied, so there is no placeholder
 left to write by accident. It arises from PostgreSQL unchanged-TOAST: a large value not
@@ -171,7 +188,7 @@ rather than something that looks writable.
 
 The underlying fields (`unavailable_columns`, `before_unavailable_columns`,
 `before_is_key_only`) are documented in the
-[API guide](https://hupe1980.github.io/rustcdc/docs/api/#partial-payloads-read-this-before-writing-a-sink).
+[API guide](https://hupe1980.github.io/rustcdc/library/api/#partial-payloads-read-this-before-writing-a-sink).
 
 ## Required source-database configuration
 
@@ -186,7 +203,7 @@ them and fails loud. Check these before your first run:
   capture at the current WAL position. Provision it out of band, or set
   `create_replication_slot_if_missing = true` for first-time setup. The connecting role needs the
   **`REPLICATION`** attribute and a direct (non-pooled) connection for the default WAL transport;
-  see [`wal_transport`](https://hupe1980.github.io/rustcdc/docs/config-reference/#wal-transport)
+  see [`wal_transport`](https://hupe1980.github.io/rustcdc/library/config-reference/#wal-transport)
   for the fallback when neither is possible.
 - **SQL Server:** CDC enabled on the database and on each captured table. Adding a table later
   with `sys.sp_cdc_enable_table` is supported while the stream is running.
@@ -200,7 +217,7 @@ Settings that need **no** change, but whose behaviour is worth knowing:
   more events than a single poll returns. The window is never advanced before it has been read in
   full.
 
-Full matrix: [configuration reference](https://hupe1980.github.io/rustcdc/docs/config-reference/).
+Full matrix: [configuration reference](https://hupe1980.github.io/rustcdc/library/config-reference/).
 
 ## Delivery guarantees
 
@@ -214,7 +231,7 @@ Full matrix: [configuration reference](https://hupe1980.github.io/rustcdc/docs/c
   records the first position *not* consumed rather than the last event's own position, because
   PostgreSQL logical decoding filters at transaction granularity and resuming from a change's
   LSN replays its whole transaction. See
-  [the checkpoint records a boundary](https://hupe1980.github.io/rustcdc/docs/api/#the-checkpoint-records-a-boundary-not-the-last-events-position).
+  [the checkpoint records a boundary](https://hupe1980.github.io/rustcdc/library/api/#the-checkpoint-records-a-boundary-not-the-last-events-position).
 
 By default a delivered batch may end mid-transaction, because batches are cut on
 `max_buffer_size`, `max_event_bytes` and commit-barrier capacity, none of which know anything
@@ -252,7 +269,7 @@ progress, to a task that is not the one holding `&mut CdcRuntime`.
 transforms, idempotency guard, health verdicts and metrics all apply unchanged — and
 implementing `IncrementalSnapshotBackend` gets you non-blocking DBLog snapshots too, since the
 watermark algorithm lives in one shared driver rather than once per connector. See
-[custom sources](https://hupe1980.github.io/rustcdc/docs/api/#custom-sources).
+[custom sources](https://hupe1980.github.io/rustcdc/library/api/#custom-sources).
 
 **Transforms don't pay for async they don't use.** Every shipped transform is pure CPU work
 over an in-memory event, so `Transform::apply` is a plain `fn`. A stage that genuinely must
@@ -267,7 +284,7 @@ streaming from a quiet database and one hung on a dead socket both report `Runni
 `Stalled { reason }` or `NotRunning` — where `reason` names both the condition and the remedy.
 `HealthVerdict::is_alertable()` is true for exactly `Stalled`, and the same verdict is exported
 as `rustcdc_runtime_health{verdict="stalled"} == 1`. See the
-[runbook](https://hupe1980.github.io/rustcdc/docs/runbook/#health-verdict-idle-vs-stalled).
+[runbook](https://hupe1980.github.io/rustcdc/library/runbook/#health-verdict-idle-vs-stalled).
 
 ## Feature flags
 
@@ -303,7 +320,7 @@ deployments — configure `TransportConfig::tls_with_ca_cert_path(...)` or
 > built against `rustls 0.23`. Two of the three advisories are unreachable on rustcdc's
 > code paths and the third needs CA misissuance to exploit; the per-advisory reachability
 > analysis, the `cargo deny` suppressions and the mitigations are in
-> [security](https://hupe1980.github.io/rustcdc/docs/security/#known-exposure-sqlserver-feature).
+> [security](https://hupe1980.github.io/rustcdc/library/security/#known-exposure-sqlserver-feature).
 > Deployments that cannot accept it should leave the feature off — it is not a default.
 
 ## Examples
@@ -318,8 +335,11 @@ cargo run --example mariadb_to_stdout --features mariadb -- \
   --host localhost --port 3306 --database testdb --snapshot-tables app.users
 
 # Full local stack: PostgreSQL + pg_to_stdout
-docker compose up --build
-docker compose down -v
+docker compose -f docker/compose.example.yml up --build
+docker compose -f docker/compose.example.yml down -v
+
+# …or the server against a seeded database, which is the product rather than an example
+docker compose -f demo/compose.yml up --build
 ```
 
 The two stdout examples deliberately show the two shapes: `pg_to_stdout` drives
@@ -335,7 +355,7 @@ related variables, and commit every 100 events by default.
 gated in CI. For a library whose public surface *is* the product, an undocumented `pub fn` on a
 checkpoint or connector type is a reader guessing at a correctness contract.
 
-**The documentation compiles.** Every Rust block in this README and under `site/content/docs/`
+**The documentation compiles.** Every Rust block in this README and under `site/content/library/`
 is compiled and run by `cargo test --doc --all-features`, gated in CI. Wiring the Markdown into
 the doctest run immediately surfaced 36 broken samples out of 96, including wrong field names
 and methods that had moved between types; extending it to the last five pages surfaced four
@@ -352,7 +372,7 @@ ignores is invisible to every fixture in it. Comparing a field is also not enoug
 the fixture format cannot produce a differing value, the comparison is vacuous, so the fixtures
 carry the partial-payload shape explicitly and every replayed event is validated rather than only
 matched. See
-[reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/).
+[reliability testing](https://hupe1980.github.io/rustcdc/library/reliability-testing/).
 
 **Suites run against the configurations that break things, not the defaults.** A resume
 coordinate is only as good as the server option it was captured under, and the permissive
@@ -412,9 +432,9 @@ you call `commit_ack`, not the poll loop. (`fsync` is unusually expensive on mac
 better absolute numbers on Linux and worse on network storage — re-run it on yours.)
 
 The evidence policy, including release-grade classification, is documented under
-[benchmark evidence](https://hupe1980.github.io/rustcdc/docs/reliability-testing/#benchmark-evidence);
+[benchmark evidence](https://hupe1980.github.io/rustcdc/library/reliability-testing/#benchmark-evidence);
 the throughput harness has its own
-[section](https://hupe1980.github.io/rustcdc/docs/reliability-testing/#end-to-end-runtime-throughput).
+[section](https://hupe1980.github.io/rustcdc/library/reliability-testing/#end-to-end-runtime-throughput).
 
 The documentation site lives in [`site/`](site/) and is built with [Zola](https://www.getzola.org/):
 
@@ -426,25 +446,30 @@ zola --root site serve
 
 | | |
 |---|---|
-| [Getting started](https://hupe1980.github.io/rustcdc/docs/getting-started/) | First pipeline, from an empty project to committed events |
-| [Architecture](https://hupe1980.github.io/rustcdc/docs/architecture/) | Capture, commit barrier and checkpointing — how they fit and why |
-| [API guide](https://hupe1980.github.io/rustcdc/docs/api/) | The embedding model: lifecycle, acknowledgement, transforms, codecs |
-| [Configuration reference](https://hupe1980.github.io/rustcdc/docs/config-reference/) | Every option, with the failure it prevents |
-| [Schema evolution](https://hupe1980.github.io/rustcdc/docs/schema-evolution/) | DDL handling, schema history, registry compatibility |
-| [Adapter SDK](https://hupe1980.github.io/rustcdc/docs/adapter-sdk/) | Writing a connector the runtime treats as first-class |
-| [WASM transform SDK](https://hupe1980.github.io/rustcdc/docs/wasm-transform-sdk/) | Sandboxed transforms, ABI and limits |
-| [Deployment](https://hupe1980.github.io/rustcdc/docs/deployment/) | Running it in production |
-| [Runbook](https://hupe1980.github.io/rustcdc/docs/runbook/) | Alert thresholds, recovery procedures, disaster recovery |
-| [Troubleshooting](https://hupe1980.github.io/rustcdc/docs/troubleshooting/) | Symptom → diagnosis → resolution |
-| [Security](https://hupe1980.github.io/rustcdc/docs/security/) | Transport defaults, secret handling, known exposure |
-| [Reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/) | Replay, fault injection, conformance |
-| [Snowflake source](https://hupe1980.github.io/rustcdc/docs/snowflake/) | Reading Snowflake with `CHANGES`, and why Streams are unsafe for an external reader |
-| [Library parity matrix](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) | Scope-aware comparison against alternatives |
+| [Getting started](https://hupe1980.github.io/rustcdc/library/getting-started/) | First pipeline, from an empty project to committed events |
+| [Architecture](https://hupe1980.github.io/rustcdc/library/architecture/) | Capture, commit barrier and checkpointing — how they fit and why |
+| [API guide](https://hupe1980.github.io/rustcdc/library/api/) | The embedding model: lifecycle, acknowledgement, transforms, codecs |
+| [Configuration reference](https://hupe1980.github.io/rustcdc/library/config-reference/) | Every option, with the failure it prevents |
+| [Schema evolution](https://hupe1980.github.io/rustcdc/library/schema-evolution/) | DDL handling, schema history, registry compatibility |
+| [Adapter SDK](https://hupe1980.github.io/rustcdc/library/adapter-sdk/) | Writing a connector the runtime treats as first-class |
+| [WASM transform SDK](https://hupe1980.github.io/rustcdc/library/wasm-transform-sdk/) | Sandboxed transforms, ABI and limits |
+| [Deployment](https://hupe1980.github.io/rustcdc/library/deployment/) | Running it in production |
+| [Runbook](https://hupe1980.github.io/rustcdc/library/runbook/) | Alert thresholds, recovery procedures, disaster recovery |
+| [Troubleshooting](https://hupe1980.github.io/rustcdc/library/troubleshooting/) | Symptom → diagnosis → resolution |
+| [Security](https://hupe1980.github.io/rustcdc/library/security/) | Transport defaults, secret handling, known exposure |
+| [Reliability testing](https://hupe1980.github.io/rustcdc/library/reliability-testing/) | Replay, fault injection, conformance |
+| [Snowflake source](https://hupe1980.github.io/rustcdc/library/snowflake/) | Reading Snowflake with `CHANGES`, and why Streams are unsafe for an external reader |
+| [Library parity matrix](https://hupe1980.github.io/rustcdc/library/library-parity-matrix/) | Scope-aware comparison against alternatives |
 
 ## MSRV
 
-Rust 1.94 or newer, matching the `rust-version` in `Cargo.toml`. Raising it is a
-minor-version change. CI verifies it on exactly that toolchain.
+Rust 1.94.1+ or newer, matching `rust-version` in `[workspace.package]`. Raising it is a
+minor-version change. CI reads the number out of the manifest rather than restating it, and
+verifies both members on exactly that toolchain — `server/tests/architecture.rs` fails the
+build if this README, the Dockerfile or the documentation site disagrees with it.
+
+The floor is set by the server's dependency graph (the AWS SDK), with wasmtime next at
+1.94.0. The library alone would compile on less, but one workspace publishes one number.
 
 ## License
 

@@ -1,7 +1,53 @@
-target
-.git
-.github
-.vscode
+# ── build artefacts ──────────────────────────────────────────────────────────
+target/
+server/fuzz/target/
+server/fuzz/corpus/
+server/fuzz/artifacts/
+
+# ── version control ──────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── CI / tooling config (not needed inside the image) ────────────────────────
+.github/
+.cargo/
+deny.toml
+rust-toolchain.toml
+
+# ── documentation ─────────────────────────────────────────────────────────────
+#
+# `site/` is excluded **except** `site/content/library/`, and `README.md` is not
+# excluded at all. Both are load-bearing for the build, not just for the website:
+# `src/lib.rs` embeds them with `include_str!`, so a context without them fails to
+# compile the library the server links against — with an error that points at
+# rustdoc rather than at this file. The server image is built from the workspace
+# root, so that now applies here.
+site/*
+!site/content/
+site/content/*
+!site/content/library/
+REVIEW.md
+FINDINGS.md
+CHANGELOG.md
+CONTRIBUTING.md
+# LICENSE-MIT / LICENSE-APACHE are deliberately NOT excluded — they are copied
+# into the runtime image.
+
+# ── things the binary does not need ──────────────────────────────────────────
+monitoring/
+demo/
+docker/
+scripts/
+fixtures/
+.vscode/
+# `examples/` stays in the context: `docker/Dockerfile.example` builds the
+# `pg_to_stdout` example from this same context root, and `.dockerignore` is shared
+# by every build that uses it.
+
+# ── local dev cruft ──────────────────────────────────────────────────────────
 **/*.log
 **/*.tmp
-**/*.swp
+.DS_Store
+*.swp
+*.swo

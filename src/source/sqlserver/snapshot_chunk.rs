@@ -1,9 +1,9 @@
 use crate::core::{
-    BeforeImage, Event, Operation, Result, SnapshotMetadata, SourceMetadata, EVENT_ENVELOPE_VERSION,
+    BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
 };
 use crate::source::helpers::now_millis;
 
-use super::{lsn_bytes_to_hex, SqlServerSnapshotHandle};
+use super::{SqlServerSnapshotHandle, lsn_bytes_to_hex};
 
 pub(super) async fn next_sqlserver_snapshot_chunk(
     handle: &mut SqlServerSnapshotHandle,
@@ -96,12 +96,11 @@ pub(super) async fn next_sqlserver_snapshot_chunk(
     }
 
     if !events.is_empty() {
-        if handle.is_complete() {
-            if let Some(last) = events.last_mut() {
-                if let Some(snapshot) = last.snapshot.as_mut() {
-                    snapshot.is_last_chunk = true;
-                }
-            }
+        if handle.is_complete()
+            && let Some(last) = events.last_mut()
+            && let Some(snapshot) = last.snapshot.as_mut()
+        {
+            snapshot.is_last_chunk = true;
         }
         handle.next_chunk_index = handle.next_chunk_index.saturating_add(1);
     }

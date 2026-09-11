@@ -22,10 +22,12 @@ fn postgres_crash_interrupted_transaction_fixture_fails_closed() {
         !result.success,
         "replay should fail for interrupted transaction"
     );
-    assert!(result
-        .errors
-        .iter()
-        .any(|error| error.contains("not committed")));
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|error| error.contains("not committed"))
+    );
     assert_eq!(replay.events().len(), 4);
     assert_eq!(
         replay.events()[0].event.table,
@@ -58,10 +60,12 @@ fn mysql_crash_interrupted_transaction_fixture_fails_closed() {
         !result.success,
         "replay should fail for interrupted transaction"
     );
-    assert!(result
-        .errors
-        .iter()
-        .any(|error| error.contains("not committed")));
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|error| error.contains("not committed"))
+    );
     assert_eq!(replay.events().len(), 4);
     assert_eq!(
         replay.events()[0].event.table,
@@ -94,10 +98,12 @@ fn sqlserver_crash_interrupted_transaction_fixture_fails_closed() {
         !result.success,
         "replay should fail for interrupted transaction"
     );
-    assert!(result
-        .errors
-        .iter()
-        .any(|error| error.contains("not committed")));
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|error| error.contains("not committed"))
+    );
     assert_eq!(replay.events().len(), 1);
     assert_eq!(
         replay.events()[0].event.table,

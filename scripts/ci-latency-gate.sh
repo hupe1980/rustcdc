@@ -78,7 +78,7 @@ MYSQL_P95_MS="${LATENCY_GATE_MYSQL_P95_MS:-400}"
 MYSQL_P99_MS="${LATENCY_GATE_MYSQL_P99_MS:-800}"
 # SQL Server CDC is not low-latency by design: rows are invisible to any consumer until
 # the capture agent has scanned the log. This ceiling reflects that architecture rather
-# than a slower connector, and is documented as such in site/content/docs/config-reference.md.
+# than a slower connector, and is documented as such in site/content/library/config-reference.md.
 SQLSERVER_P95_MS="${LATENCY_GATE_SQLSERVER_P95_MS:-5000}"
 SQLSERVER_P99_MS="${LATENCY_GATE_SQLSERVER_P99_MS:-10000}"
 

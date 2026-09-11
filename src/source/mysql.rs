@@ -4,7 +4,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use mysql_async::{prelude::Queryable, Pool as MySqlPool};
+use mysql_async::{Pool as MySqlPool, prelude::Queryable};
 
 use connections::MysqlConnections;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn as MySqlBinlogConn};
@@ -21,7 +21,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use crate::{
     checkpoint::{GenericOffset, MysqlOffset},
     core::{Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig},
-    ddl_capture::{extract_captured_ddl, DdlDialect},
+    ddl_capture::{DdlDialect, extract_captured_ddl},
     source::{
         ConnectorCapabilities, DatabaseAuthMode, HandoffResult, IncrementalSnapshotConfig,
         SnapshotEnd, SnapshotHandle, Source, StreamHandle,
@@ -51,9 +51,9 @@ use self::{
         mysql_qualified_table_name_from_reference, parse_truncate_target, quoted_mysql_identifier,
     },
     query::{
-        binlog_row_to_mysql_row, format_gtid, mysql_json_value_to_param, mysql_row_to_json,
-        mysql_row_to_json_with_labels, mysql_value_to_json, primary_key_columns_from_row,
-        EnumSetLabels,
+        EnumSetLabels, binlog_row_to_mysql_row, format_gtid, mysql_json_value_to_param,
+        mysql_row_to_json, mysql_row_to_json_with_labels, mysql_value_to_json,
+        primary_key_columns_from_row,
     },
     state::{
         ConnectionState, MysqlBinlogMessage, MysqlRowChange, MysqlStream, SnapshotCheckpointState,
@@ -1284,10 +1284,11 @@ impl MysqlConnection {
         // A `None` result means the server does not expose the variable at all (older
         // MariaDB); skip rather than fail, since we cannot distinguish "unsupported"
         // from "misconfigured" on such a server.
-        if let Some(row_metadata) = backend.binlog_row_metadata().await? {
-            if !row_metadata.eq_ignore_ascii_case("FULL") {
-                return Err(Error::SourceError(format!(
-                    "binlog_row_metadata is '{row_metadata}' but rustcdc requires 'FULL'. \
+        if let Some(row_metadata) = backend.binlog_row_metadata().await?
+            && !row_metadata.eq_ignore_ascii_case("FULL")
+        {
+            return Err(Error::SourceError(format!(
+                "binlog_row_metadata is '{row_metadata}' but rustcdc requires 'FULL'. \
                      Anything less omits column names and primary-key flags from the \
                      binlog, so streamed events would carry positional placeholder keys \
                      ('@0', '@1', …) instead of real column names, and no primary key — \
@@ -1298,24 +1299,23 @@ impl MysqlConnection {
                      binlog_row_metadata=FULL to my.cnf / server config so it survives a \
                      restart). Note this only affects binlog events written after the \
                      change, so existing binlog content keeps the old encoding."
-                )));
-            }
+            )));
         }
 
         // binlog_row_image: MINIMAL emits only changed columns in the after-image and
         // only key columns in the before-image; NOBLOB omits unchanged BLOB/TEXT.
         // A consumer upserting from a partial after-image erases every column absent
         // from it, and nothing in the envelope marks the row as partial.
-        if let Some(row_image) = backend.binlog_row_image().await? {
-            if !row_image.eq_ignore_ascii_case("FULL") {
-                return Err(Error::SourceError(format!(
-                    "mysql binlog_row_image is '{row_image}' but rustcdc requires 'FULL'. \
+        if let Some(row_image) = backend.binlog_row_image().await?
+            && !row_image.eq_ignore_ascii_case("FULL")
+        {
+            return Err(Error::SourceError(format!(
+                "mysql binlog_row_image is '{row_image}' but rustcdc requires 'FULL'. \
                      With MINIMAL or NOBLOB the binlog records only a subset of columns, so \
                      UPDATE after-images would be emitted as if complete while silently \
                      missing columns — a consumer performing an upsert would erase them. \
                      Fix: SET GLOBAL binlog_row_image = FULL (and persist it in my.cnf)."
-                )));
-            }
+            )));
         }
 
         // binlog_row_value_options=PARTIAL_JSON makes the server emit JSON diffs
@@ -1323,18 +1323,18 @@ impl MysqlConnection {
         // resulting error is raised before any checkpoint advance, so the connector
         // re-reads the same event on restart and fails identically — a permanent stall
         // that only an operator changing this variable can clear.
-        if let Some(row_value_options) = backend.binlog_row_value_options().await? {
-            if !row_value_options.trim().is_empty() {
-                return Err(Error::SourceError(format!(
-                    "mysql binlog_row_value_options is '{row_value_options}' but rustcdc \
+        if let Some(row_value_options) = backend.binlog_row_value_options().await?
+            && !row_value_options.trim().is_empty()
+        {
+            return Err(Error::SourceError(format!(
+                "mysql binlog_row_value_options is '{row_value_options}' but rustcdc \
                      requires it to be empty. PARTIAL_JSON makes the server write JSON diffs \
                      instead of complete JSON values; rustcdc cannot apply those diffs, and \
                      the resulting decode failure recurs on every restart because it happens \
                      before the checkpoint advances — stalling the pipeline permanently. \
                      Fix: SET GLOBAL binlog_row_value_options = '' (and persist it in \
                      my.cnf)."
-                )));
-            }
+            )));
         }
 
         let _ = backend.master_position().await?;
@@ -1368,10 +1368,10 @@ impl MysqlConnection {
 
 impl Drop for MysqlConnection {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.try_lock() {
-            if let Some(handle) = state.heartbeat_task.take() {
-                handle.abort();
-            }
+        if let Ok(mut state) = self.state.try_lock()
+            && let Some(handle) = state.heartbeat_task.take()
+        {
+            handle.abort();
         }
     }
 }
@@ -1842,8 +1842,8 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
@@ -1860,16 +1860,16 @@ mod tests {
         source::{SnapshotHandle, Source, StreamHandle},
     };
 
-    use super::parse_mariadb_gtid_event;
     use super::MysqlSourceConfig;
+    use super::parse_mariadb_gtid_event;
     use super::{
-        ConnectionState, MysqlBinlogMessage, MysqlBinlogProvider, MysqlConnection, MysqlRowChange,
-        MysqlSnapshot, MysqlSnapshotHandle, MysqlStream, MysqlStreamHandle, StreamState,
-        TableSnapshot, TableSnapshotState, ValidationBackend, MAX_EVENTS_PER_POLL,
-        STREAM_POLL_INTERVAL_MS,
+        ConnectionState, MAX_EVENTS_PER_POLL, MysqlBinlogMessage, MysqlBinlogProvider,
+        MysqlConnection, MysqlRowChange, MysqlSnapshot, MysqlSnapshotHandle, MysqlStream,
+        MysqlStreamHandle, STREAM_POLL_INTERVAL_MS, StreamState, TableSnapshot, TableSnapshotState,
+        ValidationBackend,
     };
-    use crate::ddl_capture::{extract_captured_ddl, DdlDialect};
     use crate::SecretString;
+    use crate::ddl_capture::{DdlDialect, extract_captured_ddl};
 
     struct MockValidationBackend {
         gtid_mode_enabled: bool,

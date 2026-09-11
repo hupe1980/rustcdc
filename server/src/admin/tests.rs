@@ -829,7 +829,7 @@ pub(super) fn abuse_guard_honors_forwarded_ip_from_trusted_proxy() {
 
 #[test]
 pub(super) fn alert_rules_file_contains_expected_slo_gates() {
-    let rules = include_str!("../../monitoring/rustcdc_slo_alerts.yml");
+    let rules = include_str!("../../../monitoring/rustcdc_slo_alerts.yml");
     assert!(rules.contains("CDCReadinessRateLow"));
     assert!(rules.contains("CDCCheckpointAgeHigh"));
     assert!(rules.contains("CDCAdminAPILatencyHigh"));

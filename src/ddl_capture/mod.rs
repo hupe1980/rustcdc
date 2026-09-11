@@ -236,22 +236,22 @@ impl CapturedDdl {
         });
 
         // Include result schema if available
-        if let Some(schema) = &self.result_schema {
-            if let Ok(schema_json) = serde_json::to_value(schema) {
-                after
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("result_schema".into(), schema_json);
-            }
+        if let Some(schema) = &self.result_schema
+            && let Ok(schema_json) = serde_json::to_value(schema)
+        {
+            after
+                .as_object_mut()
+                .unwrap()
+                .insert("result_schema".into(), schema_json);
         }
 
-        if let Some(diff) = &self.schema_diff {
-            if let Ok(diff_json) = serde_json::to_value(diff) {
-                after
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("schema_diff".into(), diff_json);
-            }
+        if let Some(diff) = &self.schema_diff
+            && let Ok(diff_json) = serde_json::to_value(diff)
+        {
+            after
+                .as_object_mut()
+                .unwrap()
+                .insert("schema_diff".into(), diff_json);
         }
 
         Event {

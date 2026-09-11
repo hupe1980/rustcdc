@@ -144,12 +144,12 @@ pub(crate) fn current_hostname() -> &'static str {
         }
         // Fall back to the `hostname` command on Unix.
         #[cfg(unix)]
-        if let Ok(output) = std::process::Command::new("hostname").output() {
-            if let Ok(s) = std::str::from_utf8(&output.stdout) {
-                let s = s.trim().to_owned();
-                if !s.is_empty() {
-                    return s;
-                }
+        if let Ok(output) = std::process::Command::new("hostname").output()
+            && let Ok(s) = std::str::from_utf8(&output.stdout)
+        {
+            let s = s.trim().to_owned();
+            if !s.is_empty() {
+                return s;
             }
         }
         "unknown".to_owned()
@@ -171,10 +171,10 @@ pub(crate) fn parse_lease(contents: &str) -> Option<(String, u32)> {
     if let Some(colon) = contents.rfind(':') {
         let host = &contents[..colon];
         let pid_str = &contents[colon + 1..];
-        if !host.is_empty() {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                return Some((host.to_owned(), pid));
-            }
+        if !host.is_empty()
+            && let Ok(pid) = pid_str.parse::<u32>()
+        {
+            return Some((host.to_owned(), pid));
         }
     }
     None

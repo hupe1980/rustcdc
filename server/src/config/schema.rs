@@ -588,6 +588,20 @@ pub struct RuntimeTuningConfig {
     #[serde(default = "default_max_poll_wait")]
     pub max_poll_wait_ms: u64,
 
+    /// Explicit stall threshold for the runtime health verdict, in milliseconds.
+    ///
+    /// Omit to derive it from the poll budget (`max_poll_wait_ms × 6`, floor 30 s). The
+    /// derived value scales *up* with the poll budget and has no ceiling: at
+    /// `max_poll_wait_ms = 60000` it is six minutes, so a wedged pipeline could go
+    /// unreported for six minutes with no way to shorten the window. Set this to state
+    /// the detection window directly.
+    ///
+    /// Must exceed `max_poll_wait_ms` — a threshold inside the poll budget reports a poll
+    /// that is merely slow as a stalled pipeline, and `stalled` is the verdict that pages
+    /// someone. Rejected at load rather than at 3am.
+    #[serde(default)]
+    pub health_stall_threshold_ms: Option<u64>,
+
     #[serde(default = "default_runtime_max_event_bytes")]
     pub max_event_bytes: usize,
 
@@ -776,6 +790,7 @@ impl Default for RuntimeTuningConfig {
         Self {
             max_buffer_size: default_max_buffer(),
             max_poll_wait_ms: default_max_poll_wait(),
+            health_stall_threshold_ms: None,
             max_event_bytes: default_runtime_max_event_bytes(),
             sink_flush_interval_events: default_runtime_sink_flush_interval_events(),
             sink_delivery_queue_capacity: default_runtime_sink_delivery_queue_capacity(),
@@ -816,6 +831,25 @@ impl RuntimeTuningConfig {
 
         if self.max_poll_wait_ms == 0 {
             return Err("runtime.max_poll_wait_ms must be > 0".to_string());
+        }
+        // Mirrored from `CdcRuntime::new` so the failure arrives at config load, naming
+        // the TOML key, rather than from inside the runtime naming a Rust field.
+        if let Some(threshold_ms) = self.health_stall_threshold_ms {
+            if threshold_ms < rustcdc::core::HEALTH_MIN_CONFIGURABLE_STALL_MS {
+                return Err(format!(
+                    "runtime.health_stall_threshold_ms ({threshold_ms}) is below the {}ms minimum; \
+                     below that the verdict measures the health-check interval rather than the pipeline",
+                    rustcdc::core::HEALTH_MIN_CONFIGURABLE_STALL_MS
+                ));
+            }
+            if threshold_ms <= self.max_poll_wait_ms {
+                return Err(format!(
+                    "runtime.health_stall_threshold_ms ({threshold_ms}) must be greater than \
+                     runtime.max_poll_wait_ms ({}); a threshold inside the poll budget reports a poll \
+                     that is merely slow as a stalled pipeline",
+                    self.max_poll_wait_ms
+                ));
+            }
         }
 
         if self.max_event_bytes == 0 {
@@ -1638,6 +1672,59 @@ topic = "cdc-checkpoint-state"
             .validate()
             .expect_err("instance_pool_size=0 must fail validation");
         assert!(err.contains("instance_pool_size"));
+    }
+
+    /// A stall threshold that would report a healthy pipeline as stalled is refused at
+    /// load, naming the TOML key.
+    ///
+    /// Both bounds guard the same failure from opposite ends. `stalled` is the one
+    /// alertable verdict, and an alert that fires on working pipelines is one operators
+    /// learn to ignore — which costs more than the faster detection it was meant to buy.
+    #[test]
+    fn runtime_tuning_rejects_a_stall_threshold_that_would_fire_on_a_healthy_pipeline() {
+        // Inside the poll budget: a poll that is merely slow would read as a stall.
+        let cfg = RuntimeTuningConfig {
+            max_poll_wait_ms: 60_000,
+            health_stall_threshold_ms: Some(30_000),
+            ..RuntimeTuningConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("a threshold inside the poll budget must be rejected");
+        assert!(err.contains("health_stall_threshold_ms"), "{err}");
+        assert!(
+            err.contains("max_poll_wait_ms"),
+            "the message must explain the relationship, not just the bound: {err}"
+        );
+
+        // Below the absolute floor: the verdict would measure the health-check interval.
+        let cfg = RuntimeTuningConfig {
+            max_poll_wait_ms: 100,
+            health_stall_threshold_ms: Some(rustcdc::core::HEALTH_MIN_CONFIGURABLE_STALL_MS - 1),
+            ..RuntimeTuningConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("a sub-minimum threshold must be rejected");
+        assert!(err.contains("health_stall_threshold_ms"), "{err}");
+
+        // The case the setting exists for: a long poll budget with a deliberately
+        // tighter window than the six minutes it would otherwise derive.
+        let cfg = RuntimeTuningConfig {
+            max_poll_wait_ms: 60_000,
+            health_stall_threshold_ms: Some(90_000),
+            ..RuntimeTuningConfig::default()
+        };
+        cfg.validate()
+            .expect("a threshold above the poll budget is valid");
+
+        // Unset stays valid and leaves the runtime deriving it.
+        let cfg = RuntimeTuningConfig {
+            max_poll_wait_ms: 60_000,
+            health_stall_threshold_ms: None,
+            ..RuntimeTuningConfig::default()
+        };
+        cfg.validate().expect("an unset threshold is valid");
     }
 
     #[test]

@@ -18,24 +18,25 @@ mod transport;
 pub(crate) mod transport_tls;
 
 pub use error::{
-    render_error_chain, Error, ErrorChain, ErrorKind, ErrorReport, FingerprintError, Result,
-    SourceErrorKind,
+    Error, ErrorChain, ErrorKind, ErrorReport, FingerprintError, Result, SourceErrorKind,
+    render_error_chain,
 };
 pub use event::{
-    BeforeImage, Event, EventBuilder, NoRowWrite, Operation, RowWrite, SnapshotMetadata,
-    SourceMetadata, TransactionMetadata, ValidationError, ValidationErrors, EVENT_ENVELOPE_VERSION,
+    BeforeImage, EVENT_ENVELOPE_VERSION, Event, EventBuilder, NoRowWrite, Operation, RowWrite,
+    SnapshotMetadata, SourceMetadata, TransactionMetadata, ValidationError, ValidationErrors,
 };
 pub use idempotency::{
-    fingerprint_event_stable, fingerprint_event_transient, EventIdempotencyGuard,
+    EventIdempotencyGuard, fingerprint_event_stable, fingerprint_event_transient,
 };
 pub use logging::StructuredLogger;
 pub use observability::{EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector};
 #[cfg(feature = "metrics")]
 pub use otel::{MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord};
 pub use runtime::{
-    AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch, HealthVerdict,
-    IdempotencyOptions, PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig,
-    RuntimeControl, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
+    AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch,
+    HEALTH_MIN_CONFIGURABLE_STALL_MS, HealthVerdict, IdempotencyOptions,
+    PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl,
+    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, StallCause,
     TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};

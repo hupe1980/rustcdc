@@ -3,13 +3,13 @@
 use std::time::{Duration, Instant};
 
 use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory, CdcRuntime,
-    MysqlSourceConfig, RuntimeConfig, RuntimeSourceConfig, TransportConfig,
+    CdcRuntime, MysqlSourceConfig, RuntimeConfig, RuntimeSourceConfig, TransportConfig,
+    checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 use tokio::time::sleep;
 
@@ -21,8 +21,8 @@ use rustls_provider_common::install_rustls_provider;
 mod latency_evidence_common;
 
 use latency_evidence_common::{
-    assert_sample_is_meaningful, now_micros, stamped_payload, write_latency_artifacts,
-    LatencyRecorder, ProgressDeadline, WriterStatus,
+    LatencyRecorder, ProgressDeadline, WriterStatus, assert_sample_is_meaningful, now_micros,
+    stamped_payload, write_latency_artifacts,
 };
 
 async fn connect_admin_pool(dsn: &str) -> rustcdc::Result<sqlx::MySqlPool> {

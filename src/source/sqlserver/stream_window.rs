@@ -1,16 +1,15 @@
 use crate::{
     core::{
-        BeforeImage, Error, Event, Operation, Result, SourceMetadata, TransactionMetadata,
-        EVENT_ENVELOPE_VERSION,
+        BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SourceMetadata,
+        TransactionMetadata,
     },
     source::table_is_allowed,
 };
 
 use super::{
-    build_cdc_poll_sql, compare_lsn, is_sqlserver_cdc_window_error, lsn_bytes_to_hex,
-    lsn_hex_to_bytes, now_millis, query, tx_id_from_seqval, validate_capture_instance_name,
     CaptureInstanceMeta, SqlServerRawChange, SqlServerRawTruncate, SqlServerStreamHandle,
-    ZERO_LSN_HEX,
+    ZERO_LSN_HEX, build_cdc_poll_sql, compare_lsn, is_sqlserver_cdc_window_error, lsn_bytes_to_hex,
+    lsn_hex_to_bytes, now_millis, query, tx_id_from_seqval, validate_capture_instance_name,
 };
 
 impl SqlServerStreamHandle {
@@ -663,7 +662,7 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
 
 #[cfg(test)]
 mod window_advance_tests {
-    use super::{compare_lsn, SqlServerStreamHandle};
+    use super::{SqlServerStreamHandle, compare_lsn};
 
     /// LSNs are 10 bytes, compared big-endian. Only the tail matters for these cases.
     fn lsn(tail: u8) -> [u8; 10] {

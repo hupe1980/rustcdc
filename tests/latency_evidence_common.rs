@@ -38,8 +38,8 @@ use std::{
     fs,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering::SeqCst},
         Arc,
+        atomic::{AtomicU64, Ordering::SeqCst},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };

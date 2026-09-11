@@ -66,30 +66,30 @@ pub mod protobuf;
 pub mod schema_registry;
 
 #[cfg(feature = "avro")]
-pub use avro::{avro_value_to_event, AvroDecoder, AvroEncoder, AVRO_SCHEMA};
+pub use avro::{AVRO_SCHEMA, AvroDecoder, AvroEncoder, avro_value_to_event};
 #[cfg(feature = "cloudevents")]
 pub use cloudevents::CloudEventsEncoder;
 pub use json::{JsonCodec, JsonEncoder, JsonPrettyEncoder};
 #[cfg(feature = "protobuf")]
 pub use protobuf::{ProtoEventKey, ProtobufEncoder};
+#[cfg(feature = "apicurio")]
+pub use schema_registry::ApicurioRegistryConfig;
 #[cfg(feature = "glue")]
 pub use schema_registry::glue;
 #[cfg(feature = "glue")]
 pub use schema_registry::glue::{GlueAvroConfig, GlueAvroDecoder, GlueAvroEncoder};
-#[cfg(feature = "apicurio")]
-pub use schema_registry::ApicurioRegistryConfig;
 #[cfg(feature = "schemreg")]
 pub use schema_registry::{
-    decode_wire_format, detect_wire_format, encode_wire_format, preflight_schema_registry,
-    warm_schema_cache, AnySchemaCache, CachedSchemaRegistry, CompatibilityLevel,
-    ConfluentAvroCodec, ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
+    AnySchemaCache, CachedSchemaRegistry, CompatibilityLevel, ConfluentAvroCodec,
+    ConfluentAvroDecoder, ConfluentAvroEncoder, ConfluentJsonSchemaCodec,
     ConfluentJsonSchemaDecoder, ConfluentJsonSchemaEncoder, ConfluentProtobufDecoder,
-    ConfluentProtobufEncoder, ConfluentSchemaRegistry, DecodedMessage, DetectedWireFormat,
-    DynSchemaRegistryClient, EncodeTarget, RetryPolicy, SchemaDecoder, SchemaEncoder, SchemaFormat,
-    SchemaId, SchemaReference, SchemaRegError, SchemaRegistryAuth, SchemaRegistryClient,
-    SchemaRegistryConfig, SchemaType, SchemaVersion, SubjectNameStrategy, WireFormatDecoder,
-    DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF, DEFAULT_MAX_RETRIES, EVENT_JSON_SCHEMA,
-    KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA, KEY_PROTO_SCHEMA,
+    ConfluentProtobufEncoder, ConfluentSchemaRegistry, DEFAULT_BASE_BACKOFF, DEFAULT_MAX_BACKOFF,
+    DEFAULT_MAX_RETRIES, DecodedMessage, DetectedWireFormat, DynSchemaRegistryClient,
+    EVENT_JSON_SCHEMA, EncodeTarget, KEY_AVRO_SCHEMA, KEY_JSON_SCHEMA, KEY_PROTO_SCHEMA,
+    PayloadDecoder, PayloadEncoder, RetryPolicy, SchemaFormat, SchemaId, SchemaReference,
+    SchemaRegError, SchemaRegistryAuth, SchemaRegistryClient, SchemaRegistryConfig, SchemaType,
+    SchemaVersion, SubjectNameStrategy, WireFormatDecoder, decode_wire_format, detect_wire_format,
+    encode_wire_format, preflight_schema_registry, warm_schema_cache,
 };
 
 use crate::core::{Event, Result};
@@ -538,7 +538,7 @@ mod tests {
     use super::*;
     use crate::codec::json::JsonEncoder;
     use crate::core::BeforeImage;
-    use crate::core::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+    use crate::core::{EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata};
 
     fn sample_event() -> Event {
         Event {

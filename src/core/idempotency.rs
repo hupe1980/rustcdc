@@ -389,10 +389,10 @@ mod tests {
     use serde_json::json;
 
     use crate::core::{
-        Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+        EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
     };
 
-    use super::{fingerprint_event_stable, fingerprint_event_transient, EventIdempotencyGuard};
+    use super::{EventIdempotencyGuard, fingerprint_event_stable, fingerprint_event_transient};
 
     fn make_event(offset: &str, tx_event_index: Option<u32>) -> Event {
         Event {

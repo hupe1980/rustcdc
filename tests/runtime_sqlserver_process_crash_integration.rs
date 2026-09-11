@@ -7,10 +7,10 @@ use std::{
 };
 
 use rustcdc::{
+    CdcRuntime, RuntimeConfig, RuntimeSourceConfig,
     checkpoint::{Checkpoint, FileCheckpoint, GenericOffset},
     core::Operation,
     schema_history::InMemorySchemaHistory,
-    CdcRuntime, RuntimeConfig, RuntimeSourceConfig,
 };
 #[cfg(feature = "encryption")]
 use rustcdc::{
@@ -60,8 +60,8 @@ async fn runtime_sqlserver_process_kill_replays_uncommitted_batch() -> rustcdc::
 }
 
 #[tokio::test]
-async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
-) -> rustcdc::Result<()> {
+async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch()
+-> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver snapshot crash-resume integration test") {
         return Ok(());
     }
@@ -210,8 +210,8 @@ async fn runtime_sqlserver_process_kill_resumes_snapshot_after_committed_batch(
 
 #[cfg(feature = "encryption")]
 #[tokio::test]
-async fn runtime_sqlserver_process_kill_replays_uncommitted_batch_with_encryption_transform(
-) -> rustcdc::Result<()> {
+async fn runtime_sqlserver_process_kill_replays_uncommitted_batch_with_encryption_transform()
+-> rustcdc::Result<()> {
     run_sqlserver_process_kill_replay_scenario(true).await
 }
 

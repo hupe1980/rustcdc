@@ -1,12 +1,12 @@
 use crate::{
     core::{
-        BeforeImage, Error, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
-        EVENT_ENVELOPE_VERSION,
+        BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SnapshotMetadata,
+        SourceMetadata,
     },
     source::helpers::now_millis,
 };
 
-use super::{PostgresSnapshotHandle, DEFAULT_SNAPSHOT_CHUNK_SIZE};
+use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, PostgresSnapshotHandle};
 
 /// Split a configured table name into `(schema, bare_table)`.
 ///
@@ -222,12 +222,11 @@ pub(super) async fn next_postgres_snapshot_chunk(
 
     if !events.is_empty() {
         let final_chunk = handle.is_complete();
-        if final_chunk {
-            if let Some(last) = events.last_mut() {
-                if let Some(snapshot) = last.snapshot.as_mut() {
-                    snapshot.is_last_chunk = true;
-                }
-            }
+        if final_chunk
+            && let Some(last) = events.last_mut()
+            && let Some(snapshot) = last.snapshot.as_mut()
+        {
+            snapshot.is_last_chunk = true;
         }
         handle.next_chunk_index += 1;
     }

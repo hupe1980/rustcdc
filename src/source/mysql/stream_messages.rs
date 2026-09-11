@@ -1,13 +1,13 @@
 use crate::{
     core::{
-        BeforeImage, Event, Operation, SourceMetadata, TransactionMetadata, EVENT_ENVELOPE_VERSION,
+        BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
     },
     source::table_is_allowed,
 };
 
 use super::{
-    parser::format_mysql_source_offset, query::merge_gtid_into_set, MysqlBinlogMessage,
-    MysqlRowChange, MysqlStreamHandle,
+    MysqlBinlogMessage, MysqlRowChange, MysqlStreamHandle, parser::format_mysql_source_offset,
+    query::merge_gtid_into_set,
 };
 
 impl MysqlStreamHandle {

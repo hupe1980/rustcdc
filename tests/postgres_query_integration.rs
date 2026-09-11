@@ -10,14 +10,14 @@
 #![cfg(feature = "postgres")]
 
 use rustcdc::{
+    PostgresConnection, PostgresSourceConfig,
     checkpoint::{FileCheckpoint, PostgresOffset},
     source::Source,
-    PostgresConnection, PostgresSourceConfig,
 };
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 // ── Shared helpers ────────────────────────────────────────────────────────────

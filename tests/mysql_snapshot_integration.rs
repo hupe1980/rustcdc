@@ -1,9 +1,9 @@
 #![cfg(feature = "mysql")]
 
 use rustcdc::{
+    MysqlConnection, MysqlSourceConfig, TransportConfig,
     checkpoint::{Checkpoint, FileCheckpoint},
     source::Source,
-    MysqlConnection, MysqlSourceConfig, TransportConfig,
 };
 use std::sync::OnceLock;
 
@@ -11,13 +11,13 @@ use std::sync::OnceLock;
 mod rustls_provider_common;
 use rustls_provider_common::install_rustls_provider;
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 use tokio::{
     sync::Mutex,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 
 fn mysql_snapshot_test_lock() -> &'static Mutex<()> {
@@ -209,15 +209,15 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
     // Validate no duplicates via PK set
     let mut pk_set = std::collections::HashSet::new();
     for event in &snapshot_events {
-        if let Some(after) = &event.after {
-            if let Some(id_val) = after.get("id") {
-                let id_str = id_val.to_string();
-                assert!(
-                    pk_set.insert(id_str.clone()),
-                    "duplicate PK detected: {}",
-                    id_str
-                );
-            }
+        if let Some(after) = &event.after
+            && let Some(id_val) = after.get("id")
+        {
+            let id_str = id_val.to_string();
+            assert!(
+                pk_set.insert(id_str.clone()),
+                "duplicate PK detected: {}",
+                id_str
+            );
         }
     }
 

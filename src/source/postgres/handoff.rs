@@ -3,7 +3,7 @@ use crate::{
     source::HandoffResult,
 };
 
-use super::{now_millis, PostgresHandoff};
+use super::{PostgresHandoff, now_millis};
 
 pub(super) fn postgres_handoff_result(
     snapshot_end_ts: Option<u64>,

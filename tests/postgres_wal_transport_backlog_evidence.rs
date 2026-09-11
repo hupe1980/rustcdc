@@ -27,11 +27,11 @@
 
 use std::time::{Duration, Instant};
 
-use rustcdc::{source::Source, Operation, PostgresConnection, PostgresSourceConfig, WalTransport};
+use rustcdc::{Operation, PostgresConnection, PostgresSourceConfig, WalTransport, source::Source};
 use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
 };
 
 /// Rows captured per measured run.
@@ -156,10 +156,10 @@ async fn measure(
         events += captured;
         // Confirm as a real consumer would: this is what advances `confirmed_flush_lsn` and,
         // for the peek transport, what determines where emission starts on the next poll.
-        if let Some(last) = batch.last() {
-            if let Ok(lsn) = parse_lsn(&last.source.offset) {
-                stream.confirm_lsn(lsn).await?;
-            }
+        if let Some(last) = batch.last()
+            && let Ok(lsn) = parse_lsn(&last.source.offset)
+        {
+            stream.confirm_lsn(lsn).await?;
         }
     }
 
