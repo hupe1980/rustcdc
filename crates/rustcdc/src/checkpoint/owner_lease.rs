@@ -427,8 +427,10 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
         // Use OpenProcess with SYNCHRONIZE (0x00100000) to probe existence.
         // Returns a non-null handle when the PID exists (even without full access).
         // Falls back to conservatively assuming alive on unexpected errors.
+        // `unsafe extern` is required by Rust 2024: declaring a foreign signature is
+        // itself the unsafe act, because nothing checks it against the real symbol.
         #[allow(unsafe_code)]
-        extern "system" {
+        unsafe extern "system" {
             fn OpenProcess(
                 dwDesiredAccess: u32,
                 bInheritHandle: i32,

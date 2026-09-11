@@ -17,6 +17,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings fail the build. Clippy is already run with `-D warnings` on Linux and macOS,
+  # but `cargo check` on Windows is the only lane that compiles the `#[cfg(windows)]` code
+  # at all — so without this, a warning (or an edition change that only that code trips
+  # over) reaches a pull request as green.
+  RUSTFLAGS: "-D warnings"
+
 jobs:
   # `rust-version` in Cargo.toml is a promise to downstream consumers. Without a job
   # pinned to it, the promise is only ever tested against whatever `stable` happens to be,
@@ -924,7 +932,7 @@ jobs:
     runs-on: ubuntu-24.04
     defaults:
       run:
-        working-directory: server
+        working-directory: crates/rustcdc-server
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

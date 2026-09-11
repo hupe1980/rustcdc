@@ -162,6 +162,12 @@ pub struct InMemorySchemaHistory {
 #[derive(Debug, Clone)]
 pub struct FileSchemaHistory {
     path: Arc<PathBuf>,
+    /// POSIX permission bitmask applied to every file this store creates.
+    ///
+    /// Read only under `#[cfg(unix)]` — Windows has no equivalent to narrow, and the
+    /// store is a no-op there rather than silently creating world-readable files under a
+    /// setting that looks applied.
+    #[cfg_attr(not(unix), allow(dead_code))]
     file_mode: u32,
     schemas: Arc<RwLock<SchemaStore>>,
     /// RAII guard that removes the `.owner` file when the last clone is dropped.
@@ -489,6 +495,12 @@ impl FileSchemaHistory {
         )))
     }
 
+    /// Apply `file_mode` to a freshly created file.
+    ///
+    /// A no-op off Unix: `file_mode` is a POSIX permission bitmask and Windows has no
+    /// equivalent to narrow. The parameter is `cfg`-renamed rather than prefixed with an
+    /// underscore so the Unix signature keeps its real name.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn apply_file_mode(&self, file: &fs::File) -> Result<()> {
         #[cfg(unix)]
         {

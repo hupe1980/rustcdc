@@ -313,6 +313,49 @@ require_file_present() {
 # silently dropped both texts from the `.crate` — the metadata still claimed the licences
 # while the artefact no longer contained them. Copies are the only option cargo offers;
 # this is what stops the copies drifting from the originals.
+# Every path a workflow names must exist.
+#
+# A `working-directory:`, a local `uses: ./…` or a script path that points at a directory
+# the repository does not have fails **only when that job runs** — on a pull request, in a
+# lane that may be slow or rarely reached, with an error from bash rather than from
+# anything that reads like a path problem:
+#
+#   An error occurred trying to start process '/usr/bin/bash' with working directory
+#   '/home/runner/work/rustcdc/rustcdc/server'. No such file or directory
+#
+# That is what a rename leaves behind when the search-and-replace only matched the form
+# with a trailing slash. This is the cheap check that would have caught it before the push.
+run_workflow_path_check() {
+  local failed=0
+
+  while IFS= read -r hit; do
+    local file value
+    file="${hit%%:*}"
+    value="$(printf '%s' "$hit" | sed -E 's/.*:[[:space:]]*//')"
+    # Absolute paths are created by the job itself (`/tmp/digests`), not by the repository.
+    case "$value" in /*) continue ;; esac
+    if [[ ! -e "$value" ]]; then
+      echo "FAIL: ${file} names a path that does not exist: ${value}" >&2
+      failed=1
+    fi
+  done < <(rg -n --no-heading -e '^\s*working-directory:\s*\S+' .github/workflows/ || true)
+
+  while IFS= read -r hit; do
+    local file value
+    file="${hit%%:*}"
+    value="$(printf '%s' "$hit" | sed -E 's/.*uses:[[:space:]]*//; s/@.*//')"
+    if [[ ! -e "$value" ]]; then
+      echo "FAIL: ${file} uses a local action that does not exist: ${value}" >&2
+      failed=1
+    fi
+  done < <(rg -n --no-heading -e '^\s*-?\s*uses:\s*\./' .github/workflows/ || true)
+
+  if [[ "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  echo "Workflow path check passed (every referenced path exists)."
+}
+
 run_licence_presence_check() {
   local failed=0
 
@@ -752,6 +795,7 @@ run_schema_contract_check
 run_deprecated_usage_check
 run_async_trait_policy_check
 run_cargo_profile_safety_check
+run_workflow_path_check
 run_licence_presence_check
 run_workflow_drift_check
 
