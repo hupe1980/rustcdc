@@ -333,6 +333,38 @@ require_file_present() {
 #
 # `lib:` the library · `server:` the binary · `workspace:` both · `release:` the tag
 # pipeline. `CI` is the aggregator branch protection requires and is deliberately bare.
+run_bench_invocation_check() {
+  # Every documented `cargo bench` in this repository was wrong, and silently so.
+  #
+  # Benchmarks build in the release profile, where the guard in `fault_injection` rejects
+  # `test-harnesses` — and `rustcdc-server` dev-depends on `rustcdc` with that feature, so
+  # cargo's feature unification turns it on for any unscoped build. Two bench targets are
+  # also named `throughput`, one per crate, so `--bench throughput` is ambiguous. Six
+  # documents and four `//!` headers told the reader to run a command that cannot work,
+  # and CI ran one too. `cargo xtask bench` carries the hatch and the `-p`.
+  #
+  # Allowed to say `cargo bench`: the xtask that wraps it, the gate that scopes it, the
+  # instructions that explain why not to, and CHANGELOG.md, which is a record of what was
+  # true when written and is not rewritten.
+  local hits
+  hits="$(rg -n --no-heading -e 'cargo bench' \
+    --glob '!target/**' \
+    --glob '!CHANGELOG.md' \
+    --glob '!crates/xtask/src/main.rs' \
+    --glob '!scripts/ci-benchmark-gate.sh' \
+    --glob '!scripts/ci-policy-gate.sh' \
+    --glob '!.github/copilot-instructions.md' \
+    . | grep -v 'cargo xtask bench' || true)"
+
+  if [[ -n "$hits" ]]; then
+    echo "FAIL: bare \`cargo bench\` is not a working command in this repository." >&2
+    echo "Use \`cargo xtask bench\` (add \`-p <crate> --bench <name>\` to narrow):" >&2
+    printf '%s\n' "$hits" >&2
+    exit 1
+  fi
+  echo "Bench invocation check passed (no bare \`cargo bench\` outside its wrapper)."
+}
+
 run_job_naming_check() {
   local failed=0
 
@@ -827,6 +859,7 @@ run_deprecated_usage_check
 run_async_trait_policy_check
 run_cargo_profile_safety_check
 run_job_naming_check
+run_bench_invocation_check
 run_workflow_path_check
 run_licence_presence_check
 run_workflow_drift_check

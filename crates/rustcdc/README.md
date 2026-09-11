@@ -397,7 +397,7 @@ Most benchmarks are in-process microbenchmarks with no connector I/O — a regre
 the transform and codec paths, not a throughput claim. One is not:
 
 ```bash
-cargo bench --bench throughput
+cargo xtask bench -p rustcdc --bench throughput
 ```
 
 `throughput` drives the **whole runtime** — poll, idempotency guard, transforms, sink, ack

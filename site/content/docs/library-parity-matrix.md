@@ -152,7 +152,7 @@ Recorded here rather than left implicit, because a matrix that only lists wins i
 | Snowflake has no container-backed evidence | Every other connector is pinned against a real server in CI. Snowflake has no self-hostable implementation, so its statement text and result-set shape are unverified against a live account — [stated in full](@/docs/snowflake.md#evidence-and-the-gap-in-it) |
 | No pgoutput `'M'` logical-decoding message support | Debezium decodes these; they are the tableless outbox pattern on PostgreSQL |
 
-An end-to-end throughput figure is no longer on this list: `cargo bench --bench throughput`
+An end-to-end throughput figure is no longer on this list: `cargo xtask bench -p rustcdc --bench throughput`
 drives the whole runtime — poll, guard, transforms, sink, ack, commit barrier, durable
 checkpoint — and reports events per second, with the database excluded on purpose so the
 number measures the library rather than someone's laptop. Figures and method:

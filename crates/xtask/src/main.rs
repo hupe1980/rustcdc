@@ -62,6 +62,11 @@ const TASKS: &[Task] = &[
         run: |args| script("ci-benchmark-gate.sh", args),
     },
     Task {
+        name: "bench",
+        about: "Build (--no-run) or run the workspace benchmarks. Extra args go to cargo.",
+        run: bench,
+    },
+    Task {
         name: "pull-images",
         about: "Pre-pull the database images the integration matrix uses.",
         run: |args| script("ci-pull-relational-images.sh", args),
@@ -109,6 +114,64 @@ fn usage() {
     println!("\nEvery task runs from the repository root, whatever directory you invoke it from.");
 }
 
+/// The cfg that opens the `test-harnesses` release guard for benchmark builds.
+///
+/// `src/fault_injection/mod.rs` refuses to compile when `test-harnesses` is on and
+/// `debug_assertions` is off, so that fault injection cannot reach a shipped binary.
+/// `cargo bench` is a release-profile build, and `rustcdc-server` dev-depends on
+/// `rustcdc` with `test-harnesses`; cargo unifies features across the packages it
+/// builds, so the feature arrives whether or not the bench wants it. A bench harness is
+/// never shipped, so the guard has nothing to protect here.
+const BENCH_HATCH: &str = "--cfg rustcdc_optimised_test_harnesses";
+
+/// Benchmarks, with the release guard opened and the package scoping cargo needs.
+///
+/// This exists so the hatch has exactly one spelling. It previously lived only in a
+/// comment in the root `Cargo.toml`, every caller was expected to retype it, and the
+/// release-evidence CI job did not — which is how an unbuildable benchmark reached main.
+fn bench(args: &[String]) -> Result<(), String> {
+    let root = workspace_root()?;
+
+    // RUSTFLAGS is one string, not a list: setting it in CI (`-D warnings`) and setting
+    // it here would be mutually exclusive, so append rather than replace.
+    let rustflags = match std::env::var("RUSTFLAGS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {BENCH_HATCH}"),
+        _ => BENCH_HATCH.to_string(),
+    };
+
+    // `--workspace --benches` alone silently skips targets with `required-features`, so
+    // a bench could rot unnoticed; `--all-features` is what makes this a real check.
+    let default_args = ["--workspace", "--benches", "--all-features"];
+    let mut command = Command::new("cargo");
+    command
+        .arg("bench")
+        .current_dir(&root)
+        .env("RUSTFLAGS", &rustflags);
+    if args.is_empty() {
+        command.args(default_args);
+    } else {
+        command.args(args);
+    }
+
+    let status = command
+        .status()
+        .map_err(|error| format!("could not run cargo bench: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo bench exited with {status}"))
+    }
+}
+
+/// The repository root, whatever directory `cargo xtask` was invoked from.
+fn workspace_root() -> Result<std::path::PathBuf, String> {
+    Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .ok_or("cannot locate the workspace root")?
+        .to_path_buf())
+}
+
 /// Run one of the shell gates, from the repository root.
 ///
 /// `cargo` sets `CARGO_MANIFEST_DIR` to this crate, so the root is two levels up. That is
@@ -116,11 +179,7 @@ fn usage() {
 /// root, and a contributor invoking one from `crates/rustcdc/` would otherwise get a
 /// confusing "no such file" from inside the script rather than from the caller.
 fn script(name: &str, args: &[String]) -> Result<(), String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .ok_or("cannot locate the workspace root")?
-        .to_path_buf();
+    let root = workspace_root()?;
     let path = root.join("scripts").join(name);
     if !path.exists() {
         return Err(format!("{} does not exist", path.display()));

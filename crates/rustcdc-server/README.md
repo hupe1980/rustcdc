@@ -518,7 +518,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo deny check --all-features
 
 # Throughput (real batch path; saves/compares a criterion baseline)
-cargo bench --bench throughput -- --save-baseline main
+cargo xtask bench -p rustcdc-server --bench throughput -- --save-baseline main
 
 # End-to-end against a real PostgreSQL (manages its own container; needs Docker)
 RUSTCDC_INTEGRATION=1 cargo test --all-features --test integration_postgres -- --test-threads=1

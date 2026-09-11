@@ -17,12 +17,13 @@
 // applies to *every* member, and quietly turns assertions on inside the library's own
 // throughput benchmark, the one number an operator quotes.
 //
-// The hatch is deliberately awkward and deliberately explicit:
+// The hatch is deliberately awkward and deliberately explicit — a `--cfg` in RUSTFLAGS,
+// which cannot be reached by adding a feature to a dependency list, the accident this
+// guard exists to catch.
 //
-//     RUSTFLAGS='--cfg rustcdc_optimised_test_harnesses' cargo bench
-//
-// It cannot be reached by adding a feature to a dependency list, which is the accident
-// this guard exists to catch.
+// Do not retype it: `cargo xtask bench` sets it, and also scopes the build to one package,
+// which cargo needs because two bench targets share the name `throughput`. When the
+// spelling lived only in comments, the CI job that builds benchmarks did not have it.
 #[cfg(all(
     feature = "test-harnesses",
     not(debug_assertions),
@@ -32,8 +33,8 @@ compile_error!(
     "The `test-harnesses` feature must not be enabled in release builds. \
      Remove it from your production feature set, or scope it to \
      `[profile.test]` / `[profile.dev]` in Cargo.toml only. \
-     To benchmark code that legitimately needs the harnesses, build with \
-     RUSTFLAGS='--cfg rustcdc_optimised_test_harnesses'."
+     To benchmark code that legitimately needs the harnesses, run `cargo xtask bench`, \
+     or build with RUSTFLAGS='--cfg rustcdc_optimised_test_harnesses'."
 );
 
 /// Checkpoint-store fault injection.

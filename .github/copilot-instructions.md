@@ -43,7 +43,11 @@ Also run when relevant:
 
 - Touched the library's public API, or any published `.md`: `cargo test -p rustcdc --doc --all-features`
 - Touched the library's file layout, `build.rs`, or anything it reads: `cargo package -p rustcdc --locked`
-- Touched benchmarks or release evidence: `cargo xtask benchmark-gate`, `cargo xtask evidence`
+- Touched benchmarks: `cargo xtask bench --no-run` to compile them, `cargo xtask benchmark-gate`
+  to compare against the baseline. Never plain `cargo bench`: benchmarks are a release-profile
+  build and `test-harnesses` arrives through a dev-dependency, which the guard in
+  `fault_injection` rejects. `xtask bench` opens the documented hatch and scopes the package.
+- Touched release evidence: `cargo xtask evidence`
 - Touched latency evidence: `cargo xtask latency-gate`
 - Touched dependencies: `cargo deny check`
 

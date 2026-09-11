@@ -347,7 +347,7 @@ separate Docker-backed latency harness described under [Coverage Areas](#coverag
 
 ### End-to-end runtime throughput
 
-One benchmark is not a microbenchmark. `cargo bench --bench throughput` drives the **whole
+One benchmark is not a microbenchmark. `cargo xtask bench -p rustcdc --bench throughput` drives the **whole
 runtime** — source poll, idempotency guard, transform pipeline, sink, ack token, commit
 barrier, durable checkpoint write — over a synthetic source, and reports events per second.
 

@@ -631,9 +631,9 @@ Throughput is measured, not asserted. `benches/throughput.rs` drives the real ba
 `benches/BASELINES.md` carries the numbers and what they mean.
 
 ```bash
-cargo bench --bench throughput -- --save-baseline main
+cargo xtask bench -p rustcdc-server --bench throughput -- --save-baseline main
 # …change something…
-cargo bench --bench throughput -- --baseline main
+cargo xtask bench -p rustcdc-server --bench throughput -- --baseline main
 ```
 
 The figures are hardware-specific and the full-pipeline one is fsync-dominated, so the

@@ -13,12 +13,12 @@
 //! through, not an end-to-end pipeline run. An end-to-end number is dominated by the
 //! sink's network behaviour and is not reproducible in CI; these are.
 //!
-//! Run with `cargo bench`. To compare against a saved baseline:
+//! Run with `cargo xtask bench`. To compare against a saved baseline:
 //!
 //! ```text
-//! cargo bench -- --save-baseline main
+//! cargo xtask bench -p rustcdc-server --bench pipeline -- --save-baseline main
 //! # ...make a change...
-//! cargo bench -- --baseline main
+//! cargo xtask bench -p rustcdc-server --bench pipeline -- --baseline main
 //! ```
 //!
 //! Criterion reports a regression when the median moves outside its noise threshold.

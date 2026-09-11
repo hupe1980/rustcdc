@@ -1,10 +1,11 @@
 # Benchmark baselines
 
-Recorded on the maintainer's machine (Apple Silicon, `darwin 25.5.0`), `cargo bench`
-with `[profile.bench]` as committed (`opt-level = 3`, `debug-assertions = true`).
+Recorded on the maintainer's machine (Apple Silicon, `darwin 25.5.0`) with
+`cargo xtask bench`, under `[profile.bench]` as committed (`opt-level = 3`,
+debug assertions off).
 
 **These numbers are hardware-specific.** Use them for order-of-magnitude sanity, not as
-CI thresholds — take a local baseline with `cargo bench -- --save-baseline main` and
+CI thresholds — take a local baseline with `cargo xtask bench -- --save-baseline main` and
 compare against that.
 
 | Benchmark | Median | Per event | Notes |

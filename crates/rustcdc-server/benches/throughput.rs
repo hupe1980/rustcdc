@@ -27,9 +27,9 @@
 //! Take a baseline before changing anything:
 //!
 //! ```text
-//! cargo bench --bench throughput -- --save-baseline main
+//! cargo xtask bench -p rustcdc-server --bench throughput -- --save-baseline main
 //! # …make a change…
-//! cargo bench --bench throughput -- --baseline main
+//! cargo xtask bench -p rustcdc-server --bench throughput -- --baseline main
 //! ```
 //!
 //! Numbers are hardware-specific; see `benches/BASELINES.md`. The gate that matters is the

@@ -84,6 +84,7 @@ cargo test -p rustcdc --lib --all-features         # the library
 cargo test -p rustcdc-server --lib --all-features  # the server
 cargo xtask                                        # the repository's gates, listed
 cargo xtask policy-gate                            # the one a pull request must pass
+cargo xtask bench                                  # benchmarks (never plain `cargo bench`)
 ```
 
 ## License
