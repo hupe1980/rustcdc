@@ -292,8 +292,71 @@ pub fn assert_sample_is_meaningful(summary: &LatencySummary, min_samples: u64) {
     );
 }
 
+/// The workspace's target directory.
+///
+/// Derived from the test executable, not from the working directory. Cargo runs an
+/// integration test with its CWD set to the **package** root, so a relative
+/// `Path::new("target")` resolves under `crates/rustcdc/` — while `ci-latency-gate.sh`
+/// runs from the workspace root and reads `target/`. The two agreed only while the
+/// library *was* the workspace root; afterwards the suite passed, wrote its artifacts
+/// where nothing looked, and the gate failed with "missing latency artifact" about files
+/// that had just been written.
+///
+/// `current_exe()` is `<target>/<profile>/deps/<test>-<hash>`, so three levels up is the
+/// target directory itself — correct for any profile and any `CARGO_TARGET_DIR`.
+fn workspace_target_dir() -> rustcdc::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
+    exe.parent()
+        .and_then(|deps| deps.parent())
+        .and_then(|profile| profile.parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            rustcdc::Error::StateError(
+                "cannot locate the target directory from the test executable".into(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod artifact_location_tests {
+    use super::workspace_target_dir;
+
+    /// The artifacts must land where `ci-latency-gate.sh` reads them.
+    ///
+    /// The gate runs from the workspace root and opens `target/<connector>-latency-
+    /// evidence.json`. Cargo runs this test with its CWD set to the *package* root, so a
+    /// relative path would resolve under `crates/rustcdc/` — the suite would pass, write
+    /// nothing the gate can see, and the gate would report the files missing.
+    #[test]
+    fn artifacts_are_written_to_the_workspace_target_directory() {
+        let target = workspace_target_dir().expect("target directory");
+
+        assert_eq!(
+            target.file_name().and_then(|n| n.to_str()),
+            Some("target"),
+            "expected the target directory itself, got {}",
+            target.display()
+        );
+
+        // The workspace root is the target directory's parent, and it is the directory
+        // holding the virtual manifest — not a crate.
+        let root = target.parent().expect("workspace root");
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "{} should hold the workspace manifest",
+            root.display()
+        );
+        assert!(
+            root.join("crates").is_dir(),
+            "{} should be the workspace root, not a crate directory",
+            root.display()
+        );
+    }
+}
+
 pub fn write_latency_artifacts(prefix: &str, summary: &LatencySummary) -> rustcdc::Result<()> {
-    let target_dir = Path::new("target");
+    let target_dir = workspace_target_dir()?;
+    let target_dir = target_dir.as_path();
     fs::create_dir_all(target_dir).map_err(rustcdc::Error::IoError)?;
 
     let json_path = target_dir.join(format!("{prefix}-latency-evidence.json"));

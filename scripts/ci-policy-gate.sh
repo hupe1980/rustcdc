@@ -325,6 +325,37 @@ require_file_present() {
 #
 # That is what a rename leaves behind when the search-and-replace only matched the form
 # with a trailing slash. This is the cheap check that would have caught it before the push.
+# Every job must say which half of the workspace it covers.
+#
+# GitHub shows a job's `name:` in the checks list, falling back to the job id. Without a
+# scope prefix a reader sees `Check`, `Test` and `Fuzz (smoke)` and cannot tell the library
+# from the server — which is exactly how a red check gets attributed to the wrong half.
+#
+# `lib:` the library · `server:` the binary · `workspace:` both · `release:` the tag
+# pipeline. `CI` is the aggregator branch protection requires and is deliberately bare.
+run_job_naming_check() {
+  local failed=0
+
+  while IFS= read -r hit; do
+    local file value
+    file="${hit%%:*}"
+    value="$(printf '%s' "$hit" | sed -E 's/.*name:[[:space:]]*//; s/^"//; s/"$//')"
+    case "$value" in
+      lib:*|server:*|workspace:*|release:*|CI) ;;
+      *)
+        echo "FAIL: ${file}: job name \"${value}\" has no scope prefix \
+(lib: / server: / workspace: / release:)" >&2
+        failed=1
+        ;;
+    esac
+  done < <(rg -n --no-heading -e '^    name:' .github/workflows/ci.yml .github/workflows/release.yml || true)
+
+  if [[ "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  echo "Job naming check passed (every job names the half it covers)."
+}
+
 run_workflow_path_check() {
   local failed=0
 
@@ -795,6 +826,7 @@ run_schema_contract_check
 run_deprecated_usage_check
 run_async_trait_policy_check
 run_cargo_profile_safety_check
+run_job_naming_check
 run_workflow_path_check
 run_licence_presence_check
 run_workflow_drift_check

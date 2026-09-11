@@ -36,6 +36,7 @@ jobs:
   # started failing, and nothing said which of the two values was wrong.
   # `crates/rustcdc-server/tests/architecture.rs` asserts this job derives rather than restates.
   msrv:
+    name: "workspace: MSRV"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,6 +66,7 @@ jobs:
         run: cargo check -p rustcdc-server --all-targets --all-features --locked
 
   check:
+    name: "lib: check (${{ matrix.os }} · ${{ matrix.rust }} · ${{ matrix.profile.name }})"
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +103,7 @@ jobs:
           cargo build --example uppercase_transform
 
   quality:
+    name: "workspace: fmt, clippy, rustdoc (${{ matrix.os }} · ${{ matrix.rust }})"
     strategy:
       fail-fast: false
       matrix:
@@ -155,6 +158,7 @@ jobs:
         run: cargo test -p rustcdc --doc --all-features
 
   transport-security:
+    name: "lib: TLS feature matrix"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -176,6 +180,7 @@ jobs:
         run: cargo test -p rustcdc --lib --features snowflake
 
   policy-gate:
+    name: "workspace: policy gate"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -203,6 +208,7 @@ jobs:
         run: cargo deny check
 
   docs-site:
+    name: "workspace: docs site"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -226,6 +232,7 @@ jobs:
           retention-days: 7
 
   correctness-smoke:
+    name: "lib: correctness smoke"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -261,6 +268,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
   reliability-core:
+    name: "lib: reliability (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -280,6 +288,7 @@ jobs:
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   latency-core:
+    name: "lib: latency evidence"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -297,6 +306,7 @@ jobs:
         run: bash scripts/ci-latency-gate.sh
 
   integration-postgres:
+    name: "lib: PostgreSQL (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -379,6 +389,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres --bins
 
   integration-postgres-encryption:
+    name: "lib: PostgreSQL + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -394,6 +405,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
 
   integration-reliability:
+    name: "lib: reliability, live (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -425,6 +437,7 @@ jobs:
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   integration-schema-registry:
+    name: "lib: schema registry"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -442,6 +455,7 @@ jobs:
         run: cargo test -p rustcdc --test schema_registry_live_integration --features schemreg,apicurio,avro -- --test-threads=1
 
   integration-mysql:
+    name: "lib: MySQL (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -486,6 +500,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql --bins
 
   integration-mysql-encryption:
+    name: "lib: MySQL + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -501,6 +516,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
 
   integration-mariadb:
+    name: "lib: MariaDB (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -527,6 +543,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb --bins
 
   integration-mariadb-encryption:
+    name: "lib: MariaDB + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -542,6 +559,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
 
   integration-sqlserver:
+    name: "lib: SQL Server (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -584,6 +602,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
   integration-sqlserver-encryption:
+    name: "lib: SQL Server + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -599,6 +618,7 @@ jobs:
         run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 
   release-evidence:
+    name: "workspace: release evidence"
     if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     needs:
       - msrv
@@ -743,6 +763,7 @@ jobs:
   # already burned. Running it here means a broken package fails the pull request that
   # broke it.
   package:
+    name: "lib: cargo package"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -775,7 +796,7 @@ jobs:
   # runs only on a tag. One platform is enough for a smoke test; the release matrix
   # covers both natively.
   container-smoke:
-    name: Container image builds
+    name: "server: container image builds"
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -803,7 +824,7 @@ jobs:
   # Prefixed `server-` so a red check names which half of the workspace broke.
   # ── Check (all targets, all features) ───────────────────────────────────────
   server-check:
-    name: Check
+    name: "server: check"
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -826,7 +847,7 @@ jobs:
   # `--no-default-features` alone is deliberately absent: it is a `compile_error!` (see
   # `crates/rustcdc-server/src/lib.rs`), because a binary with no connector rejects every configuration.
   server-connector-matrix:
-    name: Check (${{ matrix.features }})
+    name: "server: check (${{ matrix.features }})"
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -845,7 +866,7 @@ jobs:
 
   # ── Test ────────────────────────────────────────────────────────────────────
   server-test:
-    name: Test
+    name: "server: test"
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -875,7 +896,7 @@ jobs:
   # suite and forgetting to wire it up fails the unit suite rather than silently reporting
   # success — which is what an env-gated test that nobody runs does.
   server-integration:
-    name: Integration (${{ matrix.suite }}${{ matrix.broker && format(' / {0}', matrix.broker) || '' }})
+    name: "server: integration (${{ matrix.suite }}${{ matrix.broker && format(' · {0}', matrix.broker) || '' }})"
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -928,7 +949,7 @@ jobs:
   # `crates/rustcdc-server/fuzz` is excluded from the workspace (it needs nightly and `cargo fuzz`), so
   # this runs from that directory rather than the repository root.
   server-fuzz:
-    name: Fuzz (smoke)
+    name: "server: fuzz (smoke)"
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -961,7 +982,7 @@ jobs:
   #
   # A skipped dependency is accepted; a failed or cancelled one is not.
   required-checks-passed:
-    name: CI
+    name: "CI"
     if: always()
     needs:
       - msrv

@@ -125,6 +125,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
             "--features",
             "sqlserver,metrics",
         ])
+        // Correct as-is: cargo finds the workspace from any member directory.
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
         .map_err(|error| {
@@ -138,12 +139,9 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let service_name = format!("sqlserver-to-otel-example-{}", std::process::id());
-    let binary = format!(
-        "{}/target/debug/examples/sqlserver_to_otel",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let binary = example_binary("sqlserver_to_otel")?;
 
-    let child = Command::new(binary)
+    let child = Command::new(&binary)
         .env("CDC_RS_SQLSERVER_HOST", &sql_host)
         .env("CDC_RS_SQLSERVER_PORT", sql_port.to_string())
         .env("CDC_RS_SQLSERVER_USER", "sa")
@@ -294,4 +292,33 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
     );
 
     Ok(())
+}
+
+/// Locate a built example binary.
+///
+/// Derived from the test executable rather than from `CARGO_MANIFEST_DIR`: in a workspace
+/// the target directory belongs to the **workspace root**, not to the crate, so
+/// `{CARGO_MANIFEST_DIR}/target/...` resolves under `crates/rustcdc/` — a path that does
+/// not exist. The failure surfaces as a bare `No such file or directory` from `spawn`,
+/// naming nothing.
+///
+/// `current_exe()` is `<target>/<profile>/deps/<test>-<hash>`, so two levels up is the
+/// profile directory whatever the profile is and wherever `CARGO_TARGET_DIR` points.
+fn example_binary(name: &str) -> rustcdc::Result<std::path::PathBuf> {
+    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
+    let profile_dir = test_exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .ok_or_else(|| {
+            rustcdc::Error::StateError("cannot locate the target profile directory".into())
+        })?;
+
+    let candidate = profile_dir.join("examples").join(name);
+    if !candidate.exists() {
+        return Err(rustcdc::Error::StateError(format!(
+            "example binary not found at {}; `cargo build --example {name}` must run first",
+            candidate.display()
+        )));
+    }
+    Ok(candidate)
 }

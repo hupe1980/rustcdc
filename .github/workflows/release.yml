@@ -71,7 +71,7 @@ jobs:
   # On `workflow_dispatch` this job runs and the publishing jobs below do not, which
   # makes a dispatch a dry run of the gate itself.
   verify:
-    name: Verify the tag is releasable
+    name: "release: verify the tag is releasable"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -154,7 +154,7 @@ jobs:
             }
 
   container-build:
-    name: Build ${{ matrix.platform }}
+    name: "release: build image (${{ matrix.platform }})"
     needs: verify
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
@@ -245,7 +245,7 @@ jobs:
   # Job 2 of 2 — merge per-platform digests into a single multi-arch manifest
   # ─────────────────────────────────────────────────────────────────────────────
   container-publish:
-    name: Merge multi-arch manifest
+    name: "release: push multi-arch image"
     needs: container-build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
@@ -308,7 +308,7 @@ jobs:
   # can never be replaced or reused, so it happens only after the image is already live
   # and every other gate has gone green.
   publish-crate:
-    name: Publish to crates.io
+    name: "release: publish rustcdc to crates.io"
     needs: container-publish
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -347,7 +347,7 @@ jobs:
   # both artefacts do. The notes are the `CHANGELOG.md` section for this version,
   # extracted rather than written again, so the release page and the file cannot disagree.
   github-release:
-    name: GitHub release
+    name: "release: GitHub release"
     needs: publish-crate
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
