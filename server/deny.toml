@@ -1,0 +1,271 @@
+# cargo-deny policy (https://embarkstudios.github.io/cargo-deny/)
+# Run: cargo deny check
+# CI: add `cargo deny check` to the pre-release gate.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# ── Advisories ────────────────────────────────────────────────────────────────
+[advisories]
+# Deny any crate with an unmitigated security advisory.
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # RUSTSEC-2024-0436: paste 1.x — proc-macro soundness issue, no safe upgrade available.
+    # Risk: compile-time only; no runtime code executed from paste macros in our codebase.
+    # Blocked until upstream paste releases a fixed version.
+    { id = "RUSTSEC-2024-0436" },
+
+    # RUSTSEC-2023-0071: rsa 0.9.x — Marvin timing side-channel in PKCS#1 v1.5 decryption.
+    # No safe upgrade available. Affected path: rsa <- reqsign-azure-storage <-
+    # opendal-service-azblob <- opendal, i.e. only Azure request signing. Nothing here
+    # performs RSA decryption. Remove when reqsign releases against rsa >= 0.10.
+    { id = "RUSTSEC-2023-0071" },
+
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained (since August 2025).
+    # cdc-server no longer parses PEM through it — the admin TLS loader moved to
+    # `rustls_pki_types::pem::PemObject` — but two transitive paths remain:
+    #   * rustls-pemfile 2.2.0 <- axum-server 0.7 (`tls-rustls` feature), for the
+    #     admin HTTPS listener. Present in every build.
+    #   * rustls-pemfile 1.0.4 <- rustls-native-certs 0.6.3 <- tiberius 0.12
+    #     <- rustcdc's `sqlserver` feature. Present only under `--features sqlserver`.
+    # Both parse files this process supplies, never network input. Remove when
+    # axum-server and tiberius move to rustls-pki-types.
+    { id = "RUSTSEC-2025-0134" },
+
+    # RUSTSEC-2026-0098 / -0099 / -0104: rustls-webpki 0.101.x — URI name-constraint
+    # and wildcard-name-constraint acceptance, plus a CRL parsing panic.
+    #
+    # **These three are absent from a default build.** Sole path: rustls-webpki 0.101.7
+    # <- rustls 0.21 <- tokio-rustls 0.24 <- tiberius 0.12 <- rustcdc's `sqlserver`
+    # feature, which is now opt-in (`--features sqlserver`). A PostgreSQL or MySQL
+    # deployment links exactly one rustls (0.23) and one webpki, and
+    # `cargo deny check advisories` on such a build reports all three as
+    # `advisory-not-detected` — that warning is the intended, load-bearing signal that
+    # the narrow build really is narrow, and `the_default_build_has_one_tls_stack`
+    # asserts it.
+    #
+    # They stay listed because CI audits `--all-features`, where the path does exist.
+    # Under that build they affect only the SQL Server connector's TLS — not the admin
+    # listener and not any sink — and none of the three is reachable without name
+    # constraints or CRLs in the chain. Blocked until tiberius releases against a
+    # current rustls; delete these three when it does, or when `sqlserver` is dropped.
+    { id = "RUSTSEC-2026-0098" },
+    { id = "RUSTSEC-2026-0099" },
+    { id = "RUSTSEC-2026-0104" },
+
+    # RUSTSEC-2026-0194 / -0195: quick-xml < 0.41 — quadratic duplicate-attribute
+    # scanning and unbounded namespace-declaration allocation (both DoS-class; no
+    # memory unsafety). Path: quick-xml 0.39.4 <- opendal-core 0.57. Exposure is
+    # limited to XML responses from the *configured* S3/Azure endpoints, not arbitrary
+    # input. Remove when opendal moves to quick-xml >= 0.41 (it already pulls 0.41
+    # elsewhere in the graph).
+    { id = "RUSTSEC-2026-0194" },
+    { id = "RUSTSEC-2026-0195" },
+]
+
+# ── Licenses ──────────────────────────────────────────────────────────────────
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    # MIT-0: MIT No Attribution (OSI approved; strictly more permissive than MIT).
+    # Used by borrow-or-share (via fluent-uri -> jsonschema -> schemreg -> rustcdc).
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    # CDLA-Permissive-2.0: Community Data License Agreement Permissive.
+    # Used by webpki-roots (trusted root CA certificates bundle).
+    # Permissive — permits use, reproduction, modification, and redistribution.
+    "CDLA-Permissive-2.0",
+    # BSL-1.0: Boost Software License. OSI-approved and FSF Free/Libre; permissive,
+    # with no attribution requirement for binary distribution. Used by xxhash-rust
+    # (via redis <- opendal's Redis state backend).
+    "BSL-1.0",
+]
+
+[[licenses.clarify]]
+# ring uses a custom OpenSSL-adjacent license — pre-approved.
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ── Bans ──────────────────────────────────────────────────────────────────────
+[bans]
+# Deny duplicate major versions of the same crate to prevent supply-chain
+# confusion; use `skip` to allow intentional duplication with justification.
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+# Crates that must never appear in the dependency graph.
+deny = [
+    # Deprecated / unmaintained TLS backends.
+    { name = "native-tls" },
+    { name = "openssl-sys" },
+    # Avoid the unsound `atty` crate (GHSA-g98v-hv3f-hcfr).
+    { name = "atty" },
+    # Prefer tokio channels; remove crossbeam if it sneaks in.
+    # { name = "crossbeam-channel" },
+]
+
+# ── Skip justification guide ───────────────────────────────────────────────
+# To audit new duplicates:  cargo tree -d 2>/dev/null | grep '(*)'
+# To see why a crate is duplicated: cargo tree -d -i <crate-name>
+# Every skip entry must cite the root-cause dependency in a group comment.
+# Remove entries when the upstream diamond is resolved.
+# ──────────────────────────────────────────────────────────────────────────
+skip = [
+    # RustCrypto generation split: rustcdc 0.8 moved to the 0.11/0.6 generation
+    # (aes-gcm 0.11, sha2 0.11, hkdf 0.13) while iceberg 0.10 still pins aes-gcm 0.10
+    # for its Puffin/KMS encryption. Both are pure-Rust AEAD implementations of the
+    # same primitive; neither can move without its parent. Revisit when iceberg-rust
+    # upgrades aes-gcm.
+    { name = "aead" },
+    { name = "aes" },
+    { name = "aes-gcm" },
+    { name = "cipher" },
+    { name = "ctr" },
+    { name = "ghash" },
+    { name = "hkdf" },
+    { name = "inout" },
+    { name = "polyval" },
+    { name = "universal-hash" },
+    # sha1: mysql_common 0.37 (rustcdc) uses 0.10; reqsign-aws-core 3.x (opendal S3
+    # signing) uses 0.11. SHA-1 here is protocol framing — MySQL native auth and AWS
+    # SigV4 canonicalisation — not a security decision either crate makes.
+    { name = "sha1" },
+    # reqwest: iceberg 0.10 pins 0.12; opendal-core 0.57 moved to 0.13. Both are
+    # configured rustls-only by their parents. Resolves when iceberg follows opendal.
+    { name = "reqwest" },
+    # wasmparser / wasm-encoder / logos*: wasmtime 47's own tooling crates
+    # (wasm-compose, wast) lag the version rustcdc pins directly. Compile-time and
+    # module-validation only.
+    { name = "logos" },
+    { name = "logos-codegen" },
+    { name = "logos-derive" },
+    { name = "wasmparser" },
+    # petgraph / fixedbitset: wasm-compose (a wasmtime 47 tooling crate) pins petgraph
+    # 0.6, which brings fixedbitset 0.4; the rest of the tree is on petgraph 0.8. Graph
+    # data structures used at module-composition time only.
+    { name = "petgraph" },
+    { name = "fixedbitset" },
+    # unicode-width: clap 4 uses 0.2; older diagnostics crates in the wasmtime tree
+    # use 0.1. Display-width tables only.
+    { name = "unicode-width" },
+    # http / http-body: the AWS SDK's generated service crates still carry the http 0.2
+    # generation; aws-config and everything else here are on http 1. Type definitions
+    # only — the hyper 0.14 half of this diamond went away when the AWS crates stopped
+    # being pulled with `features = ["rustls"]`, which is `legacy-rustls-ring`.
+    # Resolves when the AWS SDK finishes its migration.
+    { name = "http" },
+    { name = "http-body" },
+    # Crypto / TLS version diamonds.
+    # Root causes (re-verified against the rustcdc 0.8 / krafka 0.15 / iceberg 0.10
+    # graph — `cargo tree -i <crate>@<version> --target all -e all`):
+    #   - rustls / tokio-rustls / rustls-native-certs / rustls-pemfile / rustls-webpki /
+    #       webpki-roots / const-oid / core-foundation / security-framework:
+    #       tiberius 0.12 (rustcdc's `sqlserver` feature) still pins the rustls 0.21
+    #       stack; everything else in the tree is on rustls 0.23. See the matching
+    #       advisory ignores above — this is the single diamond worth closing.
+    #   - base64: opendal/reqsign are on 0.23; older transitive crates on 0.21/0.22
+    #   - sha2 / hmac / md-5 / digest / block-buffer / crypto-common / cpufeatures:
+    #       the RustCrypto 0.10→0.11 generation change; rustcdc 0.8 moved, its
+    #       transitive deps (mysql_common, tiberius) have not
+    #   - rand / rand_chacha / rand_core / getrandom: 0.8 vs 0.9 split across the
+    #       database drivers and the newer crates
+    #   - hashbrown: indexmap 1.x vs 2.x diamond
+    { name = "base64" },
+    { name = "block-buffer" },
+    { name = "const-oid" },
+    { name = "core-foundation" },
+    { name = "cpufeatures" },
+    { name = "crypto-common" },
+    { name = "digest" },
+    { name = "getrandom" },
+    { name = "hashbrown" },
+    { name = "hmac" },
+    { name = "md-5" },
+    { name = "rand" },
+    { name = "rand_chacha" },
+    { name = "rand_core" },
+    { name = "rustls" },
+    { name = "rustls-native-certs" },
+    { name = "rustls-pemfile" },
+    { name = "rustls-webpki" },
+    { name = "security-framework" },
+    { name = "sha2" },
+    { name = "tokio-rustls" },
+    { name = "webpki-roots" },
+    # Miscellaneous minor version diamonds in shared utilities.
+    # Root causes:
+    #   - darling / darling_core / darling_macro: proc-macro crates used by both
+    #       old and new serde/derive crates in the graph
+    #   - itertools / ordered-float: iceberg-rust and opendal disagree on the minor
+    #   - openssl-probe: rustls-native-certs 0.6 (tiberius) vs 0.8 (rustcdc/krafka)
+    #   - quick-xml: opendal-core 0.57 pulls 0.39 for S3/Azure XML while another
+    #       branch of the graph is already on 0.41
+    #   - socket2: older tokio vs newer tokio/hyper version split
+    #   - serde_spanned / toml / toml_datetime / winnow: figment uses toml 0.5.x;
+    #       other crates use toml 0.8.x
+    #   - thiserror / thiserror-impl: macro + runtime split from old vs new anyhow
+    #       transitive chains (safe — no runtime code, pure proc-macro crate)
+    #   - foldhash: hashbrown 0.14 vs 0.15 internal hasher change
+    { name = "darling" },
+    { name = "darling_core" },
+    { name = "darling_macro" },
+    { name = "foldhash" },
+    { name = "itertools" },
+    { name = "openssl-probe" },
+    { name = "ordered-float" },
+    { name = "quick-xml" },
+    { name = "serde_spanned" },
+    { name = "socket2" },
+    { name = "thiserror" },
+    { name = "thiserror-impl" },
+    { name = "toml" },
+    { name = "toml_datetime" },
+    { name = "winnow" },
+    # Compression / wasm-tooling diamonds: lz4_flex and wasm-encoder are pulled at
+    # different minors by krafka's LZ4 codec, iceberg's parquet, and wasmtime's own
+    # tooling crates; whoami by two independent telemetry paths.
+    { name = "lz4_flex" },
+    { name = "wasm-encoder" },
+    { name = "whoami" },
+    # miniz_oxide: apache-avro 0.21 depends on 0.8 directly for its deflate codec, while
+    # every other DEFLATE user in the tree — krafka, parquet, mysql_common, schemreg, zip
+    # — reaches 0.9 through flate2 1.1. One pure-Rust implementation of one format at two
+    # minors. Resolves when apache-avro follows flate2.
+    { name = "miniz_oxide" },
+    # syn 2.x vs 3.x: proc-macro ecosystem mid-transition; both versions are
+    # compile-time only.
+    { name = "syn" },
+    # prettyplease: the same transition one layer up. 0.2 arrives through prost-build and
+    # tonic-build, which run in the Zerobus SDK's build script; 0.3 through bon-macros via
+    # apache-avro. It pretty-prints generated code at build time and no part of either
+    # copy is linked into the binary.
+    { name = "prettyplease" },
+    # num-bigint: redis 1.7 — reached through opendal's `services-redis`, which backs the
+    # Redis state store — moved to 0.5 while the rest of the tree is still on 0.4:
+    # arrow-buffer and parquet, apache-avro through bigdecimal, mysql_common, and
+    # jsonschema through schemreg. Arbitrary-precision integer arithmetic, no unsafe
+    # surface on either side. Resolves when those follow redis.
+    { name = "num-bigint" },
+]
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

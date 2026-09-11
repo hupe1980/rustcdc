@@ -1,0 +1,114 @@
+# Zola configuration for the rustcdc-server site.
+#
+# Build:  zola --root site build
+# Serve:  zola --root site serve
+# Check:  zola --root site check   (validates every internal and external link)
+#
+# `base_url` must match where the site is actually served, because it is what the
+# canonical URL, the sitemap and the Open Graph tags are built from — all three are
+# silently wrong if it drifts. Change it here and nowhere else; no template hard-codes
+# a host. For a custom domain, set it here and add `static/CNAME`.
+base_url = "https://hupe1980.github.io/rustcdc-server"
+
+title = "rustcdc"
+description = "Open-source change data capture in Rust. Stream row-level changes from PostgreSQL, MySQL, MariaDB and SQL Server to Kafka, Iceberg, HTTP or files."
+
+# UK spelling throughout the prose; this only affects Zola's own slug generation.
+default_language = "en"
+
+compile_sass = true
+
+# Powers the client-side documentation search. Zola emits an elasticlunr index at
+# build time, so search needs no server, no third-party service and no request that
+# leaves the reader's browser.
+build_search_index = true
+
+# Every `@/…md` link is resolved at build time, so a renamed page fails the build
+# instead of shipping a 404. This is the whole reason internal links use that syntax
+# rather than plain relative paths.
+[link_checker]
+internal_level = "error"
+external_level = "warn"
+
+[markdown]
+# Heading anchors are how deep links into the reference pages stay stable.
+insert_anchor_links = "heading"
+# Off: the reference pages are full of ASCII operators and quoted TOML, and turning
+# `"` into typographic quotes inside prose that discusses literal syntax is a hazard.
+smart_punctuation = false
+# `> [!NOTE]` and friends render as callouts, which several pages already use in spirit.
+github_alerts = true
+external_links_target_blank = false
+external_links_no_referrer = true
+
+[markdown.highlighting]
+# Solarized-dark reads well against both the light and dark page themes, which keeps one
+# highlighting theme rather than shipping two stylesheets and switching between them.
+theme = "solarized-dark"
+
+[search]
+include_title = true
+include_description = true
+include_path = true
+# Truncated, not omitted: the full body of `configuration.md` alone would dominate the
+# index and make the first load noticeably slower on a phone.
+truncate_content_length = 400
+
+[extra]
+repo = "https://github.com/hupe1980/rustcdc-server"
+repo_name = "hupe1980/rustcdc-server"
+ghcr = "https://github.com/hupe1980/rustcdc-server/pkgs/container/rustcdc-server"
+# Shown in the header and in the structured data. Bump with the release.
+version = "0.6.0"
+rust_version = "1.94.1"
+# Used for the Open Graph and Twitter card images.
+og_image = "/og.png"
+author = "hupe1980"
+
+# Left-hand documentation navigation. Declared here rather than derived from the
+# filesystem so the order is editorial — "getting started" before "reference" — instead
+# of alphabetical.
+[[extra.nav]]
+title = "Introduction"
+[[extra.nav.pages]]
+title = "Getting started"
+path = "/docs/getting-started/"
+[[extra.nav.pages]]
+title = "Core concepts"
+path = "/docs/concepts/"
+
+[[extra.nav]]
+title = "Reference"
+[[extra.nav.pages]]
+title = "Configuration"
+path = "/docs/configuration/"
+[[extra.nav.pages]]
+title = "WASM transforms"
+path = "/docs/transforms/"
+
+[[extra.nav]]
+title = "Connectors"
+[[extra.nav.pages]]
+title = "PostgreSQL"
+path = "/docs/connectors/postgres/"
+[[extra.nav.pages]]
+title = "MySQL / MariaDB"
+path = "/docs/connectors/mysql/"
+[[extra.nav.pages]]
+title = "SQL Server"
+path = "/docs/connectors/sqlserver/"
+
+[[extra.nav]]
+title = "Running it"
+[[extra.nav.pages]]
+title = "Operations"
+path = "/docs/operations/"
+[[extra.nav.pages]]
+title = "Runbook"
+path = "/docs/runbook/"
+
+[[extra.nav]]
+title = "Engineering"
+[[extra.nav.pages]]
+title = "How defects are prevented"
+path = "/docs/engineering/"

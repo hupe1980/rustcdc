@@ -1,0 +1,111 @@
+api_version       = "v1"
+delivery_contract = "at_least_once"
+
+# Initial snapshot: emit one "read" event per existing row before streaming.
+snapshot_tables = ["public.customers", "public.products", "public.orders"]
+
+# ── Source: PostgreSQL ────────────────────────────────────────────────────────
+
+[source.postgres]
+host                  = "postgres"       # Docker Compose service name
+port                  = 5432
+user                  = "cdc_user"
+password              = { env = "RUSTCDC_DEMO_SOURCE_PASSWORD" }
+database              = "demo"
+replication_slot_name = "cdc_demo_slot"
+publication_name      = "cdc_demo_pub"
+
+# Demo-only: let the connector create the slot on first boot (rustcdc ≥ 0.7.0
+# no longer creates slots implicitly — a slot that vanishes mid-life is a
+# data-loss event, and recreating it silently would skip everything in between).
+# In production, provision the slot out of band and leave this at false.
+create_replication_slot_if_missing = true
+
+# Periodically advance the slot when the database is idle so PostgreSQL can
+# recycle WAL (default 30 000 ms; 0 disables — not recommended).
+slot_idle_advance_interval_ms = 30000
+
+conn_timeout_secs     = 10
+stream_poll_interval_ms = 100
+max_events_per_poll   = 1000
+table_include_list    = ["public.customers", "public.products", "public.orders"]
+table_exclude_list    = []
+
+[source.postgres.transport]
+mode = "plaintext"   # no TLS needed for same-Docker-network connections
+
+# ── Sink: stdout ──────────────────────────────────────────────────────────────
+# Each captured event is printed as a JSON line.
+
+[sink]
+type = "stdout"
+
+# ── Transforms ────────────────────────────────────────────────────────────────
+# Native masking: customer e-mail is redacted before it reaches any sink, and
+# the name is replaced by a keyed HMAC so rows stay joinable without being
+# re-identifiable. The key comes from the environment — a literal here would be
+# rejected at load, because a key in the config file makes every value it masked
+# re-identifiable for as long as that file exists.
+
+[[pipeline.transforms]]
+name = "redact_customer_pii"
+
+  [pipeline.transforms.when]
+  tables = ["customers"]
+
+  [[pipeline.transforms.actions]]
+  type = "mask"
+
+    [pipeline.transforms.actions.rules]
+    email = { type = "redact", placeholder = "***@redacted" }
+    name  = { type = "hmac_sha256", key = { env = "RUSTCDC_DEMO_PII_KEY" } }
+
+# ── State ─────────────────────────────────────────────────────────────────────
+# Stored on a Docker named volume — restarts resume from the saved checkpoint.
+
+[state]
+dir = "/var/lib/rustcdc"
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+
+[runtime]
+max_buffer_size                    = 1000
+max_poll_wait_ms                   = 100
+max_event_bytes                    = 1048576
+sink_flush_interval_events         = 1       # flush every event for demo visibility
+transform_error_policy             = "halt"
+post_commit_source_confirm_policy  = "fail_fast"
+
+[runtime.source_connection_retry]
+enabled         = true
+max_retries     = 5
+initial_delay_ms = 300
+max_delay_ms    = 10000
+
+# ── Admin API ─────────────────────────────────────────────────────────────────
+# /livez, /readyz, /status, /metrics on port 8080.
+#
+# Bind all interfaces: Docker's port mapping forwards to the container's eth0,
+# so a loopback-only bind would be unreachable from the host. A non-loopback
+# bind requires admin tokens — the demo tokens live in compose.yml (demo only;
+# use a secret manager in production).
+
+[admin]
+bind            = "0.0.0.0:8080"
+probe_auth_mode = "require_read_token"        # non-loopback bind ⇒ probes need the token too
+read_token_env  = "RUSTCDC_ADMIN_READ_TOKEN"  # /livez, /readyz, /status, /metrics
+write_token_env = "RUSTCDC_ADMIN_WRITE_TOKEN" # signal endpoints
+# Write-capable signaling requires a durable notification channel.
+notification_log_file = "/var/lib/rustcdc/admin-notifications.jsonl"
+
+# A non-loopback admin bind also requires TLS. The demo image bakes a
+# self-signed cert (CN=localhost) — hence `curl -k` in the README.
+[admin.tls]
+cert_file = "/etc/rustcdc/tls/admin-cert.pem"
+key_file  = "/etc/rustcdc/tls/admin-key.pem"
+
+# ── Observability ─────────────────────────────────────────────────────────────
+
+[observability]
+service_name = "rustcdc-demo"
+

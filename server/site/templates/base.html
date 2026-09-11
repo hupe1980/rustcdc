@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en" prefix="og: https://ogp.me/ns#">
+<head>
+  {% block head %}{% include "partials/head.html" %}{% endblock head %}
+</head>
+<body class="{% block body_class %}{% endblock body_class %}">
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  {% include "partials/header.html" %}
+
+  <main id="content">
+    {% block content %}{% endblock content %}
+  </main>
+
+  {% include "partials/footer.html" %}
+
+  <script src="{{ get_url(path='theme.js', cachebust=true) }}" defer></script>
+  {% block scripts %}{% endblock scripts %}
+</body>
+</html>

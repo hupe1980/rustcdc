@@ -1,0 +1,32 @@
+{# `current_path` is set by whichever template includes this, so the active item is
+   highlighted on both section and page templates without duplicating the loop. #}
+<aside class="docs-sidebar" id="docs-sidebar">
+  <div class="sidebar-search">
+    <label class="visually-hidden" for="search-input">Search the documentation</label>
+    <input type="search" id="search-input" placeholder="Search docs…" autocomplete="off"
+           spellcheck="false" aria-describedby="search-hint">
+    <p id="search-hint" class="visually-hidden">Results appear as you type.</p>
+    <div id="search-results" role="listbox" aria-label="Search results" hidden></div>
+  </div>
+
+  <nav class="sidebar-nav" aria-label="Documentation">
+    <a class="sidebar-home{% if current_path == '/docs/' %} is-active{% endif %}"
+       href="{{ get_url(path='/docs/') }}">Overview</a>
+
+    {% for group in config.extra.nav %}
+      <div class="sidebar-group">
+        <h2>{{ group.title }}</h2>
+        <ul>
+          {% for item in group.pages %}
+            <li>
+              <a href="{{ get_url(path=item.path) }}"
+                 {% if current_path == item.path %}class="is-active" aria-current="page"{% endif %}>
+                {{ item.title }}
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endfor %}
+  </nav>
+</aside>

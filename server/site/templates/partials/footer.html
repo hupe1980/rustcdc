@@ -1,0 +1,31 @@
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <div class="footer-brand">
+      <strong>rustcdc</strong>
+      <p>Change data capture in Rust. Dual-licensed Apache-2.0 / MIT.</p>
+    </div>
+
+    <nav class="footer-links" aria-label="Documentation">
+      <h2>Documentation</h2>
+      <a href="{{ get_url(path='/docs/getting-started/') }}">Getting started</a>
+      <a href="{{ get_url(path='/docs/concepts/') }}">Core concepts</a>
+      <a href="{{ get_url(path='/docs/configuration/') }}">Configuration</a>
+      <a href="{{ get_url(path='/docs/transforms/') }}">WASM transforms</a>
+    </nav>
+
+    <nav class="footer-links" aria-label="Connectors">
+      <h2>Connectors</h2>
+      <a href="{{ get_url(path='/docs/connectors/postgres/') }}">PostgreSQL</a>
+      <a href="{{ get_url(path='/docs/connectors/mysql/') }}">MySQL / MariaDB</a>
+      <a href="{{ get_url(path='/docs/connectors/sqlserver/') }}">SQL Server</a>
+    </nav>
+
+    <nav class="footer-links" aria-label="Project">
+      <h2>Project</h2>
+      <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+      <a href="{{ config.extra.ghcr }}" rel="noopener">Container image</a>
+      <a href="{{ config.extra.repo }}/issues" rel="noopener">Issues</a>
+      <a href="{{ get_url(path='/docs/runbook/') }}">Runbook</a>
+    </nav>
+  </div>
+</footer>
