@@ -685,6 +685,24 @@ for bench in "${gated_benches[@]}"; do
   fi
 done
 
+# Leave a baseline behind for the next commit to be measured against.
+#
+# The gate can only detect a regression if its baseline came from a different commit, so
+# each run has to record one. Criterion compares against a *named* baseline, and the one
+# restored at the start of this run belongs to the previous commit — re-saving it here
+# under this commit's measurements is what makes the chain work. Whoever restores it next
+# is comparing against a commit that genuinely predates them.
+#
+# Only after the gate has passed: caching a baseline from a run that failed would make
+# the regression the new normal and hide it from every commit after.
+if [[ "${BENCHMARK_REFRESH_BASELINE:-0}" == "1" && -n "${CRITERION_BASELINE:-}" ]]; then
+  echo
+  for bench in "${gated_benches[@]}"; do
+    echo "Recording '${CRITERION_BASELINE}' for ${bench} at this commit, for the next run to compare against..."
+    run_bench "$bench" "target/benchmark-ci-gate-refresh-${bench}.txt" save
+  done
+fi
+
 echo "criterion_baseline_bootstrap_fallback_benches=${benchmark_fallback_benches:-none}" >> target/benchmark-ci-env.txt
 
 emit_benchmark_report

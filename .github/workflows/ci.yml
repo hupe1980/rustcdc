@@ -723,16 +723,44 @@ jobs:
       - name: cargo deny check (advisories + licenses + bans + sources)
         run: cargo deny check
 
-      - name: clear stale criterion baseline cache
-        run: |
-          # Remove any Criterion baseline cached from a prior crate version
-          # (Swatinem/rust-cache persists target/ across Cargo.lock-stable runs).
-          # Clearing here forces ensure_named_baseline to bootstrap against the
-          # current commit so the gate compares like-for-like.
-          rm -rf target/criterion
+      # `Swatinem/rust-cache` restores all of `target/`, including a `target/criterion`
+      # from some unrelated run. Drop it, so the only baseline in play is the one the
+      # next step restores against a commit we can name.
+      - name: drop any unkeyed criterion baseline
+        run: rm -rf target/criterion
+
+      # The baseline for the commit this run is measured against.
+      #
+      # Restoring it is what lets the gate detect anything at all. Without it
+      # `ensure_named_baseline` bootstraps from HEAD and the gate compares the commit
+      # against itself, which cannot show a regression and — because the bootstrap pass
+      # is reliably the fastest — reports them anyway.
+      #
+      # A miss is normal and not an error: the gate notices it has no historical
+      # baseline, says so in the evidence, and enforces nothing that run. The save below
+      # then seeds this commit, so the next one has a real baseline to beat.
+      - name: restore criterion baseline for the comparison commit
+        id: criterion-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ runner.os }}-${{ env.BENCHMARK_BASELINE_COMMIT }}
 
       - name: benchmark policy gate
+        env:
+          # Re-save the named baseline from this commit once the gate has passed.
+          BENCHMARK_REFRESH_BASELINE: "1"
         run: bash scripts/ci-benchmark-gate.sh
+
+      # Keyed on this commit, which is what a later run names as its baseline commit.
+      # `success()` only: a baseline saved from a failed run would make the regression
+      # the new normal and hide it from every commit after.
+      - name: save criterion baseline for this commit
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-${{ runner.os }}-${{ github.sha }}
 
       # Warm every image the matrix instantiates, from the ECR public mirror rather than
       # rate-limited Docker Hub.
