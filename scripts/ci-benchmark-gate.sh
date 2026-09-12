@@ -172,7 +172,11 @@ emit_benchmark_report() {
       echo
     fi
     if [[ -n "$benchmark_fallback_benches" ]]; then
-      echo "> NOTICE: Criterion baseline auto-bootstrap fallback was used for: ${benchmark_fallback_benches}."
+      echo "> WARNING: no historical Criterion baseline existed for: ${benchmark_fallback_benches}."
+      echo ">"
+      echo "> Their baseline was bootstrapped from this same commit, so the comparison"
+      echo "> above is this commit against itself — run-to-run repeatability, not a"
+      echo "> regression check against \`baseline_commit\`, which was never benchmarked."
       echo
     fi
     echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -431,8 +435,15 @@ ensure_named_baseline() {
     return 0
   fi
 
+  # A bootstrapped baseline is measured from the *current* commit, so everything that
+  # follows compares this commit against itself. That is a repeatability check, not a
+  # regression check, and the evidence has to say so — `baseline_commit` in the report
+  # names a commit this run never benchmarked.
+  record_baseline_fallback_bench "$bench_name"
+
   local bootstrap_out="target/benchmark-ci-gate-bootstrap-${bench_name}.txt"
   echo "Bootstrapping missing Criterion baseline '${baseline_name}' for ${bench_name}..."
+  echo "  Note: it is measured from HEAD, so ${bench_name} is compared against itself."
   run_bench "$bench_name" "$bootstrap_out" save
 
   if ! criterion_named_baseline_exists "$baseline_name"; then
@@ -529,6 +540,14 @@ has_significant_critical_group_regression() {
   return "$found"
 }
 
+# Did this bench compare against a baseline measured in this very run?
+baseline_was_bootstrapped() {
+  case " $benchmark_fallback_benches " in
+    *" $1 "*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
 run_confirmation_bench() {
   local bench_name="$1"
   local run_index="$2"
@@ -536,18 +555,38 @@ run_confirmation_bench() {
   run_bench "$bench_name" "$out_file"
 }
 
-count_significant_critical_group_regressions() {
+# One line per (run, benchmark) that regressed past the threshold, deduplicated within a
+# run so a benchmark Criterion reports twice in one output still counts once.
+significant_critical_group_hits() {
   local threshold="$1"
   shift
-  local significant_count=0
   local file
   for file in "$@"; do
     [[ -f "$file" ]] || continue
-    if has_significant_critical_group_regression "$file" "$threshold"; then
-      significant_count=$((significant_count + 1))
-    fi
+    {
+      while IFS='|' read -r bench_name upper; do
+        [[ -z "$bench_name" ]] && continue
+        is_critical_group_bench "$bench_name" || continue
+        if awk -v val="$upper" -v limit="$threshold" 'BEGIN { exit (val + 0 >= limit + 0 ? 0 : 1) }'; then
+          echo "Significant critical-group regression: $bench_name (+$upper% >= +$threshold%)" >&2
+          echo "$bench_name"
+        else
+          echo "Ignoring minor critical-group regression marker: $bench_name (+$upper% < +$threshold%)" >&2
+        fi
+      done < <(collect_regressions "$file")
+    } | sort -u
   done
-  echo "$significant_count"
+}
+
+# "<runs> <benchmark>" for whichever critical-group benchmark regressed in the most runs.
+#
+# Counted per benchmark, not per run. The previous version asked only "did *something*
+# regress in this run" and summed that, which is the one thing the confirmation runs
+# exist to rule out: three different benchmarks each flaking once scored 3/4 and failed
+# the gate as "reproducible". A regression is reproducible when the *same* benchmark
+# regresses again — that is what the word means here.
+worst_repeated_critical_group_regression() {
+  significant_critical_group_hits "$@" | sort | uniq -c | sort -rn | head -1
 }
 
 echo "Running benchmark regression gate..."
@@ -568,6 +607,21 @@ for bench in "${gated_benches[@]}"; do
   ensure_named_baseline "$bench"
   run_bench "$bench" "$bench_raw_out"
 
+  # A commit cannot regress against itself. When the baseline was bootstrapped in this
+  # run there is no earlier commit in the comparison, so every delta is this machine's
+  # run-to-run variance — and that variance is not random: measured locally, the
+  # bootstrap pass is consistently the fastest, and `snapshot_10k_rows` then "regressed"
+  # in 3 of 3 confirmation runs against itself. Enforcing that would fail every release
+  # for a drift the gate itself created.
+  #
+  # The report says plainly that no regression check was performed, so this weakens the
+  # evidence without quietly weakening it.
+  if baseline_was_bootstrapped "$bench"; then
+    echo "Not enforcing regressions for ${bench}: its baseline was bootstrapped from this"
+    echo "same commit, so the comparison is run-to-run variance, not a regression."
+    continue
+  fi
+
   if rg -q "Performance has regressed\." "$bench_raw_out"; then
     echo "Potential benchmark regression detected for ${bench}; running confirmation set..."
     run_bench "$bench" "$bench_retry_out"
@@ -580,7 +634,10 @@ for bench in "${gated_benches[@]}"; do
       done
     fi
 
-    significant_runs="$(count_significant_critical_group_regressions "$regression_threshold" "${confirmation_outputs[@]}")"
+    worst_regression="$(worst_repeated_critical_group_regression "$regression_threshold" "${confirmation_outputs[@]}")"
+    significant_runs="$(awk '{ print $1 + 0 }' <<< "$worst_regression")"
+    significant_runs="${significant_runs:-0}"
+    worst_bench="$(awk '{ print $2 }' <<< "$worst_regression")"
 
     # Require a strict majority of confirmation runs to show a significant
     # critical-group regression before failing.  A hard-coded floor of 2 is
@@ -594,7 +651,7 @@ for bench in "${gated_benches[@]}"; do
 
     if [[ "$strict_mode" == "1" ]]; then
       if (( significant_runs >= required_for_regression )); then
-        echo "Benchmark regression gate failed: strict mode observed reproducible significant critical-group regressions (${bench}) in ${significant_runs}/${total_outputs} runs (required: ${required_for_regression})."
+        echo "Benchmark regression gate failed: '${worst_bench}' regressed past +${regression_threshold}% in ${significant_runs}/${total_outputs} runs (required: ${required_for_regression})."
         rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_raw_out" || true
         rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_retry_out" || true
         for out_file in "${confirmation_outputs[@]}"; do
@@ -604,7 +661,7 @@ for bench in "${gated_benches[@]}"; do
         exit 1
       fi
 
-      echo "Strict benchmark confirmation set for ${bench} did not show reproducible significant critical-group regressions (${significant_runs}/${total_outputs} runs, required ${required_for_regression}); treating initial marker as noise."
+      echo "No single critical-group benchmark in ${bench} regressed in ${required_for_regression} of ${total_outputs} runs (worst: ${worst_bench:-none} at ${significant_runs}); treating the initial marker as noise."
       continue
     fi
 
@@ -614,7 +671,7 @@ for bench in "${gated_benches[@]}"; do
     fi
 
     if (( significant_runs >= required_for_regression )); then
-      echo "Benchmark regression gate failed: criterion reported reproducible regressions for ${bench} on retry (${significant_runs}/${total_outputs} runs, required ${required_for_regression})."
+      echo "Benchmark regression gate failed: '${worst_bench}' regressed on retry in ${significant_runs}/${total_outputs} runs (required: ${required_for_regression})."
       rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_raw_out" || true
       rg -n "Performance has regressed\.|Change within noise threshold\.|No change in performance detected\." "$bench_retry_out" || true
       for out_file in "${confirmation_outputs[@]}"; do
