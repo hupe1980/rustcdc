@@ -589,6 +589,68 @@ worst_repeated_critical_group_regression() {
   significant_critical_group_hits "$@" | sort | uniq -c | sort -rn | head -1
 }
 
+# ── Catastrophe budgets ──────────────────────────────────────────────────────
+#
+# A ceiling per benchmark, in nanoseconds. No baseline, no cache, no comparison against
+# another run — just "this must still finish in roughly the time it always has".
+#
+# Percentages against a previous run needed a machine that measures the same way twice,
+# and a shared CI runner is not one: consecutive runs land on different hardware, and the
+# same benchmark swings tens of percent between passes on one laptop. That gate failed
+# releases at random and never caught anything.
+#
+# These are set at ~10x the median measured on a developer laptop, so a slower runner
+# under load still fits underneath comfortably. They catch a benchmark that broke — an
+# accidental O(n^2), a lock held across an await, a rebuild per row — and nothing subtler.
+# They are not performance targets, and tightening them turns this back into a flake.
+bench_budget_ns() {
+  case "$1" in
+    quality_perf/quality_gates/snapshot_10k_rows)        echo 2300000 ;;  # 229 µs measured
+    quality_perf/quality_gates/stream_1k_events_target)  echo 5200000 ;;  # 518 µs
+    cdc_perf/quality_gates/snapshot_10k_rows)            echo 2300000 ;;  # 224 µs
+    cdc_perf/quality_gates/stream_1k_events_target)      echo 7000000 ;;  # 692 µs
+    cdc_perf/wasm_transform/pass_through_single_event)   echo 20000 ;;    # 1.67 µs
+    cdc_perf/wasm_transform/pass_through_100_events)     echo 1700000 ;;  # 170 µs
+    *) echo "" ;;
+  esac
+}
+
+# Fail if any budgeted benchmark in this output blew its ceiling.
+check_bench_budgets() {
+  local in_file="$1" failed=0 bench median_ns budget
+  while IFS='|' read -r bench median_ns; do
+    budget="$(bench_budget_ns "$bench")"
+    [[ -n "$budget" ]] || continue
+    if (( median_ns > budget )); then
+      echo "FAIL: ${bench} took $(( median_ns / 1000 )) µs, ceiling is $(( budget / 1000 )) µs." >&2
+      failed=1
+    else
+      echo "  ok: ${bench} $(( median_ns / 1000 )) µs (ceiling $(( budget / 1000 )) µs)"
+    fi
+  done < <(bench_medians_ns "$in_file")
+  return "$failed"
+}
+
+# "<bench>|<median in whole ns>" for every benchmark in a Criterion output.
+bench_medians_ns() {
+  awk '
+    /^[^[:space:]]/ { bench = $1 }
+    /time:[[:space:]]+\[/ {
+      line = $0
+      sub(/^.*\[/, "", line)
+      sub(/\].*$/, "", line)
+      n = split(line, f, " ")
+      if (n < 6 || bench == "") next
+      value = f[3] + 0; unit = f[4]
+      if      (unit == "s")  value *= 1000000000
+      else if (unit == "ms") value *= 1000000
+      else if (unit ~ /s$/ && unit != "ns") value *= 1000   # µs, us
+      printf "%s|%d\n", bench, value
+    }
+  ' "$1"
+}
+
+budget_failures=0
 echo "Running benchmark regression gate..."
 echo "Policy: threshold=+$regression_threshold%, strict_mode=$strict_mode"
 for bench in "${gated_benches[@]}"; do
@@ -606,6 +668,12 @@ for bench in "${gated_benches[@]}"; do
 
   ensure_named_baseline "$bench"
   run_bench "$bench" "$bench_raw_out"
+
+  # The part of this gate that can actually fail a build. A fixed ceiling needs no
+  # baseline and no second machine, so it means the same thing everywhere.
+  if ! check_bench_budgets "$bench_raw_out"; then
+    budget_failures=1
+  fi
 
   # A commit cannot regress against itself. When the baseline was bootstrapped in this
   # run there is no earlier commit in the comparison, so every delta is this machine's
@@ -685,26 +753,15 @@ for bench in "${gated_benches[@]}"; do
   fi
 done
 
-# Leave a baseline behind for the next commit to be measured against.
-#
-# The gate can only detect a regression if its baseline came from a different commit, so
-# each run has to record one. Criterion compares against a *named* baseline, and the one
-# restored at the start of this run belongs to the previous commit — re-saving it here
-# under this commit's measurements is what makes the chain work. Whoever restores it next
-# is comparing against a commit that genuinely predates them.
-#
-# Only after the gate has passed: caching a baseline from a run that failed would make
-# the regression the new normal and hide it from every commit after.
-if [[ "${BENCHMARK_REFRESH_BASELINE:-0}" == "1" && -n "${CRITERION_BASELINE:-}" ]]; then
-  echo
-  for bench in "${gated_benches[@]}"; do
-    echo "Recording '${CRITERION_BASELINE}' for ${bench} at this commit, for the next run to compare against..."
-    run_bench "$bench" "target/benchmark-ci-gate-refresh-${bench}.txt" save
-  done
-fi
-
 echo "criterion_baseline_bootstrap_fallback_benches=${benchmark_fallback_benches:-none}" >> target/benchmark-ci-env.txt
 
 emit_benchmark_report
 
-echo "Benchmark regression gate passed: no reproducible critical-group regressions detected."
+if (( budget_failures )); then
+  echo
+  echo "Benchmark gate failed: a benchmark blew its ceiling (see the FAIL lines above)." >&2
+  echo "That is a tenfold margin, so this is a broken benchmark, not measurement noise." >&2
+  exit 1
+fi
+
+echo "Benchmark gate passed: every budgeted benchmark is within its ceiling."

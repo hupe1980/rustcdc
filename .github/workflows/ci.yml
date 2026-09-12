@@ -723,54 +723,31 @@ jobs:
       - name: cargo deny check (advisories + licenses + bans + sources)
         run: cargo deny check
 
-      # `Swatinem/rust-cache` restores all of `target/`, including a `target/criterion`
-      # from some unrelated run. Drop it, so the only baseline in play is the one the
-      # next step restores against a commit we can name.
-      - name: drop any unkeyed criterion baseline
+      # `Swatinem/rust-cache` restores all of `target/`, including a stale
+      # `target/criterion`. Drop it so each run measures from a clean slate.
+      - name: drop stale criterion data
         run: rm -rf target/criterion
 
-      # The baseline for the commit this run is measured against.
+      # Benchmarks are checked against fixed ceilings, not against a previous run.
       #
-      # Restoring it is what lets the gate detect anything at all. Without it
-      # `ensure_named_baseline` bootstraps from HEAD and the gate compares the commit
-      # against itself, which cannot show a regression and — because the bootstrap pass
-      # is reliably the fastest — reports them anyway.
+      # Comparing percentages across runs needs a machine that measures the same way
+      # twice. A GitHub hosted runner is not that: successive runs land on different
+      # hardware with different neighbours, and the same benchmark on a developer laptop
+      # swings 16-70% between passes. A gate built on that does not detect regressions,
+      # it fails releases at random — which is what it did, for as long as it existed.
       #
-      # A miss is normal and not an error: the gate notices it has no historical
-      # baseline, says so in the evidence, and enforces nothing that run. The save below
-      # then seeds this commit, so the next one has a real baseline to beat.
-      - name: restore criterion baseline for the comparison commit
-        id: criterion-baseline
-        uses: actions/cache/restore@v4
-        with:
-          path: target/criterion
-          key: criterion-${{ runner.os }}-${{ env.BENCHMARK_BASELINE_COMMIT }}
-
-      - name: benchmark policy gate
+      # So the numbers go into the release evidence, where a human can read them, and
+      # nothing blocks on a delta this job cannot measure honestly. Catching a real
+      # regression needs dedicated hardware; until there is some, saying so is better
+      # than pretending.
+      - name: benchmark budgets
         env:
-          # Re-save the named baseline from this commit once the gate has passed.
-          BENCHMARK_REFRESH_BASELINE: "1"
+          # One pass. Confirmation runs exist to tell a real regression from noise, and
+          # nothing here acts on the answer.
+          BENCHMARK_CONFIRM_RUNS: "0"
+          BENCHMARK_PREHEAT_RUNS: "0"
         run: bash scripts/ci-benchmark-gate.sh
 
-      # Keyed on this commit, which is what a later run names as its baseline commit.
-      # `success()` only: a baseline saved from a failed run would make the regression
-      # the new normal and hide it from every commit after.
-      - name: save criterion baseline for this commit
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: target/criterion
-          key: criterion-${{ runner.os }}-${{ github.sha }}
-
-      # Warm every image the matrix instantiates, from the ECR public mirror rather than
-      # rate-limited Docker Hub.
-      #
-      # This job runs 38 container suites and had no pre-pull at all, so every image was
-      # fetched on demand from exactly the registry `ci-pull-relational-images.sh` exists to
-      # avoid — while the policy gate's `run_relational_image_drift_check` carefully kept
-      # that script's list in step with the matrices for a job that never called it. It
-      # matters more now that an image-pull failure fails the evidence gate instead of being
-      # silently counted as a pass.
       - name: pre-pull relational images (MySQL, MariaDB)
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: pre-pull postgres images used by the version matrix
