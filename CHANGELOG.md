@@ -5,6 +5,454 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.15.0
+
+Two changes, and one of them is a repository move.
+
+`rustcdc-server` is now a workspace member of this repository rather than a separate project.
+The library and the binary already could only be released together and tested against each
+other; keeping them apart meant two CI configurations, two `deny.toml` policies, two
+documentation sites and a cross-reference between them that could only ever be a bare URL. A
+single-crate fix now lands in one pull request instead of two plus a version bump.
+
+The other change fixes a health verdict that reported the opposite of what was happening.
+
+It is a **breaking** release. See *Migrating* below.
+
+### Fixed: an idle source was reported as stalled
+
+`HealthVerdict::Stalled` is the one alertable verdict, and any pipeline that delivered at least
+one event and then went quiet for 30 seconds reported it — with the reason
+*"the poll loop is blocked, not idle"*, which was precisely backwards.
+
+`last_poll_at_ms` was written in `deliver_buffered_batch`, **after** its early return on an
+empty batch, so it recorded "the last poll that produced events" while its own documentation,
+the runbook and the stall check all read it as "the last poll". On an idle source every poll
+legitimately returns empty, so the field froze at the last event while the loop kept turning on
+schedule.
+
+It is now stamped by `poll_event_batch` on **every** return — empty batches and errors included
+— which is what makes it a liveness signal for the loop rather than a traffic counter. A source
+that fails fast in a retry loop is a pipeline in trouble, but it is not a blocked poll loop, and
+saying so sent an operator to the wrong place.
+
+A second field, `last_delivery_at_ms`, carries what the old one actually measured. It is
+recorded on the local clock at delivery rather than taken from the source's own timestamp, which
+is subject to clock skew and absent on sources that do not stamp events.
+
+### Fixed: `Idle` was unreachable after the first event
+
+The fall-through was `Some(_) if total_events_polled > 0 => Healthy`, with no notion of recency,
+and neither field resets within a run. One delivered event therefore pinned the verdict to
+`Healthy` for the life of the process, so `Idle` was reachable only by a pipeline that had never
+delivered anything — the state it is least useful for. It now compares `last_delivery_at_ms`
+against the same threshold the stall check uses, so a pipeline that delivered a million rows
+this morning and has been quiet since lunch reports `Idle`, which is the distinction the verdict
+exists to make.
+
+### Fixed: a runtime nobody polls reported `Idle`
+
+With `last_poll_at_ms` at `None` the poll-loop check did not run at all, so a runtime that was
+started and then never polled — a wedged supervisor, a task that panicked before its loop —
+reported `Idle` indefinitely. It now falls back to `started_at_ms`.
+
+### Fixed: one stalled pipeline logged ten warnings a second, forever
+
+`rustcdc-server` logs the health verdict only when it changes. `Stalled` carried a `reason`
+string with the elapsed milliseconds inside it, so `PartialEq` on the whole verdict was never
+true twice in a row for one continuous stall: the guard never matched, and every health tick
+emitted a fresh WARN — at the poll rate, indefinitely, with `previous="stalled"` in the line,
+the code believing it was reporting a transition into a state it was already in. Observed in the
+field at roughly ten a second on a healthy pipeline.
+
+The volatile detail is now split out of the enum. `Stalled` carries a `StallCause` — a stable,
+`Copy`, low-cardinality discriminant — beside the prose, and `HealthVerdict::change_key()` is
+the identity a change-detecting caller compares. A stall logs once on entry and once on
+recovery; a stall that changes *cause* logs again, because that is a different problem with a
+different owner.
+
+### Changed: an ordinary multi-crate workspace
+
+The root `Cargo.toml` is now a **virtual manifest** and every crate lives under `crates/`:
+
+```
+crates/rustcdc          the library, published to crates.io
+crates/rustcdc-server   the server binary and container image (publish = false)
+crates/xtask            crash-worker binaries the process-crash suites spawn
+```
+
+The library used to be the workspace root *and* a package, which is legal and was a
+mistake. `cargo package` collects everything beneath the package root that git does not
+ignore — for a workspace root that is the entire repository, so the published `.crate`
+carried the server, its fuzz corpus, the demo stack and the CI scripts, held back only by
+a hand-maintained `exclude` list that had to grow with every new top-level directory. A
+crate in `crates/` collects its own directory and nothing else, and the exclude list is
+gone.
+
+Shared metadata moved to `[workspace.package]`, so the version, edition, MSRV and licence
+are declared once and inherited. `xtask` was still on edition 2021 with an MSRV of 1.80
+and now follows the workspace like everything else.
+
+### Added: `[workspace.dependencies]`
+
+Shared dependencies are declared once at the root. The members had drifted — the library
+on `base64 0.23` and `criterion 0.8`, the server on `0.22` and `0.7` — so one workspace
+resolved two copies of each, and `deny.toml` had been told to tolerate the duplicate
+rather than fix it. A member still narrows with `default-features = false` and adds the
+features it needs; it cannot pick its own version.
+
+The internal dependency now carries a version alongside its path
+(`rustcdc = { path = "crates/rustcdc", version = "0.15.0" }`), which is what
+`cargo publish` requires and what stopped `cargo deny` reporting it as a wildcard — the
+bans check was failing outright.
+
+### Fixed: the published crate would have shipped without its licence texts
+
+Found by the new packaging job, on the commit that moved the crate. `license = "MIT OR
+Apache-2.0"` is an SPDX expression, not a grant, and `cargo package` cannot collect a file
+from above the crate directory — so the move silently left both texts behind while the
+metadata went on naming them. Every published crate now carries its own copies, and the
+policy gate fails if they differ from the repository's.
+
+### Fixed: two Prometheus renderers, three ways apart
+
+The library and the server each rendered the runtime metric families from a
+`RuntimeAdminSnapshot`. Two implementations of one surface, and they had drifted in every
+direction available to them:
+
+- **The same signal under two names.** The replication slot lag was
+  `rustcdc_replication_slot_lag_bytes` in the library and
+  `rustcdc_runtime_replication_slot_lag_bytes` in the server — and
+  `monitoring/rustcdc_slo_alerts.yml` referenced **both**, so whichever binary you scraped,
+  one of the two rules could never fire. That is the signal whose unbounded growth ends in
+  a full `pg_wal` volume on the primary.
+- **Two families the server never emitted.**
+  `rustcdc_runtime_idempotency_evictions_total` and
+  `rustcdc_runtime_idempotency_unidentifiable_total` existed only in the library, while the
+  configuration reference told server operators to watch the first.
+- **Different label sets.** Every library family carries `source_type`; the server's
+  carried none, so a dashboard or rule written against one did not port to the other.
+
+The server's renderer is **deleted**. `rustcdc::core::write_runtime_metrics_prometheus` is
+now the only one, so the two cannot disagree — a structural fix rather than a test
+asserting that two implementations agree.
+
+Server metrics therefore gain a `source_type` label and the two missing families. PromQL
+label matchers select a subset, so existing rules such as
+`rustcdc_runtime_health{verdict="stalled"} == 1` keep working unchanged.
+
+### Fixed: the alert-rule guard could pass by reading its own tombstone
+
+`every_alert_rule_references_a_metric_the_server_emits` answered "does this name appear in
+a source tree", which is weaker than it looks: a name in a comment, in dead code, or in a
+test assertion counts. The regression assertion pinning the *removal* of the divergent
+metric spelling put that spelling straight back into the scanned corpus — so an alert rule
+referencing the dead name resolved against the assertion forbidding it, and the check
+passed.
+
+The runtime families are now taken from **rendered output** — a fully populated snapshot
+driven through the real renderer — and the source scan that still covers the sink, DLQ and
+admin families skips comments and inline test modules. Two unit tests pin the scanner
+itself, because getting that wrong in the other direction silently under-reports what the
+server emits: an early attempt cut every file at its first `#[cfg(test)]`, which in
+`admin/mod.rs` is a test-only helper 1 500 lines above the admin metrics.
+
+### Changed: the landing page covers both artefacts
+
+The documentation site presented only the server. The hero, every call to action and the
+structured data named `rustcdc-server`, so a reader arriving for the crate found no
+mention of it — no `cargo add`, no link to the library guide, nothing in the JSON-LD for
+anything that reads it. The landing page now opens with the choice between the two
+surfaces, each with the one command that starts it, and the two documentation sections
+cross-link so a reader who landed in the wrong half can cross over.
+
+### Fixed: documentation describing a defect that had been fixed
+
+The API guide still said `auto_register = false` was "silently ignored" by the JSON Schema
+and Protobuf encoders and that the later `register_schema` call "cannot be prevented".
+Both stopped being true with schemreg 0.5, which this release adopts: the encoders resolve
+through `SchemaResolution::LookupOnly` and write nothing. The page now documents the
+supported read-only producer configuration instead of the workaround it replaced.
+
+Also corrected: the library runbook's "rustcdc ships no binary", which was accurate for
+the crate and misleading for the repository — `rustcdc-server` is exactly the wrapper that
+note tells embedders to build. Stale source paths (`src/…` → `crates/rustcdc/src/…`) and
+two GitHub links broken by the move are fixed throughout.
+
+### Changed: `xtask` is a task runner again
+
+`crates/xtask` held four crash-worker binaries the process-crash suites spawn, no
+dispatcher and no alias — `cargo xtask` did not work at all. The name promised a
+build-automation entry point that did not exist and sent anyone looking for one to the
+wrong place.
+
+It is now `crates/crash-workers`, which is what it is, and `crates/xtask` is a real task
+runner reached through `cargo xtask`. It lists every gate with a line on what it is for,
+runs from any directory, and has no dependencies — an automation entry point you reach for
+when the build is already broken should not need one.
+
+Checks whose correctness depended on shell-tool dialects move into it. `profile-check` is
+the first, and it exists because the awk version was a GNU-only construct that BSD awk
+rejected outright: on macOS the program aborted, `|| true` swallowed the failure, and the
+gate reported success having read nothing. It is now compiled, and carries the tests the
+shell version could not — including one that plants the exact violation it missed.
+
+The rest of `scripts/` stays shell, which is what it is good at, and CI keeps invoking it
+directly: routing eight image pre-pulls through a `cargo build` would buy nothing.
+
+### Changed: one CI workflow, and a release ordered by reversibility
+
+There were three workflows and no ordering between them. `ci.yml` tested the library,
+`server-ci.yml` tested the server, and `publish-container.yml` pushed the container image
+on a tag **with no dependency on any test job at all** — a tag shipped an image whether or
+not anything had passed. The two publish workflows then raced on the same tag.
+
+None of it was fixable from three files: **`needs:` cannot name a job in another
+workflow.** So `ci.yml`'s crates.io publish could not wait for the server's tests, and
+nothing could order the image against the crate. A path-filtered per-crate workflow is
+also the wrong shape for branch protection: GitHub leaves a required check pending
+forever when its workflow is skipped, so a pull request that touches only one crate would
+block on a check that is never coming.
+
+Now:
+
+- **`ci.yml`** validates the whole workspace — the library's matrix, the server's
+  (prefixed `server-`), and a new `container-smoke` job that builds the Dockerfile on
+  every pull request. Nothing built the image outside a release before, so a broken
+  Dockerfile was discovered on the tag.
+- **`required-checks-passed`** is the single job branch protection should require. It
+  carries `if: always()`, because GitHub reads a *skipped* required check as success.
+- **`release.yml`** owns the tag: `verify` → container build → container publish →
+  crates.io → GitHub release.
+
+**The release order is by reversibility, and it is the opposite of the obvious one.** A
+crates.io version is permanent — it can never be overwritten, the code cannot be deleted,
+and `cargo yank` does not delete it either, it only stops new resolution while the number
+stays spent. A GHCR package version can be deleted and restored for 30 days. So the image
+ships first and the crate last, when everything that could still fail already has not. If
+crates.io fails, delete the image and retry the same tag; the reverse order spends a
+version number on a mechanical error. This is the ordering `uv` and `ruff` use for the
+same dual-artefact problem.
+
+### Added: crates.io trusted publishing
+
+The release holds no long-lived registry token. It exchanges the workflow's OIDC identity
+for a short-lived, publish-scoped one via `rust-lang/crates-io-auth-action`, revoked when
+the job ends. A trusted-publisher configuration is scoped to the workflow *filename*,
+which is the concrete reason the release lives in `release.yml` rather than in `ci.yml`:
+pointing it at the test workflow would let any action in the matrix mint a publish token.
+The trusted-publisher configuration must name `release.yml` and the `crates-io` environment; the workflow header says so.
+
+### Added: `cargo package` runs on every pull request
+
+`cargo package` is not `cargo build`: it collects the files the `.crate` will contain and
+then builds *from that copy*. It is the only thing that catches a crate which compiles in
+the repository and not from the registry — a file outside the package root, an
+`include_str!` reaching for something `exclude` removed, a `build.rs` input nobody
+packaged. Running it only at release time meant discovering that on the tag, with the
+version already burned; it now fails the pull request that broke it, and warns before the
+`.crate` approaches the crates.io 10 MiB limit.
+
+### Fixed: the release job could publish the wrong version
+
+`cargo publish` had no `-p`, which a virtual workspace root cannot resolve at all, no
+`--locked`, and no check that the tag agreed with the manifest — so a `v0.16.0` tag on a
+tree declaring `0.15.0` would have published `0.15.0` under it. A crates.io version can
+never be reused, not even after a yank. The tag and the manifest are now compared before
+the registry token is touched.
+
+### Fixed: a wedged pipeline was never restarted
+
+`/livez` and `/readyz` did not consult the health verdict at all. Both of their conditions
+were driven by *errors* — a terminal `InstanceState`, or accumulated poll errors — and **a
+poll blocked inside the source produces none.** A TCP connection that was accepted and then
+went silent, a database that stopped answering mid-query, a future that never completes:
+nothing fails, nothing changes state, `source_consecutive_errors` stays at zero, and
+`/livez` answered `200 alive` for the life of the process. The pipeline was dead and every
+signal Kubernetes had said it was fine.
+
+That is precisely the failure the health verdict exists to detect — it measures the absence
+of progress rather than the presence of failure — and nothing was acting on it.
+
+| `StallCause` | `/livez` | `/readyz` |
+|---|---|---|
+| `poll_loop_not_turning` | **503** after 120 s | 503 |
+| `unconfirmed_source_position` | 200 | 503 |
+| `consumer_not_acknowledging` | 200 | 503 |
+
+**The exclusions are the point, and they are why `StallCause` is a stable enum rather than
+prose.** Restarting on `unconfirmed_source_position` replays from the same checkpoint and
+fails identically while the source keeps retaining log — a crash-loop there makes a full
+`pg_wal` volume arrive *sooner*. `consumer_not_acknowledging` means the sink is not
+draining, where a restart thrashes against an already-unhealthy downstream. Readiness
+excludes no cause because it costs nothing: it takes the pod out of rotation rather than
+destroying in-flight work, and a stalled replica reporting itself ready is how a broken
+deploy reaches every pod. Its body names the cause (`stalled:poll_loop_not_turning`), which
+is what `kubectl describe` surfaces.
+
+An **idle** pipeline is ready and alive. A quiet source is the most common reason for a
+pipeline to be producing nothing, and treating it as a fault would take every healthy
+deployment out of rotation the moment its database went quiet.
+
+### Added: `/status` reports the verdict
+
+The runbook opens by telling an operator to `curl /status`, and the verdict was not in it —
+it was reachable only by scraping `/metrics` and grepping a one-hot gauge, for the single
+field that says whether the pipeline is working. `/status` now carries
+`health.verdict`, `health.stall_cause` and `health.stalled_for_seconds`, the last being
+what decides whether `/livez` is about to restart the pod.
+
+### Added: `health_stall_threshold_ms`
+
+The stall threshold was derived as `max_poll_wait_ms × 6` with a 30-second floor, which
+scales *up* with the poll budget and has no ceiling. At `max_poll_wait_ms = 60_000` it is
+six minutes — a pipeline could be wedged for six minutes before anything said so, and
+nothing could shorten the window.
+
+`RuntimeOptions::health_stall_threshold_ms` (TOML: `runtime.health_stall_threshold_ms`)
+states the detection window directly. Unset, the derived default is unchanged.
+
+Two values are rejected at construction and at config load, both guarding the same failure
+from opposite ends — reporting a healthy pipeline as stalled: below
+`HEALTH_MIN_CONFIGURABLE_STALL_MS` (1 000 ms), where the verdict measures the health-check
+interval rather than the pipeline; and at or below `max_poll_wait_ms`, where a merely slow
+poll reads as a stall.
+
+### Fixed: the runbook documented a verdict that cannot exist
+
+The server runbook listed a fourth verdict, `degraded`. There has never been one — the
+enum has four variants and the gauge has four series — so an operator alerting on
+`rustcdc_runtime_health{verdict="degraded"}` would have waited forever. Accumulating
+recoverable errors surface as `rustcdc_source_consecutive_poll_errors` and
+`rustcdc_runtime_recoverable_breaker_open_consecutive`, and the runbook now says so.
+
+### Added: the signals behind the verdict are observable
+
+The verdict was derived from timestamps nothing exported, so an operator could see *that* it
+flipped but never *why*.
+
+| Metric | What it says |
+|---|---|
+| `rustcdc_runtime_poll_age_ms` | Milliseconds since a poll returned, empty batches included — the poll loop's own liveness |
+| `rustcdc_runtime_delivery_age_ms` | Milliseconds since events last arrived. High on its own is a quiet database; **do not alert on it** |
+| `rustcdc_runtime_stall_cause{cause=…}` | Which of the three signals fired. Emitted only while stalled, so presence is the condition |
+
+`rustcdc_runtime_health` is unchanged and still one-hot over four fixed series, so
+`rustcdc_runtime_health{verdict="stalled"} == 1` remains a complete alert rule. The cause is
+what lets it *route*: an unconfirmed source position is a disk-fill risk on the database, a
+non-turning poll loop is a process problem, and a consumer that stopped acknowledging is the
+embedder's. `monitoring/rustcdc_slo_alerts.yml` now has one rule per cause.
+
+### Fixed: `RuntimeAdminSnapshot` could not deserialise an older snapshot
+
+The type is `#[non_exhaustive]` and documents that fields may be added in minor releases, but
+its `Deserialize` did not keep that promise: serde requires a field unless told otherwise,
+`Option` included, so every field ever added broke every stored, proxied or replayed snapshot
+with a missing-field error. Every additive field now carries `#[serde(default)]`. The identity
+fields — `state`, `capabilities`, `health` — are deliberately still required: a snapshot that
+cannot say what state the runtime was in is the wrong document, not a document with a gap.
+
+### Changed: schemreg 0.4 → 0.6
+
+Two breaking hops, taken together. The upgrade is worth it for one correctness fix alone.
+
+**Apicurio v3 no longer fabricates schema IDs.** Registry v3 removed the response headers
+its v2 client read identifiers from, and the old client fell back to a schema ID of
+**`0`** — a valid-looking identifier a producer then stamped on every record. `Schema::id`
+is now `Option<SchemaId>`, and rustcdc refuses to encode rather than invent one: Confluent
+wire format v0 carries a four-byte id and nothing else, and Avro binary is positional and
+untagged, so a consumer resolving a wrong id gets shifted fields and plausible values
+rather than an error.
+
+**`auto_register = false` now actually works on the JSON Schema and Protobuf encoders.**
+rustcdc's own comment described the gap: schemreg had no lookup-only mode, its resolution
+path was `register_schema` unconditionally, and the setting was *silently ignored* by
+both. rustcdc worked around it by asserting the subjects existed at construction, which
+restored the identity check but could not stop the later registration call. Both encoders
+are now built with `SchemaResolution::LookupOnly`, so nothing is registered and the
+encoder needs only `Subject:Read` — a read-only producer principal is a supported
+configuration rather than something the setting appeared to offer. The identity check
+stays, because it is stronger than lookup: it asserts the stored schema is byte-identical
+to the one rustcdc will write.
+
+**Confluent wire format v1 decodes.** `decode_wire_format` reports a `SchemaKey`, so a
+payload framed with the 16-byte schema GUID that Confluent Platform 8 introduced resolves
+through `get_schema_by_key` alongside the classic 4-byte id. Nothing in the configuration
+changes; a stream framed by a CP8 serialiser simply decodes.
+
+Breaking, for anyone using these directly:
+
+- `SchemaEncoder` / `SchemaDecoder` are re-exported as `PayloadEncoder` / `PayloadDecoder`.
+  They frame already-serialised bytes; the old names implied they serialised a value.
+- `ConfluentProtobufEncoder::message_indexes` returns `&[u32]`. A position within a
+  descriptor is never negative, and the signed type let the encoder emit a frame its own
+  decoder rejected.
+
+### Changed: one workspace, one toolchain, one policy
+
+* **Edition 2024** for both members, with the MSRV at **1.94.1** (the server's floor, set by the
+  AWS SDK). `#[no_mangle]` in the WASM guest sample is now `#[unsafe(no_mangle)]`, which is the
+  2024 spelling; a guest crate on edition 2021 still writes the old form.
+* **One `deny.toml`.** The two policies checked two different graphs against two different
+  allowlists — a crate banned for the server was merely warned about for the library, and the
+  `all-features = true` that makes the library's optional subtrees visible at all was absent
+  from the server's.
+* **`cargo fmt --all` and `cargo clippy --workspace`** in CI. Neither had covered both trees.
+* **Zola 0.23.** Zola 0.23 removed shortcodes entirely and made every content file a
+  Tera template rendered before the markdown parser, with no protection for fenced code
+  blocks — so any sample containing `{{` failed the build with a template error in a file
+  containing no template (getzola/zola#3263, closed upstream as intended). The site sets
+  `skip_content_templating = ["**/*.md"]`, which turns that pass off for all content, and
+  the one former shortcode's value is now a literal checked against the manifest by
+  `crates/rustcdc-server/tests/architecture.rs` — a stronger guarantee than an indirection that only
+  moved where the number was written.
+* **The Cargo-profile gate actually runs.** `scripts/ci-policy-gate.sh` used gawk's
+  three-argument `match()`, which is a syntax error on BSD awk: on macOS the whole awk
+  program aborted, `|| true` swallowed it, and the check printed "passed" having examined
+  nothing. It was silently vacuous for every developer on a Mac. Rewritten in POSIX awk,
+  and it now scans every member's manifest rather than only the workspace root.
+* **One documentation site.** `/docs/` is the server, `/library/` is the crate. The library's
+  pages moved from `site/content/docs/` to `site/content/docs/`; they are still embedded into
+  rustdoc by `include_str!`, so every Rust block on them is still compiled by
+  `cargo test --doc`.
+* **`cargo package` excludes the rest of the repository.** The workspace root package would
+  otherwise collect the server, its fuzz corpus, the demo stack and the CI scripts into the
+  published `.crate`.
+* The container image is still published as `ghcr.io/hupe1980/rustcdc-server`. Every existing
+  `docker pull` and Kubernetes manifest keeps working.
+
+### Migrating
+
+**`HealthVerdict::Stalled` gained a field.**
+
+```rust,ignore
+// Before
+HealthVerdict::Stalled { reason } => log::warn!("stalled: {reason}"),
+
+// After
+HealthVerdict::Stalled { cause, reason } => log::warn!("stalled ({cause}): {reason}"),
+```
+
+**Replace verdict equality in change detection.** If you compared `HealthVerdict` values to
+decide whether to log, alert or annotate, compare `change_key()` instead — equality on the
+verdict includes prose that moves on every evaluation:
+
+```rust,ignore
+// Before: never equal twice for one ongoing stall
+if last.as_ref() == Some(&snapshot.health) { return; }
+
+// After
+if last == Some(snapshot.health.change_key()) { return; }
+```
+
+**`last_poll_at_ms` changed meaning.** It is now "the last poll that returned" rather than "the
+last poll that produced events". If you were using it as a proxy for traffic, switch to
+`last_delivery_at_ms`, which is the old behaviour under its accurate name.
+
+**Build commands take a package.** `cargo build` builds both members; `cargo build -p rustcdc`
+and `cargo build -p rustcdc-server` address one. The server's own commands run from the
+repository root, not from `server/`.
+
 ## 0.14.0
 
 A bug report against 0.12.0 found that **any UPDATE to a table with PostgreSQL's factory

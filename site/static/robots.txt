@@ -2,4 +2,6 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://hupe1980.github.io/rustcdc/sitemap.xml
+# Absolute, and it must match `base_url` in zola.toml — a stale host here is a sitemap
+# crawlers silently ignore.
+Sitemap: https://hupe1980.github.io/rustcdc-server/sitemap.xml

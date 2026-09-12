@@ -290,13 +290,73 @@ record_baseline_fallback_bench() {
   esac
 }
 
-# Return the --features flag(s) required for a named bench target, or empty.
-# Keep this list in sync with [[bench]] required-features in Cargo.toml.
+# Bench targets, derived from `cargo metadata` rather than hand-maintained.
+#
+# The previous version of this was a `case` statement carrying a "keep this in sync with
+# Cargo.toml" comment, and it knew only about `required-features`. It could not know about
+# the owning package, and the omission mattered: `cargo bench --bench <name>` with no `-p`
+# selects every default workspace member, and cargo unifies features across that whole
+# set. `rustcdc-server` dev-depends on `rustcdc` with `test-harnesses`, so an unscoped
+# bench build turned that feature on for `rustcdc` and tripped the release guard in
+# `fault_injection`. Two bench targets are also named `throughput`, one per crate, so a
+# bare `--bench throughput` is ambiguous. Naming the package fixes both.
+bench_targets_table=""
+
+load_bench_targets() {
+  [[ -n "$bench_targets_table" ]] && return 0
+  bench_targets_table="$(
+    cargo metadata --no-deps --format-version 1 |
+      jq -r '.packages[] | .name as $pkg | .targets[]
+             | select(.kind | index("bench"))
+             | "\($pkg)|\(.name)|\((.["required-features"] // []) | join(","))"'
+  )"
+  if [[ -z "$bench_targets_table" ]]; then
+    echo "Failed to enumerate bench targets from cargo metadata." >&2
+    exit 1
+  fi
+}
+
+# Print "package|name|feat,feat" for a bench target, or fail loudly. An ambiguous name is
+# an error rather than a first-match guess: picking one silently is how the unscoped build
+# above stayed wrong for so long.
+bench_target_row() {
+  local bench_name="$1" matches count
+  load_bench_targets
+  matches="$(awk -F'|' -v n="$bench_name" '$2 == n' <<<"$bench_targets_table")"
+  count="$(grep -c . <<<"$matches" || true)"
+  if [[ -z "$matches" ]]; then
+    echo "Unknown bench target '${bench_name}'. Known targets:" >&2
+    awk -F'|' '{ printf "  %s (in %s)\n", $2, $1 }' <<<"$bench_targets_table" >&2
+    exit 1
+  fi
+  if [[ "$count" -gt 1 ]]; then
+    echo "Bench target '${bench_name}' exists in more than one package:" >&2
+    awk -F'|' '{ printf "  %s\n", $1 }' <<<"$matches" >&2
+    echo "Rename one of them, or drop it from BENCHMARK_GATED_BENCHES." >&2
+    exit 1
+  fi
+  printf '%s\n' "$matches"
+}
+
+bench_package() { bench_target_row "$1" | cut -d'|' -f1; }
+
+# The `--features` flag(s) a bench target needs, or empty.
 bench_required_features() {
-  case "$1" in
-    cdc_perf) echo "--features wasm" ;;
-    *)        echo "" ;;
-  esac
+  local feats
+  feats="$(bench_target_row "$1" | cut -d'|' -f3)"
+  if [[ -n "$feats" ]]; then
+    echo "--features $feats"
+  fi
+}
+
+# `cargo bench` is a release-profile build, so `debug_assertions` is off and the guard in
+# `fault_injection` refuses to compile when `test-harnesses` is enabled. That guard exists
+# to keep fault injection out of *shipped* binaries; a bench harness is never shipped, and
+# the feature arrives here only through a dev-dependency. Open the documented escape hatch
+# for bench builds, preserving whatever RUSTFLAGS CI already set (`-D warnings`) — cargo
+# reads RUSTFLAGS as one value, so appending is the only way to keep both.
+bench_env() {
+  printf '%s' "RUSTFLAGS=${RUSTFLAGS:+${RUSTFLAGS} }--cfg rustcdc_optimised_test_harnesses"
 }
 
 run_bench() {
@@ -305,14 +365,12 @@ run_bench() {
   local mode="${3:-compare}"
   local allow_missing_baseline_retry="${4:-1}"
   local baseline_args=()
-  local features_arg
+  local features_arg bench_pkg
   features_arg="$(bench_required_features "$bench_name")"
+  bench_pkg="$(bench_package "$bench_name")"
   local cargo_args=()
-  if [[ -n "$features_arg" ]]; then
-    cargo_args=(cargo bench --bench "$bench_name" $features_arg --)
-  else
-    cargo_args=(cargo bench --bench "$bench_name" --)
-  fi
+  # shellcheck disable=SC2086
+  cargo_args=(env "$(bench_env)" cargo bench -p "$bench_pkg" --bench "$bench_name" $features_arg --)
   cargo_args+=(
     --sample-size "$bench_sample_size"
     --measurement-time "$bench_measurement_secs"
@@ -387,11 +445,13 @@ run_preheat() {
   local bench_name="$1"
   local run_index="$2"
   local out_file="target/benchmark-ci-gate-preheat-${bench_name}-${run_index}.txt"
-  local features_arg
+  local features_arg bench_pkg
   features_arg="$(bench_required_features "$bench_name")"
+  bench_pkg="$(bench_package "$bench_name")"
   echo "Running preheat benchmark pass ${run_index} for ${bench_name} to reduce first-run jitter..."
   # shellcheck disable=SC2086
-  cargo bench --bench "$bench_name" $features_arg -- --sample-size 10 --measurement-time 2 --warm-up-time 1 > "$out_file"
+  env "$(bench_env)" cargo bench -p "$bench_pkg" --bench "$bench_name" $features_arg -- \
+    --sample-size 10 --measurement-time 2 --warm-up-time 1 > "$out_file"
 }
 
 collect_regressions() {

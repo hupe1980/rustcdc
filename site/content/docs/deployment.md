@@ -141,7 +141,7 @@ would stall the pipeline permanently on one oversized row with no way to make pr
 
 ## Non-PostgreSQL Sources
 
-For MySQL and SQL Server deployments, use the same runtime pattern with source-specific config and operational prerequisites from [config_reference.md](@/docs/config-reference.md) and [runbook.md](@/docs/runbook.md).
+For MySQL and SQL Server deployments, use the same runtime pattern with source-specific config and operational prerequisites from [config_reference.md](@/docs/config-reference.md) and [runbook.md](@/docs/embedded-operations.md).
 
 ### SQL Server: Supported Versions
 
@@ -153,7 +153,7 @@ For MySQL and SQL Server deployments, use the same runtime pattern with source-s
 | 2016 | ⚠️ Not CI-tested; minimum supported version (major version 13). Startup is allowed; manual validation required. |
 | 2014 and earlier | ❌ Not supported. Rejected at startup with `Error::SourceError` (requires major version ≥ 13). |
 
-The prerequisite probe in `src/source/sqlserver/query.rs` checks for:
+The prerequisite probe in `crates/rustcdc/src/source/sqlserver/query.rs` checks for:
 - `is_cdc_enabled` on the target database.
 - `db_owner`, `sysadmin`, or `db_ddladmin` role membership.
 - Server major version ≥ 13 (SQL Server 2016). Versions below this are rejected at startup with an `Error::SourceError`.
@@ -162,9 +162,9 @@ If you require SQL Server 2019 coverage in CI, add the `mcr.microsoft.com/mssql/
 
 ## Related Documentation
 
-- [getting_started.md](@/docs/getting-started.md)
+- [getting_started.md](@/docs/embedding.md)
 - [config_reference.md](@/docs/config-reference.md)
-- [runbook.md](@/docs/runbook.md)
+- [runbook.md](@/docs/embedded-operations.md)
 - [troubleshooting.md](@/docs/troubleshooting.md)
 
 ---
@@ -175,7 +175,7 @@ rustcdc is an embeddable library and does not start an HTTP server. `CdcRuntime`
 `admin_snapshot_json()` which returns a `RuntimeAdminSnapshot` payload as JSON.
 Wire it to any HTTP server of your choice.
 
-**Minimal axum example** (add `axum = "0.7"` and `tokio` to your Cargo.toml):
+**Minimal axum example** (add `axum = "0.8"`, `tokio` and `serde_json` to your Cargo.toml):
 
 ```rust,ignore
 // `ignore`: axum is not a dependency of this crate, so this block cannot be compiled here.
@@ -194,7 +194,10 @@ async fn health(State(rt): State<SharedRuntime>) -> impl IntoResponse {
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 [("content-type", "application/json")],
-                format!(r#"{{"error":"{error}"}}"#),
+                // `json!` rather than `format!`: an error message containing a quote
+                // or a newline would make hand-built JSON unparseable, and the one
+                // time this branch runs is the one time you need to read it.
+                serde_json::json!({ "error": error.to_string() }).to_string(),
             );
         }
     };

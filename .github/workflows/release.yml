@@ -1,0 +1,384 @@
+name: release
+
+# Everything a tag produces: the container image, the crates.io release, and the GitHub
+# release that announces them.
+#
+# Separate from `ci.yml`, which validates. Two reasons, and the second is the one that
+# decides it:
+#
+#   1. `ci.yml` runs on every pull request and is where new jobs and new actions land.
+#      This file changes rarely and is reviewed as a release surface.
+#   2. **crates.io trusted publishing pins the workflow filename.** A trusted-publisher
+#      configuration is scoped to owner + repository + workflow file, precisely so that a
+#      compromised action somewhere in CI cannot mint a publish token. Publishing from
+#      `ci.yml` would widen that scope to every action the test matrix uses.
+#
+# ── Ordering: reversible first, irreversible last ────────────────────────────
+#
+# The steps are ordered by how well each one can be undone, not by importance:
+#
+#   * **A crates.io version is permanent.** "The version can never be overwritten, and
+#     the code cannot be deleted." `cargo yank` does not delete it either — it stops new
+#     dependency resolution, and the number stays burned forever. A botched publish
+#     cannot be corrected; it can only be superseded by a new version.
+#   * **A GHCR package version can be deleted**, and restored for 30 days after.
+#
+# So the image is built and pushed *first*, and the crate is published last, once
+# everything that could still fail has succeeded. If crates.io is the leg that fails,
+# the image can simply be deleted and the same tag retried. Were the order reversed, a
+# failure after publishing would leave a version number spent and unusable.
+#
+# This is the ordering `uv` and `ruff` use for the same dual-artefact problem.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # A dry run: builds the image and packages the crate, publishes neither.
+  workflow_dispatch:
+
+# A release should never be cancelled mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Pinned rather than `${{ github.repository }}`, which resolves to `hupe1980/rustcdc` —
+  # the *library's* name, for an image you cannot run. Naming it here keeps
+  # `ghcr.io/hupe1980/rustcdc-server` stable, so every existing `docker pull`, Kubernetes
+  # manifest and documented command keeps working.
+  IMAGE_NAME: ${{ github.repository_owner }}/rustcdc-server
+
+# Narrow by default; each job widens only what it needs.
+permissions:
+  contents: read
+
+jobs:
+
+  # ── Is this tag releasable at all? ──────────────────────────────────────────
+  #
+  # Two questions, both asked before anything is built:
+  #
+  #   * Does the tag agree with the manifest? `cargo publish` reads the version from
+  #     `Cargo.toml` and ignores the tag entirely, so a mismatch silently publishes the
+  #     wrong version under the right name — and the right name can never be reused.
+  #   * Did CI actually pass **for this exact commit**? Not "for the branch", not
+  #     "recently": the check looks for a successful non-tag `ci.yml` run on this SHA
+  #     whose `release-evidence` job succeeded and produced its artefacts. Tagging a
+  #     commit that never went green is otherwise entirely possible.
+  #
+  # On `workflow_dispatch` this job runs and the publishing jobs below do not, which
+  # makes a dispatch a dry run of the gate itself.
+  verify:
+    name: "release: verify the tag is releasable"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: verify tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rustcdc") | .version')
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: verify successful release-evidence run exists for this commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflowId = '.github/workflows/ci.yml';
+            const headSha = context.sha;
+
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id: workflowId,
+              per_page: 100,
+              head_sha: headSha,
+            });
+
+            const candidates = runs.filter((run) =>
+              run.id !== context.runId &&
+              !run.head_branch?.startsWith('v') &&
+              run.event !== 'workflow_dispatch' &&
+              run.conclusion === 'success'
+            );
+
+            if (candidates.length === 0) {
+              core.setFailed(`No successful non-tag CI run found for commit ${headSha}.`);
+              return;
+            }
+
+            let evidenceFound = false;
+            for (const run of candidates) {
+              const jobsResp = await github.rest.actions.listJobsForWorkflowRun({
+                owner,
+                repo,
+                run_id: run.id,
+                per_page: 100,
+              });
+
+              const releaseEvidenceJob = jobsResp.data.jobs.find((job) => job.name === 'release-evidence');
+              if (!releaseEvidenceJob || releaseEvidenceJob.conclusion !== 'success') {
+                continue;
+              }
+
+              const artifactsResp = await github.rest.actions.listWorkflowRunArtifacts({
+                owner,
+                repo,
+                run_id: run.id,
+                per_page: 100,
+              });
+
+              const hasEvidenceArtifact = artifactsResp.data.artifacts.some((artifact) => artifact.name === 'release-gate-evidence');
+              if (hasEvidenceArtifact) {
+                core.info(`Using validated evidence from run ${run.id}.`);
+                evidenceFound = true;
+                break;
+              }
+            }
+
+            if (!evidenceFound) {
+              core.setFailed('No successful release-evidence job with release-gate-evidence artifact found for this commit.');
+            }
+
+  container-build:
+    name: "release: build image (${{ matrix.platform }})"
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write   # push by digest to GHCR
+      id-token: write   # OIDC token for the SLSA provenance attestation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # linux/amd64 → linux-amd64 (used for cache scope + artefact names)
+      - name: Derive platform slug
+        id: slug
+        run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generates OCI labels and semver tags (e.g. :1.2.3, :1.2, :1, :latest)
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest
+
+      # Build for this runner's native platform and push by digest.
+      # The merge job below assembles the final multi-arch manifest index.
+      - name: Build and push platform image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: >-
+            type=image,
+            name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},
+            push-by-digest=true,
+            name-canonical=true,
+            push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          # SLSA provenance (mode=max) and SBOM are stored inline with the manifest.
+          provenance: mode=max
+          sbom: true
+          # Per-platform GHA cache avoids cross-arch cache pollution.
+          cache-from: type=gha,scope=${{ steps.slug.outputs.slug }}
+          cache-to:   type=gha,scope=${{ steps.slug.outputs.slug }},mode=max
+
+      # Save the pushed digest so the merge job can reference this image.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+          echo "Pushed ${{ matrix.platform }} digest: $digest"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.slug.outputs.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2 of 2 — merge per-platform digests into a single multi-arch manifest
+  # ─────────────────────────────────────────────────────────────────────────────
+  container-publish:
+    name: "release: push multi-arch image"
+    needs: container-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write   # assemble and push the manifest list
+
+    steps:
+      - name: Download amd64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-linux-amd64
+          path: /tmp/digests
+
+      - name: Download arm64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-linux-arm64
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (final tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest
+
+      # Combine the two per-platform digests into one manifest index under all tags.
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}')
+          eval docker buildx imagetools create $TAGS \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      # Print the final manifest to the job summary for auditability.
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+
+  # ── crates.io — the one irreversible step ───────────────────────────────────
+  #
+  # Last on purpose. See the ordering note at the top of this file: a published version
+  # can never be replaced or reused, so it happens only after the image is already live
+  # and every other gate has gone green.
+  publish-crate:
+    name: "release: publish rustcdc to crates.io"
+    needs: container-publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # An environment, so the publish can be put behind a required reviewer and a tag
+    # policy without editing this file.
+    environment: crates-io
+    permissions:
+      contents: read
+      # Trusted publishing: crates.io exchanges this workflow's OIDC identity for a
+      # short-lived, publish-scoped token, so the repository holds no long-lived
+      # registry credential at all. The token expires in ~30 minutes and the action
+      # revokes it in its post-job step.
+      #
+      # One-time setup on crates.io: add a trusted publisher for this repository naming
+      # **release.yml** and the `crates-io` environment. See RELEASING.md.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - name: Mint a short-lived crates.io token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      # `--locked` asserts the resolution is the one CI tested. `--no-verify` because
+      # ci.yml's `package` job already built from the collected copy on this same commit;
+      # repeating it would add ten minutes to a release for an answer already in hand.
+      - name: cargo publish -p rustcdc
+        run: cargo publish -p rustcdc --locked --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # ── The announcement ────────────────────────────────────────────────────────
+  #
+  # Last, because it is what tells people the release exists: it should not appear until
+  # both artefacts do. The notes are the `CHANGELOG.md` section for this version,
+  # extracted rather than written again, so the release page and the file cannot disagree.
+  github-release:
+    name: "release: GitHub release"
+    needs: publish-crate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # create the release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract this version's changelog section
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # From `## <version>` up to, but not including, the next `## ` heading.
+          awk -v want="## $version" '
+            $0 == want { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## $version' section; the release would ship without notes"
+            exit 1
+          fi
+          echo "release notes: $(wc -l < release-notes.md) lines"
+      # `--notes-file`, never `--notes "$(...)"`. Release notes are arbitrary Markdown —
+      # backticks, `$`, quotes — and interpolating them into a shell command is both a
+      # quoting bug waiting to happen and a script-injection surface.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --verify-tag

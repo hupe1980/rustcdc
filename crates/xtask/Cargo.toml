@@ -1,0 +1,24 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# Automation, never an artefact.
+publish = false
+
+[lints]
+workspace = true
+
+# `cargo xtask` resolves to this through the alias in `.cargo/config.toml`.
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+# Deliberately no dependencies. An automation entry point that pulls a CLI parser and a
+# process-management crate has to be compiled before it can tell you what it can do, and
+# it is the thing you reach for when the build is already broken. `std` is enough to
+# dispatch a handful of names.
+[dependencies]

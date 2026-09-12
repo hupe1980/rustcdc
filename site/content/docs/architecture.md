@@ -30,13 +30,13 @@ This ordering preserves replay safety under failure and restart.
 
 ## Component Map
 
-- `src/core/`: runtime lifecycle, event model, commit barrier, errors, observability
-- `src/source/`: PostgreSQL, MySQL, SQL Server source implementations
-- `src/checkpoint/`: checkpoint traits and concrete persistence backends
-- `src/schema_history/`: schema-history abstraction and backends
-- `src/transform/`: transform interfaces and transform pipeline logic
-- `src/wasm/`: sandboxed WASM transform runtime
-- `src/testkit/`: fixtures and conformance harnesses
+- `crates/rustcdc/src/core/`: runtime lifecycle, event model, commit barrier, errors, observability
+- `crates/rustcdc/src/source/`: PostgreSQL, MySQL, SQL Server source implementations
+- `crates/rustcdc/src/checkpoint/`: checkpoint traits and concrete persistence backends
+- `crates/rustcdc/src/schema_history/`: schema-history abstraction and backends
+- `crates/rustcdc/src/transform/`: transform interfaces and transform pipeline logic
+- `crates/rustcdc/src/wasm/`: sandboxed WASM transform runtime
+- `crates/rustcdc/src/testkit/`: fixtures and conformance harnesses
 
 ## Runtime Model
 
@@ -477,5 +477,5 @@ This is not built into rustcdc directly; it requires the consumer to coordinate 
 - [Configuration Reference](@/docs/config-reference.md)
 - [Schema Evolution and DDL Capture](@/docs/schema-evolution.md)
 - [Reliability Testing Guide](@/docs/reliability-testing.md)
-- [Operator Runbook](@/docs/runbook.md)
+- [Operator Runbook](@/docs/embedded-operations.md)
 - [Troubleshooting Guide](@/docs/troubleshooting.md)

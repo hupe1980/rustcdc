@@ -92,12 +92,9 @@ field silently becomes `false`, `None` or empty, and the comparison passes whene
 default happens to be the right answer. The suite is then agreeing with itself rather than
 pinning anything.
 
-That was live until 0.13.0. Forty of the forty-one goldens predated `before_is_key_only` and
-did not record it; each loaded as `false`, which was correct for those fixtures, so nothing
-failed — and nothing would have failed if a later field's default had been *wrong* for them.
-The loader now compares each golden's keys against what the event actually serializes and
-fails with "golden is stale, regenerate", so adding an envelope field forces a conscious
-regeneration instead of a silent default. Fields with `skip_serializing_if` are legitimately
+The loader therefore compares each golden's keys against what the event actually
+serializes and fails with "golden is stale, regenerate", so adding a field to the envelope
+forces a conscious regeneration rather than a silent default. Fields with `skip_serializing_if` are legitimately
 absent when empty, so the comparison is per event rather than against a fixed field list.
 
 Envelope validation also runs **before** the regeneration branch, so a malformed event cannot
@@ -111,13 +108,10 @@ suite that fails for uninteresting reasons gets disabled.
 
 ### What it compares — and why the list matters more than it looks
 
-`semantic_diff` is the **sole** comparison the golden-fixture suite performs. A field it does not
-compare is therefore invisible to every fixture, however many fixtures there are. That is worth
-stating plainly, because until 0.12.0 it was true of fields whose regressions are exactly what the
-fixtures exist to catch: `primary_key`, `unavailable_columns`, `before_unavailable_columns`,
-`envelope_version`, `source.offset`, `transaction` and `snapshot` were all unchecked. A change to
-any of them left every golden green — including a regression that stopped reporting an
-unchanged-TOAST column, which makes a sink write `NULL` over live data.
+`semantic_diff` is the **sole** comparison the golden-fixture suite performs, so a field it
+does not compare is invisible to every fixture however many there are. The list below is
+therefore the real coverage boundary, not a summary of it — read it as the answer to "what
+would a golden actually catch?".
 
 **Compared** — every field that is a deterministic function of the replayed input: `op`, `table`,
 `schema`, `source.source_name`, `source.offset`, `before`, `after`, `before_is_key_only`,
@@ -167,13 +161,12 @@ is otherwise invisible: replay produces fewer events, the golden is re-recorded 
 scenario retires without a word. It is a checksum against truncation, not a restatement of
 `messages.len()`.
 
-It was previously named `expected_event_count` and checked only in `Fixture::new` — which
-`from_path` and `from_json` do not call — so every fixture on disk carried an unverified number. The
-name was also wrong: the count of *events* is not the count of *messages*, since an aborted
-transaction discards its buffered events, and it was compared against the message count regardless.
+It counts **messages**, not events: an aborted transaction discards its buffered events, so
+the two differ. The check runs on every load path — `new`, `from_path` and `from_json` —
+because a number verified on only one of them is a number most fixtures never verify.
 
-`Fixture::new` returns `Result` rather than asserting, so a fixture-building tool reports a problem
-instead of aborting.
+`Fixture::new` returns `Result` rather than asserting, so a fixture-building tool reports a
+problem instead of aborting.
 
 ### Every replayed event is validated, not just compared
 
@@ -354,7 +347,7 @@ separate Docker-backed latency harness described under [Coverage Areas](#coverag
 
 ### End-to-end runtime throughput
 
-One benchmark is not a microbenchmark. `cargo bench --bench throughput` drives the **whole
+One benchmark is not a microbenchmark. `cargo xtask bench -p rustcdc --bench throughput` drives the **whole
 runtime** — source poll, idempotency guard, transform pipeline, sink, ack token, commit
 barrier, durable checkpoint write — over a synthetic source, and reports events per second.
 
@@ -441,5 +434,5 @@ citing any number from it.
 
 - [API Guide](@/docs/api.md)
 - [Architecture](@/docs/architecture.md)
-- [Operator Runbook](@/docs/runbook.md)
+- [Operator Runbook](@/docs/embedded-operations.md)
 - [Troubleshooting Guide](@/docs/troubleshooting.md)

@@ -238,7 +238,7 @@ type's own output function — the same function PostgreSQL's `pgoutput` calls, 
 `boolean` is `"t"` and not `"true"`. A snapshot and the live stream therefore agree character
 for character, not merely on the JSON type.
 
-**It used to differ by path, and that was a defect.** A row backfilled by a PostgreSQL
+**It must not differ by path.** A row backfilled by a PostgreSQL
 snapshot arrived as `{"id": 1}` while the same row updated a moment later arrived as
 `{"id": "1"}`, because the chunk read went through `row_to_json` and the stream did not. A
 sink reaching for `as_i64()` read one and silently saw `None` for the other. MySQL emitted
@@ -534,9 +534,9 @@ The checkpoint advances exactly `written` events. The tail is **redelivered** by
 `poll_event_batch` with a fresh token, which is the only way to obtain one.
 
 Each token may be committed **once**. `AckToken` is `Clone` and `EventBatch::ack_mode()`
-returns a fresh copy on every call, so a second commit of the same token used to match the
-delivery id, see a shorter remaining prefix, and advance the checkpoint over the *next* events
-— which the caller had never been handed. That is now refused with an error naming the cause.
+returns a fresh copy on every call. A second commit of the same token would otherwise match
+the delivery id, see a shorter remaining prefix, and advance the checkpoint over the *next*
+events — which the caller was never handed. It is refused with an error naming the cause.
 
 ### The checkpoint records a boundary, not the last event's position
 
@@ -559,10 +559,10 @@ already the next event's position, and the SQL Server window query already incre
 
 A custom source whose per-event offset is itself a resumable boundary can leave the default
 alone. One that overrides it gets the same treatment as the built-in connectors: the runtime
-checkpoints whatever it returns, **verbatim**, on every source path rather than only the
-PostgreSQL one. That last part was a bug until 0.12.0 — the generic branch read
-`event.source.offset` directly, so a third-party connector implementing this correctly had its
-answer discarded and took the duplicate-per-restart anyway, with nothing to see it by.
+checkpoints whatever it returns, **verbatim**, on every source path — not only the
+PostgreSQL one. That generality is the point: a connector that filters at transaction
+granularity relies on it, and reading `event.source.offset` instead would hand it the
+duplicate-per-restart it overrode the method to avoid, with nothing to see it by.
 
 Important semantics:
 - not acknowledging after sink durability may replay already-delivered events
@@ -1055,20 +1055,54 @@ connector making progress?", which `RuntimeState` cannot give you (`state = Runn
 a quiet database and a hung socket).
 
 ```rust
-use rustcdc::HealthVerdict;
+use rustcdc::{HealthVerdict, StallCause};
 # use rustcdc::CdcRuntime;
 # fn example(runtime: &CdcRuntime) {
 let snapshot = runtime.admin_snapshot();
 match &snapshot.health {
     HealthVerdict::Healthy | HealthVerdict::Idle => { /* serve 200 */ }
-    HealthVerdict::Stalled { reason } => {
-        // `reason` names the condition and the remedy.
-        eprintln!("cdc stalled: {reason}");
+    HealthVerdict::Stalled { cause, reason } => {
+        // `cause` is the stable discriminant to route and compare on;
+        // `reason` is prose for a human and includes live measurements.
+        eprintln!("cdc stalled ({cause}): {reason}");
+        match cause {
+            StallCause::UnconfirmedSourcePosition => { /* the database is retaining log */ }
+            StallCause::PollLoopNotTurning => { /* the process, or the source socket */ }
+            StallCause::ConsumerNotAcknowledging => { /* your commit_ack loop */ }
+            _ => {}
+        }
     }
     HealthVerdict::NotRunning => { /* not started, or stopped */ }
     _ => {}
 }
 # }
+```
+
+### Comparing verdicts
+
+`reason` embeds the measurements that fired the check — elapsed milliseconds, event counts,
+log positions — so it **differs on every evaluation of one unchanging stall**. Two `Stalled`
+values a tick apart are therefore never `==`, and a "log only when it changed" guard written
+against the whole verdict fires on every tick forever.
+
+Compare [`change_key()`](https://docs.rs/rustcdc/latest/rustcdc/core/enum.HealthVerdict.html#method.change_key)
+instead. It pairs the verdict label with the `StallCause`, so it is stable while the
+condition is, and still changes when one stall becomes a different one:
+
+```rust
+use rustcdc::{HealthVerdict, StallCause};
+
+let first = HealthVerdict::Stalled {
+    cause: StallCause::PollLoopNotTurning,
+    reason: "no poll has returned for 32279ms".into(),
+};
+let a_tick_later = HealthVerdict::Stalled {
+    cause: StallCause::PollLoopNotTurning,
+    reason: "no poll has returned for 32381ms".into(),
+};
+
+assert_ne!(first, a_tick_later);                            // the prose moved
+assert_eq!(first.change_key(), a_tick_later.change_key());  // the condition did not
 ```
 
 `RuntimeAdminSnapshot` also carries `idempotency_evictions` and
@@ -1081,10 +1115,31 @@ metadata nor a resolvable primary key — see [Idempotency guard safety](#idempo
 gate on it without matching every variant. The enum is `#[non_exhaustive]` — match with a
 wildcard arm.
 
-`Stalled` is raised for an unconfirmed source position, a poll loop that has not completed within
-`max_poll_wait_ms × 6` (floor 30s), or polled-but-uncommitted events with a stale last commit —
-that last case meaning the embedder stopped calling `commit_ack`, not a source fault. See
-[Operations Runbook](@/docs/runbook.md#health-verdict-idle-vs-stalled) for the alerting rules.
+`Stalled` carries one of three `StallCause`s, checked in this order:
+
+| `StallCause` | Condition | Whose problem |
+|---|---|---|
+| `UnconfirmedSourcePosition` | A position was durably checkpointed but the source refused to confirm it | The database — it keeps retaining log (WAL on a PostgreSQL primary) |
+| `PollLoopNotTurning` | `poll_event_batch` has not returned within `max_poll_wait_ms × 6` (floor 30s) | The process, or a socket wedged inside the source |
+| `ConsumerNotAcknowledging` | Events delivered but not committed, with a stale last commit | Your loop — it stopped calling `commit_ack` |
+
+**`PollLoopNotTurning` is not source idleness.** A quiet source returns an empty batch on
+schedule, and every returned poll — empty or not — keeps the signal fresh. The verdict goes
+stale only when a poll never comes back or nothing is polling at all. `Idle` is the verdict
+for a quiet database, at any point in a run: a pipeline that delivered a million rows this
+morning and has been quiet since lunch reports `Idle`, not `Stalled`.
+
+The two raw signals are on the snapshot, and on the Prometheus surface as
+`rustcdc_runtime_poll_age_ms` and `rustcdc_runtime_delivery_age_ms`:
+
+| `last_poll_at_ms` | `last_delivery_at_ms` | Verdict |
+|---|---|---|
+| fresh | fresh | `Healthy` |
+| fresh | stale | `Idle` — normal for a quiet database, never alert on this alone |
+| stale | either | `Stalled { cause: PollLoopNotTurning }` |
+
+See [Operations Runbook](@/docs/embedded-operations.md#health-verdict-idle-vs-stalled) for the
+alerting rules.
 
 ## Connection Retry Policy
 
@@ -1520,7 +1575,7 @@ than being read positionally against the current one.
 
 `GlueAvroConfig` has no `auto_register = false`: `schemreg`'s Glue client offers no
 lookup-by-name API, so the setting could only have been accepted and ignored — which is
-exactly the defect the Confluent JSON Schema and Protobuf encoders shipped with through 0.8.
+exactly the failure a setting that is accepted and ignored produces.
 Glue's `register_schema` is idempotent for identical content.
 
 > **Glue is the one backend with no live-service evidence.** It has no self-hostable
@@ -1656,16 +1711,28 @@ so an incompatible auto-registration fails with a clear message rather than an o
 409 on the first event. A registry that does not implement an optional endpoint reports
 `NotSupported`, which is skipped rather than treated as a failure.
 
-`auto_register = false` is also enforced by the encoders themselves, not only by an explicit
-preflight call. `ConfluentAvroEncoder` always resolved both subjects itself, so it honoured
-the setting; the JSON Schema and Protobuf encoders delegate subject resolution to `schemreg`,
-whose resolution path *is* `register_schema` with no lookup-only mode — so through 0.8 the
-setting was **silently ignored** by both, and an operator who set it got schemas registered
-anyway plus none of the schema-identity checking it exists to buy. All three now verify at
-construction that the subjects exist and carry exactly the schema rustcdc will write. The one
-thing that cannot be prevented is the later `register_schema` call itself; because the content
-is verified identical first, a Confluent-compatible registry answers it with the existing id
-rather than a new version.
+### `auto_register = false` means no writes at all
+
+The setting is enforced by the encoders themselves, not only by an explicit preflight call.
+`ConfluentAvroEncoder` always resolved both subjects itself, so it honoured the setting.
+The JSON Schema and Protobuf encoders delegate subject resolution to `schemreg`, whose
+resolution path through its 0.4 release *was* `register_schema` with no lookup-only mode —
+so the setting was **silently ignored** by both, and an operator who set it got schemas
+registered anyway plus none of the schema-identity checking it exists to buy.
+
+Since schemreg 0.5 there is a lookup-only mode, and rustcdc uses it: with
+`auto_register = false` all three encoders resolve through
+`SchemaResolution::LookupOnly`, which reads the id without writing. **A read-only
+producer principal — `Subject:Read` and nothing more — is a supported
+configuration**, and a local schema that has drifted from the registry fails at startup
+with a non-retryable not-found rather than quietly creating a production version from a
+producer process.
+
+All three additionally verify at construction that each subject carries *exactly* the
+schema rustcdc will write. That check is deliberately stronger than lookup resolution,
+which only asks whether the content is registered: Avro binary is positional and untagged,
+so a consumer resolving a stamped id to a different schema gets shifted fields and
+plausible-looking wrong values rather than an error.
 
 **Pass the `SchemaType` your codec actually writes.** Each format has different schemas under
 different subject names — Avro and JSON Schema derive subjects from the record name
@@ -1733,10 +1800,10 @@ envelope is typed, the row payload stays schemaless.
 
 `encode_event_key` frames the primary key against `KEY_PROTO_SCHEMA` (`proto/event_key.proto`)
 under the key subject, completing the three-format key story: `ConfluentAvroEncoder` has
-`encode_key`, `ConfluentJsonSchemaEncoder` has `encode_event_key`, and through 0.8 the
-Protobuf encoder had no key path at all — so a fan-out mixing codecs silently paired a
-registry-framed value with `ProtobufEncoder`'s unframed compact-JSON key, with nothing in the
-API signalling the mismatch. Keyless events (TRUNCATE, SCHEMA_CHANGE, tables with no declared
+`encode_key`, `ConfluentJsonSchemaEncoder` has `encode_event_key`, and this is the
+Protobuf one. All three matter together: a fan-out mixing codecs with a framed value and an
+unframed key pairs them silently, with nothing in the API signalling the mismatch. Keyless
+events (TRUNCATE, SCHEMA_CHANGE, tables with no declared
 primary key) produce a message with the `key` field **absent**, not empty, matching the
 `{"key": null}` the JSON Schema encoder emits and Debezium's behaviour.
 
@@ -1754,9 +1821,9 @@ kept apart deliberately:
 Collapsing the third into the second is a silent correctness failure rather than a lost error
 message: a keyed sink reads `None` as "unkeyed", so the record is produced without a key,
 **ordering for that row is lost**, log compaction stops collapsing it — and the record still
-arrives, so nothing looks wrong. Through 0.11 the method returned a bare `Option` and
-`ConfluentAvroEncoder::encode_key` swallowed both of its failure paths with `.ok()`, so that
-outcome was expressible. It no longer is.
+arrives, so nothing looks wrong. That is why the method returns a `Result` rather than a bare
+`Option`: a failure to *build* the key and a genuine absence of one must not collapse into the
+same value.
 
 This mirrors what the transform pipeline already does from the other side: a stage that destroys
 an event's key is rejected with an error naming the stage, rather than emitting the record
@@ -1804,7 +1871,7 @@ consumer written against Debezium's key subject works unchanged.
 
 ## Related Documentation
 
-- [Getting Started](@/docs/getting-started.md)
+- [Getting Started](@/docs/embedding.md)
 - [Configuration Reference](@/docs/config-reference.md)
 - [Architecture](@/docs/architecture.md)
 - [Schema Evolution and DDL Capture](@/docs/schema-evolution.md)

@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block head %}
+  {% set title = section.title %}
+  {% set description = section.description %}
+  {% set current_url = section.permalink %}
+  {% set og_type = "website" %}
+  {% include "partials/head.html" %}
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "CollectionPage",
+    "name": {{ section.title | json_encode | safe }},
+    "description": {{ section.description | default(value=config.description) | json_encode | safe }},
+    "url": {{ section.permalink | json_encode | safe }},
+    "isPartOf": {
+      "@type": "WebSite",
+      "name": {{ config.title | json_encode | safe }},
+      "url": {{ config.base_url | json_encode | safe }}
+    }
+  }
+  </script>
+{% endblock head %}
+
+{% block body_class %}page-docs{% endblock body_class %}
+
+{% block content %}
+<div class="docs-layout wrap">
+  {% set current_path = section.path %}
+  {% include "partials/sidebar.html" %}
+
+  <article class="docs-body">
+    <header class="docs-head">
+      <h1>{{ section.title }}</h1>
+      {% if section.description %}<p class="docs-lede">{{ section.description }}</p>{% endif %}
+    </header>
+
+    <div class="prose">
+      {{ section.content | safe }}
+    </div>
+  </article>
+</div>
+{% endblock content %}
+
+{% block scripts %}
+<script src="{{ get_url(path='elasticlunr.min.js') }}" defer></script>
+<script src="{{ get_url(path='search_index.en.js') }}" defer></script>
+<script src="{{ get_url(path='search.js', cachebust=true) }}" defer></script>
+{% endblock scripts %}

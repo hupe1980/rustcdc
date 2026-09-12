@@ -18,6 +18,7 @@ need_cmd sed
 need_cmd jq
 
 CI_WORKFLOW=".github/workflows/ci.yml"
+RELEASE_WORKFLOW=".github/workflows/release.yml"
 
 run_markdown_link_check() {
   local failed=0
@@ -149,40 +150,40 @@ run_schema_contract_check() {
   # hand-written `Serialize` (what the JSON encoder writes). That seam did not exist while
   # both directions were derived, and a field written but never read — or read but never
   # written — is exactly the silent envelope divergence this gate exists to catch.
-  sed -n '/^struct EventWire {/,/^}/p' src/core/event.rs \
+  sed -n '/^struct EventWire {/,/^}/p' crates/rustcdc/src/core/event.rs \
     | sed -nE 's/^[[:space:]]*([a-z_][a-z0-9_]*)[[:space:]]*:.*/\1/p' \
     | sort -u > "$rust_event_fields"
 
-  sed -n '/^impl Serialize for Event {/,/^}/p' src/core/event.rs \
+  sed -n '/^impl Serialize for Event {/,/^}/p' crates/rustcdc/src/core/event.rs \
     | grep -oE '(serialize_field|skip_field)\("[a-z_]+"' \
     | sed -E 's/.*\("([a-z_]+)"/\1/' \
     | sort -u > "$rust_serialized_fields"
 
-  sed -n '/pub enum Operation {/,/^}/p' src/core/event.rs \
+  sed -n '/pub enum Operation {/,/^}/p' crates/rustcdc/src/core/event.rs \
     | sed -nE 's/^[[:space:]]*([A-Z][A-Za-z0-9_]*)[[:space:]]*,.*/\1/p' \
     | sed -E 's/([a-z0-9])([A-Z])/\1_\2/g' \
     | tr '[:upper:]' '[:lower:]' \
     | sort -u > "$rust_operation_symbols"
 
-  sed -n '/message Event {/,/^}/p' proto/event.proto \
+  sed -n '/message Event {/,/^}/p' crates/rustcdc/proto/event.proto \
     | sed -E 's,//.*$,,' \
     | sed -nE 's/^[[:space:]]*(optional[[:space:]]+|repeated[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]+([a-z_][a-z0-9_]*)[[:space:]]*=.*/\2/p' \
     | sort -u > "$proto_event_fields"
 
-  sed -n '/enum Operation {/,/^}/p' proto/event.proto \
+  sed -n '/enum Operation {/,/^}/p' crates/rustcdc/proto/event.proto \
     | sed -E 's,//.*$,,' \
     | sed -nE 's/^[[:space:]]*([A-Z_]+)[[:space:]]*=.*/\1/p' \
     | rg -v '^OPERATION_UNSPECIFIED$' \
     | tr '[:upper:]' '[:lower:]' \
     | sort -u > "$proto_operation_symbols"
 
-  jq -r '.fields[].name' schemas/event.avsc | sort -u > "$avro_event_fields"
+  jq -r '.fields[].name' crates/rustcdc/schemas/event.avsc | sort -u > "$avro_event_fields"
 
   jq -r '
     .fields[]
     | select(.name == "op")
     | .type.symbols[]
-  ' schemas/event.avsc \
+  ' crates/rustcdc/schemas/event.avsc \
     | tr '[:upper:]' '[:lower:]' \
     | sort -u > "$avro_operation_symbols"
 
@@ -199,7 +200,7 @@ run_schema_contract_check() {
 run_deprecated_usage_check() {
   local pattern='\#\[\s*deprecated|deprecated\('
   local matches
-  matches="$(rg -n --hidden --glob '!.git' --glob '!target' "$pattern" src tests site/content scripts .github xtask Cargo.toml README.md || true)"
+  matches="$(rg -n --hidden --glob '!.git' --glob '!target' --glob '!crates/rustcdc-server/fuzz/target' "$pattern" crates/rustcdc/src crates/rustcdc/tests crates/rustcdc-server/src crates/rustcdc-server/tests site/content scripts .github crates/xtask Cargo.toml crates/rustcdc/Cargo.toml crates/rustcdc-server/Cargo.toml README.md crates/rustcdc/README.md crates/rustcdc-server/README.md || true)"
 
   if [[ -n "$matches" ]]; then
     echo "Deprecated marker/usage gate failed. Remove deprecated APIs/usages before merging." >&2
@@ -212,9 +213,9 @@ run_deprecated_usage_check() {
 
 run_async_trait_policy_check() {
   local connector_files=(
-    "src/source/postgres.rs"
-    "src/source/mysql.rs"
-    "src/source/sqlserver.rs"
+    "crates/rustcdc/src/source/postgres.rs"
+    "crates/rustcdc/src/source/mysql.rs"
+    "crates/rustcdc/src/source/sqlserver.rs"
   )
 
   if rg -n '#\[async_trait::async_trait\]' "${connector_files[@]}"; then
@@ -226,48 +227,16 @@ run_async_trait_policy_check() {
 }
 
 run_cargo_profile_safety_check() {
-  # Reject any Cargo profile that enables debug-assertions = true unless it is the
-  # built-in "dev" or "test" profile (which expect debug-assertions in development).
+  # Delegated to `cargo xtask profile-check`, which is compiled and unit-tested.
   #
-  # This catches release/bench/custom profiles that accidentally enable assertions,
-  # not just profiles whose name contains "release".
-  local failed=0
-
-  local matches
-  matches="$(rg -n 'debug-assertions\s*=\s*true' Cargo.toml 2>/dev/null || true)"
-
-  if [[ -z "$matches" ]]; then
-    echo "Cargo profile safety check passed (no debug-assertions = true found)."
-    return 0
-  fi
-
-  # Walk Cargo.toml: track the current [profile.<name>] section and report any
-  # debug-assertions = true that appears outside the allowed set (dev, test).
-  local bad_profiles
-  bad_profiles="$(awk '
-    /^\[profile\./ {
-      # Extract profile name from "[profile.foo]" or "[profile.foo.bar]"
-      match($0, /\[profile\.([^.\]]+)/, arr)
-      current_profile = arr[1]
-    }
-    /debug-assertions\s*=\s*true/ {
-      if (current_profile != "dev" && current_profile != "test") {
-        print "[profile." current_profile "]: " $0
-      }
-    }
-  ' Cargo.toml || true)"
-
-  if [[ -n "$bad_profiles" ]]; then
-    echo "FAIL: debug-assertions = true found in non-dev/non-test Cargo profile:" >&2
-    echo "$bad_profiles" >&2
-    echo "Only [profile.dev] and [profile.test] may enable debug-assertions." >&2
-    echo "All other profiles (release, bench, custom) must use debug-assertions = false." >&2
-    failed=1
-  fi
-
-  if [[ $failed -eq 0 ]]; then
-    echo "Cargo profile safety check passed."
-  else
+  # This was awk, and on macOS it did nothing at all: the profile name was extracted with
+  # gawk's three-argument `match($0, /…/, arr)`, a GNU extension that BSD awk rejects as a
+  # syntax error. The program aborted, `|| true` swallowed it, and the gate printed
+  # "passed" having read nothing — silently vacuous for every developer not on Linux, and
+  # it stayed that way through a change that added the exact profile it rejects.
+  #
+  # A check whose correctness depends on which `awk` is installed is not a check.
+  if ! cargo xtask profile-check; then
     exit 1
   fi
 }
@@ -328,6 +297,195 @@ require_file_absent() {
   fi
 }
 
+require_file_present() {
+  local file="$1"
+
+  if [[ ! -f "$file" ]]; then
+    echo "FAIL: required workflow file is missing: ${file}" >&2
+    exit 1
+  fi
+}
+
+# Every published crate must carry the licence texts, and they must be the repository's.
+#
+# `license = "MIT OR Apache-2.0"` is an SPDX expression, not a grant. `cargo package`
+# collects only files beneath the crate directory, so moving the library into `crates/`
+# silently dropped both texts from the `.crate` — the metadata still claimed the licences
+# while the artefact no longer contained them. Copies are the only option cargo offers;
+# this is what stops the copies drifting from the originals.
+# Every path a workflow names must exist.
+#
+# A `working-directory:`, a local `uses: ./…` or a script path that points at a directory
+# the repository does not have fails **only when that job runs** — on a pull request, in a
+# lane that may be slow or rarely reached, with an error from bash rather than from
+# anything that reads like a path problem:
+#
+#   An error occurred trying to start process '/usr/bin/bash' with working directory
+#   '/home/runner/work/rustcdc/rustcdc/server'. No such file or directory
+#
+# That is what a rename leaves behind when the search-and-replace only matched the form
+# with a trailing slash. This is the cheap check that would have caught it before the push.
+# Every job must say which half of the workspace it covers.
+#
+# GitHub shows a job's `name:` in the checks list, falling back to the job id. Without a
+# scope prefix a reader sees `Check`, `Test` and `Fuzz (smoke)` and cannot tell the library
+# from the server — which is exactly how a red check gets attributed to the wrong half.
+#
+# `lib:` the library · `server:` the binary · `workspace:` both · `release:` the tag
+# pipeline. `CI` is the aggregator branch protection requires and is deliberately bare.
+run_cargo_scope_check() {
+  # A cargo command that names a target or a feature must also name a package.
+  #
+  # Without `-p`, cargo selects every default workspace member and unifies features
+  # across the whole set — so a flag meant for one crate silently reshapes another
+  # crate's build. Both of the release-evidence failures were this:
+  #
+  #   * `cargo bench --bench quality_perf` pulled in `rustcdc-server`'s dev-dependency on
+  #     `rustcdc/test-harnesses` and tripped the release guard in `fault_injection`.
+  #   * `cargo test --test mysql_connection_integration` enabled both rustls providers
+  #     (`ring` via testcontainers, `aws-lc-rs` via reqwest) and rustls will not guess
+  #     between two, so the suite panicked on a CryptoProvider that CI resolves fine.
+  #
+  # Neither failed at the seam that was wrong, and neither reproduced under the scoped
+  # command CI runs — which is exactly why this is a static check.
+  #
+  # `--workspace` counts as naming the scope: that is the deliberate whole-workspace case.
+  local hits
+  hits="$(rg -n --no-heading --hidden -e 'cargo (build|test|bench|run) ' \
+    --glob 'scripts/**/*.sh' \
+    --glob '.github/workflows/*.yml' \
+    --glob '!scripts/ci-policy-gate.sh' \
+    . \
+    | grep -E -- '--features|--test |--bench |--bin |--example ' \
+    | grep -v -E -- '(-p |--package|--workspace)' \
+    | grep -v -E '^[^:]+:[0-9]+: *#' \
+    | grep -v -E '^[^:]+:[0-9]+: *(- )?name:' || true)"
+
+  if [[ -n "$hits" ]]; then
+    echo "FAIL: cargo invocation selects a target or feature without naming a package." >&2
+    echo "Add \`-p <crate>\` (or \`--workspace\` if every member is meant):" >&2
+    printf '%s\n' "$hits" >&2
+    exit 1
+  fi
+  echo "Cargo scope check passed (every targeted cargo command names its package)."
+}
+
+run_bench_invocation_check() {
+  # Every documented `cargo bench` in this repository was wrong, and silently so.
+  #
+  # Benchmarks build in the release profile, where the guard in `fault_injection` rejects
+  # `test-harnesses` — and `rustcdc-server` dev-depends on `rustcdc` with that feature, so
+  # cargo's feature unification turns it on for any unscoped build. Two bench targets are
+  # also named `throughput`, one per crate, so `--bench throughput` is ambiguous. Six
+  # documents and four `//!` headers told the reader to run a command that cannot work,
+  # and CI ran one too. `cargo xtask bench` carries the hatch and the `-p`.
+  #
+  # Allowed to say `cargo bench`: the xtask that wraps it, the gate that scopes it, the
+  # instructions that explain why not to, and CHANGELOG.md, which is a record of what was
+  # true when written and is not rewritten.
+  local hits
+  hits="$(rg -n --no-heading --hidden -e 'cargo bench' \
+    --glob '!target/**' \
+    --glob '!.git/**' \
+    --glob '!CHANGELOG.md' \
+    --glob '!crates/xtask/src/main.rs' \
+    --glob '!scripts/ci-benchmark-gate.sh' \
+    --glob '!scripts/ci-policy-gate.sh' \
+    --glob '!.github/copilot-instructions.md' \
+    . | grep -v 'cargo xtask bench' || true)"
+
+  if [[ -n "$hits" ]]; then
+    echo "FAIL: bare \`cargo bench\` is not a working command in this repository." >&2
+    echo "Use \`cargo xtask bench\` (add \`-p <crate> --bench <name>\` to narrow):" >&2
+    printf '%s\n' "$hits" >&2
+    exit 1
+  fi
+  echo "Bench invocation check passed (no bare \`cargo bench\` outside its wrapper)."
+}
+
+run_job_naming_check() {
+  local failed=0
+
+  while IFS= read -r hit; do
+    local file value
+    file="${hit%%:*}"
+    value="$(printf '%s' "$hit" | sed -E 's/.*name:[[:space:]]*//; s/^"//; s/"$//')"
+    case "$value" in
+      lib:*|server:*|workspace:*|release:*|CI) ;;
+      *)
+        echo "FAIL: ${file}: job name \"${value}\" has no scope prefix \
+(lib: / server: / workspace: / release:)" >&2
+        failed=1
+        ;;
+    esac
+  done < <(rg -n --no-heading -e '^    name:' .github/workflows/ci.yml .github/workflows/release.yml || true)
+
+  if [[ "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  echo "Job naming check passed (every job names the half it covers)."
+}
+
+run_workflow_path_check() {
+  local failed=0
+
+  while IFS= read -r hit; do
+    local file value
+    file="${hit%%:*}"
+    value="$(printf '%s' "$hit" | sed -E 's/.*:[[:space:]]*//')"
+    # Absolute paths are created by the job itself (`/tmp/digests`), not by the repository.
+    case "$value" in /*) continue ;; esac
+    if [[ ! -e "$value" ]]; then
+      echo "FAIL: ${file} names a path that does not exist: ${value}" >&2
+      failed=1
+    fi
+  done < <(rg -n --no-heading -e '^\s*working-directory:\s*\S+' .github/workflows/ || true)
+
+  while IFS= read -r hit; do
+    local file value
+    file="${hit%%:*}"
+    value="$(printf '%s' "$hit" | sed -E 's/.*uses:[[:space:]]*//; s/@.*//')"
+    if [[ ! -e "$value" ]]; then
+      echo "FAIL: ${file} uses a local action that does not exist: ${value}" >&2
+      failed=1
+    fi
+  done < <(rg -n --no-heading -e '^\s*-?\s*uses:\s*\./' .github/workflows/ || true)
+
+  if [[ "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  echo "Workflow path check passed (every referenced path exists)."
+}
+
+run_licence_presence_check() {
+  local failed=0
+
+  while IFS= read -r manifest; do
+    local dir
+    dir="$(dirname "$manifest")"
+    # Only crates that are actually published; `publish = false` ships no artefact.
+    if rg -q '^publish = false' "$manifest"; then
+      continue
+    fi
+    for licence in LICENSE-MIT LICENSE-APACHE; do
+      if [[ ! -f "$dir/$licence" ]]; then
+        echo "FAIL: $dir is published but has no $licence; cargo package collects only \
+files beneath the crate directory, so the published artefact would carry the SPDX \
+expression without the grant it names" >&2
+        failed=1
+      elif ! diff -q "$licence" "$dir/$licence" >/dev/null; then
+        echo "FAIL: $dir/$licence differs from the repository's $licence" >&2
+        failed=1
+      fi
+    done
+  done < <(find crates -mindepth 2 -maxdepth 2 -name Cargo.toml | sort)
+
+  if [[ "$failed" -ne 0 ]]; then
+    exit 1
+  fi
+  echo "Licence presence check passed (every published crate carries both texts)."
+}
+
 run_workflow_drift_check() {
   require_file_absent ".github/workflows/publish.yml"
   require_file_absent ".github/workflows/nightly-evidence.yml"
@@ -346,16 +504,95 @@ run_workflow_drift_check() {
   # Anchored on `run:` rather than on the bare command: a step's `name:` usually repeats
   # the command, so an unanchored pattern is satisfied by the label alone and would still
   # match after the command itself was changed.
-  require_match "^ +run: cargo doc --all-features --no-deps$" "$CI_WORKFLOW" "all-features doc build"
-  require_match "^ +run: cargo doc --no-default-features --no-deps$" "$CI_WORKFLOW" "no-default-features doc build"
+  require_match "^ +run: cargo doc -p rustcdc --all-features --no-deps$" "$CI_WORKFLOW" "all-features doc build"
+  require_match "^ +run: cargo doc -p rustcdc --no-default-features --no-deps$" "$CI_WORKFLOW" "no-default-features doc build"
   require_match "bash scripts/ci-pull-relational-images.sh --relational-smoke" "$CI_WORKFLOW" "relational smoke image pull mode"
   require_match "bash scripts/ci-benchmark-gate.sh" "$CI_WORKFLOW" "benchmark policy gate"
   require_match "bash scripts/run_full_integration_matrix_evidence.sh" "$CI_WORKFLOW" "full matrix evidence run"
   require_match "BENCHMARK_ENFORCE_RELEASE_POLICY: \"1\"" "$CI_WORKFLOW" "benchmark policy enforcement"
   require_match "  release-evidence:" "$CI_WORKFLOW" "release evidence job"
-  require_match "  release-evidence-verify:" "$CI_WORKFLOW" "release evidence verification job"
-  require_match "  publish:" "$CI_WORKFLOW" "publish job"
-  require_match "needs: release-evidence-verify" "$CI_WORKFLOW" "publish dependency on release evidence verification"
+  # The evidence the release gate reads is produced here; the gate that reads it lives in
+  # `release.yml`, and asserting both ends keeps them from drifting apart.
+  require_match "  release-evidence:" "$CI_WORKFLOW" "release evidence job"
+  require_match "  package:" "$CI_WORKFLOW" "packaging job"
+  require_match "verify successful release-evidence run exists for this commit" \
+    "$RELEASE_WORKFLOW" "the release gate checks CI passed for this exact commit"
+  require_match "does not match Cargo.toml version" "$RELEASE_WORKFLOW" "tag/version agreement check"
+  # Every job in `release-evidence`'s `needs:` is a gate the release depends on
+  # transitively. These four are the ones whose loss would be least visible.
+  for required_gate in quality policy-gate server-test server-check; do
+    if ! rg -q "^      - ${required_gate}$|^ +- ${required_gate}$" "$CI_WORKFLOW"; then
+      echo "FAIL: ${required_gate} is not required by anything in ${CI_WORKFLOW}" >&2
+      exit 1
+    fi
+  done
+  # `cargo package` builds from the collected copy, which is the only thing that catches a
+  # crate compiling in the repository but not from the registry. Running it on every pull
+  # request is what keeps that discovery off the release tag.
+  require_match "^ +run: cargo package -p rustcdc --locked$" "$CI_WORKFLOW" "packaged crate is built"
+
+  # Repository-level gates must cover *both* workspace members. Scoping either to one
+  # package is how the server's 50k lines went unlinted for as long as it was a separate
+  # repository with its own, narrower, CI.
+  require_match "^ +run: cargo fmt --all --check$" "$CI_WORKFLOW" "workspace-wide formatting"
+  require_match "^ +run: cargo clippy --workspace --all-targets --all-features -- -D warnings$" \
+    "$CI_WORKFLOW" "workspace-wide clippy"
+  # The MSRV job must *derive* the toolchain from the manifest rather than restate it.
+  # Two sources of truth for one number is exactly how the previous pin drifted.
+  require_match "steps.msrv.outputs.version" "$CI_WORKFLOW" "MSRV derived from the manifest"
+
+  # One workflow for the whole workspace. Two files could not express the only thing
+  # that matters at release time — `needs:` cannot name a job in another workflow — so a
+  # tag published the library with the server's tests unverified, and a third workflow
+  # pushed the container image depending on nothing at all.
+  require_file_absent ".github/workflows/server-ci.yml"
+  require_file_absent ".github/workflows/publish-container.yml"
+  require_match "  server-connector-matrix:" "$CI_WORKFLOW" "server connector feature matrix"
+  require_match "  server-integration:" "$CI_WORKFLOW" "server integration job"
+  require_match "  server-fuzz:" "$CI_WORKFLOW" "server fuzz smoke job"
+
+  # The release chain, in order. Each link is a property, not a style preference:
+  #
+  #   container-smoke   the image builds — checked on every pull request, so the risky
+  #                     part is known good long before the irreversible one
+  #   publish           crates.io. Irreversible: a version can never be reused, not even
+  #                     after a yank, so it goes last among steps that can still fail
+  #   container-build   only after the crate exists, so no image advertises a release
+  #                     crates.io never accepted. A push is idempotent; a re-run fixes it
+  #   github-release    last, because it is the announcement
+  require_match "  container-smoke:" "$CI_WORKFLOW" "container build on pull requests"
+  require_match "^ +push: false$" "$CI_WORKFLOW" "the pull-request container build does not push"
+
+  # One required status check, and it must tolerate skipped jobs. GitHub leaves a
+  # required check pending forever when its job never runs, and treats a *skipped*
+  # required check as success — so the aggregator needs `if: always()` or it inverts.
+  require_match "  required-checks-passed:" "$CI_WORKFLOW" "branch-protection aggregator"
+  require_match "^    if: always\(\)$" "$CI_WORKFLOW" "the aggregator runs even when a dependency fails"
+
+  # ── The release, and its ordering ───────────────────────────────────────────
+  #
+  # Reversible before irreversible. A crates.io version can never be overwritten,
+  # deleted, or reused — `cargo yank` only stops new resolution — while a GHCR package
+  # version can be deleted and restored. So the image ships first and the crate last: if
+  # crates.io fails, the image is deleted and the same tag retried; the other order
+  # spends a version number that can never be reclaimed.
+  require_file_present ".github/workflows/release.yml"
+  require_match "^name: release$" "$RELEASE_WORKFLOW" "release workflow name"
+  require_match "    needs: verify" "$RELEASE_WORKFLOW" "the release is gated on the tag being verified"
+  require_match "    needs: container-build" "$RELEASE_WORKFLOW" "the manifest follows the platform builds"
+  require_match "    needs: container-publish" "$RELEASE_WORKFLOW" "crates.io is published after the image"
+  require_match "    needs: publish-crate" "$RELEASE_WORKFLOW" "the GitHub release is last"
+  require_match "\-\-notes-file release-notes.md" "$RELEASE_WORKFLOW" "release notes come from CHANGELOG.md"
+  # Trusted publishing pins the workflow *filename*, which is why the release lives in
+  # its own file rather than in ci.yml: a compromised action in the test matrix must not
+  # be able to mint a crates.io token.
+  require_match "rust-lang/crates-io-auth-action" "$RELEASE_WORKFLOW" "crates.io trusted publishing"
+  require_match "^      id-token: write$" "$RELEASE_WORKFLOW" "OIDC identity for trusted publishing"
+  if rg -qF 'CARGO_REGISTRY_TOKEN: ${{ secrets' "$RELEASE_WORKFLOW"; then
+    echo "FAIL: the release still uses a long-lived crates.io secret; trusted publishing \
+mints a short-lived token instead" >&2
+    exit 1
+  fi
 
   require_match "mysql_snapshot_integration" "$CI_WORKFLOW" "mysql depth suite"
   require_match "mariadb_e2e_integration" "$CI_WORKFLOW" "mariadb depth suite"
@@ -399,8 +636,8 @@ run_relational_image_drift_check() {
   local missing=()
 
   local mysql_versions mariadb_versions
-  mysql_versions="$(grep -oE '"[0-9]+\.[0-9]+"' tests/mysql_version_matrix.rs | tr -d '"' | sort -u)"
-  mariadb_versions="$(grep -oE '"1[0-9]\.[0-9]+"' tests/mariadb_e2e_integration.rs | tr -d '"' | sort -u)"
+  mysql_versions="$(grep -oE '"[0-9]+\.[0-9]+"' crates/rustcdc/tests/mysql_version_matrix.rs | tr -d '"' | sort -u)"
+  mariadb_versions="$(grep -oE '"1[0-9]\.[0-9]+"' crates/rustcdc/tests/mariadb_e2e_integration.rs | tr -d '"' | sort -u)"
 
   local version
   for version in $mysql_versions; do
@@ -421,7 +658,7 @@ run_relational_image_drift_check() {
   echo "Relational image drift check passed (pre-pull covers every matrix version)."
 }
 
-# Every integration suite under tests/ must actually be run by something.
+# Every integration suite under crates/rustcdc/tests/ must actually be run by something.
 #
 # The checks above are an *allow-list*: they assert that named suites appear in the
 # workflow. That is silent about suites nobody added — and a test that never runs is
@@ -435,7 +672,7 @@ run_relational_image_drift_check() {
 # must be added to one of those, or listed in HELPER_SUITES with a reason.
 run_test_suite_coverage_check() {
   # Helper modules included by other suites via `#[path = "..."] mod ...;`. Cargo also
-  # builds each as its own (empty) test binary, so they appear in tests/ without being
+  # builds each as its own (empty) test binary, so they appear in crates/rustcdc/tests/ without being
   # suites in their own right.
   local helper_suites=(
     latency_evidence_common
@@ -446,7 +683,7 @@ run_test_suite_coverage_check() {
 
   local uncovered=()
   local suite
-  for path in tests/*.rs; do
+  for path in crates/rustcdc/tests/*.rs; do
     suite="$(basename "$path" .rs)"
 
     local is_helper=0
@@ -466,7 +703,7 @@ run_test_suite_coverage_check() {
     if grep -rq --include='*.sh' -- "$suite" scripts/; then
       continue
     fi
-    if grep -rq "path = \"${suite}.rs\"" tests/; then
+    if grep -rq "path = \"${suite}.rs\"" crates/rustcdc/tests/; then
       continue
     fi
 
@@ -476,14 +713,14 @@ run_test_suite_coverage_check() {
   if (( ${#uncovered[@]} > 0 )); then
     echo "FAIL: integration suites are never run by CI or any script:" >&2
     for suite in "${uncovered[@]}"; do
-      echo "  - tests/${suite}.rs" >&2
+      echo "  - crates/rustcdc/tests/${suite}.rs" >&2
     done
     echo "Add each to a matrix in ${CI_WORKFLOW}, to a script CI runs, or to" >&2
     echo "helper_suites in scripts/ci-policy-gate.sh with a reason." >&2
     exit 1
   fi
 
-  echo "Test suite coverage check passed (every tests/*.rs is run by CI or a script)."
+  echo "Test suite coverage check passed (every crates/rustcdc/tests/*.rs is run by CI or a script)."
 }
 
 # Every public field of a user-facing config struct must appear in the configuration
@@ -529,12 +766,12 @@ run_config_docs_coverage_check() {
     done <<< "$fields"
   }
 
-  check_struct_fields_documented "src/core/runtime.rs" "RuntimeConfig"
-  check_struct_fields_documented "src/core/runtime.rs" "RuntimeOptions"
-  check_struct_fields_documented "src/source/postgres.rs" "PostgresSourceConfig"
-  check_struct_fields_documented "src/source/mysql.rs" "MysqlSourceConfig"
-  check_struct_fields_documented "src/source/sqlserver.rs" "SqlServerSourceConfig"
-  check_struct_fields_documented "src/source/snowflake.rs" "SnowflakeSourceConfig"
+  check_struct_fields_documented "crates/rustcdc/src/core/runtime.rs" "RuntimeConfig"
+  check_struct_fields_documented "crates/rustcdc/src/core/runtime.rs" "RuntimeOptions"
+  check_struct_fields_documented "crates/rustcdc/src/source/postgres.rs" "PostgresSourceConfig"
+  check_struct_fields_documented "crates/rustcdc/src/source/mysql.rs" "MysqlSourceConfig"
+  check_struct_fields_documented "crates/rustcdc/src/source/sqlserver.rs" "SqlServerSourceConfig"
+  check_struct_fields_documented "crates/rustcdc/src/source/snowflake.rs" "SnowflakeSourceConfig"
 
   if [[ "$failed" -gt 0 ]]; then
     echo "config docs coverage check failed: $failed undocumented field(s)" >&2
@@ -584,7 +821,7 @@ run_reexport_coverage_check() {
   # Nothing was broken; it cost a docs search per item and made the surface look
   # arbitrary.
   #
-  # The rule is **all-or-nothing per module**, and it configures itself: if `src/lib.rs`
+  # The rule is **all-or-nothing per module**, and it configures itself: if `crates/rustcdc/src/lib.rs`
   # re-exports anything from a module, it must re-export everything that module
   # re-exports. Modules `lib.rs` deliberately keeps namespaced — `checkpoint`,
   # `testkit`, `fault_injection`, `deterministic_replay`, `schema_history` — have no
@@ -601,16 +838,16 @@ run_reexport_coverage_check() {
   # is not mistaken for a module-level item.
   public_items="$(rg --no-line-number --no-filename -o \
     '^pub (?:struct|enum|trait|const|type|fn|async fn) ([A-Za-z_][A-Za-z0-9_]*)' \
-    --replace '$1' src | sort -u)"
+    --replace '$1' crates/rustcdc/src | sort -u)"
 
-  # Names re-exported by `<module>/mod.rs` must also be named by `src/lib.rs`.
+  # Names re-exported by `<module>/mod.rs` must also be named by `crates/rustcdc/src/lib.rs`.
   check_crate_root_reexports() {
     local module_mod="$1"
     local module_name
     module_name="$(basename "$(dirname "$module_mod")")"
 
     # Skip modules with no crate-root surface at all — they are namespaced by design.
-    if ! rg -q "^pub use crate::${module_name}::" src/lib.rs; then
+    if ! rg -q "^pub use crate::${module_name}::" crates/rustcdc/src/lib.rs; then
       return
     fi
 
@@ -628,20 +865,20 @@ run_reexport_coverage_check() {
       [[ -z "$item" ]] && continue
       # Keep only real items; skip `pub`/`use`/`crate` and module path segments.
       grep -qx -- "$item" <<< "$public_items" || continue
-      if ! rg -q "\\b$item\\b" src/lib.rs; then
-        echo "crate-root parity: $module_mod re-exports \`$item\` but src/lib.rs never names it" >&2
+      if ! rg -q "\\b$item\\b" crates/rustcdc/src/lib.rs; then
+        echo "crate-root parity: $module_mod re-exports \`$item\` but crates/rustcdc/src/lib.rs never names it" >&2
         failed=$((failed + 1))
       fi
     done <<< "$names"
   }
 
-  check_module_reexports "src/codec/schema_registry.rs" "src/codec/mod.rs"
-  check_module_reexports "src/codec/avro.rs" "src/codec/mod.rs"
-  check_module_reexports "src/codec/json.rs" "src/codec/mod.rs"
-  check_module_reexports "src/source/incremental_snapshot/driver.rs" "src/source/mod.rs"
+  check_module_reexports "crates/rustcdc/src/codec/schema_registry.rs" "crates/rustcdc/src/codec/mod.rs"
+  check_module_reexports "crates/rustcdc/src/codec/avro.rs" "crates/rustcdc/src/codec/mod.rs"
+  check_module_reexports "crates/rustcdc/src/codec/json.rs" "crates/rustcdc/src/codec/mod.rs"
+  check_module_reexports "crates/rustcdc/src/source/incremental_snapshot/driver.rs" "crates/rustcdc/src/source/mod.rs"
 
   # Every module directory; the function itself skips those with no crate-root surface.
-  for module_mod in src/*/mod.rs; do
+  for module_mod in crates/rustcdc/src/*/mod.rs; do
     check_crate_root_reexports "$module_mod"
   done
 
@@ -659,6 +896,11 @@ run_schema_contract_check
 run_deprecated_usage_check
 run_async_trait_policy_check
 run_cargo_profile_safety_check
+run_job_naming_check
+run_bench_invocation_check
+run_cargo_scope_check
+run_workflow_path_check
+run_licence_presence_check
 run_workflow_drift_check
 
 echo "Policy gate passed."

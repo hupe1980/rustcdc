@@ -1,0 +1,3456 @@
+//! PostgreSQL source configuration, connection lifecycle, and validation helpers.
+
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use tokio::{sync::Mutex, task::JoinHandle};
+use tokio_postgres::{Client, Connection, Socket};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    checkpoint::PostgresOffset,
+    core::{Error, Event, Offset, Result, SecretString, StructuredLogger, TransportConfig},
+    source::{
+        ConnectorCapabilities, DatabaseAuthMode, HandoffResult, IncrementalSnapshotConfig,
+        SnapshotHandle, Source, StreamHandle, helpers::now_millis,
+    },
+};
+
+mod config;
+mod decoder;
+mod handoff;
+pub mod incremental_snapshot;
+mod parser;
+mod query;
+mod snapshot_chunk;
+mod snapshot_finalize;
+mod snapshot_start;
+mod state;
+mod stream_messages;
+mod stream_start;
+mod streaming;
+mod validation;
+mod wire;
+
+// Import decoder types used directly in this module.
+use self::decoder::{PgOutputMessageProvider, PgRelation};
+
+use self::handoff::postgres_handoff_result;
+#[cfg(test)]
+use self::handoff::postgres_handoff_stream_watermark_gap;
+pub use self::incremental_snapshot::IncrementalSnapshotHandle;
+use self::snapshot_chunk::next_postgres_snapshot_chunk;
+use self::snapshot_finalize::{checkpoint_postgres_snapshot, finish_postgres_snapshot};
+use self::snapshot_start::{
+    start_postgres_snapshot_from_checkpoint, start_postgres_snapshot_internal,
+};
+use self::state::{
+    ConnectionState, PostgresHandoff, PostgresStream, SnapshotCheckpointState, StreamState,
+    TableSnapshotState,
+};
+use self::stream_start::start_postgres_stream;
+use self::validation::validate_connected_postgres_client;
+
+const HEARTBEAT_SECS: u64 = 60;
+const DEFAULT_SNAPSHOT_CHUNK_SIZE: usize = 5_000;
+const STREAM_POLL_INTERVAL_MS: u64 = 50;
+const MAX_EVENTS_PER_POLL: usize = 1_000;
+
+/// Maximum time a single `poll_xlog_data` SQL query may run when `timeout_ms == 0`.
+/// Prevents indefinite blocking on the "single-shot, return immediately" code-path.
+const DEFAULT_POLL_BACKSTOP_MS: u64 = 30_000;
+/// Defensive cap on remembered `(tx_id, end_lsn)` pairs.
+///
+/// The queue drains as `confirm_lsn` advances, so in a healthy pipeline it holds only the
+/// transactions currently in flight. The cap bounds it if a consumer stops acknowledging
+/// entirely; past it the oldest entries are dropped and those events fall back to their own
+/// change LSN, which costs a replay of their transaction rather than losing anything.
+const MAX_TRACKED_TX_ENDS: usize = 100_000;
+/// Slot-lag sampling cadence when idle advance is disabled.
+const DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS: u64 = 15_000;
+/// Live pgoutput stream over a logical replication slot.
+///
+/// Obtain via `PostgresConnection::start_stream`.
+pub struct PostgresStreamHandle {
+    source_name: String,
+    stream: PostgresStream,
+    provider: Box<dyn PgOutputMessageProvider>,
+    relation_map: HashMap<u32, PgRelation>,
+    /// Real primary key of each published table, by `(schema, table)`, read from the catalog
+    /// once at stream start.
+    ///
+    /// Needed because pgoutput's per-column key flag means "part of the replica identity", and
+    /// under `REPLICA IDENTITY FULL` PostgreSQL sets it on every column. See
+    /// [`query_publication_primary_keys`](super::postgres::query::query_publication_primary_keys)
+    /// for what reading the flag as a primary key breaks.
+    catalog_primary_keys: HashMap<(String, String), Vec<String>>,
+    /// Relations already warned about for an unusable REPLICA IDENTITY.
+    ///
+    /// pgoutput re-sends RELATION on every poll, so without this the warning would
+    /// repeat for every poll cycle of every affected table.
+    warned_replica_identity: std::collections::HashSet<u32>,
+    /// pgoutput message tags already warned about, so the warning fires once per tag
+    /// rather than once per message.
+    warned_unknown_messages: std::collections::HashSet<u8>,
+    current_xid: Option<u32>,
+    current_commit_ts: u64,
+    partial_tx_events: Vec<Event>,
+    /// `(tx_id, end_lsn)` for transactions released to the consumer but not yet confirmed.
+    ///
+    /// `end_lsn` is the pgoutput COMMIT message's end position — the LSN **after** the
+    /// commit record — and it is the only position a restart may resume from. See
+    /// [`PostgresStreamHandle::resume_offset_for`].
+    ///
+    /// Bounded by the in-flight window: entries are dropped as `confirm_lsn` moves past
+    /// them, and defensively capped at [`MAX_TRACKED_TX_ENDS`].
+    committed_tx_ends: std::collections::VecDeque<(u64, u64)>,
+    events_polled: u64,
+    max_events_per_poll: usize,
+    /// Changes requested from the next peek.
+    ///
+    /// Starts at `max_events_per_poll` and shrinks when a peek exceeds its budget.
+    /// `pg_logical_slot_peek_binary_changes` is **non-consuming**: it re-decodes the whole
+    /// un-acked backlog on every call, so retrying a window the server could not decode
+    /// repeats identical work and times out again. Without shrinking, a saturated server
+    /// stops the pipeline permanently — the events stay in the WAL and are never surfaced.
+    peek_window: usize,
+    stream_poll_interval_ms: u64,
+    /// Milliseconds between idle WAL advances (0 = disabled).
+    slot_idle_advance_interval_ms: u64,
+    /// Tracks when `idle_advance` was last called to gate the advance interval.
+    last_idle_advance_at: Option<std::time::Instant>,
+    /// Tracks when slot lag was last measured, to gate the sampling interval.
+    last_slot_lag_at: Option<std::time::Instant>,
+    /// Most recently observed WAL lag in bytes from the last `idle_advance` call.
+    ///
+    /// `0` before the first idle advance is executed.
+    /// Exposed via `replication_slot_lag_bytes()` and forwarded to the metrics
+    /// collector as `rustcdc_replication_slot_lag_bytes`.
+    last_slot_lag_bytes: u64,
+    table_include_list: Vec<String>,
+    table_exclude_list: Vec<String>,
+}
+
+impl PostgresStreamHandle {
+    /// Whether enough time has passed to re-measure slot lag.
+    ///
+    /// Reuses `slot_idle_advance_interval_ms` as the cadence when it is configured, and
+    /// falls back to a fixed interval when idle advance is disabled — a deployment that
+    /// turns off idle advance still needs the lag metric, and gating the measurement on the
+    /// advance is what made it stale in the first place.
+    fn slot_lag_sample_due(&self) -> bool {
+        let interval_ms = if self.slot_idle_advance_interval_ms > 0 {
+            self.slot_idle_advance_interval_ms
+        } else {
+            DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS
+        };
+        let threshold = std::time::Duration::from_millis(interval_ms);
+        self.last_slot_lag_at
+            .map(|at| at.elapsed() >= threshold)
+            .unwrap_or(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        source_name: String,
+        stream: PostgresStream,
+        provider: Box<dyn PgOutputMessageProvider>,
+        max_events_per_poll: usize,
+        stream_poll_interval_ms: u64,
+        slot_idle_advance_interval_ms: u64,
+        table_include_list: Vec<String>,
+        table_exclude_list: Vec<String>,
+        catalog_primary_keys: HashMap<(String, String), Vec<String>>,
+    ) -> Self {
+        Self {
+            source_name,
+            stream,
+            provider,
+            relation_map: HashMap::new(),
+            catalog_primary_keys,
+            warned_replica_identity: std::collections::HashSet::new(),
+            warned_unknown_messages: std::collections::HashSet::new(),
+            current_xid: None,
+            current_commit_ts: 0,
+            partial_tx_events: Vec::new(),
+            committed_tx_ends: std::collections::VecDeque::new(),
+            events_polled: 0,
+            max_events_per_poll: max_events_per_poll.max(1),
+            peek_window: max_events_per_poll.max(1),
+            stream_poll_interval_ms: stream_poll_interval_ms.max(1),
+            slot_idle_advance_interval_ms,
+            last_idle_advance_at: None,
+            last_slot_lag_at: None,
+            last_slot_lag_bytes: 0,
+            table_include_list,
+            table_exclude_list,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Per-table progress within a bulk snapshot.
+pub struct TableSnapshot {
+    /// Table in `"schema.table"` form.
+    pub table: String,
+    /// Row count observed when the snapshot began.
+    ///
+    /// A planner estimate on some connectors, so treat it as a progress denominator, not
+    /// as a correctness check.
+    pub total_rows: u64,
+    /// Rows emitted so far.
+    pub rows_processed: u64,
+    /// Keyset cursor for resuming this table, encoded per connector. `None` before the
+    /// first chunk.
+    pub cursor_position: Option<String>,
+    /// Whether this table has been read to exhaustion.
+    pub is_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Durable state of a PostgreSQL bulk snapshot.
+pub struct PostgresSnapshot {
+    /// Per-table progress.
+    pub tables: Vec<TableSnapshot>,
+    /// Stable identifier carried on every emitted row's `SnapshotMetadata`.
+    pub snapshot_id: String,
+    /// Unix epoch milliseconds when the snapshot started.
+    pub snapshot_start_ts: u64,
+    /// Unix epoch milliseconds when the snapshot finished; `0` while in progress.
+    pub snapshot_end_ts: u64,
+}
+
+/// A PostgreSQL bulk snapshot in progress.
+pub struct PostgresSnapshotHandle {
+    source_name: String,
+    snapshot: PostgresSnapshot,
+    tables: Vec<TableSnapshotState>,
+    client: Option<Arc<Client>>,
+    transaction_open: bool,
+    snapshot_watermark: u64,
+    current_table: usize,
+    next_chunk_index: u32,
+    emitted_rows: u64,
+    emitted_in_run: u64,
+}
+
+impl PostgresSnapshotHandle {
+    fn new(
+        source_name: String,
+        snapshot: PostgresSnapshot,
+        tables: Vec<TableSnapshotState>,
+        client: Option<Arc<Client>>,
+        transaction_open: bool,
+        snapshot_watermark: u64,
+    ) -> Self {
+        Self {
+            source_name,
+            snapshot,
+            tables,
+            client,
+            transaction_open,
+            snapshot_watermark,
+            current_table: 0,
+            next_chunk_index: 0,
+            emitted_rows: 0,
+            emitted_in_run: 0,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.tables.iter().all(|table| table.snapshot.is_complete)
+    }
+
+    fn sync_snapshot_tables(&mut self) {
+        self.snapshot.tables = self
+            .tables
+            .iter()
+            .map(|table| table.snapshot.clone())
+            .collect();
+    }
+
+    fn total_expected_rows(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(|table| table.snapshot.total_rows)
+            .sum()
+    }
+
+    fn has_live_query_tables(&self) -> bool {
+        self.tables.iter().any(|table| table.live_query)
+    }
+
+    fn decode_pk_cursor(cursor: &str, expected_columns: usize) -> Result<Vec<String>> {
+        let values: Vec<String> = serde_json::from_str(cursor).map_err(|error| {
+            Error::CheckpointError(format!(
+                "invalid postgres snapshot cursor: expected JSON array of primary key values: {error}"
+            ))
+        })?;
+
+        if values.len() != expected_columns {
+            return Err(Error::CheckpointError(format!(
+                "invalid postgres snapshot cursor: expected {expected_columns} key values, got {}",
+                values.len()
+            )));
+        }
+
+        Ok(values)
+    }
+
+    fn derive_current_table_from_progress(tables: &[TableSnapshotState]) -> usize {
+        tables
+            .iter()
+            .position(|table| !table.snapshot.is_complete)
+            .unwrap_or(tables.len())
+    }
+
+    fn resume_from_checkpoint_payload(mut self, payload: &[u8]) -> Result<Self> {
+        let state: SnapshotCheckpointState = serde_json::from_slice(payload)?;
+        if state.tables.len() != self.tables.len() {
+            return Err(Error::CheckpointError(
+                "postgres snapshot checkpoint table count does not match snapshot handle".into(),
+            ));
+        }
+
+        self.snapshot.snapshot_id = state.snapshot_id;
+        self.snapshot.snapshot_start_ts = state.snapshot_start_ts;
+        self.snapshot.snapshot_end_ts = state.snapshot_end_ts;
+        self.snapshot_watermark = state.snapshot_watermark;
+        self.next_chunk_index = state.next_chunk_index;
+        self.emitted_rows = 0;
+        self.emitted_in_run = 0;
+
+        for (index, table_state) in self.tables.iter_mut().enumerate() {
+            let saved = &state.tables[index];
+            if table_state.snapshot.table != saved.table {
+                return Err(Error::CheckpointError(format!(
+                    "postgres snapshot checkpoint table mismatch at index {index}: expected '{}' got '{}'",
+                    table_state.snapshot.table, saved.table
+                )));
+            }
+
+            table_state.snapshot = saved.clone();
+            if table_state.live_query {
+                if let Some(cursor) = table_state.snapshot.cursor_position.as_deref() {
+                    Self::decode_pk_cursor(cursor, table_state.primary_key_columns.len()).map_err(
+                        |error| {
+                            Error::CheckpointError(format!(
+                                "invalid postgres snapshot cursor for table '{}': {error}",
+                                saved.table
+                            ))
+                        },
+                    )?;
+                }
+                table_state.next_row = 0;
+            } else {
+                table_state.next_row = usize::try_from(saved.rows_processed).map_err(|_| {
+                    Error::CheckpointError(format!(
+                        "rows_processed does not fit into usize for table {}",
+                        saved.table
+                    ))
+                })?;
+                if table_state.next_row > table_state.rows.len() {
+                    return Err(Error::CheckpointError(format!(
+                        "rows_processed exceeds available rows for table {}",
+                        saved.table
+                    )));
+                }
+            }
+
+            self.emitted_rows += saved.rows_processed;
+        }
+
+        self.current_table = Self::derive_current_table_from_progress(&self.tables);
+
+        if state.current_table != self.current_table {
+            return Err(Error::CheckpointError(format!(
+                "postgres snapshot checkpoint current_table mismatch: saved={} derived={} from table completion state",
+                state.current_table, self.current_table
+            )));
+        }
+
+        if self.current_table > self.tables.len() {
+            return Err(Error::CheckpointError(format!(
+                "postgres snapshot checkpoint current_table {} exceeds table count {}",
+                self.current_table,
+                self.tables.len()
+            )));
+        }
+
+        self.sync_snapshot_tables();
+        Ok(self)
+    }
+
+    async fn fetch_live_rows(
+        &self,
+        table: &str,
+        key_columns: &[String],
+        key_types: &[String],
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<String>, serde_json::Value)>> {
+        let client = self.client.as_ref().ok_or_else(|| {
+            Error::StateError(
+                "postgres snapshot live query requires an active client connection".into(),
+            )
+        })?;
+        let (schema, table_name) = parse_table_reference(table)?;
+        let table_ref = qualified_table_name(&schema, &table_name);
+        let limit = i64::try_from(limit).map_err(|_| {
+            Error::SourceError(format!("snapshot chunk size exceeds i64 limit: {limit}"))
+        })?;
+
+        if key_columns.is_empty() || key_types.is_empty() || key_columns.len() != key_types.len() {
+            return Err(Error::SourceError(format!(
+                "missing or invalid primary key metadata for snapshot table '{schema}.{table_name}'"
+            )));
+        }
+
+        let order_expr = key_columns
+            .iter()
+            .map(|column| format!("t.{}", quote_pg_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key_value_expr = key_columns
+            .iter()
+            .map(|column| format!("t.{}::text", quote_pg_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The row payload is built column by column so its text matches what pgoutput
+        // produces on the streaming path. See `query::row_as_text_json`.
+        let all_columns = query::query_all_columns(client, &schema, &table_name).await?;
+        let row_json = query::row_as_text_json(&all_columns);
+
+        let rows = if let Some(last_pk_cursor) = cursor {
+            let key_values =
+                Self::decode_pk_cursor(last_pk_cursor, key_columns.len()).map_err(|error| {
+                    Error::SourceError(format!(
+                        "invalid snapshot cursor for table '{table}': {error}"
+                    ))
+                })?;
+
+            // Bind snapshot keyset cursor values as text and cast inside SQL.
+            // This keeps checkpoint cursor encoding stable across restarts while
+            // avoiding driver-side serialization mismatches for typed PK columns.
+            let predicate_expr = key_types
+                .iter()
+                .enumerate()
+                .map(|(index, pg_type)| format!("${}::text::{pg_type}", index + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let query = format!(
+                "SELECT ARRAY[{key_value_expr}], {row_json} \
+                 FROM {table_ref} t \
+                 WHERE ({order_expr}) > ({predicate_expr}) \
+                 ORDER BY {order_expr} \
+                 LIMIT ${}",
+                key_columns.len() + 1,
+            );
+
+            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                Vec::with_capacity(key_values.len() + 1);
+            for value in &key_values {
+                params.push(value as &(dyn tokio_postgres::types::ToSql + Sync));
+            }
+            params.push(&limit as &(dyn tokio_postgres::types::ToSql + Sync));
+
+            client
+                .query(&query, &params)
+                .await
+                .map_err(|error| {
+                    Error::SourceError(format!(
+                        "failed fetching snapshot rows for table '{schema}.{table_name}' after cursor {last_pk_cursor}: {error}"
+                    ))
+                })?
+        } else {
+            let query = format!(
+                "SELECT ARRAY[{key_value_expr}], {row_json} \
+                 FROM {table_ref} t \
+                 ORDER BY {order_expr} \
+                 LIMIT $1"
+            );
+            client.query(&query, &[&limit]).await.map_err(|error| {
+                Error::SourceError(format!(
+                    "failed fetching snapshot rows for table '{schema}.{table_name}': {error}"
+                ))
+            })?
+        };
+
+        let mut decoded = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key_values: Vec<Option<String>> = row.get(0);
+            let key_values = key_values
+                .into_iter()
+                .map(|value| {
+                    value.ok_or_else(|| {
+                        Error::SourceError(format!(
+                            "primary key column returned null value for table '{schema}.{table_name}'"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let payload: String = row.get(1);
+            let json = serde_json::from_str(&payload).map_err(|error| {
+                Error::SerializationError(format!(
+                    "failed decoding live snapshot JSON row for table '{schema}.{table_name}': {error}"
+                ))
+            })?;
+            decoded.push((key_values, json));
+        }
+
+        Ok(decoded)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Configuration for a PostgreSQL CDC connection.
+pub struct PostgresSourceConfig {
+    /// Server hostname or IP.
+    pub host: String,
+    /// Server port.
+    pub port: u16,
+    /// Login user. Needs the connector's replication/CDC privileges.
+    pub user: String,
+    /// Password material. Redacted in `Debug` and `Display`; prefer
+    /// [`SecretString::from_provider`](crate::core::SecretString::from_provider) or
+    /// `from_callback` so it is resolved at connect time rather than held in config.
+    pub password: SecretString,
+    /// Connector authentication mode.
+    ///
+    /// `AwsIamToken` indicates the password field should provide short-lived
+    /// IAM auth tokens (typically via `SecretString::from_callback`).
+    #[serde(default)]
+    pub auth_mode: DatabaseAuthMode,
+    /// Database to replicate from.
+    pub database: String,
+    /// Logical replication slot name.
+    ///
+    /// The slot is the durable retention anchor: PostgreSQL holds WAL for it until the
+    /// connector confirms progress. Provision it out of band in production — see
+    /// `create_replication_slot_if_missing` for why auto-creation is off by default.
+    pub replication_slot_name: String,
+    /// Publication the slot reads through. Must include every captured table.
+    pub publication_name: String,
+    /// Transport mode. TLS by default; plaintext is an explicit, loudly-logged opt-in.
+    pub transport: TransportConfig,
+    /// Connection timeout in seconds.
+    pub conn_timeout_secs: u64,
+    /// Stream poll interval in milliseconds.
+    pub stream_poll_interval_ms: u64,
+    /// Maximum events yielded by a single stream poll cycle.
+    pub max_events_per_poll: usize,
+    /// Allowlist of tables to stream, in `"schema.table"` format.
+    ///
+    /// When non-empty, only tables in this list are forwarded to the caller.
+    /// Takes precedence over [`table_exclude_list`](PostgresSourceConfig::table_exclude_list).
+    /// An empty list means *all* tables are included (subject to the publication).
+    pub table_include_list: Vec<String>,
+    /// Blocklist of tables to suppress, in `"schema.table"` format.
+    ///
+    /// Ignored when [`table_include_list`](PostgresSourceConfig::table_include_list) is non-empty.
+    /// An empty list means no tables are excluded.
+    pub table_exclude_list: Vec<String>,
+    /// Interval in milliseconds between WAL slot idle-advance calls.
+    ///
+    /// When no committed events are delivered (e.g., during bursts of rolled-back
+    /// transactions or when the upstream database is idle), the replication slot's
+    /// `confirmed_flush_lsn` stays pinned and PostgreSQL cannot recycle WAL segments.
+    /// Setting this interval causes the connector to periodically call
+    /// `pg_replication_slot_advance(pg_current_wal_lsn())` when no events have
+    /// been observed for the configured duration.
+    ///
+    /// - Set to `0` to disable idle advances (not recommended for long-lived streams).
+    /// - Default: 30 000 ms.
+    #[serde(default = "PostgresSourceConfig::default_slot_idle_advance_interval_ms")]
+    pub slot_idle_advance_interval_ms: u64,
+    /// Whether `connect()` may create the replication slot when it does not exist.
+    ///
+    /// **Defaults to `false`, which is the safe setting for a running pipeline.**
+    ///
+    /// A replication slot that vanishes mid-life — dropped by an operator, lost in a
+    /// failover to a replica that never had it, or invalidated by
+    /// `max_slot_wal_keep_size` — is a *data-loss* event: the WAL it was retaining is
+    /// gone. Recreating it silently restarts capture at the current WAL position and
+    /// skips everything in between, which looks exactly like healthy operation.
+    ///
+    /// Set this to `true` only for first-time provisioning, or in environments where
+    /// the slot is genuinely expected to be absent on startup (ephemeral test
+    /// databases). Prefer creating the slot out of band in production.
+    #[serde(default)]
+    pub create_replication_slot_if_missing: bool,
+    /// Create the replication slot with `failover = true` (PostgreSQL **17+**).
+    ///
+    /// A failover-enabled slot is synchronized to physical standbys, so logical
+    /// replication can resume from the new primary after a promotion. Without it the
+    /// slot exists only on the old primary and is **lost on failover** — taking with it
+    /// every change since the last confirmed LSN, and forcing a re-snapshot.
+    ///
+    /// Only applies when the slot is created by this connector (see
+    /// [`create_replication_slot_if_missing`](PostgresSourceConfig::create_replication_slot_if_missing)).
+    ///
+    /// Slot synchronization additionally requires cluster-side configuration that this
+    /// connector cannot set: on the standby `sync_replication_slots = on`,
+    /// `primary_slot_name`, `hot_standby_feedback = on`, and a `dbname` in
+    /// `primary_conninfo`; on the primary, `synchronized_standby_slots`. Sync is
+    /// **asynchronous**, so verify `confirmed_flush_lsn` on the standby's synced slot
+    /// before promoting, and disable subscriptions before promotion to avoid consuming
+    /// from both old and new primary.
+    ///
+    /// Default: `false` (compatible with PostgreSQL 16 and earlier).
+    #[serde(default)]
+    pub failover_slot: bool,
+    /// How the WAL stream is read. Defaults to [`WalTransport::StreamingReplication`].
+    #[serde(default)]
+    pub wal_transport: WalTransport,
+}
+
+/// How the connector reads the WAL stream from PostgreSQL.
+///
+/// PostgreSQL offers two ways to consume a logical replication slot, and they are not
+/// equivalent: one is the protocol logical replication was designed around, the other is
+/// a SQL function that re-does work on every call. The default is the former.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WalTransport {
+    /// `START_REPLICATION ... LOGICAL` over the streaming replication protocol.
+    ///
+    /// The server pushes WAL as it is written, over a long-lived connection, and progress
+    /// is reported back with Standby Status Update messages. This is what PostgreSQL's own
+    /// subscribers, `pg_recvlogical` and every other mature CDC implementation use.
+    ///
+    /// Requires the connecting role to have the `REPLICATION` attribute (or be
+    /// `rds_replication` / superuser), and requires a **direct** connection: a connection
+    /// pooler in transaction-pooling mode cannot carry a replication stream.
+    #[default]
+    StreamingReplication,
+    /// `pg_logical_slot_peek_binary_changes` over an ordinary SQL connection.
+    ///
+    /// **Slower by construction, and the cost grows with the workload rather than being
+    /// constant.** The peek is non-consuming, and PostgreSQL begins decoding at the slot's
+    /// `restart_lsn` while only emitting past `confirmed_flush_lsn`. Any long-running
+    /// transaction pins `restart_lsn`, so *every* poll re-reads the WAL between the two —
+    /// work that the streaming protocol pays once per connection. Delivery latency is also
+    /// bounded by the poll interval rather than pushed by the server.
+    ///
+    /// It exists because it needs neither the `REPLICATION` attribute nor a direct
+    /// connection, which makes it the fallback for environments that cannot grant one:
+    ///
+    /// * a managed service that withholds `REPLICATION` from the application role;
+    /// * a connection routed through a pooler that cannot proxy replication.
+    ///
+    /// A [`TransportConfig::RustlsConfig`](crate::core::TransportConfig) is **not** a
+    /// reason. The streaming client builds its own connector, so an injected config is used
+    /// as-is, custom verifier and all — see
+    /// [`rustls_client_config`](crate::core::rustls_client_config).
+    ///
+    /// Prefer fixing the environment. Reach for this when you cannot.
+    SqlPeek,
+}
+
+/// PostgreSQL connector lifecycle manager.
+pub struct PostgresConnection {
+    config: PostgresSourceConfig,
+    logger: StructuredLogger,
+    state: Arc<Mutex<ConnectionState>>,
+    stream_poll_interval_ms: u64,
+    max_events_per_poll: usize,
+    slot_idle_advance_interval_ms: u64,
+}
+
+impl PostgresConnection {
+    /// Build a connection from configuration. Does not connect; call `connect()`.
+    pub fn new(config: PostgresSourceConfig) -> Self {
+        let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
+        let max_events_per_poll = config.max_events_per_poll.max(1);
+        let slot_idle_advance_interval_ms = config.slot_idle_advance_interval_ms;
+        Self {
+            config,
+            logger: StructuredLogger::new("postgres"),
+            state: Arc::new(Mutex::new(ConnectionState::default())),
+            stream_poll_interval_ms,
+            max_events_per_poll,
+            slot_idle_advance_interval_ms,
+        }
+    }
+
+    /// Build a connection with a caller-supplied structured logger.
+    pub fn with_logger(config: PostgresSourceConfig, logger: StructuredLogger) -> Self {
+        let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
+        let max_events_per_poll = config.max_events_per_poll.max(1);
+        let slot_idle_advance_interval_ms = config.slot_idle_advance_interval_ms;
+        Self {
+            config,
+            logger,
+            state: Arc::new(Mutex::new(ConnectionState::default())),
+            stream_poll_interval_ms,
+            max_events_per_poll,
+            slot_idle_advance_interval_ms,
+        }
+    }
+
+    /// Establish the connection and validate the server-side prerequisites.
+    ///
+    /// Validation is the point: several PostgreSQL misconfigurations cause **silent**
+    /// wrong results rather than errors, so they are rejected here with a remedy in the
+    /// message. Idempotent — connecting an already-connected source succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SourceError`] for connection
+    /// failures, or [`Error::Unrecoverable`] when the
+    /// replication slot is missing and auto-creation is not enabled.
+    pub async fn connect(&self) -> Result<()> {
+        self.config.validate()?;
+        crate::source::warn_on_schema_agnostic_include_entries(
+            "postgres",
+            &self.config.table_include_list,
+        );
+        {
+            let state = self.state.lock().await;
+            if state.client.is_some() {
+                return Err(Error::StateError(
+                    "postgres connection already established".into(),
+                ));
+            }
+        }
+
+        self.config.transport.warn_if_insecure("postgres");
+        let connect_result: Result<()> = match &self.config.transport {
+            TransportConfig::Plaintext => {
+                let connect_config = self.config.build_connect_config()?;
+                let (client, connection) = connect_config
+                    .connect(tokio_postgres::NoTls)
+                    .await
+                    .map_err(|error| {
+                        Error::SourceError(format!(
+                            "postgres plaintext connection failed: {}",
+                            crate::core::render_error_chain(&error)
+                        ))
+                    })?;
+                let connection_task = tokio::spawn(run_connection_task(connection));
+                self.validate_connected_client(&client).await?;
+                let client = Arc::new(client);
+                let heartbeat_task = self.start_heartbeat(client.clone());
+                let mut state = self.state.lock().await;
+                state.client = Some(client);
+                state.connection_task = Some(connection_task);
+                state.heartbeat_task = Some(heartbeat_task);
+                Ok(())
+            }
+            TransportConfig::Tls {
+                ca_cert_path,
+                client_cert_path,
+                client_key_path,
+                allow_invalid_certificates,
+                allow_invalid_hostnames,
+            } => {
+                // The insecure flags are documented as working, and the PostgreSQL
+                // connector silently ignored them — always building a fully verifying
+                // config. That fails *secure*, but it is still a config lie: an
+                // operator who set `tls_insecure_skip_verify()` to get past a
+                // self-signed certificate in a test environment hit an opaque
+                // verification failure while every doc and the config object told them
+                // verification was disabled. Say so instead.
+                //
+                // Note the three connectors previously interpreted the same
+                // `TransportConfig` three different ways; this makes PostgreSQL explicit
+                // about what it does and does not honour.
+                if *allow_invalid_certificates || *allow_invalid_hostnames {
+                    return Err(Error::ConfigError(
+                        "postgres transport sets allow_invalid_certificates or \
+                         allow_invalid_hostnames, but this connector always verifies the \
+                         server certificate and cannot disable it. Rather than silently \
+                         ignoring the setting and failing verification with an opaque error, \
+                         it is rejected here. For a self-signed or private-CA server use \
+                         TransportConfig::tls_with_ca_cert_path(Some(path)) and trust the CA \
+                         explicitly; for a plaintext test setup use TransportConfig::Plaintext."
+                            .into(),
+                    ));
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = (ca_cert_path, client_cert_path, client_key_path);
+                    return Err(Error::ConfigError(
+                        "postgres connector requires crate feature 'tls' for TLS transport".into(),
+                    ));
+                }
+
+                #[cfg(feature = "tls")]
+                {
+                    use tokio_postgres_rustls::MakeRustlsConnect;
+
+                    let tls_config = build_tls_client_config(
+                        ca_cert_path.as_deref(),
+                        client_cert_path.as_deref(),
+                        client_key_path.as_deref(),
+                    )?;
+
+                    let tls_connector = MakeRustlsConnect::new(tls_config);
+                    let connect_config = self.config.build_connect_config()?;
+                    let (client, connection) = connect_config
+                        .connect(tls_connector)
+                        .await
+                        .map_err(|error| {
+                            Error::SourceError(format!(
+                                "postgres tls connection failed: {}",
+                                crate::core::render_error_chain(&error)
+                            ))
+                        })?;
+
+                    let connection_task = tokio::spawn(run_connection_task(connection));
+                    self.validate_connected_client(&client).await?;
+                    let client = Arc::new(client);
+                    let heartbeat_task = self.start_heartbeat(client.clone());
+
+                    let mut state = self.state.lock().await;
+                    state.client = Some(client);
+                    state.connection_task = Some(connection_task);
+                    state.heartbeat_task = Some(heartbeat_task);
+                    Ok(())
+                }
+            }
+            #[cfg(feature = "tls")]
+            TransportConfig::RustlsConfig { config: rustls_cfg } => {
+                use tokio_postgres_rustls::MakeRustlsConnect;
+                let tls_connector = MakeRustlsConnect::new((*rustls_cfg.0).clone());
+                let connect_config = self.config.build_connect_config()?;
+                let (client, connection) =
+                    connect_config
+                        .connect(tls_connector)
+                        .await
+                        .map_err(|error| {
+                            Error::SourceError(format!(
+                                "postgres rustls connection failed: {error}"
+                            ))
+                        })?;
+                let connection_task = tokio::spawn(run_connection_task(connection));
+                self.validate_connected_client(&client).await?;
+                let client = Arc::new(client);
+                let heartbeat_task = self.start_heartbeat(client.clone());
+                let mut state = self.state.lock().await;
+                state.client = Some(client);
+                state.connection_task = Some(connection_task);
+                state.heartbeat_task = Some(heartbeat_task);
+                Ok(())
+            }
+        };
+        connect_result.inspect(|_| self.logger.source_connected())?;
+        Ok(())
+    }
+
+    /// Close the connection. Safe to call when already closed.
+    pub async fn close(&self) {
+        let mut state = self.state.lock().await;
+        if let Some(handle) = state.heartbeat_task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = state.connection_task.take() {
+            handle.abort();
+        }
+        state.client = None;
+        self.logger.source_disconnected();
+    }
+
+    /// Whether a connection is currently established.
+    pub async fn is_connected(&self) -> bool {
+        self.state.lock().await.client.is_some()
+    }
+
+    async fn start_snapshot_internal(&mut self, tables: &[&str]) -> Result<PostgresSnapshotHandle> {
+        start_postgres_snapshot_internal(self, tables).await
+    }
+
+    /// Resume a bulk snapshot from a persisted snapshot checkpoint.
+    pub async fn start_snapshot_from_checkpoint(
+        &mut self,
+        tables: &[&str],
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn SnapshotHandle>> {
+        start_postgres_snapshot_from_checkpoint(self, tables, resume_from).await
+    }
+
+    /// Start an incremental (non-blocking) snapshot using the DBLog watermark pattern.
+    ///
+    /// Unlike `start_snapshot`, this method:
+    /// - Does **not** pause the replication stream.
+    /// - Does **not** hold a `REPEATABLE READ` transaction.
+    /// - Reads the table in small chunks (keyset-paginated, `READ COMMITTED`).
+    /// - For each chunk, captures a low/high watermark LSN and uses the replication
+    ///   stream to detect concurrent writes, suppressing stale chunk rows.
+    ///
+    /// The returned `StreamHandle` interleaves snapshot `Read` events with live
+    /// replication events.  Once all tables are exhausted it acts as a pure
+    /// stream delegate.
+    ///
+    /// `resume_from` is forwarded to `start_stream` to resume from a saved
+    /// checkpoint offset.
+    pub async fn start_incremental_snapshot(
+        &mut self,
+        config: IncrementalSnapshotConfig,
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn StreamHandle>> {
+        let client = {
+            let state = self.state.lock().await;
+            state.client.clone().ok_or_else(|| {
+                Error::StateError(
+                    "postgres connection must be established before starting an incremental snapshot".into(),
+                )
+            })?
+        };
+        let resume_state = crate::source::incremental_snapshot_state_from_offset(resume_from);
+        let inner = start_postgres_stream(self, resume_from).await?;
+        let source_name = self.source_type().to_string();
+        let handle =
+            incremental_snapshot::start(inner, client, config, source_name, resume_state).await?;
+        Ok(Box::new(handle))
+    }
+
+    async fn validate_connected_client(&self, client: &Client) -> Result<()> {
+        validate_connected_postgres_client(&self.config, client).await
+    }
+
+    fn start_heartbeat(&self, client: Arc<Client>) -> JoinHandle<()> {
+        let logger = self.logger.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+            loop {
+                interval.tick().await;
+                if let Err(error) = client.simple_query("SELECT 1").await {
+                    logger.connection_error(&format!("heartbeat query failed: {error}"));
+                    break;
+                }
+            }
+        })
+    }
+}
+
+impl Drop for PostgresConnection {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.try_lock() {
+            if let Some(handle) = state.heartbeat_task.take() {
+                handle.abort();
+            }
+            if let Some(handle) = state.connection_task.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Source for PostgresConnection {
+    async fn start_snapshot(&mut self, tables: &[&str]) -> Result<Box<dyn SnapshotHandle>> {
+        Ok(Box::new(self.start_snapshot_internal(tables).await?))
+    }
+
+    async fn start_stream(
+        &mut self,
+        resume_from: Option<&dyn Offset>,
+    ) -> Result<Box<dyn StreamHandle>> {
+        start_postgres_stream(self, resume_from).await
+    }
+
+    async fn perform_handoff(
+        &mut self,
+        snapshot: &mut dyn SnapshotHandle,
+        stream: &mut dyn StreamHandle,
+    ) -> Result<HandoffResult> {
+        let (snapshot_watermark, stream_watermark) = {
+            let state = self.state.lock().await;
+            let snapshot_watermark = state.snapshot_watermark.ok_or_else(|| {
+                Error::StateError(
+                    "postgres perform_handoff requires start_snapshot to have been called first"
+                        .into(),
+                )
+            })?;
+            let stream_watermark = state.stream_start_watermark.ok_or_else(|| {
+                Error::StateError(
+                    "postgres perform_handoff requires start_stream to have been called first"
+                        .into(),
+                )
+            })?;
+            (snapshot_watermark, stream_watermark)
+        };
+
+        let snapshot_end = snapshot.finish().await?.snapshot_end_ts;
+        stream.confirm_lsn(snapshot_watermark).await?;
+        let handoff = PostgresHandoff {
+            snapshot_watermark,
+            stream_watermark,
+            handoff_complete: true,
+        };
+
+        tracing::info!(
+            target: "rustcdc::source::postgres",
+            snapshot_watermark = handoff.snapshot_watermark,
+            stream_watermark = handoff.stream_watermark,
+            stream_watermark_gap = handoff.stream_watermark_gap(),
+            "postgres snapshot-to-stream handoff completed",
+        );
+
+        postgres_handoff_result(
+            Some(snapshot_end),
+            Some(handoff.snapshot_watermark),
+            Some(handoff.stream_watermark),
+        )
+    }
+
+    fn source_type(&self) -> &str {
+        PostgresSourceConfig::source_type()
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            snapshot: true,
+            snapshot_checkpoint_resume: true,
+            handoff: true,
+            ddl_capture: true,
+            // heartbeat = false: the SELECT 1 keepalive prevents TCP idle-timeout
+            // but does NOT send a pgoutput StandbyStatusUpdate to the primary.
+            // WAL keepalive is handled instead by the idle_advance mechanism
+            // (slot_idle_advance_interval_ms) which periodically calls
+            // pg_replication_slot_advance(pg_current_wal_lsn()).
+            heartbeat: false,
+            tls: cfg!(feature = "tls"),
+            schema_introspection: true,
+            truncate: true,
+            incremental_snapshot: true,
+        }
+    }
+}
+
+#[async_trait]
+impl SnapshotHandle for PostgresSnapshotHandle {
+    async fn next_chunk(&mut self, chunk_size: usize) -> Result<Vec<Event>> {
+        next_postgres_snapshot_chunk(self, chunk_size).await
+    }
+
+    async fn checkpoint(
+        &self,
+        checkpoint: &mut dyn crate::checkpoint::Checkpoint,
+        committed_event_count: u64,
+    ) -> Result<()> {
+        checkpoint_postgres_snapshot(self, checkpoint, committed_event_count).await
+    }
+
+    async fn finish(&mut self) -> Result<crate::source::SnapshotEnd> {
+        finish_postgres_snapshot(self).await
+    }
+}
+
+#[async_trait]
+impl StreamHandle for PostgresStreamHandle {
+    async fn next_events(&mut self, timeout_ms: u64) -> Result<Vec<Event>> {
+        if self.stream.replication_status != StreamState::Streaming {
+            return Err(Error::StateError(
+                "postgres stream polling requested while stream is not running".into(),
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+
+        loop {
+            // What this budget means depends on the transport; see
+            // `PgOutputMessageProvider::waits_for_data`.
+            //
+            // A query-based provider gets the backstop, because for it the value is a
+            // ceiling on server-side work and shrinking it as the outer budget drains just
+            // provokes spurious timeouts and a shrinking decode window.
+            //
+            // A provider that blocks on a socket gets the caller's **remaining** budget,
+            // because for it the value is dead time on an idle stream. Handing it the 30 s
+            // backstop made `next_events(250)` block for up to 30 s — the elapsed-time check
+            // below cannot help, since it only runs once the provider has already returned.
+            let poll_timeout = if self.provider.waits_for_data() {
+                timeout.saturating_sub(started.elapsed())
+            } else {
+                Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS)
+            };
+            // A zero budget still gets one attempt at whatever is already buffered, so a
+            // caller passing `timeout_ms = 0` polls without blocking rather than not at all.
+            let poll_timeout = poll_timeout.min(Duration::from_millis(DEFAULT_POLL_BACKSTOP_MS));
+
+            let requested_window = self.peek_window;
+            let poll_outcome = self
+                .provider
+                .poll_xlog_data(requested_window, poll_timeout)
+                .await?;
+
+            match &poll_outcome {
+                decoder::PollOutcome::TimedOut => {
+                    // Halve the window so the retry asks the server for strictly less work
+                    // than the attempt that just failed. Repeated timeouts converge on a
+                    // single change, which always decodes — so forward progress is
+                    // guaranteed rather than merely likely.
+                    let shrunk = (requested_window / 2).max(1);
+                    if shrunk < self.peek_window {
+                        tracing::warn!(
+                            target: "rustcdc::source::postgres",
+                            slot = %self.stream.slot_name,
+                            previous_window = requested_window,
+                            new_window = shrunk,
+                            "postgres peek exceeded its budget; shrinking the decode window. \
+                             The peek is non-consuming, so retrying the same window would \
+                             repeat identical work and time out again — halting delivery \
+                             while the changes sit unread in the WAL.",
+                        );
+                        self.peek_window = shrunk;
+                    }
+                }
+                decoder::PollOutcome::Data(_) => {
+                    // Recover toward the configured ceiling so a transient load spike does
+                    // not permanently cap throughput.
+                    if self.peek_window < self.max_events_per_poll {
+                        self.peek_window = self
+                            .peek_window
+                            .saturating_mul(2)
+                            .min(self.max_events_per_poll);
+                    }
+                }
+            }
+            // Only a *completed* poll that returned nothing proves the slot is caught
+            // up. A timed-out poll means the opposite — there is more backlog than
+            // could be decoded in the budget — so it must never reach the idle branch.
+            let slot_is_caught_up = poll_outcome.is_caught_up();
+            let xlog_data = poll_outcome.into_rows();
+            let had_data = !xlog_data.is_empty();
+            if had_data {
+                // Got WAL data — reset the idle advance timer so the interval is
+                // measured from the last active period, not from the last call.
+                self.last_idle_advance_at = Some(std::time::Instant::now());
+
+                let lsn_before = self.stream.lsn_position;
+                let events = self.process_messages(xlog_data).await?;
+                if !events.is_empty() {
+                    tracing::debug!(
+                        target: "rustcdc::source::postgres",
+                        count = events.len(),
+                        lsn = self.stream.lsn_position,
+                        "postgres stream events received",
+                    );
+                    return Ok(events);
+                }
+                // No user-visible events were produced (e.g. filtered-table transactions
+                // or schema-only messages), but lsn_position may have advanced via a
+                // COMMIT in process_messages.  If we leave the provider's confirmed_lsn
+                // behind, pg_logical_slot_peek_binary_changes returns the exact same
+                // batch on every subsequent poll — creating an infinite busy-poll loop.
+                // Advance the slot now so the next peek starts past these rows.
+                if self.stream.lsn_position > lsn_before {
+                    self.provider.confirm_lsn(self.stream.lsn_position).await?;
+                }
+            }
+
+            // Sample lag on a timer, independent of whether the slot is caught up.
+            //
+            // `rustcdc_replication_slot_lag_bytes` is the early warning for WAL exhaustion
+            // and for slot invalidation via `max_slot_wal_keep_size` — both data-loss
+            // events — so it has to be current precisely when the pipeline is *behind*.
+            // Sampling it only from the idle-advance branch meant it refreshed only when
+            // the pipeline was caught up, and not at all when idle advance was disabled.
+            if self.slot_lag_sample_due()
+                && let Some(lag_bytes) = self.provider.measure_slot_lag().await?
+            {
+                self.last_slot_lag_bytes = lag_bytes;
+                self.last_slot_lag_at = Some(std::time::Instant::now());
+            }
+
+            if !had_data && slot_is_caught_up && self.slot_idle_advance_interval_ms > 0 {
+                // The slot is provably caught up: the poll completed and returned no
+                // rows. Periodically advance the replication slot to the current WAL
+                // write position so PostgreSQL can reclaim WAL segments that would
+                // otherwise accumulate indefinitely during aborted-transaction storms
+                // or idle periods.
+                //
+                // Guarded on `slot_is_caught_up` because `idle_advance` jumps the slot
+                // to `pg_current_wal_lsn()`, permanently discarding anything not yet
+                // consumed. Running it after a timed-out poll would discard exactly the
+                // backlog that caused the timeout — and because the peek re-decodes the
+                // whole backlog each cycle, a stalled consumer makes timeouts *more*
+                // likely, so the two defaults (30 s poll backstop, 30 s idle interval)
+                // would otherwise turn downstream backpressure into silent WAL loss.
+                let threshold =
+                    std::time::Duration::from_millis(self.slot_idle_advance_interval_ms);
+                let should_advance = self
+                    .last_idle_advance_at
+                    .map(|t| t.elapsed() >= threshold)
+                    .unwrap_or(true);
+                if should_advance {
+                    let lag_bytes = self.provider.idle_advance().await?;
+                    self.last_slot_lag_bytes = lag_bytes;
+                    self.last_idle_advance_at = Some(std::time::Instant::now());
+                }
+            }
+
+            if timeout_ms == 0 || started.elapsed() >= timeout {
+                return Ok(Vec::new());
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(
+                self.stream_poll_interval_ms
+                    .min(remaining.as_millis() as u64),
+            ))
+            .await;
+        }
+    }
+
+    async fn save_position(
+        &self,
+        checkpoint: &mut dyn crate::checkpoint::Checkpoint,
+    ) -> Result<()> {
+        let offset = PostgresOffset::new(self.stream.lsn_position, self.stream.slot_name.clone());
+        checkpoint.save(&offset, self.events_polled).await
+    }
+
+    fn position_offset(&self) -> Option<Box<dyn crate::core::Offset>> {
+        Some(Box::new(PostgresOffset::new(
+            self.stream.lsn_position,
+            self.stream.slot_name.clone(),
+        )))
+    }
+
+    fn resume_offset_for(&self, event: &Event) -> Option<String> {
+        // Only a *transaction end* is resumable — `StreamHandle::resume_offset_for` explains
+        // why the event's own change LSN is not. Every event released by the decoder belongs
+        // to a transaction whose COMMIT has already been read, so the lookup always hits for
+        // an event this handle produced.
+        let tx_id = event.transaction.as_ref()?.tx_id;
+        let end_lsn = self
+            .committed_tx_ends
+            .iter()
+            .rev()
+            .find_map(|(id, end_lsn)| (*id == tx_id).then_some(*end_lsn))?;
+        Some(parser::format_pg_lsn(end_lsn))
+    }
+
+    async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
+        self.provider.confirm_lsn(lsn).await?;
+        // Everything at or below the confirmed position is settled; the consumer can never
+        // ask to resume before it again.
+        self.committed_tx_ends.retain(|(_, end_lsn)| *end_lsn > lsn);
+        Ok(())
+    }
+
+    fn replication_slot_lag_bytes(&self) -> Option<u64> {
+        // Return None before the first measurement so callers can distinguish
+        // "not yet measured" from "measured and zero".
+        if self.last_slot_lag_at.is_none() {
+            None
+        } else {
+            Some(self.last_slot_lag_bytes)
+        }
+    }
+}
+
+impl Drop for PostgresStreamHandle {
+    fn drop(&mut self) {
+        self.stream.replication_status = StreamState::Stopped;
+    }
+}
+
+fn parse_table_reference(table: &str) -> Result<(String, String)> {
+    parser::parse_table_reference(table)
+}
+
+fn quote_pg_identifier(identifier: &str) -> String {
+    parser::quote_pg_identifier(identifier)
+}
+
+fn qualified_table_name(schema: &str, table: &str) -> String {
+    parser::qualified_table_name(schema, table)
+}
+
+async fn query_primary_key_columns_and_types(
+    client: &Client,
+    schema: &str,
+    table: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    query::query_primary_key_columns_and_types(client, schema, table).await
+}
+
+fn parse_pg_lsn(value: &str) -> Result<u64> {
+    parser::parse_pg_lsn(value)
+}
+
+/// Format a u64 LSN as the PostgreSQL "HIGH/LOW" hex string expected by SQL queries.
+fn format_pg_lsn(lsn: u64) -> String {
+    parser::format_pg_lsn(lsn)
+}
+
+/// Convert a PostgreSQL microsecond timestamp (since 2000-01-01 UTC) to Unix milliseconds.
+fn pg_timestamp_to_millis(pg_us: i64) -> u64 {
+    parser::pg_timestamp_to_millis(pg_us)
+}
+
+fn decode_stream_resume_lsn(
+    source_type: &str,
+    configured_slot_name: &str,
+    resume_from: &dyn Offset,
+) -> Result<u64> {
+    parser::decode_stream_resume_lsn(source_type, configured_slot_name, resume_from)
+}
+
+async fn reconcile_stream_resume_lsn_with_retry(
+    client: &Client,
+    checkpoint_lsn: u64,
+    slot_name: &str,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<u64> {
+    query::reconcile_stream_resume_lsn_with_retry(
+        client,
+        checkpoint_lsn,
+        slot_name,
+        attempts,
+        retry_delay,
+    )
+    .await
+}
+
+async fn query_current_wal_lsn(client: &Client) -> Result<u64> {
+    query::query_current_wal_lsn(client).await
+}
+
+/// Build a rustls `RootCertStore` from a PEM file path, or use system roots if `None`.
+///
+/// When mTLS paths are provided (`client_cert_path` + `client_key_path`), mutual TLS
+/// authentication is configured. When only `ca_cert_path` is provided, server-auth-only
+/// TLS is used. Falls back to system trust roots when `ca_cert_path` is `None`.
+#[cfg(feature = "tls")]
+fn build_tls_client_config(
+    ca_cert_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<rustls::ClientConfig> {
+    query::build_tls_client_config(ca_cert_path, client_cert_path, client_key_path)
+}
+
+async fn run_connection_task<S>(connection: Connection<Socket, S>)
+where
+    S: tokio_postgres::tls::TlsStream + Send + Unpin + 'static,
+{
+    if let Err(error) = connection.await {
+        tracing::warn!(target: "rustcdc::source::postgres", %error, "postgres connection task ended with error");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    fn reconcile_stream_resume_lsn(
+        checkpoint_lsn: u64,
+        slot_confirmed_lsn: u64,
+        slot_name: &str,
+    ) -> crate::core::Result<u64> {
+        super::parser::reconcile_stream_resume_lsn(checkpoint_lsn, slot_confirmed_lsn, slot_name)
+    }
+
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
+
+    use crate::checkpoint::{Checkpoint, InMemoryCheckpoint, PostgresOffset};
+    use crate::source::{SnapshotHandle, Source, StreamHandle};
+
+    use super::PostgresSourceConfig;
+    use super::decoder::{
+        PgOutputMessage, PgOutputXLogData, PgValue, PollOutcome, decode_pgoutput_message,
+    };
+    use super::parser::map_pgoutput_poll_error;
+    use super::validation::{ValidationBackend, validate_with_backend};
+    use super::{
+        MAX_EVENTS_PER_POLL, PgOutputMessageProvider, PostgresConnection, PostgresSnapshotHandle,
+        PostgresStream, PostgresStreamHandle, STREAM_POLL_INTERVAL_MS, StreamState, TableSnapshot,
+        TableSnapshotState,
+    };
+    use crate::{SecretString, core::TransportConfig};
+
+    // ─── Validation backend mock ─────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct MockValidationBackend {
+        slot_exists: bool,
+        create_slot_result: Option<crate::core::Error>,
+        publication_exists: bool,
+        has_replication_privilege: bool,
+        create_called: Arc<AtomicBool>,
+        /// Records the `failover` argument the connector passed to slot creation.
+        create_failover: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ValidationBackend for MockValidationBackend {
+        async fn replication_slot_exists(&self, _slot_name: &str) -> crate::core::Result<bool> {
+            Ok(self.slot_exists)
+        }
+
+        async fn create_replication_slot(
+            &self,
+            _slot_name: &str,
+            failover: bool,
+        ) -> crate::core::Result<()> {
+            self.create_failover.store(failover, Ordering::Relaxed);
+            self.create_called.store(true, Ordering::Relaxed);
+            if let Some(error) = &self.create_slot_result {
+                return Err(crate::core::Error::SourceError(error.to_string()));
+            }
+            Ok(())
+        }
+
+        async fn publication_exists(&self, _publication_name: &str) -> crate::core::Result<bool> {
+            Ok(self.publication_exists)
+        }
+
+        async fn has_replication_privilege(&self) -> crate::core::Result<bool> {
+            Ok(self.has_replication_privilege)
+        }
+    }
+
+    // ─── Pgoutput message provider mock ──────────────────────────────────────
+
+    struct MockPgOutputProvider {
+        batches: VecDeque<Vec<PgOutputXLogData>>,
+        confirmed_lsn: Arc<Mutex<u64>>,
+    }
+
+    impl MockPgOutputProvider {
+        fn new(batches: Vec<Vec<PgOutputXLogData>>) -> Self {
+            Self {
+                batches: batches.into_iter().collect(),
+                confirmed_lsn: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PgOutputMessageProvider for MockPgOutputProvider {
+        async fn poll_xlog_data(
+            &mut self,
+            _max: usize,
+            _poll_timeout: std::time::Duration,
+        ) -> crate::core::Result<PollOutcome> {
+            Ok(PollOutcome::Data(
+                self.batches.pop_front().unwrap_or_default(),
+            ))
+        }
+
+        async fn confirm_lsn(&mut self, lsn: u64) -> crate::core::Result<()> {
+            *self.confirmed_lsn.lock().await = lsn;
+            Ok(())
+        }
+    }
+
+    /// Provider that models a server too loaded to decode the requested window.
+    ///
+    /// `pg_logical_slot_peek_binary_changes` is **non-consuming**: it re-decodes the whole
+    /// un-acked backlog on every call. So a peek that exceeds its `statement_timeout` is
+    /// not a transient hiccup — the identical work is retried next poll and times out
+    /// again. Asking for the same window forever is a livelock.
+    /// A provider that behaves like a push transport: it blocks for the whole budget and
+    /// then reports an empty, caught-up poll.
+    struct BlockingProvider {
+        /// Longest budget any single poll was handed.
+        longest_budget_ms: Arc<Mutex<u64>>,
+    }
+
+    #[async_trait]
+    impl PgOutputMessageProvider for BlockingProvider {
+        async fn poll_xlog_data(
+            &mut self,
+            _max: usize,
+            poll_timeout: std::time::Duration,
+        ) -> crate::core::Result<PollOutcome> {
+            {
+                let mut longest = self.longest_budget_ms.lock().await;
+                *longest = (*longest).max(poll_timeout.as_millis() as u64);
+            }
+            tokio::time::sleep(poll_timeout).await;
+            Ok(PollOutcome::Data(Vec::new()))
+        }
+
+        fn waits_for_data(&self) -> bool {
+            true
+        }
+
+        async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waiting_provider_is_never_handed_more_than_the_callers_budget() {
+        // Regression: the poll budget was always the 30 s backstop, on the reasoning that it
+        // is a *work ceiling* and the outer `timeout_ms` is enforced by an elapsed-time check
+        // afterwards. That holds for a query-based transport, which returns as soon as it has
+        // rows. It is badly wrong for a transport that blocks on a socket: the elapsed check
+        // only runs once the provider has returned, so `next_events(250)` blocked for up to
+        // 30 s per empty poll. Against a live server that turned a 4-second incremental
+        // snapshot into a 300-second one.
+        let longest_budget_ms = Arc::new(Mutex::new(0_u64));
+        let provider = BlockingProvider {
+            longest_budget_ms: Arc::clone(&longest_budget_ms),
+        };
+
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            1_000,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+
+        let started = std::time::Instant::now();
+        let events = handle.next_events(250).await.expect("poll completes");
+        let elapsed = started.elapsed();
+
+        assert!(events.is_empty());
+        let longest = *longest_budget_ms.lock().await;
+        assert!(
+            longest <= 250,
+            "a waiting provider must never be handed more than the caller asked for; got \
+             {longest}ms for a 250ms budget"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the call must respect its budget rather than the 30s backstop; took {elapsed:?}"
+        );
+    }
+
+    struct SaturatedProvider {
+        /// Largest window this server can decode inside the budget.
+        max_decodable: usize,
+        batches: VecDeque<Vec<PgOutputXLogData>>,
+        timeouts: Arc<Mutex<usize>>,
+        smallest_window_seen: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl PgOutputMessageProvider for SaturatedProvider {
+        async fn poll_xlog_data(
+            &mut self,
+            max: usize,
+            _poll_timeout: std::time::Duration,
+        ) -> crate::core::Result<PollOutcome> {
+            {
+                let mut smallest = self.smallest_window_seen.lock().await;
+                *smallest = (*smallest).min(max);
+            }
+            if max > self.max_decodable {
+                *self.timeouts.lock().await += 1;
+                return Ok(PollOutcome::TimedOut);
+            }
+            Ok(PollOutcome::Data(
+                self.batches.pop_front().unwrap_or_default(),
+            ))
+        }
+
+        async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peek_that_times_out_shrinks_its_window_until_it_makes_progress() {
+        // The failure this reproduces: under load the peek exceeds its budget, the
+        // connector retries the *same* oversized window, and the pipeline stops
+        // delivering permanently — events that exist in the WAL are never surfaced.
+        let timeouts = Arc::new(Mutex::new(0usize));
+        let smallest_window_seen = Arc::new(Mutex::new(usize::MAX));
+        let provider = SaturatedProvider {
+            // Only a tiny window decodes in time — the server is badly saturated.
+            max_decodable: 4,
+            batches: vec![vec![
+                xlog(
+                    800,
+                    build_relation(999, "public", "users", &[("id", true), ("name", false)]),
+                ),
+                xlog(800, build_begin(1000, 0, 7)),
+                xlog(900, build_insert(999, &[Some("1"), Some("row")])),
+                xlog(1000, build_commit(900, 1100, 0)),
+            ]]
+            .into_iter()
+            .collect(),
+            timeouts: Arc::clone(&timeouts),
+            smallest_window_seen: Arc::clone(&smallest_window_seen),
+        };
+
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            // Far larger than the server can decode: every peek at this size times out.
+            1_000,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+        let events = handle
+            .next_events(2_000)
+            .await
+            .expect("polling must not error");
+
+        assert!(
+            *timeouts.lock().await > 0,
+            "the test must actually exercise the timeout path"
+        );
+        assert!(
+            *smallest_window_seen.lock().await <= 4,
+            "the connector must shrink the peek window after a timeout; it stayed at {} \
+             and would retry the same impossible decode forever",
+            *smallest_window_seen.lock().await
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "once the window is small enough to decode, the pending event must be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_peek_window_recovers_after_the_pressure_passes() {
+        // Shrinking must not be permanent: a transient load spike would otherwise cap
+        // throughput for the rest of the process's life.
+        let timeouts = Arc::new(Mutex::new(0usize));
+        let smallest = Arc::new(Mutex::new(usize::MAX));
+        let provider = SaturatedProvider {
+            max_decodable: usize::MAX, // server is healthy
+            batches: VecDeque::new(),
+            timeouts: Arc::clone(&timeouts),
+            smallest_window_seen: Arc::clone(&smallest),
+        };
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            1_000,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+
+        // Simulate having shrunk hard during an earlier spike.
+        handle.peek_window = 1;
+        let _ = handle.next_events(10).await.expect("poll");
+
+        assert!(
+            handle.peek_window > 1,
+            "a successful poll must widen the window again, got {}",
+            handle.peek_window
+        );
+        assert!(
+            handle.peek_window <= 1_000,
+            "recovery must not exceed the configured max_events_per_poll, got {}",
+            handle.peek_window
+        );
+    }
+
+    #[test]
+    fn default_config_prefers_tls_when_available() {
+        let config = PostgresSourceConfig::default();
+        assert!(config.transport.is_tls());
+    }
+
+    // ─── Binary message builders ──────────────────────────────────────────────
+
+    fn build_begin(final_lsn: u64, timestamp_us: i64, xid: u32) -> Vec<u8> {
+        let mut buf = vec![b'B'];
+        buf.extend_from_slice(&final_lsn.to_be_bytes());
+        buf.extend_from_slice(&timestamp_us.to_be_bytes());
+        buf.extend_from_slice(&xid.to_be_bytes());
+        buf
+    }
+
+    fn build_commit(commit_lsn: u64, end_lsn: u64, timestamp_us: i64) -> Vec<u8> {
+        let mut buf = vec![b'C', 0u8]; // flags = 0
+        buf.extend_from_slice(&commit_lsn.to_be_bytes());
+        buf.extend_from_slice(&end_lsn.to_be_bytes());
+        buf.extend_from_slice(&timestamp_us.to_be_bytes());
+        buf
+    }
+
+    fn build_relation(oid: u32, ns: &str, name: &str, cols: &[(&str, bool)]) -> Vec<u8> {
+        build_relation_with_identity(oid, ns, name, cols, b'd')
+    }
+
+    fn build_relation_with_identity(
+        oid: u32,
+        ns: &str,
+        name: &str,
+        cols: &[(&str, bool)],
+        replica_identity: u8,
+    ) -> Vec<u8> {
+        let mut buf = vec![b'R'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.extend_from_slice(ns.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.push(replica_identity);
+        let num: u16 = cols.len() as u16;
+        buf.extend_from_slice(&num.to_be_bytes());
+        for (col, is_key) in cols {
+            buf.push(u8::from(*is_key));
+            buf.extend_from_slice(col.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&23u32.to_be_bytes()); // int4 OID
+            buf.extend_from_slice(&(-1i32).to_be_bytes()); // atttypmod = -1
+        }
+        buf
+    }
+
+    fn append_tuple_data(buf: &mut Vec<u8>, values: &[Option<&str>]) {
+        buf.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        for val in values {
+            match val {
+                None => buf.push(b'n'),
+                Some(s) => {
+                    buf.push(b't');
+                    buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+    }
+
+    /// Tuple builder that can emit the pgoutput `'u'` unchanged-TOAST placeholder.
+    ///
+    /// `None` → SQL NULL (`'n'`), `Some(None)` → unchanged TOAST (`'u'`),
+    /// `Some(Some(text))` → a value (`'t'`).
+    fn append_tuple_data_with_toast(buf: &mut Vec<u8>, values: &[Option<Option<&str>>]) {
+        buf.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        for val in values {
+            match val {
+                None => buf.push(b'n'),
+                Some(None) => buf.push(b'u'),
+                Some(Some(s)) => {
+                    buf.push(b't');
+                    buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+    }
+
+    fn build_update_with_toast(oid: u32, new: &[Option<Option<&str>>]) -> Vec<u8> {
+        let mut buf = vec![b'U'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.push(b'N');
+        append_tuple_data_with_toast(&mut buf, new);
+        buf
+    }
+
+    fn build_insert(oid: u32, values: &[Option<&str>]) -> Vec<u8> {
+        let mut buf = vec![b'I'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.push(b'N');
+        append_tuple_data(&mut buf, values);
+        buf
+    }
+
+    fn build_update(oid: u32, old: Option<&[Option<&str>]>, new: &[Option<&str>]) -> Vec<u8> {
+        let mut buf = vec![b'U'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        if let Some(old_vals) = old {
+            buf.push(b'O');
+            append_tuple_data(&mut buf, old_vals);
+        }
+        buf.push(b'N');
+        append_tuple_data(&mut buf, new);
+        buf
+    }
+
+    fn build_delete(oid: u32, key: &[Option<&str>]) -> Vec<u8> {
+        let mut buf = vec![b'D'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.push(b'K');
+        append_tuple_data(&mut buf, key);
+        buf
+    }
+
+    fn xlog(lsn: u64, data: Vec<u8>) -> PgOutputXLogData {
+        PgOutputXLogData { lsn, data }
+    }
+
+    fn make_stream_handle(
+        initial_lsn: u64,
+        provider: MockPgOutputProvider,
+    ) -> PostgresStreamHandle {
+        make_stream_handle_with_keys(initial_lsn, provider, std::collections::HashMap::new())
+    }
+
+    fn make_stream_handle_with_keys(
+        initial_lsn: u64,
+        provider: MockPgOutputProvider,
+        catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
+    ) -> PostgresStreamHandle {
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: initial_lsn,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            0, // idle advance disabled in unit tests
+            Vec::new(),
+            Vec::new(),
+            catalog_primary_keys,
+        );
+        handle.stream.replication_status = StreamState::Streaming;
+        handle
+    }
+
+    /// A `REPLICA IDENTITY FULL` table's key is its primary key, not its every column.
+    ///
+    /// PostgreSQL sets the pgoutput replica-identity flag on every column under `FULL`, so reading
+    /// that flag as the primary key reported the whole row as the key. See
+    /// `query_publication_primary_keys` for what that breaks; these tests pin the resolution.
+    mod full_replica_identity_key_tests {
+        use super::*;
+
+        const OID: u32 = 77;
+
+        fn catalog(keys: &[&str]) -> std::collections::HashMap<(String, String), Vec<String>> {
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                ("public".to_string(), "toasty".to_string()),
+                keys.iter().map(|k| (*k).to_string()).collect(),
+            );
+            map
+        }
+
+        /// Every column flagged, as PostgreSQL sends it under FULL.
+        fn full_relation() -> Vec<u8> {
+            build_relation_with_identity(
+                OID,
+                "public",
+                "toasty",
+                &[("id", true), ("small", true), ("big", true)],
+                b'f',
+            )
+        }
+
+        fn batch() -> MockPgOutputProvider {
+            MockPgOutputProvider::new(vec![vec![
+                xlog(100, full_relation()),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(
+                    150,
+                    build_insert(OID, &[Some("1"), Some("s"), Some("wide")]),
+                ),
+                xlog(200, build_commit(200, 250, 0)),
+            ]])
+        }
+
+        #[tokio::test]
+        async fn the_key_is_the_catalog_primary_key_not_every_flagged_column() {
+            let mut handle = make_stream_handle_with_keys(0, batch(), catalog(&["id"]));
+            let events = handle.next_events(50).await.unwrap();
+
+            assert_eq!(
+                events[0].primary_key,
+                Some(vec!["id".to_string()]),
+                "under FULL every column carries the replica-identity flag; reporting them all \
+                 as the key makes the key change with any column, so a compacted topic cannot \
+                 collapse a row and one row's versions scatter across partitions"
+            );
+            assert_eq!(
+                events[0].primary_key_values(),
+                Some(serde_json::json!({"id": "1"})),
+                "the key must address the row, and must not carry the row's payload"
+            );
+        }
+
+        /// The reason the live TOAST test failed: a key that includes an unavailable column is a
+        /// partial key, and a partial key must be refused rather than widened — so the whole
+        /// update degraded to no write at all.
+        #[tokio::test]
+        async fn an_unavailable_column_does_not_destroy_the_key() {
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(100, full_relation()),
+                xlog(100, build_begin(200, 0, 10)),
+                // 'u' marks an unchanged TOAST value: present in the row, absent from the WAL.
+                xlog(150, {
+                    let mut buf = vec![b'U'];
+                    buf.extend_from_slice(&OID.to_be_bytes());
+                    buf.push(b'N');
+                    buf.extend_from_slice(&3u16.to_be_bytes());
+                    buf.push(b't');
+                    buf.extend_from_slice(&1i32.to_be_bytes());
+                    buf.extend_from_slice(b"1");
+                    buf.push(b't');
+                    buf.extend_from_slice(&2i32.to_be_bytes());
+                    buf.extend_from_slice(b"s2");
+                    buf.push(b'u');
+                    buf
+                }),
+                xlog(200, build_commit(200, 250, 0)),
+            ]]);
+            let mut handle = make_stream_handle_with_keys(0, provider, catalog(&["id"]));
+            let events = handle.next_events(50).await.unwrap();
+
+            assert_eq!(events[0].unavailable_columns, vec!["big".to_string()]);
+            assert!(
+                matches!(events[0].row_write(), crate::core::RowWrite::Merge { .. }),
+                "an unchanged-TOAST update must still merge; it wrote nothing when the \
+                 unavailable column was treated as part of the key: {:?}",
+                events[0].row_write()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_full_table_without_a_primary_key_reports_no_key_rather_than_the_whole_row() {
+            let mut handle =
+                make_stream_handle_with_keys(0, batch(), std::collections::HashMap::new());
+            let events = handle.next_events(50).await.unwrap();
+
+            assert_eq!(
+                events[0].primary_key, None,
+                "FULL without a primary key has no key to report; the whole row is not one"
+            );
+        }
+
+        /// The same flag drove the schema-change event, so a FULL table was published as one
+        /// whose every column was a non-nullable primary key — which an Avro schema turns into a
+        /// record with no optional fields.
+        #[tokio::test]
+        async fn the_published_schema_marks_only_the_real_key() {
+            let provider = MockPgOutputProvider::new(vec![
+                vec![xlog(100, full_relation())],
+                // A changed relation is what emits the schema-change event, and it is released
+                // with the transaction that carried it.
+                vec![
+                    xlog(105, build_begin(300, 0, 11)),
+                    xlog(
+                        110,
+                        build_relation_with_identity(
+                            OID,
+                            "public",
+                            "toasty",
+                            &[
+                                ("id", true),
+                                ("small", true),
+                                ("big", true),
+                                ("added", true),
+                            ],
+                            b'f',
+                        ),
+                    ),
+                    xlog(300, build_commit(300, 350, 0)),
+                ],
+            ]);
+            let mut handle = make_stream_handle_with_keys(0, provider, catalog(&["id"]));
+            // A poll keeps reading until it has something, so the schema change may land in
+            // either poll; collect both rather than assuming.
+            let mut events = handle.next_events(50).await.unwrap();
+            events.extend(handle.next_events(50).await.unwrap());
+
+            let schema = events
+                .iter()
+                .find(|event| event.op == crate::core::Operation::SchemaChange)
+                .and_then(|event| event.after.clone())
+                .and_then(|after| after.get("result_schema").cloned())
+                .expect("a changed relation publishes its schema");
+
+            assert_eq!(
+                schema["primary_keys"],
+                serde_json::json!(["id"]),
+                "the published key must be the real one: {schema}"
+            );
+            for column in schema["columns"].as_array().expect("columns array") {
+                let name = column["name"].as_str().expect("column name");
+                let expected_key = name == "id";
+                let constraints = column["constraints"].as_array().expect("constraints array");
+                assert_eq!(
+                    constraints.contains(&serde_json::json!("primary_key")),
+                    expected_key,
+                    "column '{name}' primary-key constraint is wrong: {column}"
+                );
+                assert_eq!(
+                    column["nullable"].as_bool(),
+                    Some(!expected_key),
+                    "column '{name}' nullability follows the real key, not the identity flag"
+                );
+            }
+        }
+    }
+
+    // ─── Pgoutput decoder tests ───────────────────────────────────────────────
+
+    #[test]
+    fn decode_pgoutput_begin_message() {
+        let data = build_begin(1000, 946_684_800_000_000, 42);
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Begin(b) => {
+                assert_eq!(b.final_lsn, 1000);
+                assert_eq!(b.xid, 42);
+                assert_eq!(b.commit_timestamp_us, 946_684_800_000_000);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_commit_message() {
+        let data = build_commit(900, 1000, 0);
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Commit(c) => {
+                assert_eq!(c.commit_lsn, 900);
+                assert_eq!(c.end_lsn, 1000);
+                assert_eq!(c.flags, 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_relation_message() {
+        let data = build_relation(1001, "public", "users", &[("id", true), ("name", false)]);
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Relation(r) => {
+                assert_eq!(r.oid, 1001);
+                assert_eq!(r.namespace, "public");
+                assert_eq!(r.name, "users");
+                assert_eq!(r.columns.len(), 2);
+                assert_eq!(r.columns[0].name, "id");
+                assert!(r.columns[0].is_key());
+                assert_eq!(r.columns[1].name, "name");
+                assert!(!r.columns[1].is_key());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_insert_message() {
+        let data = build_insert(1001, &[Some("1"), Some("alice")]);
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Insert(i) => {
+                assert_eq!(i.relation_oid, 1001);
+                assert_eq!(i.new_tuple.len(), 2);
+                assert_eq!(i.new_tuple[0], PgValue::Text("1".into()));
+                assert_eq!(i.new_tuple[1], PgValue::Text("alice".into()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_insert_with_null_column() {
+        let data = build_insert(1001, &[Some("1"), None]);
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Insert(i) => {
+                assert_eq!(i.new_tuple[1], PgValue::Null);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_update_message_with_old_tuple() {
+        let data = build_update(
+            1001,
+            Some(&[Some("1"), Some("alice")]),
+            &[Some("1"), Some("bob")],
+        );
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Update(u) => {
+                assert_eq!(u.relation_oid, 1001);
+                assert!(u.old_tuple.is_some());
+                let old = u.old_tuple.as_ref().unwrap();
+                assert_eq!(old[1], PgValue::Text("alice".into()));
+                assert_eq!(u.new_tuple[1], PgValue::Text("bob".into()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_update_message_without_old_tuple() {
+        let data = build_update(1001, None, &[Some("1"), Some("bob")]);
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Update(u) => {
+                assert!(u.old_tuple.is_none());
+                assert!(u.key_tuple.is_none());
+                assert_eq!(u.new_tuple[0], PgValue::Text("1".into()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_delete_message_with_key() {
+        let data = build_delete(1001, &[Some("1"), None]);
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Delete(d) => {
+                assert_eq!(d.relation_oid, 1001);
+                assert!(d.key_tuple.is_some());
+                let key = d.key_tuple.as_ref().unwrap();
+                assert_eq!(key[0], PgValue::Text("1".into()));
+                assert_eq!(key[1], PgValue::Null);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_unknown_message_type() {
+        let data = vec![b'X'];
+        match decode_pgoutput_message(&data).unwrap() {
+            PgOutputMessage::Unknown(t) => assert_eq!(t, b'X'),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_pgoutput_rejects_empty_message() {
+        let result = decode_pgoutput_message(&[]);
+        assert!(matches!(result, Err(crate::core::Error::SourceError(_))));
+    }
+
+    #[test]
+    fn decode_pgoutput_rejects_truncated_begin() {
+        let truncated = &build_begin(1000, 0, 1)[..5]; // cut short
+        let result = decode_pgoutput_message(truncated);
+        assert!(result.is_err());
+    }
+
+    // ─── Pgoutput timestamp conversion ───────────────────────────────────────
+
+    #[test]
+    fn pg_timestamp_to_millis_at_pg_epoch() {
+        // PG epoch = 2000-01-01 → Unix ms = 946_684_800_000
+        let ms = super::pg_timestamp_to_millis(0);
+        assert_eq!(ms, 946_684_800_000);
+    }
+
+    #[test]
+    fn pg_timestamp_to_millis_handles_negative() {
+        // Before PG epoch is clamped to 0
+        let ms = super::pg_timestamp_to_millis(i64::MIN);
+        assert_eq!(ms, 0);
+    }
+
+    // ─── format_pg_lsn round-trip ─────────────────────────────────────────────
+
+    #[test]
+    fn format_pg_lsn_round_trips_with_parse() {
+        let original: u64 = (0x16_u64 << 32) | 0xB374D848;
+        let formatted = super::format_pg_lsn(original);
+        let parsed = super::parse_pg_lsn(&formatted).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    // ─── Stream handle — pgoutput integration tests ───────────────────────────
+
+    #[tokio::test]
+    async fn stream_next_events_returns_insert_event() {
+        const OID: u32 = 999;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                800,
+                build_relation(OID, "public", "users", &[("id", true), ("name", false)]),
+            ),
+            xlog(800, build_begin(1000, 0, 1)),
+            xlog(900, build_insert(OID, &[Some("1"), Some("alice")])),
+            xlog(1000, build_commit(900, 1100, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let events = handle.next_events(100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, crate::core::Operation::Insert);
+        assert_eq!(events[0].table, "users");
+        assert_eq!(
+            events[0].after,
+            Some(serde_json::json!({"id": "1", "name": "alice"}))
+        );
+        assert_eq!(events[0].primary_key, Some(vec!["id".to_string()]));
+        // LSN position updated to the end LSN from COMMIT
+        assert_eq!(handle.stream.lsn_position, 1100);
+    }
+
+    #[tokio::test]
+    async fn stream_next_events_returns_update_event_with_before_after() {
+        const OID: u32 = 999;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                800,
+                build_relation(OID, "public", "users", &[("id", true), ("name", false)]),
+            ),
+            xlog(800, build_begin(1000, 0, 2)),
+            xlog(
+                900,
+                build_update(
+                    OID,
+                    Some(&[Some("1"), Some("alice")]),
+                    &[Some("1"), Some("bob")],
+                ),
+            ),
+            xlog(1000, build_commit(900, 1100, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let events = handle.next_events(100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, crate::core::Operation::Update);
+        assert_eq!(
+            events[0].before.row(),
+            Some(&serde_json::json!({"id": "1", "name": "alice"}))
+        );
+        assert_eq!(
+            events[0].after,
+            Some(serde_json::json!({"id": "1", "name": "bob"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_next_events_returns_delete_event_with_before() {
+        const OID: u32 = 999;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                800,
+                build_relation(OID, "public", "users", &[("id", true), ("name", false)]),
+            ),
+            xlog(800, build_begin(1000, 0, 3)),
+            xlog(900, build_delete(OID, &[Some("1"), None])),
+            xlog(1000, build_commit(900, 1100, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let events = handle.next_events(100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, crate::core::Operation::Delete);
+        assert!(events[0].before.is_present());
+        assert!(events[0].after.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_next_events_times_out_when_provider_returns_empty() {
+        let provider = MockPgOutputProvider::new(vec![]); // always empty
+        let mut handle = make_stream_handle(100, provider);
+        let events = handle.next_events(5).await.unwrap();
+        assert!(events.is_empty());
+        assert_eq!(handle.stream.lsn_position, 100);
+    }
+
+    #[tokio::test]
+    async fn stream_next_events_returns_empty_on_zero_timeout() {
+        let provider = MockPgOutputProvider::new(vec![]);
+        let mut handle = make_stream_handle(100, provider);
+        let events = handle.next_events(0).await.unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_next_events_rejects_non_streaming_state() {
+        let provider = MockPgOutputProvider::new(vec![]);
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Starting,
+            },
+            Box::new(provider),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            0, // idle advance disabled in unit tests
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+        let result = handle.next_events(100).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_save_position_persists_commit_lsn() {
+        const OID: u32 = 1;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(100, build_relation(OID, "public", "t", &[("id", true)])),
+            xlog(100, build_begin(200, 0, 5)),
+            xlog(150, build_insert(OID, &[Some("1")])),
+            xlog(200, build_commit(200, 250, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        handle.next_events(50).await.unwrap();
+
+        let mut checkpoint = InMemoryCheckpoint::default();
+        handle.save_position(&mut checkpoint).await.unwrap();
+        let offset = checkpoint.load().await.unwrap().unwrap();
+        let restored = PostgresOffset::from_bytes(&offset.encode().unwrap()).unwrap();
+        assert_eq!(restored.lsn, 250);
+        assert_eq!(restored.slot_name, "slot");
+    }
+
+    #[tokio::test]
+    async fn stream_transaction_metadata_populated_correctly() {
+        const OID: u32 = 1;
+        // PG epoch timestamp → Unix ms = 946_684_800_000
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(100, build_relation(OID, "public", "t", &[("id", true)])),
+            xlog(100, build_begin(200, 0, 77)),
+            xlog(150, build_insert(OID, &[Some("1")])),
+            xlog(160, build_insert(OID, &[Some("2")])),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let events = handle.next_events(100).await.unwrap();
+
+        assert_eq!(events.len(), 2);
+        let tx0 = events[0].transaction.as_ref().unwrap();
+        let tx1 = events[1].transaction.as_ref().unwrap();
+        assert_eq!(tx0.tx_id, 77);
+        assert_eq!(tx0.total_events, Some(2));
+        assert_eq!(tx0.event_index, 0);
+        assert_eq!(tx1.total_events, Some(2));
+        assert_eq!(tx1.event_index, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_confirm_lsn_delegates_to_provider() {
+        let provider = MockPgOutputProvider::new(vec![]);
+        let lsn_store = provider.confirmed_lsn.clone();
+        let mut handle = make_stream_handle(0, provider);
+        handle.confirm_lsn(999).await.unwrap();
+        assert_eq!(*lsn_store.lock().await, 999);
+    }
+
+    #[tokio::test]
+    async fn stream_relation_map_persists_across_polls() {
+        const OID: u32 = 5;
+        // First batch: RELATION + first transaction.
+        // Second batch: second transaction — no RELATION (schema already cached).
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(100, build_relation(OID, "public", "items", &[("id", true)])),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(150, build_insert(OID, &[Some("42")])),
+                xlog(200, build_commit(200, 250, 0)),
+            ],
+            vec![
+                // No RELATION — relation_map must still contain OID from first poll.
+                xlog(250, build_begin(300, 0, 11)),
+                xlog(280, build_insert(OID, &[Some("43")])),
+                xlog(300, build_commit(300, 350, 0)),
+            ],
+        ]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let first = handle.next_events(50).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].table, "items");
+
+        // relation_map preserved: second poll decodes correctly without a new RELATION.
+        let second = handle.next_events(50).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].table, "items");
+    }
+
+    #[tokio::test]
+    async fn stream_schema_qualified_table_name() {
+        const OID: u32 = 7;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(OID, "myschema", "orders", &[("id", true)]),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(150, build_insert(OID, &[Some("1")])),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let events = handle.next_events(100).await.unwrap();
+
+        // `table` is the BARE name and `schema` carries the namespace; the envelope
+        // joins them via `qualified_table_name()`. Putting the namespace in both
+        // produced `myschema.myschema.orders`, which no route pattern can match — so
+        // every event from a non-public schema fell through to the default sink.
+        assert_eq!(events[0].table, "orders");
+        assert_eq!(events[0].schema, Some("myschema".to_string()));
+        assert_eq!(events[0].qualified_table_name(), "myschema.orders");
+    }
+
+    #[tokio::test]
+    async fn unchanged_toast_columns_are_reported_not_silently_omitted() {
+        // An UPDATE that does not touch a large TOASTed column: PostgreSQL omits the
+        // value from the WAL entirely and pgoutput sends the 'u' placeholder. The value
+        // is unrecoverable, so the column must be reported as *unavailable* rather than
+        // silently dropped — otherwise a consumer doing a full-row upsert writes NULL
+        // over a multi-megabyte document that never changed.
+        const OID: u32 = 31;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(
+                    OID,
+                    "public",
+                    "docs",
+                    &[("id", true), ("title", false), ("body", false)],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(
+                150,
+                // id=1, title changed, body unchanged-TOAST.
+                build_update_with_toast(OID, &[Some(Some("1")), Some(Some("new")), Some(None)]),
+            ),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let events = handle.next_events(100).await.unwrap();
+        assert_eq!(events.len(), 1);
+
+        let after = events[0].after.as_ref().unwrap();
+        assert_eq!(after.get("title").unwrap(), "new");
+        assert!(
+            after.get("body").is_none(),
+            "an unchanged TOAST value is absent, never null"
+        );
+        assert_eq!(
+            events[0].unavailable_columns,
+            vec!["body".to_string()],
+            "the omitted column must be reported so a consumer can exclude it from writes"
+        );
+
+        // A column whose value IS present must never be reported unavailable.
+        assert!(!events[0].unavailable_columns.contains(&"title".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stream_row_with_unknown_relation_fails_loud() {
+        // pgoutput guarantees RELATION precedes any row referencing it. A row for an
+        // unknown OID means the decoder state is inconsistent; the row cannot be
+        // attributed to a table, and silently dropping it loses data.
+        const KNOWN: u32 = 11;
+        const UNKNOWN: u32 = 99;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(KNOWN, "public", "items", &[("id", true)]),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(150, build_insert(UNKNOWN, &[Some("1")])),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let error = handle
+            .next_events(100)
+            .await
+            .expect_err("an unknown relation oid must fail loud, not be silently dropped");
+        let message = error.to_string();
+        assert!(message.contains("relation oid 99"), "{message}");
+        assert!(message.contains("RELATION"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn stream_emits_schema_change_on_relation_update() {
+        const OID: u32 = 21;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(OID, "public", "users", &[("id", true), ("name", false)]),
+            ),
+            xlog(
+                400,
+                build_relation(
+                    OID,
+                    "public",
+                    "users",
+                    &[("id", true), ("name", false), ("email", false)],
+                ),
+            ),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let events = handle.next_events(100).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, crate::core::Operation::SchemaChange);
+        assert_eq!(events[0].source.offset, "0/00000190");
+        assert_eq!(events[0].schema.as_deref(), Some("public"));
+        assert_eq!(events[0].table, "users__ddl_events");
+
+        let after = events[0].after.as_ref().expect("schema event payload");
+        assert_eq!(after["ddl_type"], "ALTER_TABLE");
+        assert_eq!(after["schema"], "public");
+        assert_eq!(after["table"], "users");
+    }
+
+    #[tokio::test]
+    async fn stream_large_transaction_handles_10k_events() {
+        const OID: u32 = 42;
+        let mut batch = vec![
+            xlog(
+                100,
+                build_relation(OID, "public", "big_table", &[("id", true)]),
+            ),
+            xlog(100, build_begin(1_000, 0, 555)),
+        ];
+        for i in 0..10_000_u32 {
+            batch.push(xlog(
+                200 + u64::from(i),
+                build_insert(OID, &[Some(&i.to_string())]),
+            ));
+        }
+        batch.push(xlog(20_500, build_commit(20_000, 21_000, 0)));
+
+        let provider = MockPgOutputProvider::new(vec![batch]);
+        let mut handle = make_stream_handle(0, provider);
+        let events = handle.next_events(100).await.unwrap();
+
+        assert_eq!(events.len(), 10_000);
+        assert_eq!(events[0].table, "big_table");
+        assert_eq!(events[0].transaction.as_ref().map(|t| t.tx_id), Some(555));
+        assert_eq!(
+            events[0].transaction.as_ref().and_then(|t| t.total_events),
+            Some(10_000)
+        );
+        assert_eq!(
+            events
+                .last()
+                .and_then(|e| e.transaction.as_ref())
+                .map(|t| t.event_index),
+            Some(9_999)
+        );
+    }
+
+    #[test]
+    fn pgoutput_poll_error_maps_dead_slot_guidance() {
+        let err = map_pgoutput_poll_error("slot1", "ERROR: required WAL segment has been removed");
+        let msg = err.to_string();
+        assert!(msg.contains("stale or dead"));
+        assert!(msg.contains("slot1"));
+    }
+
+    // ─── Existing tests kept ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_pg_lsn_supports_valid_hex_format() {
+        let parsed = super::parse_pg_lsn("16/B374D848").unwrap();
+        assert_eq!(parsed, (0x16_u64 << 32) | 0xB374D848);
+    }
+
+    #[test]
+    fn parse_pg_lsn_rejects_invalid_format() {
+        let error = super::parse_pg_lsn("invalid").unwrap_err();
+        assert!(matches!(error, crate::core::Error::SourceError(_)));
+    }
+
+    #[test]
+    fn parse_table_reference_supports_quoted_identifiers_and_rejects_injection_like_inputs() {
+        assert!(super::parse_table_reference("public.users").is_ok());
+        let quoted = super::parse_table_reference("public.\"users.with.dot\"").unwrap();
+        assert_eq!(quoted.0, "public");
+        assert_eq!(quoted.1, "users.with.dot");
+
+        let quoted_schema = super::parse_table_reference("\"sales-team\".users").unwrap();
+        assert_eq!(quoted_schema.0, "sales-team");
+        assert_eq!(quoted_schema.1, "users");
+
+        assert!(super::parse_table_reference("users;DROP TABLE audit").is_err());
+        assert!(super::parse_table_reference("public.users --comment").is_err());
+        assert!(super::parse_table_reference("public.\"unterminated").is_err());
+    }
+
+    #[test]
+    fn decode_stream_resume_lsn_uses_checkpoint_value() {
+        let offset = PostgresOffset {
+            lsn: 4242,
+            slot_name: "slot".into(),
+            incremental_snapshot: None,
+        };
+        let lsn = super::decode_stream_resume_lsn("postgres", "slot", &offset).unwrap();
+        assert_eq!(lsn, 4242);
+    }
+
+    #[test]
+    fn stream_resume_alignment_accepts_exact_match() {
+        assert_eq!(reconcile_stream_resume_lsn(42, 42, "slot").unwrap(), 42);
+    }
+
+    #[test]
+    fn stream_resume_alignment_accepts_checkpoint_behind_slot() {
+        assert_eq!(reconcile_stream_resume_lsn(41, 42, "slot").unwrap(), 41);
+    }
+
+    #[test]
+    fn stream_resume_alignment_rejects_checkpoint_ahead_of_slot() {
+        let error = reconcile_stream_resume_lsn(43, 42, "slot").unwrap_err();
+        assert!(matches!(error, crate::core::Error::CheckpointError(_)));
+    }
+
+    #[test]
+    fn config_validation_rejects_empty_fields() {
+        let config = PostgresSourceConfig::default();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_validation_rejects_zero_stream_tuning() {
+        let mut config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: 1,
+            max_events_per_poll: 1,
+            ..Default::default()
+        };
+
+        config.stream_poll_interval_ms = 0;
+        assert!(config.validate().is_err());
+
+        config.stream_poll_interval_ms = 1;
+        config.max_events_per_poll = 0;
+        assert!(config.validate().is_err());
+
+        config.max_events_per_poll = 1;
+        config.conn_timeout_secs = 301;
+        assert!(config.validate().is_err());
+
+        config.conn_timeout_secs = 30;
+        config.stream_poll_interval_ms = 60_001;
+        assert!(config.validate().is_err());
+
+        config.stream_poll_interval_ms = 1;
+        config.max_events_per_poll = 100_001;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn debug_redacts_password() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("***redacted***"));
+        assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn validation_accepts_callback_backed_passwords() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: SecretString::from_callback("postgres-password", || {
+                Ok("callback-secret".to_string())
+            }),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+        assert!(config.build_connect_config().is_ok());
+    }
+
+    #[test]
+    fn aws_iam_auth_mode_requires_tls() {
+        let mut config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: SecretString::from_callback("postgres-iam-token", || {
+                Ok("iam-token".to_string())
+            }),
+            auth_mode: super::DatabaseAuthMode::AwsIamToken,
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::plaintext(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(error, crate::core::Error::ConfigError(message) if message.contains("requires TLS"))
+        );
+
+        config.transport = TransportConfig::tls();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn plaintext_transport_is_explicitly_supported() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            auth_mode: super::DatabaseAuthMode::Password,
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::plaintext(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn transport_helper_methods_set_expected_mode() {
+        let plaintext = PostgresSourceConfig::default().with_plaintext_transport();
+        assert!(!plaintext.transport.is_tls());
+
+        let tls = plaintext.with_tls_transport();
+        assert!(tls.transport.is_tls());
+    }
+
+    #[tokio::test]
+    async fn source_type_is_postgres() {
+        let connection = PostgresConnection::new(PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        });
+
+        assert_eq!(connection.source_type(), "postgres");
+        let capabilities = connection.capabilities();
+        assert!(capabilities.snapshot);
+        assert!(capabilities.handoff);
+        assert!(!capabilities.heartbeat);
+        assert!(capabilities.ddl_capture);
+    }
+
+    #[tokio::test]
+    async fn validation_creates_replication_slot_when_explicitly_opted_in() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            create_replication_slot_if_missing: true,
+            ..Default::default()
+        };
+        let backend = MockValidationBackend {
+            slot_exists: false,
+            publication_exists: true,
+            has_replication_privilege: true,
+            create_called: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
+        };
+
+        validate_with_backend(&config, &backend).await.unwrap();
+        assert!(backend.create_called.load(Ordering::Relaxed));
+    }
+
+    /// `failover_slot` must reach slot creation, and must default to off.
+    ///
+    /// A failover-enabled slot (PostgreSQL 17+) is synchronized to standbys so logical
+    /// replication can resume from the new primary after a promotion. Without it the
+    /// slot lives only on the old primary and is lost on failover, taking every change
+    /// since the last confirmed LSN with it.
+    #[tokio::test]
+    async fn failover_slot_flag_reaches_slot_creation() {
+        let base = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            create_replication_slot_if_missing: true,
+            ..Default::default()
+        };
+        assert!(
+            !base.failover_slot,
+            "failover slots are PG17+, so they must be opt-in"
+        );
+
+        for failover in [false, true] {
+            let config = PostgresSourceConfig {
+                failover_slot: failover,
+                ..base.clone()
+            };
+            let backend = MockValidationBackend {
+                slot_exists: false,
+                publication_exists: true,
+                has_replication_privilege: true,
+                create_called: Arc::new(AtomicBool::new(false)),
+                create_failover: Arc::new(AtomicBool::new(false)),
+                ..Default::default()
+            };
+
+            validate_with_backend(&config, &backend).await.unwrap();
+            assert!(backend.create_called.load(Ordering::Relaxed));
+            assert_eq!(
+                backend.create_failover.load(Ordering::Relaxed),
+                failover,
+                "failover_slot={failover} must be passed through to slot creation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_refuses_to_recreate_a_missing_slot_by_default() {
+        // Auto-creating a slot that disappeared mid-life restarts capture at the
+        // current WAL position, silently discarding everything since the last
+        // confirmed_flush_lsn. The default must fail loud instead.
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+        assert!(
+            !config.create_replication_slot_if_missing,
+            "auto-create must be off by default"
+        );
+        let backend = MockValidationBackend {
+            slot_exists: false,
+            publication_exists: true,
+            has_replication_privilege: true,
+            create_called: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
+        };
+
+        let error = validate_with_backend(&config, &backend)
+            .await
+            .expect_err("a missing slot must fail loud unless explicitly opted in");
+        assert!(
+            !backend.create_called.load(Ordering::Relaxed),
+            "the slot must not be created"
+        );
+        let message = error.to_string();
+        assert!(message.contains("does not exist"), "{message}");
+        assert!(
+            message.contains("create_replication_slot_if_missing"),
+            "the error must name the opt-in: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_missing_publication() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+        let backend = MockValidationBackend {
+            slot_exists: true,
+            publication_exists: false,
+            has_replication_privilege: true,
+            ..Default::default()
+        };
+
+        let error = validate_with_backend(&config, &backend).await.unwrap_err();
+        assert!(matches!(error, crate::core::Error::SourceError(_)));
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_missing_replication_privilege() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            port: 5432,
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            transport: TransportConfig::tls(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
+            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            ..Default::default()
+        };
+        let backend = MockValidationBackend {
+            slot_exists: true,
+            publication_exists: true,
+            has_replication_privilege: false,
+            ..Default::default()
+        };
+
+        let error = validate_with_backend(&config, &backend).await.unwrap_err();
+        assert!(matches!(error, crate::core::Error::SourceError(_)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_handle_chunks_rows_and_finishes_consistently() {
+        let snapshot = super::PostgresSnapshot {
+            tables: vec![TableSnapshot {
+                table: "users".into(),
+                total_rows: 3,
+                rows_processed: 0,
+                cursor_position: None,
+                is_complete: false,
+            }],
+            snapshot_id: "snap-1".into(),
+            snapshot_start_ts: 1,
+            snapshot_end_ts: 0,
+        };
+        let mut handle = PostgresSnapshotHandle::new(
+            "postgres".into(),
+            snapshot,
+            vec![TableSnapshotState {
+                snapshot: TableSnapshot {
+                    table: "users".into(),
+                    total_rows: 3,
+                    rows_processed: 0,
+                    cursor_position: None,
+                    is_complete: false,
+                },
+                rows: vec![
+                    serde_json::json!({"id": 1}),
+                    serde_json::json!({"id": 2}),
+                    serde_json::json!({"id": 3}),
+                ],
+                next_row: 0,
+                live_query: false,
+                primary_key_columns: vec![],
+                primary_key_types: vec![],
+            }],
+            None,
+            false,
+            0,
+        );
+
+        let first = handle.next_chunk(2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let second = handle.next_chunk(2).await.unwrap();
+        assert_eq!(second.len(), 1);
+        let none = handle.next_chunk(2).await.unwrap();
+        assert!(none.is_empty());
+
+        let end = handle.finish().await.unwrap();
+        assert!(end.snapshot_end_ts > 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_checkpoint_persists_cursor_state() {
+        let snapshot = super::PostgresSnapshot {
+            tables: vec![TableSnapshot {
+                table: "users".into(),
+                total_rows: 1,
+                rows_processed: 0,
+                cursor_position: None,
+                is_complete: false,
+            }],
+            snapshot_id: "snap-1".into(),
+            snapshot_start_ts: 1,
+            snapshot_end_ts: 0,
+        };
+        let mut handle = PostgresSnapshotHandle::new(
+            "postgres".into(),
+            snapshot,
+            vec![TableSnapshotState {
+                snapshot: TableSnapshot {
+                    table: "users".into(),
+                    total_rows: 1,
+                    rows_processed: 0,
+                    cursor_position: None,
+                    is_complete: false,
+                },
+                rows: vec![serde_json::json!({"id": 1})],
+                next_row: 0,
+                live_query: false,
+                primary_key_columns: vec![],
+                primary_key_types: vec![],
+            }],
+            None,
+            false,
+            0,
+        );
+
+        handle.next_chunk(1).await.unwrap();
+        let mut checkpoint = InMemoryCheckpoint::default();
+        handle.checkpoint(&mut checkpoint, 7).await.unwrap();
+        assert!(checkpoint.load().await.unwrap().is_some());
+    }
+
+    #[test]
+    fn snapshot_live_query_cursor_validation_accepts_json_pk_values() {
+        assert!(PostgresSnapshotHandle::decode_pk_cursor("[\"1\"]", 1).is_ok());
+        assert!(PostgresSnapshotHandle::decode_pk_cursor("[\"42\",\"9\"]", 2).is_ok());
+        assert!(PostgresSnapshotHandle::decode_pk_cursor("12", 1).is_err());
+        assert!(PostgresSnapshotHandle::decode_pk_cursor("[\"1\"]", 2).is_err());
+        assert!(PostgresSnapshotHandle::decode_pk_cursor("[]", 1).is_err());
+    }
+
+    #[test]
+    fn snapshot_resume_rejects_malformed_pk_keyset_cursor() {
+        let snapshot = super::PostgresSnapshot {
+            tables: vec![TableSnapshot {
+                table: "users".into(),
+                total_rows: 10,
+                rows_processed: 0,
+                cursor_position: None,
+                is_complete: false,
+            }],
+            snapshot_id: "snap-1".into(),
+            snapshot_start_ts: 1,
+            snapshot_end_ts: 0,
+        };
+        let handle = PostgresSnapshotHandle::new(
+            "postgres".into(),
+            snapshot,
+            vec![TableSnapshotState {
+                snapshot: TableSnapshot {
+                    table: "users".into(),
+                    total_rows: 10,
+                    rows_processed: 0,
+                    cursor_position: None,
+                    is_complete: false,
+                },
+                rows: vec![],
+                next_row: 0,
+                live_query: true,
+                primary_key_columns: vec!["id".into()],
+                primary_key_types: vec!["bigint".into()],
+            }],
+            None,
+            false,
+            0,
+        );
+
+        let state = super::SnapshotCheckpointState {
+            snapshot_id: "snap-1".into(),
+            snapshot_start_ts: 1,
+            snapshot_end_ts: 0,
+            snapshot_watermark: 10,
+            current_table: 0,
+            next_chunk_index: 2,
+            tables: vec![TableSnapshot {
+                table: "users".into(),
+                total_rows: 10,
+                rows_processed: 5,
+                cursor_position: Some("5".into()),
+                is_complete: false,
+            }],
+        };
+
+        let payload = serde_json::to_vec(&state).unwrap();
+        let error = match handle.resume_from_checkpoint_payload(&payload) {
+            Ok(_) => {
+                panic!("resume should reject malformed keyset cursor for live query snapshots")
+            }
+            Err(error) => error,
+        };
+        match error {
+            crate::core::Error::CheckpointError(message) => {
+                assert!(message.contains("expected JSON array of primary key values"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_empty_table_emits_no_rows() {
+        let snapshot = super::PostgresSnapshot {
+            tables: vec![TableSnapshot {
+                table: "users".into(),
+                total_rows: 0,
+                rows_processed: 0,
+                cursor_position: None,
+                is_complete: true,
+            }],
+            snapshot_id: "snap-1".into(),
+            snapshot_start_ts: 1,
+            snapshot_end_ts: 1,
+        };
+        let mut handle = PostgresSnapshotHandle::new(
+            "postgres".into(),
+            snapshot,
+            vec![TableSnapshotState {
+                snapshot: TableSnapshot {
+                    table: "users".into(),
+                    total_rows: 0,
+                    rows_processed: 0,
+                    cursor_position: None,
+                    is_complete: true,
+                },
+                rows: vec![],
+                next_row: 0,
+                live_query: false,
+                primary_key_columns: vec![],
+                primary_key_types: vec![],
+            }],
+            None,
+            false,
+            0,
+        );
+
+        assert!(handle.next_chunk(10).await.unwrap().is_empty());
+        assert!(handle.finish().await.unwrap().snapshot_end_ts > 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_offsets_do_not_repeat_across_chunks() {
+        let snapshot = super::PostgresSnapshot {
+            tables: vec![TableSnapshot {
+                table: "users".into(),
+                total_rows: 4,
+                rows_processed: 0,
+                cursor_position: None,
+                is_complete: false,
+            }],
+            snapshot_id: "snap-1".into(),
+            snapshot_start_ts: 1,
+            snapshot_end_ts: 0,
+        };
+        let mut handle = PostgresSnapshotHandle::new(
+            "postgres".into(),
+            snapshot,
+            vec![TableSnapshotState {
+                snapshot: TableSnapshot {
+                    table: "users".into(),
+                    total_rows: 4,
+                    rows_processed: 0,
+                    cursor_position: None,
+                    is_complete: false,
+                },
+                rows: vec![
+                    serde_json::json!({"id": 1}),
+                    serde_json::json!({"id": 2}),
+                    serde_json::json!({"id": 3}),
+                    serde_json::json!({"id": 4}),
+                ],
+                next_row: 0,
+                live_query: false,
+                primary_key_columns: vec![],
+                primary_key_types: vec![],
+            }],
+            None,
+            false,
+            0,
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for chunk in [2_usize, 1_usize, 10_usize] {
+            for event in handle.next_chunk(chunk).await.unwrap() {
+                assert!(seen.insert(event.source.offset));
+            }
+        }
+        assert_eq!(seen.len(), 4);
+        assert!(handle.finish().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn snapshot_finish_allows_row_count_drift_for_live_query_tables() {
+        let snapshot = super::PostgresSnapshot {
+            tables: vec![TableSnapshot {
+                table: "users".into(),
+                total_rows: 10,
+                rows_processed: 0,
+                cursor_position: None,
+                is_complete: false,
+            }],
+            snapshot_id: "snap-1".into(),
+            snapshot_start_ts: 1,
+            snapshot_end_ts: 0,
+        };
+        let mut handle = PostgresSnapshotHandle::new(
+            "postgres".into(),
+            snapshot,
+            vec![TableSnapshotState {
+                snapshot: TableSnapshot {
+                    table: "users".into(),
+                    total_rows: 10,
+                    rows_processed: 0,
+                    cursor_position: None,
+                    is_complete: false,
+                },
+                rows: vec![
+                    serde_json::json!({"id": 1}),
+                    serde_json::json!({"id": 2}),
+                    serde_json::json!({"id": 3}),
+                ],
+                next_row: 0,
+                live_query: true,
+                primary_key_columns: vec!["id".into()],
+                primary_key_types: vec!["bigint".into()],
+            }],
+            None,
+            false,
+            0,
+        );
+
+        let events = handle.next_chunk(10).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(handle.finish().await.is_ok());
+    }
+
+    #[test]
+    fn handoff_watermarks_accept_equal_or_forward_progress() {
+        let equal = super::postgres_handoff_stream_watermark_gap(100, 100).unwrap();
+        assert_eq!(equal, 0);
+
+        let overlap = super::postgres_handoff_stream_watermark_gap(100, 160).unwrap();
+        assert_eq!(overlap, 60);
+    }
+
+    #[test]
+    fn handoff_watermarks_reject_stream_behind_snapshot() {
+        let err = super::postgres_handoff_stream_watermark_gap(200, 199).unwrap_err();
+        assert!(matches!(err, crate::core::Error::SourceError(_)));
+    }
+
+    #[test]
+    fn handoff_snapshot_only_returns_no_stream_start() {
+        let result = super::postgres_handoff_result(Some(11), Some(10), None).unwrap();
+        assert_eq!(result.snapshot_end_ts, Some(11));
+        assert_eq!(result.stream_start_ts, None);
+        assert_eq!(result.overlap_events_dropped, None);
+        assert_eq!(result.stream_watermark_gap, None);
+    }
+
+    #[test]
+    fn handoff_stream_only_returns_no_snapshot_end() {
+        let result = super::postgres_handoff_result(None, None, Some(10)).unwrap();
+        assert_eq!(result.snapshot_end_ts, None);
+        assert!(result.stream_start_ts.is_some());
+        assert_eq!(result.overlap_events_dropped, None);
+        assert_eq!(result.stream_watermark_gap, None);
+    }
+
+    #[test]
+    fn handoff_overlap_reports_watermark_gap_not_event_count() {
+        let result = super::postgres_handoff_result(Some(25), Some(100), Some(160)).unwrap();
+        assert_eq!(result.snapshot_end_ts, Some(25));
+        assert_eq!(result.overlap_events_dropped, None);
+        assert_eq!(result.stream_watermark_gap, Some(60));
+        assert!(result.stream_start_ts.is_some());
+    }
+
+    /// Regression test: when all events in a batch are filtered out (e.g. the
+    /// transaction only touches excluded tables), process_messages returns empty
+    /// but the COMMIT still advances `lsn_position`.  next_events must call
+    /// confirm_lsn on the new position so that the next pg_logical_slot_peek_binary_changes
+    /// call returns fresh WAL rows rather than endlessly replaying the same batch.
+    #[tokio::test]
+    async fn stream_filtered_tx_advances_confirmed_lsn() {
+        const OID: u32 = 99;
+        // A single transaction on table "excluded_table".  The stream handle is
+        // configured with an include-list that does NOT contain this table, so
+        // process_messages will produce zero user events but the COMMIT still
+        // moves lsn_position from 0 → 1100.
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                800,
+                build_relation(OID, "public", "excluded_table", &[("id", true)]),
+            ),
+            xlog(800, build_begin(1000, 0, 42)),
+            xlog(900, build_insert(OID, &[Some("1")])),
+            xlog(1000, build_commit(900, 1100, 0)),
+        ]]);
+        let confirmed_lsn = provider.confirmed_lsn.clone();
+
+        // Build a stream handle that only allows "allowed_table" — "excluded_table" is filtered.
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            0,                                   // idle advance disabled in unit tests
+            vec!["public.allowed_table".into()], // include-list excludes "excluded_table"
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+
+        // next_events times out with no events (batch is filtered) but must have
+        // called confirm_lsn to unblock subsequent peeks.
+        let events = handle.next_events(5).await.unwrap();
+        assert!(events.is_empty(), "filtered batch should yield no events");
+        assert_eq!(
+            handle.stream.lsn_position, 1100,
+            "lsn_position must advance even when all events are filtered"
+        );
+        assert_eq!(
+            *confirmed_lsn.lock().await,
+            1100,
+            "confirm_lsn must be called with the new lsn_position to unblock next peek"
+        );
+    }
+
+    /// A schema change on an excluded table must not be emitted.
+    ///
+    /// The relation cache is still updated — the decoder needs it to attribute any row it
+    /// later sees — but the *event* carries the table's full column list to the sink, and
+    /// an exclusion is an instruction about what may leave the database. This path used
+    /// to bypass the include/exclude lists entirely, so an operator who allow-listed one
+    /// table still received the schema of every other table in the publication.
+    #[tokio::test]
+    async fn a_schema_change_on_an_excluded_table_is_not_emitted() {
+        const ALLOWED: u32 = 10;
+        const EXCLUDED: u32 = 11;
+
+        let provider = MockPgOutputProvider::new(vec![vec![
+            // First sighting of each relation: establishes the cache, emits nothing.
+            xlog(
+                100,
+                build_relation(ALLOWED, "public", "allowed_table", &[("id", true)]),
+            ),
+            xlog(
+                100,
+                build_relation(EXCLUDED, "public", "secret_table", &[("id", true)]),
+            ),
+            // Both tables gain a column. Only the allowed one may be reported.
+            xlog(
+                200,
+                build_relation(
+                    EXCLUDED,
+                    "public",
+                    "secret_table",
+                    &[("id", true), ("ssn", false)],
+                ),
+            ),
+            xlog(
+                300,
+                build_relation(
+                    ALLOWED,
+                    "public",
+                    "allowed_table",
+                    &[("id", true), ("note", false)],
+                ),
+            ),
+        ]]);
+
+        let mut handle = PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(provider),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            0,
+            vec!["public.allowed_table".into()],
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+
+        let events = handle.next_events(5).await.unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one schema change is inside the allowlist, got {:?}",
+            events.iter().map(|e| e.table.clone()).collect::<Vec<_>>()
+        );
+        // A schema-change event is published under a synthetic `<table>__ddl_events`
+        // name, which is exactly why the filter has to be applied at the source: no
+        // downstream matcher on the real table name can ever see it.
+        assert_eq!(events[0].table, "allowed_table__ddl_events");
+        assert!(
+            !format!("{:?}", events[0]).contains("ssn"),
+            "no column of an excluded table may reach a sink"
+        );
+        assert!(
+            handle.relation_map.contains_key(&EXCLUDED),
+            "the relation cache must still track excluded tables so rows stay attributable"
+        );
+    }
+}

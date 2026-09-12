@@ -1,0 +1,1433 @@
+//! Schema history abstractions and backends.
+
+use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use crate::checkpoint::owner_lease::{self, OwnerLease};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+use crate::core::{Error, Event, Result, ValidationError};
+use crate::ddl_capture::{SchemaDiff, SchemaDiffOperation};
+
+/// A single column definition captured from schema history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnDef {
+    /// Column name as reported by the source schema.
+    pub name: String,
+    /// Source-declared logical data type.
+    pub data_type: String,
+    /// Whether the column accepts null values.
+    pub nullable: bool,
+    /// Additional column-level constraints such as primary key markers.
+    pub constraints: Vec<String>,
+}
+
+/// Full schema snapshot for a table at a specific version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSchema {
+    /// Schema or namespace name.
+    pub schema: String,
+    /// Table name.
+    pub table: String,
+    /// Ordered column definitions.
+    pub columns: Vec<ColumnDef>,
+    /// Primary key column names.
+    pub primary_keys: Vec<String>,
+    /// Monotonic schema version assigned by the history store.
+    pub version: u32,
+}
+
+/// DDL changes recorded by the schema-history store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DDLEvent {
+    /// A new table definition.
+    CreateTable(TableSchema),
+    /// A schema evolution event that supersedes the previous version.
+    AlterTable(TableSchema),
+    /// A schema evolution event represented as an ordered diff over the previous version.
+    AlterTableDiff {
+        /// Schema containing the table.
+        schema: String,
+        /// Table that changed.
+        table: String,
+        /// Ordered operations taking the previous version to this one.
+        diff: SchemaDiff,
+    },
+    /// Table removal.
+    DropTable {
+        /// Schema containing the table.
+        schema: String,
+        /// Table that was dropped.
+        table: String,
+    },
+}
+
+/// Abstraction for recording and querying table schema history.
+#[async_trait]
+pub trait SchemaHistory: Send + Sync {
+    /// Record a DDL change and return the resulting schema version.
+    ///
+    /// `ddl_id` is a stable identity for the statement — in the runtime it is the
+    /// source log position the DDL was captured at. **Recording is idempotent on
+    /// it**: a DDL redelivered under at-least-once replay returns the version it was
+    /// already assigned instead of appending a second entry.
+    ///
+    /// That is not a nicety. The runtime records a schema change before it enqueues
+    /// the event announcing it, and a crash between the record and the checkpoint
+    /// commit replays the DDL on restart. Without the identity check, replaying an
+    /// [`DDLEvent::AlterTableDiff`] re-applies its operations to a schema that
+    /// already has them — `ADD COLUMN` on a column that now exists — which returns
+    /// [`Error::SchemaError`], fails the poll, and fails identically on every
+    /// subsequent restart. The pipeline never starts again.
+    async fn record_ddl(&mut self, ddl_id: &str, ddl: DDLEvent) -> Result<u32>;
+    /// Look up a schema by version.
+    async fn get_schema_at_version(&self, table: &str, version: u32)
+    -> Result<Option<TableSchema>>;
+    /// Look up the most recent schema at or before a timestamp.
+    async fn get_schema_at_timestamp(&self, table: &str, ts: u64) -> Result<Option<TableSchema>>;
+    /// Return the latest known schema for a table.
+    async fn latest_schema(&self, table: &str) -> Result<Option<TableSchema>>;
+    /// Apply retention policy and prune old history entries.
+    async fn apply_retention(&mut self, retention: SchemaHistoryRetention) -> Result<usize>;
+}
+
+/// Retention policy for schema-history pruning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SchemaHistoryRetention {
+    /// Maximum number of historical versions retained per table key.
+    pub max_versions_per_table: usize,
+}
+
+impl SchemaHistoryRetention {
+    /// Create a policy retaining only the latest `max_versions_per_table` entries.
+    pub fn keep_last(max_versions_per_table: usize) -> Result<Self> {
+        if max_versions_per_table == 0 {
+            return Err(Error::ConfigError(
+                "schema history retention max_versions_per_table must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            max_versions_per_table,
+        })
+    }
+}
+
+type SchemaStore = HashMap<String, Vec<VersionedSchema>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionedSchema {
+    version: u32,
+    recorded_at: u64,
+    schema: Option<TableSchema>,
+    /// Identity of the DDL that produced this version, used to recognise a replay.
+    ///
+    /// `None` for an entry written by a caller that supplied an empty id, which
+    /// disables replay suppression for that entry rather than colliding every
+    /// unidentified DDL onto one key.
+    #[serde(default)]
+    ddl_id: Option<String>,
+}
+
+/// In-memory schema-history backend.
+///
+/// Suitable for tests, short-lived processes, and embeddings where DDL history
+/// does not need to survive a restart. For production use with long-lived
+/// deployments, prefer [`FileSchemaHistory`] to avoid unbounded memory growth
+/// and loss on restart.
+#[derive(Debug, Clone, Default)]
+pub struct InMemorySchemaHistory {
+    schemas: Arc<RwLock<SchemaStore>>,
+}
+
+/// Durable schema-history backend persisted to a local JSON file.
+///
+/// `FileSchemaHistory` uses write-rename persistence with file and directory fsync
+/// to provide crash-safe single-process durability semantics.
+///
+/// # Exclusive ownership
+///
+/// On construction, `FileSchemaHistory` acquires a PID lease file at
+/// `<path>.owner` to prevent two processes from writing to the same history file
+/// simultaneously. Stale leases left by dead processes are cleared automatically;
+/// a `StateError` is returned if a live process already holds the lease.
+#[derive(Debug, Clone)]
+pub struct FileSchemaHistory {
+    path: Arc<PathBuf>,
+    /// POSIX permission bitmask applied to every file this store creates.
+    ///
+    /// Read only under `#[cfg(unix)]` — Windows has no equivalent to narrow, and the
+    /// store is a no-op there rather than silently creating world-readable files under a
+    /// setting that looks applied.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    file_mode: u32,
+    schemas: Arc<RwLock<SchemaStore>>,
+    /// RAII guard that removes the `.owner` file when the last clone is dropped.
+    _lease: Arc<Mutex<Option<OwnerLease>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FileSchemaHistoryState {
+    schemas: SchemaStore,
+}
+
+fn table_key(schema: &str, table: &str) -> String {
+    format!("{schema}.{table}")
+}
+
+/// Returns a wall-clock millisecond timestamp that is guaranteed to be
+/// **monotonically non-decreasing** across concurrent calls on the same process.
+///
+/// Plain `SystemTime::now()` can go backward under NTP slew or leap-second
+/// corrections, which would silently mis-order schema history entries.  A CAS
+/// loop over a process-wide atomic clamps the returned value to
+/// `max(wall_clock, last_seen)` without requiring a mutex.
+fn current_time() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static LAST_TS_MS: AtomicU64 = AtomicU64::new(0);
+
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1); // 0 would leave LAST_TS_MS stuck at 0 forever on error
+
+    let mut prev = LAST_TS_MS.load(Ordering::Acquire);
+    loop {
+        let next = wall.max(prev);
+        match LAST_TS_MS.compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+fn next_version(store: &SchemaStore, key: &str) -> u32 {
+    store
+        .get(key)
+        .and_then(|entries| entries.last().map(|entry| entry.version + 1))
+        .unwrap_or(1)
+}
+
+/// Version already recorded for `ddl_id` under `key`, if this DDL is a replay.
+fn existing_version_for_ddl(store: &SchemaStore, key: &str, ddl_id: &str) -> Option<u32> {
+    if ddl_id.is_empty() {
+        return None;
+    }
+    store
+        .get(key)?
+        .iter()
+        .find_map(|entry| (entry.ddl_id.as_deref() == Some(ddl_id)).then_some(entry.version))
+}
+
+fn record_ddl_in_store(
+    store: &mut SchemaStore,
+    ddl_id: &str,
+    ddl: DDLEvent,
+    timestamp: u64,
+) -> Result<u32> {
+    let ddl_id = (!ddl_id.is_empty()).then(|| ddl_id.to_string());
+    match ddl {
+        DDLEvent::CreateTable(mut schema) | DDLEvent::AlterTable(mut schema) => {
+            let key = table_key(&schema.schema, &schema.table);
+            if let Some(version) = ddl_id
+                .as_deref()
+                .and_then(|id| existing_version_for_ddl(store, &key, id))
+            {
+                return Ok(version);
+            }
+            let version = next_version(store, &key);
+            schema.version = version;
+            store.entry(key).or_default().push(VersionedSchema {
+                version,
+                recorded_at: timestamp,
+                schema: Some(schema),
+                ddl_id,
+            });
+            Ok(version)
+        }
+        DDLEvent::AlterTableDiff {
+            schema,
+            table,
+            diff,
+        } => {
+            let key = table_key(&schema, &table);
+            if let Some(version) = ddl_id
+                .as_deref()
+                .and_then(|id| existing_version_for_ddl(store, &key, id))
+            {
+                return Ok(version);
+            }
+            let version = next_version(store, &key);
+            let mut next_schema = store
+                .get(&key)
+                .and_then(|entries| entries.last())
+                .and_then(|entry| entry.schema.clone())
+                .ok_or_else(|| {
+                    Error::SchemaError(format!(
+                        "cannot apply ALTER TABLE diff to unknown table '{key}'"
+                    ))
+                })?;
+
+            apply_schema_diff(&mut next_schema, &diff)?;
+            next_schema.version = version;
+
+            store.entry(key).or_default().push(VersionedSchema {
+                version,
+                recorded_at: timestamp,
+                schema: Some(next_schema),
+                ddl_id,
+            });
+            Ok(version)
+        }
+        DDLEvent::DropTable { schema, table } => {
+            let key = table_key(&schema, &table);
+            if let Some(version) = ddl_id
+                .as_deref()
+                .and_then(|id| existing_version_for_ddl(store, &key, id))
+            {
+                return Ok(version);
+            }
+            let version = next_version(store, &key);
+            store.entry(key).or_default().push(VersionedSchema {
+                version,
+                recorded_at: timestamp,
+                schema: None,
+                ddl_id,
+            });
+            Ok(version)
+        }
+    }
+}
+
+fn schema_at_version(store: &SchemaStore, table: &str, version: u32) -> Option<TableSchema> {
+    store
+        .get(table)
+        .and_then(|entries| entries.iter().find(|entry| entry.version == version))
+        .and_then(|entry| entry.schema.clone())
+}
+
+fn schema_at_timestamp(store: &SchemaStore, table: &str, ts: u64) -> Option<TableSchema> {
+    store
+        .get(table)
+        .and_then(|entries| entries.iter().rev().find(|entry| entry.recorded_at <= ts))
+        .and_then(|entry| entry.schema.clone())
+}
+
+fn latest_schema_for_table(store: &SchemaStore, table: &str) -> Option<TableSchema> {
+    store
+        .get(table)
+        .and_then(|entries| entries.last())
+        .and_then(|entry| entry.schema.clone())
+}
+
+fn apply_store_retention(store: &mut SchemaStore, retention: SchemaHistoryRetention) -> usize {
+    let mut removed = 0usize;
+
+    for entries in store.values_mut() {
+        if entries.len() > retention.max_versions_per_table {
+            let trim_count = entries.len() - retention.max_versions_per_table;
+            entries.drain(0..trim_count);
+            removed = removed.saturating_add(trim_count);
+        }
+    }
+
+    removed
+}
+
+/// Run `work` on a blocking worker so filesystem calls never stall an async executor.
+async fn on_blocking_worker<T, F>(work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(error) => Err(Error::StateError(format!(
+            "schema history filesystem task failed to run to completion: {error}"
+        ))),
+    }
+}
+
+impl FileSchemaHistory {
+    const DEFAULT_FILE_MODE: u32 = 0o600;
+    const TEMP_FILE_ATTEMPTS: u32 = 8;
+
+    /// Create a durable schema-history backend stored at `path`.
+    pub async fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        // Directory creation, the initial read and the lease acquisition are all
+        // synchronous filesystem calls; running them inline would block the caller's
+        // executor thread. See `persist_store` for why that matters on the write path.
+        let (schemas, lease) = on_blocking_worker(move || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let schemas = if path.exists() {
+                Self::load_store(&path)?
+            } else {
+                HashMap::new()
+            };
+
+            let lease_path = path.with_extension(
+                path.extension()
+                    .map(|ext| format!("{}.owner", ext.to_string_lossy()))
+                    .unwrap_or_else(|| "owner".into()),
+            );
+            let lease = owner_lease::acquire(&lease_path, "schema_history")?;
+            Ok((schemas, (path, lease)))
+        })
+        .await?;
+        let (path, lease) = lease;
+
+        Ok(Self {
+            path: Arc::new(path),
+            file_mode: Self::DEFAULT_FILE_MODE,
+            schemas: Arc::new(RwLock::new(schemas)),
+            _lease: Arc::new(Mutex::new(Some(lease))),
+        })
+    }
+
+    /// Confirm this process still owns the store file before rewriting it.
+    fn verify_lease_still_held(&self) -> Result<()> {
+        let lease = self._lease.lock().map_err(|_| {
+            Error::StateError("schema_history owner lease lock poisoned during verification".into())
+        })?;
+
+        match lease.as_ref() {
+            Some(lease) => lease.verify_still_held("schema_history"),
+            None => Err(Error::StateError(
+                "schema_history owner lease is not held; refusing to write".into(),
+            )),
+        }
+    }
+
+    fn load_store(path: &Path) -> Result<SchemaStore> {
+        let bytes = fs::read(path)?;
+        if bytes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let state: FileSchemaHistoryState = serde_json::from_slice(&bytes).map_err(|error| {
+            Error::SerializationError(format!(
+                "failed to parse schema history file '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+        Ok(state.schemas)
+    }
+
+    /// Serialize the store and rewrite the file atomically, off the async executor.
+    ///
+    /// The write is `create_new` + `write_all` + `fsync` + `rename` + directory `fsync`.
+    /// Two of those are unbounded on a slow or networked filesystem, and this crate runs
+    /// inside the caller's Tokio runtime — holding a worker thread through an `fsync`
+    /// stalls every other task scheduled on it, and wedges a current-thread runtime
+    /// outright.
+    async fn persist_store(&self, store: &SchemaStore) -> Result<()> {
+        let state = FileSchemaHistoryState {
+            schemas: store.clone(),
+        };
+
+        let bytes = serde_json::to_vec_pretty(&state).map_err(|error| {
+            Error::SerializationError(format!(
+                "failed to serialize schema history for '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+
+        let handle = self.clone();
+        on_blocking_worker(move || handle.persist_bytes_blocking(&bytes)).await
+    }
+
+    fn persist_bytes_blocking(&self, bytes: &[u8]) -> Result<()> {
+        // Fence the write: ownership acquired at construction is not ownership now.
+        // This rewrites the *whole* file from this instance's in-memory state, so a
+        // second writer does not merge with it — it erases it.
+        self.verify_lease_still_held()?;
+
+        let (tmp_path, mut file) = self.create_temp_file()?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&tmp_path, self.path.as_path())?;
+
+        crate::core::durability::fsync_parent_directory(self.path.as_path())?;
+
+        Ok(())
+    }
+
+    fn create_temp_file(&self) -> Result<(PathBuf, fs::File)> {
+        for _ in 0..Self::TEMP_FILE_ATTEMPTS {
+            let tmp_path = Self::temp_path(self.path.as_path());
+            let file_result = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path);
+
+            match file_result {
+                Ok(file) => {
+                    self.apply_file_mode(&file)?;
+                    return Ok((tmp_path, file));
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(Error::SchemaError(format!(
+            "failed to create unique schema history temp file after {} attempts",
+            Self::TEMP_FILE_ATTEMPTS
+        )))
+    }
+
+    /// Apply `file_mode` to a freshly created file.
+    ///
+    /// A no-op off Unix: `file_mode` is a POSIX permission bitmask and Windows has no
+    /// equivalent to narrow. The parameter is `cfg`-renamed rather than prefixed with an
+    /// underscore so the Unix signature keeps its real name.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn apply_file_mode(&self, file: &fs::File) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(fs::Permissions::from_mode(self.file_mode))?;
+        }
+
+        Ok(())
+    }
+
+    fn temp_path(path: &Path) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        let mut tmp = path.to_path_buf();
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("json");
+        tmp.set_extension(format!("{ext}.{stamp}.tmp"));
+        tmp
+    }
+}
+
+#[async_trait]
+impl SchemaHistory for InMemorySchemaHistory {
+    async fn record_ddl(&mut self, ddl_id: &str, ddl: DDLEvent) -> Result<u32> {
+        tracing::warn!(
+            target: "rustcdc::schema_history",
+            "InMemorySchemaHistory::record_ddl called — schema history state is held in memory \
+             and will be lost on process restart. Use FileSchemaHistory for production deployments."
+        );
+        let mut store = self.schemas.write().await;
+        record_ddl_in_store(&mut store, ddl_id, ddl, current_time())
+    }
+
+    async fn get_schema_at_version(
+        &self,
+        table: &str,
+        version: u32,
+    ) -> Result<Option<TableSchema>> {
+        let store = self.schemas.read().await;
+        Ok(schema_at_version(&store, table, version))
+    }
+
+    async fn get_schema_at_timestamp(&self, table: &str, ts: u64) -> Result<Option<TableSchema>> {
+        let store = self.schemas.read().await;
+        Ok(schema_at_timestamp(&store, table, ts))
+    }
+
+    async fn latest_schema(&self, table: &str) -> Result<Option<TableSchema>> {
+        let store = self.schemas.read().await;
+        Ok(latest_schema_for_table(&store, table))
+    }
+
+    async fn apply_retention(&mut self, retention: SchemaHistoryRetention) -> Result<usize> {
+        let mut store = self.schemas.write().await;
+        Ok(apply_store_retention(&mut store, retention))
+    }
+}
+
+#[async_trait]
+impl SchemaHistory for FileSchemaHistory {
+    async fn record_ddl(&mut self, ddl_id: &str, ddl: DDLEvent) -> Result<u32> {
+        let mut store = self.schemas.write().await;
+        let entries_before = store.values().map(Vec::len).sum::<usize>();
+        let version = record_ddl_in_store(&mut store, ddl_id, ddl, current_time())?;
+        // A recognised replay changed nothing, so there is nothing to make durable —
+        // and rewriting the whole file plus two `fsync`s per redelivered DDL is not a
+        // cost worth paying for a no-op.
+        if store.values().map(Vec::len).sum::<usize>() != entries_before {
+            self.persist_store(&store).await?;
+        }
+        Ok(version)
+    }
+
+    async fn get_schema_at_version(
+        &self,
+        table: &str,
+        version: u32,
+    ) -> Result<Option<TableSchema>> {
+        let store = self.schemas.read().await;
+        Ok(schema_at_version(&store, table, version))
+    }
+
+    async fn get_schema_at_timestamp(&self, table: &str, ts: u64) -> Result<Option<TableSchema>> {
+        let store = self.schemas.read().await;
+        Ok(schema_at_timestamp(&store, table, ts))
+    }
+
+    async fn latest_schema(&self, table: &str) -> Result<Option<TableSchema>> {
+        let store = self.schemas.read().await;
+        Ok(latest_schema_for_table(&store, table))
+    }
+
+    async fn apply_retention(&mut self, retention: SchemaHistoryRetention) -> Result<usize> {
+        let mut store = self.schemas.write().await;
+        let removed = apply_store_retention(&mut store, retention);
+        if removed > 0 {
+            self.persist_store(&store).await?;
+        }
+        Ok(removed)
+    }
+}
+
+fn apply_schema_diff(schema: &mut TableSchema, diff: &SchemaDiff) -> Result<()> {
+    for operation in &diff.operations {
+        match operation {
+            SchemaDiffOperation::AddColumn { column } => {
+                if schema
+                    .columns
+                    .iter()
+                    .any(|existing| existing.name == column.name)
+                {
+                    return Err(Error::SchemaError(format!(
+                        "cannot apply ALTER TABLE diff: column '{}' already exists on {}.{}",
+                        column.name, schema.schema, schema.table
+                    )));
+                }
+
+                schema.columns.push(column.clone());
+
+                if column
+                    .constraints
+                    .iter()
+                    .any(|constraint| constraint.eq_ignore_ascii_case("primary_key"))
+                    && !schema.primary_keys.iter().any(|key| key == &column.name)
+                {
+                    schema.primary_keys.push(column.name.clone());
+                }
+            }
+            SchemaDiffOperation::DropColumn { name } => {
+                if !schema.columns.iter().any(|column| column.name == *name) {
+                    return Err(Error::SchemaError(format!(
+                        "cannot apply ALTER TABLE diff: column '{}' does not exist on {}.{}",
+                        name, schema.schema, schema.table
+                    )));
+                }
+                schema.columns.retain(|column| column.name != *name);
+                schema.primary_keys.retain(|key| key != name);
+            }
+            SchemaDiffOperation::RenameColumn { from, to } => {
+                if schema.columns.iter().any(|column| column.name == *to) {
+                    return Err(Error::SchemaError(format!(
+                        "cannot apply ALTER TABLE diff: rename target '{}' already exists on {}.{}",
+                        to, schema.schema, schema.table
+                    )));
+                }
+
+                let Some(column) = schema
+                    .columns
+                    .iter_mut()
+                    .find(|column| column.name == *from)
+                else {
+                    return Err(Error::SchemaError(format!(
+                        "cannot apply ALTER TABLE diff: source column '{}' does not exist on {}.{}",
+                        from, schema.schema, schema.table
+                    )));
+                };
+
+                column.name = to.clone();
+                for key in &mut schema.primary_keys {
+                    if key == from {
+                        *key = to.clone();
+                    }
+                }
+            }
+            SchemaDiffOperation::Unsupported { clause } => {
+                return Err(Error::SchemaError(format!(
+                    "cannot apply ALTER TABLE diff with unsupported clause '{}' on {}.{}",
+                    clause, schema.schema, schema.table
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks events against the recorded schema history.
+///
+/// Catches the case where a consumer would observe a row shape the history has no entry
+/// for — which means either the DDL was missed or the history was written after the event
+/// it describes, and either way a downstream schema-aware consumer will fail on it.
+pub struct SchemaValidator<H> {
+    history: Arc<H>,
+}
+
+impl<H> SchemaValidator<H>
+where
+    H: SchemaHistory + 'static,
+{
+    /// Build a validator over a shared schema history.
+    pub fn new(history: Arc<H>) -> Self {
+        Self { history }
+    }
+
+    /// Check an event against the recorded history for its table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SchemaError`] when the event's
+    /// shape has no corresponding history entry — meaning either the DDL was never
+    /// captured or the history was written after the event that describes it. A
+    /// schema-aware downstream consumer would fail on such an event later and further
+    /// from the cause.
+    pub async fn validate_event(
+        &self,
+        event: &Event,
+    ) -> std::result::Result<(), Vec<ValidationError>> {
+        let schema_name = event.schema.clone().unwrap_or_else(|| "public".into());
+        let key = table_key(&schema_name, &event.table);
+        let Some(table_schema) = self.history.latest_schema(&key).await.map_err(|error| {
+            vec![ValidationError {
+                field: "schema".into(),
+                message: error.to_string(),
+            }]
+        })?
+        else {
+            return Err(vec![ValidationError {
+                field: "schema".into(),
+                message: format!("no schema registered for {key}"),
+            }]);
+        };
+
+        let mut errors = Vec::new();
+        for (field_name, payload) in [
+            ("before", event.before.row()),
+            ("after", event.after.as_ref()),
+        ] {
+            if let Some(serde_json::Value::Object(object)) = payload {
+                for column in &table_schema.columns {
+                    match object.get(&column.name) {
+                        Some(value) => {
+                            if value.is_null() && !column.nullable {
+                                errors.push(ValidationError {
+                                    field: format!("{field_name}.{}", column.name),
+                                    message: "non-nullable column contains null".into(),
+                                });
+                            } else if !value.is_null() && !matches_type(value, &column.data_type) {
+                                errors.push(ValidationError {
+                                    field: format!("{field_name}.{}", column.name),
+                                    message: format!(
+                                        "value does not match declared type {}",
+                                        column.data_type
+                                    ),
+                                });
+                            }
+                        }
+                        None if !column.nullable => errors.push(ValidationError {
+                            field: format!("{field_name}.{}", column.name),
+                            message: "required column missing from payload".into(),
+                        }),
+                        None => {}
+                    }
+                }
+
+                for unknown in object.keys().filter(|key| {
+                    !table_schema
+                        .columns
+                        .iter()
+                        .any(|column| column.name == **key)
+                }) {
+                    errors.push(ValidationError {
+                        field: format!("{field_name}.{unknown}"),
+                        message: "column not present in schema".into(),
+                    });
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+fn matches_type(value: &serde_json::Value, data_type: &str) -> bool {
+    let normalized = data_type.to_ascii_lowercase();
+    if normalized.contains("json") {
+        return true;
+    }
+    if normalized.contains("bool") {
+        return value.is_boolean();
+    }
+    if normalized.contains("int")
+        || normalized.contains("numeric")
+        || normalized.contains("decimal")
+        || normalized.contains("float")
+    {
+        return value.is_number();
+    }
+    if normalized.contains("char")
+        || normalized.contains("text")
+        || normalized.contains("string")
+        || normalized.contains("uuid")
+    {
+        return value.is_string();
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::BeforeImage;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use crate::core::{EVENT_ENVELOPE_VERSION, Error, Event, Operation, SourceMetadata};
+    use crate::ddl_capture::{SchemaDiff, SchemaDiffOperation};
+
+    use super::{
+        ColumnDef, DDLEvent, FileSchemaHistory, InMemorySchemaHistory, SchemaHistory,
+        SchemaHistoryRetention, SchemaValidator, TableSchema,
+    };
+    use tempfile::tempdir;
+
+    fn schema() -> TableSchema {
+        TableSchema {
+            schema: "public".into(),
+            table: "users".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: "integer".into(),
+                    nullable: false,
+                    constraints: vec!["primary_key".into()],
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    data_type: "text".into(),
+                    nullable: false,
+                    constraints: Vec::new(),
+                },
+                ColumnDef {
+                    name: "nickname".into(),
+                    data_type: "text".into(),
+                    nullable: true,
+                    constraints: Vec::new(),
+                },
+            ],
+            primary_keys: vec!["id".into()],
+            version: 0,
+        }
+    }
+
+    fn event(after: serde_json::Value) -> Event {
+        Event {
+            before: BeforeImage::Unavailable,
+            after: Some(after),
+            op: Operation::Insert,
+            source: SourceMetadata {
+                source_name: "test".into(),
+                offset: "1".into(),
+                timestamp: 1,
+            },
+            ts: 1,
+            schema: Some("public".into()),
+            table: "users".into(),
+            primary_key: Some(vec!["id".into()]),
+            snapshot: None,
+            transaction: None,
+            envelope_version: EVENT_ENVELOPE_VERSION,
+            unavailable_columns: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_history_round_trip() {
+        let mut history = InMemorySchemaHistory::default();
+        let version = history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+        assert_eq!(version, 1);
+        let loaded = history
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.table, "users");
+    }
+
+    #[tokio::test]
+    async fn validator_detects_unknown_and_missing_columns() {
+        let mut history = InMemorySchemaHistory::default();
+        history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+        let validator = SchemaValidator::new(Arc::new(history));
+
+        let errors = validator
+            .validate_event(&event(json!({"id": 1, "extra": true})))
+            .await
+            .unwrap_err();
+        assert!(errors.iter().any(|error| error.field.ends_with("name")));
+        assert!(errors.iter().any(|error| error.field.ends_with("extra")));
+    }
+
+    #[tokio::test]
+    async fn validator_accepts_nullable_missing_column() {
+        let mut history = InMemorySchemaHistory::default();
+        history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+        let validator = SchemaValidator::new(Arc::new(history));
+        assert!(
+            validator
+                .validate_event(&event(json!({"id": 1, "name": "alice"})))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_history_tracks_version_and_timestamp_semantics() {
+        let mut history = InMemorySchemaHistory::default();
+        let mut schema = schema();
+
+        assert_eq!(
+            history
+                .record_ddl("", DDLEvent::CreateTable(schema.clone()))
+                .await
+                .unwrap(),
+            1
+        );
+
+        schema.columns.push(ColumnDef {
+            name: "email".into(),
+            data_type: "text".into(),
+            nullable: true,
+            constraints: Vec::new(),
+        });
+        assert_eq!(
+            history
+                .record_ddl("", DDLEvent::AlterTable(schema.clone()))
+                .await
+                .unwrap(),
+            2
+        );
+
+        let loaded = history
+            .get_schema_at_version("public.users", 2)
+            .await
+            .unwrap()
+            .expect("version 2 schema should exist");
+        assert_eq!(loaded.version, 2);
+        assert!(loaded.columns.iter().any(|column| column.name == "email"));
+
+        assert!(
+            history
+                .get_schema_at_timestamp("public.users", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            history
+                .record_ddl(
+                    "",
+                    DDLEvent::DropTable {
+                        schema: "public".into(),
+                        table: "users".into(),
+                    }
+                )
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(
+            history
+                .latest_schema("public.users")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_alter_diff_returns_the_version_it_already_got() {
+        // The wedge this exists to prevent: delivery is at-least-once, so a crash
+        // between recording a DDL and committing the checkpoint replays it on restart.
+        // Re-applying `ADD COLUMN` to a schema that already has the column returns
+        // `SchemaError`, which failed the poll — and failed identically on every
+        // subsequent restart, because the same event replays from the same checkpoint.
+        let mut history = InMemorySchemaHistory::default();
+        history
+            .record_ddl("0/100", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+
+        let diff = || DDLEvent::AlterTableDiff {
+            schema: "public".into(),
+            table: "users".into(),
+            diff: SchemaDiff {
+                operations: vec![SchemaDiffOperation::AddColumn {
+                    column: ColumnDef {
+                        name: "email".into(),
+                        data_type: "text".into(),
+                        nullable: true,
+                        constraints: Vec::new(),
+                    },
+                }],
+            },
+        };
+
+        let first = history.record_ddl("0/200", diff()).await.unwrap();
+        let replay = history
+            .record_ddl("0/200", diff())
+            .await
+            .expect("a replayed DDL must not be an error");
+        assert_eq!(
+            first, replay,
+            "a replay must return the version already assigned, not append a second one",
+        );
+
+        let latest = history
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("schema recorded");
+        assert_eq!(
+            latest.columns.iter().filter(|c| c.name == "email").count(),
+            1,
+            "the replay must not have applied the diff twice",
+        );
+        assert_eq!(latest.version, first);
+    }
+
+    #[tokio::test]
+    async fn two_distinct_ddls_on_one_table_still_produce_two_versions() {
+        // The other half: identity-based suppression must not collapse genuinely
+        // different statements.
+        let mut history = InMemorySchemaHistory::default();
+        let first = history
+            .record_ddl("0/100", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+        let second = history
+            .record_ddl("0/200", DDLEvent::AlterTable(schema()))
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn alter_table_diff_applies_incremental_schema_changes() {
+        let mut history = InMemorySchemaHistory::default();
+        history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+
+        let version = history
+            .record_ddl(
+                "",
+                DDLEvent::AlterTableDiff {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    diff: SchemaDiff {
+                        operations: vec![
+                            SchemaDiffOperation::AddColumn {
+                                column: ColumnDef {
+                                    name: "email".into(),
+                                    data_type: "text".into(),
+                                    nullable: true,
+                                    constraints: Vec::new(),
+                                },
+                            },
+                            SchemaDiffOperation::RenameColumn {
+                                from: "name".into(),
+                                to: "full_name".into(),
+                            },
+                            SchemaDiffOperation::DropColumn {
+                                name: "nickname".into(),
+                            },
+                        ],
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(version, 2);
+
+        let loaded = history
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("schema should still exist after alter diff");
+        assert_eq!(loaded.version, 2);
+        assert!(loaded.columns.iter().any(|column| column.name == "email"));
+        assert!(
+            loaded
+                .columns
+                .iter()
+                .any(|column| column.name == "full_name")
+        );
+        assert!(
+            !loaded
+                .columns
+                .iter()
+                .any(|column| column.name == "nickname")
+        );
+    }
+
+    #[tokio::test]
+    async fn alter_table_diff_rejects_unsupported_clause_without_mutating_history() {
+        let mut history = InMemorySchemaHistory::default();
+        history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+
+        let error = history
+            .record_ddl(
+                "",
+                DDLEvent::AlterTableDiff {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    diff: SchemaDiff {
+                        operations: vec![SchemaDiffOperation::Unsupported {
+                            clause: "REPLICA IDENTITY FULL".into(),
+                        }],
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported clause 'REPLICA IDENTITY FULL'")
+        );
+
+        let loaded = history
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("schema should remain at the previous version");
+        assert_eq!(loaded.version, 1);
+        assert!(loaded.columns.iter().any(|column| column.name == "name"));
+    }
+
+    #[tokio::test]
+    async fn alter_table_diff_rejects_invalid_column_operations() {
+        let mut history = InMemorySchemaHistory::default();
+        history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+
+        let error = history
+            .record_ddl(
+                "",
+                DDLEvent::AlterTableDiff {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    diff: SchemaDiff {
+                        operations: vec![SchemaDiffOperation::RenameColumn {
+                            from: "missing".into(),
+                            to: "display_name".into(),
+                        }],
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("source column 'missing' does not exist")
+        );
+
+        let loaded = history
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("schema should remain unchanged after invalid alter diff");
+        assert_eq!(loaded.version, 1);
+        assert!(loaded.columns.iter().any(|column| column.name == "name"));
+    }
+
+    #[tokio::test]
+    async fn a_ddl_replayed_after_a_restart_is_recognised_from_the_file() {
+        // The identity has to survive the serde round trip, or the wedge comes back the
+        // moment the process that recorded the DDL is the one that restarted.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("schema-history.json");
+
+        let diff = || DDLEvent::AlterTableDiff {
+            schema: "public".into(),
+            table: "users".into(),
+            diff: SchemaDiff {
+                operations: vec![SchemaDiffOperation::AddColumn {
+                    column: ColumnDef {
+                        name: "email".into(),
+                        data_type: "text".into(),
+                        nullable: true,
+                        constraints: Vec::new(),
+                    },
+                }],
+            },
+        };
+
+        let mut history = FileSchemaHistory::new(&path).await.unwrap();
+        history
+            .record_ddl("0/100", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+        let version = history.record_ddl("0/200", diff()).await.unwrap();
+        drop(history);
+
+        let mut restarted = FileSchemaHistory::new(&path).await.unwrap();
+        let replay = restarted
+            .record_ddl("0/200", diff())
+            .await
+            .expect("a DDL replayed after a restart must not wedge the pipeline");
+        assert_eq!(version, replay);
+
+        let latest = restarted
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("schema persisted");
+        assert_eq!(
+            latest.columns.iter().filter(|c| c.name == "email").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn file_schema_history_persists_and_reloads_versions() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("schema-history.json");
+
+        let mut history = FileSchemaHistory::new(&path).await.unwrap();
+        history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+
+        let mut altered = schema();
+        altered.columns.push(ColumnDef {
+            name: "email".into(),
+            data_type: "text".into(),
+            nullable: true,
+            constraints: Vec::new(),
+        });
+        history
+            .record_ddl("", DDLEvent::AlterTable(altered))
+            .await
+            .unwrap();
+
+        // Release the writer before reopening: one instance per store file is the
+        // enforced contract, and this is simulating a restart.
+        drop(history);
+        let reloaded = FileSchemaHistory::new(&path).await.unwrap();
+        let latest = reloaded
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("schema should be persisted and reloaded");
+
+        assert_eq!(latest.version, 2);
+        assert!(latest.columns.iter().any(|column| column.name == "email"));
+    }
+
+    #[tokio::test]
+    async fn file_schema_history_rejects_corrupt_payload() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("schema-history.json");
+        std::fs::write(&path, b"{not-json").unwrap();
+
+        let error = FileSchemaHistory::new(&path).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse schema history file")
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_schema_history_applies_retention_per_table() {
+        let mut history = InMemorySchemaHistory::default();
+        let mut v1 = schema();
+        history
+            .record_ddl("", DDLEvent::CreateTable(v1.clone()))
+            .await
+            .unwrap();
+
+        v1.columns.push(ColumnDef {
+            name: "email".into(),
+            data_type: "text".into(),
+            nullable: true,
+            constraints: Vec::new(),
+        });
+        history
+            .record_ddl("", DDLEvent::AlterTable(v1))
+            .await
+            .unwrap();
+
+        let mut v3 = schema();
+        v3.columns.push(ColumnDef {
+            name: "phone".into(),
+            data_type: "text".into(),
+            nullable: true,
+            constraints: Vec::new(),
+        });
+        history
+            .record_ddl("", DDLEvent::AlterTable(v3))
+            .await
+            .unwrap();
+
+        let removed = history
+            .apply_retention(SchemaHistoryRetention::keep_last(2).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        assert!(
+            history
+                .get_schema_at_version("public.users", 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            history
+                .get_schema_at_version("public.users", 2)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            history
+                .latest_schema("public.users")
+                .await
+                .unwrap()
+                .expect("latest schema should exist")
+                .version,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn file_schema_history_retention_persists_after_reload() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("schema-history.json");
+
+        let mut history = FileSchemaHistory::new(&path).await.unwrap();
+        history
+            .record_ddl("", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+
+        let mut altered = schema();
+        altered.columns.push(ColumnDef {
+            name: "email".into(),
+            data_type: "text".into(),
+            nullable: true,
+            constraints: Vec::new(),
+        });
+        history
+            .record_ddl("", DDLEvent::AlterTable(altered))
+            .await
+            .unwrap();
+
+        let mut altered_again = schema();
+        altered_again.columns.push(ColumnDef {
+            name: "phone".into(),
+            data_type: "text".into(),
+            nullable: true,
+            constraints: Vec::new(),
+        });
+        history
+            .record_ddl("", DDLEvent::AlterTable(altered_again))
+            .await
+            .unwrap();
+
+        let removed = history
+            .apply_retention(SchemaHistoryRetention::keep_last(1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+
+        drop(history);
+        let reloaded = FileSchemaHistory::new(&path).await.unwrap();
+        assert!(
+            reloaded
+                .get_schema_at_version("public.users", 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reloaded
+                .get_schema_at_version("public.users", 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reloaded
+                .latest_schema("public.users")
+                .await
+                .unwrap()
+                .expect("latest schema should remain after retention")
+                .version,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_history_retention_rejects_zero_limit() {
+        let error = SchemaHistoryRetention::keep_last(0).unwrap_err();
+        assert!(matches!(error, Error::ConfigError(_)));
+    }
+}

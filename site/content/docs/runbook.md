@@ -1,1035 +1,503 @@
 +++
-title = "Operations runbook"
-description = "Alert thresholds, disaster recovery, secret rotation and per-connector maintenance for rustcdc."
-weight = 100
+title = "Runbook"
+description = "Incident procedures for rustcdc: replication slot growth, checkpoint corruption, quarantined events, lease conflicts, disaster recovery, upgrade and rollback."
+weight = 70
 +++
 
-**Audience:** Platform operators and SREs managing rustcdc in production  
-**Version:** Current  
-**Last Updated:** May 25, 2026
+Operational procedures for rustcdc. Written to be usable at 3 a.m. by someone who did
+not build it.
 
----
+Each entry states the **symptom** you will actually see, what it means, and what to do.
+Diagnosis first, action second, and where an action loses data it says so in the step
+rather than in a footnote.
 
-## Table of Contents
-
-1. [PostgreSQL Source Management](#postgresql-source-management)
-2. [MySQL Source Management](#mysql-source-management)
-3. [SQL Server Source Management](#sql-server-source-management)
-4. [Metric Alerting and Monitoring](#metric-alerting-and-monitoring)
-5. [Troubleshooting Common Failures](#troubleshooting-common-failures)
-6. [Secret Rotation](#secret-rotation)
-7. [Disaster Recovery](#disaster-recovery)
-
----
-
-## Integration Scaffolding Assumptions
-
-This runbook assumes rustcdc is embedded into an application/runtime wrapper that provides:
-
-- A service manager command for start/stop/restart (examples use `systemctl`)
-- A metrics endpoint path and port (examples use `http://localhost:9090/metrics`)
-- A deployment-specific checkpoint storage path (examples use `/var/rustcdc/...`)
-
-Replace these placeholders with your environment equivalents:
-
-- Service manager: `systemctl` or `docker compose` or Kubernetes rollout/exec commands
-- Metrics endpoint: your runtime/admin endpoint bound by the embedder
-- Checkpoint path: your configured persistent volume or mount path
-
-If your deployment does not provide these wrappers, see [Deployment](@/docs/deployment.md) first and wire health/metrics/service controls before applying this runbook verbatim.
-
-> **rustcdc ships no binary.** There is no `[[bin]]` target and no `src/main.rs`; `systemctl stop
-> rustcdc` and `curl localhost:9090/metrics` refer to **your** wrapper, not to anything this crate
-> installs. In particular:
->
-> - **Nothing flushes on SIGTERM unless you implement it.** Graceful drain is
->   `CdcRuntime::drain_and_stop()` — which returns the drained events and commits them, so **you
->   must consume the returned `Vec<Event>`**; dropping it is unrecoverable data loss. Use
->   `stop()` (refuses while events are uncommitted) or `force_stop()` (discards explicitly, returns
->   them for replay) if you do not intend to process them.
-> - **No HTTP server is provided.** The crate exposes `admin_snapshot_json()` and a Prometheus text
->   *renderer*; binding a port is the embedder's job.
-> - **Restart does not drain automatically.** Any "will drain pending events before restart"
->   behaviour is a property of your supervisor.
-
----
-
-## PostgreSQL Source Management
-
-> **The default WAL transport holds the replication slot.** `WalTransport::StreamingReplication`
-> keeps a walsender attached for the life of the stream, and PostgreSQL refuses
-> `pg_replication_slot_advance` and `pg_drop_replication_slot` on an active slot
-> (`SQLSTATE 55006`, *"replication slot is active for PID N"*). Every slot procedure below
-> therefore stops the pipeline first — that ordering is load-bearing, not tidiness. The server
-> reaps the walsender a moment after the socket closes, so retry briefly if the first attempt
-> still reports the slot active. `SELECT slot_name, active, active_pid FROM
-> pg_replication_slots;` shows the holder.
->
-> The connecting role also needs the **`REPLICATION`** attribute and a direct connection; a
-> pooler in transaction-pooling mode cannot carry a replication stream. Where neither can be
-> arranged, `WalTransport::SqlPeek` reads the same slot over an ordinary connection — see
-> [`wal_transport`](@/docs/config-reference.md#wal-transport) for what that costs.
+> **One rule above all others.** Never hand-edit a checkpoint file. It carries a
+> `content_checksum` and the runtime refuses to start on a mismatch — by design. A
+> checkpoint that parses but is wrong resumes capture from the wrong position and skips
+> events with no error anywhere.
 
 
-### Replication Slot Setup
+## 1. First response
 
-**Prerequisites:**
-- PostgreSQL 10+ (recommended 16+)
-- Logical replication enabled: `wal_level = logical` in postgresql.conf
-- Sufficient WAL retention (at least 1GB, preferably 10GB+)
-
-**Initial Setup:**
+Three commands, in this order. They separate "the process is unhealthy" from "the
+process is fine and the data is not".
 
 ```bash
-# On PostgreSQL server
-CREATE ROLE cdc_user WITH LOGIN REPLICATION PASSWORD '<provision-from-secret-manager>';
-GRANT CONNECT ON DATABASE your_database TO cdc_user;
-GRANT USAGE ON SCHEMA public TO cdc_user;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO cdc_user;
+# 1. Is it alive and does it think it is healthy?
+curl -sk https://<host>:8080/livez        # 200 = running, 503 = Error/degraded
+
+# 2. What does it think is wrong? (needs the read token)
+curl -sk -H "Authorization: Bearer $READ_TOKEN" https://<host>:8080/status | jq '{
+  state, last_terminal_reason_code, checkpoint_age_seconds, slo
+}'
+
+# 3. What do the numbers say?
+curl -sk -H "Authorization: Bearer $READ_TOKEN" https://<host>:8080/metrics \
+  | grep -E 'rustcdc_(runtime_health|slo_checkpoint_age_seconds|dlq_events_total|source_consecutive_poll_errors)'
 ```
 
-**rustcdc Connector Fields (PostgreSQL):**
+`rustcdc_runtime_health` is a one-hot gauge — exactly one `verdict` label is `1`:
 
-- `host`, `port`, `user`, `password`, `database`
-- `replication_slot_name`, `publication_name`
-- `conn_timeout_secs`
-- `stream_poll_interval_ms` (poll cadence; lower for latency, higher for throughput batching)
-- `max_events_per_poll` (per-poll event budget)
-- transport selection: `transport = TransportConfig::tls()` (default with `tls` feature) or `TransportConfig::tls_with_ca_cert_path(...)`
-
-### Replication Slot Lifecycle
-
-**Creation:**
-- rustcdc automatically creates a replication slot on first `start_stream()` call
-- Slot name: taken from `PostgresSourceConfig.replication_slot_name`
-- Slot is logical replication type (pgoutput plugin)
-
-**Monitoring Slot Health:**
-
-```sql
--- Check slot status
-SELECT slot_name, slot_type, active, restart_lsn, confirmed_flush_lsn 
-FROM pg_replication_slots;
-
--- Check lag in bytes
-SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS lag_bytes
-FROM pg_replication_slots WHERE slot_name = 'your_slot_name';
-```
-
-### Replication Slot Divergence Recovery
-
-**Symptom:** Error message similar to:
-```text
-ERROR: source error: postgres checkpoint/slot divergence for slot '...'
-```
-
-**Root Causes:**
-1. **Slot was dropped manually** → Operator accidentally dropped the slot
-2. **WAL was pruned** → checkpoint_lsn is older than current oldest WAL available
-3. **Slot became inactive** → rustcdc didn't consume for >24 hours (typical WAL retention)
-
-**Recovery Steps:**
-
-**Option A: Manual Slot Recovery (Recommended)**
-
-```bash
-# 1. Stop rustcdc instance gracefully
-systemctl stop rustcdc
-# or send SIGTERM to the process
-
-# 2. Verify checkpoint is readable
-cat /var/rustcdc/checkpoint_postgres.json
-# Should be valid JSON and contain postgres offset state
-
-# If the checkpoint/slot alignment no longer matches, reset the pair together
-# instead of forcing a resume attempt.
-
-# 3. Check current WAL position on PostgreSQL
-psql -U cdc_user -d your_database -c "SELECT pg_current_wal_lsn();"
-
-# 4. If checkpoint LSN is older than current WAL minus retention:
-#    a) Create a replacement checkpoint using the runtime file format envelope:
-CURRENT_LSN_HEX=$(psql -U cdc_user -d your_database -Atc "
-SELECT
-  (('x' || split_part(pg_current_wal_lsn()::text, '/', 1))::bit(32)::bigint * 4294967296) +
-  (('x' || split_part(pg_current_wal_lsn()::text, '/', 2))::bit(32)::bigint);
-")
-
-#    Seed a replacement checkpoint. Checkpoint files carry an integrity checksum, so
-#    they cannot be written correctly by hand — use the bundled tool, which also writes
-#    atomically, applies the required 0600 mode, and fsyncs the directory.
-#
-#    Do this only while the connector is STOPPED. Seeding a position AHEAD of what was
-#    actually delivered downstream skips every event in between, permanently. When in
-#    doubt seed behind: the delivery contract is at-least-once, so downstream must
-#    already tolerate duplicates.
-cargo run --example seed_checkpoint --features postgres -- \
-  --dir /var/rustcdc \
-  --source-type postgres \
-  --committed-event-count 0 \
-  --offset "{\"lsn\": $CURRENT_LSN_HEX, \"slot_name\": \"rustcdc_postgres_new\"}"
-
-# Confirm the runtime will accept it before restarting the service. A checkpoint that
-# fails its integrity check is rejected at load, so verify now rather than at startup.
-jq -e '.checkpoint_format_version == 1 and .content_checksum != null' \
-  /var/rustcdc/checkpoint_postgres.json
-
-#    b) Optionally create new replication slot on PostgreSQL
-psql -U cdc_user -d your_database -c "SELECT * FROM pg_create_logical_replication_slot('rustcdc_postgres_new', 'pgoutput');"
-
-# 5. Restart rustcdc
-systemctl start rustcdc
-
-# 6. Verify slot is active and consuming
-psql -U cdc_user -d your_database -c "SELECT slot_name, active, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'rustcdc_postgres_new';"
-```
-
-**Option B: Force Reset (Data Loss Risk)**
-
-⚠️ **WARNING:** This discards uncommitted events and may cause data loss if not coordinated with downstream systems.
-
-Before executing force reset, record and confirm this checklist in the incident/change ticket:
-
-- Change ticket created (for example `INC-12345`) with operator + reviewer names.
-- Current checkpoint/offset snapshot archived.
-- Downstream consumers paused or explicitly verified dedup-safe.
-- Replication-slot/binlog retention and catch-up impact reviewed.
-- Rollback plan prepared and on-call ownership confirmed.
-
-```bash
-# 1. Stop rustcdc
-systemctl stop rustcdc
-
-# 2. Drop old slot
-psql -U cdc_user -d your_database -c "SELECT pg_drop_replication_slot('rustcdc_postgres_old');"
-
-# 3. Delete ALL checkpoint files for this source family to force a fresh start.
-#    Deleting only `checkpoint_postgres.json` leaves `checkpoint_postgres_snapshot.json`
-#    behind, and `load()` picks the record with the highest committed count across the
-#    directory — so the snapshot checkpoint is resumed and the outcome is not "fresh".
-rm -f /var/rustcdc/checkpoint_postgres.json \
-      /var/rustcdc/checkpoint_postgres_snapshot.json
-
-# 4. Restart rustcdc (will start fresh from current WAL position)
-systemctl start rustcdc
-```
-
-### Preventive Maintenance
-
-**Daily Checks:**
-
-```bash
-#!/bin/bash
-# Check runtime lag every hour (milliseconds)
-LAG_MS=$(curl -s http://localhost:9090/metrics | awk '/^rustcdc_runtime_replication_lag_ms / {print $2; exit}')
-
-if [ -n "$LAG_MS" ] && [ "$LAG_MS" -gt 30000 ]; then  # 30 seconds
-  echo "WARNING: rustcdc replication lag exceeds 30s" | mail -s "rustcdc Alert" ops@company.com
-fi
-```
-
----
-
-## MySQL Source Management
-
-### Binlog Configuration
-
-**Prerequisites:**
-- MySQL 8.0+ (MariaDB 10.5+)
-- Binlog enabled: `log_bin = ON` in my.cnf
-- GTID enabled (recommended): `gtid_mode = ON`
-- Binlog retention: `binlog_expire_logs_auto_purge = 0` (manual management recommended)
-
-**Configuration (my.cnf):**
-
-```ini
-[mysqld]
-log_bin = /var/log/mysql/mysql-bin
-binlog_format = ROW
-gtid_mode = ON
-enforce_gtid_consistency = ON
-log_slave_updates = ON
-binlog_expire_logs_auto_purge = 0
-# Retention: Keep 7 days of binlogs (adjust per your needs)
-# FLUSH BINARY LOGS EVERY 24 HOURS via cron is recommended
-```
-
-**User Setup:**
-
-```sql
-CREATE USER 'cdc_user'@'%' IDENTIFIED BY '<provision-from-secret-manager>';
-GRANT SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'cdc_user'@'%';
-FLUSH PRIVILEGES;
-```
-
-**rustcdc Connector Fields (MySQL):**
-
-- `host`, `port`, `user`, `password`, `database`
-- `server_id`, `gtid_mode_enabled`, `binlog_format_check`
-- `conn_timeout_secs`
-- `stream_poll_interval_ms` (poll cadence; lower for latency, higher for throughput batching)
-- `max_events_per_poll` (per-poll event budget)
-- transport selection: `transport = TransportConfig::tls()` (default with `tls` feature) or `TransportConfig::tls_with_ca_cert_path(...)`
-
-### Binlog Retention Strategy
-
-**Recommended: Manual Cleanup with Monitoring**
-
-```bash
-#!/bin/bash
-# Run daily via cron
-MYSQL_USER="cdc_user"
-MYSQL_HOST="localhost"
-MYSQL_CLIENT_CNF="/etc/rustcdc/mysql-client.cnf"  # file contains credentials with 0600 perms
-
-# Get current replication position from rustcdc checkpoint wrapper
-CHECKPOINT=$(cat /var/rustcdc/checkpoint_mysql.json | jq -r '.offset.gtid')
-
-# Log checkpoint for audit
-echo "$(date): Current checkpoint: $CHECKPOINT" >> /var/log/rustcdc-binlog-retention.log
-
-# Purge binlogs older than 7 days, but preserve current GTID
-mysql --defaults-extra-file="$MYSQL_CLIENT_CNF" -h "$MYSQL_HOST" -u "$MYSQL_USER" -e "PURGE BINARY LOGS BEFORE DATE_SUB(NOW(), INTERVAL 7 DAY);"
-
-# Verify retention
-mysql --defaults-extra-file="$MYSQL_CLIENT_CNF" -h "$MYSQL_HOST" -u "$MYSQL_USER" -e "SHOW BINARY LOGS;" >> /var/log/rustcdc-binlog-retention.log
-```
-
-### GTID Mode Verification
-
-```sql
--- Check GTID status
-SHOW VARIABLES LIKE 'gtid_mode';
--- Should output: gtid_mode | ON
-
--- Check replication position (used by rustcdc)
-SHOW MASTER STATUS\G
--- Note: GTID set for checkpoint tracking
-```
-
-### MysqlOffset Resume Priority
-
-`MysqlOffset` tracks two parallel position fields: `gtid` (a GTID set string), and `binlog_file` + `binlog_pos` (a traditional file/position pair). Understanding which takes precedence on restart is important for recovery operations.
-
-**Resume order:**
-
-1. **GTID-mode servers** — When the server has `gtid_mode=ON` and the stored `gtid` field is non-empty, the connector resumes using the GTID set. This is the preferred path because GTID positions are server-globally unique and survive binlog rotation without ambiguity.
-
-2. **Non-GTID or empty GTID field** — When `gtid` is empty (GTID mode off, or a legacy checkpoint written before GTID support), the connector falls back to `binlog_file` + `binlog_pos`. This requires the named binlog file to still be present on the server (see [Binlog Retention Strategy](#binlog-retention-strategy)).
-
-**Operational implications:**
-
-- If you migrate a server from non-GTID to GTID mode, existing checkpoints will have an empty `gtid` field. The runtime will use the file/position fallback until at least one new checkpoint is written in GTID mode.
-- If binlog files have been purged and the checkpoint references a rotated-away file, restart will fail with a `SourceError` indicating the position is unavailable. Remedy: reset the checkpoint to an empty offset and trigger a fresh snapshot.
-- For cross-server failover (primary → replica promotion), GTID-mode checkpoints are portable; file/position checkpoints are not — they are specific to the binlog sequence of the original primary.
-
----
-
-## SQL Server Source Management
-
-### CDC Setup on SQL Server
-
-**Prerequisites:**
-- SQL Server 2016+ (2019 recommended)
-- SQL Server Agent running
-- Database recovery model: FULL (not SIMPLE)
-
-**Enable CDC on Database:**
-
-```sql
--- Connect as sa or db_owner
-USE your_database;
-GO
-
--- Enable CDC on database
-EXEC sys.sp_cdc_enable_db;
-GO
-
--- Enable CDC on specific table
-EXEC sys.sp_cdc_enable_table
-    @source_schema = N'dbo',
-    @source_name = N'users',
-    @role_name = N'cdc_role',
-    @supports_net_changes = 0;
-GO
-
--- Verify CDC enabled
-SELECT name FROM sys.databases WHERE database_id = DB_ID() AND is_cdc_enabled = 1;
-```
-
-**Create CDC User (Recommended):**
-
-```sql
--- Create login
-CREATE LOGIN cdc_user WITH PASSWORD = '<provision-from-secret-manager>';
-
--- Create user in database
-USE your_database;
-CREATE USER cdc_user FOR LOGIN cdc_user;
-
--- Grant minimal required permissions
-GRANT SELECT ON sys.cdc_lsn_time_mapping TO cdc_user;
-GRANT SELECT ON cdc.lsn_time_mapping TO cdc_user;
-GRANT SELECT ON cdc.fn_cdc_get_all_changes_dbo_users TO cdc_user;  -- Per table
-ALTER ROLE cdc_admin ADD MEMBER cdc_user;  -- Or custom role
-```
-
-### LSN Progression Monitoring
-
-```sql
--- Check current LSN
-SELECT @@DBTS AS current_lsn;
-
--- Check change table progress (used by rustcdc)
-SELECT TOP (10)
-    CAST(start_lsn AS VARCHAR(32)) AS start_lsn,
-    CAST(end_lsn AS VARCHAR(32)) AS end_lsn
-FROM cdc.lsn_time_mapping
-ORDER BY start_lsn DESC;
-```
-
-### SQL Server CDC Cleanup
-
-```sql
--- Cleanup old CDC tables (keep last 7 days of LSN)
-EXEC sys.sp_cdc_cleanup_change_tables
-    @capture_instance = N'dbo_users',
-    @low_water_mark = NULL;  -- Use default retention
-GO
-```
-
-### SQL Server TRUNCATE Capture — DDL Trigger Management
-
-`SqlServerSourceConfig::capture_truncate_events` controls whether `TRUNCATE TABLE` operations are captured as `Operation::Truncate` events. SQL Server's native CDC change tables do **not** record `TRUNCATE TABLE`; capture requires an opt-in DDL trigger that `rustcdc` installs automatically.
-
-#### Required permissions
-
-The connecting user must have the following permissions to install the trigger:
-
-```sql
--- Verify permissions
-SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER') AS can_alter_database;
-SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TRIGGER') AS can_create_trigger;
-```
-
-If either returns `0`, grant the permissions to the CDC login:
-
-```sql
-GRANT ALTER ON DATABASE::[your_database] TO [cdc_login];
-GRANT CREATE TRIGGER TO [cdc_login];
-```
-
-#### Verify the trigger is installed
-
-After connecting with `capture_truncate_events: true`, verify the trigger exists:
-
-```sql
-SELECT
-    t.name AS trigger_name,
-    te.type_desc AS event_type,
-    t.create_date,
-    t.modify_date
-FROM sys.triggers t
-JOIN sys.trigger_events te ON t.object_id = te.object_id
-WHERE t.parent_class_desc = 'DATABASE'
-  AND t.name LIKE 'rustcdc_%';
-```
-
-Expected: one row with `trigger_name = 'rustcdc_truncate_capture'` (or similar) and `event_type = 'ALTER_TABLE'`.
-
-#### Behaviour when trigger is absent
-
-- If the trigger installation fails (insufficient permissions, quota), `connect()` returns an error. No truncate events are captured, and the connector does not start.
-- If the trigger is deleted after startup while the connector is running, subsequent `TRUNCATE TABLE` statements are silently missed. No error is surfaced at runtime. Re-connect to reinstall.
-
-#### Cleanup on decommission
-
-When removing a `rustcdc` deployment, drop the DDL trigger to avoid orphaned objects:
-
-```sql
--- List all rustcdc DDL triggers
-SELECT name FROM sys.triggers WHERE parent_class_desc = 'DATABASE' AND name LIKE 'rustcdc_%';
-
--- Drop the truncate capture trigger
-DROP TRIGGER IF EXISTS rustcdc_truncate_capture ON DATABASE;
-GO
-```
-
-Also verify no capture instances remain from the CDC setup:
-
-```sql
-SELECT capture_instance, source_schema, source_table
-FROM cdc.change_tables
-WHERE capture_instance LIKE 'rustcdc_%';
-```
-
-Drop them with `sys.sp_cdc_disable_table` if needed.
-
-### SQL Server Connection and Poll Tuning
-
-`SqlServerSourceConfig` now exposes explicit concurrency/throughput controls:
-
-- `prereq_pool_size`
-- `stream_poll_interval_ms`
-- `max_events_per_poll`
-
-Recommended starting profiles:
-
-| Profile | prereq_pool_size | stream_poll_interval_ms | max_events_per_poll |
-|---|---:|---:|---:|
-| Low-latency | 4 | 250 | 5000 |
-| Balanced | 4-8 | 1000 | 10000-20000 |
-| Throughput-heavy | 8-16 | 2000-5000 | 20000-50000 |
-
-Rollout guidance:
-
-1. Change one knob set at a time.
-2. Observe `rustcdc_runtime_replication_lag_ms`, checkpoint progression, and source CPU.
-3. Revert if lag drops but source CPU or lock contention spikes.
-
-### SQL Server Tail-Latency Watch (p99)
-
-For SQL Server, watch the p99/p95 spread for poll latency in evidence runs.
-Large sustained spread indicates burstiness or source-side pressure even when p95 stays low.
-
-Operator policy:
-
-- Warning: p99 > 10x p95 for 3 consecutive evidence runs.
-- Escalate: p99 > 50x p95 with user-visible lag growth.
-
-First response actions:
-
-1. Increase `max_events_per_poll` for burst absorption.
-2. Increase `stream_poll_interval_ms` modestly (for example, 1000 -> 2000) to reduce poll churn.
-3. Validate source indexing and CDC capture table growth on SQL Server.
-
----
-
-## Structured Log Field Schema
-
-All connector events emitted by `StructuredLogger` use the `tracing` framework and include a consistent set of structured fields. This schema is stable and suitable for log aggregation pipeline alert rules.
-
-### Common fields (present on every log record)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `source_type` | `string` | Connector type (`postgres`, `mysql`, `mariadb`, `sqlserver`) |
-| `event` | `string` | Event name (see table below) |
-
-### Event names and additional fields
-
-| Event name (`event =`) | Level | Additional fields | Description |
-|---|---|---|---|
-| `source_connected` | INFO | — | Source database connection established |
-| `source_disconnected` | INFO | — | Source database connection closed |
-| `insecure_transport` | WARN | `mode`, `details` | TLS verification is disabled |
-| `connection_error` | ERROR | `error` | Connection-level error |
-| `snapshot_started` | INFO | `table` | Snapshot phase started for table |
-| `snapshot_chunk_received` | DEBUG | `table`, `chunk_size` | Snapshot batch received |
-| `snapshot_complete` | INFO | `table` | Snapshot phase completed for table |
-| `stream_started` | INFO | `offset` | Streaming replication started at offset |
-| `stream_events_received` | DEBUG | `table`, `event_count`, `offset` | Batch of stream events received |
-| `stream_error` | ERROR | `error` | Streaming-level error |
-| `checkpoint_saved` | INFO | `offset`, `committed_count` | Checkpoint durably persisted |
-| `checkpoint_loaded` | INFO | `offset`, `committed_count` | Checkpoint loaded on startup |
-| `checkpoint_error` | WARN | `error` | Checkpoint operation warning |
-| `transform_applied` | DEBUG | `transform`, `table`, `offset` | Transform stage applied to event |
-| `transform_error` | WARN | `transform`, `error` | Transform stage returned an error |
-
-> **Note:** `error` fields are sanitized by `sanitize_context()` — DSN credentials and common key=value secrets are redacted before logging. You will see `***redacted***` in place of password/token values.
-
-### Example log-aggregation filter (Loki)
-
-```logql
-{app="rustcdc"} | json | event = "checkpoint_saved" | committed_count > 0
-```
-
-### Alert rule guidance
-
-- Alert on `event = "source_disconnected"` sustained for > 30s with no `source_connected` following.
-- Alert on `event = "stream_error"` rate > 1/min.
-- Alert on `event = "checkpoint_error"` — any occurrence warrants investigation.
-- Use `committed_count` from `checkpoint_saved` to derive event throughput rate.
-
----
-
-## Metric Alerting and Monitoring
-
-### Two surfaces, one set of names
-
-Metrics reach you two ways, and the names below work for both:
-
-- the **text exposition** from `runtime.admin_snapshot()` / the Prometheus endpoint — always
-  available, no feature flag;
-- **OpenTelemetry**, under the `metrics` feature, exported through a collector.
-
-Every OTel instrument is named so the standard OTel → Prometheus translation (dots to underscores,
-`_total` appended to counters) produces **the same series name** as the text exposition. So a
-threshold below applies whichever path you scrape.
-
-That was not true before 0.12.0: OTel emitted `rustcdc.replication_lag_ms` and
-`rustcdc.buffer_size` where the exposition emitted `rustcdc_runtime_replication_lag_ms` and
-`rustcdc_runtime_buffer_depth`, and only the latter were documented — so every threshold on this
-page silently matched nothing for anyone on the OTel path. If you built alerts against the old OTel
-names, they need updating; if you built them from this page, they now work on both.
-
-**The two surfaces still carry different quantities**, which is a separate matter from naming.
-Only the text exposition has `rustcdc_runtime_health`, `_liveness`, `_readiness`, the idempotency
-counters and `_events_skipped_total`. Only OTel has replication lag in events, the checkpoint
-offset, snapshot progress and the event-processing and checkpoint-commit duration histograms. For
-the alerts on this page, scrape the text exposition; add OTel when you want the latency
-distributions.
-
-`rustcdc.runtime.events_filtered` is an embedder-facing hook rather than a pipeline metric — the
-runtime never feeds it, so it reads zero unless your code calls `record_events_filtered`. Do not
-alert on it expecting the runtime's own filtering, which is `_events_skipped_total` and
-`_events_deduplicated_total` in the text exposition.
-
-### Recommended Alert Thresholds
-
-**Critical (Page On-Call):**
-
-| Metric | Threshold | Action |
-|--------|-----------|--------|
-| **`rustcdc_replication_slot_lag_bytes`** (PostgreSQL) | **Sustained growth over 15 min, or > 25% of free `pg_wal` volume** | **The single most operationally critical PostgreSQL CDC signal.** A slot pins WAL *and* catalog xmin; unbounded growth ends in a full `pg_wal` volume or, in the extreme, a transaction-ID-wraparound shutdown of the **primary**. See [PostgreSQL WAL retention](#postgresql-source-management). Distinguish *idle-nonzero* (normal) from *monotonically growing* (act now) — alert on the derivative, not the level. |
-| `rustcdc_runtime_replication_lag_ms` | > 30000 ms | Investigate source/database lag, downstream throughput, and checkpoint commits |
-| `rustcdc_runtime_events_committed_total` | No increase for 5 min | Check stream connectivity; may indicate stalled progress |
-| `rustcdc_runtime_liveness` | == 0 | Runtime stopped or unhealthy; investigate process and startup logs |
-| `rustcdc_runtime_health{verdict="stalled"}` | == 1 | The runtime's own verdict that progress has stopped, with the reason and remedy in the log line. See [Health verdict](#health-verdict-idle-vs-stalled). |
-| **`rustcdc_runtime_events_skipped_total`** | **Any increase** | **Data was lost.** `TransformErrorPolicy::Skip` drops the event *and* the checkpoint advances past it, so it is never replayed. Recover it from the dead-letter handler; if none was configured the runtime refuses to start under `Skip`, so one exists. |
-
-**Warning (ticket, not a page):**
-
-| Metric | Threshold | Action |
-|--------|-----------|--------|
-| `rustcdc_transform_rules_unmatched{kind="mask"}` | Present at all, after real traffic | **A configured column is shipping in clear text.** The rule's path does not match any field: a typo, a column renamed upstream, or a path-mutating transform (`FieldMappingTransform`, `UnwrapTransform`) ordered *before* the mask stage. Nothing errors, so this metric is the only signal. Fix the path or the stage order — do not delete the rule. |
-| `rustcdc_transform_rules_unmatched{kind="route"}` | Present at all, after real traffic | Events that rule was meant to route are going to `default_destination`. Routing fails open, so the only symptom is a destination that stays empty. Check the table name against the source, and remember exact-table rules win over patterns. |
-| `rustcdc_transform_rules_unmatched{kind="filter"}` | Present at all, after real traffic | A filter predicate has been evaluated and never matched, so it is contributing nothing to the `FilterMode`. Usually a typo in a field path or a value that never occurs. Rules that were never *reached* (short-circuited under `FilterMode::All`) are deliberately not reported. |
-| `rustcdc_runtime_idempotency_evictions_total` | Sustained growth | The dedup window is too small for this deployment's replay distance, so duplicates older than the window stop being suppressed. Delivery stays at-least-once, but a sink relying on the guard will start seeing repeats. Raise `IdempotencyOptions::capacity`. |
-| `rustcdc_runtime_idempotency_unidentifiable_total` | Growth on a table you expected to be keyed | Events with neither transaction metadata nor a resolvable primary key are deliberately **not** deduplicated — suppressing them could drop distinct rows. Expected for keyless tables; unexpected growth means a primary key is missing or its columns are absent from the row image (check `REPLICA IDENTITY` on PostgreSQL, `binlog_row_image` on MySQL). |
-| `rustcdc_runtime_buffer_depth` | At `max_buffer_size` for > 5 min | The embedder is not acknowledging. The runtime is applying backpressure (`ErrorKind::Backpressure`), which is flow control, not a failure — but sustained saturation means the sink cannot keep up. |
-
-### Health verdict: idle vs stalled
-
-`RuntimeState` alone cannot answer whether a connector is *healthy*. It has only
-`Idle | Running | Stopping | Stopped`, and `Idle` there means *not yet started*. A connector
-streaming from a quiet database and one hung on a dead socket both report `state=running`,
-`readiness=true`, and flat counters.
-
-`RuntimeAdminSnapshot::health` resolves that ambiguity. It is a `HealthVerdict`:
-
-| Verdict | Meaning | Alert? |
+| Verdict | Meaning | Alertable |
 |---|---|---|
-| `Healthy` | The poll loop is turning and committed progress is current. | No |
-| `Idle` | The loop is turning, but the source has produced nothing. Normal for a quiet database. | No |
-| `Stalled { reason }` | Progress has stopped for a reason the runtime can name. | **Yes** |
-| `NotRunning` | The runtime has not been started, or has stopped. | No — but check it was intentional |
+| `healthy` | Progressing | — |
+| `idle` | Connected, no changes upstream | **No.** A quiet database is not an incident |
+| `stalled` | Running but not progressing | **Yes.** Go to §3 |
 
-`HealthVerdict::is_alertable()` returns `true` for exactly `Stalled`, so an embedder's health
-endpoint can gate on it directly. The verdict is derived from three independent signals, checked
-in this order, and `reason` names both the condition and the remedy:
+There are exactly these four — the gauge has four series and the enum has four variants.
+There is no `degraded`. Accumulating recoverable errors show up as
+`rustcdc_source_consecutive_poll_errors` and
+`rustcdc_runtime_recoverable_breaker_open_consecutive` instead; see §7.
 
-1. **Unconfirmed source position** — a checkpoint committed but the source-side confirmation
-   (`confirmed_flush_lsn` and equivalents) failed repeatedly. Retention keeps growing at the
-   source even though the consumer is making progress.
-2. **Poll loop stuck** — `now - last_poll_at_ms` exceeds `max_poll_wait_ms × 6` (floor 30s).
-   The connector is blocked in the source, typically a dead socket.
-3. **Consumer stall** — events were polled but not committed, and `last_commit_at_ms` is stale.
-   The embedder has stopped calling `commit_ack`; this is *not* a source problem.
+`idle` is reachable at any point in a run, not only before the first event: a pipeline that
+delivered a million rows this morning and has been quiet since lunch reports `idle`.
 
-The same verdict is exposed on the Prometheus surface as a set of gauges of which exactly one
-is `1`, so an alert rule is unambiguous:
+While the verdict is `stalled`, a second gauge says **which** signal fired. It has three
+different owners, so it is what an alert should route on:
 
-```promql
-rustcdc_runtime_health{verdict="stalled"} == 1
-```
+| `rustcdc_runtime_stall_cause{cause=…}` | What it means | Where to look |
+|---|---|---|
+| `unconfirmed_source_position` | A checkpointed position could not be confirmed to the source, which keeps replaying *and* retaining its log | The database. This ends in a full `pg_wal` volume, not a stopped pipeline |
+| `poll_loop_not_turning` | `poll_event_batch` has stopped returning | This process, or the socket to the source |
+| `consumer_not_acknowledging` | Events delivered, never acknowledged, no recent commit | The sink and the commit path — §3 |
 
-Alert on that expression. Do not alert on flat `events_committed_total` alone — it fires on every
-quiet period.
+The series is absent when healthy, so presence is the condition.
 
-Pair it with `rustcdc_runtime_events_skipped_total`: any non-zero value means events were dropped
-by the transform error policy rather than delivered, which is silent data loss unless a
-dead-letter handler is recording them.
+Two ages feed the verdict, and reading them together is what separates a quiet database
+from a dead one:
 
-**Warning (Alert, No Page):**
+| `rustcdc_runtime_poll_age_ms` | `rustcdc_runtime_delivery_age_ms` | Verdict |
+|---|---|---|
+| low | low | `healthy` |
+| low | high | `idle` — normal. **Never page on delivery age alone** |
+| high | any | `stalled`, cause `poll_loop_not_turning` |
 
-| Metric | Threshold | Action |
-|--------|-----------|--------|
-| `rustcdc_runtime_replication_lag_ms` | > 10000 ms | Monitor; lag is growing and may approach retention risk window |
-| `rustcdc_runtime_checkpoint_age_ms` | > 10000 ms | Commit progression is stale; check checkpoint backend and consumer ack flow |
-| `rustcdc_runtime_events_polled_total` | Deviation > 20% from 1h baseline | Throughput anomaly; check source and transform paths |
+The server logs **one** WARN on entry to a stall — `runtime health degraded to stalled`,
+carrying `cause=` and the measurements — and one INFO on recovery. A stall that changes
+cause logs again, because that is a different problem with a different owner.
 
-**Informational (Dashboard Only):**
+`last_terminal_reason_code` in `/status` is the single most useful field after a crash:
+it names the subsystem that ended the run (`batch_delivery_error`,
+`checkpoint_barrier_commit_error`, `runtime_poll_error`, …) without needing logs.
 
-| Metric | Baseline |
-|--------|----------|
-| `rustcdc_runtime_events_polled_total` | Should be monotonically increasing |
-| `rustcdc_runtime_in_flight_events` | Should remain bounded; sustained growth indicates ack stalls |
-| `rustcdc_runtime_buffer_depth` | Should remain bounded relative to workload |
 
-### Prometheus Example Configuration
+## 2. Pipeline will not start
 
-```yaml
-groups:
-  - name: rustcdc
-    interval: 30s
-    rules:
-      - alert: CdcReplicationLagCritical
-        expr: rustcdc_runtime_replication_lag_ms > 30000  # 30s
-        for: 5m
-        annotations:
-          summary: "rustcdc replication lag critical ({{ $value }} ms)"
-          action: "Check source database; verify checkpoint commits; investigate network/storage"
+### `another cdc-server process (PID N) is already running against state directory`
 
-      - alert: CdcRuntimeStopped
-        expr: rustcdc_runtime_liveness == 0
-        for: 1m
-        annotations:
-          summary: "rustcdc runtime is not live"
-          action: "Check process health, startup logs, and source connectivity"
-
-      - alert: CdcCheckpointStalled
-        expr: increase(rustcdc_runtime_events_committed_total[5m]) == 0
-        for: 5m
-        annotations:
-          summary: "rustcdc checkpoint not advancing"
-          action: "Check connectivity to source; verify no transform errors"
-```
-
----
-
-## Troubleshooting Common Failures
-
-See [troubleshooting.md](@/docs/troubleshooting.md) for detailed diagnosis procedures.
-
-### Quick Diagnosis
+Local PID lock. Either a second process really is running, or a previous one was killed
+without cleanup.
 
 ```bash
-# 1. Check rustcdc process health
-systemctl status rustcdc
-journalctl -u rustcdc -f  # Live logs
-
-# 2. Check checkpoint state
-ls -lh /var/rustcdc/checkpoint_*.json
-cat /var/rustcdc/checkpoint_postgres.json | jq .
-cat /var/rustcdc/.rustcdc_checkpoint.owner 2>/dev/null || true
-
-# 3. Check source database connectivity
-# PostgreSQL
-psql -h $PG_HOST -U cdc_user -d your_database -c "SELECT 1;"
-
-# MySQL
-mysql --defaults-extra-file=/etc/rustcdc/mysql-client.cnf -h "$MYSQL_HOST" -u cdc_user -e "SELECT 1;"
-
-# SQL Server
-SQLCMDPASSWORD="${SQLCMDPASSWORD:?set from secret manager}" sqlcmd -S "$SQLSERVER_HOST" -U cdc_user -Q "SELECT 1;"
-
-# 4. Check recent errors in logs
-journalctl -u rustcdc -n 50 --no-pager | grep -i "error\|warn"
-
-# 5. Verify metrics are flowing
-curl -s http://localhost:9090/metrics | grep rustcdc_ | head -20
+ps -p <PID> -o pid,comm,args     # is it actually a rustcdc process?
+# If it is gone, the lock is stale and the next start overwrites it automatically.
+# If the file is orphaned on a shared volume:
+rm <state-dir>/.cdc-server.lock
 ```
 
-### Checkpoint Owner-Lease Conflict Recovery
+### `<backend> state is already owned by '<host:pid:nonce>'`
 
-Symptom example:
+Remote owner lease for the `redis` / `postgresql` state backends. Another instance holds
+it.
 
-```text
-checkpoint owner lease conflict for '/var/rustcdc': lock owned by pid ...
+**The overwhelmingly common cause is a Kubernetes rolling update.** A `Deployment`
+without `strategy: Recreate` starts the new pod before stopping the old one, so both
+claim the state. Fix the Deployment — see
+[operations.md §11](@/docs/operations.md#11-kubernetes-deployment). This is not optional.
+
+If the previous owner is genuinely gone, the lease expires by itself after **60 s**;
+just wait. Do not delete the lease key to hurry it along unless you have confirmed the
+other process is dead — that is precisely the check being bypassed.
+
+### `failed to initialize the kafka state producer's transactional state`
+
+The Kafka state backend fences by producer epoch. This means another instance took the
+`transactional.id`, or the broker is unreachable. Same cause and same fix as above; check
+broker connectivity first with the same `brokers` value from the config.
+
+### `429 Too Many Requests` from the admin API
+
+Rate limiting runs **before** authentication, so a `429` says nothing about your
+credentials. Buckets are per client IP (or per `X-Forwarded-For` client behind a trusted
+proxy), default 20 rps with a burst of 40 per endpoint.
+
+A first-time client gets the full configured burst. If you are seeing `429` at low
+request rates, check whether the limiter is tracking a very large number of distinct
+client keys — under that pressure new keys are deliberately admitted with a single token
+to stop an address-rotating attacker multiplying their allowance. That is the attack
+signature, not a misconfiguration.
+
+### `source password must use a deferred secret reference`
+
+By design. Put the credential in a secret manager and reference it:
+`password = { env = "POSTGRES_PASSWORD" }`.
+
+### `unrecognised configuration key(s): ...`
+
+A typo, or a key under the wrong table. The message names the full path. This is
+deliberate: a misspelled `table_include_lst` leaves the include list empty, which
+captures **every table in the database**.
+
+### `postgres at '<host>' refused TLS (the server replied 'N')`
+
+The connector is configured with `transport.mode = "tls"` and the server has
+`ssl = off`. It now fails instead of silently continuing unencrypted — previously
+this connection downgraded to plaintext with no error and no warning, detectable only
+with a packet capture.
+
+Enable TLS on the server, or state the trade-off explicitly:
+
+```toml
+[source.postgres.transport]
+mode = "plaintext"   # credentials and change data in the clear
 ```
 
-Safe recovery steps:
+### `replication slot "<slot>" is active for PID <n>`
+
+An out-of-band `pg_replication_slot_advance` or `pg_drop_replication_slot` was run
+against a slot a live pipeline holds. Under the default
+`wal_transport = "streaming_replication"` a walsender holds the slot for the life of
+the stream, and PostgreSQL refuses both operations on an active slot.
+
+Stop the pipeline first, run the operation, then start it again. This did not apply
+under `sql_peek`, where nothing held the slot persistently — an operator script
+carried over from that transport is the usual source.
+
+
+## 3. Checkpoint is not advancing
+
+**Symptom:** `rustcdc_slo_checkpoint_age_seconds` climbing;
+`rustcdc_runtime_health{verdict="stalled"} 1`.
+
+Work down this list — it is ordered by how often each is the cause.
+
+0. **Which cause?** `rustcdc_runtime_stall_cause` names it directly, and the three go to
+   three different places. Everything below is the `consumer_not_acknowledging` path.
+1. **Is anything happening upstream?** `verdict="idle"` means no changes to capture, and is
+   not a fault. Confirm with a write to a captured table.
+2. **Is the sink accepting?** Check `rustcdc_sink_send_ops_total` for movement and
+   `rustcdc_runtime_batch_delivery_latency_seconds` for a p99 blowout. A sink that has
+   stopped acknowledging stalls the pipeline by design — the checkpoint must not
+   advance past undelivered data.
+3. **Is the source connection degraded?** `rustcdc_source_consecutive_poll_errors > 0`.
+4. **Is the breaker open?** `rustcdc_runtime_recoverable_breaker_open_consecutive > 0`
+   → §7.
 
 ```bash
-# 1. Confirm rustcdc process is not running.
-systemctl status rustcdc
-
-# 2. Inspect owner-lease file (if present).
-cat /var/rustcdc/.rustcdc_checkpoint.owner
-
-# 3. Verify the listed PID is not active.
-#    The lease file contains `HOSTNAME:PID`, so split it before calling `ps` —
-#    `ps -p "$(cat ...)"` errors out on the whole string.
-LEASE=$(cat /var/rustcdc/.rustcdc_checkpoint.owner)
-LEASE_HOST="${LEASE%:*}"
-LEASE_PID="${LEASE##*:}"
-echo "lease held by host=$LEASE_HOST pid=$LEASE_PID (this host: $(hostname))"
-
-if [ "$LEASE_HOST" = "$(hostname)" ]; then
-  ps -p "$LEASE_PID"        # exit 0 = still alive, do NOT remove the lease
-else
-  echo "Lease belongs to a DIFFERENT host. Do not remove it from here."
-  echo "Confirm no runtime is running on $LEASE_HOST first — two writers against one"
-  echo "checkpoint directory destroy each other's records."
-fi
-
-# 4. Only if the PID is genuinely dead on THIS host: remove the stale lease.
-#    A live process normally clears its own lease on exit, so a leftover file means
-#    the process was killed with SIGKILL or the host lost power.
-rm -f /var/rustcdc/.rustcdc_checkpoint.owner
-systemctl start rustcdc
+# What position is actually stored?
+rustcdc inspect-checkpoint --config-file /etc/rustcdc/config.toml
 ```
 
-> The runtime fences writes against this file: it re-reads the lease before every durable
-> write and refuses to write if the token is no longer its own. Removing the lease while a
-> runtime is live therefore stops that runtime with a named error rather than silently
-> allowing two writers — but it still costs you an outage, so confirm liveness first.
+If the checkpoint is advancing but downstream is behind, the pipeline is fine and the
+consumer is the problem — check lag on the sink side, not here.
 
----
+### `refusing checkpoint write ... the stream position moved backwards`
 
-## Secret Rotation
+The connector offered a resume position **behind** the one already stored while the
+committed-event count kept rising. That is not a replay: a replay forgets progress,
+and this reports progress while recording a position before data the sink has already
+committed. The write is refused rather than accepted, so the pipeline halts loudly
+instead of resuming from a position the stream never reached.
 
-### PostgreSQL Credential Rotation
+Three causes, in order of likelihood:
 
-**Procedure (Zero-Downtime):**
+1. **The source was repointed or rebuilt.** A different server, a restored backup, or
+   a `pg_resetwal`. The stored position describes a log that no longer exists. Clear
+   the checkpoint directory and re-snapshot — see §9.
+2. **A failover on MySQL/MariaDB without GTID.** Binlog file+position is server-local
+   and a promoted replica's coordinates are routinely lower. Enable
+   `gtid_mode_enabled`: with a GTID set the coordinates are not compared at all,
+   because the GTID is what resumes the stream.
+3. **A connector defect.** If neither of the above applies, the message names both
+   positions — report it with that pair.
+
+The guard is deliberately narrow and does not fire on legitimate movement: PostgreSQL
+LSNs go backwards routinely under concurrent writers (pgoutput emits in *commit*
+order while each change keeps its own WAL position), so only a zero LSN is caught
+there.
+
+
+## 4. Replication slot growth (PostgreSQL)
+
+**Symptom:** `rustcdc_replication_slot_lag_bytes` growing steadily.
+
+This is the failure that takes the **source database** down, so it outranks almost
+everything else. An unconsumed slot pins WAL forever; the disk fills; PostgreSQL stops
+accepting writes.
+
+```sql
+SELECT slot_name, active, restart_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots;
+```
+
+- **`active = false` and the pipeline is running** → it is not connected. Go to §2.
+- **`active = true` and `retained` still growing** → the pipeline is connected but not
+  confirming. Go to §3; the cause is almost always a stalled sink.
+- **The pipeline is decommissioned** → drop the slot. Nothing else releases the WAL:
+
+  ```sql
+  SELECT pg_drop_replication_slot('cdc_slot');
+  ```
+
+  Dropping the slot **discards every change since the last confirmed position**. If the
+  pipeline will return, it will need a fresh snapshot.
+
+Set `max_slot_wal_keep_size` on the server so PostgreSQL invalidates a runaway slot
+rather than exhausting the volume. An invalidated slot loses data and needs a
+re-snapshot — bad, but survivable, unlike a full WAL volume.
+
+
+## 5. Events are being quarantined
+
+**Symptom:** `rustcdc_dlq_events_total` increasing;
+`RUSTCDCEventsQuarantined` firing.
+
+**Every one of these is an event that was not delivered and whose checkpoint advanced
+anyway.** It is recorded data loss. Treat it as a data incident, not a warning.
 
 ```bash
-# 1. Create new credential in PostgreSQL (value supplied from secret manager)
-psql -U postgres -d your_database -v new_password="$NEW_CDC_PASSWORD" -c "ALTER ROLE cdc_user WITH PASSWORD :'new_password';"
+# What was dropped and why?
+tail -n 50 /var/lib/rustcdc/dlq.jsonl | jq -r '[.ts_ms, .table, .source_offset, .error] | @tsv'
 
-# 2. Update rustcdc configuration (new connection string with new password)
-# Edit: /etc/rustcdc/config.toml or environment variable
-# Update configured secret source for `PostgresSourceConfig.password`
-
-# 3. Gracefully restart rustcdc (will drain pending events before restart)
-systemctl restart rustcdc
-
-# 4. Verify new connection is active
-journalctl -u rustcdc -n 10 | grep "source_connected\|connection"
-
-# 5. Old password can now be revoked (after verification)
-psql -U postgres -d your_database -c "ALTER ROLE cdc_user WITH PASSWORD NULL;" # Disable old password
+# Which tables and causes dominate?
+jq -r '.error' /var/lib/rustcdc/dlq.jsonl | sort | uniq -c | sort -rn
 ```
 
-### MySQL Credential Rotation
+With the `kafka` target the same questions are answerable from the record headers, without
+deserialising anything — the record key is the source table, and
+`__rustcdc.dlq.source.table`, `__rustcdc.dlq.source.offset`, `__rustcdc.dlq.sink` and
+`__rustcdc.dlq.exception.message` carry the rest:
 
 ```bash
-# 1. Create new user with password supplied via secret manager
-mysql --defaults-extra-file=/etc/rustcdc/mysql-admin.cnf -e "CREATE USER 'cdc_user_new'@'%' IDENTIFIED BY '${NEW_CDC_PASSWORD}'; GRANT SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'cdc_user_new'@'%';"
-
-# 2. Update rustcdc config
-# Update configured secret source for `MysqlSourceConfig.password`
-
-# 3. Restart
-systemctl restart rustcdc
-
-# 4. Verify
-journalctl -u rustcdc -n 10 | grep "source_connected"
-
-# 5. Revoke old user
-mysql --defaults-extra-file=/etc/rustcdc/mysql-admin.cnf -e "DROP USER 'cdc_user'@'%';"
+kafka-console-consumer --bootstrap-server kafka:9092 --topic cdc.dlq \
+  --from-beginning --property print.headers=true --property print.key=true
 ```
 
----
+Common causes and their fixes:
 
-## Disaster Recovery
+| Error contains | Cause | Fix |
+|---|---|---|
+| `max_event_bytes` | Encoded payload over the limit | Raise `runtime.max_event_bytes` to just under the broker's `max.message.bytes`, or exclude the offending column with a transform |
+| `codec` / `schema` | Registry rejected the schema | Reconcile the subject's compatibility mode; check the registry is reachable |
+| `ValidationError` | Envelope contract violation after a transform | Inspect the transform rule that touched the table |
 
-### Scenario 0: Forcing a Re-Snapshot
+**Replaying after the fix.** The DLQ is JSONL of full events, which is what `replay`
+consumes:
 
-Several procedures below end in "re-snapshot the affected tables". This is that procedure.
-It is needed whenever the source can no longer supply the changes the checkpoint says we
-still need — the connector detects each of these and stops with an `Unrecoverable` error
-naming the cause:
+```bash
+jq -c '.event' /var/lib/rustcdc/dlq.jsonl > /tmp/replay.jsonl
+rustcdc replay /tmp/replay.jsonl --config-file /etc/rustcdc/config.toml
+```
 
-- PostgreSQL: replication slot dropped or invalidated (`invalidation_reason` non-NULL).
-- MySQL/MariaDB: binlogs purged past the checkpointed GTID position.
-- SQL Server: CDC cleanup purged change rows past the checkpointed LSN (error 313).
+Replay delivers to the configured sink and does **not** move the checkpoint. Under
+`at_least_once` a replayed event that had partially succeeded may duplicate; that is
+within contract. Truncate the DLQ only after you have confirmed the replay landed.
 
-**Steps:**
 
-1. **Stop the pipeline.** Do not skip this — a running connector will re-create state
-   underneath you.
+## 6. Sink is failing
 
-2. **Remove BOTH checkpoint files for the source.** A stream checkpoint and a snapshot
-   checkpoint coexist, and deleting only the stream one leaves the snapshot checkpoint to
-   be picked up on restart:
+**Symptom:** batch delivery errors in the log; the pipeline retries and may terminate.
+
+Recoverable sink failures are retried under `[runtime]`'s backoff and circuit-breaker
+policy — the *same* policy the source uses. A terminal exit means either the breaker
+escalated (§7) or the failure was classified non-recoverable.
+
+Non-recoverable means "the same attempt will fail identically": an oversized event, a
+config error. Those go to the DLQ if `[dlq]` is configured (§5) and halt the pipeline if
+it is not.
+
+```bash
+# Is it the sink or the network?
+rustcdc dry-run --config-file /etc/rustcdc/config.toml --events 10
+```
+
+`dry-run` pushes synthetic events through the real sink. If it succeeds, the sink is
+reachable and the problem is data-shaped, not connectivity.
+
+**Known limitation.** A transient failure surfacing during a sink *flush* rather than a
+send is currently treated as terminal, because the router flattens per-sink flush errors
+into one string and loses the classification. The pipeline restarts and resumes from the
+checkpoint; no data is lost, but the restart is avoidable noise.
+
+
+## 7. Circuit breaker keeps opening
+
+**Symptom:** `rustcdc_runtime_recoverable_breaker_open_consecutive` rising, and
+`rustcdc_source_consecutive_poll_errors` above zero. The health verdict does **not**
+change for this — it has no `degraded` state, and a pipeline whose poll loop is still
+turning and still committing reads as `healthy` while the breaker cycles underneath.
+These two counters are the signal.
+
+The breaker exists to convert an endless retry loop into a loud failure. Repeated
+opening means the underlying dependency is genuinely unhealthy — the answer is upstream,
+not in these settings.
+
+Widen the policy only when the dependency is *known* to be slow-but-recovering (a
+failover in progress, say):
+
+```toml
+[runtime]
+recoverable_error_breaker_consecutive_threshold = 30     # was 10
+recoverable_error_breaker_cooldown_ms           = 60000  # was 30000
+recoverable_error_breaker_max_open_cycles       = 10     # was 3
+```
+
+Widening it while the dependency is actually down just delays the page.
+
+
+## 8. Duplicate events downstream
+
+Expected under `at_least_once` — that is the contract. Consumers must be idempotent.
+
+**Not** expected under `effectively_once`. The batch's records and its checkpoint commit
+in one Kafka transaction, so a crash discards both or keeps both; there is no window that
+replays a committed batch. See [delivery contracts](@/docs/concepts.md#3-delivery-contracts).
+If you are seeing duplicates under that contract, check first:
+
+1. Is the consumer reading `read_committed`? A `read_uncommitted` consumer sees records
+   from aborted transactions, and no producer-side guarantee prevents that. This is by far
+   the most common cause.
+2. Is the duplicate actually a *retry* of an aborted batch? Compare the producer epoch in
+   the record headers; an aborted attempt and its replay are distinct transactions and only
+   the second is committed.
+
+For either contract, a duplicate burst that is **not** explained by a restart is
+different. Check:
+
+1. Did two instances run concurrently? Look for lease-conflict errors around the burst
+   (§2). This is the signature of a rolling update without `strategy: Recreate`.
+2. Did the checkpoint move backwards? Compare `inspect-checkpoint` against the last
+   known position from your logs.
+
+
+## 9. Disaster recovery
+
+### Lost state directory, source intact
+
+The pipeline resumes from the *live head* if there is no checkpoint, which **silently
+skips everything since the last durable position**. That is almost never what you want.
+
+Deliberate choice, in order of preference:
+
+1. **Restore the state directory from backup.** Fastest and loses nothing after the
+   backup point. Take state backups.
+2. **Re-snapshot.** Correct and complete; costs a full table read and duplicates
+   everything the sink already has. Consumers must be idempotent.
    ```bash
-   rm -f /var/rustcdc/checkpoint_<source>.json \
-         /var/rustcdc/checkpoint_<source>_snapshot.json
+   # Remove state, then start with snapshot_tables configured.
+   rustcdc run --config-file /etc/rustcdc/config.toml --snapshot-table public.orders
    ```
-   `<source>` is `postgres`, `mysql`, `mariadb`, or `sqlserver`. **Note MariaDB writes
-   `checkpoint_mariadb.json`, not `checkpoint_mysql.json`.**
+3. **Accept the gap.** Only with an explicit, written decision about which window of
+   changes is being abandoned.
 
-3. **Re-provision source-side capture state** where it was lost:
-   ```sql
-   -- PostgreSQL: recreate the slot (add failover for PG17+ multi-node clusters)
-   SELECT pg_create_logical_replication_slot('rustcdc_slot', 'pgoutput');
-   SELECT pg_create_logical_replication_slot('rustcdc_slot', 'pgoutput', false, false, true);
+### Corrupt checkpoint
 
-   -- SQL Server: verify the capture instance still exists and the Agent jobs are running
-   SELECT capture_instance, start_lsn FROM cdc.change_tables;
-   EXEC sys.sp_cdc_help_jobs;
-   ```
-
-4. **Restart with `snapshot_tables` configured** for the affected tables. The connector
-   performs a fresh snapshot, then hands off to streaming at the snapshot watermark.
-
-5. **Expect duplicates downstream, not gaps.** The re-snapshot re-emits every row of the
-   affected tables. Sinks must be idempotent (upsert on primary key); this is the
-   at-least-once contract, not a bug.
-
-> **Prevention is retention.** Every trigger above is "the source discarded data before we
-> read it". Size retention against your worst-case downtime:
-> PostgreSQL `max_slot_wal_keep_size` (and monitor `rustcdc_replication_slot_lag_bytes`),
-> MySQL `binlog_expire_logs_seconds`, SQL Server
-> `sys.sp_cdc_change_job @job_type='cleanup', @retention = ...`.
-
-### Scenario 1: Source Database Becomes Unavailable
-
-**Recovery Steps:**
-
-1. **Graceful Shutdown**
-
-   ```bash
-   systemctl stop rustcdc
-   ```
-
-   > **This does not flush anything by itself.** rustcdc ships no binary and installs no
-   > signal handler; a plain `SIGTERM` kills the process with the in-flight batch
-   > uncommitted, which replays on restart (at-least-once — correct, but noisy).
-   >
-   > Flushing is a property of **your** wrapper. To get it, handle the shutdown signal and
-   > call `CdcRuntime::drain_and_stop()`, which polls until the source is exhausted and
-   > commits — and **returns the drained events**, because dropping them after the
-   > checkpoint has advanced past them is unrecoverable. `stop()` refuses to run while
-   > events are in flight; `force_stop()` discards them and logs
-   > `shutdown_mode = "forced"`.
-
-2. **Verify Last Checkpoint**
-   ```bash
-   cat /var/rustcdc/checkpoint_postgres.json | jq .
-   ```
-
-3. **Source Recovery**
-   - Wait for source database to recover
-   - Verify replication slot still exists (if PostgreSQL)
-   - Verify WAL/binlog is available for resume position
-
-4. **Resume**
-   ```bash
-   systemctl start rustcdc
-   # Will resume from last committed checkpoint
-   ```
-
-### Scenario 2: Checkpoint Corruption
-
-**Diagnosis:**
-```bash
-# Attempt to parse checkpoint
-cat /var/rustcdc/checkpoint_postgres.json | jq . 2>&1
-# If error: checkpoint file is corrupted
+```
+Checkpoint error: … integrity check …
 ```
 
-**Recovery:**
+Working as designed — the checksum caught a damaged file rather than resuming from a
+wrong position. Do not edit it. Restore from backup, or re-snapshot as above.
 
-```bash
-# 1. Stop rustcdc
-systemctl stop rustcdc
+### Lost source (database rebuilt / failed over)
 
-# 2. Backup corrupted checkpoint
-cp /var/rustcdc/checkpoint_postgres.json /var/rustcdc/checkpoint_postgres.json.corrupt.$(date +%s)
+A logical replication slot does **not** survive a rebuild, and on most managed platforms
+does not survive a failover either. After either, the old checkpoint refers to a position
+that no longer exists.
 
-# 3. Delete ALL checkpoint files for this source family to force a full rescan.
-#    See the note above: a leftover `_snapshot.json` is still a resumable checkpoint.
-rm -f /var/rustcdc/checkpoint_postgres.json \
-      /var/rustcdc/checkpoint_postgres_snapshot.json
+1. Stop the pipeline.
+2. Recreate the publication and slot on the new primary.
+3. Clear the state directory — the old LSN is meaningless against a new timeline.
+4. Start with a snapshot.
 
-# 4. Restart
-systemctl start rustcdc
 
-# ⚠️ WARNING: This may cause duplicate events if consumer is already processing data beyond this point
-# Coordinate with downstream systems to handle duplicates
-```
+## 10. Upgrade and rollback
 
-### Scenario 3: Metric Exporter Unavailable
+### Upgrade
 
-If metrics are critical for operations:
+1. Read the release notes for state-format changes.
+2. Update the image tag.
+3. `kubectl rollout restart deployment/rustcdc`.
+
+**What CI already checked for you.** `tests/state_compatibility.rs` holds frozen state
+artefacts — a real checkpoint file with its `content_checksum`, snapshot state in the shape
+a previous release wrote, every version of the Kafka state-topic record, the `local_fs`
+owner lease, and the processed-signal ledger — and asserts this build reads all of them
+with the right *values*, not merely that they parse. A release that could not resume an
+existing pipeline fails the build rather than the deploy.
+
+That covers the forward direction only. It cannot cover rollback, because the old binary is
+not present to test against; see below.
+
+With `strategy: Recreate` (**required** — see
+[operations.md §11](@/docs/operations.md#11-kubernetes-deployment)) the old pod stops before
+the new one starts. Capture pauses for `terminationGracePeriodSeconds` plus startup;
+the source retains the changes.
+
+Confirm success: `rustcdc_slo_checkpoint_age_seconds` returns to baseline and
+`rustcdc_runtime_health{verdict="healthy"}` is `1`.
+
+### Rollback
+
+Roll the image tag back and restart. Safe **as long as the state format did not
+change** — checkpoints are forward-compatible within a format version, not backward.
+
+The asymmetry is deliberate and worth understanding: a new build reading old state fills in
+absent fields with documented defaults, and CI proves it does. An *old* build reading new
+state has no such rule — it sees fields it was never taught, and depending on the struct it
+either ignores them (losing whatever they recorded) or refuses the file. A concrete example
+from 0.12: snapshot state gained `stopped`. Roll back to a build that predates it and a
+backfill an operator deliberately stopped starts again from row zero on the next restart,
+because the field carrying that decision is one the old build cannot see.
+
+If the release notes flagged a state-format change, rolling back requires the state as
+it was *before* the upgrade:
+
+1. Stop the pipeline.
+2. Restore the state directory from the pre-upgrade backup.
+3. Deploy the old image.
+
+**Take a state backup immediately before any upgrade whose notes mention state.** There
+is no downgrade path for state written by a newer format, and no tool that reconstructs
+it.
+
+### Config change
+
+`validate-config` parses and validates without starting — use it in CI:
 
 ```bash
-# Verify metrics endpoint is responding
-curl -v http://localhost:9090/metrics
-
-# If OTel collector is unreachable, rustcdc will:
-# 1. Log warning message
-# 2. Continue processing (metrics are not critical to CDC correctness)
-# 3. Retry connection periodically
-
-# No action needed; CDC processing continues
+rustcdc validate-config --config-file cdc.toml --print-json
 ```
 
----
+It resolves environment variables and prints the redacted result, so it also confirms
+your secret references actually resolve in the target environment.
 
-## Maintenance Windows
 
-### Planned Maintenance Schedule
+## 11. Credential rotation
 
-**Weekly (off-hours):**
-- [ ] Verify checkpoint files are readable
-- [ ] Check replication lag is healthy (< 10000 ms steady-state target)
-- [ ] Confirm no errors in recent logs
+### Source password
 
-**Monthly:**
-- [ ] Rotate credentials (if policy requires)
-- [ ] Verify backup/disaster recovery procedure
-- [ ] Review metric alert thresholds vs. actual baseline
+Referenced by env var, so rotation is a restart, not a config change:
 
-**Quarterly:**
-- [ ] Test failover to secondary source (if applicable)
-- [ ] Review and update this runbook
-- [ ] Capacity planning based on data growth
+1. Update the secret.
+2. Restart the pod. Capture pauses for the restart and resumes from the checkpoint.
 
-### Backfill load during business hours
+### Admin tokens
 
-**Symptom:** an incremental snapshot of a large table is adding read load to a production
-primary at a bad time.
+Static tokens (`admin.read_token_env` / `write_token_env`) require a restart. For
+rotation without downtime use a signed token manifest
+(`admin.token_manifest_file`), which is reloaded in place and supports overlapping
+validity and revocation.
 
-**Do not** stop the pipeline and clear the checkpoint. That stops capture as well, and
-restarting rebuilds the snapshot from wherever the cursors were lost.
+### Audit signing key
 
-**Instead**, pause chunk reading and leave capture running:
+Rotating `admin.audit_signing_key_env` invalidates signatures on **previously exported**
+audit trails — verify and archive before rotating. Confirm the new key is in effect:
+an unset or malformed key logs at `warn` on startup and exports go out **unsigned**.
 
-```rust
-# use rustcdc::CdcRuntime;
-# async fn example(runtime: &mut CdcRuntime) -> rustcdc::Result<()> {
-runtime.pause_incremental_snapshot().await?;   // idempotent
-# Ok(())
-# }
-```
+### Masking HMAC key
 
-The change stream is unaffected — replication-slot lag keeps draining, and the checkpoint keeps
-advancing. Resume in the evening with `resume_incremental_snapshot()`, which continues from the
-chunk it stopped at rather than restarting the table.
-
-The pause is written into the checkpoint, so a deploy during the paused window does **not**
-silently restart the backfill. That also means a pause left in place is invisible unless you
-look: check `admin_snapshot().incremental_snapshot`, whose `paused` flag and per-table
-`rows_emitted` / `is_complete` are the progress readout. From an admin task that does not hold
-`&mut CdcRuntime`, use `control_handle()` — `RuntimeControl::incremental_snapshot_state()` is
-non-blocking and cannot hang behind a stalled pipeline.
-
-To abandon the backfill entirely, `stop_incremental_snapshot()` discards the cursors and
-returns how many tables still had work. Capture continues, and the stop **survives a restart** —
-including for tables named in the static config, which is the case that used to silently restart
-the whole backfill on the next deploy. Re-request the tables with
-`request_incremental_snapshot()` to start over.
-
-The stop is recorded as an explicit flag in the snapshot state and becomes durable with the next
-checkpoint write, so a crash in that narrow window resumes the snapshot — stop it again. A
-synchronous checkpoint is deliberately not forced here: it would let an operator action rewrite
-the stream position, which is the worse trade.
-
----
-
-## Contacts and Escalation
-
-| Role | Contact | Escalation |
-|------|---------|-----------|
-| On-Call SRE | Page via PagerDuty | Escalate to Platform Lead if unresolved in 30 min |
-| Database Admin | Slack #dba-oncall | Create incident ticket if source DB issue confirmed |
-| CDC Maintainer | GitHub Issues or #rustcdc Slack | Create critical incident if data loss risk detected |
-
----
-
-**Last Updated:** May 25, 2026  
-**Version:** Current Runbook
+Rotating a `mask_hash` key changes every pseudonym it has ever produced, so
+previously-emitted values will no longer join to newly-emitted ones. Treat it as a
+data-model change, not a credential rotation.

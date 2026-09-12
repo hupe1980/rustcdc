@@ -1,302 +1,334 @@
 +++
 title = "Getting started"
-description = "Build your first rustcdc pipeline: provision a replication slot, stream changes from PostgreSQL, and acknowledge them durably."
+description = "Install rustcdc, write a minimal configuration, and stream your first row-level change from PostgreSQL, MySQL, MariaDB or SQL Server in about ten minutes."
 weight = 10
 +++
 
-By the end of this page you will have a Rust binary that streams row changes out of a
-PostgreSQL database, applies them to a sink, and records durable progress so a restart
-resumes where it left off rather than replaying from the beginning.
+> [!TIP]
+> To see it working before configuring anything, run the
+> [self-contained demo](https://github.com/hupe1980/rustcdc/blob/main/demo/README.md).
+> It streams live PostgreSQL changes to your terminal in under two minutes:
+> `cd demo && docker compose up`
 
-The example uses PostgreSQL because it needs the least server-side setup. MySQL, MariaDB and
-SQL Server differ only in the source config and the server prerequisites — see the
-[configuration reference](@/docs/config-reference.md).
+You need a database you can enable replication on, and either Rust or Docker. Pick the
+install path that matches where this will run — a binary for local development, VMs and
+bare metal, or the container image for Kubernetes and CI.
 
-## Prerequisites
+## Install the binary
 
-- Rust 1.94 or newer
-- A PostgreSQL 10+ server you can configure, with `wal_level = logical`
-- A role with the **`REPLICATION`** attribute, and a **direct** connection to the server — the
-  default WAL transport runs `START_REPLICATION` and a pooler in transaction-pooling mode cannot
-  carry it. `ALTER ROLE <user> REPLICATION;` grants it (`rds_replication` on RDS). If your
-  environment cannot provide either, see
-  [`wal_transport`](@/docs/config-reference.md#wal-transport) for the SQL-based fallback.
-- Docker, if you want to run the connector-backed test suites
-
-A throwaway server for this walkthrough:
+Requires Rust 1.94.1 or later (`rustup update stable`).
 
 ```bash
-docker run --rm -d --name rustcdc-pg -p 5432:5432 \
-  -e POSTGRES_PASSWORD=postgres \
-  postgres:16 -c wal_level=logical
+git clone https://github.com/hupe1980/rustcdc
+cd rustcdc
+cargo build --release --locked
+sudo cp target/release/rustcdc /usr/local/bin/
+rustcdc --version
 ```
 
-The `postgres` superuser already has `REPLICATION`. Note this container has TLS off, so the
-walkthrough below sets `TransportConfig::plaintext()` explicitly — a TLS transport against a
-server without TLS now fails rather than silently downgrading.
+Building from source needs `cmake`, `clang` and `perl` on the build host — they are
+required by `aws-lc-sys`, the cryptography backend used for TLS.
 
-## 1. Add the dependency
+### Choosing connectors
+
+**A source build captures PostgreSQL only.** Connectors are cargo features, and the
+default is `postgres`:
+
+| Feature | Connectors | Default |
+|---|---|---|
+| `postgres` | PostgreSQL logical replication | **yes** |
+| `mysql` | MySQL and MariaDB binlog | no |
+| `sqlserver` | SQL Server CDC | no |
+| `glue` | AWS Glue Schema Registry codec | no |
 
 ```bash
-cargo add rustcdc --features postgres
-cargo add tokio --features full
+# MySQL and MariaDB instead of PostgreSQL
+cargo build --release --locked --no-default-features --features mysql
+
+# Everything
+cargo build --release --locked --all-features
 ```
 
-## 2. Prepare the source database
+At least one connector is required; a build with none fails to compile rather than
+producing a binary that rejects every configuration.
 
-CDC on PostgreSQL needs two server-side objects: a **publication** naming the tables to
-capture, and a **replication slot** holding the WAL position. Create both before the first
-run:
+This is a security boundary, not packaging taste. `sqlserver` pulls `tiberius`, which
+pins rustls 0.21 — **a second TLS stack**, with its own X.509 verifier and four
+suppressed RUSTSEC advisories that the admin listener and every sink (on rustls 0.23) do
+not carry. A PostgreSQL deployment that never touches SQL Server should not have to rely
+on "that code path is unreachable" being true; leaving the connector out makes the
+question moot. A default build links exactly one rustls and one webpki, and a test
+asserts it.
+
+A config naming a connector the binary lacks is rejected at startup with the feature to
+rebuild with — it never loads silently.
+
+**The container image is built with `--all-features`** and carries every connector, so
+none of this applies if you deploy the image.
+
+
+## Run with Docker
+
+The official image is multi-arch (`linux/amd64`, `linux/arm64`), runs as a
+non-root user, and is based on `distroless/cc` — no shell, no package manager.
+
+### Pull
+
+```bash
+docker pull ghcr.io/hupe1980/rustcdc-server:latest
+```
+
+### Verify
+
+```bash
+docker run --rm ghcr.io/hupe1980/rustcdc-server:latest --version
+```
+
+
+## Prepare PostgreSQL
+
+rustcdc reads from the PostgreSQL logical replication stream. You need
+`wal_level = logical` and a replication user.
 
 ```sql
-CREATE TABLE users (id bigserial PRIMARY KEY, email text NOT NULL, name text);
+-- 1. Enable logical replication (requires superuser; needs a server restart
+--    if wal_level was not already "logical")
+ALTER SYSTEM SET wal_level = logical;
+SELECT pg_reload_conf();   -- confirm with: SHOW wal_level;
 
-CREATE PUBLICATION rustcdc_publication FOR TABLE users;
-SELECT pg_create_logical_replication_slot('rustcdc_slot', 'pgoutput');
+-- 2. Create a dedicated replication user
+CREATE USER cdc_user WITH REPLICATION LOGIN PASSWORD 'changeme';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO cdc_user;
+
+-- 3. Create a publication for the tables you want to capture
+CREATE PUBLICATION cdc_pub FOR TABLE public.orders, public.customers;
 ```
 
-rustcdc will **not** create the slot for you unless you ask it to. A slot that vanished
-mid-life is a data-loss event, and silently recreating it restarts capture at the *current*
-WAL position — everything written in between is gone with no error raised anywhere. Provision
-it out of band, or set `create_replication_slot_if_missing = true` for first-time setup only.
+> **Cloud databases:** RDS, Azure Database for PostgreSQL, and Cloud SQL all
+> support logical replication — see the
+> [PostgreSQL connector guide](@/docs/connectors/postgres.md#4-cloud-databases).
 
-> **A slot holds WAL until it is consumed.** If your pipeline stops for long enough, the
-> server accumulates WAL and eventually runs out of disk. Monitor slot lag from day one — see
-> [the runbook](@/docs/runbook.md).
 
-## 3. Configure the runtime
+## Create your config
 
-`RuntimeConfig` binds four things: which source to read, where durable progress is recorded,
-where schema history lives, and the runtime options.
-
-```rust
-use rustcdc::{
-    checkpoint::FileCheckpoint, schema_history::FileSchemaHistory,
-    PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
-};
-
-# async fn build() -> rustcdc::Result<()> {
-let source = PostgresSourceConfig {
-    host: "localhost".into(),
-    port: 5432,
-    user: "postgres".into(),
-    password: "postgres".into(),
-    database: "postgres".into(),
-    replication_slot_name: "rustcdc_slot".into(),
-    publication_name: "rustcdc_publication".into(),
-    // The throwaway container above has TLS off. Against a real server, drop this line and
-    // keep the default TLS transport — which now means `sslmode=require`, so a server with
-    // `ssl = off` fails the connection rather than quietly sending everything in the clear.
-    transport: rustcdc::TransportConfig::plaintext(),
-    ..PostgresSourceConfig::default()
-};
-
-let config = RuntimeConfig::new(
-    RuntimeSourceConfig::Postgres(source),
-    FileCheckpoint::new("/var/lib/rustcdc/checkpoints"),
-    FileSchemaHistory::new("/var/lib/rustcdc/schema-history.json").await?,
-)
-.with_max_buffer_size(1_000);
-# let _ = config;
-# Ok(())
-# }
-```
-
-`InMemoryCheckpoint` and `InMemorySchemaHistory` exist and are convenient in tests, but they
-lose everything on restart — which means a restart re-reads from the beginning, or from
-nothing at all. Use the file-backed pair, or your own durable backend, for anything you care
-about.
-
-> **Create the checkpoint directory yourself.** `FileCheckpoint` refuses to run against a
-> directory that does not exist rather than creating one. A directory it created would be an
-> empty directory, and an empty checkpoint means "start from the log head" — which silently
-> skips everything written before now. A typo in the path would look exactly like a first
-> run. `std::fs::create_dir_all(...)` at startup makes that a deliberate choice.
-
-Both file-backed stores take an exclusive **owner lease** on their path, so a second writable
-instance against the same directory is refused instead of silently interleaving writes. Both
-also run every filesystem call — including `fsync` — on a blocking worker, so a commit never
-holds one of your executor threads.
-
-## 4. Run the loop
-
-The delivery contract is: poll a batch, apply it, then acknowledge it. The acknowledgement is
-a separate step on purpose — the durable position must not advance past what your sink has
-actually committed, or a crash in between silently skips those rows.
-
-```rust
-use rustcdc::{CdcRuntime, Event, RuntimeConfig};
-
-# fn apply(_event: &Event) -> rustcdc::Result<()> { Ok(()) }
-async fn run(config: RuntimeConfig) -> rustcdc::Result<()> {
-    let mut runtime = CdcRuntime::new(config)?;
-    runtime.start().await?;
-
-    loop {
-        let batch = runtime.poll_event_batch().await?;
-
-        for event in batch.events() {
-            apply(event)?;                      // your sink
-        }
-        // flush_sink().await?;                 // make the writes durable FIRST
-
-        runtime.commit_ack(batch.ack_mode()).await?;
-    }
-}
-```
-
-`batch.ack_mode()` returns an `AckToken` that `commit_ack` consumes. There is no other way to
-advance the checkpoint, so a pipeline that forgets to acknowledge stalls visibly instead of
-losing data quietly. An empty batch yields `AckMode::NotRequired` and `commit_ack` is a no-op,
-so the loop above is correct as written. Each token may be committed once — a second commit
-of the same token is refused rather than advancing the checkpoint over events you never saw.
-
-Order matters: flush the sink **before** acknowledging. Acknowledge first and a crash in the
-gap drops every event in the batch.
-
-### Or let the runtime drive it
-
-If your sink implements `SinkAdapter`, that whole loop — in the right order — is one call:
-
-```rust
-use rustcdc::{CdcRuntime, RuntimeConfig, sink::StdoutSink};
-use rustcdc::CancellationToken;
-
-async fn run(config: RuntimeConfig, shutdown: CancellationToken) -> rustcdc::Result<()> {
-    let mut runtime = CdcRuntime::new(config)?;
-    runtime.register_sink(StdoutSink::new());
-    runtime.start().await?;
-
-    runtime.run_to_completion(shutdown).await?;
-
-    runtime.stop().await?;   // closes the sink too
-    Ok(())
-}
-```
-
-Write the loop yourself when the sink write has to be coordinated with something the runtime
-cannot see — your own transaction, a two-phase commit, a fan-out with per-branch error
-handling. Otherwise `run_to_completion` is the same thing with the ordering already right.
-
-## 5. Apply events correctly
-
-`apply` above is where the one genuinely subtle part of CDC lives. Not every event carries a
-complete row, and writing a partial one as if it were complete overwrites untouched columns
-with `NULL`. Match on `row_write()` rather than reaching for `event.after`:
-
-```rust
-use rustcdc::RowWrite;
-# use rustcdc::Event;
-# struct Sink;
-# impl Sink {
-#     fn replace(&self, _key: Option<serde_json::Value>, _row: &serde_json::Value) {}
-#     fn update_only(&self, _key: serde_json::Value, _cols: &serde_json::Value) {}
-#     fn delete(&self, _key: serde_json::Value) {}
-#     fn truncate(&self) {}
-# }
-# fn example(event: &Event, sink: &Sink) {
-match event.row_write() {
-    // The source supplied the whole row: replace it.
-    RowWrite::Replace { key, row } => sink.replace(key, row),
-    // Partial row: SET only these columns, leave the rest alone.
-    RowWrite::Merge { key, columns, .. } => sink.update_only(key, columns),
-    RowWrite::Delete { key } => sink.delete(key),
-    RowWrite::Truncate => sink.truncate(),
-    // DDL, or an event with no addressable row.
-    RowWrite::None { .. } => {}
-    _ => {}
-}
-# }
-```
-
-Full treatment, including which fields tell you *why* a payload was partial, is in
-[Partial payloads](@/docs/api.md#partial-payloads-read-this-before-writing-a-sink).
-
-## 6. Backfill existing rows
-
-The steps so far capture changes made *after* the slot was created. To also load rows that
-already exist, run a snapshot. Prefer the incremental one:
-
-```rust
-use rustcdc::source::IncrementalSnapshotConfig;
-# use rustcdc::{checkpoint::InMemoryCheckpoint, schema_history::InMemorySchemaHistory,
-#     RuntimeConfig, RuntimeSourceConfig};
-# let config = RuntimeConfig::new(
-#     RuntimeSourceConfig::Disabled,
-#     InMemoryCheckpoint::default(),
-#     InMemorySchemaHistory::default(),
-# );
-
-let config = config.with_incremental_snapshot(
-    IncrementalSnapshotConfig::new(vec!["public.users".to_string()]),
-);
-# let _ = config;
-```
-
-This is the DBLog watermark algorithm: it interleaves keyset-paginated chunk reads with the
-live replication stream rather than holding one long transaction, so the stream never pauses
-and no transaction ID backlog accumulates. Chunk cursors are persisted inside the checkpoint
-offset — the same atomic, fsynced, checksummed write as the stream position — so a restart
-mid-snapshot resumes at the chunk boundary instead of starting the table over.
-
-`RuntimeConfig::with_snapshot_tables` is the older blocking path, kept for the case where you
-want one consistent read and do not care that the stream waits for it. Set one or the other,
-never both.
-
-## 7. Know whether it is running
-
-`RuntimeState` cannot distinguish a connector streaming from a quiet database from one hung on
-a dead socket — both report `Running`. Ask for the health verdict instead:
-
-```rust
-# use rustcdc::{CdcRuntime, HealthVerdict};
-# async fn example(runtime: &CdcRuntime) {
-let snapshot = runtime.admin_snapshot();
-if snapshot.health.is_alertable() {
-    // `Stalled { reason }` — the reason names both the condition and the remedy.
-    eprintln!("cdc stalled: {:?}", snapshot.health);
-}
-# }
-```
-
-The same verdict is exported as `rustcdc_runtime_health{verdict="stalled"}` for Prometheus.
-Alert on exactly that; see [health verdict](@/docs/runbook.md#health-verdict-idle-vs-stalled)
-for why `Idle` is not an alert condition.
-
-## Delivery guarantees
-
-rustcdc is **at-least-once**. After a crash, a restart, or a partial ack window, you will see
-duplicates. Ordering is preserved within committed ack prefixes. Deduplicate sink-side on a
-stable key — source, table, primary key, source offset — and test that dedup before you rely
-on it.
-
-There is no exactly-once mode, and no configuration that produces one.
-
-## Feature profiles
-
-The default build is `postgres` + `tls`. Everything else is additive:
+Generate a starter file:
 
 ```bash
-cargo build                                # postgres + tls
-cargo build --features mysql               # or mariadb, sqlserver
-cargo build --features wasm                # WASM transform sandbox (~15 MB overhead)
-cargo build --no-default-features          # foundation only, no connector
-cargo build --all-features
+rustcdc init --output cdc.toml --profile dev
 ```
 
-Relational connector features enable `tls` transitively. Private-CA and mutual-TLS
-deployments need no extra feature — configure `TransportConfig::tls_with_ca_cert_path(...)`
-or `TransportConfig::mtls(...)` directly. `TransportConfig::tls_insecure_skip_verify()` exists
-for local testing and air-gapped environments where CA distribution is impractical; it
-disables certificate *and* hostname verification and does not belong in production.
+Then edit `cdc.toml` to match your environment. The minimal working config:
 
-## Where to go next
+```toml
+api_version = "v1"
 
-- [Architecture](@/docs/architecture.md) — the commit barrier and checkpoint model, and why
-  the ack is a separate step
-- [API guide](@/docs/api.md) — transforms, codecs, schema registries, custom sinks
-- [Configuration reference](@/docs/config-reference.md) — every option and the failure it
-  prevents, including the MySQL and SQL Server server-side prerequisites
-- [Reliability testing](@/docs/reliability-testing.md) — replay a captured stream inside your
-  own test suite
-- [Runbook](@/docs/runbook.md) — what to alert on before this goes to production
+[source.postgres]
+host        = "localhost"
+port        = 5432
+user        = "cdc_user"
+password    = { env = "POSTGRES_PASSWORD" }   # never hardcode secrets
+database    = "mydb"
+publication_name      = "cdc_pub"
+replication_slot_name = "cdc_slot"
+table_include_list = ["public.orders", "public.customers"]
+table_exclude_list = []
+conn_timeout_secs       = 10
+stream_poll_interval_ms = 100
+max_events_per_poll     = 1000
+
+# Quickstart convenience: create the replication slot on first connect.
+# In production, provision the slot out of band and set this to false —
+# a slot that vanishes mid-life is a data-loss event, and recreating it
+# silently would skip everything in between.
+create_replication_slot_if_missing = true
+
+[source.postgres.transport]
+mode = "plaintext"
+
+[sink]
+type = "stdout"   # swap for http, kafka, or iceberg when ready
+
+[state]
+dir = "./state"
+```
+
+Validate before running:
+
+```bash
+rustcdc validate-config --config-file cdc.toml
+```
+
+
+## First run
+
+### Binary
+
+```bash
+export POSTGRES_PASSWORD="changeme"
+
+# (Kafka-topic state backend only) seed the state topic first:
+# rustcdc init-state --config-file cdc.toml
+
+# Start streaming — the slot is created on first connect thanks to
+# create_replication_slot_if_missing = true
+rustcdc run --config-file cdc.toml
+```
+
+### Docker
+
+```bash
+docker run --rm \
+  -e POSTGRES_PASSWORD="changeme" \
+  -v "$PWD/cdc.toml:/etc/rustcdc/config.toml:ro" \
+  -v "$PWD/state:/var/lib/rustcdc/state" \
+  -p 8080:8080 \
+  ghcr.io/hupe1980/rustcdc-server:latest \
+  run --config-file /etc/rustcdc/config.toml
+```
+
+> **Tip:** add `--network host` (Linux) or configure `host.docker.internal` so
+> the container can reach your local Postgres.
+
+### Docker Compose (development)
+
+```yaml
+# compose.yml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: mydb
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports: ["5432:5432"]
+
+  rustcdc:
+    image: ghcr.io/hupe1980/rustcdc-server:latest
+    depends_on: [postgres]
+    environment:
+      POSTGRES_PASSWORD: changeme
+    volumes:
+      - ./cdc.toml:/etc/rustcdc/config.toml:ro
+      - rustcdc-state:/var/lib/rustcdc/state
+    ports: ["8080:8080"]
+    command: ["run", "--config-file", "/etc/rustcdc/config.toml"]
+
+volumes:
+  rustcdc-state:
+```
+
+```bash
+docker compose up
+```
+
+
+## Verify it's working
+
+Events stream to stdout as JSON lines — the full rustcdc event envelope
+(abridged; real events also carry `source`, `ts`, `transaction`, and
+`envelope_version`):
+
+```json
+{"before":null,"after":{"id":42,"amount":"99.99","status":"pending"},"op":"insert",
+ "schema":"public","table":"orders","primary_key":["id"],"before_is_key_only":false}
+```
+
+Check the admin API (available on port 8080). With the dev profile, `/healthz`,
+`/livez`, and `/readyz` need no token; `/status` and `/metrics` always require a
+read token — configure `[admin] read_token_env` and export the variable first:
+
+```bash
+# Liveness / readiness (no token needed with the dev profile)
+curl http://localhost:8080/livez
+curl http://localhost:8080/readyz
+
+# Pipeline status and Prometheus metrics (read token required)
+export RUSTCDC_ADMIN_READ_TOKEN="my-dev-read-token"   # matches [admin] read_token_env
+curl -H "Authorization: Bearer $RUSTCDC_ADMIN_READ_TOKEN" http://localhost:8080/status
+curl -H "Authorization: Bearer $RUSTCDC_ADMIN_READ_TOKEN" http://localhost:8080/metrics
+```
+
+
+## Add a transform (optional)
+
+rustcdc can modify, filter, or enrich every event before it reaches the sink.
+Two modes are available:
+
+**Native rules** — zero-code, declared in TOML. Good for filtering and simple
+field operations:
+
+```toml
+# Drop audit-log events and stamp provenance metadata onto customer events
+[[pipeline.transforms]]
+name = "drop-audit-log"
+
+  [[pipeline.transforms.actions]]
+  type = "filter"
+  include_tables = ["customers", "orders"]   # everything else is dropped
+
+[[pipeline.transforms]]
+name = "stamp-metadata"
+
+  [pipeline.transforms.when]
+  tables = ["customers"]
+  ops    = ["insert", "update", "read"]
+
+  [[pipeline.transforms.actions]]
+  type         = "metadata_projection"
+  target_field = "_meta"
+  fields       = ["source_name", "offset", "table", "operation"]
+```
+
+Available native actions: `unwrap`, `flatten`, `filter`, `route`,
+`metadata_projection`, `key_shaping`. For column redaction/masking, use a WASM
+module (below).
+
+**WASM module** — arbitrary logic compiled from Rust, AssemblyScript, TinyGo,
+or any `wasm32` target. Use this for enrichment, complex routing, custom
+pseudonymisation, and anything native rules cannot express:
+
+```toml
+[pipeline.transform_runtime]
+mode = "wasm"
+
+  [pipeline.transform_runtime.wasm]
+  module_path        = "/etc/rustcdc/my_transform.wasm"
+  timeout_ms         = 50
+  max_memory_bytes   = 8388608
+  instance_pool_size = 4
+```
+
+→ [Writing WASM transforms](@/docs/transforms.md) for build steps, patterns, testing,
+and Kubernetes deployment.
+
+
+## Production checklist
+
+Before going to production, work through these items:
+
+- [ ] **Sink** — swap `stdout` for `kafka`, `http`, or `iceberg`
+  ([sink configuration](@/docs/configuration.md#3-sink-sink-sinks))
+- [ ] **Delivery contract** — set `delivery_contract = "at_least_once"` (default)
+  or `"effectively_once"` for Kafka
+  ([delivery contracts](@/docs/concepts.md#3-delivery-contracts))
+- [ ] **State backend** — replace `local_fs` with `kafka_topic`, `redis`, or
+  `postgresql` for HA ([state backends](@/docs/configuration.md#4-state-backends-state))
+- [ ] **Secrets** — all passwords via `{ env = "VAR" }`, never inline
+- [ ] **Audit trail** — enable signing and IP pseudonymisation
+  ([security hardening](@/docs/configuration.md#7-admin-api-admin))
+- [ ] **Health probes** — wire `/livez` and `/readyz` to your orchestrator
+  ([admin API](@/docs/configuration.md#7-admin-api-admin))
+- [ ] **SLO alerts** — deploy `monitoring/rustcdc_slo_alerts.yml` to Prometheus
+
+
+## Next steps
+
+| Guide | What it covers |
+|---|---|
+| [PostgreSQL connector](@/docs/connectors/postgres.md) | Publications, slots, replica identity, RDS/Azure/GCP, HA failover |
+| [MySQL / MariaDB connector](@/docs/connectors/mysql.md) | `binlog_format`, `server_id`, grants, GTID |
+| [SQL Server connector](@/docs/connectors/sqlserver.md) | `sp_cdc_enable_db`, permissions, polling interval |
+| [Core concepts](@/docs/concepts.md) | Event model, pipeline lifecycle, delivery contracts, circuit breaker |
+| [Configuration reference](@/docs/configuration.md) | Every TOML field with defaults and examples |
+| [Operations guide](@/docs/operations.md) | Replay, migrate-state, graceful shutdown, performance tuning |
+| [Writing WASM transforms](@/docs/transforms.md) | Write custom transforms in Rust, AssemblyScript, or any WASM language |

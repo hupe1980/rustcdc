@@ -1,43 +1,81 @@
-# Copilot Instructions for rustcdc
+# Copilot instructions — rustcdc
 
-## Project intent
-- This repository is a correctness-first Rust CDC library.
-- Prioritize correctness and replay safety over convenience.
-- Treat data loss, silent corruption, and uncontrolled duplication risks as release-critical concerns.
+## What this repository is
 
-## Engineering priorities
-- Preserve runtime commit/checkpoint ordering invariants.
-- Keep at-least-once semantics explicit; do not imply exactly-once guarantees.
-- Prefer deterministic behavior and explicit policy knobs over hidden heuristics.
-- Avoid introducing deprecated APIs or deprecated usage patterns.
+A Cargo workspace shipping change data capture two ways from one version:
 
-## Required validation for meaningful changes
-Run these locally when touching related areas:
-- General quality:
-  - `cargo check --all-targets --all-features`
-  - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `bash scripts/ci-policy-gate.sh`
-- Policy/contract gates:
-  - `bash scripts/ci-policy-gate.sh`
-- If touching benchmark/release evidence logic:
-  - `bash scripts/ci-benchmark-gate.sh`
-  - `bash scripts/run_full_integration_matrix_evidence.sh`
-- If touching latency evidence logic:
-  - `bash scripts/ci-latency-gate.sh`
+| Crate | What |
+|---|---|
+| `crates/rustcdc` | The library. Published to crates.io |
+| `crates/rustcdc-server` | The server binary and container image. `publish = false` |
+| `crates/crash-workers` | Binaries the process-crash suites spawn; a test cannot `SIGKILL` itself |
+| `crates/xtask` | `cargo xtask <task>` — the repository's gates |
 
-## CI policy invariants
-- Keep `scripts/ci-benchmark-gate.sh` and `scripts/run_full_integration_matrix_evidence.sh` as the release evidence execution path in `ci.yml`.
-- Keep `BENCHMARK_ENFORCE_RELEASE_POLICY: "1"` in release workflows.
-- Keep policy-gate, reliability-core, and latency-core lanes present in default CI.
-- Keep core connector integration matrix jobs present on push/pull_request unless intentionally re-governed.
+Everything that decides correctness is in the library. The server adds configuration,
+sinks, state backends and an operational surface on top.
 
-## Code change guidance
-- Prefer small, auditable changes with direct evidence.
-- Add or update tests when changing behavior.
-- Do not relax safety checks silently; if policies are changed, update docs and CI guards together.
-- Keep scripts portable across macOS/Linux shell environments.
+Rust 1.94.1, edition 2024. Every command runs from the repository root.
 
-## Documentation guidance
-- Keep docs aligned with implementation and CI behavior.
-- For audits and findings, prefer current-state reporting over historical timelines unless explicitly requested.
-- Include clear release conditions and evidence anchors when documenting risk decisions.
+## Priorities
+
+Correctness and replay safety over convenience. Data loss, silent corruption and
+uncontrolled duplication are release-critical.
+
+- Preserve the commit-barrier ordering: the durable checkpoint never advances past an event
+  the sink has not acknowledged.
+- Keep delivery semantics explicit. Do not imply exactly-once where the mechanism does not
+  provide it.
+- Prefer deterministic behaviour and explicit policy knobs over hidden heuristics.
+- **State limits next to guarantees.** A guarantee that silently does not hold is worse
+  than one that is absent.
+
+## Validation
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test -p rustcdc --lib --all-features
+cargo test -p rustcdc-server --lib --all-features
+cargo xtask policy-gate            # the gate a pull request must pass
+```
+
+Also run when relevant:
+
+- Touched the library's public API, or any published `.md`: `cargo test -p rustcdc --doc --all-features`
+- Touched the library's file layout, `build.rs`, or anything it reads: `cargo package -p rustcdc --locked`
+- Touched benchmarks: `cargo xtask bench --no-run` to compile them, `cargo xtask benchmark-gate`
+  to compare against the baseline. Never plain `cargo bench`: benchmarks are a release-profile
+  build and `test-harnesses` arrives through a dev-dependency, which the guard in
+  `fault_injection` rejects. `xtask bench` opens the documented hatch and scopes the package.
+- Touched release evidence: `cargo xtask evidence`
+- Touched latency evidence: `cargo xtask latency-gate`
+- Touched dependencies: `cargo deny check`
+
+## Standing rules
+
+1. **Test the path the user crosses.** A unit test of a helper is not coverage of a feature.
+2. **A guard that cannot fire is worse than no guard** — it reads as coverage. Verify every
+   new guard against a *planted* violation before trusting it.
+3. **Two implementations of one semantic must be reduced to one**, or asserted to agree.
+4. **Prose is not data.** Anything compared, routed or keyed on must be a stable value, not
+   a human-readable string.
+5. **Name the test that pins a number.** If you cannot, write "not measured".
+6. **Reproduce before repairing**, then plant the defect against the new test. A regression
+   test that passes against the old code is not a regression test.
+
+## Writing style
+
+- Comments explain **why**, not what. Delete a comment that restates the code.
+- No essays. If a comment needs three paragraphs, the code probably needs changing.
+- Published docs under `site/content/docs/` are **not a changelog**. Describe current
+  behaviour; do not narrate what a previous release did wrong.
+- Every Rust block in `README.md` and `site/content/docs/` is compiled by
+  `cargo test --doc`. Mark a block that genuinely cannot run `ignore` with a one-line reason.
+
+## Do not
+
+- Add a Git dependency — it makes the crate unpublishable.
+- Add `unsafe` outside the two allowlisted sites (`crates/rustcdc-server/tests/architecture.rs`
+  holds the list).
+- Relax a safety check silently. Change the policy and its CI guard together.
+- Introduce deprecated APIs or usage patterns.

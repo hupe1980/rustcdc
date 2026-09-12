@@ -193,18 +193,34 @@ run_case() {
   echo | tee -a "$report_path"
 }
 
+# `-p rustcdc`, not a bare `cargo test`, and for the same reason the benchmark gate needs
+# `-p`: without it cargo selects every default workspace member and unifies features
+# across the lot. `rustcdc-server`'s dependency graph turns on *both* rustls providers
+# (`ring` via testcontainers, `aws-lc-rs` via reqwest), and rustls will not guess between
+# two — so `mysql_connection_integration` panicked here on a CryptoProvider it resolves
+# fine in CI, which runs the scoped command. Release evidence has to run what CI runs.
 run_test_case() {
   local label="$1"
   local test_target="$2"
   local features="$3"
-  run_case "$label" cargo test --test "$test_target" --features "$features"
+  run_case "$label" cargo test -p rustcdc --test "$test_target" --features "$features"
 }
 
-run_xtask_worker_build_case() {
-  local label="$1"
-  local worker_bin="$2"
-  local features="$3"
-  run_case "$label" cargo build -p xtask --bin "$worker_bin" --features "$features"
+# `runtime_<db>_process_crash_integration` launches a helper binary from the
+# `crash-workers` crate and kills it mid-stream. Build that worker as its own labelled
+# case first, so a compile error in it reads as a build failure rather than as a
+# mysterious crash-recovery failure.
+#
+# Derived from the test target name rather than one `if` per database. The four
+# hardcoded branches this replaces still said `-p xtask`, from before the workers moved
+# out of that crate, so every one of them failed; and mariadb never had a branch at all,
+# so its worker was the only one built implicitly, inside the test.
+maybe_run_crash_worker_build() {
+  local test_target="$1" db
+  [[ "$test_target" =~ ^runtime_([a-z]+)_process_crash_integration$ ]] || return 0
+  db="${BASH_REMATCH[1]}"
+  run_case "${db} crash worker build" \
+    cargo build -p crash-workers --bin "${db}_crash_worker" --features "$db"
 }
 
 postgres_suites=(
@@ -238,6 +254,7 @@ mysql_suites=(
 mariadb_suites=(
   "mariadb connection|mariadb_connection_integration|mariadb"
   "mariadb e2e|mariadb_e2e_integration|mariadb"
+  "mariadb process crash|runtime_mariadb_process_crash_integration|mariadb"
 )
 
 sqlserver_suites=(
@@ -262,30 +279,25 @@ reliability_suites=(
 
 for entry in "${postgres_suites[@]}"; do
   IFS='|' read -r label test_target features <<< "$entry"
-  if [[ "$test_target" == "runtime_postgres_process_crash_integration" ]]; then
-    run_xtask_worker_build_case "postgres crash worker build" "postgres_crash_worker" "postgres"
-  fi
+  maybe_run_crash_worker_build "$test_target"
   run_test_case "$label" "$test_target" "$features"
 done
 
 for entry in "${mysql_suites[@]}"; do
   IFS='|' read -r label test_target features <<< "$entry"
-  if [[ "$test_target" == "runtime_mysql_process_crash_integration" ]]; then
-    run_xtask_worker_build_case "mysql crash worker build" "mysql_crash_worker" "mysql"
-  fi
+  maybe_run_crash_worker_build "$test_target"
   run_test_case "$label" "$test_target" "$features"
 done
 
 for entry in "${mariadb_suites[@]}"; do
   IFS='|' read -r label test_target features <<< "$entry"
+  maybe_run_crash_worker_build "$test_target"
   run_test_case "$label" "$test_target" "$features"
 done
 
 for entry in "${sqlserver_suites[@]}"; do
   IFS='|' read -r label test_target features <<< "$entry"
-  if [[ "$test_target" == "runtime_sqlserver_process_crash_integration" ]]; then
-    run_xtask_worker_build_case "sqlserver crash worker build" "sqlserver_crash_worker" "sqlserver"
-  fi
+  maybe_run_crash_worker_build "$test_target"
   run_test_case "$label" "$test_target" "$features"
 done
 

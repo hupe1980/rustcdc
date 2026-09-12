@@ -1,0 +1,35 @@
+name: Install build dependencies
+description: >
+  Install apt packages from Ubuntu's own archive, with the hosted image's unused
+  third-party repositories taken out of the way first.
+
+inputs:
+  packages:
+    description: Space-separated apt packages to install.
+    required: false
+    default: cmake clang perl pkg-config
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        # `apt-get update` fails the whole step when any *one* configured repository is
+        # unhealthy, and the hosted runner image registers third-party repositories —
+        # Google Chrome and Microsoft — that nothing in this workflow installs from. On
+        # 2026-09-09 a bad publish on Google's CDN (a hash-sum mismatch on
+        # `dl.google.com/linux/chrome-stable`) failed the Clippy job, having fetched every
+        # Ubuntu index it actually needed without trouble.
+        #
+        # Every package this repository installs comes from Ubuntu's archive, so dropping
+        # the lists we never read puts that class of outage out of reach rather than
+        # leaving CI to be re-run until someone else's mirror recovers.
+        sudo rm -f /etc/apt/sources.list.d/google-chrome.* \
+                   /etc/apt/sources.list.d/microsoft-prod.*
+        sudo apt-get update
+        # Unquoted on purpose: the input is a space-separated package list.
+        # shellcheck disable=SC2086
+        sudo apt-get install -y --no-install-recommends $PACKAGES

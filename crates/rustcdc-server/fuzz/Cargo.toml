@@ -1,0 +1,42 @@
+# cargo-fuzz targets (libFuzzer). Deep, unbounded fuzzing for the two surfaces that parse
+# operator- or attacker-shaped input.
+#
+# Excluded from the workspace on purpose: it needs a nightly toolchain and `cargo fuzz`,
+# so building it must not be a precondition for `cargo build` on stable.
+#
+# Run:
+#   cargo +nightly fuzz run redact_secrets
+#   cargo +nightly fuzz run config_loader
+#
+# The always-on half of this coverage is `tests/fuzz_properties.rs`, which runs on stable
+# in every CI build. These targets go deeper; that suite guarantees the invariants are
+# checked continuously. Both exist because either alone leaves a gap.
+
+[package]
+name = "rustcdc-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rustcdc-server = { path = ".." }
+serde_json = "1"
+tempfile = "3"
+
+[[bin]]
+name = "redact_secrets"
+path = "fuzz_targets/redact_secrets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_loader"
+path = "fuzz_targets/config_loader.rs"
+test = false
+doc = false
+bench = false

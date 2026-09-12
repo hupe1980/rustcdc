@@ -1,0 +1,55 @@
+# The **library** example stack: PostgreSQL plus the `pg_to_stdout` example binary.
+#
+# This is not the product. For the server, use `demo/compose.yml`, which runs the
+# actual `rustcdc` binary against a seeded database with a Kafka sink.
+#
+#   docker compose -f docker/compose.example.yml up --build
+#
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=16
+      - -c
+      - max_wal_senders=16
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./initdb/01_cdc_setup.sql:/docker-entrypoint-initdb.d/01_cdc_setup.sql:ro
+
+  cdc-rs:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.example
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CDC_RS_HOST: postgres
+      CDC_RS_PORT: "5432"
+      CDC_RS_USER: postgres
+      CDC_RS_PASSWORD: postgres
+      CDC_RS_DB: app
+      CDC_RS_SLOT: cdc_rs_example_slot
+      CDC_RS_PUBLICATION: cdc_rs_example_pub
+      CDC_RS_SNAPSHOT_TABLES: public.users
+      CDC_RS_CHECKPOINT_DIR: /var/lib/cdc-rs/checkpoints
+      RUST_LOG: info
+    volumes:
+      - cdc-rs-checkpoints:/var/lib/cdc-rs/checkpoints
+
+volumes:
+  cdc-rs-checkpoints:

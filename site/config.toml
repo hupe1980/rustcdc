@@ -1,37 +1,192 @@
-# Zola configuration for the rustcdc site.
+# Zola configuration for the rustcdc documentation site.
 #
-# The site is two things: a landing page that says what the library is and why it
-# exists, and the documentation set. Both are generated from Markdown that also
-# ships in the repository, so there is one source of truth rather than a copy that
-# drifts.
-
+# One site, one documentation section. The server and the library are one product at one
+# version, so the pages are grouped by task rather than by artefact — a reader should not
+# have to pick a side before knowing which one they want.
+#
+# Build:  zola --root site build
+# Serve:  zola --root site serve
+# Check:  zola --root site check   (validates every internal and external link)
+#
+# `base_url` must match where the site is actually served, because it is what the
+# canonical URL, the sitemap and the Open Graph tags are built from — all three are
+# silently wrong if it drifts. Change it here and nowhere else; no template hard-codes
+# a host. For a custom domain, set it here and add `static/CNAME`.
 base_url = "https://hupe1980.github.io/rustcdc"
+
 title = "rustcdc"
-description = "Embeddable change data capture for Rust. PostgreSQL, MySQL, MariaDB and SQL Server in one crate — no JVM, no sidecar."
+description = "Open-source change data capture in Rust. Stream row-level changes from PostgreSQL, MySQL, MariaDB and SQL Server to Kafka, Iceberg, HTTP or files — as a server, or as a crate you embed."
+
+# UK spelling throughout the prose; this only affects Zola's own slug generation.
 default_language = "en"
 
 compile_sass = true
+
+# Powers the client-side documentation search. Zola emits an elasticlunr index at
+# build time, so search needs no server, no third-party service and no request that
+# leaves the reader's browser.
 build_search_index = true
-generate_feeds = true
-feed_filenames = ["atom.xml"]
+
+# Zola 0.23 made every content file a Tera template, rendered *before* the markdown
+# parser and with no protection for fenced code blocks. On a site that is mostly code
+# samples that is a standing hazard: any Rust `format!` escape, Prometheus annotation,
+# Helm value or Vue snippet containing `{{` fails the build, and the failure reads as a
+# template error in a file that contains no template. Upstream considers this intended
+# (getzola/zola#3263, closed "not going to happen by default").
+#
+# Skipping the pass for all content restores what 0.22 did. Nothing here wants Tera in
+# prose: the one former shortcode had a single call site, and the number it inserted is
+# now checked against the manifest by `crates/rustcdc-server/tests/architecture.rs`, which is a stronger
+# guarantee than an indirection that merely moved where the number was written.
+skip_content_templating = ["**/*.md"]
+
+# Every `@/…md` link is resolved at build time, so a renamed page fails the build
+# instead of shipping a 404. This is the whole reason internal links use that syntax
+# rather than plain relative paths.
+[link_checker]
+internal_level = "error"
+external_level = "warn"
 
 [markdown]
-render_emoji = false
-# Heading anchors make every section linkable, which is what people actually paste
-# into an issue or a support thread.
+# Heading anchors are how deep links into the reference pages stay stable.
 insert_anchor_links = "heading"
+# Off: the reference pages are full of ASCII operators and quoted TOML, and turning
+# `"` into typographic quotes inside prose that discusses literal syntax is a hazard.
 smart_punctuation = false
+# `> [!NOTE]` and friends render as callouts, which several pages already use in spirit.
+github_alerts = true
+external_links_target_blank = false
+external_links_no_referrer = true
+
+[markdown.highlighting]
+# Solarized-dark reads well against both the light and dark page themes, which keeps one
+# highlighting theme rather than shipping two stylesheets and switching between them.
+theme = "solarized-dark"
 
 [search]
 include_title = true
 include_description = true
 include_path = true
-include_content = true
+# Truncated, not omitted: the full body of `configuration.md` alone would dominate the
+# index and make the first load noticeably slower on a phone.
+truncate_content_length = 400
 
 [extra]
-repo_url = "https://github.com/hupe1980/rustcdc"
+repo = "https://github.com/hupe1980/rustcdc"
+repo_name = "hupe1980/rustcdc"
+ghcr = "https://github.com/hupe1980/rustcdc/pkgs/container/rustcdc"
 crate_url = "https://crates.io/crates/rustcdc"
 docs_rs_url = "https://docs.rs/rustcdc"
-author = "hupe1980"
-# Shown in the page footer and in structured data.
 license = "MIT OR Apache-2.0"
+# Shown in the header and in the structured data. Checked against the workspace
+# manifest by `crates/rustcdc-server/tests/architecture.rs`, so it cannot drift.
+version = "0.15.0"
+rust_version = "1.94.1"
+# Used for the Open Graph and Twitter card images.
+og_image = "/og.png"
+author = "hupe1980"
+
+# Left-hand documentation navigation. Declared here rather than derived from the
+# filesystem so the order is editorial — what a reader needs first, not alphabetical.
+#
+# One section, not two. The library and the server are one product at one version, and
+# splitting the documentation by *artefact* made a reader pick a side before they knew
+# which one they wanted — then re-read the same concepts in whichever half they landed in.
+# Pages are grouped by the task instead, and each says at the top which surface it applies
+# to when that is not both.
+
+[[extra.nav]]
+title = "Start"
+[[extra.nav.pages]]
+title = "Getting started"
+path = "/docs/getting-started/"
+[[extra.nav.pages]]
+title = "Embedding the library"
+path = "/docs/embedding/"
+[[extra.nav.pages]]
+title = "Core concepts"
+path = "/docs/concepts/"
+[[extra.nav.pages]]
+title = "Architecture"
+path = "/docs/architecture/"
+
+[[extra.nav]]
+title = "Connect a source"
+[[extra.nav.pages]]
+title = "PostgreSQL"
+path = "/docs/connectors/postgres/"
+[[extra.nav.pages]]
+title = "MySQL / MariaDB"
+path = "/docs/connectors/mysql/"
+[[extra.nav.pages]]
+title = "SQL Server"
+path = "/docs/connectors/sqlserver/"
+[[extra.nav.pages]]
+title = "Snowflake"
+path = "/docs/snowflake/"
+
+[[extra.nav]]
+title = "Configure"
+[[extra.nav.pages]]
+title = "Server configuration"
+path = "/docs/configuration/"
+[[extra.nav.pages]]
+title = "Library options"
+path = "/docs/config-reference/"
+[[extra.nav.pages]]
+title = "Schema evolution"
+path = "/docs/schema-evolution/"
+[[extra.nav.pages]]
+title = "Feature flags"
+path = "/docs/feature-policy/"
+
+[[extra.nav]]
+title = "Build on it"
+[[extra.nav.pages]]
+title = "API guide"
+path = "/docs/api/"
+[[extra.nav.pages]]
+title = "Transforms"
+path = "/docs/transforms/"
+[[extra.nav.pages]]
+title = "WASM transform SDK"
+path = "/docs/wasm-transform-sdk/"
+[[extra.nav.pages]]
+title = "WASM conformance"
+path = "/docs/wasm-conformance-contract/"
+[[extra.nav.pages]]
+title = "Writing a connector"
+path = "/docs/adapter-sdk/"
+
+[[extra.nav]]
+title = "Run it"
+[[extra.nav.pages]]
+title = "Deployment"
+path = "/docs/deployment/"
+[[extra.nav.pages]]
+title = "Operations"
+path = "/docs/operations/"
+[[extra.nav.pages]]
+title = "Incident runbook"
+path = "/docs/runbook/"
+[[extra.nav.pages]]
+title = "Embedded pipelines"
+path = "/docs/embedded-operations/"
+[[extra.nav.pages]]
+title = "Troubleshooting"
+path = "/docs/troubleshooting/"
+[[extra.nav.pages]]
+title = "Security"
+path = "/docs/security/"
+
+[[extra.nav]]
+title = "Evidence"
+[[extra.nav.pages]]
+title = "How defects are prevented"
+path = "/docs/engineering/"
+[[extra.nav.pages]]
+title = "Reliability testing"
+path = "/docs/reliability-testing/"
+[[extra.nav.pages]]
+title = "Comparison"
+path = "/docs/library-parity-matrix/"

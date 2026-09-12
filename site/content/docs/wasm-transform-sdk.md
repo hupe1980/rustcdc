@@ -107,7 +107,7 @@ let pool: Vec<WasmRuntime> = (0..shards)
 - Memory and timeout limits apply per-instance, per-invocation.
 
 ## Rust API Reference
-Implemented in [`src/wasm/runtime.rs`](https://github.com/hupe1980/rustcdc/blob/main/src/wasm/runtime.rs):
+Implemented in [`src/wasm/runtime.rs`](https://github.com/hupe1980/rustcdc/blob/main/crates/rustcdc/src/wasm/runtime.rs):
 - `WasmRuntime`
   - `new(wasm_module_path: &str) -> Result<Self>`
   - `new_with_config(config: WasmConfig) -> Result<Self>`
@@ -131,26 +131,31 @@ Implemented in [`src/wasm/runtime.rs`](https://github.com/hupe1980/rustcdc/blob/
 
 ## Example Guest Transform Skeleton (Rust)
 
+> [!NOTE]
+> `#[unsafe(no_mangle)]` is the **Rust 2024** spelling, which this page is compiled
+> against. On edition 2021 and earlier, write `#[no_mangle]` — the attribute is
+> otherwise identical. The edition of your guest crate is what decides, not rustcdc's.
+
 ```rust
 use std::sync::atomic::{AtomicI32, Ordering};
 
 static HEAP: AtomicI32 = AtomicI32::new(8); // address 0 is reserved
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rustcdc_abi_version() -> i32 { 2 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn alloc(len: i32) -> i32 {
     HEAP.fetch_add(len, Ordering::Relaxed)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dealloc(_ptr: i32, _len: i32) {} // no-op for bump allocator
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn init(_config_ptr: i32, _config_len: i32) -> i32 { 0 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn transform(event_ptr: i32, event_len: i32) -> i64 {
     // 1. Read input bytes from [event_ptr .. event_ptr+event_len).
     // 2. Parse, transform, serialise output.
@@ -162,7 +167,7 @@ pub extern "C" fn transform(event_ptr: i32, event_len: i32) -> i64 {
     0 // drop the event (example: filter everything)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn shutdown() -> i32 { 0 }
 ```
 

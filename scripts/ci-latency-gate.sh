@@ -29,13 +29,13 @@ run_latency_step() {
 }
 
 run_latency_step "postgres connector latency evidence" \
-  cargo test --test postgres_latency_evidence --features postgres -- --nocapture
+  cargo test -p rustcdc --test postgres_latency_evidence --features postgres -- --nocapture
 
 run_latency_step "mysql connector latency evidence" \
-  cargo test --test mysql_latency_evidence --features mysql -- --nocapture
+  cargo test -p rustcdc --test mysql_latency_evidence --features mysql -- --nocapture
 
 run_latency_step "sqlserver connector latency evidence" \
-  cargo test --test sqlserver_latency_evidence --features sqlserver -- --nocapture
+  cargo test -p rustcdc --test sqlserver_latency_evidence --features sqlserver -- --nocapture
 
 for artifact in target/postgres-latency-evidence.md target/mysql-latency-evidence.md target/sqlserver-latency-evidence.md; do
   if [[ -f "$artifact" ]]; then
@@ -54,7 +54,7 @@ echo "Report written to $latency_evidence_report_path" | tee -a "$latency_eviden
 #
 # These gate CAPTURE LATENCY: wall-clock time from the writer committing a row to the
 # event reaching the consumer, measured against a single clock with writes running
-# concurrently with polling. See tests/latency_evidence_common.rs.
+# concurrently with polling. See crates/rustcdc/tests/latency_evidence_common.rs.
 #
 # The previous thresholds (p95 <= 500 ms) gated `poll_latency`, which timed draining an
 # already-populated in-process VecDeque. That is a sub-millisecond operation, so a 500 ms

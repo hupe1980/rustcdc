@@ -17,23 +17,56 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings fail the build. Clippy is already run with `-D warnings` on Linux and macOS,
+  # but `cargo check` on Windows is the only lane that compiles the `#[cfg(windows)]` code
+  # at all — so without this, a warning (or an edition change that only that code trips
+  # over) reaches a pull request as green.
+  RUSTFLAGS: "-D warnings"
+
 jobs:
+  # `rust-version` in Cargo.toml is a promise to downstream consumers. Without a job
+  # pinned to it, the promise is only ever tested against whatever `stable` happens to be,
+  # and a newer-than-MSRV feature ships unnoticed.
+  #
+  # The toolchain is **read from the manifest** rather than written here. This job used to
+  # hardcode `1.94.0` while the manifest said `1.94`: two sources of truth for one number,
+  # and exactly how they drift. A dependency raised its own requirement, the pinned job
+  # started failing, and nothing said which of the two values was wrong.
+  # `crates/rustcdc-server/tests/architecture.rs` asserts this job derives rather than restates.
   msrv:
+    name: "workspace: MSRV"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test -n "$version" || { echo "no rust-version in [workspace.package]"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $version"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.94.0
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check --no-default-features (msrv)
-        run: cargo check --no-default-features
-      - name: cargo check --features default (msrv)
-        run: cargo check --features default
-      - name: cargo test --lib --features default (msrv)
-        run: cargo test --lib --features default
+      - uses: ./.github/actions/build-deps
+      - name: cargo check -p rustcdc --no-default-features (msrv)
+        run: cargo check -p rustcdc --no-default-features
+      - name: cargo check -p rustcdc --features default (msrv)
+        run: cargo check -p rustcdc --features default
+      - name: cargo test -p rustcdc --lib --features default (msrv)
+        run: cargo test -p rustcdc --lib --features default
+      # The server is the other half of the MSRV promise, and it has the higher floor
+      # (the AWS SDK). Checking only the library would let the shipped binary need a
+      # newer toolchain than the manifest declares.
+      - name: cargo check -p rustcdc-server --all-targets --all-features (msrv)
+        run: cargo check -p rustcdc-server --all-targets --all-features --locked
 
   check:
+    name: "lib: check (${{ matrix.os }} · ${{ matrix.rust }} · ${{ matrix.profile.name }})"
     strategy:
       fail-fast: false
       matrix:
@@ -56,20 +89,21 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check (${{ matrix.profile.name }})
-        run: cargo check ${{ matrix.profile.args }}
-      - name: cargo test --lib (${{ matrix.profile.name }})
-        run: cargo test --lib ${{ matrix.profile.args }}
+      - name: cargo check -p rustcdc (${{ matrix.profile.name }})
+        run: cargo check -p rustcdc ${{ matrix.profile.args }}
+      - name: cargo test -p rustcdc --lib (${{ matrix.profile.name }})
+        run: cargo test -p rustcdc --lib ${{ matrix.profile.args }}
       - name: cargo build --example suite (stable ubuntu)
         if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
         run: |
-          cargo build --example pg_to_stdout --features postgres
-          cargo build --example postgres_to_otel --features postgres,metrics
-          cargo build --example sqlserver_to_otel --features sqlserver,metrics
-          cargo build --example regex_filter_transform
-          cargo build --example uppercase_transform
+          cargo build -p rustcdc --example pg_to_stdout --features postgres
+          cargo build -p rustcdc --example postgres_to_otel --features postgres,metrics
+          cargo build -p rustcdc --example sqlserver_to_otel --features sqlserver,metrics
+          cargo build -p rustcdc --example regex_filter_transform
+          cargo build -p rustcdc --example uppercase_transform
 
   quality:
+    name: "workspace: fmt, clippy, rustdoc (${{ matrix.os }} · ${{ matrix.rust }})"
     strategy:
       fail-fast: false
       matrix:
@@ -83,15 +117,24 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt --check
-        run: cargo fmt --check
-      - name: cargo clippy --all-targets --all-features -- -D warnings
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      # Clippy is workspace-wide and therefore compiles the server, whose dependency
+      # graph (aws-lc-rs, parquet, wasmtime) needs a C toolchain.
+      - uses: ./.github/actions/build-deps
+        if: runner.os == 'Linux'
+      # `--all`, not the default: without it `cargo fmt` formats only the package in the
+      # current directory, so every file under `crates/rustcdc-server/` and `crates/crash-workers/` went unchecked.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+      # Workspace-wide on purpose. Both members are the product; linting only the library
+      # would leave the shipped binary's code unchecked, which is what two repositories
+      # with two CI configurations had already achieved by accident.
+      - name: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # `missing_docs` is `deny` at the crate root, so this also fails on any
       # undocumented public item. The backfill that made it pass covered 416 items;
       # leaving the lint off would let that decay immediately.
-      - name: cargo doc --all-features --no-deps
-        run: cargo doc --all-features --no-deps
+      - name: cargo doc -p rustcdc --all-features --no-deps
+        run: cargo doc -p rustcdc --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
       # The all-features build cannot see a broken link *into* a feature-gated item,
@@ -103,18 +146,19 @@ jobs:
       #
       # `--no-default-features` is the complementary extreme; between the two, an ungated
       # item cannot link to a gated one without one of the lanes failing.
-      - name: cargo doc --no-default-features --no-deps
-        run: cargo doc --no-default-features --no-deps
+      - name: cargo doc -p rustcdc --no-default-features --no-deps
+        run: cargo doc -p rustcdc --no-default-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
       # Compiles every Rust block in README.md and docs/*.md as well as the rustdoc
       # examples. Published samples that no longer compile are integration failures
       # waiting to happen; before this ran, 36 of 96 documented samples were broken.
       # See `markdown_doctests` in src/lib.rs.
-      - name: cargo test --doc --all-features (rustdoc + Markdown samples)
-        run: cargo test --doc --all-features
+      - name: cargo test -p rustcdc --doc --all-features (rustdoc + Markdown samples)
+        run: cargo test -p rustcdc --doc --all-features
 
   transport-security:
+    name: "lib: TLS feature matrix"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,20 +166,38 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --lib --features postgres,tls
-        run: cargo test --lib --features postgres,tls
-      - name: cargo test --lib --features mysql,tls
-        run: cargo test --lib --features mysql,tls
-      - name: cargo test --lib --features sqlserver,tls
-        run: cargo test --lib --features sqlserver,tls
+      - name: cargo test -p rustcdc --lib --features postgres,tls
+        run: cargo test -p rustcdc --lib --features postgres,tls
+      - name: cargo test -p rustcdc --lib --features mysql,tls
+        run: cargo test -p rustcdc --lib --features mysql,tls
+      - name: cargo test -p rustcdc --lib --features sqlserver,tls
+        run: cargo test -p rustcdc --lib --features sqlserver,tls
       # `snowflake` alone, with no `tls` and no other connector: the feature adds no
       # dependencies and must therefore build against the bare foundation. Testing it only
       # under `--all-features` would hide a dependency it accidentally picked up from a
       # sibling feature.
-      - name: cargo test --lib --features snowflake
-        run: cargo test --lib --features snowflake
+      - name: cargo test -p rustcdc --lib --features snowflake
+        run: cargo test -p rustcdc --lib --features snowflake
+
+  # Benchmarks are a release-profile build, and nothing else in CI compiles them in that
+  # profile: `clippy --all-targets` builds them with `debug_assertions` on, which is the
+  # one setting that decides whether the `test-harnesses` release guard fires. Without
+  # this job the only lane that would notice a bench that no longer compiles is
+  # `release-evidence`, twelve minutes in, behind an apt install and a cargo-deny build.
+  bench-build:
+    name: "workspace: bench targets build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo xtask bench --no-run (all packages, all features)
+        run: cargo run -q -p xtask -- bench --no-run
 
   policy-gate:
+    name: "workspace: policy gate"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +213,7 @@ jobs:
             | sudo tar -xz -C /usr/local/bin zola
           zola --version
         env:
-          ZOLA_VERSION: 0.22.1
+          ZOLA_VERSION: 0.23.4
       - name: policy gates (schema + deprecated + workflow drift)
         run: bash scripts/ci-policy-gate.sh
       - uses: dtolnay/rust-toolchain@master
@@ -163,6 +225,7 @@ jobs:
         run: cargo deny check
 
   docs-site:
+    name: "workspace: docs site"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,7 +235,7 @@ jobs:
             | sudo tar -xz -C /usr/local/bin zola
           zola --version
         env:
-          ZOLA_VERSION: 0.22.1
+          ZOLA_VERSION: 0.23.4
       # `zola check` resolves every internal `@/...` link and fetches external ones.
       # A broken cross-reference fails here rather than shipping to the published site.
       - name: check documentation site
@@ -186,6 +249,7 @@ jobs:
           retention-days: 7
 
   correctness-smoke:
+    name: "lib: correctness smoke"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -200,27 +264,28 @@ jobs:
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: contract compatibility smoke
-        run: cargo test --test compatibility_contract --all-features
+        run: cargo test -p rustcdc --test compatibility_contract --all-features
       - name: postgres checkpoint durability smoke
-        run: cargo test --test checkpoint_file_integration --features postgres
+        run: cargo test -p rustcdc --test checkpoint_file_integration --features postgres
       - name: postgres process-crash replay smoke
-        run: cargo test --test runtime_postgres_process_crash_integration --features postgres --bins
+        run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres --bins
       - name: reliability data-loss smoke
-        run: cargo test --test data_loss_detection --features postgres,test-harnesses
+        run: cargo test -p rustcdc --test data_loss_detection --features postgres,test-harnesses
       - name: mysql connection integration smoke
-        run: cargo test --test mysql_connection_integration --features mysql
+        run: cargo test -p rustcdc --test mysql_connection_integration --features mysql
       - name: mariadb connection integration smoke
-        run: cargo test --test mariadb_connection_integration --features mariadb
+        run: cargo test -p rustcdc --test mariadb_connection_integration --features mariadb
       - name: sqlserver connection integration smoke
-        run: cargo test --test sqlserver_connection_integration --features sqlserver
+        run: cargo test -p rustcdc --test sqlserver_connection_integration --features sqlserver
       - name: mysql process-crash replay smoke
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql --bins
+        run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql --bins
       - name: mariadb process-crash replay smoke
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb --bins
+        run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb --bins
       - name: sqlserver process-crash replay smoke
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
+        run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
   reliability-core:
+    name: "lib: reliability (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -237,9 +302,10 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: reliability core suite (${{ matrix.suite }})
-        run: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   latency-core:
+    name: "lib: latency evidence"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -257,6 +323,7 @@ jobs:
         run: bash scripts/ci-latency-gate.sh
 
   integration-postgres:
+    name: "lib: PostgreSQL (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -321,24 +388,25 @@ jobs:
             tags="12-alpine 14-alpine 15-alpine 16-alpine"
           fi
           bash scripts/ci-pull-relational-images.sh ${tags}
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration' && matrix.suite != 'example_pg_to_stdout'
-        run: cargo test --test ${{ matrix.suite }} --features postgres
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres
       # The test builds the example itself (`cargo build --example pg_to_stdout`) before spawning
       # it, so no extra target selection is needed. It used to pass `--examples --tests`, and
       # `--tests` selects *every* test target — so this matrix entry ran the whole integration
       # suite and reported unrelated failures under this job's name.
-      - name: cargo test --test example_pg_to_stdout
+      - name: cargo test -p rustcdc --test example_pg_to_stdout
         if: matrix.suite == 'example_pg_to_stdout'
-        run: cargo test --test example_pg_to_stdout --features postgres
-      - name: cargo test --test ${{ matrix.suite }} (metrics)
+        run: cargo test -p rustcdc --test example_pg_to_stdout --features postgres
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }} (metrics)
         if: matrix.suite == 'otel_metrics_integration' || matrix.suite == 'otel_tracing_integration'
-        run: cargo test --test ${{ matrix.suite }} --features postgres,metrics
-      - name: cargo test --test runtime_postgres_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,metrics
+      - name: cargo test -p rustcdc --test runtime_postgres_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_postgres_process_crash_integration'
-        run: cargo test --test runtime_postgres_process_crash_integration --features postgres --bins
+        run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres --bins
 
   integration-postgres-encryption:
+    name: "lib: PostgreSQL + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -350,10 +418,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
         run: bash scripts/ci-pull-relational-images.sh 16-alpine
-      - name: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
-        run: cargo test --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
+        run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
 
   integration-reliability:
+    name: "lib: reliability, live (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -381,10 +450,11 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
-        run: cargo test --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres,wasm,test-harnesses
 
   integration-schema-registry:
+    name: "lib: schema registry"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -398,10 +468,11 @@ jobs:
       # so a single container exercises both client paths. "Compiles" is not evidence for
       # a network-facing client: this suite found an Avro decoder that had never decoded
       # an event and a JSON Schema that rejected every INSERT.
-      - name: cargo test --test schema_registry_live_integration
-        run: cargo test --test schema_registry_live_integration --features schemreg,apicurio,avro -- --test-threads=1
+      - name: cargo test -p rustcdc --test schema_registry_live_integration
+        run: cargo test -p rustcdc --test schema_registry_live_integration --features schemreg,apicurio,avro -- --test-threads=1
 
   integration-mysql:
+    name: "lib: MySQL (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -434,18 +505,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mysql_process_crash_integration' && matrix.suite != 'mysql_restart_resume_integration'
-        run: cargo test --test ${{ matrix.suite }} --features mysql
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features mysql
       # Covers MySQL and MariaDB in one suite, so it needs both features.
-      - name: cargo test --test mysql_restart_resume_integration (mysql + mariadb)
+      - name: cargo test -p rustcdc --test mysql_restart_resume_integration (mysql + mariadb)
         if: matrix.suite == 'mysql_restart_resume_integration'
-        run: cargo test --test mysql_restart_resume_integration --features mysql,mariadb -- --test-threads=1
-      - name: cargo test --test runtime_mysql_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test mysql_restart_resume_integration --features mysql,mariadb -- --test-threads=1
+      - name: cargo test -p rustcdc --test runtime_mysql_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_mysql_process_crash_integration'
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql --bins
+        run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql --bins
 
   integration-mysql-encryption:
+    name: "lib: MySQL + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -457,10 +529,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
-        run: cargo test --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
+        run: cargo test -p rustcdc --test runtime_mysql_process_crash_integration --features mysql,encryption --bins
 
   integration-mariadb:
+    name: "lib: MariaDB (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -479,14 +552,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_mariadb_process_crash_integration'
-        run: cargo test --test ${{ matrix.suite }} --features mariadb
-      - name: cargo test --test runtime_mariadb_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features mariadb
+      - name: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_mariadb_process_crash_integration'
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb --bins
+        run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb --bins
 
   integration-mariadb-encryption:
+    name: "lib: MariaDB + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -498,10 +572,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
-      - name: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
-        run: cargo test --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
+        run: cargo test -p rustcdc --test runtime_mariadb_process_crash_integration --features mariadb,encryption --bins
 
   integration-sqlserver:
+    name: "lib: SQL Server (${{ matrix.suite }})"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -529,21 +604,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
         run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
-      - name: cargo test --test ${{ matrix.suite }}
+      - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
-        run: cargo test --test ${{ matrix.suite }} --features sqlserver
+        run: cargo test -p rustcdc --test ${{ matrix.suite }} --features sqlserver
       # The test builds the example itself (`cargo build --example sqlserver_to_otel`) before
       # spawning it, so no extra target selection is needed here. It used to pass
       # `--examples --tests`, and `--tests` selects *every* test target — so this matrix entry ran
       # the whole integration suite, and a PostgreSQL failure was reported as a SQL Server one.
-      - name: cargo test --test sqlserver_to_otel_example_integration
+      - name: cargo test -p rustcdc --test sqlserver_to_otel_example_integration
         if: matrix.suite == 'sqlserver_to_otel_example_integration'
-        run: cargo test --test sqlserver_to_otel_example_integration --features sqlserver,metrics
-      - name: cargo test --test runtime_sqlserver_process_crash_integration (with bins)
+        run: cargo test -p rustcdc --test sqlserver_to_otel_example_integration --features sqlserver,metrics
+      - name: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration (with bins)
         if: matrix.suite == 'runtime_sqlserver_process_crash_integration'
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
+        run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver --bins
 
   integration-sqlserver-encryption:
+    name: "lib: SQL Server + encryption"
     runs-on: ubuntu-latest
     env:
       CDC_RS_RUN_DOCKER_TESTS: "1"
@@ -555,10 +631,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
         run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
-      - name: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
-        run: cargo test --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
+      - name: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
+        run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 
   release-evidence:
+    name: "workspace: release evidence"
     if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     needs:
       - msrv
@@ -691,100 +768,283 @@ jobs:
             target/benchmark-ci-env.txt
             target/criterion
             BENCHMARK_REPORT.md
-
-  release-evidence-verify:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # ── The published artefact, built on every pull request ──────────────────────
+  #
+  # `cargo package` is not `cargo build`. It collects the files the `.crate` will
+  # actually contain and then builds *from that copy*, so it is the only thing that
+  # catches a crate which compiles in the repository and not from the registry: a file
+  # outside the package root, an `include_str!` reaching for something `exclude` removed,
+  # a `build.rs` input nobody packaged.
+  #
+  # Running it only at release time means discovering that on the tag, with the version
+  # already burned. Running it here means a broken package fails the pull request that
+  # broke it.
+  package:
+    name: "lib: cargo package"
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: install verification dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      - name: verify tag matches Cargo.toml version
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "rustcdc") | .version')
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION"
-            exit 1
-          fi
-
-      - name: verify successful release-evidence run exists for this commit
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const workflowId = '.github/workflows/ci.yml';
-            const headSha = context.sha;
-
-            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
-              owner,
-              repo,
-              workflow_id: workflowId,
-              per_page: 100,
-              head_sha: headSha,
-            });
-
-            const candidates = runs.filter((run) =>
-              run.id !== context.runId &&
-              !run.head_branch?.startsWith('v') &&
-              run.event !== 'workflow_dispatch' &&
-              run.conclusion === 'success'
-            );
-
-            if (candidates.length === 0) {
-              core.setFailed(`No successful non-tag CI run found for commit ${headSha}.`);
-              return;
-            }
-
-            let evidenceFound = false;
-            for (const run of candidates) {
-              const jobsResp = await github.rest.actions.listJobsForWorkflowRun({
-                owner,
-                repo,
-                run_id: run.id,
-                per_page: 100,
-              });
-
-              const releaseEvidenceJob = jobsResp.data.jobs.find((job) => job.name === 'release-evidence');
-              if (!releaseEvidenceJob || releaseEvidenceJob.conclusion !== 'success') {
-                continue;
-              }
-
-              const artifactsResp = await github.rest.actions.listWorkflowRunArtifacts({
-                owner,
-                repo,
-                run_id: run.id,
-                per_page: 100,
-              });
-
-              const hasEvidenceArtifact = artifactsResp.data.artifacts.some((artifact) => artifact.name === 'release-gate-evidence');
-              if (hasEvidenceArtifact) {
-                core.info(`Using validated evidence from run ${run.id}.`);
-                evidenceFound = true;
-                break;
-              }
-            }
-
-            if (!evidenceFound) {
-              core.setFailed('No successful release-evidence job with release-gate-evidence artifact found for this commit.');
-            }
-
-  publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: release-evidence-verify
-    runs-on: ubuntu-latest
-    environment: crates-io
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo publish
-        run: cargo publish --no-verify
+      - uses: ./.github/actions/build-deps
+      # Verification build included — that is the whole point of the job.
+      - name: cargo package -p rustcdc
+        run: cargo package -p rustcdc --locked
+      # A `.crate` that quietly grew by an order of magnitude is a packaging mistake
+      # (a fixture tree, a corpus, a `target/` escape), and crates.io rejects above 10 MiB.
+      - name: report the packaged size
+        run: |
+          set -euo pipefail
+          crate="$(ls target/package/rustcdc-*.crate)"
+          bytes="$(wc -c < "$crate")"
+          echo "$crate is $((bytes / 1024)) KiB"
+          if [ "$bytes" -gt 9437184 ]; then
+            echo "::error::the packaged crate is within 1 MiB of the crates.io 10 MiB limit"
+            exit 1
+          fi
+
+  # ── The image builds, checked on every pull request ─────────────────────────
+  #
+  # Nothing built the container outside a release, so a Dockerfile that stopped working —
+  # a renamed directory, a `.dockerignore` entry that removed a file the build needs, a
+  # base image that moved — was discovered on the tag, after the crate had published.
+  #
+  # `push: false`: this proves the image *builds*. Publishing it is `release.yml`, which
+  # runs only on a tag. One platform is enough for a smoke test; the release matrix
+  # covers both natively.
+  container-smoke:
+    name: "server: container image builds"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: docker build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha,scope=container-smoke
+          cache-to: type=gha,scope=container-smoke,mode=max
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # rustcdc-server
+  # ───────────────────────────────────────────────────────────────────────────
+  #
+  # Merged in from a separate `server-ci.yml`. Two workflows could not express the thing
+  # that matters most: **a job cannot `needs:` a job in another workflow**, so the
+  # release gate could never wait for the server's tests — and a branch-protection rule
+  # naming a path-filtered workflow blocks forever on pull requests that skip it.
+  #
+  # Prefixed `server-` so a red check names which half of the workspace broke.
+  # ── Check (all targets, all features) ───────────────────────────────────────
+  server-check:
+    name: "server: check"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo check -p rustcdc-server --all-targets --all-features --locked
+
+  # ── Connector feature matrix ────────────────────────────────────────────────
+  #
+  # Connectors are opt-in cargo features so a PostgreSQL-only deployment does not link
+  # tiberius and its rustls 0.21 stack. That only holds if every combination keeps
+  # compiling, and nothing else in CI would notice a `#[cfg]` arm that stopped matching:
+  # the other jobs all build `--all-features`, where every variant exists.
+  #
+  # `cargo check` rather than `--all-targets` on purpose. The property is that a narrow
+  # *binary* builds; the test fixtures are PostgreSQL-shaped throughout, and gating each
+  # one to compile under a MySQL-only build would be churn that asserts nothing.
+  #
+  # `--no-default-features` alone is deliberately absent: it is a `compile_error!` (see
+  # `crates/rustcdc-server/src/lib.rs`), because a binary with no connector rejects every configuration.
+  server-connector-matrix:
+    name: "server: check (${{ matrix.features }})"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - postgres
+          - mysql
+          - sqlserver
+          - postgres,mysql,sqlserver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo check -p rustcdc-server --no-default-features --features ${{ matrix.features }} --locked
+
+  # ── Test ────────────────────────────────────────────────────────────────────
+  server-test:
+    name: "server: test"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo test -p rustcdc-server --all-features --locked
+      # State compatibility runs on its own line so a failure is unmistakable in the log:
+      # it means this build cannot read state a previous one wrote, which is an upgrade
+      # that breaks every existing pipeline rather than an ordinary test failure.
+      - run: cargo test -p rustcdc-server --all-features --locked --test state_compatibility
+      # The default feature set is PostgreSQL-only, which is what most deployments build
+      # and what every test fixture here is shaped for. `--no-default-features` is not run:
+      # it has no connector and is a `compile_error!` by design; `connector-matrix` covers
+      # the narrow combinations.
+      - run: cargo test -p rustcdc-server --locked
+
+  # ── Integration (real databases and brokers) ────────────────────────────────
+  #
+  # The test manages its own container, so this job and a developer's local run are the
+  # same command against the same fixture. `--test-threads=1` because the tests share one
+  # container name and one host port on purpose: a killed run leaves exactly one thing to
+  # clean up.
+  #
+  # `crates/rustcdc-server/tests/architecture.rs::every_integration_suite_is_run_by_ci` enumerates
+  # `crates/rustcdc-server/tests/integration_*.rs` from disk and asserts each one is named here. Adding a
+  # suite and forgetting to wire it up fails the unit suite rather than silently reporting
+  # success — which is what an env-gated test that nobody runs does.
+  server-integration:
+    name: "server: integration (${{ matrix.suite }}${{ matrix.broker && format(' · {0}', matrix.broker) || '' }})"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: integration_postgres
+            container: rustcdc-integration-postgres
+          - suite: integration_mysql
+            container: rustcdc-integration-mysql
+          # Two brokers, one suite. Redpanda is an independent reimplementation of the
+          # Kafka wire protocol, so a green run against one says nothing about the other —
+          # and this matrix proved it on its first run: Apache Kafka propagates new-topic
+          # metadata asynchronously and elects a group coordinator lazily, neither of which
+          # Redpanda does. A Redpanda-only suite would have shipped a harness incapable of
+          # testing Kafka.
+          - suite: integration_kafka
+            broker: redpanda
+            container: rustcdc-integration-kafka
+          - suite: integration_kafka
+            broker: kafka
+            container: rustcdc-integration-kafka
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - name: Run the ${{ matrix.suite }} suite
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RUSTCDC_INTEGRATION: "1"
+          RUSTCDC_TEST_BROKER: ${{ matrix.broker }}
+        run: cargo test -p rustcdc-server --all-features --locked --test ${{ matrix.suite }} -- --test-threads=1
+      # Removes the container **this** job started. It used to remove
+      # `rustcdc-integration-postgres` unconditionally, so the MySQL job cleaned up a
+      # container it had never started and left its own running.
+      - name: Clean up the container
+        if: always()
+        run: docker rm -f ${{ matrix.container }} || true
+
+  # ── Fuzz targets (build + short smoke run) ──────────────────────────────────
+  #
+  # The invariants these targets check also run on stable, every build, in
+  # `crates/rustcdc-server/tests/fuzz_properties.rs` — that suite is the continuous guarantee. This job
+  # exists so the libFuzzer targets cannot silently stop compiling: an uncompilable fuzz
+  # target is indistinguishable from a fuzz target nobody ever ran.
+  #
+  # 60 seconds each is a smoke test, not a campaign. Deep fuzzing is an on-demand
+  # `cargo +nightly fuzz run <target>` with a corpus, not something on the pull-request
+  # path.
+  #
+  # `crates/rustcdc-server/fuzz` is excluded from the workspace (it needs nightly and `cargo fuzz`), so
+  # this runs from that directory rather than the repository root.
+  server-fuzz:
+    name: "server: fuzz (smoke)"
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/rustcdc-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/build-deps
+        with:
+          packages: protobuf-compiler cmake clang perl pkg-config
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz build
+      - run: cargo +nightly fuzz run redact_secrets -- -max_total_time=60
+      - run: cargo +nightly fuzz run config_loader -- -max_total_time=60
+
+  # ── The one required status check ───────────────────────────────────────────
+  #
+  # Branch protection should require **this job and nothing else**.
+  #
+  # Requiring the individual jobs does not work. GitHub leaves a required check
+  # `Pending` forever when its job never runs — and jobs here legitimately do not run (an
+  # `if:` on the ref, a skipped matrix leg) — so a pull request would block on a check
+  # that is never coming. Requiring one aggregator also means the protection rule does
+  # not have to be edited every time a job is added or renamed.
+  #
+  # `if: always()` is essential: without it this job is skipped the moment any dependency
+  # fails, and GitHub reads a *skipped* required check as success — the exact inversion
+  # the rule exists to prevent.
+  #
+  # A skipped dependency is accepted; a failed or cancelled one is not.
+  required-checks-passed:
+    name: "CI"
+    if: always()
+    needs:
+      - msrv
+      - check
+      - quality
+      - transport-security
+      - policy-gate
+      - docs-site
+      - correctness-smoke
+      - reliability-core
+      - latency-core
+      - integration-postgres
+      - integration-postgres-encryption
+      - integration-reliability
+      - integration-schema-registry
+      - integration-mysql
+      - integration-mysql-encryption
+      - integration-mariadb
+      - integration-mariadb-encryption
+      - integration-sqlserver
+      - integration-sqlserver-encryption
+      - release-evidence
+      - bench-build
+      - package
+      - container-smoke
+      - server-check
+      - server-connector-matrix
+      - server-test
+      - server-integration
+      - server-fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - name: every required job succeeded or was skipped
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          failed="$(printf '%s' "$NEEDS_JSON" | jq -r '
+            to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | "\(.key): \(.value.result)"
+          ')"
+          if [ -n "$failed" ]; then
+            echo "::error::these jobs did not pass:"
+            printf '%s\n' "$failed"
+            exit 1
+          fi
+          echo "all required jobs passed"

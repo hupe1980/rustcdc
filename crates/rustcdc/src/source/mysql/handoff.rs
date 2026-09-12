@@ -1,0 +1,124 @@
+use std::time::Instant;
+
+use crate::{
+    checkpoint::MysqlOffset,
+    core::{Error, Result},
+    source::{HandoffResult, SnapshotHandle, StreamHandle},
+};
+
+use super::{
+    parser::parse_mysql_source_offset,
+    query::dedup_overlap_events_by_pk,
+    state::{MysqlHandoff, compare_binlog_position},
+};
+use crate::source::helpers::now_millis;
+
+pub(super) async fn mysql_handoff_result(
+    snapshot: &mut dyn SnapshotHandle,
+    stream: &mut dyn StreamHandle,
+    snapshot_wm: MysqlOffset,
+    stream_wm: MysqlOffset,
+    overlap_drain_budget_ms: u64,
+) -> Result<HandoffResult> {
+    let handoff = MysqlHandoff {
+        snapshot_binlog_file: snapshot_wm.binlog_file,
+        snapshot_binlog_pos: snapshot_wm.binlog_pos,
+        snapshot_gtid: snapshot_wm.gtid,
+        stream_start_binlog_file: stream_wm.binlog_file,
+        stream_start_binlog_pos: stream_wm.binlog_pos,
+        stream_start_gtid: stream_wm.gtid,
+    };
+
+    // The stream must start at or before the snapshot's binlog position so that
+    // every change made after the snapshot was opened is visible in the stream.
+    if !handoff.has_no_gap() {
+        return Err(Error::SourceError(format!(
+            "mysql handoff invariant violated: stream starts at {}:{} which is after snapshot watermark {}:{} - events would be lost",
+            handoff.stream_start_binlog_file,
+            handoff.stream_start_binlog_pos,
+            handoff.snapshot_binlog_file,
+            handoff.snapshot_binlog_pos,
+        )));
+    }
+
+    // Finish the snapshot (commits the consistent-read transaction).
+    let snapshot_end = snapshot.finish().await?.snapshot_end_ts;
+
+    // Drain overlap events within the configured wall-clock budget, then
+    // deduplicate by primary key (last writer wins) and requeue for delivery.
+    // A budget of 0 means unlimited drain time.
+    let drain_deadline = (overlap_drain_budget_ms > 0)
+        .then(|| Instant::now() + std::time::Duration::from_millis(overlap_drain_budget_ms));
+    let mut overlap_events = Vec::new();
+    let mut non_overlap_events = Vec::new();
+    let mut overlap_phase_complete = false;
+    let mut polls = 0_usize;
+
+    while !overlap_phase_complete {
+        // Check wall-clock budget before each poll.
+        if let Some(deadline) = drain_deadline
+            && Instant::now() >= deadline
+        {
+            tracing::warn!(
+                target: "rustcdc::source::mysql",
+                polls,
+                budget_ms = overlap_drain_budget_ms,
+                overlap_events_so_far = overlap_events.len(),
+                "mysql handoff overlap drain budget exhausted; residual overlap events may \
+                 contain duplicates — increase handoff_overlap_drain_budget_ms or verify \
+                 traffic volume at handoff time",
+            );
+            break;
+        }
+        polls += 1;
+        let batch = stream.next_events(0).await?;
+        if batch.is_empty() {
+            break;
+        }
+
+        for event in batch {
+            let is_overlap = parse_mysql_source_offset(&event.source.offset)
+                .map(|(file, pos)| {
+                    compare_binlog_position(
+                        file,
+                        pos,
+                        &handoff.snapshot_binlog_file,
+                        handoff.snapshot_binlog_pos,
+                    )
+                    .is_le()
+                })
+                .unwrap_or(false);
+
+            if !overlap_phase_complete && is_overlap {
+                overlap_events.push(event);
+            } else {
+                overlap_phase_complete = true;
+                non_overlap_events.push(event);
+            }
+        }
+    }
+
+    let (deduped_overlap, overlap_duplicates) = dedup_overlap_events_by_pk(overlap_events);
+    let mut replay_events = deduped_overlap;
+    replay_events.extend(non_overlap_events);
+    if !replay_events.is_empty() {
+        stream.requeue_events(replay_events).await?;
+    }
+
+    if overlap_duplicates > 0 {
+        tracing::info!(
+            target: "rustcdc::source::mysql",
+            overlap_duplicates,
+            snapshot_binlog_file = %handoff.snapshot_binlog_file,
+            snapshot_binlog_pos = handoff.snapshot_binlog_pos,
+            "mysql handoff deduplicated overlap events by primary key"
+        );
+    }
+
+    Ok(HandoffResult {
+        snapshot_end_ts: Some(snapshot_end),
+        stream_start_ts: Some(now_millis()),
+        overlap_events_dropped: Some(overlap_duplicates),
+        stream_watermark_gap: None,
+    })
+}

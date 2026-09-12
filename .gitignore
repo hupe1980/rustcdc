@@ -21,9 +21,20 @@ target
 #.idea/
 
 # Custom
-FINDINGS.md
-REVIEW.md
 .DS_Store
+
+# ── Internal notes and third-party specifications ────────────────────────────
+
+# Architecture notes. Not published with the crates and not part of the repository's
+# public surface: they cite decisions and risks by identifiers that mean nothing outside
+# the folder, and a `(D12)` leaking into a doc comment renders on docs.rs as a reference
+# to a document the reader cannot open.
+/concepts/
+
+# Protocol specifications and papers — third-party copyrighted publications, so local
+# copies are not redistributed here. `concepts/REFERENCES.md` indexes every one with its
+# retrieval URL, so the folder can be rebuilt from scratch.
+/specs/
 
 # Generated local benchmark summary.
 /BENCHMARK_REPORT.md
@@ -32,3 +43,24 @@ REVIEW.md
 # own base URL and publishes the artifact it produces, so a committed copy is never the one
 # served — it is stale build output that reads like the live site. It was, in fact, stale.
 /site/public/
+
+# ── Merged from the former rustcdc-server repository ──────────────────────────
+
+# Tooling caches — but not the checked-in build config. `.cargo/config.toml` carries
+# the `[env]` block the server test suite depends on (deferred-secret fixtures, the
+# prefixed non-config variables that guard unknown-key detection). Without it a fresh
+# clone fails the whole suite for reasons that look nothing like the cause.
+/.cargo/*
+!/.cargo/config.toml
+
+# cargo-fuzz artefacts. The corpus and crash inputs are reproduction data for a
+# specific build, not source, and the target directory is measured in gigabytes.
+/crates/rustcdc-server/fuzz/target/
+/crates/rustcdc-server/fuzz/corpus/
+/crates/rustcdc-server/fuzz/artifacts/
+
+# Editor noise the server repo also ignored.
+.vscode/
+*.log
+*.tmp
+*.swp

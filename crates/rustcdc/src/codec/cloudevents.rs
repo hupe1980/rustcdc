@@ -1,0 +1,653 @@
+//! CloudEvents 1.0 structured-JSON encoding for CDC events.
+//!
+//! [CloudEvents](https://cloudevents.io/) is a CNCF specification (v1.0.2) for
+//! describing event data in a common, interoperable way.  It is natively
+//! supported by Knative, Azure Event Grid, Google Cloud Eventarc, and the
+//! Apache Kafka CloudEvents binding (`kafka-clients` + CloudEvents spec).
+//!
+//! This encoder produces the **Structured Content Mode** CloudEvents JSON
+//! binding (`application/cloudevents+json`).
+//!
+//! # Attribute mapping
+//!
+//! | CloudEvents attribute | Derived from |
+//! |---|---|
+//! | `specversion` | Always `"1.0"` |
+//! | `type` | `"io.rustcdc.change.{op}"` (e.g. `io.rustcdc.change.insert`) |
+//! | `source` | `"/{connector}/{schema_or_dash}/{table}"` |
+//! | `id` | `"{source_name}/{offset}"` |
+//! | `time` | RFC 3339 timestamp from `event.ts` (ms since epoch) |
+//! | `datacontenttype` | `"application/json"` |
+//! | `subject` | `"{schema}.{table}"` or `"{table}"` |
+//!
+//! # CDC extension attributes
+//!
+//! Extension attribute names are all-lowercase ASCII alphanumeric per the
+//! CloudEvents spec.
+//!
+//! | Extension | Value |
+//! |---|---|
+//! | `cdcop` | Operation string (`"insert"`, `"update"`, `"delete"`, …) |
+//! | `cdctable` | Table name |
+//! | `cdcschema` | Schema name (omitted when unknown) |
+//! | `cdcsource` | Source connector name |
+//! | `cdcoffset` | Source offset / LSN |
+//!
+//! # `data` payload
+//!
+//! The `data` field holds the CDC-specific payload:
+//! ```json
+//! {
+//!   "before": { "id": 1, "name": "alice" },
+//!   "after":  { "id": 1, "name": "alice-v2" },
+//!   "primary_key": ["id"],
+//!   "snapshot":    null,
+//!   "transaction": { "tx_id": 42, "total_events": 1, "event_index": 0 }
+//! }
+//! ```
+
+use serde_json::{Map, Value, json};
+
+use crate::codec::{EncodedOutput, EventEncoder};
+use crate::core::{Event, Result};
+
+const CONTENT_TYPE: &str = "application/cloudevents+json";
+const CE_SPEC_VERSION: &str = "1.0";
+
+// ─── CloudEventsEncoder ───────────────────────────────────────────────────────
+
+/// Encodes CDC events as [CloudEvents 1.0](https://cloudevents.io/) structured JSON.
+///
+/// See the [module documentation](self) for the full attribute mapping.
+///
+/// # Example
+///
+/// ```rust
+/// # use rustcdc::codec::{EventEncoder, CloudEventsEncoder};
+/// # use rustcdc::{Event, Operation, SourceMetadata, EVENT_ENVELOPE_VERSION};
+/// let encoder = CloudEventsEncoder::default();
+/// let event = Event::builder("users", Operation::Insert)
+///     .after(serde_json::json!({"id": 1}))
+///     .source(SourceMetadata::new("postgres", "0/16B6A70", 1716595200000))
+///     .ts(1716595200000)
+///     .schema("public")
+///     .primary_key(["id"])
+///     .build();
+///
+/// let out = encoder.encode(&event).unwrap();
+/// let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+/// assert_eq!(ce["specversion"], "1.0");
+/// assert_eq!(ce["type"], "io.rustcdc.change.insert");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct CloudEventsEncoder {
+    /// Optional URI prefix used as the base of the CloudEvents `source`
+    /// attribute.  When `None`, the source is derived as
+    /// `"/{connector}/{schema}/{table}"`.
+    ///
+    /// Example: `Some("urn:cdc:myapp".to_string())` produces
+    /// `"urn:cdc:myapp/public/users"`.
+    pub source_uri_prefix: Option<String>,
+}
+
+impl CloudEventsEncoder {
+    /// Create a new encoder with an optional `source` URI prefix.
+    pub fn new(source_uri_prefix: Option<String>) -> Self {
+        Self { source_uri_prefix }
+    }
+}
+
+impl EventEncoder for CloudEventsEncoder {
+    fn encode(&self, event: &Event) -> Result<EncodedOutput> {
+        let schema_str = event.schema.as_deref().unwrap_or("-");
+
+        // CloudEvents `source` — URI identifying the event producer.
+        let source_uri = match &self.source_uri_prefix {
+            Some(prefix) => format!("{}/{}/{}", prefix, schema_str, event.table),
+            None => format!(
+                "/{}/{}/{}",
+                event.source.source_name, schema_str, event.table
+            ),
+        };
+
+        // CloudEvents `type` — reverse-DNS prefixed event type.
+        let ce_type = format!("io.rustcdc.change.{}", event.op.to_str());
+
+        // CloudEvents `id` — MUST be unique per `source`.
+        //
+        // The offset alone is not: every row of a multi-row transaction shares one
+        // commit LSN, so `UPDATE users SET tier='gold' WHERE region='EU'` touching 500
+        // rows produced 500 CloudEvents with identical `(source, id)`. Spec-conformant
+        // consumers performing at-most-once dedup on that pair — Knative Eventing,
+        // Azure Event Grid — discard 499 of them, as silent data loss the producer
+        // cannot observe.
+        //
+        // Fold in the transaction sequence when present (the same tiebreaker the
+        // idempotency fingerprint uses, and for the same reason), then the stable
+        // content fingerprint as a last resort for sources that carry neither.
+        let id = match &event.transaction {
+            Some(tx) => format!(
+                "{}/{}/{}/{}",
+                event.source.source_name, event.source.offset, tx.tx_id, tx.event_index
+            ),
+            None => match crate::core::fingerprint_event_stable(event) {
+                Ok(fingerprint) => format!(
+                    "{}/{}/{}",
+                    event.source.source_name, event.source.offset, fingerprint
+                ),
+                // Fingerprinting only fails on an empty source_name/offset, which
+                // `validate()` already rejects. Fall back rather than fail the encode.
+                Err(_) => format!("{}/{}", event.source.source_name, event.source.offset),
+            },
+        };
+
+        // CloudEvents `time` — RFC 3339 timestamp.
+        let time = unix_ms_to_rfc3339(event.ts);
+
+        // CloudEvents `subject` — logical entity name.
+        //
+        // Delegated rather than rebuilt: this used to join the two halves itself and so
+        // rendered `Some("")` as a subject beginning with a dot, where every other consumer
+        // of the same pair — routing, filtering, log lines — treats an empty schema as
+        // absent. `Event::qualified_table_name` is that one rule.
+        let subject = event.qualified_table_name();
+
+        // Build the `data` payload (CDC-specific fields).
+        let mut data = Map::new();
+        data.insert(
+            "before".into(),
+            event.before.row().cloned().unwrap_or(Value::Null),
+        );
+        data.insert("after".into(), event.after.clone().unwrap_or(Value::Null));
+        if let Some(pk) = &event.primary_key {
+            data.insert("primary_key".into(), json!(pk));
+        }
+        if let Some(snapshot) = &event.snapshot {
+            data.insert("snapshot".into(), serde_json::to_value(snapshot)?);
+        }
+        if let Some(tx) = &event.transaction {
+            data.insert("transaction".into(), serde_json::to_value(tx)?);
+        }
+        // The partial-payload contract, in full. All three fields or none of them: a consumer
+        // that receives `unavailable_columns` but not `before_unavailable_columns` cannot tell
+        // a before-image column that is absent *because it was TOASTed* from one that was
+        // genuinely NULL — which is exactly the distinction `BeforeImage::Full`'s own
+        // `unavailable_columns` exists to make, and the one a diff or a compensating write
+        // depends on.
+        //
+        // `before_unavailable_columns` was omitted here when it was added to the envelope, so
+        // CloudEvents consumers silently had a weaker contract than JSON, Avro and Protobuf
+        // consumers of the same stream. Only the emptiness check is conditional — the three
+        // fields are written by one loop so a fourth cannot be forgotten the same way.
+        if event.before.is_key_only() {
+            data.insert("before_is_key_only".into(), json!(true));
+        }
+        for (field, columns) in [
+            ("unavailable_columns", event.unavailable_columns.as_slice()),
+            (
+                "before_unavailable_columns",
+                event.before.unavailable_columns(),
+            ),
+        ] {
+            if !columns.is_empty() {
+                data.insert(field.into(), json!(columns));
+            }
+        }
+        // Carry the envelope version so consumers can detect a version bump.
+        data.insert("envelope_version".into(), json!(event.envelope_version));
+
+        // Assemble the CloudEvents envelope.
+        let mut ce = Map::new();
+        ce.insert("specversion".into(), json!(CE_SPEC_VERSION));
+        ce.insert("id".into(), json!(id));
+        ce.insert("type".into(), json!(ce_type));
+        ce.insert("source".into(), json!(source_uri));
+        ce.insert("time".into(), json!(time));
+        ce.insert("datacontenttype".into(), json!("application/json"));
+        ce.insert("subject".into(), json!(subject));
+
+        // CDC extension attributes (spec: lowercase alphanumeric, max 20 chars).
+        ce.insert("cdcop".into(), json!(event.op.to_str()));
+        ce.insert("cdctable".into(), json!(event.table));
+        if let Some(schema) = &event.schema {
+            ce.insert("cdcschema".into(), json!(schema));
+        }
+        ce.insert("cdcsource".into(), json!(event.source.source_name));
+        ce.insert("cdcoffset".into(), json!(event.source.offset));
+
+        ce.insert("data".into(), Value::Object(data));
+
+        let bytes = serde_json::to_vec(&Value::Object(ce))?;
+        Ok(EncodedOutput::new(bytes, CONTENT_TYPE))
+    }
+
+    fn content_type(&self) -> &'static str {
+        CONTENT_TYPE
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Format Unix epoch milliseconds as an RFC 3339 / ISO 8601 UTC timestamp.
+///
+/// This is a dependency-free implementation to avoid pulling in `chrono` or
+/// `time` solely for timestamp formatting.
+///
+/// Examples: `0` → `"1970-01-01T00:00:00.000Z"`,
+///           `1716595200000` → `"2024-05-25T00:00:00.000Z"`
+pub fn unix_ms_to_rfc3339(ts_ms: u64) -> String {
+    let secs = ts_ms / 1000;
+    let ms = ts_ms % 1000;
+    let (year, month, day, hour, min, sec) = epoch_secs_to_datetime(secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year, month, day, hour, min, sec, ms
+    )
+}
+
+/// Decompose Unix epoch seconds into (year, month, day, hour, min, sec) UTC.
+fn epoch_secs_to_datetime(total_secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let sec = (total_secs % 60) as u32;
+    let total_mins = total_secs / 60;
+    let min = (total_mins % 60) as u32;
+    let total_hours = total_mins / 60;
+    let hour = (total_hours % 24) as u32;
+    let mut days = (total_hours / 24) as u32; // days since 1970-01-01
+
+    let mut year = 1970u32;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let month_lengths = if is_leap_year(year) {
+        [31u32, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1u32;
+    for &len in &month_lengths {
+        if days < len {
+            break;
+        }
+        days -= len;
+        month += 1;
+    }
+
+    (year, month, days + 1, hour, min, sec)
+}
+
+fn is_leap_year(year: u32) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::BeforeImage;
+    use crate::core::{
+        EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
+    };
+
+    /// CloudEvents 1.0 requires `source` + `id` to be unique per distinct event.
+    ///
+    /// Every row of a multi-row transaction shares one commit LSN, so keying `id` on
+    /// the offset alone made a 500-row `UPDATE` emit 500 events with identical
+    /// `(source, id)`. Spec-conformant consumers dedup on that pair and would discard
+    /// 499 of them — silent data loss the producer cannot observe.
+    #[test]
+    fn cloudevents_id_is_unique_within_one_transaction() {
+        let encoder = CloudEventsEncoder::default();
+
+        let mut ids = std::collections::HashSet::new();
+        for index in 0..500u32 {
+            let mut event = insert_event();
+            // Same commit LSN for every row, as a real transaction produces.
+            event.source.offset = "0/16B6A70".into();
+            event.after = Some(serde_json::json!({"id": index, "tier": "gold"}));
+            event.transaction = Some(TransactionMetadata {
+                tx_id: 4242,
+                total_events: Some(500),
+                event_index: index,
+            });
+
+            let encoded = encoder.encode(&event).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&encoded.bytes).unwrap();
+            let id = value.get("id").unwrap().as_str().unwrap().to_string();
+            assert!(
+                ids.insert(id.clone()),
+                "duplicate CloudEvents id '{id}' at event_index {index}"
+            );
+        }
+        assert_eq!(ids.len(), 500);
+    }
+
+    /// Sources that carry no transaction metadata must still produce distinct ids for
+    /// distinct rows sharing an offset.
+    #[test]
+    fn cloudevents_id_is_unique_without_transaction_metadata() {
+        let encoder = CloudEventsEncoder::default();
+
+        let mut first = insert_event();
+        first.transaction = None;
+        first.after = Some(serde_json::json!({"id": 1, "name": "alice"}));
+
+        let mut second = insert_event();
+        second.transaction = None;
+        second.after = Some(serde_json::json!({"id": 2, "name": "bob"}));
+
+        let id_of = |event: &Event| -> String {
+            let encoded = encoder.encode(event).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&encoded.bytes).unwrap();
+            value.get("id").unwrap().as_str().unwrap().to_string()
+        };
+
+        assert_ne!(
+            id_of(&first),
+            id_of(&second),
+            "two distinct rows at the same offset must not share a CloudEvents id"
+        );
+    }
+
+    fn insert_event() -> Event {
+        Event {
+            before: BeforeImage::Unavailable,
+            after: Some(serde_json::json!({"id": 1, "name": "alice"})),
+            op: Operation::Insert,
+            source: SourceMetadata {
+                source_name: "postgres".into(),
+                offset: "0/16B6A70".into(),
+                timestamp: 1716595200000,
+            },
+            ts: 1716595200000,
+            schema: Some("public".into()),
+            table: "users".into(),
+            primary_key: Some(vec!["id".into()]),
+            snapshot: None,
+            transaction: Some(TransactionMetadata {
+                tx_id: 42,
+                total_events: Some(1),
+                event_index: 0,
+            }),
+            envelope_version: EVENT_ENVELOPE_VERSION,
+            unavailable_columns: Vec::new(),
+        }
+    }
+
+    // ── RFC 3339 formatter ───────────────────────────────────────────────────
+
+    #[test]
+    fn rfc3339_unix_epoch() {
+        assert_eq!(unix_ms_to_rfc3339(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn rfc3339_known_date() {
+        // 2024-05-25T00:00:00.000Z = 1716595200000 ms
+        assert_eq!(
+            unix_ms_to_rfc3339(1716595200000),
+            "2024-05-25T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn rfc3339_sub_second_preserved() {
+        // 1716595200123 ms → should end in .123Z
+        let ts = 1716595200123u64;
+        assert!(unix_ms_to_rfc3339(ts).ends_with(".123Z"));
+    }
+
+    #[test]
+    fn rfc3339_leap_day() {
+        // 2024-02-29T00:00:00.000Z = 1709164800000 ms
+        assert_eq!(
+            unix_ms_to_rfc3339(1709164800000),
+            "2024-02-29T00:00:00.000Z"
+        );
+    }
+
+    // ── CloudEvents encoder ──────────────────────────────────────────────────
+
+    #[test]
+    fn specversion_is_always_one_zero() {
+        let enc = CloudEventsEncoder::default();
+        let out = enc.encode(&insert_event()).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["specversion"], "1.0");
+    }
+
+    #[test]
+    fn type_encodes_operation_name() {
+        let enc = CloudEventsEncoder::default();
+        let out = enc.encode(&insert_event()).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["type"], "io.rustcdc.change.insert");
+    }
+
+    #[test]
+    fn source_uses_connector_schema_table() {
+        let enc = CloudEventsEncoder::default();
+        let out = enc.encode(&insert_event()).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["source"], "/postgres/public/users");
+    }
+
+    #[test]
+    fn source_prefix_is_respected() {
+        let enc = CloudEventsEncoder::new(Some("urn:cdc:myapp".to_string()));
+        let out = enc.encode(&insert_event()).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["source"], "urn:cdc:myapp/public/users");
+    }
+
+    #[test]
+    fn subject_is_schema_dot_table() {
+        let enc = CloudEventsEncoder::default();
+        let out = enc.encode(&insert_event()).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["subject"], "public.users");
+    }
+
+    #[test]
+    fn subject_falls_back_to_table_when_no_schema() {
+        let enc = CloudEventsEncoder::default();
+        let mut ev = insert_event();
+        ev.schema = None;
+        let out = enc.encode(&ev).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["subject"], "users");
+    }
+
+    #[test]
+    fn cdc_extension_attributes_present() {
+        let enc = CloudEventsEncoder::default();
+        let out = enc.encode(&insert_event()).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["cdcop"], "insert");
+        assert_eq!(ce["cdctable"], "users");
+        assert_eq!(ce["cdcschema"], "public");
+        assert_eq!(ce["cdcsource"], "postgres");
+        assert_eq!(ce["cdcoffset"], "0/16B6A70");
+    }
+
+    #[test]
+    fn cdcschema_absent_when_no_schema() {
+        let enc = CloudEventsEncoder::default();
+        let mut ev = insert_event();
+        ev.schema = None;
+        let out = enc.encode(&ev).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert!(
+            ce.get("cdcschema").is_none(),
+            "cdcschema must be absent when schema is None"
+        );
+    }
+
+    #[test]
+    fn data_contains_after_and_transaction() {
+        let enc = CloudEventsEncoder::default();
+        let out = enc.encode(&insert_event()).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        let data = &ce["data"];
+        assert_eq!(data["after"]["name"], "alice");
+        assert_eq!(data["before"], serde_json::Value::Null);
+        assert_eq!(data["transaction"]["tx_id"], 42);
+    }
+
+    #[test]
+    fn content_type_is_cloudevents_json() {
+        let enc = CloudEventsEncoder::default();
+        assert_eq!(enc.content_type(), "application/cloudevents+json");
+        let out = enc.encode(&insert_event()).unwrap();
+        assert_eq!(out.content_type, "application/cloudevents+json");
+    }
+
+    #[test]
+    fn update_event_type_is_update() {
+        let enc = CloudEventsEncoder::default();
+        let mut ev = insert_event();
+        ev.op = Operation::Update;
+        ev.before = BeforeImage::full(serde_json::json!({"id": 1, "name": "alice"}));
+        ev.after = Some(serde_json::json!({"id": 1, "name": "alice-v2"}));
+        let out = enc.encode(&ev).unwrap();
+        let ce: serde_json::Value = serde_json::from_slice(&out.bytes).unwrap();
+        assert_eq!(ce["type"], "io.rustcdc.change.update");
+        assert_eq!(ce["cdcop"], "update");
+    }
+}
+
+#[cfg(test)]
+mod partial_payload_contract_tests {
+    use super::*;
+    use crate::core::BeforeImage;
+    use crate::core::{Event, Operation, SourceMetadata};
+
+    /// An UPDATE with a hole in **each** image, which is the shape that separates the two
+    /// unavailable-column lists: a TOASTed column that was modified is present in `after` and
+    /// absent from `before`, and one that was not is the reverse.
+    fn event_with_holes() -> Event {
+        Event::builder("documents", Operation::Update)
+            .schema("public")
+            .source(SourceMetadata::new("postgres", "0/16B6A70", 1))
+            .ts(1_716_595_200_000)
+            .before_image(BeforeImage::full_with_holes(
+                serde_json::json!({ "id": "1", "title": "draft" }),
+                ["summary"],
+            ))
+            .after(serde_json::json!({ "id": "1", "title": "final" }))
+            .primary_key(["id"])
+            .unavailable_columns(["body"])
+            .build()
+    }
+
+    /// The bug this closes: `before_unavailable_columns` was never written, so a CloudEvents
+    /// consumer got a **weaker contract than a JSON, Avro or Protobuf consumer of the same
+    /// stream** — and could not tell a before-image column absent because it was TOASTed from
+    /// one that was genuinely NULL. That is the distinction the field exists to make, and the
+    /// one a row diff or a compensating write depends on.
+    #[test]
+    fn the_cloudevents_data_carries_every_partial_payload_field() {
+        let event = event_with_holes();
+        let encoded = CloudEventsEncoder::default()
+            .encode(&event)
+            .expect("encode");
+        let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
+        let data = ce.get("data").expect("data payload");
+
+        assert_eq!(
+            data.get("unavailable_columns"),
+            Some(&json!(["body"])),
+            "the after-image hole must be reported"
+        );
+        assert_eq!(
+            data.get("before_unavailable_columns"),
+            Some(&json!(["summary"])),
+            "the before-image hole must be reported too. Reporting only one of the two lets a \
+             consumer read a TOASTed column's absence as NULL, which is the corruption the \
+             lists exist to prevent"
+        );
+    }
+
+    /// Every field of the envelope that a consumer needs must be discoverable in the output.
+    /// Asserted as a set rather than one field at a time, because the failure mode here is a
+    /// field added to `Event` and not to this encoder — which is exactly what happened.
+    #[test]
+    fn no_envelope_field_is_silently_dropped() {
+        let mut event = event_with_holes();
+
+        event.transaction = Some(crate::core::TransactionMetadata::new(42, 1, Some(2)));
+        event.snapshot = Some(crate::core::SnapshotMetadata::new("snap-1", 0, false));
+
+        let encoded = CloudEventsEncoder::default()
+            .encode(&event)
+            .expect("encode");
+        let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
+        let data = ce.get("data").expect("data payload");
+
+        // In `data`, because they are CDC payload rather than CloudEvents context.
+        for field in [
+            "before",
+            "after",
+            "primary_key",
+            "snapshot",
+            "transaction",
+            "envelope_version",
+            "unavailable_columns",
+            "before_unavailable_columns",
+        ] {
+            assert!(
+                data.get(field).is_some(),
+                "`{field}` is missing from the CloudEvents data payload, so a consumer of this \
+                 stream has a weaker contract than one reading JSON, Avro or Protobuf"
+            );
+        }
+
+        // As CloudEvents context attributes or extensions.
+        for field in [
+            "specversion",
+            "id",
+            "type",
+            "source",
+            "time",
+            "subject",
+            "cdcop",
+            "cdctable",
+            "cdcschema",
+            "cdcsource",
+            "cdcoffset",
+        ] {
+            assert!(
+                ce.get(field).is_some(),
+                "`{field}` is missing from the CloudEvents envelope"
+            );
+        }
+    }
+
+    /// `before_is_key_only` is written only when true, so its false case must not be mistaken
+    /// for an omission by the test above.
+    #[test]
+    fn before_is_key_only_appears_when_set() {
+        let mut event = event_with_holes();
+        // A key-only pre-image cannot carry TOAST holes, and now cannot even be built
+        // with them: one constructor call replaces the clear-then-set dance.
+        event.before = BeforeImage::key_only(serde_json::json!({ "id": "1" }));
+        event
+            .validate()
+            .expect("a well-formed key-only before-image");
+
+        let encoded = CloudEventsEncoder::default()
+            .encode(&event)
+            .expect("encode");
+        let ce: Value = serde_json::from_slice(&encoded.bytes).expect("valid JSON");
+        assert_eq!(
+            ce["data"].get("before_is_key_only"),
+            Some(&json!(true)),
+            "a key-only before-image must be flagged, or a consumer treats it as a full row"
+        );
+    }
+}

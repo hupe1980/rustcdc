@@ -54,6 +54,37 @@ failure visible rather than to keep the pipeline running through one.
 | `observability` | `RuntimeObservability` | no-op | Metrics collector and event tracer. Nothing is exported until you set these. |
 | `max_buffer_size` | `usize` | 10 000 | Maximum events per delivered batch. |
 | `max_poll_wait_ms` | `u64` | 5 000 | How long `poll_event_batch` waits before returning an empty batch. |
+| `health_stall_threshold_ms` | `Option<u64>` | `None` (derived) | How long the poll loop may go without returning before [`HealthVerdict::Stalled`](@/docs/embedded-operations.md#health-verdict-idle-vs-stalled). `None` derives `max_poll_wait_ms × 6`, floor 30 s. |
+
+### `health_stall_threshold_ms` — when to set it
+
+The derived default scales *up* with the poll budget and has a floor but no ceiling. At
+`max_poll_wait_ms = 60_000` the threshold is six minutes, so a wedged pipeline can go
+unreported for six minutes and nothing could shorten the window. That is the case this
+setting exists for:
+
+```rust
+use rustcdc::RuntimeOptions;
+
+let options = RuntimeOptions::default()
+    .with_max_poll_wait_ms(60_000)
+    // Report a stall after 90s rather than the six minutes this poll budget derives.
+    .with_health_stall_threshold_ms(90_000);
+```
+
+**Set it lower** when you need tighter detection than the derived value gives. **Set it
+higher** when a source's normal poll latency is long enough that the derived value is
+tight and you are seeing stalls on a working pipeline.
+
+Two values are rejected at construction, and both guard the same failure from opposite
+ends — reporting a *healthy* pipeline as stalled, which is the verdict that pages someone:
+
+- below `HEALTH_MIN_CONFIGURABLE_STALL_MS` (1 000 ms), where the verdict measures the
+  health-check interval rather than the pipeline;
+- at or below `max_poll_wait_ms`, where a poll that is merely slow reads as a stall.
+
+An alert that fires on healthy pipelines is one operators learn to ignore, and that costs
+more than the slower detection it was meant to buy.
 | `max_event_bytes` | `Option<usize>` | `None` | Upper bound on serialized bytes per batch. `None` relies on `max_buffer_size` alone — which is a poor proxy when row sizes vary by orders of magnitude. |
 | `transform_error_policy` | `TransformErrorPolicy` | `Halt` | What a failing transform does. `Halt` preserves failure visibility; `Skip` requires a `dead_letter_handler`. |
 | `dead_letter_handler` | `Option<Arc<dyn Fn(Event, Error)>>` | `None` | Invoked for events discarded under `TransformErrorPolicy::Skip` or `ValidationErrorPolicy::Quarantine`. Mandatory with either — a discarded event is otherwise unrecoverable. |
@@ -241,21 +272,19 @@ runtime
 ```
 
 Re-requesting a table that already finished is a **deliberate re-snapshot**: it rewinds the
-cursor, adopts the new request's filter, and re-reads the table. The rows are delivered again
-rather than being suppressed as duplicates — before 0.12.0 the idempotency guard dropped every one
-of them, so the request reported success and delivered nothing.
+cursor, adopts the new request's filter, and re-reads the table. The rows are delivered again rather than
+being suppressed as duplicates: a re-snapshot that reported success and delivered nothing
+would be indistinguishable from a table with no changes.
 
 A request condition **overrides** the configured `table_conditions` entry for the same table; a
 table with no override keeps its configured filter. Both carry the same trust level — raw SQL,
 never built from untrusted input, and not a tenancy boundary.
 
-> **Before 0.12.0, `table_conditions` was silently ignored for on-demand requests.** The filter
-> was applied when resolving startup tables and tables adopted from a checkpoint, but not on the
-> request path — so a request read the whole table, and the only symptom was volume. Worse, the
-> two paths disagreed: a runtime-requested table ran unfiltered and then a restart adopted it
-> *with* the filter, so the emitted rows matched no single predicate. Both are fixed, and
-> `IncrementalSnapshotState` now reports the filter actually in effect per table so the question
-> is answerable from outside.
+> **The filter applies on every path** — startup tables, tables adopted from a checkpoint,
+> and on-demand requests alike. It has to: a request that ran unfiltered and then resumed
+> *with* the filter after a restart would emit a set of rows matching no single predicate,
+> and the only symptom would be volume. `IncrementalSnapshotState` reports the filter
+> actually in effect per table, so the question is answerable from outside the process.
 
 | Operation | Effect on chunk reads | Effect on the live stream |
 |---|---|---|
@@ -419,12 +448,11 @@ glob patterns**, matched against `"schema.table"` — or against the bare table 
 source reports no schema. The sink router's `table_matches` calls the same matcher on the same
 key, so a pattern that selects an event also routes it.
 
-> **That equivalence was not true before 0.13.0, and the gap was silent.** The matcher was
-> shared, but only the connector filter lowered its inputs; the router compared case-sensitively.
-> A server that folds identifiers — PostgreSQL to lower, Snowflake to upper, MySQL depending on
-> the host filesystem — could therefore pass a table through the include list and then match no
-> route, and `drop_unrouted` is on by default. Case folding now lives in the matcher, so there is
-> one answer rather than two. It is **ASCII** folding, which is what every supported server's
+> **Case folding lives in the matcher**, so the include list and the router give one answer
+> rather than two. That matters because servers fold identifiers differently — PostgreSQL to
+> lower, Snowflake to upper, MySQL depending on the host filesystem — and a table that passed
+> the include list but matched no route would be dropped silently, since `drop_unrouted` is on
+> by default. It is **ASCII** folding, which is what every supported server's
 > identifier rules are defined in terms of.
 >
 > The consequence worth knowing: on a case-sensitive MySQL (`lower_case_table_names = 0`), two
@@ -454,12 +482,11 @@ schema half against. Blank entries are ignored rather than treated as catch-alls
 
 ### What the lists cover
 
-Every event a connector can emit for a table, including its **schema-change events**. That
-was not true before 0.13.0: `ALTER TABLE` / `CREATE TABLE` / `DROP_TABLE` events were built
-straight from connector metadata and never consulted the lists, so an operator who
-allow-listed one table still received the full column list of every other table the
-publication, binlog or `cdc.change_tables` carried. All three connectors now apply the
-filter to that path:
+Every event a connector can emit for a table, including its **schema-change events**.
+This matters more than it first looks: `ALTER TABLE` / `CREATE TABLE` / `DROP TABLE` events
+carry a full column list, so a path that skipped the filter would hand an operator who
+allow-listed one table the schema of every other table in the publication, binlog or
+`cdc.change_tables`. All three connectors apply the filter there:
 
 | Connector | Where the schema event comes from | Now filtered |
 |---|---|---|
@@ -471,11 +498,9 @@ Note that a schema-change event is published under a synthetic `<table>__ddl_eve
 name, which is why the filter has to be applied at the source — no downstream matcher on
 the real table name can see it.
 
-**These lists used to match exact strings only.** The globs are new in 0.12.0. Before that,
-`table_exclude_list = ["public.tmp_*"]` excluded nothing at all, which is indistinguishable from
-a set of tables that never changed; on the include side an allowlist matching nothing is
-indistinguishable from an idle database. If you carried a literal `*` in a list as a
-no-op placeholder, it is now a catch-all — check your lists before upgrading.
+**These lists match globs, not exact strings.** `table_exclude_list = ["public.tmp_*"]`
+excludes every matching table. Note the consequence for a literal `*` used as a placeholder:
+it is a catch-all, not a no-op.
 
 ---
 
@@ -811,8 +836,8 @@ values against real databases.
 > `number` or `boolean` row. A JSON number is an IEEE-754 double by the time most consumers see
 > it, so `numeric(38,4)` and `bigint` past 2^53 do not survive one — and a representation that
 > depended on the value's magnitude would be undecodable without inspecting each value first.
-> Read with `value.as_str()` and parse. This table described JSON numbers before 0.11.0; if you
-> built against that, integers and floats now arrive quoted.
+> Read with `value.as_str()` and parse — integers and floats arrive **quoted**, to keep the
+> full source precision that a JSON number would round.
 
 ### Binary column encoding, per connector
 
@@ -826,11 +851,11 @@ per source and never inspects a value to decide:
 | MySQL / MariaDB | lowercase hex, no prefix | `"deadbeef"` |
 | SQL Server | whatever `FOR JSON PATH` emits for `varbinary`, which the connector passes through unaltered | asserted by `tests/sqlserver_type_fidelity_integration.rs` rather than restated here |
 
-**MySQL's form used to depend on the value.** A binary column whose bytes happened to be valid
-UTF-8 arrived as text, and the same column's other rows arrived as hex — so no single decoder was
-correct for the column. The binlog's charset metadata (collation `63` is `binary`) now decides,
-and a column type alone cannot: `BLOB` and `TEXT` share one type, `VARBINARY` and `VARCHAR`
-share another. Fixed in 0.12.0.
+**MySQL's form is decided by charset metadata, not by the value.** The binlog's collation
+(`63` is `binary`) is what distinguishes binary from text, and a column *type* alone cannot:
+`BLOB` and `TEXT` share one, `VARBINARY` and `VARCHAR` another. Deciding per value would mean
+a column whose bytes happen to be valid UTF-8 arrives as text while its other rows arrive as
+hex — leaving no single decoder correct for the column.
 
 The last two rows are the distinction that matters most: a missing key means "no information",
 a `null` means "the value is NULL". Collapsing them is the classic CDC corruption.
@@ -1383,7 +1408,7 @@ let config = RuntimeConfig::new(...)
 | `rustcdc_runtime_health` | Gauge | Derived health verdict, one series per `verdict` label. **`rustcdc_runtime_health{verdict="stalled"} == 1` is the alert rule** — `state` alone cannot distinguish healthy-idle from stalled. |
 | `rustcdc_runtime_checkpoint_age_ms` | Gauge | Age of last durable checkpoint |
 | `rustcdc_runtime_replication_lag_ms` | Gauge | Estimated source lag in milliseconds |
-| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. Sampled on a timer that does **not** depend on the pipeline being caught up — it used to refresh only from the idle-advance path, so it went stale exactly while the pipeline was behind, and never sampled at all when `slot_idle_advance_interval_ms = 0`. The cadence follows `slot_idle_advance_interval_ms`, or 15 s when idle advance is disabled. |
+| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. Sampled on a timer that does **not** depend on the pipeline being caught up — a sampler tied to the idle-advance path would go stale exactly while the pipeline was behind, which is when the value matters most. The cadence follows `slot_idle_advance_interval_ms`, or 15 s when idle advance is disabled. |
 | `rustcdc_runtime_source_capability` | Gauge | Connector capability flags, one series per `capability` label |
 
 ### OpenTelemetry Exported Metrics (`OTelMetricsCollector`)

@@ -218,7 +218,7 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
 |------------|--------|
 | Checkpoint corrupted | Stop rustcdc; delete checkpoint file; restart (will scan from current position) |
 | Replication slot dropped | Stop rustcdc; recreate checkpoint with current LSN; restart |
-| WAL/binlog purged | See [Replication Slot Divergence Recovery](@/docs/runbook.md#replication-slot-divergence-recovery) |
+| WAL/binlog purged | See [Replication Slot Divergence Recovery](@/docs/embedded-operations.md#replication-slot-divergence-recovery) |
 | Checkpoint permissions | Verify `/var/rustcdc/` is writable by rustcdc process owner |
 
 ---
@@ -637,7 +637,7 @@ ERROR schema error: table schema not found for public.users
 |------------|--------|
 | Source schema changed (DDL) | 1. Update rustcdc snapshot_tables list; 2. Manually trigger schema refresh in SchemaHistory |
 | Transform filter too broad | Review transform rules; test in development first |
-| Event validation rule violated | Check the [API guide](@/docs/api.md) and the `src/core/event.rs` validation contract; verify the source is generating events correctly |
+| Event validation rule violated | Check the [API guide](@/docs/api.md) and the `crates/rustcdc/src/core/event.rs` validation contract; verify the source is generating events correctly |
 
 ---
 
