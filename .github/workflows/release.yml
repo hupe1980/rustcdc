@@ -55,9 +55,20 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   # Pinned rather than `${{ github.repository }}`, which resolves to `hupe1980/rustcdc` —
-  # the *library's* name, for an image you cannot run. Naming it here keeps
-  # `ghcr.io/hupe1980/rustcdc-server` stable, so every existing `docker pull`, Kubernetes
-  # manifest and documented command keeps working.
+  # the *library's* name, for an image that contains the server binary and not the
+  # library. The image is named after what it holds.
+  #
+  # The cost of that choice is that the package name no longer matches the repository
+  # publishing it, so GitHub will not connect the two on its own. Two things do the
+  # connecting, and both must hold:
+  #
+  #   * `org.opencontainers.image.source` in the Dockerfile points at this repository.
+  #     That is what links the package on a *first* publish.
+  #   * The package must not already belong to another repository. A GHCR package keeps
+  #     the Actions access of whoever created it, and `hupe1980/rustcdc-server` was a
+  #     repository of its own before the merge. If it published this image even once,
+  #     `GITHUB_TOKEN` from here cannot push to it until that package is deleted or this
+  #     repository is added under "Manage Actions access" — no workflow change helps.
   IMAGE_NAME: ${{ github.repository_owner }}/rustcdc-server
 
 # Narrow by default; each job widens only what it needs.
@@ -83,6 +94,11 @@ jobs:
   verify:
     name: "release: verify the tag is releasable"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Only to ask GHCR what it would allow. This job pushes nothing; it holds the
+      # permission so the answer it gets is the one `container-build` will get.
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,16 +117,81 @@ jobs:
             exit 1
           fi
 
-      # The tag itself proves nothing: it is a label on a commit. What makes a commit
-      # releasable is that the full matrix — the integration suites, the latency gate,
-      # the benchmark gate — already went green on it, on main, before the tag existed.
+      # Ask GHCR whether this workflow may push, before anything is built.
       #
-      # Matched on the uploaded artifact, not on a job's display name. This check used to
-      # look for a job literally named `release-evidence`; the GitHub API returns a job's
-      # *display* name, so when that job was renamed to "workspace: release evidence" the
-      # lookup silently stopped matching and every release failed here. The artifact name
-      # is a real contract between the two workflows, and `scripts/ci-policy-gate.sh`
-      # asserts both ends still agree.
+      # Without this, a registry permission problem is discovered by the *push*, which is
+      # the last thing `container-build` does — after a twelve-minute cross-compile on an
+      # arm64 runner. The build is fine and the error arrives twenty-four minutes in.
+      #
+      # The probe mints a registry token scoped to pull+push and reads back what GHCR
+      # actually granted. That is an authorisation question, so it needs no image and
+      # writes nothing.
+      #
+      # Inconclusive is not failure: a network blip or an unexpected token shape warns and
+      # lets the release proceed. Only a definite "push not granted" stops it, because
+      # that one is deterministic and will not fix itself in the next twenty-four minutes.
+      - name: check GHCR grants this workflow push access
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_PATH: ${{ env.IMAGE_NAME }}
+        run: |
+          set -uo pipefail
+          token="$(curl -fsSL -u "${GHCR_USER}:${GHCR_TOKEN}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull,push" \
+            | jq -r '.token // empty')"
+          if [ -z "$token" ]; then
+            echo "::warning::Could not mint a GHCR token; skipping the push-access preflight."
+            exit 0
+          fi
+
+          # Open a blob upload, then cancel it. This is the authorisation path a real push
+          # takes, which a token-scope check is not: GHCR handed buildx a `pull,push` token
+          # for this image and still refused the push, because the package resolves to a
+          # different repository than this one. What the token claims proves nothing; what
+          # the registry does when asked to begin a write proves it.
+          #
+          # Nothing is stored. An upload session that is cancelled never becomes a layer, a
+          # tag, or a version.
+          hdr="$(mktemp)"
+          code="$(curl -s -o /dev/null -D "$hdr" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${token}" -H 'Content-Length: 0' \
+            "https://ghcr.io/v2/${IMAGE_PATH}/blobs/uploads/")"
+
+          case "$code" in
+            202)
+              location="$(tr -d '\r' < "$hdr" | awk -F': ' 'tolower($1) == "location" { print $2 }')"
+              if [ -n "$location" ]; then
+                case "$location" in
+                  https://*) ;;
+                  *) location="https://ghcr.io${location}" ;;
+                esac
+                curl -s -o /dev/null -X DELETE -H "Authorization: Bearer ${token}" "$location" || true
+              fi
+              echo "Push access to ${IMAGE_PATH} confirmed."
+              ;;
+            401|403)
+              echo "::error::GHCR refuses writes to ${IMAGE_PATH} (HTTP ${code})."
+              echo ""
+              echo "The workflow is not at fault: 'packages: write' is declared, and GHCR does"
+              echo "hand out a pull,push token. The package resolves to a different repository"
+              echo "— it was created by the standalone rustcdc-server repo, and a GHCR package"
+              echo "keeps the Actions access of whoever created it. The merge moved the source,"
+              echo "not the package."
+              echo ""
+              echo "Grant this repository access:"
+              echo "  github.com/users/${GHCR_USER}/packages/container/rustcdc-server/settings"
+              echo "  -> Manage Actions access -> Add repository -> rustcdc -> role: Write"
+              echo ""
+              echo "or, since nothing is released yet, delete the package and let this workflow"
+              echo "recreate it — the first push from here links it to this repository."
+              exit 1
+              ;;
+            *)
+              echo "::warning::GHCR write probe returned HTTP ${code}; treating as inconclusive."
+              ;;
+          esac
+          rm -f "$hdr"
       - name: verify successful release-evidence run exists for this commit
         uses: actions/github-script@v7
         with:
