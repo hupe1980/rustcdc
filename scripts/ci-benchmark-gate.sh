@@ -599,18 +599,22 @@ worst_repeated_critical_group_regression() {
 # same benchmark swings tens of percent between passes on one laptop. That gate failed
 # releases at random and never caught anything.
 #
-# These are set at ~10x the median measured on a developer laptop, so a slower runner
-# under load still fits underneath comfortably. They catch a benchmark that broke — an
-# accidental O(n^2), a lock held across an await, a rebuild per row — and nothing subtler.
-# They are not performance targets, and tightening them turns this back into a flake.
+# Roughly 20x the median measured on a developer laptop. That sounds absurdly loose until
+# you watch one: `snapshot_10k_rows` measured 229 µs and 636 µs on the same machine, same
+# commit, minutes apart — a 2.8x swing before a slower, busier CI runner is involved.
+#
+# So these catch a benchmark that broke by an order of magnitude — an accidental O(n^2), a
+# lock held across an await, a rebuild per row — and nothing subtler. That is the whole
+# intent. Tightening them to catch smaller changes turns this straight back into a gate
+# that fails releases at random, which is what it replaced.
 bench_budget_ns() {
   case "$1" in
-    quality_perf/quality_gates/snapshot_10k_rows)        echo 2300000 ;;  # 229 µs measured
-    quality_perf/quality_gates/stream_1k_events_target)  echo 5200000 ;;  # 518 µs
-    cdc_perf/quality_gates/snapshot_10k_rows)            echo 2300000 ;;  # 224 µs
-    cdc_perf/quality_gates/stream_1k_events_target)      echo 7000000 ;;  # 692 µs
-    cdc_perf/wasm_transform/pass_through_single_event)   echo 20000 ;;    # 1.67 µs
-    cdc_perf/wasm_transform/pass_through_100_events)     echo 1700000 ;;  # 170 µs
+    quality_perf/quality_gates/snapshot_10k_rows)        echo 5000000 ;;   # 229-636 µs measured
+    quality_perf/quality_gates/stream_1k_events_target)  echo 15000000 ;;  # 518-694 µs
+    cdc_perf/quality_gates/snapshot_10k_rows)            echo 5000000 ;;   # 224-245 µs
+    cdc_perf/quality_gates/stream_1k_events_target)      echo 15000000 ;;  # 609-692 µs
+    cdc_perf/wasm_transform/pass_through_single_event)   echo 50000 ;;     # 1.67 µs
+    cdc_perf/wasm_transform/pass_through_100_events)     echo 4000000 ;;   # 170 µs
     *) echo "" ;;
   esac
 }
