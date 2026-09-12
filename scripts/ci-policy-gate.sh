@@ -333,6 +333,32 @@ require_file_present() {
 #
 # `lib:` the library · `server:` the binary · `workspace:` both · `release:` the tag
 # pipeline. `CI` is the aggregator branch protection requires and is deliberately bare.
+run_release_evidence_contract_check() {
+  # `release.yml` gates every release on an artifact that `ci.yml` uploads. That name is
+  # the only contract between the two files, and nothing else would notice it breaking:
+  # the release simply fails at the tag, which is the worst moment to find out.
+  #
+  # This check exists because the gate did break, in a way no test could catch. It used
+  # to match the *job* named `release-evidence`; the GitHub API returns a job's display
+  # name, so renaming the job to "workspace: release evidence" made the lookup match
+  # nothing, and the failure only appeared on a pushed tag.
+  local expected uploaded
+  expected="$(rg -o --no-heading --no-line-number \
+    "const EVIDENCE_ARTIFACT = '([^']+)'" -r '$1' .github/workflows/release.yml || true)"
+  if [[ -z "$expected" ]]; then
+    echo "FAIL: .github/workflows/release.yml no longer declares EVIDENCE_ARTIFACT." >&2
+    exit 1
+  fi
+
+  uploaded="$(rg -n --no-heading "name: ${expected}\$" .github/workflows/ci.yml || true)"
+  if [[ -z "$uploaded" ]]; then
+    echo "FAIL: release.yml gates on artifact '${expected}', which ci.yml never uploads." >&2
+    echo "The release would fail at the tag. Keep both ends of the name in step." >&2
+    exit 1
+  fi
+  echo "Release evidence contract check passed (ci.yml uploads '${expected}')."
+}
+
 run_cargo_scope_check() {
   # A cargo command that names a target or a feature must also name a package.
   #
@@ -486,6 +512,40 @@ expression without the grant it names" >&2
   echo "Licence presence check passed (every published crate carries both texts)."
 }
 
+# The release pipeline's job graph, asserted as a graph rather than as four loose
+# greps for "needs: <something>". Those greps passed no matter which job carried which
+# edge, so reordering the pipeline left them green with labels that described the old
+# order — a check that agreed with whatever it was shown.
+#
+# Compared in file order, so the jobs must also be *written* in the order they run. A
+# release file that reads top to bottom is the whole point of having one.
+require_release_job_order() {
+  local expected actual
+  # Build first (proves both architectures compile, pushing only untagged digests), then
+  # the irreversible crates.io publish, then the image tagging that makes it consumable,
+  # then the announcement. See the ordering note at the top of release.yml.
+  expected="container-build=verify
+publish-crate=container-build
+container-publish=publish-crate
+github-release=container-publish"
+
+  actual="$(awk '
+    /^jobs:$/            { in_jobs = 1; next }
+    in_jobs && /^  [a-z][a-z0-9-]*:$/ { job = substr($1, 1, length($1) - 1); next }
+    in_jobs && /^    needs: / && job != "" { print job "=" $2; job = "" }
+  ' "$RELEASE_WORKFLOW")"
+
+  if [[ "$actual" != "$expected" ]]; then
+    echo "FAIL: release.yml job order changed." >&2
+    echo "expected:" >&2
+    printf '  %s\n' "$expected" >&2
+    echo "actual:" >&2
+    printf '  %s\n' "$actual" >&2
+    exit 1
+  fi
+  echo "Release job order check passed (build -> crates.io -> image tags -> announcement)."
+}
+
 run_workflow_drift_check() {
   require_file_absent ".github/workflows/publish.yml"
   require_file_absent ".github/workflows/nightly-evidence.yml"
@@ -494,7 +554,6 @@ run_workflow_drift_check() {
   require_match "^name: ci$" "$CI_WORKFLOW" "single workflow name"
   require_match "^  pull_request:$" "$CI_WORKFLOW" "pull request trigger"
   require_match "^  push:$" "$CI_WORKFLOW" "push trigger"
-  require_match "^      - \"v\*\"$" "$CI_WORKFLOW" "tag trigger for releases"
   require_match "bash scripts/ci-policy-gate.sh" "$CI_WORKFLOW" "policy gate"
   # Both doc lanes, not just one. The all-features build is blind to a link from an
   # ungated doc comment into a feature-gated item, because every gate is on; the
@@ -571,17 +630,15 @@ run_workflow_drift_check() {
 
   # ── The release, and its ordering ───────────────────────────────────────────
   #
-  # Reversible before irreversible. A crates.io version can never be overwritten,
-  # deleted, or reused — `cargo yank` only stops new resolution — while a GHCR package
-  # version can be deleted and restored. So the image ships first and the crate last: if
-  # crates.io fails, the image is deleted and the same tag retried; the other order
-  # spends a version number that can never be reclaimed.
   require_file_present ".github/workflows/release.yml"
   require_match "^name: release$" "$RELEASE_WORKFLOW" "release workflow name"
-  require_match "    needs: verify" "$RELEASE_WORKFLOW" "the release is gated on the tag being verified"
-  require_match "    needs: container-build" "$RELEASE_WORKFLOW" "the manifest follows the platform builds"
-  require_match "    needs: container-publish" "$RELEASE_WORKFLOW" "crates.io is published after the image"
-  require_match "    needs: publish-crate" "$RELEASE_WORKFLOW" "the GitHub release is last"
+  require_release_job_order
+
+  # The tag trigger belongs to release.yml and to nothing else. When ci.yml also had one,
+  # every tag push ran the whole matrix a second time on a commit main had already tested,
+  # and release.yml ignored that run anyway — it reads evidence from the run on main.
+  require_match "^    tags:$" "$RELEASE_WORKFLOW" "release is what a tag triggers"
+  require_absent "^      - \"v\\*\"$" "$CI_WORKFLOW" "tag trigger in ci.yml (releases are release.yml's job)"
   require_match "\-\-notes-file release-notes.md" "$RELEASE_WORKFLOW" "release notes come from CHANGELOG.md"
   # Trusted publishing pins the workflow *filename*, which is why the release lives in
   # its own file rather than in ci.yml: a compromised action in the test matrix must not
@@ -899,6 +956,7 @@ run_cargo_profile_safety_check
 run_job_naming_check
 run_bench_invocation_check
 run_cargo_scope_check
+run_release_evidence_contract_check
 run_workflow_path_check
 run_licence_presence_check
 run_workflow_drift_check

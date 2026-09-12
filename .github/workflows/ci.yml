@@ -5,8 +5,10 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
+  # Deliberately not tags. A tag is a label on a commit main has already tested, so a
+  # tag run would repeat the entire matrix — an hour of containers — to re-prove what the
+  # run on main proved. `release.yml` does not even look at tag runs: it goes back to the
+  # run on main for this commit, because that is the one that carries the evidence.
   pull_request:
 
 permissions:
@@ -636,7 +638,6 @@ jobs:
 
   release-evidence:
     name: "workspace: release evidence"
-    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     needs:
       - msrv
       - check
