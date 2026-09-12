@@ -28,7 +28,7 @@ use testcontainers::{
 mod process_crash_marker;
 mod process_crash_worker;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
-use process_crash_worker::resolve_xtask_worker_bin;
+use process_crash_worker::resolve_crash_worker_bin;
 
 #[path = "rustls_provider_common.rs"]
 mod rustls_provider_common;
@@ -495,10 +495,5 @@ fn spawn_crash_worker(
 }
 
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
-    resolve_xtask_worker_bin(
-        "mariadb_crash_worker",
-        "mariadb",
-        "CARGO_BIN_EXE_mariadb_crash_worker",
-        "mariadb crash worker binary not found; build with `cargo build -p xtask --bin mariadb_crash_worker --features mariadb`",
-    )
+    resolve_crash_worker_bin("mariadb_crash_worker", "mariadb")
 }

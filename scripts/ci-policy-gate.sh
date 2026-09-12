@@ -333,6 +333,43 @@ require_file_present() {
 #
 # `lib:` the library · `server:` the binary · `workspace:` both · `release:` the tag
 # pipeline. `CI` is the aggregator branch protection requires and is deliberately bare.
+run_cargo_scope_check() {
+  # A cargo command that names a target or a feature must also name a package.
+  #
+  # Without `-p`, cargo selects every default workspace member and unifies features
+  # across the whole set — so a flag meant for one crate silently reshapes another
+  # crate's build. Both of the release-evidence failures were this:
+  #
+  #   * `cargo bench --bench quality_perf` pulled in `rustcdc-server`'s dev-dependency on
+  #     `rustcdc/test-harnesses` and tripped the release guard in `fault_injection`.
+  #   * `cargo test --test mysql_connection_integration` enabled both rustls providers
+  #     (`ring` via testcontainers, `aws-lc-rs` via reqwest) and rustls will not guess
+  #     between two, so the suite panicked on a CryptoProvider that CI resolves fine.
+  #
+  # Neither failed at the seam that was wrong, and neither reproduced under the scoped
+  # command CI runs — which is exactly why this is a static check.
+  #
+  # `--workspace` counts as naming the scope: that is the deliberate whole-workspace case.
+  local hits
+  hits="$(rg -n --no-heading --hidden -e 'cargo (build|test|bench|run) ' \
+    --glob 'scripts/**/*.sh' \
+    --glob '.github/workflows/*.yml' \
+    --glob '!scripts/ci-policy-gate.sh' \
+    . \
+    | grep -E -- '--features|--test |--bench |--bin |--example ' \
+    | grep -v -E -- '(-p |--package|--workspace)' \
+    | grep -v -E '^[^:]+:[0-9]+: *#' \
+    | grep -v -E '^[^:]+:[0-9]+: *(- )?name:' || true)"
+
+  if [[ -n "$hits" ]]; then
+    echo "FAIL: cargo invocation selects a target or feature without naming a package." >&2
+    echo "Add \`-p <crate>\` (or \`--workspace\` if every member is meant):" >&2
+    printf '%s\n' "$hits" >&2
+    exit 1
+  fi
+  echo "Cargo scope check passed (every targeted cargo command names its package)."
+}
+
 run_bench_invocation_check() {
   # Every documented `cargo bench` in this repository was wrong, and silently so.
   #
@@ -347,8 +384,9 @@ run_bench_invocation_check() {
   # instructions that explain why not to, and CHANGELOG.md, which is a record of what was
   # true when written and is not rewritten.
   local hits
-  hits="$(rg -n --no-heading -e 'cargo bench' \
+  hits="$(rg -n --no-heading --hidden -e 'cargo bench' \
     --glob '!target/**' \
+    --glob '!.git/**' \
     --glob '!CHANGELOG.md' \
     --glob '!crates/xtask/src/main.rs' \
     --glob '!scripts/ci-benchmark-gate.sh' \
@@ -860,6 +898,7 @@ run_async_trait_policy_check
 run_cargo_profile_safety_check
 run_job_naming_check
 run_bench_invocation_check
+run_cargo_scope_check
 run_workflow_path_check
 run_licence_presence_check
 run_workflow_drift_check

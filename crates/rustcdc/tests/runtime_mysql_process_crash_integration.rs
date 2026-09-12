@@ -27,7 +27,7 @@ use testcontainers::{
 mod process_crash_marker;
 mod process_crash_worker;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
-use process_crash_worker::resolve_xtask_worker_bin;
+use process_crash_worker::resolve_crash_worker_bin;
 
 #[path = "rustls_provider_common.rs"]
 mod rustls_provider_common;
@@ -494,10 +494,5 @@ fn spawn_crash_worker(
 }
 
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
-    resolve_xtask_worker_bin(
-        "mysql_crash_worker",
-        "mysql",
-        "CARGO_BIN_EXE_mysql_crash_worker",
-        "mysql crash worker binary not found; build with `cargo build -p xtask --bin mysql_crash_worker --features mysql`",
-    )
+    resolve_crash_worker_bin("mysql_crash_worker", "mysql")
 }

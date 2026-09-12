@@ -120,12 +120,17 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
     let status = Command::new("cargo")
         .args([
             "build",
+            "-p",
+            "rustcdc",
             "--example",
             "sqlserver_to_otel",
             "--features",
             "sqlserver,metrics",
         ])
-        // Correct as-is: cargo finds the workspace from any member directory.
+        // `-p` as well as the directory: cargo finds the workspace from any member, but
+        // without naming the package it also selects every *other* default member and
+        // unifies features across all of them, which is how a bare `cargo test` in the
+        // evidence script ended up with two rustls providers and no way to choose.
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
         .map_err(|error| {

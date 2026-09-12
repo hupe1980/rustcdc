@@ -84,12 +84,17 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> rustcdc
     let status = Command::new("cargo")
         .args([
             "build",
+            "-p",
+            "rustcdc",
             "--example",
             "pg_to_stdout",
             "--features",
             "postgres",
         ])
-        // Correct as-is: cargo finds the workspace from any member directory.
+        // `-p` as well as the directory: cargo finds the workspace from any member, but
+        // without naming the package it also selects every *other* default member and
+        // unifies features across all of them, which is how a bare `cargo test` in the
+        // evidence script ended up with two rustls providers and no way to choose.
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
         .map_err(|e| rustcdc::Error::SourceError(format!("failed to build example: {e}")))?;

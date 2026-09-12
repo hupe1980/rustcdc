@@ -29,13 +29,13 @@ run_latency_step() {
 }
 
 run_latency_step "postgres connector latency evidence" \
-  cargo test --test postgres_latency_evidence --features postgres -- --nocapture
+  cargo test -p rustcdc --test postgres_latency_evidence --features postgres -- --nocapture
 
 run_latency_step "mysql connector latency evidence" \
-  cargo test --test mysql_latency_evidence --features mysql -- --nocapture
+  cargo test -p rustcdc --test mysql_latency_evidence --features mysql -- --nocapture
 
 run_latency_step "sqlserver connector latency evidence" \
-  cargo test --test sqlserver_latency_evidence --features sqlserver -- --nocapture
+  cargo test -p rustcdc --test sqlserver_latency_evidence --features sqlserver -- --nocapture
 
 for artifact in target/postgres-latency-evidence.md target/mysql-latency-evidence.md target/sqlserver-latency-evidence.md; do
   if [[ -f "$artifact" ]]; then

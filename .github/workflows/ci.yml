@@ -96,11 +96,11 @@ jobs:
       - name: cargo build --example suite (stable ubuntu)
         if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
         run: |
-          cargo build --example pg_to_stdout --features postgres
-          cargo build --example postgres_to_otel --features postgres,metrics
-          cargo build --example sqlserver_to_otel --features sqlserver,metrics
-          cargo build --example regex_filter_transform
-          cargo build --example uppercase_transform
+          cargo build -p rustcdc --example pg_to_stdout --features postgres
+          cargo build -p rustcdc --example postgres_to_otel --features postgres,metrics
+          cargo build -p rustcdc --example sqlserver_to_otel --features sqlserver,metrics
+          cargo build -p rustcdc --example regex_filter_transform
+          cargo build -p rustcdc --example uppercase_transform
 
   quality:
     name: "workspace: fmt, clippy, rustdoc (${{ matrix.os }} · ${{ matrix.rust }})"

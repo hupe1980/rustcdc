@@ -23,7 +23,7 @@ mod process_crash_worker;
 #[path = "sqlserver_testkit.rs"]
 mod sqlserver_testkit;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
-use process_crash_worker::resolve_xtask_worker_bin;
+use process_crash_worker::resolve_crash_worker_bin;
 
 type SqlClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
 
@@ -428,12 +428,7 @@ fn spawn_crash_worker(
 }
 
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
-    resolve_xtask_worker_bin(
-        "sqlserver_crash_worker",
-        "sqlserver",
-        "CARGO_BIN_EXE_sqlserver_crash_worker",
-        "sqlserver crash worker binary not found; build with `cargo build -p xtask --bin sqlserver_crash_worker --features sqlserver`",
-    )
+    resolve_crash_worker_bin("sqlserver_crash_worker", "sqlserver")
 }
 
 fn lsn_bytes_to_hex(bytes: &[u8]) -> String {

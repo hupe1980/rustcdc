@@ -6,6 +6,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+/// The crate that declares the process-crash helper binaries.
+const CRASH_WORKER_PACKAGE: &str = "crash-workers";
+
 static WORKER_BIN_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<HashMap<String, PathBuf>> {
@@ -27,12 +30,12 @@ fn cache_set(bin: &str, path: &Path) -> rustcdc::Result<()> {
     Ok(())
 }
 
-fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
+fn build_crash_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
     let status = Command::new("cargo")
         .args([
             "build",
             "-p",
-            "crash-workers",
+            CRASH_WORKER_PACKAGE,
             "--bin",
             bin,
             "--features",
@@ -45,22 +48,26 @@ fn build_xtask_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
         Ok(())
     } else {
         Err(rustcdc::Error::StateError(format!(
-            "failed to build {bin} in xtask crate"
+            "failed to build {bin} in the {CRASH_WORKER_PACKAGE} crate"
         )))
     }
 }
 
-pub fn resolve_xtask_worker_bin(
-    bin: &str,
-    feature: &str,
-    cargo_bin_env_var: &str,
-    not_found_hint: &str,
-) -> rustcdc::Result<PathBuf> {
+/// Locate the helper binary a process-crash suite kills, building it if absent.
+///
+/// The caller passes only the binary and the feature that gates it. Everything else is
+/// derived: the four call sites used to spell out the `cargo build` command in a
+/// not-found hint, and every one of those hints still named `-p xtask` long after the
+/// workers moved to their own crate — telling a developer to run a command that fails.
+pub fn resolve_crash_worker_bin(bin: &str, feature: &str) -> rustcdc::Result<PathBuf> {
     if let Some(path) = cache_get(bin)? {
         return Ok(path);
     }
 
-    if let Ok(path) = std::env::var(cargo_bin_env_var) {
+    // Cargo only sets `CARGO_BIN_EXE_<name>` for integration tests in the package that
+    // declares the binary, which this is not, so this is an explicit override rather
+    // than something cargo fills in: point it at a prebuilt worker to skip the build.
+    if let Ok(path) = std::env::var(format!("CARGO_BIN_EXE_{bin}")) {
         let path = PathBuf::from(path);
         if path.exists() {
             cache_set(bin, &path)?;
@@ -76,12 +83,15 @@ pub fn resolve_xtask_worker_bin(
             return Ok(candidate);
         }
 
-        build_xtask_worker(bin, feature)?;
+        build_crash_worker(bin, feature)?;
         if candidate.exists() {
             cache_set(bin, &candidate)?;
             return Ok(candidate);
         }
     }
 
-    Err(rustcdc::Error::StateError(not_found_hint.to_string()))
+    Err(rustcdc::Error::StateError(format!(
+        "{bin} not found and could not be built; run \
+         `cargo build -p {CRASH_WORKER_PACKAGE} --bin {bin} --features {feature}`"
+    )))
 }

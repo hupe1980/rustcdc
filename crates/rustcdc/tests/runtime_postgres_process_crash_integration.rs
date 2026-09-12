@@ -26,7 +26,7 @@ use testcontainers::{
 mod process_crash_marker;
 mod process_crash_worker;
 use process_crash_marker::{read_worker_batch_len, read_worker_marker, wait_for_marker};
-use process_crash_worker::resolve_xtask_worker_bin;
+use process_crash_worker::resolve_crash_worker_bin;
 
 #[tokio::test]
 async fn runtime_postgres_process_kill_replays_uncommitted_batch() -> rustcdc::Result<()> {
@@ -565,12 +565,7 @@ fn spawn_crash_worker(
 }
 
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {
-    resolve_xtask_worker_bin(
-        "postgres_crash_worker",
-        "postgres",
-        "CARGO_BIN_EXE_postgres_crash_worker",
-        "postgres crash worker binary not found; build with `cargo build -p xtask --bin postgres_crash_worker --features postgres`",
-    )
+    resolve_crash_worker_bin("postgres_crash_worker", "postgres")
 }
 
 fn parse_pg_lsn(value: &str) -> rustcdc::Result<u64> {
