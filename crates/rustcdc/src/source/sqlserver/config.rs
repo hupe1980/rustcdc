@@ -45,13 +45,13 @@ impl Default for SqlServerSourceConfig {
             password: SecretString::default(),
             database: String::new(),
             instance_name: None,
-            transport: TransportConfig::tls(),
-            conn_timeout_secs: 30,
-            cdc_enabled: true,
-            cdc_schema: "cdc".into(),
-            prereq_pool_size: DEFAULT_POOL_SIZE,
-            stream_poll_interval_ms: DEFAULT_STREAM_POLL_INTERVAL_MS,
-            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            transport: TransportConfig::default(),
+            conn_timeout_secs: Self::default_conn_timeout_secs(),
+            cdc_enabled: Self::default_cdc_enabled(),
+            cdc_schema: Self::default_cdc_schema(),
+            prereq_pool_size: Self::default_prereq_pool_size(),
+            stream_poll_interval_ms: Self::default_stream_poll_interval_ms(),
+            max_events_per_poll: Self::default_max_events_per_poll(),
             table_include_list: Vec::new(),
             table_exclude_list: Vec::new(),
             capture_truncate_events: false,
@@ -63,6 +63,37 @@ impl SqlServerSourceConfig {
     /// Return the connector name used by the source abstraction.
     pub const fn source_type() -> &'static str {
         "sqlserver"
+    }
+
+    /// Default connection timeout (30 s). Referenced as the serde `default` by
+    /// configuration layers that deserialize this connector's settings.
+    pub const fn default_conn_timeout_secs() -> u64 {
+        30
+    }
+
+    /// Default for `cdc_enabled`: require CDC on the database.
+    pub const fn default_cdc_enabled() -> bool {
+        true
+    }
+
+    /// Default schema holding the CDC capture tables.
+    pub fn default_cdc_schema() -> String {
+        "cdc".into()
+    }
+
+    /// Default size of the prerequisite-check connection pool.
+    pub const fn default_prereq_pool_size() -> usize {
+        DEFAULT_POOL_SIZE
+    }
+
+    /// Default stream poll interval.
+    pub const fn default_stream_poll_interval_ms() -> u64 {
+        DEFAULT_STREAM_POLL_INTERVAL_MS
+    }
+
+    /// Default per-poll event cap, per capture instance.
+    pub const fn default_max_events_per_poll() -> usize {
+        MAX_EVENTS_PER_POLL
     }
 
     /// Set plaintext transport explicitly.

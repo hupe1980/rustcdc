@@ -170,12 +170,21 @@ pub struct SqlServerProfileConfig {
     pub database: String,
     #[serde(default)]
     pub instance_name: Option<String>,
+    // Defaults come from `SqlServerSourceConfig`, so this profile and the library's
+    // `Default` cannot disagree about a value the reference documents.
+    #[serde(default)]
     pub transport: TransportConfig,
+    #[serde(default = "SqlServerSourceConfig::default_conn_timeout_secs")]
     pub conn_timeout_secs: u64,
+    #[serde(default = "SqlServerSourceConfig::default_cdc_enabled")]
     pub cdc_enabled: bool,
+    #[serde(default = "SqlServerSourceConfig::default_cdc_schema")]
     pub cdc_schema: String,
+    #[serde(default = "SqlServerSourceConfig::default_prereq_pool_size")]
     pub prereq_pool_size: usize,
+    #[serde(default = "SqlServerSourceConfig::default_stream_poll_interval_ms")]
     pub stream_poll_interval_ms: u64,
+    #[serde(default = "SqlServerSourceConfig::default_max_events_per_poll")]
     pub max_events_per_poll: usize,
     #[serde(default)]
     pub capture_truncate_events: bool,

@@ -137,16 +137,22 @@ pub struct MysqlSourceConfig {
     /// Binlog coordinates are server-local, so a file+position resume after a failover
     /// reads an unrelated point in an unrelated file. Enable this wherever failover is
     /// possible.
+    #[serde(default)]
     pub gtid_mode_enabled: bool,
     /// Verify `binlog_format = ROW` at connect time.
+    #[serde(default = "MysqlSourceConfig::default_binlog_format_check")]
     pub binlog_format_check: bool,
     /// Transport mode. TLS by default; plaintext is an explicit, loudly-logged opt-in.
+    #[serde(default)]
     pub transport: TransportConfig,
     /// Connection timeout in seconds.
+    #[serde(default = "MysqlSourceConfig::default_conn_timeout_secs")]
     pub conn_timeout_secs: u64,
     /// Stream poll interval in milliseconds.
+    #[serde(default = "MysqlSourceConfig::default_stream_poll_interval_ms")]
     pub stream_poll_interval_ms: u64,
     /// Maximum events yielded by a single stream poll cycle.
+    #[serde(default = "MysqlSourceConfig::default_max_events_per_poll")]
     pub max_events_per_poll: usize,
     /// Identifies the server dialect (MySQL or MariaDB).
     ///
@@ -160,11 +166,13 @@ pub struct MysqlSourceConfig {
     /// When non-empty, only tables in this list are forwarded to the caller.
     /// Takes precedence over [`table_exclude_list`](MysqlSourceConfig::table_exclude_list).
     /// An empty list means *all* tables are included.
+    #[serde(default)]
     pub table_include_list: Vec<String>,
     /// Blocklist of tables to suppress, in `"schema.table"` format.
     ///
     /// Ignored when [`table_include_list`](MysqlSourceConfig::table_include_list) is non-empty.
     /// An empty list means no tables are excluded.
+    #[serde(default)]
     pub table_exclude_list: Vec<String>,
     /// Wall-clock budget in milliseconds for draining overlap events during snapshot-to-stream
     /// handoff deduplication.
