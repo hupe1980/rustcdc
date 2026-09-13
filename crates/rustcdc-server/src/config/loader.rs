@@ -114,7 +114,7 @@ fn reject_unknown_config_keys(
         "unrecognised configuration key(s): {}. A key the schema does not know is \
          silently ignored, so a typo does not disable a setting — it leaves the default \
          in place. Check the spelling and the table it sits under against \
-         https://hupe1980.github.io/rustcdc-server/docs/configuration/.",
+         https://hupe1980.github.io/rustcdc/docs/configuration/.",
         unknown.join(", ")
     )))
 }
@@ -405,6 +405,51 @@ fn resolve_env_secret_references(
     Ok(())
 }
 
+/// Every sink document in the raw config, labelled the way the operator wrote it.
+///
+/// Three shapes, and the third is the one that was missing: the default `[sink]`, each
+/// `[[sinks]]` entry, **and every fan-out child underneath either**. A literal
+/// `bearer_token` or webhook signing key inside `[[sink.sinks]]` was accepted, because the
+/// scan looked only at the two top-level positions and a fan sink's own `type` is `"fan"`
+/// — so none of the per-type checks fired for its children.
+///
+/// That is the worst position for this particular hole. A leaked signing key does not just
+/// expose data; it lets anyone forge events *as this pipeline*, which is the property the
+/// signature exists to provide.
+///
+/// The path is carried rather than reconstructed so the error names the block to edit —
+/// `sinks.warehouse.sinks[1].bearer_token`, not "the HTTP sink" when three are configured.
+fn sink_documents(raw: &serde_json::Value) -> Vec<(String, &serde_json::Value)> {
+    fn walk<'a>(
+        path: String,
+        sink: &'a serde_json::Value,
+        into: &mut Vec<(String, &'a serde_json::Value)>,
+    ) {
+        if let Some(children) = sink.get("sinks").and_then(serde_json::Value::as_array) {
+            for (index, child) in children.iter().enumerate() {
+                walk(format!("{path}.sinks[{index}]"), child, into);
+            }
+        }
+        into.push((path, sink));
+    }
+
+    let mut found = Vec::new();
+    if let Some(sink) = raw.get("sink") {
+        walk("sink".to_string(), sink, &mut found);
+    }
+    if let Some(sinks) = raw.get("sinks").and_then(serde_json::Value::as_array) {
+        for (index, named) in sinks.iter().enumerate() {
+            let label = named
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(|name| format!("sinks.{name}"))
+                .unwrap_or_else(|| format!("sinks[{index}]"));
+            walk(label, named, &mut found);
+        }
+    }
+    found
+}
+
 /// Reject plaintext literals for token-like credentials in the config file.
 ///
 /// Checked on the raw document (before `resolve_env_secret_references`) because
@@ -443,25 +488,42 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
         }
     }
 
-    let mut sink_values: Vec<&serde_json::Value> = Vec::new();
-    if let Some(sink) = raw.get("sink") {
-        sink_values.push(sink);
-    }
-    if let Some(sinks) = raw.get("sinks").and_then(serde_json::Value::as_array) {
-        sink_values.extend(sinks.iter());
-    }
-
-    for sink in sink_values {
+    for (path, sink) in sink_documents(raw) {
         let sink_type = sink.get("type").and_then(serde_json::Value::as_str);
 
         if sink_type == Some("http")
             && let Some(token) = sink.get("bearer_token")
             && token.is_string()
         {
-            return Err(ConfigError::Invalid(
-                        "sink.http.bearer_token must use deferred secret references (for example { env = \"VAR\" })"
-                            .to_string(),
-                    ));
+            return Err(ConfigError::Invalid(format!(
+                "{path}.bearer_token must use deferred secret references (for example \
+                 {{ env = \"VAR\" }})"
+            )));
+        }
+
+        // A signing key written as a literal is a signing key in the config file, in the
+        // `/status` snapshot, and in whatever backs them up. Same rule as `bearer_token`,
+        // and it matters more: a leaked signing key lets anyone forge events *as this
+        // pipeline*, which is the thing the signature exists to make impossible.
+        if sink_type == Some("http")
+            && let Some(signing) = sink.get("signing").and_then(serde_json::Value::as_object)
+        {
+            if signing.get("key").is_some_and(serde_json::Value::is_string) {
+                return Err(ConfigError::Invalid(format!(
+                    "{path}.signing.key must use deferred secret references (for \
+                     example {{ env = \"WEBHOOK_SIGNING_KEY\" }})"
+                )));
+            }
+            if let Some(previous) = signing
+                .get("previous_keys")
+                .and_then(serde_json::Value::as_array)
+                && previous.iter().any(serde_json::Value::is_string)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{path}.signing.previous_keys entries must use deferred secret \
+                     references (for example {{ env = \"WEBHOOK_SIGNING_KEY_PREVIOUS\" }})"
+                )));
+            }
         }
 
         if sink_type == Some("iceberg") {
@@ -474,7 +536,7 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
                     && value.is_string()
                 {
                     return Err(ConfigError::Invalid(format!(
-                        "sink.iceberg.catalog.rest.{field} must use deferred secret references (for example {{ env = \"VAR\" }})"
+                        "{path}.catalog.rest.{field} must use deferred secret references (for example {{ env = \"VAR\" }})"
                     )));
                 }
             }
@@ -913,97 +975,9 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if let SinkConfig::Http(http) = &config.sink {
-        if http.url.trim().is_empty() {
-            return Err(ConfigError::Invalid(
-                "sink.http.url must not be empty".to_string(),
-            ));
-        }
-        if !http.verify_tls {
-            return Err(ConfigError::Invalid(
-                "sink.http.verify_tls must be true; insecure HTTP TLS bypass is unsupported"
-                    .to_string(),
-            ));
-        }
-        validate_http_sink_url_policy(&http.url)?;
-        if http.timeout_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.timeout_ms must be > 0".to_string(),
-            ));
-        }
-        if http.batch_max_events == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.batch_max_events must be > 0".to_string(),
-            ));
-        }
-        if http.batch_max_delay_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.batch_max_delay_ms must be > 0".to_string(),
-            ));
-        }
-        if http.max_pending_bytes == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.max_pending_bytes must be > 0".to_string(),
-            ));
-        }
-        if http.backoff_multiplier < 1.0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_multiplier must be >= 1.0".to_string(),
-            ));
-        }
-        if !http.backoff_multiplier.is_finite() {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_multiplier must be finite".to_string(),
-            ));
-        }
-        if http.backoff_initial_ms == 0 || http.backoff_max_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_initial_ms and backoff_max_ms must be > 0".to_string(),
-            ));
-        }
-        if http.backoff_initial_ms > http.backoff_max_ms {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_initial_ms must be <= backoff_max_ms".to_string(),
-            ));
-        }
-        if http.batch_retry_time_budget_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.batch_retry_time_budget_ms must be > 0".to_string(),
-            ));
-        }
-        if let Some(token) = &http.bearer_token {
-            // Plaintext literals in the config file are rejected earlier, on the
-            // raw document (`enforce_deferred_secret_literals`) — by this point
-            // an inline value is the resolved form of an `{ env = … }` reference.
-            let resolved = token.resolve().map_err(|e| {
-                ConfigError::Invalid(format!("sink.http.bearer_token could not be resolved: {e}"))
-            })?;
-            if resolved.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "sink.http.bearer_token must not be empty when configured".to_string(),
-                ));
-            }
-        }
-    }
-
-    if let SinkConfig::Kafka(kafka) = &config.sink {
-        kafka.validate().map_err(ConfigError::Invalid)?;
-    }
-
-    if let SinkConfig::Iceberg(iceberg) = &config.sink {
-        iceberg.validate().map_err(ConfigError::Invalid)?;
-    }
-
-    if let SinkConfig::Fan(fan) = &config.sink {
-        validate_fan_sink_config(fan)?;
-    }
-
-    // Codec configuration was never validated: a codec naming a plaintext registry URL,
-    // or a registry-backed codec with no registry at all, only failed when the sink was
-    // built — after the source had already connected.
-    validate_sink_codec("sink", &config.sink)?;
+    validate_sink_config("sink", &config.sink)?;
     for named in &config.sinks {
-        validate_sink_codec(&format!("sinks.{}", named.name), &named.sink)?;
+        validate_sink_config(&format!("sinks.{}", named.name), &named.sink)?;
     }
 
     validate_delivery_contract(config)?;
@@ -1078,52 +1052,150 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
-    if let SinkConfig::Kafka(kafka) = &config.sink
-        && matches!(
+/// Every sink an event can reach, labelled the way the operator wrote it.
+///
+/// `[[sinks]]` entries are routing destinations, not documentation: a `[[pipeline.routes]]`
+/// entry sends real change events to one, so a contract checked only against `[sink]` is
+/// checked against a sink the events may never reach.
+fn routed_sinks(config: &AppConfig) -> Vec<(String, &SinkConfig)> {
+    std::iter::once(("sink".to_string(), &config.sink))
+        .chain(
+            config
+                .sinks
+                .iter()
+                .map(|named| (format!("sinks.{}", named.name), &named.sink)),
+        )
+        .collect()
+}
+
+/// How a sink reaches `effectively_once`, if it can at all.
+///
+/// # Why a mechanism rather than a pair of booleans
+///
+/// `sink.kafka` in **idempotent** mode and `sink.snowflake` both answer "idempotent
+/// delivery, no transactional barrier" — the same pair — yet one reaches the contract and
+/// the other does not. Snowflake's guarantee comes from a destination-side offset token
+/// rather than a transaction this process opens, and no combination of those flags
+/// separates them. Asking *which mechanism* does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectivelyOnceMechanism {
+    /// The batch's records and its checkpoint commit in one Kafka transaction.
+    ///
+    /// Requires the checkpoint to live in Kafka on the same cluster, and requires this to
+    /// be the **only** such sink in the pipeline.
+    KafkaTransaction,
+
+    /// A destination-side offset token the sink advances before `flush` returns, so a
+    /// replayed batch is filtered at the destination rather than duplicated.
+    DestinationOffsetToken,
+}
+
+fn effectively_once_mechanism(sink: &SinkConfig) -> Option<EffectivelyOnceMechanism> {
+    match sink {
+        SinkConfig::Kafka(kafka) => matches!(
             kafka.delivery_mode,
             super::schema::KafkaDeliveryMode::Transactional
         )
-        && config.delivery_contract != DeliveryContract::EffectivelyOnce
-    {
-        return Err(ConfigError::Invalid(
-                "delivery_contract must be \"effectively_once\" when sink.kafka.delivery_mode=\"transactional\""
-                    .to_string(),
-            ));
+        .then_some(EffectivelyOnceMechanism::KafkaTransaction),
+        SinkConfig::Snowflake(_) => Some(EffectivelyOnceMechanism::DestinationOffsetToken),
+        // Fan-out is excluded even when every child is transactional: the children are
+        // erased to `BoxedSink`, so no child's producer is reachable and no transaction can
+        // span them. `BuiltSink::transaction_handle` returns `None` for that reason, and a
+        // `None` handle checkpoints through a second producer, outside the transaction.
+        _ => None,
+    }
+}
+
+fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
+    let routed = routed_sinks(config);
+
+    // Checked for every routed sink, not only the default one: `delivery_mode` is a
+    // statement about the contract, and a named sink in transactional mode under
+    // `at_least_once` opens a transaction nothing ever couples a checkpoint to.
+    for (path, sink) in &routed {
+        if let SinkConfig::Kafka(kafka) = sink
+            && matches!(
+                kafka.delivery_mode,
+                super::schema::KafkaDeliveryMode::Transactional
+            )
+            && config.delivery_contract != DeliveryContract::EffectivelyOnce
+        {
+            return Err(ConfigError::Invalid(format!(
+                "delivery_contract must be \"effectively_once\" when \
+                 {path}.delivery_mode=\"transactional\""
+            )));
+        }
     }
 
     validate_durability_waits_fit_the_flush_timeout(config)?;
 
-    let sink_name = sink_name(&config.sink);
-    let idempotent_delivery_capable = sink_idempotent_delivery_capable(&config.sink);
-    let transactional_checkpoint_barrier_capable =
-        sink_transactional_checkpoint_barrier_capable(&config.sink);
+    if config.delivery_contract != DeliveryContract::EffectivelyOnce {
+        return Ok(());
+    }
 
-    if !config.delivery_contract.is_satisfied_by(
-        idempotent_delivery_capable,
-        transactional_checkpoint_barrier_capable,
-    ) {
-        let mut requirements = Vec::new();
-        if config.delivery_contract.requires_idempotent_delivery() {
-            requirements.push("idempotent delivery");
+    // Every sink the events reach has to carry the guarantee, because the contract is a
+    // property of the pipeline rather than of whichever sink happens to be listed first.
+    //
+    // The transactional sinks are collected *with* their config rather than by name, so the
+    // cluster check below reads the one it already has instead of looking it up again — a
+    // second lookup that can only fail by construction is a panic waiting for a refactor to
+    // make it reachable.
+    let mut kafka_transaction_sinks: Vec<(&str, &super::sink::KafkaSinkConfig)> = Vec::new();
+    for (path, sink) in &routed {
+        match (effectively_once_mechanism(sink), sink) {
+            (Some(EffectivelyOnceMechanism::KafkaTransaction), SinkConfig::Kafka(kafka)) => {
+                kafka_transaction_sinks.push((path.as_str(), kafka));
+            }
+            (Some(EffectivelyOnceMechanism::KafkaTransaction), _) => {
+                // Unreachable by construction — only a Kafka sink yields this mechanism —
+                // and treated as "no mechanism" rather than asserted, so a future sink that
+                // gains a transaction is rejected until this arm is taught about it.
+                return Err(ConfigError::Invalid(format!(
+                    "delivery_contract='effectively_once': {path} reports a Kafka transaction \
+                     but is not a Kafka sink; this is a bug in rustcdc, please report it"
+                )));
+            }
+            (Some(EffectivelyOnceMechanism::DestinationOffsetToken), _) => {}
+            (None, _) => {
+                return Err(ConfigError::Invalid(format!(
+                    "delivery_contract='effectively_once' is incompatible with \
+                     {path}.type='{}'. Reaching it needs either a Kafka sink with \
+                     delivery_mode=\"transactional\", so the records and the checkpoint \
+                     commit in one transaction, or a sink with a destination-side offset \
+                     token (snowflake). Either change that sink, or set \
+                     delivery_contract=\"at_least_once\".",
+                    sink_name(sink)
+                )));
+            }
         }
-        if config
-            .delivery_contract
-            .requires_transactional_checkpoint_barrier()
-        {
-            requirements.push("transactional checkpoint barrier coupling");
-        }
+    }
 
+    // Two transactions are not one. `BuiltRouter::transaction_handle` yields `None` when a
+    // second transactional sink exists, and a `None` handle writes the checkpoint through
+    // a separate producer — outside either transaction, which is precisely the window this
+    // contract is chosen to close. Refusing is the only honest answer; picking one of the
+    // two silently leaves the other's records uncoupled.
+    if kafka_transaction_sinks.len() > 1 {
         return Err(ConfigError::Invalid(format!(
-            "delivery_contract='{}' is incompatible with sink.type='{}': missing {}",
-            config.delivery_contract.as_label(),
-            sink_name,
-            requirements.join(" and ")
+            "delivery_contract='effectively_once' allows at most one transactional Kafka \
+             sink, but {} are configured ({}). One Kafka transaction cannot span two \
+             producers, so the checkpoint could only ever be written inside one of them \
+             and the other's records would commit separately. Route through a single \
+             transactional sink, or set delivery_contract=\"at_least_once\".",
+            kafka_transaction_sinks.len(),
+            kafka_transaction_sinks
+                .iter()
+                .map(|(path, _)| *path)
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
 
-    if config.delivery_contract == DeliveryContract::EffectivelyOnce {
-        validate_effectively_once_state_backend(config)?;
+    // Only the Kafka mechanism constrains the state backend. A pipeline reaching the
+    // contract purely through destination-side offset tokens needs no Kafka at all, which
+    // is why this is not a blanket requirement of the contract.
+    if let Some((path, kafka)) = kafka_transaction_sinks.first() {
+        validate_effectively_once_state_backend(path, kafka, config)?;
     }
 
     Ok(())
@@ -1139,13 +1211,15 @@ fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
 /// combination used to be accepted and the residual window documented; requiring the
 /// backend instead turns a caveat an operator has to read into a configuration they cannot
 /// express.
-fn validate_effectively_once_state_backend(config: &AppConfig) -> Result<(), ConfigError> {
-    let SinkConfig::Kafka(sink) = &config.sink else {
-        // A non-Kafka sink cannot satisfy the contract at all; the capability check above
-        // has already rejected it.
-        return Ok(());
-    };
-
+///
+/// `path` names the transactional sink the way the operator wrote it, because it is no
+/// longer necessarily `[sink]` — a `[[sinks]]` entry can be the one carrying the
+/// transaction.
+fn validate_effectively_once_state_backend(
+    path: &str,
+    sink: &super::sink::KafkaSinkConfig,
+    config: &AppConfig,
+) -> Result<(), ConfigError> {
     let super::state::StateBackend::KafkaTopic(state) = &config.state.offset.backend else {
         return Err(ConfigError::Invalid(format!(
             "delivery_contract='effectively_once' requires state.offset.backend=\"kafka_topic\", \
@@ -1168,9 +1242,10 @@ fn validate_effectively_once_state_backend(config: &AppConfig) -> Result<(), Con
 
     if sink_brokers != state_brokers {
         return Err(ConfigError::Invalid(format!(
-            "delivery_contract='effectively_once' requires the sink and the checkpoint topic to \
-             be on the same Kafka cluster, because one transaction cannot span two. \
-             sink.kafka.brokers is '{}' and state.offset.backend.kafka_topic.brokers is '{}'.",
+            "delivery_contract='effectively_once' requires the transactional sink and the \
+             checkpoint topic to be on the same Kafka cluster, because one transaction cannot \
+             span two. {path}.brokers is '{}' and state.offset.backend.kafka_topic.brokers is \
+             '{}'.",
             sink.brokers, state.brokers
         )));
     }
@@ -1245,36 +1320,48 @@ fn sink_name(sink: &SinkConfig) -> &'static str {
     }
 }
 
-fn sink_idempotent_delivery_capable(sink: &SinkConfig) -> bool {
-    match sink {
-        SinkConfig::Kafka(_) => true,
-        // The channel's offset token is a destination-side record of what is durable, and
-        // `flush` does not return until it has advanced — so a replayed batch is filtered
-        // out on resume rather than duplicated. That is idempotence in the sense this flag
-        // means, without a Kafka transaction anywhere.
-        SinkConfig::Snowflake(_) => true,
-        SinkConfig::Fan(fan) => fan.sinks.iter().all(sink_idempotent_delivery_capable),
-        _ => false,
-    }
-}
+/// Validate one sink and, for fan-out, every child underneath it.
+///
+/// `path` names the sink the way the operator wrote it — `sink`, `sinks.warehouse`,
+/// `sink.sinks[1]` — so an error points at the block to edit rather than at "the Kafka
+/// sink" when three of them are configured.
+fn validate_sink_config(path: &str, sink: &SinkConfig) -> Result<(), ConfigError> {
+    let relabel = |e: String| ConfigError::Invalid(relabel_sink_error(path, e));
 
-fn sink_transactional_checkpoint_barrier_capable(sink: &SinkConfig) -> bool {
     match sink {
-        SinkConfig::Kafka(kafka) => {
-            matches!(
-                kafka.delivery_mode,
-                super::schema::KafkaDeliveryMode::Transactional
-            )
+        SinkConfig::Fan(fan) => {
+            validate_fan_sink_config(path, fan)?;
+            for (i, child) in fan.sinks.iter().enumerate() {
+                validate_sink_config(&format!("{path}.sinks[{i}]"), child)?;
+            }
         }
-        SinkConfig::Fan(fan) => fan
-            .sinks
-            .iter()
-            .all(sink_transactional_checkpoint_barrier_capable),
-        _ => false,
+        SinkConfig::Kafka(kafka) => kafka.validate().map_err(relabel)?,
+        SinkConfig::Iceberg(iceberg) => iceberg.validate().map_err(relabel)?,
+        SinkConfig::Http(http) => http.validate().map_err(relabel)?,
+        _ => {}
     }
+
+    validate_sink_codec(path, sink)
 }
 
-/// Validate the codec of a sink (and, recursively, of every fan-out child).
+/// Re-point a sink error written for the default `[sink]` block at the sink it came from.
+///
+/// The per-sink `validate()` methods spell their own paths (`sink.kafka.topic`), which is
+/// right for the default sink and wrong for every other one. Rewriting the prefix here
+/// keeps one message per rule instead of threading a path argument through every
+/// validator — and leaves a message that names no path alone.
+fn relabel_sink_error(path: &str, error: String) -> String {
+    if path == "sink" {
+        return error;
+    }
+    for kind in ["kafka", "iceberg", "http"] {
+        if let Some(rest) = error.strip_prefix(&format!("sink.{kind}.")) {
+            return format!("{path}.{kind}.{rest}");
+        }
+    }
+    format!("{path}: {error}")
+}
+
 fn validate_sink_codec(path: &str, sink: &SinkConfig) -> Result<(), ConfigError> {
     match sink {
         SinkConfig::Fan(fan) => {
@@ -1299,16 +1386,19 @@ fn validate_sink_codec(path: &str, sink: &SinkConfig) -> Result<(), ConfigError>
     }
 }
 
-fn validate_fan_sink_config(fan: &super::schema::FanSinkConfig) -> Result<(), ConfigError> {
+fn validate_fan_sink_config(
+    path: &str,
+    fan: &super::schema::FanSinkConfig,
+) -> Result<(), ConfigError> {
     if fan.sinks.is_empty() {
-        return Err(ConfigError::Invalid(
-            "sink.fan.sinks must contain at least one child sink".to_string(),
-        ));
+        return Err(ConfigError::Invalid(format!(
+            "{path}.sinks must contain at least one child sink"
+        )));
     }
     for (i, child) in fan.sinks.iter().enumerate() {
         if matches!(child, SinkConfig::Fan(_)) {
             return Err(ConfigError::Invalid(format!(
-                "sink.fan.sinks[{i}]: nested fan-out sinks are not supported"
+                "{path}.sinks[{i}]: nested fan-out sinks are not supported"
             )));
         }
     }
@@ -1355,3 +1445,7 @@ pub(crate) fn validate_http_sink_url_policy(url: &str) -> Result<(), ConfigError
 #[cfg(test)]
 #[path = "loader_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "loader_sink_tests.rs"]
+mod sink_tests;

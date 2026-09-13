@@ -183,9 +183,12 @@ fn bench_pipeline_batch(c: &mut Criterion) {
                     |(dir, config, batch)| {
                         let transform = &transform;
                         async move {
-                            let binding = rustcdc_server::sink::build_binding(&config, 1 << 20)
-                                .await
-                                .expect("sink binding");
+                            let binding = rustcdc_server::sink::build_binding(
+                                &config,
+                                &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+                            )
+                            .await
+                            .expect("sink binding");
                             let mut router = rustcdc_server::pipeline::router::single(binding);
 
                             let stats = rustcdc_server::runtime::batch::process_batch_events(

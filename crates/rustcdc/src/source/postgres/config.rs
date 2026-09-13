@@ -64,6 +64,7 @@ impl Default for PostgresSourceConfig {
             // The protocol logical replication was designed around. `SqlPeek` is the
             // fallback for environments that cannot grant a replication connection.
             wal_transport: WalTransport::StreamingReplication,
+            reselect_unavailable_columns: false,
         }
     }
 }

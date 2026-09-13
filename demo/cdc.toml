@@ -40,6 +40,16 @@ mode = "plaintext"   # no TLS needed for same-Docker-network connections
 [sink]
 type = "stdout"
 
+# For Kafka, one sink covers every table — `${schema}` and `${table}` resolve per event:
+#
+#   [sink]
+#   type    = "kafka"
+#   brokers = "redpanda:9092"
+#   topic   = "cdc.${schema}.${table}"
+#
+# Startup checks the topics this demo's `snapshot_tables` render to. Create them first;
+# rustcdc does not.
+
 # ── Transforms ────────────────────────────────────────────────────────────────
 # Native masking: customer e-mail is redacted before it reaches any sink, and
 # the name is replaced by a keyed HMAC so rows stay joinable without being

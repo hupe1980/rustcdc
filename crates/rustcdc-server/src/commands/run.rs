@@ -294,7 +294,7 @@ async fn run_with_runtime_state(
         app_config.delivery_contract,
     )?;
     let delivery_contract_satisfied = app_config.delivery_contract.is_satisfied_by(
-        sink_idempotent_delivery_capable,
+        sink.delivery_guarantee(),
         sink_transactional_checkpoint_barrier_capable,
     );
     let checkpoint_txn_reconciliation_enabled = app_config.delivery_contract
@@ -628,10 +628,12 @@ pub(crate) mod tests {
     /// `SinkBinding`, so they check the limit where it now lives.
     #[tokio::test]
     async fn event_size_limit_rejects_an_oversized_encoded_payload() {
-        let mut binding =
-            crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()), 64)
-                .await
-                .expect("stdout binding");
+        let mut binding = crate::sink::build_binding(
+            &SinkConfig::Stdout(StdoutSinkConfig::default()),
+            &crate::sink::SinkBuildContext::new(64),
+        )
+        .await
+        .expect("stdout binding");
 
         let err = binding
             .send_event(&sample_event(&"x".repeat(4096)))
@@ -645,10 +647,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn event_size_limit_allows_a_payload_within_the_limit() {
-        let mut binding =
-            crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()), 4096)
-                .await
-                .expect("stdout binding");
+        let mut binding = crate::sink::build_binding(
+            &SinkConfig::Stdout(StdoutSinkConfig::default()),
+            &crate::sink::SinkBuildContext::new(4096),
+        )
+        .await
+        .expect("stdout binding");
 
         binding
             .send_event(&sample_event("ok"))
@@ -981,6 +985,7 @@ pub(crate) mod tests {
             create_replication_slot_if_missing: false,
             failover_slot: false,
             wal_transport: Default::default(),
+            reselect_unavailable_columns: false,
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

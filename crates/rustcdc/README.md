@@ -168,8 +168,13 @@ decide. The three forms are tabulated in the
 
 `Merge` hands you only the columns the source actually supplied, so there is no placeholder
 left to write by accident. It arises from PostgreSQL unchanged-TOAST: a large value not
-modified by an `UPDATE` is omitted from the WAL and is unrecoverable. `REPLICA IDENTITY FULL`
-does **not** fix it — replica identity governs the before-image only.
+modified by an `UPDATE` is omitted from the WAL. `REPLICA IDENTITY FULL` does **not** fix it
+— replica identity governs the before-image only.
+
+The value is absent from the log but still in the table: `reselect_unavailable_columns` on
+the PostgreSQL source re-reads it by row key and hands you a complete row. Off by default —
+it reads the value *now* rather than at the event's LSN, and a row deleted in the meantime
+keeps its columns absent.
 
 The same refusal covers keys. A composite key missing one column is not a narrower key, it is a
 **wider** one: `{"tenant_id": 7}` from a `(tenant_id, id)` key addresses every row of that

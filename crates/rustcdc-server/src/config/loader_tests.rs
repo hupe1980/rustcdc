@@ -574,13 +574,17 @@ dir = "/tmp/cdc-state"
 
     let err = load(&config_path)
         .expect_err("expected effectively_once contract rejection without transactional mode");
+    // The message names what would actually fix it. The wording it replaced reported
+    // "missing idempotent delivery" for a Kafka sink, whose producer is idempotent —
+    // it listed the contract's requirements rather than the sink's shortfall.
+    let err = err.to_string();
     assert!(
-        err.to_string().contains(
-            "delivery_contract='effectively_once' is incompatible with sink.type='kafka': missing idempotent delivery and transactional checkpoint barrier coupling"
-        ) || err.to_string().contains(
-            "delivery_contract='effectively_once' is incompatible with sink.type='kafka': missing transactional checkpoint barrier coupling"
-        ),
+        err.contains("delivery_contract='effectively_once' is incompatible with sink.type='kafka'"),
         "unexpected error: {err}"
+    );
+    assert!(
+        err.contains("delivery_mode=\"transactional\""),
+        "the error must name the setting that fixes it: {err}"
     );
 }
 
@@ -677,9 +681,12 @@ kafka_topic = { brokers = "localhost:9092", topic = "cdc-state", min_replication
 
     let err = load(&config_path)
         .expect_err("expected delivery_contract mismatch for transactional kafka mode");
+    // `sink.delivery_mode`, not `sink.kafka.delivery_mode`: the key sits directly under
+    // `[sink]` beside `type = "kafka"`, and there is no `[sink.kafka]` table to edit. The
+    // path is also how a `[[sinks]]` entry is named, so one spelling covers both.
     assert!(
         err.to_string().contains(
-            "delivery_contract must be \"effectively_once\" when sink.kafka.delivery_mode=\"transactional\""
+            "delivery_contract must be \"effectively_once\" when sink.delivery_mode=\"transactional\""
         ),
         "unexpected error: {err}"
     );
@@ -2956,7 +2963,7 @@ dir = "/tmp/cdc-state"
     let err = load(&config_path).expect_err("expected inline bearer token literal to be rejected");
     assert!(
         err.to_string()
-            .contains("sink.http.bearer_token must use deferred secret references")
+            .contains("sink.bearer_token must use deferred secret references")
     );
 }
 
@@ -3124,7 +3131,7 @@ dir = "/tmp/cdc-state"
     let err = load(&config_path).expect_err("expected inline iceberg token literal to be rejected");
     assert!(
         err.to_string()
-            .contains("sink.iceberg.catalog.rest.token must use deferred secret references")
+            .contains("sink.catalog.rest.token must use deferred secret references")
     );
 }
 
@@ -3367,4 +3374,365 @@ dir = "{}"
     // test that depends on an ambient variable passes locally and fails in isolation.
     let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
     load(&config_path).expect("config should load")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `effectively_once` is a property of the pipeline, not of `[sink]`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One PostgreSQL source, a Kafka state backend, and whatever sinks the test needs.
+///
+/// Written as a real TOML document and run through the real `load()`: the rules under
+/// test live in the loader, and a rule the loader never reaches is a rule no operator is
+/// protected by.
+fn eos_fixture(dir: &std::path::Path, contract: &str, sink: &str, extra: &str) -> PathBuf {
+    let config_path: PathBuf = dir.join("cdc.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+api_version = "v1alpha1"
+delivery_contract = "{contract}"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc_user"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+conn_timeout_secs = 10
+stream_poll_interval_ms = 100
+max_events_per_poll = 1000
+table_include_list = []
+table_exclude_list = []
+
+[source.postgres.transport]
+mode = "plaintext"
+
+{sink}
+
+[state]
+dir = "/tmp/cdc-state"
+
+[state.backend]
+kafka_topic = {{ brokers = "localhost:9092", topic = "cdc-state", min_replication_factor = 1, min_insync_replicas = 1, durability_profile = "development" }}
+{extra}
+"#
+        ),
+    )
+    .expect("write config");
+    config_path
+}
+
+const TRANSACTIONAL_DEFAULT_SINK: &str = r#"
+[sink]
+type = "kafka"
+brokers = "localhost:9092"
+topic = "cdc-events"
+delivery_mode = "transactional"
+transactional_id = "cdc-eos-1"
+"#;
+
+/// A `[[sinks]]` entry is a destination, so the contract has to hold there too.
+///
+/// The defect: `validate_delivery_contract` read `config.sink` and nothing else, so this
+/// document loaded. A `[[pipeline.routes]]` entry then sent real change events to a
+/// `file_jsonl` sink that has neither a transaction nor a destination-side offset token,
+/// under a contract promising both — the guarantee was lost for every routed event, and
+/// nothing said so at startup or afterwards.
+#[test]
+fn effectively_once_rejects_a_routed_named_sink_that_cannot_honour_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "effectively_once",
+        &format!(
+            r#"{TRANSACTIONAL_DEFAULT_SINK}
+[[sinks]]
+name = "audit"
+type = "file_jsonl"
+path = "/tmp/audit.jsonl"
+"#
+        ),
+        "\n[[pipeline.routes]]\ntable_pattern = \"public.audit\"\nsink = \"audit\"\n",
+    );
+
+    let error = load(&path)
+        .expect_err("a routed file_jsonl sink cannot deliver effectively_once")
+        .to_string();
+    assert!(
+        error.contains("sinks.audit.type='file_jsonl'"),
+        "the error must name the offending sink the way the operator wrote it: {error}"
+    );
+}
+
+/// Two transactional Kafka sinks are two transactions, and the checkpoint fits in neither.
+///
+/// `BuiltRouter::transaction_handle` deliberately yields `None` when more than one exists,
+/// and a `None` handle builds a second producer that writes the checkpoint *outside* the
+/// sink's transaction — at-least-once wearing the name of the stronger contract. The
+/// binding's own documentation said the loader rejected this; it did not.
+#[test]
+fn effectively_once_rejects_a_second_transactional_kafka_sink() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "effectively_once",
+        &format!(
+            r#"{TRANSACTIONAL_DEFAULT_SINK}
+[[sinks]]
+name = "second"
+type = "kafka"
+brokers = "localhost:9092"
+topic = "cdc-second"
+delivery_mode = "transactional"
+transactional_id = "cdc-eos-2"
+"#
+        ),
+        "\n[[pipeline.routes]]\ntable_pattern = \"public.second\"\nsink = \"second\"\n",
+    );
+
+    let error = load(&path)
+        .expect_err("one transaction cannot span two producers")
+        .to_string();
+    assert!(
+        error.contains("at most one transactional Kafka sink"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("sink, sinks.second"),
+        "both offending sinks must be named: {error}"
+    );
+}
+
+/// Fan-out cannot carry the transaction, even when every child could carry one alone.
+///
+/// The children are erased to `BoxedSink`, so no child's producer is reachable and
+/// `BuiltSink::transaction_handle` returns `None`. The old capability test asked whether
+/// *all* children were transactionally capable and answered yes, so this loaded and then
+/// checkpointed outside every transaction.
+#[test]
+fn effectively_once_rejects_fan_out_even_when_every_child_is_transactional() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "effectively_once",
+        r#"
+[sink]
+type = "fan"
+
+[[sink.sinks]]
+type = "kafka"
+brokers = "localhost:9092"
+topic = "cdc-a"
+delivery_mode = "transactional"
+transactional_id = "cdc-eos-a"
+
+[[sink.sinks]]
+type = "kafka"
+brokers = "localhost:9092"
+topic = "cdc-b"
+delivery_mode = "transactional"
+transactional_id = "cdc-eos-b"
+"#,
+        "",
+    );
+
+    let error = load(&path)
+        .expect_err("a transaction cannot span fan-out children")
+        .to_string();
+    assert!(
+        error.contains("sink.type='fan_out'"),
+        "unexpected error: {error}"
+    );
+}
+
+/// The documented Snowflake path must actually load.
+///
+/// `DELIVERY.md`'s "Snowflake exception" and the sink table both promise that a Snowflake
+/// sink reaches `effectively_once` through the channel's offset token, with no Kafka
+/// anywhere. The old two-boolean test required a transactional barrier as well, so this
+/// configuration was refused at load — reporting "missing idempotent delivery" for a sink
+/// whose idempotence is the entire mechanism.
+#[test]
+fn effectively_once_accepts_a_snowflake_sink_with_no_kafka_transaction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "effectively_once",
+        r#"
+[sink]
+type = "snowflake"
+account_url = "https://myorg-myaccount.snowflakecomputing.com"
+account = "MYORG-MYACCOUNT"
+user = "CDC_SVC"
+database = "CDC"
+schema = "PUBLIC"
+pipe = "EVENTS_PIPE"
+commit_timeout_ms = 30000
+
+[sink.auth]
+type = "key_pair"
+private_key = { env = "CDC_TEST_SNOWFLAKE_KEY" }
+"#,
+        "",
+    );
+
+    let _env = crate::test_env::EnvGuard::set(&[
+        ("CDC_TEST_SOURCE_PASSWORD", "pg-secret"),
+        (
+            "CDC_TEST_SNOWFLAKE_KEY",
+            include_str!("../../tests/fixtures/snowflake_test_key.pem"),
+        ),
+    ]);
+
+    load(&path).expect("the documented Snowflake exception must load");
+}
+
+/// A named sink in transactional mode is still a transactional sink.
+///
+/// The `delivery_mode`/`delivery_contract` agreement check also read only `config.sink`,
+/// so a `[[sinks]]` entry could open a transaction under `at_least_once` that nothing
+/// would ever couple a checkpoint to.
+#[test]
+fn a_transactional_named_kafka_sink_under_at_least_once_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "at_least_once",
+        r#"
+[sink]
+type = "stdout"
+
+[[sinks]]
+name = "events"
+type = "kafka"
+brokers = "localhost:9092"
+topic = "cdc-events"
+delivery_mode = "transactional"
+transactional_id = "cdc-eos-1"
+"#,
+        "\n[[pipeline.routes]]\ntable_pattern = \"public.events\"\nsink = \"events\"\n",
+    );
+
+    let error = load(&path)
+        .expect_err("a transactional named sink needs effectively_once")
+        .to_string();
+    assert!(
+        error.contains("sinks.events.delivery_mode=\"transactional\""),
+        "the error must name the named sink: {error}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Literal secrets are refused wherever a sink can be configured
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A fan-out child is a sink, so its credentials follow the same rule.
+///
+/// The scan looked only at `[sink]` and `[[sinks]]`. A fan sink's own `type` is `"fan"`, so
+/// none of the per-type checks fired for it, and its children were never visited at all —
+/// a literal bearer token inside `[[sink.sinks]]` loaded cleanly.
+#[test]
+fn a_literal_bearer_token_in_a_fan_out_child_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "at_least_once",
+        r#"
+[sink]
+type = "fan"
+
+[[sink.sinks]]
+type = "stdout"
+
+[[sink.sinks]]
+type = "http"
+url = "https://example.com/hook"
+bearer_token = "super-secret-literal-token"
+"#,
+        "",
+    );
+    let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
+
+    let error = load(&path)
+        .expect_err("a literal bearer token must be refused in a fan-out child")
+        .to_string();
+    assert!(
+        error.contains("sink.sinks[1].bearer_token"),
+        "the error must name the child that carries it: {error}"
+    );
+}
+
+/// The same hole, on the credential where it costs the most.
+///
+/// A leaked webhook signing key does not merely expose data — it lets anyone forge events
+/// *as this pipeline*, which is the one property the signature exists to provide.
+#[test]
+fn a_literal_webhook_signing_key_in_a_fan_out_child_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "at_least_once",
+        r#"
+[sink]
+type = "fan"
+
+[[sink.sinks]]
+type = "stdout"
+
+[[sink.sinks]]
+type = "http"
+url = "https://example.com/hook"
+
+[sink.sinks.signing]
+scheme = "hmac_sha256"
+key = "whsec_bGl0ZXJhbHNlY3JldGxpdGVyYWxzZWNyZXQ="
+"#,
+        "",
+    );
+    let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
+
+    let error = load(&path)
+        .expect_err("a literal signing key must be refused in a fan-out child")
+        .to_string();
+    assert!(
+        error.contains("sink.sinks[1].signing.key"),
+        "the error must name the child that carries it: {error}"
+    );
+}
+
+/// The error names the block the operator has to edit.
+///
+/// It used to say `sink.http.bearer_token` for every position, so a literal token in the
+/// third of four named sinks reported a path that does not exist in the document.
+#[test]
+fn a_literal_secret_in_a_named_sink_is_reported_against_that_sink() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = eos_fixture(
+        dir.path(),
+        "at_least_once",
+        r#"
+[sink]
+type = "stdout"
+
+[[sinks]]
+name = "webhook"
+type = "http"
+url = "https://example.com/hook"
+bearer_token = "super-secret-literal-token"
+"#,
+        "\n[[pipeline.routes]]\ntable_pattern = \"public.x\"\nsink = \"webhook\"\n",
+    );
+    let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
+
+    let error = load(&path)
+        .expect_err("a literal bearer token must be refused")
+        .to_string();
+    assert!(
+        error.contains("sinks.webhook.bearer_token"),
+        "the error must name the sink by the name the operator gave it: {error}"
+    );
 }

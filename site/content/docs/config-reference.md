@@ -526,6 +526,7 @@ it is a catch-all, not a no-op.
 | `max_events_per_poll` | `usize` | 1 000 | Range 1–100 000. |
 | `slot_idle_advance_interval_ms` | `u64` | 30 000 | See "Idle slots retain WAL" below. `0` disables. |
 | `wal_transport` | `WalTransport` | `StreamingReplication` | How the WAL stream is read; see below. |
+| `reselect_unavailable_columns` | `bool` | `false` | Re-read unchanged TOASTed values from the source instead of reporting them absent; see below. |
 
 **`create_replication_slot_if_missing` is not a convenience flag.** A slot that vanishes
 mid-life — dropped by an operator, lost to a failover onto a replica that never had it, or
@@ -543,6 +544,35 @@ burst of rolled-back transactions — the slot's `confirmed_flush_lsn` stays pin
 PostgreSQL cannot recycle WAL segments. `slot_idle_advance_interval_ms` makes the connector
 confirm the server's current WAL position after that much time without events. Disabling it on a
 long-lived stream is how a disk fills up.
+
+
+### `reselect_unavailable_columns`
+
+PostgreSQL does not write an **unchanged** out-of-line (TOASTed) value to the WAL, so an
+`UPDATE` that does not touch such a column emits an event without it and names it in
+`unavailable_columns`. Set this to re-read those values from the source and fill them in:
+
+```toml
+[source.postgres]
+reselect_unavailable_columns = true
+```
+
+Filled columns are removed from `unavailable_columns`, so the sink sees a complete row. The
+values use the same projection as the snapshot path, so they match what the WAL would have
+carried — a reselected `boolean` reads `t`, not the `true` a `::text` cast yields.
+
+**Cost.** One extra `SELECT` per event that has holes, on the ordinary SQL connection.
+Events without holes are untouched; the per-table catalog lookup happens once per stream.
+
+**Limits.** The value is read *now*, not at the event's LSN:
+
+- a later `UPDATE` to that column, committed before the reselect runs, attaches the newer
+  value to the older event. The window is narrow — PostgreSQL omits the value precisely
+  because the statement did not modify it — but it is not closed;
+- a later `DELETE` leaves nothing to read, and the columns stay absent. A missing row is
+  never reported as `NULL`;
+- holes in the `before` image are never filled; reading the row now cannot recover what a
+  column held beforehand.
 
 
 ### `wal_transport`

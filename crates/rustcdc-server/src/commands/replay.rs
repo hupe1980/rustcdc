@@ -75,7 +75,11 @@ pub async fn execute(args: ReplayArgs, config_path: Option<&Path>) -> Result<(),
     };
     let effective_sink_config = override_sink.unwrap_or(sink_config);
     let mut sink = crate::pipeline::router::single(
-        sink::build_binding(&effective_sink_config, runtime_tuning.max_event_bytes).await?,
+        sink::build_binding(
+            &effective_sink_config,
+            &sink::SinkBuildContext::new(runtime_tuning.max_event_bytes),
+        )
+        .await?,
     );
 
     // Fail fast if the parity mode is incompatible with the delivery contract

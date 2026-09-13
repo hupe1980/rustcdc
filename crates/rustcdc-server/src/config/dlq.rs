@@ -177,9 +177,7 @@ impl DlqConfig {
                 if kafka.brokers.trim().is_empty() {
                     return Err("dlq.brokers must not be empty for the kafka target".to_string());
                 }
-                if kafka.topic.trim().is_empty() {
-                    return Err("dlq.topic must not be empty for the kafka target".to_string());
-                }
+                crate::topic::validate_literal_topic("dlq.topic", &kafka.topic)?;
             }
             DlqTarget::Sqs(sqs) => {
                 let url = sqs.queue_url.trim();

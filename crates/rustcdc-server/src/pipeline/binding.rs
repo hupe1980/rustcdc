@@ -50,8 +50,21 @@ pub async fn build_router(config: &AppConfig) -> Result<BuiltRouter, AppError> {
     // attempts rather than before.
     validate_route_references(&config.pipeline.routes, &config.sinks)?;
 
+    // Each sink preflights the topics *it* will be asked for, not the pipeline's whole
+    // table list. A named sink behind `table_pattern = "public.orders"` that demanded a
+    // topic for `public.customers` — a table routed elsewhere — would fail startup over
+    // a topic that will never receive an event.
+    let assignment = assign_known_tables(
+        sink::SinkBuildContext::known_tables_from_config(config),
+        &config.pipeline.routes,
+    );
+    let context_for = |tables: Vec<crate::topic::QualifiedTable>| {
+        sink::SinkBuildContext::new(config.runtime.max_event_bytes).with_known_tables(tables)
+    };
+
     // Always build the default sink binding.
-    let default_binding = sink::build_binding(&config.sink, config.runtime.max_event_bytes).await?;
+    let default_binding =
+        sink::build_binding(&config.sink, &context_for(assignment.default)).await?;
     let mut sink_metrics = SinkMetricsRegistry::default();
     sink_metrics.register(default_binding.metrics_handle());
 
@@ -64,29 +77,45 @@ pub async fn build_router(config: &AppConfig) -> Result<BuiltRouter, AppError> {
         });
     }
 
-    // Build named sink bindings and validate route references.
-    let mut named_sink_map: std::collections::HashMap<String, crate::sink::SinkBinding> =
-        std::collections::HashMap::with_capacity(config.sinks.len());
-    for named in &config.sinks {
-        let built = sink::build_binding(&named.sink, config.runtime.max_event_bytes).await?;
-        named_sink_map.insert(named.name.clone(), built);
-    }
+    // Named sinks are built inside the route loop rather than up front, because a sink's
+    // build context depends on which route claims it — a sink preflights the tables its
+    // own route sends it. `validate_route_references` has already established both
+    // invariants this loop relies on; they are re-checked here because violating either
+    // would mean building a producer twice or not at all, and a `?` is cheaper than
+    // trusting a caller two hundred lines away.
+    let declared: std::collections::HashMap<&str, &crate::config::sink::SinkConfig> = config
+        .sinks
+        .iter()
+        .map(|named| (named.name.as_str(), &named.sink))
+        .collect();
+    let mut claimed: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(config.sinks.len());
 
-    // Compile routes in order, consuming named sink bindings.
     let mut routes: Vec<(String, crate::sink::SinkBinding)> =
         Vec::with_capacity(config.pipeline.routes.len());
 
-    for route in &config.pipeline.routes {
-        // `validate_route_references` has already established that the name exists. It can
-        // still be absent here when two routes name the same sink — one binding cannot be
-        // owned by two routes — which is also rejected up front.
-        let binding = named_sink_map.remove(&route.sink).ok_or_else(|| {
+    for (index, route) in config.pipeline.routes.iter().enumerate() {
+        let sink_config = declared.get(route.sink.as_str()).ok_or_else(|| {
             AppError::Config(Box::new(crate::error::ConfigError::Invalid(format!(
                 "pipeline route references unknown sink {:?}; \
                  add a [[sinks]] entry with that name",
                 route.sink
             ))))
         })?;
+        if !claimed.insert(route.sink.as_str()) {
+            // The old loop consumed bindings out of a map, so the second route to name a
+            // sink reported "unknown sink" for one that was plainly declared. Whatever
+            // this says, it should not say that.
+            return Err(AppError::Config(Box::new(
+                crate::error::ConfigError::Invalid(format!(
+                    "sink {:?} is referenced by more than one [[pipeline.routes]] entry; \
+                     one binding cannot serve two routes",
+                    route.sink
+                )),
+            )));
+        }
+        let tables = assignment.per_route.get(index).cloned().unwrap_or_default();
+        let binding = sink::build_binding(sink_config, &context_for(tables)).await?;
         sink_metrics.register(binding.metrics_handle());
         routes.push((route.table_pattern.clone(), binding));
     }
@@ -106,6 +135,46 @@ pub async fn build_router(config: &AppConfig) -> Result<BuiltRouter, AppError> {
         transaction_handle,
         sink_metrics,
     })
+}
+
+/// Which of the configuration's known tables each sink will actually be asked for.
+struct KnownTableAssignment {
+    /// Tables no route claims — what the default `[sink]` receives.
+    default: Vec<crate::topic::QualifiedTable>,
+    /// Tables per route, in route order.
+    per_route: Vec<Vec<crate::topic::QualifiedTable>>,
+}
+
+/// Split the configuration's concrete tables the way the router will split its events.
+///
+/// Only the Kafka sink's topic preflight consumes this, and only when its `topic` is a
+/// template — but getting the split wrong is a startup failure over a topic that will
+/// never receive an event, so it uses the router's own matcher and the router's own
+/// first-match-wins order rather than an approximation of them.
+///
+/// A table matching no route lands on the default sink, which is exactly what
+/// `TableRouter::route_for` does.
+fn assign_known_tables(
+    tables: Vec<crate::topic::QualifiedTable>,
+    routes: &[crate::config::pipeline::RouteConfig],
+) -> KnownTableAssignment {
+    let mut assignment = KnownTableAssignment {
+        default: Vec::new(),
+        per_route: vec![Vec::new(); routes.len()],
+    };
+
+    for table in tables {
+        let key = table.display();
+        match routes
+            .iter()
+            .position(|route| rustcdc::pipeline::table_matches(&route.table_pattern, &key))
+        {
+            Some(index) => assignment.per_route[index].push(table),
+            None => assignment.default.push(table),
+        }
+    }
+
+    assignment
 }
 
 /// Check that `[[pipeline.routes]]` and `[[sinks]]` name each other consistently.
@@ -178,12 +247,21 @@ fn validate_route_references(
 mod tests {
     use crate::config::pipeline::RouteConfig;
     use crate::config::sink::{NamedSinkConfig, SinkConfig};
+    use crate::topic::QualifiedTable;
 
     fn stdout_sink(name: &str) -> NamedSinkConfig {
         NamedSinkConfig {
             name: name.to_string(),
             sink: SinkConfig::Stdout(Default::default()),
         }
+    }
+
+    /// The concrete tables among `entries`, the way the config path derives them.
+    fn concrete(entries: &[&str]) -> Vec<QualifiedTable> {
+        entries
+            .iter()
+            .filter_map(|entry| QualifiedTable::parse_concrete(entry))
+            .collect()
     }
 
     fn route(pattern: &str, sink: &str) -> RouteConfig {
@@ -233,6 +311,71 @@ mod tests {
         assert!(message.contains("exactly one route"), "{message}");
     }
 
+    /// A sink must preflight the topics *it* will be asked for.
+    ///
+    /// Giving every sink the pipeline's whole table list would make a named Kafka sink
+    /// behind `table_pattern = "public.orders"` demand a topic for `billing.invoices` —
+    /// a table routed somewhere else — and fail startup over a topic that will never
+    /// receive an event.
+    #[test]
+    fn each_sink_preflights_only_the_tables_its_route_claims() {
+        let assignment = super::assign_known_tables(
+            concrete(&["public.orders", "public.customers", "billing.invoices"]),
+            &[route("public.orders", "a"), route("billing.*", "b")],
+        );
+
+        let names = |tables: &[QualifiedTable]| {
+            tables
+                .iter()
+                .map(QualifiedTable::display)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&assignment.per_route[0]), vec!["public.orders"]);
+        assert_eq!(names(&assignment.per_route[1]), vec!["billing.invoices"]);
+        // Everything no route claims falls to the default sink, exactly as the router
+        // itself falls through.
+        assert_eq!(names(&assignment.default), vec!["public.customers"]);
+    }
+
+    /// First match wins, in both the router and this split. A later route that also
+    /// matches must not steal the table from the earlier one.
+    #[test]
+    fn the_table_split_follows_the_routers_first_match_wins_order() {
+        let assignment = super::assign_known_tables(
+            concrete(&["public.orders"]),
+            &[route("public.orders", "a"), route("public.*", "b")],
+        );
+        assert_eq!(
+            assignment.per_route[0]
+                .iter()
+                .map(QualifiedTable::display)
+                .collect::<Vec<_>>(),
+            vec!["public.orders"]
+        );
+        assert!(assignment.per_route[1].is_empty());
+        assert!(assignment.default.is_empty());
+    }
+
+    /// `table_include_list` takes glob patterns, so it cannot be rendered into topic
+    /// names wholesale. Only its concrete entries contribute.
+    /// `table_include_list` takes glob patterns, so it cannot be rendered into topic
+    /// names wholesale — and a patterned entry must not silently become a table.
+    #[test]
+    fn a_glob_entry_contributes_no_preflight_table_and_reaches_no_route() {
+        let assignment = super::assign_known_tables(
+            // `concrete` applies the same filter the config path does.
+            concrete(&["public.orders", "public.tmp_*"]),
+            &[route("public.*", "a")],
+        );
+        assert_eq!(
+            assignment.per_route[0]
+                .iter()
+                .map(QualifiedTable::display)
+                .collect::<Vec<_>>(),
+            vec!["public.orders"]
+        );
+    }
+
     #[test]
     fn a_routeless_pipeline_with_no_named_sinks_is_accepted() {
         super::validate_route_references(&[], &[]).expect("the single-sink shape stays valid");
@@ -268,9 +411,10 @@ mod tests {
         }))
         .expect("http sink config");
 
-        let binding = crate::sink::build_binding(&unreachable, 1 << 20)
-            .await
-            .expect("http binding");
+        let binding =
+            crate::sink::build_binding(&unreachable, &crate::sink::SinkBuildContext::new(1 << 20))
+                .await
+                .expect("http binding");
         let mut registry = super::SinkMetricsRegistry::default();
         registry.register(binding.metrics_handle());
 

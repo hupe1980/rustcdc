@@ -122,11 +122,14 @@ impl AppError {
             // Pipeline-scoped, or not understood.
             Self::SinkFatal(_) | Self::Config(_) | Self::Other(_) => false,
             Self::Io(_) | Self::Http(_) | Self::SinkTimeout(_) => false,
-            // A rustcdc `ValidationError` is the upstream spelling of "this event is
-            // malformed"; every other terminal kind is environmental.
-            Self::Runtime(err) => {
-                matches!(err, rustcdc::core::Error::ValidationError(_))
-            }
+            // Delegated, not restated. This rule decides whether it is safe to advance
+            // the durable position past an undelivered event, so it belongs in the
+            // library — an embedder writing their own quarantine path needs the same
+            // answer, and `Error::kind()` returns `Terminal` for both halves of the
+            // distinction. It used to be spelled here as `matches!(err,
+            // ValidationError(_))`, which was the same rule in a second place and would
+            // have drifted the first time the library learned a new terminal variant.
+            Self::Runtime(err) => err.is_record_attributable(),
         }
     }
 }

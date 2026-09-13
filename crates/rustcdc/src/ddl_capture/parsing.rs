@@ -3,19 +3,47 @@
 use super::SchemaDiffOperation;
 use crate::schema_history::ColumnDef;
 
+/// Case-insensitive ASCII search returning an offset into `haystack` **itself**.
+///
+/// `haystack.to_uppercase().find(needle)` returns an offset into the *uppercased* copy, and
+/// the two disagree whenever a character changes byte length when folded: `ı` is two bytes and
+/// uppercases to a one-byte `I`. Indexing the original with that offset reads the wrong bytes,
+/// and lands inside a character often enough to panic.
+///
+/// The needle is ASCII, so a match can never begin inside a multi-byte character — every
+/// continuation byte is `0x80..=0xBF` and no ASCII byte compares equal to one. The boundary
+/// checks are kept anyway, because they cost a comparison.
+pub(crate) fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let hay = haystack.as_bytes();
+    let pat = needle.as_bytes();
+    if pat.is_empty() || hay.len() < pat.len() {
+        return None;
+    }
+    (0..=hay.len() - pat.len()).find(|&index| {
+        hay[index..index + pat.len()].eq_ignore_ascii_case(pat)
+            && haystack.is_char_boundary(index)
+            && haystack.is_char_boundary(index + pat.len())
+    })
+}
+
+/// Case-insensitive ASCII prefix strip, returning the remainder of the **original**.
+///
+/// The counterpart to [`find_ascii_ci`]: matching on an uppercased copy and then slicing the
+/// original by the keyword's length couples two strings that need not share offsets.
+/// `split_at_checked` rather than `split_at`, because a byte length can land mid-character.
+pub(crate) fn strip_prefix_ascii_ci<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let (candidate, rest) = input.split_at_checked(prefix.len())?;
+    candidate.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
 pub(crate) fn parse_alter_clause(clause: &str) -> Option<SchemaDiffOperation> {
     let trimmed = clause.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let upper = trimmed.to_uppercase();
-
-    if upper.starts_with("ADD COLUMN ") || upper.starts_with("ADD ") {
-        let raw = if upper.starts_with("ADD COLUMN ") {
-            &trimmed[11..]
-        } else {
-            &trimmed[4..]
-        };
+    if let Some(raw) = strip_prefix_ascii_ci(trimmed, "ADD COLUMN ")
+        .or_else(|| strip_prefix_ascii_ci(trimmed, "ADD "))
+    {
         let raw = strip_optional_keyword(raw.trim(), "IF NOT EXISTS");
         if !is_column_clause_candidate(raw) {
             return Some(SchemaDiffOperation::Unsupported {
@@ -26,12 +54,9 @@ pub(crate) fn parse_alter_clause(clause: &str) -> Option<SchemaDiffOperation> {
         return Some(SchemaDiffOperation::AddColumn { column });
     }
 
-    if upper.starts_with("DROP COLUMN ") || upper.starts_with("DROP ") {
-        let raw = if upper.starts_with("DROP COLUMN ") {
-            &trimmed[12..]
-        } else {
-            &trimmed[5..]
-        };
+    if let Some(raw) = strip_prefix_ascii_ci(trimmed, "DROP COLUMN ")
+        .or_else(|| strip_prefix_ascii_ci(trimmed, "DROP "))
+    {
         let raw = strip_optional_keyword(raw.trim(), "IF EXISTS");
         if !is_column_clause_candidate(raw) {
             return Some(SchemaDiffOperation::Unsupported {
@@ -49,10 +74,9 @@ pub(crate) fn parse_alter_clause(clause: &str) -> Option<SchemaDiffOperation> {
         return None;
     }
 
-    if upper.starts_with("RENAME COLUMN ") {
-        let raw = trimmed[14..].trim_start();
-        let upper_raw = raw.to_uppercase();
-        if let Some(to_pos) = upper_raw.find(" TO ") {
+    if let Some(raw) = strip_prefix_ascii_ci(trimmed, "RENAME COLUMN ") {
+        let raw = raw.trim_start();
+        if let Some(to_pos) = find_ascii_ci(raw, " TO ") {
             let from = normalize_identifier(raw[..to_pos].trim());
             let to = normalize_identifier(raw[to_pos + 4..].trim());
             if !from.is_empty() && !to.is_empty() {
@@ -283,10 +307,13 @@ pub(crate) fn split_alter_table_clauses(input: &str) -> Option<&str> {
 
 pub(crate) fn strip_optional_keyword<'a>(input: &'a str, keyword: &str) -> &'a str {
     let trimmed = input.trim_start();
-    if trimmed.len() < keyword.len() {
+    // `split_at_checked` rather than a length test plus `split_at`: the length test admits an
+    // index that is long enough but lands *inside* a multi-byte character, and `split_at`
+    // panics there. `ADD COLUMN kundennummerü VARCHAR(10)` did exactly that — byte 13, the
+    // length of "IF NOT EXISTS", falls in the middle of the `ü`.
+    let Some((candidate, rest)) = trimmed.split_at_checked(keyword.len()) else {
         return trimmed;
-    }
-    let (candidate, rest) = trimmed.split_at(keyword.len());
+    };
     if candidate.eq_ignore_ascii_case(keyword)
         && (rest.is_empty()
             || rest
@@ -420,10 +447,9 @@ pub(crate) fn split_qualified_identifier_parts(sql: &str) -> Vec<String> {
 /// Extract primary keys from a CREATE TABLE statement.
 pub fn extract_primary_keys(sql: &str) -> Vec<String> {
     let mut pks = Vec::new();
-    let upper = sql.to_uppercase();
 
-    if let Some(pk_start) = upper.find("PRIMARY KEY") {
-        let after_pk = &sql[pk_start + 11..];
+    if let Some(pk_start) = find_ascii_ci(sql, "PRIMARY KEY") {
+        let after_pk = &sql[pk_start + "PRIMARY KEY".len()..];
         let after_pk_trimmed = after_pk.trim_start();
         if after_pk_trimmed.starts_with('(')
             && let Some(paren_end) = after_pk_trimmed.find(')')

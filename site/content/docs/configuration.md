@@ -23,7 +23,7 @@ delivery_contract = "at_least_once"   # at_least_once | effectively_once
 | Field | Required | Default | Description |
 |---|---|---|---|
 | `api_version` | yes | — | Schema version. Must be `"v1"`. |
-| `delivery_contract` | no | `"at_least_once"` | When the checkpoint advances relative to delivery. `"effectively_once"` additionally requires a transactional Kafka sink **and** `state.offset.backend = "kafka_topic"` on the same cluster, because it writes the checkpoint inside the sink's transaction; any other combination is rejected at load. See [delivery contracts](@/docs/concepts.md#3-delivery-contracts). |
+| `delivery_contract` | no | `"at_least_once"` | When the checkpoint advances relative to delivery. `"effectively_once"` needs either a transactional Kafka sink with `state.offset.backend = "kafka_topic"` on the same cluster, or a Snowflake sink (whose channel offset token needs no Kafka). It applies to **every** routed sink, allows at most one transactional Kafka sink, and rejects fan-out; any other combination is rejected at load, naming the sink at fault. See [delivery contracts](@/docs/concepts.md#3-delivery-contracts). |
 
 ### Unknown keys are rejected
 
@@ -224,6 +224,11 @@ url    = "https://ingest.example.com/events"
 # Authentication (choose one or none)
 bearer_token = { env = "INGEST_TOKEN" }
 
+# Request signing — see "Standard Webhooks signing" below
+[sink.signing]
+scheme = "ed25519"
+key    = { env = "WEBHOOK_SIGNING_KEY" }
+
 # Batching
 batch_max_events   = 256     # flush after N events
 batch_max_delay_ms = 250     # flush after N ms, even if batch is not full
@@ -263,6 +268,60 @@ Content-Type = "application/x-ndjson"
 | `pool_max_idle_per_host` | `8` | HTTP connection pool size |
 | `tcp_keepalive_secs` | `30` | TCP keepalive interval; `null` disables |
 | `verify_tls` | `true` | Verify TLS certificates |
+| `signing` | — | [Standard Webhooks](#standard-webhooks-signing) request signing |
+
+#### Standard Webhooks signing
+
+`bearer_token` proves the sender holds a secret. It does not prove the body is unaltered,
+and it is replayable by anyone who captures a request or reads a proxy log. A per-request
+signature does both.
+
+rustcdc implements [Standard Webhooks](https://www.standardwebhooks.com/), so a receiver
+that already verifies webhooks from Zapier, Twilio, ngrok, Supabase or Svix verifies these
+with the same library.
+
+```toml
+[sink.signing]
+scheme        = "ed25519"                               # ed25519 | hmac_sha256
+key           = { env = "WEBHOOK_SIGNING_KEY" }         # whsk_… | whsec_…
+previous_keys = [{ env = "WEBHOOK_SIGNING_KEY_OLD" }]   # optional, for rotation
+```
+
+| Field | Description |
+|---|---|
+| `scheme` | `ed25519` (signature `v1a`, key `whsk_…`) or `hmac_sha256` (`v1`, key `whsec_…`) |
+| `key` | Signing key. **Must** be `{ env = "VAR" }` — a literal is rejected at load |
+| `previous_keys` | Keys still honoured during a rotation; every one signs every request |
+
+**Prefer `ed25519`.** The receiver holds only the public half, so a compromised receiver
+cannot forge events back at you.
+
+Mint the key with `rustcdc webhook-keygen` — the encoding is what goes wrong, and every
+wrong form fails late. It prints the `whpk_…` public key for the receiver; the pipeline also
+logs it at startup, since the config holds only the private seed.
+
+**Headers sent with every request:**
+
+| Header | Value |
+|---|---|
+| `webhook-id` | Message id, **stable across retries** — the receiver's deduplication key |
+| `webhook-timestamp` | Unix seconds, **regenerated per attempt** — the replay window |
+| `webhook-signature` | Space-delimited `<version>,<base64>` list |
+
+The signed string is `{id}.{timestamp}.{payload}`, over the bytes as sent. The id is derived
+from the payload, so a retried batch keeps it, and it is also the value of `Idempotency-Key`.
+Each attempt is re-signed because a frozen timestamp would fall outside the receiver's
+tolerance — typically five minutes — well before this sink's retry budget is spent.
+
+**Rotation is zero-downtime.** Put the new key in `previous_keys`, let receivers pick it up,
+then promote it to `key`.
+
+Two limits: this is **signature-compatible, not payload-compatible** — the body is whatever
+`sink.http.codec` produces, not the spec's recommended `{type, timestamp, data}` — and one
+request is one **batch**, so `webhook-id` identifies the batch rather than a row change.
+
+A key carrying the wrong scheme's prefix is refused at load: an ed25519 private key is a
+valid HMAC secret and would otherwise sign requests nothing could verify.
 
 ### Apache Kafka
 
@@ -304,7 +363,7 @@ registry_ref = "prod"          # or an inline [sink.codec.registry] table
 | Field | Default | Description |
 |---|---|---|
 | `brokers` | — | Comma-separated `host:port` list |
-| `topic` | — | Destination Kafka topic |
+| `topic` | — | Destination Kafka topic. A literal name, or a template — see [Topic naming](#topic-naming) |
 | `client_id` | `"rustcdc-server"` | Kafka client identifier |
 | `delivery_mode` | `"at_least_once_idempotent"` | `at_least_once_idempotent` \| `transactional` |
 | `transactional_id` | — | Required for `"transactional"` mode; must be unique per pipeline |
@@ -313,7 +372,161 @@ registry_ref = "prod"          # or an inline [sink.codec.registry] table
 | `batch_size` | `16384` | Bytes per partition batch before a send |
 | `linger_ms` | `0` | Ordinary Kafka linger: how long a partially-filled batch waits for more records. Because up to `max_pipelined_sends` records are in flight at once, the wait is amortised across all of them rather than paid per record. The default stays `0` because CDC consumers are usually latency-sensitive, not because linger is harmful. |
 | `max_pipelined_sends` | `128` | Records accepted for delivery before the sink waits for an acknowledgement — the pipelining window. `1` restores one broker round-trip per record. Per-partition ordering is unaffected: records reach the broker in submission order regardless of the depth. Two other settings cap the effective depth, so raising this alone past either has no effect: `runtime.sink_flush_interval_events` (a flush drains the window) and `runtime.sink_delivery_queue_capacity` (bounds how far the prepare stage runs ahead). |
+| `tombstones_on_delete` | `true` | Follow every delete with a tombstone. See [Delete tombstones](#delete-tombstones) |
+| `record_headers` | `"cdc"` | Provenance headers on every record. `cdc` \| `none`. See [Record headers](#record-headers) |
 | `ack_timeout_ms` / `retry_backoff_ms` / `retry_max_attempts` | — | Producer retry tuning (the TCP connect timeout follows `ack_timeout_ms` down, capped at 10 s) |
+
+#### Record headers
+
+Every published record carries provenance headers, tombstones included:
+
+| Header | Value |
+|---|---|
+| `__rustcdc.op` | `insert` \| `update` \| `delete` \| `read` \| `truncate` \| `schema_change` |
+| `__rustcdc.source.schema` | Source schema or database. **Omitted** when the event has none |
+| `__rustcdc.source.table` | Table name |
+| `__rustcdc.source.name` | Logical name of the source connector |
+| `__rustcdc.source.offset` | Source log position (LSN, binlog coordinates) |
+| `__rustcdc.source.ts_ms` | Source commit time, ms since epoch, as decimal text |
+
+The body carries all of it too; the headers are what make it reachable without
+deserialising every payload. The field set matches the CloudEvents codec's
+`cdcop`/`cdctable`/`cdcschema`/`cdcsource`/`cdcoffset`, and the namespace matches the
+dead-letter headers.
+
+```toml
+record_headers = "cdc"   # "cdc" (default) | "none"
+```
+
+> Tombstones carry them too, and that is why the default is on: a tombstone has a key and a
+> null value, so with no headers nothing on the record names the table, the operation, or
+> the log position. On a single topic — the default — nothing recovers them.
+
+`none` saves roughly 90–140 bytes per record. Source identifiers are truncated at 512
+bytes, above any database's identifier limit, so a malformed one cannot have the broker
+reject the record.
+
+#### Delete tombstones
+
+A tombstone is a record with a key and Kafka's *null* value. On a
+`cleanup.policy=compact` topic it marks the key for deletion.
+
+```toml
+tombstones_on_delete = true   # the default
+```
+
+Without one, a delete leaves a record carrying the before-image and nothing ever removes
+the key: every deleted row stays in the compacted log forever, and a consumer rebuilding
+state sees the delete but never sees the key disappear. This is Debezium's
+`tombstones.on.delete`; turn it off for a non-compacted topic, where the extra record is
+pure cost.
+
+A tombstone is a statement about a **row key**, so three cases produce none:
+
+| Case | Why |
+|---|---|
+| `op = "truncate"` | Keyed by the qualified table name — a tombstone would compact away the truncate marker |
+| `op = "schema_change"` | The same |
+| A table with **no primary key** | Every event shares the `schema.table` key, so a tombstone would erase the table's history |
+
+> A keyless table cannot be consumed from a compacted topic at all: all its events share
+> one key, so compaction retains only the newest. Logged at WARN on that table's first
+> delete, and counted.
+
+The tombstone carries the delete's key, so it shares its partition and is submitted
+immediately after — a consumer cannot see the key removed before it sees why. Both records
+enter the same send window, so the batch's flush covers them and the checkpoint cannot
+advance past a delete whose tombstone is missing. Under `effectively_once` they commit in
+one transaction.
+
+A **terminal** tombstone rejection halts the pipeline rather than dead-lettering the event,
+which differs from every other sink failure: quarantining would advance past a delete
+already accepted for delivery. Transient failures retry as usual.
+
+**Observability.** `rustcdc_sink_kafka_unkeyed_deletes_total` counts deletes that could not
+be tombstoned — every increment is a key a compacted topic will never reclaim. Alert on any
+increase (`RUSTCDCKafkaDeleteCannotBeTombstoned` ships with the rules).
+`rustcdc_sink_kafka_tombstones_total` counts the successful ones; read it as a rate beside
+the first, never as a condition — zero is normal for a pipeline with no deletes.
+
+#### Topic naming
+
+`topic` is either a literal name or a template resolved per event:
+
+```toml
+topic = "cdc.${schema}.${table}"
+```
+
+That is the layout Debezium produces from `topic.prefix`, and it collapses what otherwise
+needs one `[[sinks]]` block, one `[[pipeline.routes]]` entry and one producer per table
+into a single sink. A new table starts flowing without a config change.
+
+| Placeholder | Value |
+|---|---|
+| `${schema}` | PostgreSQL/SQL Server schema, or MySQL/MariaDB database |
+| `${table}` | Table name |
+
+Anything else is a startup error. There is no `${op}`: splitting a table's inserts,
+updates and deletes across topics destroys per-key ordering — a consumer replaying them
+would see a delete before the insert it follows.
+
+**Checked at load:** the template parses, placeholders are known, literal segments contain
+only `[a-zA-Z0-9._-]`, and a literal topic is validated in full (length, reserved names).
+**Checked per event:** the schema and table interpolate, and the rendered name is legal,
+within 249 characters, and not `.` or `..`.
+
+**At startup**, preflight renders the template against the tables the config already names
+— `snapshot_tables`, `incremental_snapshot.tables`, and the non-glob entries of
+`table_include_list` — and asks the broker whether those topics exist. Tables discovered at
+runtime are not covered; the log says how many were checked. Each sink checks only the
+tables its routes send it.
+
+Topics are **not** auto-created.
+
+**Ordering.** Per-key ordering is unaffected — a table's events share a topic and a key.
+Cross-table ordering is not preserved, as with Debezium; `preserve_transactions` still
+stops a sink committing half a source transaction, and under `effectively_once` the whole
+batch commits across all its topics in one transaction.
+
+#### Identifiers Kafka cannot spell
+
+Quoted SQL identifiers are more permissive than Kafka topic names: `my table`,
+`order#items` and `bestellungen_für` are legal tables and none is a legal topic.
+
+```toml
+[sink.topic_naming]
+invalid_characters = "reject"   # reject (default) | replace
+replacement        = "_"
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `invalid_characters` | `"reject"` | `reject` fails the event — dead-lettered when `[dlq]` is configured, halting when it is not. `replace` substitutes each illegal character, as Debezium does |
+| `replacement` | `"_"` | One character from `[a-zA-Z0-9_-]`. `.` is refused: it is the template's segment separator |
+
+`reject` is the default because a topic name is a published interface.
+
+`replace` carries one hazard: `my table` and `my_table` both render to `my_table`. **That
+is detected, not allowed** — the second table to reach an already-claimed name halts the
+pipeline, naming both. Merges the template itself expresses (a literal topic, or
+`topic = "cdc.${schema}"`) are not collisions.
+
+A dot is legal in a topic name, so `orders.2026` renders unchanged under both policies.
+
+#### Schema registry with a templated topic
+
+A registry-backed codec derives its subject from the topic name, and the codec is built
+once at startup. A templated topic is therefore rejected at load with
+`subject_name_strategy = "topic_name"` (the Confluent default) or `"topic_record_name"` —
+every table's schema would register under the literal `cdc.${schema}.${table}-value`.
+
+Use `record_name`, which a topic-per-table layout wants anyway: the subject becomes the
+fully-qualified table name.
+
+```toml
+[sink.codec.registry]
+subject_name_strategy = "record_name"
+```
 
 #### `[sink.security]`
 
@@ -688,6 +901,12 @@ sink          = "kafka_all"
 Routes are evaluated top-to-bottom; the first match wins. Route patterns and the
 source-side `table_include_list` / `table_exclude_list` use the **same** matcher — see
 [Table patterns](#table-patterns) below.
+
+> **Not for topic-per-table.** Routing one table per `[[sinks]]` block to get one topic
+> per table is the wrong tool: it opens a producer per table and needs a config change
+> and a restart for every new one. Use a [topic template](#topic-naming) —
+> `topic = "cdc.${schema}.${table}"` on a single sink — and keep routes for what they
+> read like, sending *particular* tables somewhere *different*.
 
 **Routes and named sinks must line up exactly**, and startup refuses three mismatches
 before a single connection is opened:

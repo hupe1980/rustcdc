@@ -337,6 +337,11 @@ jobs:
           - postgres_version_matrix
           - postgres_snapshot_integration
           - postgres_stream_integration
+          # Reselecting unchanged TOASTed values. Both halves of the claim run against one
+          # live server: the default must report the hole, and only then does filling it
+          # prove anything — a suite asserting only the filled half would pass just as well
+          # if PostgreSQL had sent the value all along.
+          - postgres_reselect_integration
           - postgres_wal_transport_parity_integration
           - postgres_incremental_snapshot_reconnect_integration
           # The two transaction-id scales in the snapshot watermark bracket must agree.

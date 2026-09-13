@@ -1,7 +1,7 @@
 //! Consumer-side idempotency helpers for at-least-once delivery boundaries.
 
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ahash::{AHashMap as HashMap, AHasher};
@@ -31,6 +31,13 @@ use crate::core::{Error, Event, FingerprintError, Result};
 /// through is at-least-once — the guarantee the pipeline already documents — while
 /// dropping a distinct row is not recoverable by any downstream consumer.
 ///
+/// # The fingerprint is 128 bits, because a match is acted on irreversibly
+///
+/// A match makes the guard drop the event and let the checkpoint advance past it, so a hash
+/// collision is the same silent loss this type exists to prevent. 64 bits left that reachable
+/// as the window grew — and the window is the knob operators are told to raise when
+/// [`eviction_count`](EventIdempotencyGuard::eviction_count) climbs. At 128 it is not.
+///
 /// # A deliberate re-read is not a duplicate, and the fingerprint has to say so
 ///
 /// The same reasoning has a second edge, and it is subtler because the event really is
@@ -54,8 +61,8 @@ use crate::core::{Error, Event, FingerprintError, Result};
 pub struct EventIdempotencyGuard {
     capacity: usize,
     ttl_ms: Option<u64>,
-    seen: HashMap<u64, u64>,
-    order: VecDeque<(u64, u64)>,
+    seen: HashMap<u128, u64>,
+    order: VecDeque<(u128, u64)>,
     evictions: u64,
     unidentifiable_passthrough: u64,
 }
@@ -132,7 +139,7 @@ impl EventIdempotencyGuard {
         Ok(true)
     }
 
-    fn insert(&mut self, fingerprint: u64, seen_at_ms: u64) {
+    fn insert(&mut self, fingerprint: u128, seen_at_ms: u64) {
         self.seen.insert(fingerprint, seen_at_ms);
         self.order.push_back((fingerprint, seen_at_ms));
 
@@ -198,7 +205,7 @@ fn event_is_identifiable(event: &Event) -> bool {
 ///
 /// The fingerprint includes source position and intra-transaction sequence so
 /// that events sharing coarse offsets remain distinguishable within a session.
-pub fn fingerprint_event_transient(event: &Event) -> std::result::Result<u64, FingerprintError> {
+pub fn fingerprint_event_transient(event: &Event) -> std::result::Result<u128, FingerprintError> {
     if event.source.source_name.trim().is_empty() {
         return Err(FingerprintError::EmptySourceName);
     }
@@ -206,7 +213,7 @@ pub fn fingerprint_event_transient(event: &Event) -> std::result::Result<u64, Fi
         return Err(FingerprintError::EmptyOffset);
     }
 
-    let mut hasher = AHasher::default();
+    let mut hasher = DualHasher::new();
     event.source.source_name.hash(&mut hasher);
     event.source.offset.hash(&mut hasher);
     event.table.hash(&mut hasher);
@@ -222,7 +229,6 @@ pub fn fingerprint_event_transient(event: &Event) -> std::result::Result<u64, Fi
     }
 
     // Hash JSON payloads without allocating an intermediate String.
-    // serde_json::to_writer writes directly into the hasher's byte sink.
     if let Some(before) = event.before.row() {
         hash_json_value(before, &mut hasher);
     }
@@ -230,7 +236,61 @@ pub fn fingerprint_event_transient(event: &Event) -> std::result::Result<u64, Fi
         hash_json_value(after, &mut hasher);
     }
 
-    Ok(hasher.finish())
+    Ok(hasher.finish128())
+}
+
+/// Two independently-seeded [`AHasher`]s fed from one traversal, combined into 128 bits.
+///
+/// The guard acts on a fingerprint match by dropping the event *and* letting the checkpoint
+/// advance past it, so a collision is unrecoverable loss. Expected collisions run at about
+/// `n · w / 2^bits` for `n` events and a window of `w`; at 128 bits that is unreachable, so
+/// the window can be sized for replay distance alone rather than traded against collision
+/// risk.
+///
+/// `AHasher` yields 64 bits and has no wider variant, so the second half comes from a second
+/// seed. Both are fed from a **single** traversal of the event, so the JSON walk — the
+/// expensive part — happens once. Seeds are per-process random, so fingerprints stay unstable
+/// across restarts by design; [`fingerprint_event_stable`] is the cross-restart identity.
+struct DualHasher {
+    low: AHasher,
+    high: AHasher,
+}
+
+impl DualHasher {
+    fn new() -> Self {
+        let (low, high) = dual_hash_states();
+        Self {
+            low: low.build_hasher(),
+            high: high.build_hasher(),
+        }
+    }
+
+    fn finish128(&self) -> u128 {
+        (u128::from(self.high.finish()) << 64) | u128::from(self.low.finish())
+    }
+}
+
+impl Hasher for DualHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.low.write(bytes);
+        self.high.write(bytes);
+    }
+
+    /// Present because `Hasher` requires it. The guard uses [`DualHasher::finish128`];
+    /// this half alone would reintroduce exactly the width this type exists to widen.
+    fn finish(&self) -> u64 {
+        self.low.finish()
+    }
+}
+
+/// The two hash states, drawn once per process.
+///
+/// Two separate `RandomState`s rather than one used twice: the second half has to be
+/// independent of the first, or the pair carries no more information than either alone.
+fn dual_hash_states() -> &'static (ahash::RandomState, ahash::RandomState) {
+    static STATES: std::sync::OnceLock<(ahash::RandomState, ahash::RandomState)> =
+        std::sync::OnceLock::new();
+    STATES.get_or_init(|| (ahash::RandomState::new(), ahash::RandomState::new()))
 }
 
 /// Build a **stable, cross-process-safe** fingerprint as a hex-encoded SHA-256 digest.
@@ -332,7 +392,7 @@ pub fn fingerprint_event_stable(event: &Event) -> std::result::Result<String, Fi
 /// structural traversal is canonical: `serde_json::Map` is a `BTreeMap` here, so object
 /// keys are visited in **sorted** order rather than insertion order, and two rows with the
 /// same columns hash the same however the connector ordered them.
-fn hash_json_value(value: &serde_json::Value, hasher: &mut AHasher) {
+fn hash_json_value<H: Hasher>(value: &serde_json::Value, hasher: &mut H) {
     match value {
         serde_json::Value::Null => 0_u8.hash(hasher),
         serde_json::Value::Bool(v) => {
@@ -482,6 +542,42 @@ mod tests {
         event.primary_key = None;
         event.after = Some(json!({"payload": "ping"}));
         event
+    }
+
+    /// The transient fingerprint must carry 128 bits of entropy, not a widened 64.
+    ///
+    /// The guard's response to a match is to drop the event and advance the checkpoint past
+    /// it, so a hash collision is unrecoverable loss delivered by the component meant to
+    /// prevent it. Width is what bounds that, and the subtle regression is not changing the
+    /// type back — it is keeping `u128` while filling only the low half, which no type
+    /// signature would catch.
+    ///
+    /// Checking the high half over a batch rather than one event keeps it deterministic in
+    /// practice: a single fingerprint can legitimately have a zero high word, but all 64
+    /// doing so has probability 2^-4096.
+    #[test]
+    fn the_transient_fingerprint_fills_both_halves() {
+        let mut high_bits_seen = false;
+        let mut low_bits_seen = false;
+
+        for index in 0..64 {
+            let event = make_event(&format!("offset-{index}"), Some(index));
+            let fingerprint = fingerprint_event_transient(&event).expect("fingerprint");
+            if (fingerprint >> 64) != 0 {
+                high_bits_seen = true;
+            }
+            if (fingerprint as u64) != 0 {
+                low_bits_seen = true;
+            }
+        }
+
+        assert!(
+            high_bits_seen,
+            "the upper 64 bits are always zero, so the fingerprint carries 64 bits of \
+             entropy in a 128-bit type — the birthday bound is unchanged and the window \
+             cannot be raised safely"
+        );
+        assert!(low_bits_seen, "the lower 64 bits are always zero");
     }
 
     #[test]

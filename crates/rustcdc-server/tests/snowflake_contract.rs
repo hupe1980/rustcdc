@@ -308,9 +308,12 @@ fn event(id: u64) -> Event {
 }
 
 async fn build_router(addr: SocketAddr) -> rustcdc_server::pipeline::router::TableRouter {
-    let binding = rustcdc_server::sink::build_binding(&sink_config(addr), 1 << 20)
-        .await
-        .expect("snowflake binding");
+    let binding = rustcdc_server::sink::build_binding(
+        &sink_config(addr),
+        &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+    )
+    .await
+    .expect("snowflake binding");
     rustcdc_server::pipeline::router::single(binding)
 }
 
@@ -621,9 +624,12 @@ async fn a_programmatic_access_token_is_sent_verbatim() {
         addr,
         serde_json::json!({ "type": "programmatic_access_token", "token": "pat-secret" }),
     );
-    let binding = rustcdc_server::sink::build_binding(&config, 1 << 20)
-        .await
-        .expect("binding");
+    let binding = rustcdc_server::sink::build_binding(
+        &config,
+        &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+    )
+    .await
+    .expect("binding");
     let mut router = rustcdc_server::pipeline::router::single(binding);
     router.preflight_check().await.expect("preflight");
 
@@ -661,9 +667,12 @@ async fn a_workload_identity_attestation_is_prefixed_and_re_read_each_time() {
             "token_file": token_file,
         }),
     );
-    let binding = rustcdc_server::sink::build_binding(&config, 1 << 20)
-        .await
-        .expect("binding");
+    let binding = rustcdc_server::sink::build_binding(
+        &config,
+        &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+    )
+    .await
+    .expect("binding");
     let mut router = rustcdc_server::pipeline::router::single(binding);
     router.preflight_check().await.expect("preflight");
 
@@ -689,9 +698,12 @@ async fn a_workload_identity_attestation_is_prefixed_and_re_read_each_time() {
 ",
     )
     .expect("rotate token");
-    let binding = rustcdc_server::sink::build_binding(&config, 1 << 20)
-        .await
-        .expect("binding");
+    let binding = rustcdc_server::sink::build_binding(
+        &config,
+        &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+    )
+    .await
+    .expect("binding");
     let mut router = rustcdc_server::pipeline::router::single(binding);
     router.preflight_check().await.expect("preflight");
 
@@ -711,9 +723,12 @@ async fn the_sink_advertises_the_contract_its_design_actually_provides() {
     let addr = start_fake(Arc::clone(&state)).await;
 
     // On the binding, not the router: `TableRouter::name()` is the router's own label.
-    let binding = rustcdc_server::sink::build_binding(&sink_config(addr), 1 << 20)
-        .await
-        .expect("snowflake binding");
+    let binding = rustcdc_server::sink::build_binding(
+        &sink_config(addr),
+        &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+    )
+    .await
+    .expect("snowflake binding");
     assert_eq!(binding.name(), "snowflake");
 
     let router = build_router(addr).await;

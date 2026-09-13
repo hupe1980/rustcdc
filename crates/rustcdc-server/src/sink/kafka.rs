@@ -11,8 +11,11 @@ use krafka::producer::{Acks, Producer, ProducerRecord, RecordMetadata, Transacti
 use rustcdc::core::Error as RtError;
 use tokio::sync::Mutex;
 
-use crate::config::schema::{KafkaDeliveryMode, KafkaSecurityConfig, KafkaSinkConfig};
+use crate::config::schema::{
+    KafkaDeliveryMode, KafkaRecordHeaders, KafkaSecurityConfig, KafkaSinkConfig,
+};
 use crate::error::AppError;
+use crate::topic::{QualifiedTable, TopicResolveError, TopicResolver, TopicTemplate};
 
 use super::SinkDeliveryGuarantee;
 
@@ -285,9 +288,161 @@ impl KafkaTransactionHandle {
     }
 }
 
+/// Re-classify a tombstone failure that would otherwise quarantine its own delete.
+///
+/// This closes a hole that only exists because the tombstone is the *second* record.
+///
+/// `classify_krafka_error` maps `MessageTooLarge`, `InvalidRecord`, `Serialization` and
+/// `Compression` to `SinkPoisonRecord`, which becomes `ValidationError` and which
+/// `AppError::is_dead_letterable` treats as "quarantine this event and advance". That is
+/// the right answer for a *record*. It is the wrong answer here: by the time the
+/// tombstone is attempted its delete has already been accepted into the send window and
+/// will be published by the next flush. Quarantining the event would advance the
+/// checkpoint past a delete that reaches the topic with no tombstone behind it — a key a
+/// compacted log never reclaims, produced by the very mechanism meant to prevent it, and
+/// silent because every counter reports success.
+///
+/// So a terminal, record-attributable tombstone failure is escalated to `Unrecoverable`,
+/// which halts. Loud and wrong beats quiet and wrong when the quiet failure is
+/// undetectable downstream.
+///
+/// Retriable failures are deliberately left alone. Those surface as `SinkTimeout`, the
+/// batch loop retries the whole batch, and the delete is simply re-sent — a duplicate
+/// that `at_least_once_idempotent` collapses by sequence number and that
+/// `effectively_once` hides behind the aborted barrier.
+fn escalate_tombstone_failure(error: RtError) -> RtError {
+    match error {
+        RtError::ValidationError(_) => RtError::Unrecoverable(format!(
+            "the delete for this event was already accepted but its tombstone was \
+             rejected: {error}. Halting rather than quarantining, because advancing past \
+             it would leave a delete on the topic with no tombstone behind it — a key \
+             log compaction can never reclaim, and one nothing downstream can detect."
+        )),
+        other => other,
+    }
+}
+
+// ─── CDC provenance headers ───────────────────────────────────────────────────
+
+/// The event's operation — `insert`, `update`, `delete`, `read`, `truncate`,
+/// `schema_change`.
+pub const HEADER_OP: &str = "__rustcdc.op";
+/// The source schema (PostgreSQL/SQL Server schema, MySQL/MariaDB database).
+///
+/// **Omitted** when the event carries none, rather than sent with a null or empty value.
+/// A null header value is a third state on the wire that nothing asked for, and an empty
+/// one is indistinguishable from a schema genuinely named `""`. Absent means absent —
+/// the same choice the CloudEvents encoder makes for `cdcschema`.
+pub const HEADER_SOURCE_SCHEMA: &str = "__rustcdc.source.schema";
+/// The source table name.
+pub const HEADER_SOURCE_TABLE: &str = "__rustcdc.source.table";
+/// The logical name of the source connector that produced the event.
+pub const HEADER_SOURCE_NAME: &str = "__rustcdc.source.name";
+/// The source log position — LSN, binlog coordinates, LSN/commit pair.
+pub const HEADER_SOURCE_OFFSET: &str = "__rustcdc.source.offset";
+/// The source commit timestamp, milliseconds since the Unix epoch, as decimal text.
+///
+/// Text rather than eight big-endian bytes because a header is read by
+/// `kafka-console-consumer`, by a `jq` filter and by a human before it is read by a typed
+/// consumer, and none of those can decode a binary integer. Every other header here is
+/// text for the same reason; making one of them binary would be the surprise.
+pub const HEADER_SOURCE_TS_MS: &str = "__rustcdc.source.ts_ms";
+
+/// A source-supplied identifier can be no longer than this in a header value.
+///
+/// Every database bounds its own identifiers far below this (PostgreSQL 63 bytes, MySQL
+/// 64, SQL Server 128) and every connector's offset is a short coordinate string, so this
+/// is not a limit anyone reaches. It exists because the alternative to truncating is a
+/// broker rejecting the whole record for oversized headers — which fails the *event* over
+/// a diagnostic field, and the payload always carries the untruncated value anyway.
+const MAX_IDENTIFIER_HEADER_BYTES: usize = 512;
+
+/// Build the provenance headers for one event.
+///
+/// The `__rustcdc.*` namespace matches this crate's dead-letter headers
+/// (`__rustcdc.dlq.*`), which in turn mirror krafka's `__krafka.dlq.*` without borrowing
+/// its names. The field set is the one the CloudEvents encoder already publishes as
+/// `cdcop` / `cdctable` / `cdcschema` / `cdcsource` / `cdcoffset`, so a deployment reading
+/// both sees one vocabulary rather than two spellings of the same five facts.
+///
+/// Every value is `Some`: krafka distinguishes a null header value from a zero-length one,
+/// and each of these is text a consumer reads. A `None` would be a different header on the
+/// wire, and the one field that can legitimately be absent — the schema — is omitted
+/// entirely instead.
+fn cdc_headers(event: &rustcdc::Event) -> Vec<(String, Option<Bytes>)> {
+    fn identifier(value: &str) -> Option<Bytes> {
+        // Through `crate::text` so the byte budget can never split a character: a header
+        // value that is not valid UTF-8 is unreadable by every consumer that assumes text.
+        Some(Bytes::from(
+            crate::text::truncate_utf8(value, MAX_IDENTIFIER_HEADER_BYTES, "…").into_owned(),
+        ))
+    }
+
+    let mut headers = Vec::with_capacity(6);
+    headers.push((HEADER_OP.to_string(), identifier(event.op.to_str())));
+    if let Some(schema) = event.schema.as_deref().filter(|s| !s.is_empty()) {
+        headers.push((HEADER_SOURCE_SCHEMA.to_string(), identifier(schema)));
+    }
+    headers.push((HEADER_SOURCE_TABLE.to_string(), identifier(&event.table)));
+    headers.push((
+        HEADER_SOURCE_NAME.to_string(),
+        identifier(&event.source.source_name),
+    ));
+    headers.push((
+        HEADER_SOURCE_OFFSET.to_string(),
+        identifier(&event.source.offset),
+    ));
+    headers.push((
+        HEADER_SOURCE_TS_MS.to_string(),
+        identifier(&event.source.timestamp.to_string()),
+    ));
+    headers
+}
+
+/// Render a list of topic names for an error message or a log field.
+///
+/// One rendering, so the singular and plural forms of every preflight message agree
+/// about quoting.
+fn quoted_list(topics: &[String]) -> String {
+    topics
+        .iter()
+        .map(|topic| format!("'{topic}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub struct KafkaSink {
     producer: KafkaProducerClient,
-    topic: String,
+    /// Resolves each event's topic from `sink.kafka.topic` — a constant for a literal
+    /// name, a per-table render for a template. See [`crate::topic`].
+    topics: TopicResolver,
+    /// Concrete tables the configuration already names, rendered at preflight so a
+    /// templated topic still fails at startup for the tables that are known then.
+    ///
+    /// Empty for a literal topic, which needs no per-table expansion.
+    preflight_tables: Vec<QualifiedTable>,
+    /// `sink.kafka.tombstones_on_delete`.
+    tombstones_on_delete: bool,
+    /// `sink.kafka.record_headers`.
+    headers: KafkaRecordHeaders,
+    /// Tombstones published, for `rustcdc_sink_kafka_tombstones_total`.
+    tombstones_total: u64,
+    /// Deletes that carried no row key, so no tombstone could be published.
+    ///
+    /// Separate from `tombstones_total` because the two answer different questions and
+    /// only this one is alertable. "Tombstones are zero" is indistinguishable from "no
+    /// rows were deleted", which is the normal state of most tables; "a delete could not
+    /// be tombstoned" is unambiguous, and on a compacted topic it is a key that will
+    /// never be reclaimed.
+    unkeyed_deletes_total: u64,
+    /// Tables whose deletes carry no row key, so the "cannot tombstone this" warning is
+    /// logged once per table rather than once per delete.
+    ///
+    /// A keyless table produces a *delete per row* on a table that may have millions of
+    /// them; logging per event would turn a configuration warning into an outage of its
+    /// own. Bounded by the number of distinct keyless tables, which is bounded by the
+    /// schema.
+    unkeyed_delete_warned: std::collections::HashSet<String>,
     delivery_guarantee: SinkDeliveryGuarantee,
     /// Guards barrier state transitions (begin / commit / abort) and the
     /// barrier state machine itself.  Merging state into the lock makes the
@@ -329,11 +484,16 @@ impl KafkaSink {
             ));
         }
 
-        if config.topic.trim().is_empty() {
-            return Err(RtError::ConfigError(
-                "sink.kafka.topic must not be empty".to_string(),
-            ));
-        }
+        // The same parser the config loader ran. Reached again here because a sink can
+        // be built from a `KafkaSinkConfig` that never passed through `config::load` —
+        // the replay command and the Kafka state backend both do — and a template that
+        // is only checked in one of the two paths is a template that is not checked.
+        let template = TopicTemplate::parse(&config.topic)
+            .map_err(|e| RtError::ConfigError(format!("sink.kafka.{e}")))?;
+        config
+            .topic_naming
+            .validate("sink.kafka.topic_naming")
+            .map_err(RtError::ConfigError)?;
 
         if config.client_id.trim().is_empty() {
             return Err(RtError::ConfigError(
@@ -468,9 +628,28 @@ impl KafkaSink {
             }
         };
 
+        // One line at construction saying what the topic layout is. An operator reading
+        // a startup log should not have to infer "one topic" versus "one per table" from
+        // the absence of a message, and the character policy is the setting most likely
+        // to be wondered about after the first dead-lettered event.
+        if template.is_templated() {
+            tracing::info!(
+                topic_template = %config.topic,
+                invalid_characters = ?config.topic_naming.invalid_characters,
+                "kafka sink: the topic is resolved per event, one topic per distinct \
+                 rendering of the template"
+            );
+        }
+
         Ok(Self {
             producer,
-            topic: config.topic.clone(),
+            topics: TopicResolver::new(template, config.topic_naming.clone()),
+            preflight_tables: Vec::new(),
+            tombstones_on_delete: config.tombstones_on_delete,
+            headers: config.record_headers,
+            tombstones_total: 0,
+            unkeyed_deletes_total: 0,
+            unkeyed_delete_warned: std::collections::HashSet::new(),
             delivery_guarantee,
             barrier: Arc::new(Mutex::new(BarrierStateMachine::new())),
             closed: false,
@@ -482,6 +661,107 @@ impl KafkaSink {
             preflight_transport: transport,
             preflight_timeout: Duration::from_millis(config.ack_timeout_ms.max(5_000)),
         })
+    }
+
+    /// Name the concrete tables preflight should render this sink's topic template
+    /// against.
+    ///
+    /// Separate from [`new`](Self::new) because the table set is a property of the
+    /// *pipeline* — `snapshot_tables`, `incremental_snapshot.tables` and the non-glob
+    /// entries of the source's `table_include_list` — not of the sink. A sink built
+    /// without it still preflights the broker connection; it just has no per-table
+    /// topics to check.
+    pub fn with_preflight_tables(mut self, tables: Vec<QualifiedTable>) -> Self {
+        self.preflight_tables = tables;
+        self
+    }
+
+    /// The topic this event belongs on.
+    ///
+    /// A render failure is a property of the event's own identifiers — a schema the
+    /// event does not carry, a table name Kafka cannot spell — so it surfaces as
+    /// `ValidationError`, which [`AppError::is_dead_letterable`] treats as
+    /// quarantine-and-continue. A *collision* is not: two tables are equally
+    /// responsible, quarantining one of them would drain a healthy table into the DLQ,
+    /// and the merge it prevents is silent data corruption. That surfaces as
+    /// `ConfigError`, which halts.
+    pub fn topic_for(&mut self, event: &rustcdc::Event) -> rustcdc::core::Result<Arc<str>> {
+        self.topics
+            .resolve(event.schema.as_deref(), &event.table)
+            .map_err(|error| match error {
+                TopicResolveError::Render(_) => RtError::ValidationError(vec![error.to_string()]),
+                TopicResolveError::Collision { .. } => RtError::ConfigError(error.to_string()),
+            })
+    }
+
+    /// Follow a delivered delete with a tombstone, when this event calls for one.
+    ///
+    /// `row_key` is the key the **codec** produced, before `SinkBinding::send_event`
+    /// substitutes its qualified-table-name fallback. That distinction is the whole rule: a
+    /// tombstone is a statement about a *row*, and the fallback key names a *table*.
+    ///
+    /// `row_key.is_some()` therefore excludes three cases, each of which would destroy data
+    /// rather than prune it: `truncate` and `schema_change` (keyed by table name — a
+    /// tombstone would compact away the marker itself), and a table with no primary key
+    /// (every event shares one key, so a tombstone would erase its whole history). Testing
+    /// `event.op` and `primary_key_values()` separately reaches the same answer today and
+    /// drifts the moment a codec derives keys some other way.
+    ///
+    /// Durability, transactions and the DLQ are settled by *where this sits*. The tombstone
+    /// enters the same send window as its delete, so the batch's flush covers both and the
+    /// checkpoint cannot advance past a delete whose tombstone is missing; under
+    /// `effectively_once` the barrier's transaction spans the batch, so both join it. And a
+    /// tombstone cannot exceed `runtime.max_event_bytes` when the delete did not — same key,
+    /// no value.
+    pub async fn send_delete_tombstone(
+        &mut self,
+        event: &rustcdc::Event,
+        row_key: Option<&Bytes>,
+    ) -> rustcdc::core::Result<()> {
+        if !self.tombstones_on_delete || event.op != rustcdc::Operation::Delete {
+            return Ok(());
+        }
+
+        let Some(key) = row_key else {
+            self.unkeyed_deletes_total = self.unkeyed_deletes_total.saturating_add(1);
+            self.warn_unkeyed_delete(event);
+            return Ok(());
+        };
+
+        // Resolved again rather than passed in: the resolver caches per table, so this is
+        // a hash lookup, and asking it twice is what guarantees the tombstone lands on the
+        // same topic as the delete even if the template is ever made richer.
+        let topic = self.topic_for(event)?;
+        self.send_tombstone(event, &topic, key.clone())
+            .await
+            .map_err(escalate_tombstone_failure)?;
+        self.tombstones_total = self.tombstones_total.saturating_add(1);
+        Ok(())
+    }
+
+    /// Say once per table that its deletes cannot be tombstoned.
+    fn warn_unkeyed_delete(&mut self, event: &rustcdc::Event) {
+        let table = event.qualified_table_name();
+        if !self.unkeyed_delete_warned.insert(table.clone()) {
+            return;
+        }
+        tracing::warn!(
+            table = %table,
+            "table has no primary key, so its deletes carry no row key and cannot be \
+             tombstoned; note that such a table cannot be consumed from a compacted \
+             topic at all — every one of its events shares the qualified-table-name key, \
+             so compaction would retain only the newest one"
+        );
+    }
+
+    /// Tombstones published by this sink.
+    pub fn tombstones_total(&self) -> u64 {
+        self.tombstones_total
+    }
+
+    /// Deletes this sink could not tombstone because the event carried no row key.
+    pub fn unkeyed_deletes_total(&self) -> u64 {
+        self.unkeyed_deletes_total
     }
 
     /// Connection-level counters from the underlying krafka producer.
@@ -509,13 +789,19 @@ impl KafkaSink {
         )
     }
 
-    /// Verify that the configured Kafka topic exists and is reachable before
-    /// the pipeline starts processing events.  Uses a short-lived AdminClient
-    /// so the main producer is not involved.
-    /// `&mut self` rather than `&self` so the returned future needs only
-    /// `KafkaSink: Send`. Holding `&self` across an await would demand `Sync`, which the
-    /// in-flight send futures cannot provide — and preflight is exclusive anyway: it runs
-    /// once, before the pipeline is marked ready.
+    /// Verify that the Kafka topics this sink will write to exist and are reachable, using
+    /// a short-lived AdminClient so the main producer is not involved.
+    ///
+    /// A literal topic is described directly. A template has no finite topic set, so it is
+    /// rendered against the tables the configuration already names
+    /// ([`with_preflight_tables`](Self::with_preflight_tables)) and those are described —
+    /// a partial check, and the log line says so. It still catches an unreachable broker
+    /// and a topic-per-table layout whose topics were never created; it cannot catch a
+    /// table that first appears at runtime, short of auto-creating topics.
+    ///
+    /// A named table that cannot be *rendered* is a startup warning rather than a failure:
+    /// it will dead-letter if it ever produces an event, and failing the pipeline for it
+    /// would take out every healthy table alongside it.
     pub async fn preflight_check(&mut self) -> Result<(), AppError> {
         let auth = self
             .preflight_security
@@ -538,28 +824,95 @@ impl KafkaSink {
                 ))
             })?;
 
-        let topics = admin
-            .describe_topics(std::slice::from_ref(&self.topic))
-            .await
-            .map_err(|e| {
-                AppError::Other(format!(
-                    "sink preflight: failed to describe Kafka topic '{}': {e}",
-                    self.topic
-                ))
-            })?;
+        let template = self.topics.template().source().to_string();
+        let templated = self.topics.template().is_templated();
 
-        if !topics.iter().any(|t| t.0 == self.topic.as_str()) {
-            return Err(AppError::Other(format!(
-                "sink preflight: Kafka topic '{}' not found on brokers '{}'",
-                self.topic, self.preflight_brokers
-            )));
+        let expected: Vec<String> = match self.topics.template().as_literal() {
+            Some(literal) => vec![literal.to_string()],
+            None => {
+                // Moved out and put back rather than cloned: `warm` needs `&mut
+                // self.topics` and the table list is `&self.preflight_tables`, which the
+                // borrow checker will not grant together. Restored rather than consumed
+                // so a second preflight — a reconnect, a test — checks the same set.
+                let tables = std::mem::take(&mut self.preflight_tables);
+                let (resolved, skipped) = self.topics.warm(&tables);
+                self.preflight_tables = tables;
+
+                for reason in &skipped {
+                    tracing::warn!(
+                        topic_template = %template,
+                        reason = %reason,
+                        "sink preflight: a configured table has no representable Kafka \
+                         topic; events from it will be dead-lettered when they arrive"
+                    );
+                }
+
+                if resolved.is_empty() {
+                    // Not a failure: a stream-only pipeline names no tables up front,
+                    // and a glob include-list names patterns rather than tables. Saying
+                    // so is the whole point — a silent no-op check reads exactly like a
+                    // check that passed.
+                    tracing::info!(
+                        topic_template = %template,
+                        brokers = %self.preflight_brokers,
+                        "sink preflight: Kafka brokers reachable; the topic template \
+                         names no topics that can be checked up front, so per-topic \
+                         existence is verified on first use by the broker itself"
+                    );
+                    return Ok(());
+                }
+                resolved
+            }
+        };
+
+        let found = admin.describe_topics(&expected).await.map_err(|e| {
+            AppError::Other(format!(
+                "sink preflight: failed to describe Kafka topic(s) {}: {e}",
+                quoted_list(&expected)
+            ))
+        })?;
+
+        let missing: Vec<String> = expected
+            .iter()
+            .filter(|topic| !found.iter().any(|t| t.0 == topic.as_str()))
+            .cloned()
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(AppError::Other(if templated {
+                format!(
+                    "sink preflight: Kafka topic(s) {} not found on brokers '{}'. They \
+                     are the topics sink.kafka.topic = \"{template}\" renders for the \
+                     tables this configuration names; create them, or narrow the \
+                     template.",
+                    quoted_list(&missing),
+                    self.preflight_brokers
+                )
+            } else {
+                format!(
+                    "sink preflight: Kafka topic {} not found on brokers '{}'",
+                    quoted_list(&missing),
+                    self.preflight_brokers
+                )
+            }));
         }
 
-        tracing::info!(
-            topic = %self.topic,
-            brokers = %self.preflight_brokers,
-            "sink preflight: Kafka topic reachable"
-        );
+        if templated {
+            tracing::info!(
+                topic_template = %template,
+                topics = %quoted_list(&expected),
+                checked = expected.len(),
+                brokers = %self.preflight_brokers,
+                "sink preflight: every Kafka topic this configuration names up front is \
+                 reachable; tables discovered at runtime are not covered by this check"
+            );
+        } else {
+            tracing::info!(
+                topic = %expected[0],
+                brokers = %self.preflight_brokers,
+                "sink preflight: Kafka topic reachable"
+            );
+        }
         Ok(())
     }
 
@@ -592,13 +945,24 @@ impl KafkaSink {
         producer: KafkaProducerClient,
         topic: String,
         key: Bytes,
-        value: Bytes,
+        value: Option<Bytes>,
+        headers: Vec<(String, Option<Bytes>)>,
     ) -> krafka::error::Result<InFlightSend> {
         // `with_key` unconditionally, including for an empty key. An empty key and an
         // absent key partition differently — murmur2("") pins one partition, absent
         // round-robins — and the original path always passed `Some(key)`. Changing that
         // here would silently repartition an existing topic.
-        let record = ProducerRecord::new(topic, value).with_key(key);
+        //
+        // `None` is a **tombstone**: Kafka's null value, a `-1` length prefix on the
+        // wire, which marks the key for deletion on a `cleanup.policy=compact` topic.
+        // `Some(Bytes::new())` would be a zero-length value — an ordinary record that
+        // compaction preserves — which is why this is `Option` rather than an empty
+        // `Bytes` by convention.
+        let mut record = match value {
+            Some(value) => ProducerRecord::new(topic, value).with_key(key),
+            None => ProducerRecord::tombstone(topic, key),
+        };
+        record.headers = headers;
         match producer {
             KafkaProducerClient::Idempotent(producer) => {
                 let handle = producer.enqueue(record).await?;
@@ -664,7 +1028,68 @@ impl KafkaSink {
         }
     }
 
-    /// Accept a record for delivery, without waiting for its acknowledgement.
+    /// Accept an encoded record for delivery, without waiting for its acknowledgement.
+    ///
+    /// `topic` is a per-event value once `sink.kafka.topic` carries placeholders; callers
+    /// get it from [`topic_for`](Self::topic_for), which renders and caches.
+    ///
+    /// `event` is required even though the bytes are already encoded, because the record's
+    /// *headers* come from it. There is deliberately no header-free variant: a second entry
+    /// point into the producer would be a second set of headers to keep in step, and the one
+    /// that got forgotten would publish records a consumer cannot filter — silently, since a
+    /// missing header reads exactly like a consumer bug.
+    ///
+    /// Ordering and the send window are [`enqueue`](Self::enqueue)'s contract.
+    pub async fn send_encoded(
+        &mut self,
+        event: &rustcdc::Event,
+        topic: &str,
+        key: Bytes,
+        value: Bytes,
+    ) -> rustcdc::core::Result<()> {
+        let headers = self.headers_for(event);
+        self.enqueue(topic, key, Some(value), headers).await
+    }
+
+    /// The configured headers for one event, or nothing when `headers = "none"`.
+    fn headers_for(&self, event: &rustcdc::Event) -> Vec<(String, Option<Bytes>)> {
+        match self.headers {
+            KafkaRecordHeaders::Cdc => cdc_headers(event),
+            KafkaRecordHeaders::None => Vec::new(),
+        }
+    }
+
+    /// Publish a **tombstone**: `key` with Kafka's null value.
+    ///
+    /// On a `cleanup.policy=compact` topic this marks the key for deletion, so log
+    /// compaction eventually removes every earlier record for that row and then the
+    /// tombstone itself. Without one, a deleted row's last record is retained forever and
+    /// a consumer rebuilding state from the topic sees the delete event but never sees
+    /// the key disappear.
+    ///
+    /// Goes through the same window as every other record — same ordering guarantee, so a
+    /// tombstone can never overtake the delete it follows — which is the whole reason it
+    /// is not a separate producer call.
+    pub async fn send_tombstone(
+        &mut self,
+        event: &rustcdc::Event,
+        topic: &str,
+        key: Bytes,
+    ) -> rustcdc::core::Result<()> {
+        // The headers matter more here than anywhere else. A tombstone has a key and a
+        // null value, so without them nothing on the record says which table it came
+        // from, which operation produced it, or where in the source log that happened.
+        // On a topic-per-table layout the topic name recovers the table; on a single
+        // topic nothing does, and a Debezium tombstone is opaque for exactly this reason.
+        let headers = self.headers_for(event);
+        self.enqueue(topic, key, None, headers).await
+    }
+
+    /// The one path into the send window. `None` is a tombstone; see [`build_send`].
+    ///
+    /// Records and tombstones share it deliberately. Two entry points into the producer
+    /// would be two orderings, and the invariant that a tombstone follows its delete
+    /// depends on there being exactly one.
     ///
     /// # Ordering
     ///
@@ -690,7 +1115,13 @@ impl KafkaSink {
     /// `send(record) -> Future<RecordMetadata>`, which separates *enqueue* from *await*
     /// explicitly instead of leaving both inside one opaque future, which would make this
     /// invariant structural rather than argued.
-    pub async fn send_encoded(&mut self, key: Bytes, value: Bytes) -> rustcdc::core::Result<()> {
+    async fn enqueue(
+        &mut self,
+        topic: &str,
+        key: Bytes,
+        value: Option<Bytes>,
+        headers: Vec<(String, Option<Bytes>)>,
+    ) -> rustcdc::core::Result<()> {
         if self.closed {
             return Err(RtError::StateError("sink is closed".to_string()));
         }
@@ -704,11 +1135,18 @@ impl KafkaSink {
         // An enqueue failure is the record never reaching the accumulator at all —
         // validation, an unknown topic, or the bounded wait for buffer memory expiring.
         // It is this record's outcome and belongs to this call, not to the window.
-        let mut send =
-            match Self::build_send(self.producer.clone(), self.topic.clone(), key, value).await {
-                Ok(send) => send,
-                Err(error) => return Self::settle(Err(error)),
-            };
+        let mut send = match Self::build_send(
+            self.producer.clone(),
+            topic.to_string(),
+            key,
+            value,
+            headers,
+        )
+        .await
+        {
+            Ok(send) => send,
+            Err(error) => return Self::settle(Err(error)),
+        };
         match futures::poll!(send.as_mut()) {
             // Already settled — a small record into a warm accumulator with memory
             // available can complete without ever suspending.
@@ -1002,1401 +1440,21 @@ pub(crate) fn enforce_durable_confirmation(
     Ok(())
 }
 
-impl rustcdc::sink::SinkAdapter for KafkaSink {
-    fn name(&self) -> &str {
-        "kafka"
-    }
+// `KafkaSink` deliberately does **not** implement `SinkAdapter`.
+//
+// It did, and the impl was dead — nothing ever built a `BoxedSink` from a bare
+// `KafkaSink`, because the router holds `SinkBinding`s. What it would have done if anyone
+// had reached for it was wrong three times over: it serialised the event as JSON directly,
+// ignoring the sink's configured codec; it passed an **empty** message key, which Kafka
+// partitioners hash like any other key, pinning every event across every table to one
+// murmur2("") partition — the exact defect `SinkBinding::send_event`'s key fallback exists
+// to prevent; and it published no tombstone after a delete.
+//
+// A correct Kafka send needs the codec, and the codec lives in `SinkBinding`. Driving the
+// sink through the binding is the only way to get one, so the trait impl that suggested
+// otherwise is gone rather than repaired. Compile errors are better documentation than a
+// comment on a footgun.
 
-    async fn send(&mut self, event: &rustcdc::Event) -> rustcdc::core::Result<()> {
-        let value =
-            serde_json::to_vec(event).map_err(|e| RtError::SerializationError(e.to_string()))?;
-        self.send_encoded(Bytes::new(), Bytes::from(value)).await
-    }
-
-    async fn flush(&mut self) -> rustcdc::core::Result<()> {
-        self.flush().await
-    }
-
-    async fn close(&mut self) -> rustcdc::core::Result<()> {
-        self.close().await
-    }
-
-    fn delivery_guarantee(&self) -> rustcdc::sink::SinkDeliveryGuarantee {
-        match self.delivery_guarantee() {
-            SinkDeliveryGuarantee::EffectivelyOnce => {
-                rustcdc::sink::SinkDeliveryGuarantee::EffectivelyOnce
-            }
-            _ => rustcdc::sink::SinkDeliveryGuarantee::AtLeastOnce,
-        }
-    }
-
-    fn transactional_checkpoint_barrier_capable(&self) -> bool {
-        self.transactional_checkpoint_barrier_capable()
-    }
-
-    async fn begin_checkpoint_barrier(&mut self) -> rustcdc::core::Result<()> {
-        self.begin_checkpoint_barrier().await
-    }
-
-    async fn commit_checkpoint_barrier(&mut self) -> rustcdc::core::Result<()> {
-        self.commit_checkpoint_barrier().await
-    }
-
-    async fn abort_checkpoint_barrier(&mut self) -> rustcdc::core::Result<()> {
-        self.abort_checkpoint_barrier().await
-    }
-}
-
-/// Derive a stable Avro record name from the event's table identifier.
-/// Falls back to `"CdcEvent"` when no table name is present.
 #[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use super::{
-        BarrierState, BarrierStateMachine, KafkaSink, RtError, classify_krafka_error,
-        kafka_connect_timeout,
-    };
-    use crate::config::schema::{
-        KafkaCompression, KafkaSecurityConfig, KafkaSecurityProtocol, KafkaSinkConfig,
-    };
-    use crate::error::AppError;
-    use krafka::consumer::{AutoOffsetReset, Consumer};
-    use rustcdc::{Event, Operation, SourceMetadata, fingerprint_event_stable};
-    use serde_json::json;
-    use tokio::process::Command;
-    use tokio::sync::{Barrier, Mutex};
-    use tokio::time::{Duration, sleep};
-
-    #[test]
-    fn barrier_state_machine_rejects_invalid_transition_order() {
-        let mut machine = BarrierStateMachine::new();
-
-        let commit_without_begin = machine
-            .ensure_can_commit()
-            .expect_err("commit must fail when no checkpoint barrier is active");
-        assert!(
-            commit_without_begin.to_string().contains("expected Active"),
-            "unexpected commit error: {commit_without_begin}"
-        );
-
-        machine.ensure_can_begin().expect("begin should be allowed");
-        machine.mark_active();
-        assert_eq!(machine.state(), BarrierState::Active);
-
-        let begin_twice = machine
-            .ensure_can_begin()
-            .expect_err("second begin must fail while barrier is active");
-        assert!(
-            begin_twice.to_string().contains("expected NotActive"),
-            "unexpected begin error: {begin_twice}"
-        );
-
-        machine
-            .ensure_can_commit()
-            .expect("commit should be allowed");
-        machine.mark_not_active();
-        assert_eq!(machine.state(), BarrierState::NotActive);
-    }
-
-    #[tokio::test]
-    async fn barrier_state_machine_contention_yields_single_begin_winner() {
-        let machine = Arc::new(Mutex::new(BarrierStateMachine::new()));
-        let start = Arc::new(Barrier::new(3));
-
-        let mut joins = Vec::new();
-        for _ in 0..2 {
-            let machine = Arc::clone(&machine);
-            let start = Arc::clone(&start);
-            joins.push(tokio::spawn(async move {
-                start.wait().await;
-                let mut guard = machine.lock().await;
-                match guard.ensure_can_begin() {
-                    Ok(()) => {
-                        guard.mark_active();
-                        Ok::<(), String>(())
-                    }
-                    Err(err) => Err(err.to_string()),
-                }
-            }));
-        }
-
-        start.wait().await;
-
-        let mut success = 0_usize;
-        let mut expected_error = 0_usize;
-        for join in joins {
-            match join.await.expect("join must succeed") {
-                Ok(()) => success += 1,
-                Err(err) => {
-                    if err.contains("expected NotActive") {
-                        expected_error += 1;
-                    }
-                }
-            }
-        }
-
-        assert_eq!(success, 1, "exactly one contender should begin barrier");
-        assert_eq!(
-            expected_error, 1,
-            "exactly one contender should be rejected by state machine"
-        );
-        assert_eq!(machine.lock().await.state(), BarrierState::Active);
-    }
-
-    fn sample_event() -> Event {
-        Event::builder("users", Operation::Insert)
-            .after(json!({"id": 42, "name": "bob"}))
-            .source(SourceMetadata::new("postgres", "0/16B6A71", 1))
-            .ts(1)
-            .schema("public")
-            .primary_key(["id"])
-            .build()
-    }
-
-    fn sample_kafka_config(brokers: &str, topic: &str) -> KafkaSinkConfig {
-        KafkaSinkConfig {
-            brokers: brokers.to_string(),
-            topic: topic.to_string(),
-            client_id: "cdc-kafka-test".to_string(),
-            ack_timeout_ms: 1_000,
-            retry_backoff_ms: 100,
-            retry_max_attempts: 3,
-            compression: KafkaCompression::None,
-            compression_level: None,
-            batch_size: 16 * 1024,
-            linger_ms: 0,
-            max_pipelined_sends: 128,
-            transport: Default::default(),
-            delivery_mode: crate::config::schema::KafkaDeliveryMode::AtLeastOnceIdempotent,
-            transactional_id: None,
-            transaction_timeout_ms: 60_000,
-            security: KafkaSecurityConfig::default(),
-            codec: None,
-        }
-    }
-
-    fn live_kafka_config_from_env(brokers: &str, topic: &str) -> KafkaSinkConfig {
-        let mut cfg = sample_kafka_config(brokers, topic);
-        cfg.security.protocol = match std::env::var("CDC_TEST_KAFKA_PROTOCOL") {
-            Ok(protocol) if protocol.eq_ignore_ascii_case("tls") => KafkaSecurityProtocol::Tls,
-            _ => KafkaSecurityProtocol::Plaintext,
-        };
-        cfg.security.ssl_ca_location = std::env::var("CDC_TEST_KAFKA_CA")
-            .ok()
-            .map(std::path::PathBuf::from);
-        cfg
-    }
-
-    fn sample_live_event(timestamp: u64, offset_prefix: &str) -> Event {
-        static NEXT_SUFFIX: AtomicU64 = AtomicU64::new(1);
-
-        let mut event = sample_event();
-        let suffix = NEXT_SUFFIX.fetch_add(1, Ordering::Relaxed);
-        event.source.offset = format!("{offset_prefix}{suffix}");
-        event.source.timestamp = timestamp;
-        event.ts = timestamp;
-        event
-    }
-
-    fn live_kafka_target_from_env(test_name: &str) -> Option<(String, String)> {
-        let Ok(brokers) = std::env::var("CDC_TEST_KAFKA_BROKERS") else {
-            eprintln!("skipping {test_name} (CDC_TEST_KAFKA_BROKERS is not set)");
-            return None;
-        };
-
-        let Ok(topic) = std::env::var("CDC_TEST_KAFKA_TOPIC") else {
-            eprintln!("skipping {test_name} (CDC_TEST_KAFKA_TOPIC is not set)");
-            return None;
-        };
-
-        Some((brokers, topic))
-    }
-
-    fn decode_event_offset(record_value: &[u8]) -> String {
-        let event: Event =
-            serde_json::from_slice(record_value).expect("kafka record value must decode as Event");
-        event.source.offset
-    }
-
-    async fn consume_until_offsets_seen(
-        consumer: &Consumer,
-        expected_offsets: &BTreeSet<String>,
-        attempts: usize,
-    ) -> BTreeSet<String> {
-        let mut seen_offsets = BTreeSet::new();
-
-        for _ in 0..attempts {
-            let records = consumer
-                .poll(Duration::from_millis(250))
-                .await
-                .expect("consumer poll should succeed");
-
-            for record in records {
-                if let Some(value) = &record.value {
-                    seen_offsets.insert(decode_event_offset(value.as_ref()));
-                }
-            }
-
-            if expected_offsets.is_subset(&seen_offsets) {
-                break;
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        seen_offsets
-    }
-
-    async fn consume_offset_sequence_until_seen(
-        consumer: &Consumer,
-        expected_offsets: &BTreeSet<String>,
-        attempts: usize,
-    ) -> Vec<String> {
-        let mut seen_offsets = BTreeSet::new();
-        let mut sequence = Vec::new();
-
-        for _ in 0..attempts {
-            let records = consumer
-                .poll(Duration::from_millis(250))
-                .await
-                .expect("consumer poll should succeed");
-
-            for record in records {
-                if let Some(value) = &record.value {
-                    let offset = decode_event_offset(value.as_ref());
-                    sequence.push(offset.clone());
-                    seen_offsets.insert(offset);
-                }
-            }
-
-            if expected_offsets.is_subset(&seen_offsets) {
-                break;
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        sequence
-    }
-
-    #[test]
-    fn fingerprint_bytes_are_stable() {
-        let event = sample_event();
-        let expected = fingerprint_event_stable(&event)
-            .expect("fingerprint")
-            .into_bytes();
-        let actual = fingerprint_event_stable(&event)
-            .expect("fingerprint")
-            .into_bytes();
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn fingerprint_changes_when_source_offset_changes() {
-        let first = sample_event();
-        let mut second = sample_event();
-        second.source.offset = "0/16B6A72".to_string();
-
-        let first_fp = fingerprint_event_stable(&first).expect("fingerprint");
-        let second_fp = fingerprint_event_stable(&second).expect("fingerprint");
-
-        assert_ne!(first_fp, second_fp);
-    }
-
-    #[tokio::test]
-    async fn broker_degradation_fails_closed() {
-        let mut cfg = sample_kafka_config("127.0.0.1:1", "cdc-events-degraded");
-        cfg.ack_timeout_ms = 200;
-        cfg.retry_backoff_ms = 25;
-        cfg.retry_max_attempts = 1;
-
-        match KafkaSink::new(&cfg).await {
-            Ok(mut sink) => {
-                let event = sample_event();
-                let json = serde_json::to_vec(&event).expect("serialize");
-                let err = sink
-                    .send_encoded(bytes::Bytes::new(), bytes::Bytes::from(json))
-                    .await
-                    .expect_err("send should fail when broker is unavailable");
-                assert!(err.to_string().contains("Kafka sink delivery failed"));
-            }
-            Err(err) => {
-                assert!(
-                    err.to_string().contains("failed to build")
-                        && err.to_string().contains("krafka producer"),
-                    "expected krafka producer build error, got: {err}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_blank_topic_before_build() {
-        let mut cfg = sample_kafka_config("localhost:9092", "cdc-events");
-        cfg.topic = "   ".to_string();
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected blank topic to be rejected"),
-            Err(err) => assert!(err.to_string().contains("sink.kafka.topic")),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_blank_client_id_before_build() {
-        let mut cfg = sample_kafka_config("localhost:9092", "cdc-events");
-        cfg.client_id = "   ".to_string();
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected blank client_id to be rejected"),
-            Err(err) => assert!(err.to_string().contains("sink.kafka.client_id")),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_blank_brokers_before_build() {
-        let cfg = sample_kafka_config(" , , ", "cdc-events");
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected blank broker list to be rejected"),
-            Err(err) => assert!(err.to_string().contains("sink.kafka.brokers")),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_zero_ack_timeout_before_build() {
-        let mut cfg = sample_kafka_config("localhost:9092", "cdc-events");
-        cfg.ack_timeout_ms = 0;
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected zero ack_timeout_ms to be rejected"),
-            Err(err) => assert!(err.to_string().contains("sink.kafka.ack_timeout_ms")),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_zero_retry_backoff_before_build() {
-        let mut cfg = sample_kafka_config("localhost:9092", "cdc-events");
-        cfg.retry_backoff_ms = 0;
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected zero retry_backoff_ms to be rejected"),
-            Err(err) => assert!(err.to_string().contains("sink.kafka.retry_backoff_ms")),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_zero_retry_attempts_before_build() {
-        let mut cfg = sample_kafka_config("localhost:9092", "cdc-events");
-        cfg.retry_max_attempts = 0;
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected zero retry_max_attempts to be rejected"),
-            Err(err) => assert!(err.to_string().contains("sink.kafka.retry_max_attempts")),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_tls_with_verify_peer_disabled_before_build() {
-        let mut cfg = sample_kafka_config("localhost:9092", "cdc-events");
-        cfg.security.protocol = KafkaSecurityProtocol::Tls;
-        cfg.security.verify_peer = false;
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected insecure tls verify_peer=false to be rejected"),
-            Err(err) => assert!(err.to_string().contains("sink.kafka.security.verify_peer")),
-        }
-    }
-
-    #[tokio::test]
-    async fn new_rejects_tls_with_missing_ca_file_before_build() {
-        let mut cfg = sample_kafka_config("localhost:9092", "cdc-events");
-        cfg.security.protocol = KafkaSecurityProtocol::Tls;
-        cfg.security.verify_peer = true;
-        cfg.security.ssl_ca_location =
-            Some(std::path::PathBuf::from("/tmp/no-such-kafka-ca-cert.pem"));
-
-        match KafkaSink::new(&cfg).await {
-            Ok(_) => panic!("expected missing tls CA file to be rejected"),
-            Err(err) => assert!(
-                err.to_string()
-                    .contains("sink.kafka.security.ssl_ca_location")
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn live_kafka_send_and_flush_when_env_is_set() {
-        let Some((brokers, topic)) = live_kafka_target_from_env("live kafka sink test") else {
-            return;
-        };
-
-        let cfg = live_kafka_config_from_env(&brokers, &topic);
-        let first = sample_live_event(11, "0/16B6A7");
-        let second = sample_live_event(12, "0/16B6A8");
-
-        let mut sink = KafkaSink::new(&cfg)
-            .await
-            .expect("live kafka producer must build");
-        let send = |event: &Event| {
-            let json = serde_json::to_vec(event).expect("serialize");
-            (bytes::Bytes::new(), bytes::Bytes::from(json))
-        };
-        let (k, v) = send(&first);
-        sink.send_encoded(k, v)
-            .await
-            .expect("first send should succeed");
-        let (k, v) = send(&second);
-        sink.send_encoded(k, v)
-            .await
-            .expect("second send should succeed");
-        sink.flush().await.expect("flush should succeed");
-        sink.close().await.expect("close should succeed");
-        assert!(sink.is_closed());
-    }
-
-    #[tokio::test]
-    async fn live_kafka_recovers_after_external_churn_when_env_is_set() {
-        let Some((brokers, topic)) = live_kafka_target_from_env("kafka churn test") else {
-            return;
-        };
-        let Ok(churn_cmd) = std::env::var("CDC_TEST_KAFKA_CHURN_COMMAND") else {
-            eprintln!("skipping kafka churn test (CDC_TEST_KAFKA_CHURN_COMMAND is not set)");
-            return;
-        };
-
-        let cfg = live_kafka_config_from_env(&brokers, &topic);
-
-        let mut sink = KafkaSink::new(&cfg)
-            .await
-            .expect("live kafka producer must build");
-
-        // Establish baseline health before injecting churn.
-        let baseline = sample_live_event(10, "0/16B6C");
-        let bl_json = serde_json::to_vec(&baseline).expect("serialize");
-        sink.send_encoded(bytes::Bytes::new(), bytes::Bytes::from(bl_json))
-            .await
-            .expect("baseline send should succeed");
-        sink.flush().await.expect("baseline flush should succeed");
-
-        let churn = Command::new("sh")
-            .arg("-c")
-            .arg(churn_cmd.as_str())
-            .output()
-            .await
-            .expect("failed to execute churn command");
-        assert!(
-            churn.status.success(),
-            "churn command failed: {}",
-            String::from_utf8_lossy(&churn.stderr)
-        );
-
-        // After churn, give the broker/client path a bounded recovery window.
-        let mut recovered = false;
-        for attempt in 0..40_u64 {
-            let event = sample_live_event(20 + attempt, &format!("0/16B6D{}", attempt));
-            let ev_json = serde_json::to_vec(&event).expect("serialize");
-            let delivered = sink
-                .send_encoded(bytes::Bytes::new(), bytes::Bytes::from(ev_json))
-                .await
-                .is_ok();
-            let flushed = sink.flush().await.is_ok();
-            if delivered && flushed {
-                recovered = true;
-                break;
-            }
-            sleep(Duration::from_millis(250)).await;
-        }
-
-        assert!(
-            recovered,
-            "sink did not recover delivery after external churn command"
-        );
-        sink.close().await.expect("close should succeed");
-    }
-
-    #[tokio::test]
-    async fn live_kafka_consumer_group_commit_survives_rebalance_and_restart() {
-        let Some((brokers, topic)) =
-            live_kafka_target_from_env("kafka consumer-group commit/rebalance test")
-        else {
-            return;
-        };
-
-        static NEXT_GROUP_SUFFIX: AtomicU64 = AtomicU64::new(1);
-        let suffix = NEXT_GROUP_SUFFIX.fetch_add(1, Ordering::Relaxed);
-
-        let cfg = live_kafka_config_from_env(&brokers, &topic);
-        let auth = cfg
-            .security
-            .to_auth_config()
-            .expect("kafka auth config should be valid");
-
-        let first_batch = vec![
-            sample_live_event(31, &format!("0/16B6E1-{suffix}-")),
-            sample_live_event(32, &format!("0/16B6E2-{suffix}-")),
-        ];
-        let first_offsets = first_batch
-            .iter()
-            .map(|event| event.source.offset.clone())
-            .collect::<BTreeSet<_>>();
-
-        let mut sink = KafkaSink::new(&cfg)
-            .await
-            .expect("live kafka producer must build");
-        for event in &first_batch {
-            let json = serde_json::to_vec(event).expect("serialize");
-            sink.send_encoded(bytes::Bytes::new(), bytes::Bytes::from(json))
-                .await
-                .expect("first-batch send should succeed");
-        }
-        sink.flush()
-            .await
-            .expect("first-batch flush should succeed");
-
-        let group_id = format!("cdc-kafka-commit-e2e-{suffix}");
-        let consumer_a = Consumer::builder()
-            .bootstrap_servers(brokers.clone())
-            .group_id(group_id.clone())
-            .client_id(format!("cdc-kafka-commit-e2e-a-{suffix}"))
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false)
-            .request_timeout(Duration::from_millis(cfg.ack_timeout_ms))
-            .connect_timeout(kafka_connect_timeout(Duration::from_millis(
-                cfg.ack_timeout_ms,
-            )))
-            .auth(auth.clone())
-            .build()
-            .await
-            .expect("consumer A should build");
-        consumer_a
-            .subscribe(&[topic.as_str()])
-            .await
-            .expect("consumer A should subscribe");
-
-        let seen_by_a = consume_until_offsets_seen(&consumer_a, &first_offsets, 40).await;
-        assert!(
-            first_offsets.is_subset(&seen_by_a),
-            "consumer A did not receive all first-batch offsets; expected={first_offsets:?}, seen={seen_by_a:?}"
-        );
-        consumer_a
-            .commit()
-            .await
-            .expect("consumer A commit should succeed");
-
-        let consumer_b = Consumer::builder()
-            .bootstrap_servers(brokers.clone())
-            .group_id(group_id)
-            .client_id(format!("cdc-kafka-commit-e2e-b-{suffix}"))
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false)
-            .request_timeout(Duration::from_millis(cfg.ack_timeout_ms))
-            .connect_timeout(kafka_connect_timeout(Duration::from_millis(
-                cfg.ack_timeout_ms,
-            )))
-            .auth(auth)
-            .build()
-            .await
-            .expect("consumer B should build");
-        consumer_b
-            .subscribe(&[topic.as_str()])
-            .await
-            .expect("consumer B should subscribe");
-
-        // Drive a short overlap window so group membership churn triggers rebalance.
-        for _ in 0..8 {
-            let _ = consumer_a
-                .poll(Duration::from_millis(150))
-                .await
-                .expect("consumer A overlap poll should succeed");
-            let _ = consumer_b
-                .poll(Duration::from_millis(150))
-                .await
-                .expect("consumer B overlap poll should succeed");
-            sleep(Duration::from_millis(75)).await;
-        }
-
-        consumer_a
-            .close()
-            .await
-            .expect("consumer A close should succeed");
-
-        let second_batch = vec![
-            sample_live_event(41, &format!("0/16B6F1-{suffix}-")),
-            sample_live_event(42, &format!("0/16B6F2-{suffix}-")),
-        ];
-        let expected_second_order = second_batch
-            .iter()
-            .map(|event| event.source.offset.clone())
-            .collect::<Vec<_>>();
-        let second_offsets = second_batch
-            .iter()
-            .map(|event| event.source.offset.clone())
-            .collect::<BTreeSet<_>>();
-        for event in &second_batch {
-            let json = serde_json::to_vec(event).expect("serialize");
-            sink.send_encoded(bytes::Bytes::new(), bytes::Bytes::from(json))
-                .await
-                .expect("second-batch send should succeed");
-        }
-        sink.flush()
-            .await
-            .expect("second-batch flush should succeed");
-
-        let seen_by_b_sequence =
-            consume_offset_sequence_until_seen(&consumer_b, &second_offsets, 40).await;
-        let seen_by_b = seen_by_b_sequence.iter().cloned().collect::<BTreeSet<_>>();
-        assert!(
-            second_offsets.is_subset(&seen_by_b),
-            "consumer B did not receive all second-batch offsets; expected={second_offsets:?}, seen={seen_by_b:?}"
-        );
-
-        let replayed = seen_by_b
-            .iter()
-            .filter(|offset| first_offsets.contains(*offset))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            replayed.is_empty(),
-            "consumer B replayed committed first-batch offsets after rebalance/restart: {replayed:?}"
-        );
-
-        let seen_second_in_order = seen_by_b_sequence
-            .iter()
-            .filter(|offset| second_offsets.contains(*offset))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            seen_second_in_order, expected_second_order,
-            "consumer B violated second-batch ordering after rebalance/restart"
-        );
-
-        let mut second_counts = BTreeMap::<String, usize>::new();
-        for offset in &seen_second_in_order {
-            *second_counts.entry(offset.clone()).or_default() += 1;
-        }
-        for expected in &expected_second_order {
-            assert_eq!(
-                second_counts.get(expected),
-                Some(&1),
-                "consumer B observed duplicate/missing second-batch offset {expected} after rebalance/restart"
-            );
-        }
-
-        consumer_b
-            .commit()
-            .await
-            .expect("consumer B commit should succeed");
-        consumer_b
-            .close()
-            .await
-            .expect("consumer B close should succeed");
-        sink.close().await.expect("sink close should succeed");
-    }
-
-    // ── In-process fake-broker tests (krafka `test-broker`) ──────────────────
-    //
-    // These run the real Kafka wire protocol against krafka's in-process fake
-    // broker — no Docker, no env gating, always on in CI.
-
-    #[tokio::test]
-    async fn fake_broker_sink_delivers_all_records_durably() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        broker.create_topic("cdc.fake.delivery", 3);
-
-        let cfg = sample_kafka_config(&broker.bootstrap_servers(), "cdc.fake.delivery");
-        let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
-
-        for i in 0..5u32 {
-            sink.send_encoded(
-                bytes::Bytes::from(format!("key-{i}")),
-                bytes::Bytes::from(format!("value-{i}")),
-            )
-            .await
-            .expect("send must succeed and confirm durably");
-        }
-        sink.flush().await.expect("flush");
-
-        // Every record must be in the broker log — the sum of next_offset over
-        // all partitions is the total number of durably appended records.
-        let total: i64 = broker.with_state(|state| {
-            (0..3)
-                .filter_map(|partition| state.partition("cdc.fake.delivery", partition))
-                .map(|p| p.next_offset)
-                .sum()
-        });
-        assert_eq!(
-            total, 5,
-            "all sends must be appended to the fake broker log"
-        );
-
-        sink.close().await.expect("close");
-    }
-
-    // ── Pipelined sends ──────────────────────────────────────────────────────
-
-    /// Read every record of a single-partition topic back off the fake broker, in log
-    /// order, as a `read_uncommitted` consumer sees it.
-    async fn drain_partition_values(brokers: &str, topic: &str, expected: usize) -> Vec<String> {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(brokers.to_string())
-            .group_id(format!("{topic}-verify"))
-            .client_id(format!("{topic}-verify"))
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false)
-            .build()
-            .await
-            .expect("verification consumer");
-        consumer.subscribe(&[topic]).await.expect("subscribe");
-
-        let mut values = Vec::new();
-        for _ in 0..40 {
-            for record in consumer
-                .poll(Duration::from_millis(250))
-                .await
-                .expect("poll")
-            {
-                if let Some(value) = &record.value {
-                    values.push(String::from_utf8_lossy(value.as_ref()).into_owned());
-                }
-            }
-            if values.len() >= expected {
-                break;
-            }
-        }
-        consumer.close().await.expect("close verification consumer");
-        values
-    }
-
-    /// Read a topic as a `read_committed` consumer does — aborted records excluded.
-    async fn read_committed_values(brokers: &str, topic: &str) -> Vec<String> {
-        let consumer = Consumer::builder()
-            .bootstrap_servers(brokers.to_string())
-            .group_id(format!("{topic}-committed"))
-            .client_id(format!("{topic}-committed"))
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .isolation_level(krafka::consumer::IsolationLevel::ReadCommitted)
-            .enable_auto_commit(false)
-            .build()
-            .await
-            .expect("read_committed consumer");
-        consumer.subscribe(&[topic]).await.expect("subscribe");
-
-        let mut values = Vec::new();
-        for _ in 0..8 {
-            for record in consumer
-                .poll(Duration::from_millis(250))
-                .await
-                .expect("poll")
-            {
-                if let Some(value) = &record.value {
-                    values.push(String::from_utf8_lossy(value.as_ref()).into_owned());
-                }
-            }
-        }
-        consumer.close().await.expect("close");
-        values
-    }
-
-    /// **The property pipelining must not break.** Per-partition ordering is what every
-    /// downstream CDC consumer depends on: replaying `UPDATE balance=100` before
-    /// `UPDATE balance=50` silently corrupts the replica.
-    ///
-    /// One partition, a window far wider than the record count, so every send is
-    /// outstanding at once and any reordering in the accumulator would show up here.
-    #[tokio::test]
-    async fn pipelined_sends_reach_the_partition_in_submission_order() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        let topic = "cdc.fake.pipeline.order";
-        broker.create_topic(topic, 1);
-
-        let mut cfg = sample_kafka_config(&broker.bootstrap_servers(), topic);
-        cfg.max_pipelined_sends = 256;
-        // A non-zero linger is the case that used to be unusable: it forces records to
-        // coalesce in the accumulator, which is exactly where a reordering would happen.
-        cfg.linger_ms = 5;
-        let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
-
-        let expected: Vec<String> = (0..200).map(|i| format!("value-{i:04}")).collect();
-        for value in &expected {
-            sink.send_encoded(
-                bytes::Bytes::from_static(b"same-key"),
-                bytes::Bytes::from(value.clone()),
-            )
-            .await
-            .expect("send accepted");
-        }
-        sink.flush().await.expect("flush");
-
-        let observed =
-            drain_partition_values(&broker.bootstrap_servers(), topic, expected.len()).await;
-        assert_eq!(
-            observed, expected,
-            "pipelined sends must reach the partition in submission order"
-        );
-
-        sink.close().await.expect("close");
-    }
-
-    /// `flush` is the durability boundary the checkpoint depends on: `run_loop_batch`
-    /// commits a checkpoint only after `process_batch_events` returns, and that calls
-    /// `flush`. If `flush` returned before collecting outstanding acknowledgements, the
-    /// checkpoint would advance past records that were never confirmed.
-    #[tokio::test]
-    async fn flush_collects_every_outstanding_acknowledgement() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        let topic = "cdc.fake.pipeline.flush";
-        broker.create_topic(topic, 1);
-
-        let mut cfg = sample_kafka_config(&broker.bootstrap_servers(), topic);
-        cfg.max_pipelined_sends = 512;
-        cfg.linger_ms = 20;
-        let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
-
-        for i in 0..100u32 {
-            sink.send_encoded(
-                bytes::Bytes::from(format!("k{i}")),
-                bytes::Bytes::from(format!("v{i}")),
-            )
-            .await
-            .expect("send accepted");
-        }
-
-        sink.flush().await.expect("flush");
-        assert!(
-            sink.inflight.is_empty(),
-            "flush must leave no unconfirmed sends behind"
-        );
-
-        let durable = broker.next_offset(topic, 0).expect("partition exists");
-        assert_eq!(
-            durable, 100,
-            "every accepted record must be durable once flush returns"
-        );
-
-        sink.close().await.expect("close");
-    }
-
-    /// `max_pipelined_sends` is a ceiling, not a hint. An inert tuning knob is worse than
-    /// no knob, so this asserts the window is bounded
-    /// while sends are outstanding, not merely that the field is read.
-    #[tokio::test]
-    async fn the_pipeline_window_is_bounded_by_its_configured_depth() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        let topic = "cdc.fake.pipeline.window";
-        broker.create_topic(topic, 1);
-
-        let mut cfg = sample_kafka_config(&broker.bootstrap_servers(), topic);
-        cfg.max_pipelined_sends = 8;
-        cfg.linger_ms = 20;
-        let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
-
-        for i in 0..50u32 {
-            sink.send_encoded(
-                bytes::Bytes::from(format!("k{i}")),
-                bytes::Bytes::from(format!("v{i}")),
-            )
-            .await
-            .expect("send accepted");
-            assert!(
-                sink.inflight.len() <= 8,
-                "window grew to {} with max_pipelined_sends = 8",
-                sink.inflight.len()
-            );
-        }
-
-        sink.flush().await.expect("flush");
-        sink.close().await.expect("close");
-    }
-
-    /// The throughput claim, measured rather than asserted in prose.
-    ///
-    /// A depth-1 window is precisely the original sink: one broker round-trip per
-    /// record. Both runs go through the same code against the same in-process broker, so
-    /// the ratio isolates pipelining from everything else. The threshold is deliberately
-    /// loose — this runs on shared CI hardware, and the point is to catch the window
-    /// silently reverting to serial, not to publish a number.
-    #[tokio::test]
-    async fn pipelining_outperforms_one_round_trip_per_record() {
-        async fn run(broker_servers: &str, topic: &str, depth: usize) -> Duration {
-            let mut cfg = sample_kafka_config(broker_servers, topic);
-            cfg.max_pipelined_sends = depth;
-            cfg.linger_ms = 2;
-            let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
-
-            let started = std::time::Instant::now();
-            for i in 0..300u32 {
-                sink.send_encoded(
-                    bytes::Bytes::from(format!("k{i}")),
-                    bytes::Bytes::from(format!("v{i}")),
-                )
-                .await
-                .expect("send accepted");
-            }
-            sink.flush().await.expect("flush");
-            let elapsed = started.elapsed();
-            sink.close().await.expect("close");
-            elapsed
-        }
-
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        broker.create_topic("cdc.fake.perf.serial", 1);
-        broker.create_topic("cdc.fake.perf.pipelined", 1);
-
-        broker.clear_requests();
-        let serial = run(&broker.bootstrap_servers(), "cdc.fake.perf.serial", 1).await;
-        let serial_produces = broker.request_count(krafka::protocol::ApiKey::Produce);
-
-        broker.clear_requests();
-        let pipelined = run(&broker.bootstrap_servers(), "cdc.fake.perf.pipelined", 256).await;
-        let pipelined_produces = broker.request_count(krafka::protocol::ApiKey::Produce);
-
-        eprintln!(
-            "pipelining: serial {serial:?} / {serial_produces} produce requests \
-             vs pipelined {pipelined:?} / {pipelined_produces} produce requests"
-        );
-
-        // The round-trip count is the deterministic signal and the one that actually
-        // governs throughput on a real network; wall-clock on shared CI hardware is not.
-        assert_eq!(
-            serial_produces, 300,
-            "a depth-1 window is one broker round-trip per record, by definition"
-        );
-        assert!(
-            pipelined_produces * 10 < serial_produces,
-            "pipelining must coalesce records into batches (serial {serial_produces} \
-             produce requests, pipelined {pipelined_produces})"
-        );
-        assert!(
-            pipelined < serial,
-            "pipelining must not be slower (serial {serial:?}, pipelined {pipelined:?})"
-        );
-    }
-
-    // ── Transactional (effectively-once) coverage ────────────────────────────
-    //
-    // The fake broker serves the full transaction protocol — commit and abort markers,
-    // `read_committed` isolation and the last-stable-offset — so the checkpoint-barrier
-    // path has broker-level evidence, not only the in-memory state machine above.
-
-    fn transactional_kafka_config(brokers: &str, topic: &str, txn_id: &str) -> KafkaSinkConfig {
-        let mut cfg = sample_kafka_config(brokers, topic);
-        cfg.delivery_mode = crate::config::schema::KafkaDeliveryMode::Transactional;
-        cfg.transactional_id = Some(txn_id.to_string());
-        cfg
-    }
-
-    /// A committed barrier must advance the last stable offset — that is what makes
-    /// the records visible to a `read_committed` consumer, and it is the property
-    /// `effectively_once` actually sells.
-    #[tokio::test]
-    async fn fake_broker_committed_barrier_advances_last_stable_offset() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        broker.create_topic("cdc.fake.txn.commit", 1);
-
-        let cfg = transactional_kafka_config(
-            &broker.bootstrap_servers(),
-            "cdc.fake.txn.commit",
-            "cdc-txn-commit",
-        );
-        let mut sink = KafkaSink::new(&cfg).await.expect("transactional sink");
-        assert_eq!(
-            sink.delivery_guarantee(),
-            super::SinkDeliveryGuarantee::EffectivelyOnce
-        );
-
-        sink.begin_checkpoint_barrier()
-            .await
-            .expect("begin barrier");
-        for i in 0..3u32 {
-            sink.send_encoded(
-                bytes::Bytes::from(format!("key-{i}")),
-                bytes::Bytes::from(format!("value-{i}")),
-            )
-            .await
-            .expect("send inside transaction");
-        }
-
-        // Uncommitted: the records are appended but not yet stable, so a
-        // `read_committed` consumer must not be able to see them.
-        let lso_before = broker
-            .last_stable_offset("cdc.fake.txn.commit", 0)
-            .expect("partition exists");
-        assert_eq!(
-            lso_before, 0,
-            "records must not be stable before the barrier commits"
-        );
-
-        sink.commit_checkpoint_barrier()
-            .await
-            .expect("commit barrier");
-
-        let lso_after = broker
-            .last_stable_offset("cdc.fake.txn.commit", 0)
-            .expect("partition exists");
-        assert!(
-            lso_after > lso_before,
-            "committing the barrier must advance the last stable offset \
-             ({lso_before} -> {lso_after})"
-        );
-        assert!(
-            broker
-                .aborted_transactions("cdc.fake.txn.commit", 0)
-                .is_empty(),
-            "a committed barrier must leave no abort marker"
-        );
-
-        sink.close().await.expect("close");
-    }
-
-    /// An aborted barrier must leave an abort marker, so a `read_committed`
-    /// consumer skips the records rather than reading a partially-applied batch.
-    /// This is the failure path the delivery contract exists for.
-    #[tokio::test]
-    async fn fake_broker_aborted_barrier_leaves_an_abort_marker() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        broker.create_topic("cdc.fake.txn.abort", 1);
-
-        let cfg = transactional_kafka_config(
-            &broker.bootstrap_servers(),
-            "cdc.fake.txn.abort",
-            "cdc-txn-abort",
-        );
-        let mut sink = KafkaSink::new(&cfg).await.expect("transactional sink");
-
-        sink.begin_checkpoint_barrier()
-            .await
-            .expect("begin barrier");
-        sink.send_encoded(
-            bytes::Bytes::from("key-doomed"),
-            bytes::Bytes::from("value-doomed"),
-        )
-        .await
-        .expect("send inside transaction");
-        // Collect the acknowledgement so the record is genuinely in the open transaction
-        // on the broker. Without this the abort has nothing to mark: a pipelined send may
-        // still be outstanding, and `abort_checkpoint_barrier` cancels it rather than
-        // waiting — see `SendWindow::abandon`. Both routes discard the batch, and the
-        // *unflushed* one is covered below; this half needs a record that reached the log.
-        sink.flush().await.expect("flush into the open transaction");
-
-        sink.abort_checkpoint_barrier()
-            .await
-            .expect("abort barrier");
-
-        assert!(
-            !broker
-                .aborted_transactions("cdc.fake.txn.abort", 0)
-                .is_empty(),
-            "an aborted barrier must record an abort marker so read_committed skips it"
-        );
-
-        // The state machine must be back to NotActive, so the next barrier can begin.
-        sink.begin_checkpoint_barrier()
-            .await
-            .expect("a new barrier must be startable after an abort");
-        sink.commit_checkpoint_barrier()
-            .await
-            .expect("commit the recovery barrier");
-
-        sink.close().await.expect("close");
-    }
-
-    /// The other half of the abort contract: a record accepted into a pipelined window
-    /// but aborted before it drains must never become visible either.
-    ///
-    /// This is the path `run_loop_batch` takes when delivery fails mid-batch — it aborts
-    /// without flushing. Cancelling an outstanding send is sound precisely because the
-    /// transaction it belonged to is being discarded; the assertion is that the record
-    /// does not survive by some other route.
-    #[tokio::test]
-    async fn aborting_before_the_window_drains_publishes_nothing() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        let topic = "cdc.fake.txn.abort.undrained";
-        broker.create_topic(topic, 1);
-
-        let mut cfg =
-            transactional_kafka_config(&broker.bootstrap_servers(), topic, "cdc-txn-undrained");
-        cfg.max_pipelined_sends = 128;
-        cfg.linger_ms = 50;
-        let mut sink = KafkaSink::new(&cfg).await.expect("transactional sink");
-
-        sink.begin_checkpoint_barrier()
-            .await
-            .expect("begin barrier");
-        for i in 0..20u32 {
-            sink.send_encoded(
-                bytes::Bytes::from(format!("k{i}")),
-                bytes::Bytes::from(format!("doomed-{i}")),
-            )
-            .await
-            .expect("send accepted");
-        }
-        sink.abort_checkpoint_barrier()
-            .await
-            .expect("abort barrier");
-
-        // Whatever reached the log is covered by an abort marker; whatever did not was
-        // cancelled. Either way a read_committed consumer sees no *data*. Asserting on
-        // the last stable offset would be wrong: the abort marker is itself a control
-        // record and takes an offset, so the LSO advances past it on a correct abort.
-        let visible = read_committed_values(&broker.bootstrap_servers(), topic).await;
-        assert!(
-            visible.is_empty(),
-            "no aborted record may become visible to a read_committed consumer, saw {visible:?}"
-        );
-
-        sink.close().await.expect("close");
-    }
-
-    // ── Sink error classification ────────────────────────────────────────────
-
-    /// Every Kafka failure used to map to `SourceError`, which classifies as Transient.
-    /// A record the broker rejects permanently was therefore retried until the circuit
-    /// breaker killed the process — and then failed identically after the restart, on the
-    /// same record, forever. The dead-letter queue could not help, because its branch
-    /// only runs for a non-recoverable error and this sink never produced one.
-    #[test]
-    fn a_poison_record_is_quarantinable_not_retriable() {
-        let error = krafka::error::KrafkaError::Broker {
-            code: krafka::error::ErrorCode::MessageTooLarge,
-            message: "record exceeds max.message.bytes".to_string(),
-        };
-        let classified = classify_krafka_error(&error, "sink delivery failed");
-
-        assert!(
-            !classified.is_recoverable(),
-            "a record the broker will reject identically forever is not retriable"
-        );
-        assert!(
-            classified.is_dead_letterable(),
-            "an oversized record is the record's fault, so quarantine is the way forward"
-        );
-    }
-
-    /// The mirror image, and the reason `is_dead_letterable` exists as a separate
-    /// question. Bad credentials are permanent *and* not the record's fault: quarantining
-    /// them would drain the entire change stream into the DLQ one event at a time while
-    /// every health check still reported the pipeline as running.
-    #[test]
-    fn an_authorization_failure_is_neither_retriable_nor_quarantinable() {
-        let error = krafka::error::KrafkaError::Broker {
-            code: krafka::error::ErrorCode::TopicAuthorizationFailed,
-            message: "not authorized".to_string(),
-        };
-        let classified = classify_krafka_error(&error, "sink delivery failed");
-
-        assert!(
-            !classified.is_recoverable(),
-            "an ACL will not change on retry"
-        );
-        assert!(
-            !classified.is_dead_letterable(),
-            "dead-lettering an ACL failure quarantines every event in the stream"
-        );
-    }
-
-    /// A leader election is the common case and must stay retriable, or a routine broker
-    /// restart becomes a process exit and a full replay from the last checkpoint.
-    #[test]
-    fn a_transient_broker_condition_stays_retriable() {
-        let error = krafka::error::KrafkaError::Broker {
-            code: krafka::error::ErrorCode::LeaderNotAvailable,
-            message: "leader election in progress".to_string(),
-        };
-        assert!(
-            classify_krafka_error(&error, "sink delivery failed").is_recoverable(),
-            "a leader election must be retried, not escalated"
-        );
-    }
-
-    /// The classification has to survive the trip through `rustcdc::core::Error` and back,
-    /// because that is the boundary the sink's result actually crosses on its way to the
-    /// batch loop's dead-letter decision.
-    #[test]
-    fn classification_survives_the_round_trip_through_rustcdc() {
-        let poison = classify_krafka_error(
-            &krafka::error::KrafkaError::Broker {
-                code: krafka::error::ErrorCode::InvalidRecord,
-                message: "malformed".to_string(),
-            },
-            "sink delivery failed",
-        );
-        let round_tripped = AppError::Runtime(RtError::from(poison));
-        assert!(!round_tripped.is_recoverable());
-        assert!(
-            round_tripped.is_dead_letterable(),
-            "a poison record must still be quarantinable after crossing the sink boundary"
-        );
-
-        let fatal = classify_krafka_error(
-            &krafka::error::KrafkaError::Auth {
-                message: "bad credentials".to_string(),
-            },
-            "sink delivery failed",
-        );
-        let round_tripped = AppError::Runtime(RtError::from(fatal));
-        assert!(!round_tripped.is_recoverable());
-        assert!(
-            !round_tripped.is_dead_letterable(),
-            "an auth failure must not become quarantinable by crossing the sink boundary"
-        );
-    }
-
-    /// `init_transactions` must fence the previous producer for the same
-    /// transactional id by bumping the epoch — that is what stops a zombie writer
-    /// from committing after this instance took over (KIP-447).
-    #[tokio::test]
-    async fn fake_broker_reinit_fences_the_previous_producer_epoch() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        broker.create_topic("cdc.fake.txn.fence", 1);
-
-        let cfg = transactional_kafka_config(
-            &broker.bootstrap_servers(),
-            "cdc.fake.txn.fence",
-            "cdc-txn-fence",
-        );
-
-        let first = KafkaSink::new(&cfg).await.expect("first sink");
-        let (id_a, epoch_a) = broker
-            .transactional_producer("cdc-txn-fence")
-            .expect("producer registered");
-
-        // A second instance claiming the same transactional id — the restart case.
-        let mut second = KafkaSink::new(&cfg).await.expect("second sink");
-        let (id_b, epoch_b) = broker
-            .transactional_producer("cdc-txn-fence")
-            .expect("producer still registered");
-
-        assert_eq!(
-            id_a, id_b,
-            "re-initialising the same transactional id must keep the producer id"
-        );
-        assert!(
-            epoch_b > epoch_a,
-            "re-initialising must bump the epoch to fence the previous producer \
-             ({epoch_a} -> {epoch_b})"
-        );
-
-        drop(first);
-        second.close().await.expect("close");
-    }
-
-    /// `linger_ms` must default to 0.
-    ///
-    /// This sink awaits each record's broker confirmation before returning from
-    /// `send_encoded` — that per-record durability check is the point of the Kafka
-    /// sink. It also means a batch never accumulates across calls: every send waits
-    /// out the full linger on its own, so a non-zero default silently caps throughput
-    /// at `1000 / linger_ms` events per second per sink. Measured against the fake
-    /// broker, a 50 ms linger takes ~50 ms *per record*.
-    #[tokio::test]
-    async fn linger_is_not_charged_per_record_at_the_default() {
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        broker.create_topic("cdc.fake.linger", 1);
-
-        let cfg = sample_kafka_config(&broker.bootstrap_servers(), "cdc.fake.linger");
-        assert_eq!(
-            cfg.linger_ms, 0,
-            "the default linger must be 0; anything higher is charged once per record \
-             because send_encoded awaits each confirmation"
-        );
-
-        let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
-        let started = std::time::Instant::now();
-        for i in 0..20u32 {
-            sink.send_encoded(bytes::Bytes::from(format!("k{i}")), bytes::Bytes::from("v"))
-                .await
-                .expect("send");
-        }
-        let elapsed = started.elapsed();
-        sink.close().await.expect("close");
-
-        // 20 sequential confirmed sends against an in-process broker. With a 5 ms
-        // linger this took >100 ms; with 0 it is bounded by the round-trips alone.
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "20 confirmed sends took {elapsed:?}; the default linger is charging \
-             per-record latency"
-        );
-    }
-
-    /// End-to-end check of the message-key contract through `SinkBinding`:
-    /// events with a primary key are keyed by the PK JSON (per-row ordering);
-    /// keyless events fall back to the qualified table name instead of an
-    /// empty key (which Kafka would hash — pinning every keyless event of
-    /// every table to one partition).
-    #[tokio::test]
-    async fn fake_broker_message_keys_use_pk_json_with_table_name_fallback() {
-        use krafka::consumer::CompactedTopicConsumer;
-
-        let broker = krafka::testing::FakeBroker::start()
-            .await
-            .expect("fake broker");
-        broker.create_topic("cdc.fake.keys", 1);
-
-        let cfg = sample_kafka_config(&broker.bootstrap_servers(), "cdc.fake.keys");
-        let mut binding =
-            crate::sink::build_binding(&crate::config::schema::SinkConfig::Kafka(cfg), usize::MAX)
-                .await
-                .expect("sink binding");
-
-        let keyed = sample_event(); // primary_key = ["id"], after.id = 42
-        let mut keyless = sample_event();
-        keyless.primary_key = None;
-
-        binding.send_event(&keyed).await.expect("send keyed");
-        binding.send_event(&keyless).await.expect("send keyless");
-        use rustcdc::sink::SinkAdapter as _;
-        binding.flush().await.expect("flush");
-
-        let mut consumer = CompactedTopicConsumer::from_consumer_builder(
-            krafka::consumer::Consumer::builder()
-                .bootstrap_servers(broker.bootstrap_servers())
-                .client_id("fake-key-check".to_string())
-                .connect_timeout(Duration::from_secs(2))
-                .request_timeout(Duration::from_secs(10)),
-            "cdc.fake.keys",
-        )
-        .await
-        .expect("compacted consumer");
-        consumer
-            .scan(Duration::from_millis(1_000))
-            .await
-            .expect("scan");
-        let table = consumer.table();
-
-        assert!(
-            table.contains_key(br#"{"id":42}"#.as_slice()),
-            "keyed event must use the primary-key JSON as message key"
-        );
-        assert!(
-            table.contains_key(b"public.users".as_slice()),
-            "keyless event must fall back to the qualified table name key"
-        );
-        consumer.close().await.expect("consumer close");
-        binding.close().await.expect("binding close");
-    }
-}
+#[path = "kafka_tests.rs"]
+mod tests;

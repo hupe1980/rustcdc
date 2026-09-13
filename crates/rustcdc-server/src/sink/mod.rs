@@ -92,6 +92,24 @@ pub struct SinkDeliveryMetrics {
     /// Unix epoch. `0` means none has been fetched yet, or the provider returned no
     /// `expires_in`.
     pub kafka_oauth_token_expiry_epoch_ms: u64,
+    /// Tombstones published after a delete.
+    ///
+    /// The signal that `tombstones_on_delete` is actually doing something. Read it as a
+    /// rate, not a level: zero is the normal state of a pipeline whose tables are not
+    /// being deleted from, so it is not alertable on its own — that is what
+    /// [`kafka_unkeyed_deletes_total`](Self::kafka_unkeyed_deletes_total) is for.
+    pub kafka_tombstones_total: u64,
+    /// Deletes that could not be tombstoned because the event carried no row key.
+    ///
+    /// Unambiguous where the counter above is not: every increment is a key that a
+    /// compacted topic will never reclaim, and the cause is always the same — the table
+    /// has no primary key. Such a table cannot be consumed from a compacted topic at all,
+    /// because every one of its events shares the qualified-table-name key.
+    ///
+    /// Truncate and schema-change events are *not* counted here. They legitimately carry
+    /// no row key and nothing is wrong with them; folding them in would make the counter
+    /// fire on healthy pipelines and there would be nothing to do about it.
+    pub kafka_unkeyed_deletes_total: u64,
     /// Rows appended to a Snowpipe Streaming channel.
     pub snowflake_rows_appended_total: u64,
     /// Rows dropped on resume because the channel's committed offset token already
@@ -258,6 +276,14 @@ impl SinkDeliveryMetrics {
             other.kafka_oauth_token_expiry_epoch_ms,
         );
         add(
+            &mut self.kafka_tombstones_total,
+            other.kafka_tombstones_total,
+        );
+        add(
+            &mut self.kafka_unkeyed_deletes_total,
+            other.kafka_unkeyed_deletes_total,
+        );
+        add(
             &mut self.snowflake_rows_appended_total,
             other.snowflake_rows_appended_total,
         );
@@ -369,16 +395,86 @@ pub enum BuiltSink {
     Fan(Box<FanOutSink>, Vec<SinkMetricsHandle>),
 }
 
+/// What a sink needs from the rest of the configuration in order to be built.
+///
+/// Started as a bare `max_event_bytes` parameter and grew a second field the moment a
+/// Kafka topic could be a template: preflighting one needs the tables the *pipeline*
+/// names, which no `SinkConfig` carries. Threading a second positional argument through
+/// `build`, `build_binding` and every fan-out child is how the two get passed in the
+/// wrong order; a named struct cannot be.
+#[derive(Debug, Clone)]
+pub struct SinkBuildContext {
+    /// `runtime.max_event_bytes`, enforced against the payload the transport will send.
+    pub max_event_bytes: usize,
+
+    /// Concrete tables this configuration already names, for preflighting a templated
+    /// Kafka topic. Glob patterns are excluded — they are not topics anyone can describe.
+    ///
+    /// Empty is legitimate and common: a stream-only pipeline names no tables up front.
+    pub known_tables: Vec<crate::topic::QualifiedTable>,
+}
+
+impl SinkBuildContext {
+    /// A context with no known tables — for a sink built outside a pipeline.
+    pub fn new(max_event_bytes: usize) -> Self {
+        Self {
+            max_event_bytes,
+            known_tables: Vec::new(),
+        }
+    }
+
+    pub fn with_known_tables(mut self, tables: Vec<crate::topic::QualifiedTable>) -> Self {
+        self.known_tables = tables;
+        self
+    }
+
+    /// Everything in `config` that names a concrete table, deduplicated.
+    ///
+    /// Three sources, and they are deliberately unioned rather than ranked:
+    ///
+    /// * `snapshot_tables` — the blocking bootstrap list, always concrete;
+    /// * `incremental_snapshot.tables` — the DBLog backfill list, always concrete;
+    /// * the source's `table_include_list` — **glob patterns**, so only the entries with
+    ///   no metacharacter are usable. `public.*` is a pattern, not a table, and
+    ///   rendering it into `cdc.public.*` would fail preflight against a topic that was
+    ///   never supposed to exist.
+    ///
+    /// Any of the three can be empty, and all three being empty is the normal shape of a
+    /// stream-only pipeline. Preflight says so rather than silently checking nothing.
+    pub fn known_tables_from_config(
+        config: &crate::config::schema::AppConfig,
+    ) -> Vec<crate::topic::QualifiedTable> {
+        let incremental = config
+            .incremental_snapshot
+            .as_ref()
+            .map(|inc| inc.tables.as_slice())
+            .unwrap_or_default();
+
+        let mut tables: Vec<crate::topic::QualifiedTable> = config
+            .snapshot_tables
+            .iter()
+            .chain(incremental)
+            .chain(config.source.driver.table_include_list())
+            .filter_map(|entry| crate::topic::QualifiedTable::parse_concrete(entry))
+            .collect();
+
+        tables.sort();
+        tables.dedup();
+        tables
+    }
+}
+
 /// Build the concrete sink from the application configuration.
 ///
-/// `max_event_bytes` is threaded in for transports that produce the transmitted bytes
-/// themselves. Snowflake is the first: its NDJSON row *is* the JSON, so it enforces the
-/// limit on the bytes it is about to send rather than on a second rendering made purely to
-/// measure and thrown away.
-fn build(
-    config: &SinkConfig,
-    max_event_bytes: usize,
-) -> BoxFuture<'_, Result<BuiltSink, AppError>> {
+/// The context carries `max_event_bytes` for transports that produce the transmitted
+/// bytes themselves — Snowflake is the first: its NDJSON row *is* the JSON, so it
+/// enforces the limit on the bytes it is about to send rather than on a second rendering
+/// made purely to measure and thrown away — and the pipeline's table set for the Kafka
+/// sink's topic preflight.
+fn build<'a>(
+    config: &'a SinkConfig,
+    ctx: &'a SinkBuildContext,
+) -> BoxFuture<'a, Result<BuiltSink, AppError>> {
     Box::pin(async move {
         match config {
             SinkConfig::Stdout(StdoutSinkConfig {}) => {
@@ -406,17 +502,18 @@ fn build(
                 Ok(BuiltSink::Http(Box::new(sink)))
             }
             SinkConfig::Snowflake(cfg) => {
-                let sink = SnowflakeSink::new(cfg, max_event_bytes).await?;
+                let sink = SnowflakeSink::new(cfg, ctx.max_event_bytes).await?;
                 Ok(BuiltSink::Snowflake(Box::new(sink)))
             }
             SinkConfig::Zerobus(cfg) => {
-                let sink = ZerobusSink::new(cfg, max_event_bytes).await?;
+                let sink = ZerobusSink::new(cfg, ctx.max_event_bytes).await?;
                 Ok(BuiltSink::Zerobus(Box::new(sink)))
             }
             SinkConfig::Kafka(cfg) => {
                 let sink = KafkaSink::new(cfg)
                     .await
-                    .map_err(|e| AppError::Other(format!("failed to build Kafka sink: {e}")))?;
+                    .map_err(|e| AppError::Other(format!("failed to build Kafka sink: {e}")))?
+                    .with_preflight_tables(ctx.known_tables.clone());
                 Ok(BuiltSink::Kafka(Box::new(sink)))
             }
             SinkConfig::Iceberg(cfg) => {
@@ -438,13 +535,9 @@ fn build(
                     // parent binding's direct path, which has already enforced the
                     // limit. Enforcing it again per child would reject the same event
                     // twice and report the child's name for the parent's decision.
-                    let child = build_binding(child_cfg, max_event_bytes)
-                        .await
-                        .map_err(|e| {
-                            AppError::Other(format!(
-                                "failed to build fan-out child sink [{i}]: {e}"
-                            ))
-                        })?;
+                    let child = build_binding(child_cfg, ctx).await.map_err(|e| {
+                        AppError::Other(format!("failed to build fan-out child sink [{i}]: {e}"))
+                    })?;
                     child_metrics.push(child.metrics_handle());
                     children.push(BoxedSink::new(child));
                 }
@@ -524,8 +617,13 @@ impl SinkBinding {
                 .encode_async(event)
                 .await
                 .map_err(AppError::Runtime)?;
-            let key = match output.key {
-                Some(key) => Bytes::from(key),
+            // Kept separate from the message key below, because they answer different
+            // questions. `row_key` is "does this event name a row?" — `None` for a
+            // truncate, a schema change, or any table without a primary key. The message
+            // key is "which partition?", which every event needs an answer to.
+            let row_key = output.key.map(Bytes::from);
+            let key = match &row_key {
+                Some(key) => key.clone(),
                 // Keyless events (table without a primary key): partition by the
                 // qualified table name so per-table ordering survives. The previous
                 // `unwrap_or_default()` produced an *empty* key, which Kafka
@@ -537,9 +635,16 @@ impl SinkBinding {
             // Exact: these are the bytes going on the wire, and measuring them costs
             // nothing because they already exist.
             enforce_size_limit(key.len() + value.len(), self.max_event_bytes)?;
+            self.transport
+                .send_encoded(event, key, value)
+                .await
+                .map_err(AppError::Runtime)?;
+            // After the delete, never before: the tombstone shares the delete's key and
+            // therefore its partition, so submission order is delivery order and a
+            // consumer can never see the key removed before it sees why.
             return self
                 .transport
-                .send_encoded(key, value)
+                .send_delete_tombstone(event, row_key.as_ref())
                 .await
                 .map_err(AppError::Runtime);
         }
@@ -665,19 +770,19 @@ fn enforce_size_limit(size: usize, max_event_bytes: usize) -> Result<(), AppErro
 }
 
 /// Build a [`SinkBinding`] (codec + transport) from configuration.
-pub fn build_binding(
-    config: &SinkConfig,
-    max_event_bytes: usize,
-) -> BoxFuture<'_, Result<SinkBinding, AppError>> {
+pub fn build_binding<'a>(
+    config: &'a SinkConfig,
+    ctx: &'a SinkBuildContext,
+) -> BoxFuture<'a, Result<SinkBinding, AppError>> {
     Box::pin(async move {
         let codec = build_codec_from_sink_config(config)
             .await
             .map_err(|e| AppError::Other(format!("failed to build codec: {e}")))?;
-        let transport = build(config, max_event_bytes).await?;
+        let transport = build(config, ctx).await?;
         let binding = SinkBinding {
             codec,
             transport,
-            max_event_bytes,
+            max_event_bytes: ctx.max_event_bytes,
             metrics: SinkMetricsHandle::default(),
         };
         binding.publish_metrics();
@@ -685,9 +790,25 @@ pub fn build_binding(
     })
 }
 
+/// Build the sink's codec.
+///
+/// The `topic` argument is what a registry-backed codec turns into its subject name
+/// under the topic-derived strategies. A **templated** topic is not a topic — handing
+/// `cdc.${schema}.${table}` to the registry would register every schema under that
+/// literal string. Config validation rejects that combination outright
+/// (`KafkaSinkConfig::validate_subject_naming`), so the only templated configs that
+/// reach here use `record_name`, which ignores the topic entirely. Passing the empty
+/// string rather than the template makes that structural: if the check above is ever
+/// weakened, the subject becomes obviously wrong rather than subtly wrong.
 async fn build_codec_from_sink_config(config: &SinkConfig) -> Result<BuiltCodec, String> {
     match config {
-        SinkConfig::Kafka(cfg) => build_codec(cfg.codec.as_ref(), &cfg.topic).await,
+        SinkConfig::Kafka(cfg) => {
+            let topic = match cfg.topic_template()?.is_templated() {
+                true => "",
+                false => cfg.topic.as_str(),
+            };
+            build_codec(cfg.codec.as_ref(), topic).await
+        }
         SinkConfig::Http(cfg) => build_codec(cfg.codec.as_ref(), "").await,
         _ => build_codec(None, "").await,
     }
@@ -740,13 +861,52 @@ impl BuiltSink {
     }
 
     /// Deliver pre-encoded bytes to transport sinks (Kafka, HTTP).
-    pub async fn send_encoded(&mut self, key: Bytes, value: Bytes) -> rustcdc::core::Result<()> {
+    ///
+    /// `event` travels alongside the bytes it encodes to because the *destination* can
+    /// depend on it: a Kafka `topic` carrying `${schema}` / `${table}` is resolved per
+    /// record. It is not re-encoded here — the codec already ran, and the bytes are what
+    /// goes on the wire. HTTP ignores it; its URL is fixed.
+    ///
+    /// The alternative — resolving the topic in `send_event` and passing a string — puts
+    /// the template, the character policy and the resolution cache one layer above the
+    /// sink that owns them, and leaves `BuiltSink::Http` taking a topic it has no use for.
+    pub async fn send_encoded(
+        &mut self,
+        event: &Event,
+        key: Bytes,
+        value: Bytes,
+    ) -> rustcdc::core::Result<()> {
         match self {
-            BuiltSink::Kafka(sink) => sink.send_encoded(key, value).await,
+            BuiltSink::Kafka(sink) => {
+                let topic = sink.topic_for(event)?;
+                sink.send_encoded(event, &topic, key, value).await
+            }
             BuiltSink::Http(sink) => sink.send_json_vec(value.to_vec()).await,
             _ => Err(rustcdc::core::Error::StateError(
                 "this sink type requires event dispatch, not encoded bytes".to_string(),
             )),
+        }
+    }
+
+    /// Follow a delivered delete with a tombstone, where the transport has the concept.
+    ///
+    /// Kafka only, and deliberately asked of the transport rather than decided here.
+    /// Whether a tombstone is wanted depends on `sink.kafka.tombstones_on_delete`, which
+    /// no other sink has — and on what a tombstone *means*, which no other sink has
+    /// either. A null value in a JSONL file or an Iceberg table is not a deletion marker,
+    /// it is a malformed row.
+    ///
+    /// `row_key` is the codec's key, **not** the message key `send_encoded` was given:
+    /// the fallback that names a table where a row key is missing must not be tombstoned.
+    /// See [`KafkaSink::send_delete_tombstone`].
+    pub async fn send_delete_tombstone(
+        &mut self,
+        event: &Event,
+        row_key: Option<&Bytes>,
+    ) -> rustcdc::core::Result<()> {
+        match self {
+            BuiltSink::Kafka(sink) => sink.send_delete_tombstone(event, row_key).await,
+            _ => Ok(()),
         }
     }
 
@@ -853,6 +1013,8 @@ impl BuiltSink {
                     kafka_oauth_token_fetches_total: 0,
                     kafka_oauth_token_fetch_failures_total: 0,
                     kafka_oauth_token_expiry_epoch_ms: 0,
+                    kafka_tombstones_total: 0,
+                    kafka_unkeyed_deletes_total: 0,
                     snowflake_rows_appended_total: 0,
                     snowflake_rows_skipped_on_resume_total: 0,
                     snowflake_channel_reopens_total: 0,
@@ -898,6 +1060,8 @@ impl BuiltSink {
                     kafka_oauth_token_fetches_total: connection.oauth_token_fetches,
                     kafka_oauth_token_fetch_failures_total: connection.oauth_token_fetch_failures,
                     kafka_oauth_token_expiry_epoch_ms: connection.oauth_token_expiry_epoch_ms,
+                    kafka_tombstones_total: sink.tombstones_total(),
+                    kafka_unkeyed_deletes_total: sink.unkeyed_deletes_total(),
                     ..SinkDeliveryMetrics::default()
                 }
             }
@@ -1040,9 +1204,10 @@ mod size_limit_tests {
     async fn the_limit_measures_the_encoded_payload_not_a_json_rendering() {
         let event = wide_event();
 
-        let json_binding = super::build_binding(&http_sink(None), usize::MAX)
-            .await
-            .expect("json binding");
+        let json_binding =
+            super::build_binding(&http_sink(None), &super::SinkBuildContext::new(usize::MAX))
+                .await
+                .expect("json binding");
         let json_len = json_binding
             .codec
             .encode_async(&event)
@@ -1052,9 +1217,12 @@ mod size_limit_tests {
             .len();
 
         // A limit set just under the JSON size must reject under the JSON codec.
-        let mut tight = super::build_binding(&http_sink(None), json_len - 1)
-            .await
-            .expect("json binding");
+        let mut tight = super::build_binding(
+            &http_sink(None),
+            &super::SinkBuildContext::new(json_len - 1),
+        )
+        .await
+        .expect("json binding");
         let err = tight
             .send_event(&event)
             .await
@@ -1066,9 +1234,12 @@ mod size_limit_tests {
 
         // And accept it when the limit clears the encoded size. The key is included in
         // the measurement, so allow for it.
-        let mut loose = super::build_binding(&http_sink(None), json_len * 2)
-            .await
-            .expect("json binding");
+        let mut loose = super::build_binding(
+            &http_sink(None),
+            &super::SinkBuildContext::new(json_len * 2),
+        )
+        .await
+        .expect("json binding");
         loose
             .send_event(&event)
             .await

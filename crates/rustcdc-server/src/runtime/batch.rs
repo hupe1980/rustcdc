@@ -524,10 +524,12 @@ mod tests {
     /// consumer that waits on `recv()` — forever, for every batch, empty or not.
     #[tokio::test]
     async fn process_batch_events_completes_for_empty_and_nonempty_batches() {
-        let binding =
-            crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()), 1 << 20)
-                .await
-                .expect("stdout binding");
+        let binding = crate::sink::build_binding(
+            &SinkConfig::Stdout(StdoutSinkConfig::default()),
+            &crate::sink::SinkBuildContext::new(1 << 20),
+        )
+        .await
+        .expect("stdout binding");
         let mut router = crate::pipeline::router::single(binding);
         let pipeline = TransformPipeline::from_config(TransformRuntimeConfig::default(), vec![])
             .expect("pipeline");

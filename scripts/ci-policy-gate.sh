@@ -24,8 +24,12 @@ run_markdown_link_check() {
   local failed=0
   local checked=0
 
+  # `local_only` is set for trees that are deliberately not in the repository — the
+  # gitignored `concepts/` notes. There, "this target is gitignored" is the normal case
+  # rather than the defect, so only existence is checked.
   check_markdown_file() {
     local markdown_file="$1"
+    local local_only="${2:-}"
     local markdown_dir
     markdown_dir="$(dirname "$markdown_file")"
 
@@ -65,7 +69,7 @@ run_markdown_link_check() {
       if [[ ! -e "$resolved" ]]; then
         echo "broken markdown link in $markdown_file -> $target" >&2
         failed=$((failed + 1))
-      elif git -C "$repo_root" check-ignore -q "$resolved" 2>/dev/null; then
+      elif [[ -z "$local_only" ]] && git -C "$repo_root" check-ignore -q "$resolved" 2>/dev/null; then
         # Existence on the author's disk is not the test: a gitignored target is not in
         # the repository, so the link is broken for CI and for every reader while looking
         # fine locally. This is how a link to a local-only audit note reached a released
@@ -82,6 +86,17 @@ run_markdown_link_check() {
   while IFS= read -r file; do
     check_markdown_file "$file"
   done < <(find site/content -type f -name '*.md' | sort)
+
+  # `concepts/` is gitignored, so it is absent in CI and present on a maintainer's disk.
+  # Checking it only when it is there is the point rather than a compromise: these notes
+  # are the only documents nothing validated, and they had rotted accordingly — three
+  # references to a `site/content/library/` directory that has not existed under that name,
+  # pointing at the very rule ("every documented sample compiles") they were describing.
+  if [[ -d concepts ]]; then
+    while IFS= read -r file; do
+      check_markdown_file "$file" local_only
+    done < <(find concepts -type f -name '*.md' | sort)
+  fi
 
   if [[ "$failed" -gt 0 ]]; then
     echo "markdown link check failed: $failed broken links out of $checked checked" >&2
@@ -947,6 +962,43 @@ run_reexport_coverage_check() {
   echo "Re-export coverage check passed."
 }
 
+run_rust_version_pin_check() {
+  # Every Rust toolchain pinned in a Dockerfile must be the workspace MSRV.
+  #
+  # CI derives its own toolchain from `rust-version`, and the main Dockerfile tracks it by
+  # hand — but nothing compared the two, so `docker/Dockerfile.example` sat two minor
+  # versions *below* the MSRV and could not have built the crate it demonstrates. A pin
+  # that drifts down is a broken example; one that drifts up silently raises the real
+  # minimum past what the manifest promises downstream.
+  local msrv
+  msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+  if [[ -z "$msrv" ]]; then
+    echo "rust version pin check failed: no rust-version in [workspace.package]" >&2
+    exit 1
+  fi
+
+  local failed=0
+  local checked=0
+  while IFS= read -r dockerfile; do
+    while IFS= read -r pinned; do
+      checked=$((checked + 1))
+      if [[ "$pinned" != "$msrv" ]]; then
+        echo "rust pin in $dockerfile is $pinned, but Cargo.toml rust-version is $msrv" >&2
+        failed=$((failed + 1))
+      fi
+    done < <(rg --no-line-number --no-filename --pcre2 -o \
+      '(?:FROM rust:|ARG RUST_VERSION=)([0-9]+\.[0-9]+(?:\.[0-9]+)?)' \
+      -r '$1' "$dockerfile" 2>/dev/null)
+  done < <(find . -name 'Dockerfile*' -not -path './target/*' | sort)
+
+  if [[ "$failed" -gt 0 ]]; then
+    echo "rust version pin check failed: $failed pin(s) disagree with the manifest" >&2
+    exit 1
+  fi
+
+  echo "Rust version pin check passed ($checked pin(s) match rust-version $msrv)."
+}
+
 run_config_docs_coverage_check
 run_reexport_coverage_check
 run_schema_contract_check
@@ -960,5 +1012,6 @@ run_release_evidence_contract_check
 run_workflow_path_check
 run_licence_presence_check
 run_workflow_drift_check
+run_rust_version_pin_check
 
 echo "Policy gate passed."

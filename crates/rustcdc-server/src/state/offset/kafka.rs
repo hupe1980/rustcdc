@@ -1197,6 +1197,20 @@ mod tests {
         (sink, writer)
     }
 
+    /// A minimal event for the EOS harness sends.
+    ///
+    /// These tests drive `send_encoded` directly to exercise the transaction barrier, so
+    /// the event only has to be well-formed — the sink reads it for the record's
+    /// provenance headers, nothing else.
+    fn eos_sample_event() -> rustcdc::Event {
+        rustcdc::Event::builder("orders", rustcdc::Operation::Insert)
+            .after(serde_json::json!({"id": 1}))
+            .source(rustcdc::core::SourceMetadata::new("postgres", "0/1", 1))
+            .ts(1)
+            .schema("public")
+            .build()
+    }
+
     /// Read a topic as a `read_committed` consumer does — aborted records excluded.
     async fn committed_values(brokers: &str, topic: &str) -> Vec<String> {
         use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
@@ -1284,6 +1298,8 @@ mod tests {
             .await
             .expect("begin second barrier");
         sink.send_encoded(
+            &eos_sample_event(),
+            "eos.data.readback",
             bytes::Bytes::from_static(b"k1"),
             bytes::Bytes::from_static(b"doomed-row"),
         )
@@ -1327,6 +1343,8 @@ mod tests {
             .await
             .expect("begin barrier");
         sink.send_encoded(
+            &eos_sample_event(),
+            "eos.data.abort",
             bytes::Bytes::from_static(b"k1"),
             bytes::Bytes::from_static(b"doomed-row"),
         )
@@ -1377,6 +1395,8 @@ mod tests {
             .await
             .expect("begin barrier");
         sink.send_encoded(
+            &eos_sample_event(),
+            "eos.data.commit",
             bytes::Bytes::from_static(b"k1"),
             bytes::Bytes::from_static(b"row-1"),
         )

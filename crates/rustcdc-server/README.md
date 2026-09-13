@@ -35,12 +35,16 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 | 📐 **Nine wire formats** | JSON · CloudEvents 1.0 · Avro · Protobuf, plus Confluent framing (Avro / JSON Schema / Protobuf) against Confluent **or** Apicurio registries, and AWS Glue framing |
 | 🌊 **Non-blocking backfill** | DBLog watermark incremental snapshots interleave with the live stream and resume mid-chunk after a restart — no held replication slot, no re-read from row zero |
 | 🧩 **Transform pipeline** | Native rules — masking (redact / HMAC / AES-GCM), field mapping, transactional outbox, routing — plus sandboxed WASM modules in any language. A rule that never matches is a metric, not a silent no-op |
+| 🏷️ **Topic per table, from one sink** | `topic = "cdc.${schema}.${table}"` gives the Debezium layout without a `[[sinks]]` block, a route and a producer per table; a new table needs no config change. Identifiers Kafka cannot spell are rejected, or sanitised on request — and a sanitised name that would merge two tables onto one topic halts rather than interleaving them |
+| 🏷️ **Provenance headers** | Every record carries `__rustcdc.op` and the source schema, table, connector, offset and commit time, so a consumer filters without deserialising. Tombstones carry them too — otherwise a null value names nothing |
+| 🪦 **Delete tombstones** | A delete is followed by a null-value record on the same key, so a compacted topic drops the row instead of keeping it forever. Debezium's `tombstones.on.delete`, on by default — and never emitted where the key names a table rather than a row, which would compact away the history it exists to prune |
 | 📦 **Pluggable state** | Checkpoint anywhere: local FS · Kafka topic · Redis · PostgreSQL |
 | ☠️ **Sink-agnostic dead-letter queue** | Permanently undeliverable events are quarantined to a file, a Kafka topic or **Amazon SQS** with their source offset and cause, so a poison record cannot crash-loop the pipeline. SQS brings redrive-to-source and broker-level age alarms; it is offered as a DLQ and deliberately *not* as a sink, [with the reasoning written down](https://hupe1980.github.io/rustcdc/docs/configuration/). Opt-in, because advancing past an undelivered event is data loss and should be a decision |
 | 🧮 **Failures classified on two axes** | Permanent and *this record's fault* (`MessageTooLarge`) is quarantined; permanent and *environmental* (a revoked ACL) halts the pipeline instead of draining the change stream into the DLQ one event at a time; transient is retried. Conflating the first two is how a dead-letter queue becomes the data loss it exists to prevent |
 | 🎯 **End-to-end exactly-once, two ways** | `effectively_once` writes the checkpoint *inside* the sink's Kafka transaction, so the data and the position commit together. The **Snowflake** sink reaches the same guarantee with no Kafka at all: a Snowpipe Streaming channel's offset token is a destination-side record of what is durable, and `flush` does not return until it has advanced. Plus `at_least_once`, and an optional `preserve_transactions` boundary so a sink never commits half a source transaction |
 | 🔭 **First-class observability** | Prometheus `/metrics` + OTLP traces & metrics (gRPC/HTTP), a one-hot runtime health verdict (`healthy · idle · stalled · not_running`) that distinguishes a quiet database from a dead socket, and a data-loss tripwire counter |
-| 🧬 **Partial-image safety** | PostgreSQL unchanged-TOAST holes are tracked per image (`unavailable_columns` / `before_unavailable_columns`) and survive transforms, sinks, and the Iceberg schema — absent is never conflated with `NULL` |
+| 🧬 **Partial-image safety** | PostgreSQL unchanged-TOAST holes are tracked per image (`unavailable_columns` / `before_unavailable_columns`) and survive transforms, sinks, and the Iceberg schema — absent is never conflated with `NULL`. `reselect_unavailable_columns` fills them from the source when you would rather have a complete row |
+| ✍️ **Signed webhooks** | The HTTP sink signs every request to [Standard Webhooks](https://www.standardwebhooks.com/) — ed25519 or HMAC-SHA256, with zero-downtime key rotation — so any receiver built against Zapier, Twilio, ngrok or Svix verifies it unchanged. `rustcdc webhook-keygen` mints the key |
 | 🔒 **Security by default** | Kafka SASL (PLAIN · SCRAM · OAUTHBEARER with a built-in OIDC provider · AWS MSK IAM), mTLS with hot certificate reload, Ed25519-signed audit trail, token-manifest auth, per-IP rate limiting, IP pseudonymisation (GDPR) |
 | 🐳 **Distroless multi-arch image** | `linux/amd64` + `linux/arm64`, SLSA provenance + SBOM, no shell inside |
 
@@ -346,7 +350,7 @@ delivery_contract = "effectively_once"  # at_least_once | effectively_once
 | Contract | Guarantee | Kafka | HTTP |
 |---|---|---|---|
 | `at_least_once` | Delivered ≥ 1×; checkpoint advances only after durable delivery | ✅ | ✅ |
-| `effectively_once` | **Exactly-once, end to end.** The batch's records and its checkpoint are written in one Kafka transaction, so a crash discards both or keeps both — never one. Requires a transactional Kafka sink and `state.offset.backend = "kafka_topic"` on the same cluster; any other combination is rejected at load rather than silently degraded. [How it works](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts). | ✅ | ❌ |
+| `effectively_once` | **Exactly-once, end to end.** Either the records and the checkpoint commit in one Kafka transaction, or the sink carries a destination-side offset token (Snowflake). The Kafka route needs a transactional sink and `state.offset.backend = "kafka_topic"` on the same cluster. It must hold for **every** routed sink; anything that cannot deliver it is rejected at load, naming the sink. [How it works](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts). | ✅ | ❌ |
 
 ---
 
@@ -447,6 +451,7 @@ rustcdc --config-file <FILE> <COMMAND>
   replay               Replay events from a saved JSONL file
   status               Query runtime status via the admin API
   snapshot             Backfill tables on a running instance, without a restart
+  webhook-keygen       Mint a Standard Webhooks signing key for the HTTP sink
 ```
 
 ```bash

@@ -75,3 +75,10 @@ pub mod telemetry;
 /// crate is `publish = false`, so this widens no external API.
 pub mod test_env;
 pub mod token_manifest_policy;
+/// How a Kafka topic name is derived from an event: literal names and `${schema}` /
+/// `${table}` templates, with one parser shared by config validation, preflight and the
+/// hot path.
+pub mod topic;
+/// [Standard Webhooks](https://www.standardwebhooks.com/) request signing for the HTTP
+/// sink: `webhook-id` / `webhook-timestamp` / `webhook-signature`, HMAC-SHA256 or ed25519.
+pub mod webhook;

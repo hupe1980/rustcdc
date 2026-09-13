@@ -228,6 +228,7 @@ postgres_suites=(
   "postgres version matrix|postgres_version_matrix|postgres"
   "postgres snapshot|postgres_snapshot_integration|postgres"
   "postgres stream|postgres_stream_integration|postgres"
+  "postgres toast reselect|postgres_reselect_integration|postgres"
   "postgres wal transport parity|postgres_wal_transport_parity_integration|postgres"
   "postgres incremental snapshot reconnect|postgres_incremental_snapshot_reconnect_integration|postgres"
   "postgres snapshot watermark visibility|postgres_snapshot_visibility_integration|postgres"

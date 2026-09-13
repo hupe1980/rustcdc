@@ -31,7 +31,8 @@ carries its cause.
 3. [Performance and Throughput Issues](#performance-and-throughput-issues)
 4. [Data Quality Issues](#data-quality-issues)
 5. [Transform and Filter Issues](#transform-and-filter-issues)
-6. [Diagnostics Toolkit](#diagnostics-toolkit)
+6. [Kafka Topic Naming Issues](#kafka-topic-naming-issues)
+7. [Diagnostics Toolkit](#diagnostics-toolkit)
 
 ---
 
@@ -685,6 +686,105 @@ WARNING events filtered by transform (count=50)
 | Regex invalid | Use online regex tester (regex101.com); test pattern before deploying |
 | Transform policy = Halt | If acceptable data loss, change to `transform_error_policy = Skip` |
 | Column doesn't exist | Verify column name matches source schema exactly (case-sensitive) |
+
+---
+
+## Kafka Topic Naming Issues
+
+For `sink.kafka.topic` templates and tombstones. Configuration:
+[Topic naming](@/docs/configuration.md#topic-naming),
+[Delete tombstones](@/docs/configuration.md#delete-tombstones).
+
+### Symptom: startup fails naming topics that do not exist
+
+```text
+sink preflight: Kafka topic(s) 'cdc.public.customers' not found on brokers 'broker:9092'.
+They are the topics sink.kafka.topic = "cdc.${schema}.${table}" renders for the tables
+this configuration names; create them, or narrow the template.
+```
+
+rustcdc does not auto-create topics.
+
+| Root Cause | Action |
+|------------|--------|
+| The topics were never created | Create them with the partition count and replication factor you want |
+| The template prefix is wrong | Compare the rendered names in the error against the topics that exist |
+| Broker auto-creation is on | It does not cover preflight, which asks before producing |
+
+Preflight only checks tables the config names; one discovered at runtime is not covered.
+The startup log reports how many were verified.
+
+### Symptom: events dead-letter with "not legal in a Kafka topic name"
+
+```text
+topic template "cdc.${schema}.${table}" rendered "cdc.public.my table" for table
+"my table", which contains ' ' — not legal in a Kafka topic name ([a-zA-Z0-9._-])
+```
+
+| Root Cause | Action |
+|------------|--------|
+| The table's name is not spellable as a topic | Set `[sink.topic_naming] invalid_characters = "replace"` — read the collision symptom below first |
+| Only a few tables are affected | Exclude them with `table_exclude_list`, or route them to a sink with a literal topic |
+
+### Symptom: the pipeline halts with "topic naming collision"
+
+```text
+topic naming collision: public.my_table and public.my table both render to topic
+"cdc.public.my_table" ... because invalid_characters = "replace" rewrote an identifier.
+```
+
+Two tables would share one topic, interleaving their change streams under keys unique only
+per table. This halts rather than dead-letters because neither table is at fault.
+
+| Root Cause | Action |
+|------------|--------|
+| Two tables differ only in characters Kafka forbids | Rename one, or exclude one with `table_exclude_list` |
+| You want them on separate topics | Route one to its own `[[sinks]]` entry with a literal topic |
+| You would rather quarantine the unnameable one | Set `invalid_characters = "reject"` |
+
+Merges the template itself expresses — a literal topic, or `topic = "cdc.${schema}"` — are
+not collisions.
+
+### Symptom: config rejected for `subject_name_strategy`
+
+The codec is built once at startup, and a registry-backed codec derives its subject from
+the topic string — with a template that subject would be the literal
+`cdc.${schema}.${table}-value`.
+
+Set `subject_name_strategy = "record_name"` on the registry.
+
+### Symptom: events dead-letter with "carries no schema"
+
+The template interpolates `${schema}` and the event has none. Connectors populate it for
+row events, so this usually means a synthetic envelope — a schema-change or heartbeat
+record. Use a template without `${schema}`, or route those tables to a literal topic.
+
+### Symptom: a compacted topic grows without bound
+
+Deleted keys are never reclaimed. Check `rustcdc_sink_kafka_tombstones_total` against the
+delete rate.
+
+| Root Cause | Action |
+|------------|--------|
+| `tombstones_on_delete = false` | A delete record alone does not remove a key. Set it back to `true` |
+| `rustcdc_sink_kafka_unkeyed_deletes_total` is rising | The tables have no primary key — see below |
+| Both counters move and the log still grows | The topic is not `cleanup.policy=compact`, or `delete.retention.ms` has not elapsed |
+
+### Symptom: "table has no primary key … cannot be tombstoned"
+
+Logged once per table, counted by `rustcdc_sink_kafka_unkeyed_deletes_total`.
+
+The tombstone is the smaller half: a keyless table is keyed by `schema.table`, so
+compaction retains only its most recent event regardless.
+
+| Root Cause | Action |
+|------------|--------|
+| The table has no primary key | Add one; on PostgreSQL a `REPLICA IDENTITY` yielding key columns also works |
+| It has one, but the pre-image does not carry it | Check the table's replica identity — `FULL` on a table with no primary key reports no key at all |
+| The table is fine as it is | Route it to a non-compacted topic |
+
+Truncate and schema-change events also carry no row key and are deliberately not counted:
+they are keyed by table name by design.
 
 ---
 

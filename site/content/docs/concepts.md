@@ -192,15 +192,33 @@ upsert sinks) handle this transparently.
 | Duplicates during steady-state retries | impossible |
 | Duplicates after a crash | impossible |
 | Data gaps | impossible |
-| Compatible sinks | Kafka only |
+| Compatible sinks | Kafka (transactional), or Snowflake |
 
-Requires all of:
+Two mechanisms reach this contract, and a pipeline may use either.
+
+**A Kafka transaction** — the records and the checkpoint commit together:
 
 - `sink.type = "kafka"` with `sink.delivery_mode = "transactional"`
 - a unique `sink.transactional_id` per pipeline
 - `state.offset.backend = "kafka_topic"`, on the **same** Kafka cluster as the sink
 
-The loader rejects any other combination rather than accepting it and degrading — see
+**A destination-side offset token** — `sink.type = "snowflake"`, which needs no Kafka at
+all and places no requirement on the state backend. See
+[the Snowflake sink](@/docs/configuration.md#snowflake-type-snowflake).
+
+Whichever mechanism you use, the contract is a property of the **whole pipeline**, so the
+loader also requires:
+
+- **every routed sink to carry it** — `[sink]` and every `[[sinks]]` entry a
+  `[[pipeline.routes]]` rule names. One sink that cannot honour the contract loses the
+  guarantee for every event routed to it;
+- **at most one transactional Kafka sink.** Two are two transactions, and the checkpoint
+  can be written inside at most one of them;
+- **no fan-out sink**, even when every child is a transactional Kafka sink — a transaction
+  cannot span the children.
+
+The loader rejects any other combination rather than accepting it and degrading, and names
+the sink at fault — see
 [why the state backend is not optional](#why-the-checkpoint-has-to-live-in-kafka).
 
 #### How it works

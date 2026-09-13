@@ -75,6 +75,9 @@ pub enum Command {
 
     /// Snapshot tables on a running instance, without restarting it.
     Snapshot(SnapshotArgs),
+
+    /// Generate a correctly-encoded Standard Webhooks signing key for the HTTP sink.
+    WebhookKeygen(WebhookKeygenArgs),
 }
 
 // ── Snapshot ─────────────────────────────────────────────────────────────────
@@ -113,6 +116,46 @@ pub struct SnapshotArgs {
 
     #[command(flatten)]
     pub admin_auth: AdminAuthClientArgs,
+}
+
+// ── Webhook keygen ───────────────────────────────────────────────────────────
+
+/// Arguments for `webhook-keygen`.
+///
+/// The command exists because the *encoding* is what people get wrong, and every way of
+/// getting it wrong fails late: `openssl genpkey` emits PEM, most libraries export the
+/// 64-byte expanded ed25519 keypair rather than the 32-byte seed, and
+/// `head -c 32 /dev/urandom | base64` yields a secret with no prefix — which is accepted,
+/// so the mistake stays invisible until a receiver cannot verify.
+#[derive(Debug, Parser)]
+pub struct WebhookKeygenArgs {
+    /// Signature scheme the key is for.
+    ///
+    /// `ed25519` by default, matching the specification's recommendation and this sink's:
+    /// the receiver holds only the public half, so a compromised receiver cannot forge
+    /// events back at you.
+    #[arg(long, value_enum, default_value = "ed25519")]
+    pub scheme: WebhookKeygenScheme,
+}
+
+/// CLI spelling of [`crate::webhook::WebhookSignatureScheme`].
+///
+/// Separate from the config enum because that one derives `serde` and this one derives
+/// clap's `ValueEnum`; putting both on one type would couple the config file's spelling to
+/// the command line's for no benefit.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum WebhookKeygenScheme {
+    Ed25519,
+    HmacSha256,
+}
+
+impl From<WebhookKeygenScheme> for crate::webhook::WebhookSignatureScheme {
+    fn from(value: WebhookKeygenScheme) -> Self {
+        match value {
+            WebhookKeygenScheme::Ed25519 => Self::Ed25519,
+            WebhookKeygenScheme::HmacSha256 => Self::HmacSha256,
+        }
+    }
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────

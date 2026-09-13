@@ -187,6 +187,22 @@ names are listed in the event's `unavailable_columns` (holes in `after`) and
 `NULL` — consumers must exclude listed columns from any write they build from the
 payload. See [Core concepts — partial row images](@/docs/concepts.md#partial-row-images-unchanged-toast).
 
+#### Filling the holes: `reselect_unavailable_columns`
+
+If handling partial rows in the sink is impractical, the connector can re-read the missing
+values from the source:
+
+```toml
+[source.postgres]
+reselect_unavailable_columns = true
+```
+
+One extra `SELECT` per affected event, keyed on the event's row key; filled columns leave
+`unavailable_columns`, so the sink sees a complete row. Off by default: the value is read
+*now* rather than at the event's LSN, and a row deleted in the meantime keeps its columns
+absent. Cost and limits in full:
+[`reselect_unavailable_columns`](@/docs/config-reference.md#reselect-unavailable-columns).
+
 
 ## 3. Setting up PostgreSQL
 

@@ -773,3 +773,77 @@ fn captured_ddl_to_event_emits_schema_change() {
     assert_eq!(event.ts, 1000);
     assert!(event.after.is_some());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Non-ASCII identifiers
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// DDL arrives from the database — a MySQL binlog query event, a PostgreSQL event trigger —
+// so a statement here is whatever an operator actually ran. Accented and dotless-i column
+// names are ordinary in German, Turkish, Nordic and Spanish schemas, and the parser used to
+// slice them by byte offsets borrowed from an uppercased copy of the statement. The result
+// was a panic inside the poll loop, taking the pipeline down on a routine migration.
+
+use crate::ddl_capture::{DdlDialect, parse_ddl_statement};
+
+/// `strip_optional_keyword` split at `"IF NOT EXISTS".len()` == 13 without checking that 13
+/// was a character boundary. `kundennummer` is 12 bytes, so `ü` occupies 12..14 and the
+/// split landed inside it.
+#[test]
+fn an_added_column_whose_name_straddles_the_keyword_length_does_not_panic() {
+    let parsed = parse_ddl_statement(
+        DdlDialect::Postgres,
+        "ALTER TABLE public.kunden ADD COLUMN kundennummerü VARCHAR(10)",
+    )
+    .expect("an ALTER TABLE statement must parse");
+
+    let captured = parsed.into_captured();
+    assert!(
+        format!("{captured:?}").contains("kundennummerü"),
+        "the column must survive parsing intact: {captured:?}"
+    );
+}
+
+/// `DROP COLUMN` splits at `"IF EXISTS".len()` == 9 on the same path.
+#[test]
+fn a_dropped_column_whose_name_straddles_the_keyword_length_does_not_panic() {
+    let parsed = parse_ddl_statement(
+        DdlDialect::Postgres,
+        "ALTER TABLE public.kunden DROP COLUMN kundennrü",
+    )
+    .expect("an ALTER TABLE statement must parse");
+    let _ = parsed.into_captured();
+}
+
+/// `RENAME COLUMN` searched for `" TO "` in an uppercased copy and indexed the original with
+/// the result. `ı` is two bytes and uppercases to a one-byte `I`, so every offset past it was
+/// one byte short — landing inside the character itself.
+#[test]
+fn a_renamed_column_with_a_length_changing_character_resolves_both_names() {
+    let parsed = parse_ddl_statement(
+        DdlDialect::Postgres,
+        "ALTER TABLE public.kullanicilar RENAME COLUMN ı TO kimlik",
+    )
+    .expect("an ALTER TABLE statement must parse");
+
+    let rendered = format!("{:?}", parsed.into_captured());
+    assert!(
+        rendered.contains("kimlik"),
+        "the new name must be recovered: {rendered}"
+    );
+}
+
+/// `extract_primary_keys` had the same coupling: `PRIMARY KEY` located in an uppercased copy,
+/// then sliced out of the original. Two dotless `ı`s ahead of it shifted the offset by two
+/// bytes, so the key list was read from the wrong place.
+#[test]
+fn a_primary_key_is_found_past_length_changing_identifiers() {
+    let keys = crate::ddl_capture::extract_primary_keys(
+        "CREATE TABLE kullanicilar (ı INT, ıd INT, PRIMARY KEY (ıd))",
+    );
+    assert_eq!(
+        keys,
+        vec!["ıd".to_string()],
+        "the key must be read from the original statement, not from an uppercased copy"
+    );
+}

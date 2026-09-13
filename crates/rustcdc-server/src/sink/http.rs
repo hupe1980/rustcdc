@@ -54,6 +54,11 @@ pub struct HttpSink {
     backoff_multiplier: f64,
     headers: Vec<(String, String)>,
     bearer_token: Option<SecretString>,
+    /// Standard Webhooks signer, when `sink.http.signing` is configured.
+    ///
+    /// Built once: parsing a key per request would turn a configuration error into a
+    /// per-request failure, and the keys do not change between them.
+    signer: Option<crate::webhook::WebhookSigner>,
     /// Global time budget ceiling for retries within a single flush operation.
     /// Prevents unbounded retry storms during sustained failures.
     /// Default: configured via `sink.http.batch_retry_time_budget_ms`.
@@ -131,6 +136,38 @@ impl HttpSink {
             backoff_multiplier: config.backoff_multiplier,
             headers,
             bearer_token: config.bearer_token.clone(),
+            signer: match &config.signing {
+                Some(signing) => {
+                    let signer = crate::webhook::WebhookSigner::new(
+                        signing.scheme,
+                        &signing.key,
+                        &signing.previous_keys,
+                    )
+                    .map_err(RtError::ConfigError)?;
+                    // The public key is logged because it is the one thing an operator
+                    // needs and the configuration does not contain: `signing.key` holds
+                    // the private seed, and until this line existed there was no way to
+                    // get the `whpk_` half out of a running pipeline at all. It is not a
+                    // secret — handing it to the receiver is the entire point of choosing
+                    // the asymmetric scheme.
+                    match signer.public_key() {
+                        Some(public) => tracing::info!(
+                            public_key = %public,
+                            keys = signer.key_count(),
+                            "http sink: signing requests with ed25519; give this public \
+                             key to the receiver"
+                        ),
+                        None => tracing::info!(
+                            keys = signer.key_count(),
+                            "http sink: signing requests with HMAC-SHA256; the receiver \
+                             verifies with the same shared secret, so prefer ed25519 \
+                             where the receiver is not you"
+                        ),
+                    }
+                    Some(signer)
+                }
+                None => None,
+            },
             batch_retry_time_budget: Duration::from_millis(config.batch_retry_time_budget_ms),
             accounting: DeliveryAccounting::default(),
             pending: Vec::new(),
@@ -295,15 +332,43 @@ impl HttpSink {
     }
 
     async fn send_once(&self, payload: bytes::Bytes) -> rustcdc::core::Result<reqwest::StatusCode> {
+        // Derived from the payload, so it is identical on every attempt at the same batch
+        // — which is exactly what makes it usable as the receiver's deduplication key, and
+        // what Standard Webhooks requires of `webhook-id`: "it remains the same no matter
+        // how many times a webhook that has failed is retried".
         let idempotency_key = build_http_idempotency_key(&payload);
         let mut req = self
             .client
             .post(&self.url)
             .timeout(self.timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("Idempotency-Key", idempotency_key)
+            // Kept alongside `webhook-id`, carrying the same value. It predates the
+            // signing support and is the spelling a receiver built against Stripe's
+            // convention looks for; dropping it would break those for no gain.
+            .header("Idempotency-Key", &idempotency_key)
             // `bytes::Bytes::clone` is a cheap reference-count bump — no heap copy.
             .body(payload.clone());
+
+        if let Some(signer) = &self.signer {
+            // Signed **per attempt**, not per batch. The timestamp is inside the signature
+            // and receivers reject one outside their tolerance — five minutes, typically —
+            // so a signature frozen at the first attempt would be rejected as a replay by
+            // every retry after that, while this sink's retry budget runs to minutes. The
+            // specification says the same: "every time an attempt is retried the timestamp
+            // of the attempt is updated".
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+            // `payload` is the same `Bytes` handed to `body` above. Signing a different
+            // buffer — a re-serialisation, a pretty-print — produces a signature the
+            // receiver cannot reproduce, and nothing on this side would notice.
+            let signature = signer.sign(&idempotency_key, timestamp, &payload);
+            req = req
+                .header(crate::webhook::HEADER_ID, &idempotency_key)
+                .header(crate::webhook::HEADER_TIMESTAMP, timestamp.to_string())
+                .header(crate::webhook::HEADER_SIGNATURE, signature);
+        }
 
         for (k, v) in &self.headers {
             req = req.header(k, v);
@@ -806,6 +871,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let mut sink = HttpSink::new(&cfg).expect("sink");
@@ -847,6 +913,192 @@ mod tests {
         }
     }
 
+    // ── Standard Webhooks signing ────────────────────────────────────────────
+
+    fn signed_cfg(url: String, scheme: crate::webhook::WebhookSignatureScheme) -> HttpSinkConfig {
+        let key = match scheme {
+            crate::webhook::WebhookSignatureScheme::HmacSha256 => {
+                "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw".to_string()
+            }
+            crate::webhook::WebhookSignatureScheme::Ed25519 => {
+                use base64::Engine as _;
+                format!(
+                    "whsk_{}",
+                    base64::engine::general_purpose::STANDARD.encode([9u8; 32])
+                )
+            }
+        };
+        HttpSinkConfig {
+            url,
+            timeout_ms: 1000,
+            batch_max_events: 64,
+            batch_max_delay_ms: 10,
+            max_pending_bytes: 1024 * 1024,
+            max_retries: 3,
+            batch_retry_time_budget_ms: 30_000,
+            backoff_initial_ms: 1,
+            backoff_max_ms: 5,
+            backoff_multiplier: 2.0,
+            headers: std::collections::HashMap::new(),
+            bearer_token: None,
+            verify_tls: true,
+            pool_max_idle_per_host: 10,
+            pool_idle_timeout_secs: None,
+            tcp_keepalive_secs: None,
+            codec: None,
+            signing: Some(crate::config::sink::HttpSigningConfig {
+                scheme,
+                key: rustcdc::SecretString::from(key),
+                previous_keys: Vec::new(),
+            }),
+        }
+    }
+
+    /// The body of a captured raw HTTP request — everything after the blank line.
+    fn request_body(req: &str) -> &str {
+        req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("")
+    }
+
+    /// End-to-end: the three headers are present, and the signature is one a receiver can
+    /// actually verify — recomputed here from the captured id, timestamp and body rather
+    /// than compared against a value this code also produced.
+    #[tokio::test]
+    async fn a_signed_request_carries_a_signature_the_receiver_can_verify() {
+        let statuses = Arc::new(Mutex::new(vec![200]));
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_http_server(statuses, captures.clone()).await;
+
+        let cfg = signed_cfg(url, crate::webhook::WebhookSignatureScheme::HmacSha256);
+        let mut sink = HttpSink::new(&cfg).expect("sink");
+        sink.send(&sample_event()).await.expect("send");
+        sink.flush().await.expect("flush");
+
+        let requests = captures.lock().expect("captures lock");
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+
+        let id = extract_header(req, "webhook-id").expect("webhook-id");
+        let timestamp = extract_header(req, "webhook-timestamp").expect("webhook-timestamp");
+        let signature = extract_header(req, "webhook-signature").expect("webhook-signature");
+
+        // The receiver's idempotency key and the long-standing `Idempotency-Key` must
+        // agree — they are one value, and two spellings that could drift would be worse
+        // than one.
+        assert_eq!(
+            Some(id.clone()),
+            extract_header(req, "idempotency-key"),
+            "webhook-id and Idempotency-Key must carry the same value"
+        );
+
+        // Verify exactly as a receiver would: re-sign `{id}.{timestamp}.{body}`.
+        let signer = crate::webhook::WebhookSigner::new(
+            crate::webhook::WebhookSignatureScheme::HmacSha256,
+            &rustcdc::SecretString::from("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw".to_string()),
+            &[],
+        )
+        .expect("signer");
+        let expected = signer.sign(
+            &id,
+            timestamp.parse::<i64>().expect("timestamp is an integer"),
+            request_body(req).as_bytes(),
+        );
+        assert_eq!(
+            signature, expected,
+            "the signature must cover the id, the timestamp and the body as sent"
+        );
+        assert!(signature.starts_with("v1,"), "{signature}");
+    }
+
+    /// The half of the contract that is easiest to get backwards: the id is stable so the
+    /// receiver can deduplicate, and the timestamp — and therefore the signature — is
+    /// fresh so a late retry is not rejected as a replay.
+    #[tokio::test]
+    async fn a_retry_reuses_the_id_and_re_signs_with_a_fresh_timestamp() {
+        let statuses = Arc::new(Mutex::new(vec![500, 200]));
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_http_server(statuses, captures.clone()).await;
+
+        let mut cfg = signed_cfg(url, crate::webhook::WebhookSignatureScheme::HmacSha256);
+        // Long enough that the two attempts land in different seconds, so the timestamp
+        // genuinely differs rather than passing by accident.
+        cfg.backoff_initial_ms = 1_100;
+        cfg.backoff_max_ms = 1_100;
+
+        let mut sink = HttpSink::new(&cfg).expect("sink");
+        sink.send(&sample_event()).await.expect("send");
+        sink.flush().await.expect("flush");
+
+        let requests = captures.lock().expect("captures lock");
+        assert_eq!(requests.len(), 2, "one failure, one retry");
+
+        let first_id = extract_header(&requests[0], "webhook-id").expect("id");
+        let second_id = extract_header(&requests[1], "webhook-id").expect("id");
+        assert_eq!(
+            first_id, second_id,
+            "a retried batch must keep its id, or the receiver cannot deduplicate it"
+        );
+
+        let first_ts = extract_header(&requests[0], "webhook-timestamp").expect("ts");
+        let second_ts = extract_header(&requests[1], "webhook-timestamp").expect("ts");
+        assert_ne!(
+            first_ts, second_ts,
+            "the timestamp must be regenerated per attempt, or a retry outside the \
+             receiver's tolerance is rejected as a replay"
+        );
+
+        let first_sig = extract_header(&requests[0], "webhook-signature").expect("sig");
+        let second_sig = extract_header(&requests[1], "webhook-signature").expect("sig");
+        assert_ne!(
+            first_sig, second_sig,
+            "a fresh timestamp must produce a fresh signature, or the timestamp is not \
+             actually covered"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ed25519_signed_request_uses_the_v1a_tag() {
+        let statuses = Arc::new(Mutex::new(vec![200]));
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_http_server(statuses, captures.clone()).await;
+
+        let cfg = signed_cfg(url, crate::webhook::WebhookSignatureScheme::Ed25519);
+        let mut sink = HttpSink::new(&cfg).expect("sink");
+        sink.send(&sample_event()).await.expect("send");
+        sink.flush().await.expect("flush");
+
+        let requests = captures.lock().expect("captures lock");
+        let signature = extract_header(&requests[0], "webhook-signature").expect("signature");
+        assert!(signature.starts_with("v1a,"), "{signature}");
+    }
+
+    /// Unsigned is still the default, and must stay clean: a receiver that sees
+    /// `webhook-signature` will try to verify it.
+    #[tokio::test]
+    async fn an_unsigned_sink_sends_no_webhook_headers() {
+        let statuses = Arc::new(Mutex::new(vec![200]));
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_http_server(statuses, captures.clone()).await;
+
+        let mut cfg = signed_cfg(url, crate::webhook::WebhookSignatureScheme::HmacSha256);
+        cfg.signing = None;
+
+        let mut sink = HttpSink::new(&cfg).expect("sink");
+        sink.send(&sample_event()).await.expect("send");
+        sink.flush().await.expect("flush");
+
+        let requests = captures.lock().expect("captures lock");
+        for header in ["webhook-id", "webhook-timestamp", "webhook-signature"] {
+            assert!(
+                extract_header(&requests[0], header).is_none(),
+                "{header} must be absent when signing is not configured"
+            );
+        }
+        assert!(
+            extract_header(&requests[0], "idempotency-key").is_some(),
+            "the idempotency key predates signing and is unconditional"
+        );
+    }
+
     #[tokio::test]
     async fn batches_multiple_events_into_single_request() {
         let statuses = Arc::new(Mutex::new(vec![200]));
@@ -871,6 +1123,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let mut sink = HttpSink::new(&cfg).expect("sink");
@@ -920,6 +1173,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let mut sink = HttpSink::new(&cfg).expect("sink");
@@ -976,6 +1230,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let mut sink = HttpSink::new(&cfg).expect("sink");
@@ -1015,6 +1270,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let mut sink = HttpSink::new(&cfg).expect("sink");
@@ -1065,6 +1321,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let mut sink = HttpSink::new(&cfg).expect("sink");
@@ -1100,6 +1357,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let err = match HttpSink::new(&cfg) {
@@ -1129,6 +1387,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let err = match HttpSink::new(&cfg) {
@@ -1158,6 +1417,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let sink = HttpSink::new(&cfg).expect("sink");
@@ -1184,6 +1444,7 @@ mod tests {
             pool_idle_timeout_secs: None,
             tcp_keepalive_secs: None,
             codec: None,
+            signing: None,
         };
 
         let err = match HttpSink::new(&cfg) {

@@ -29,6 +29,7 @@ Commands:
   replay               Replay events from a JSONL file
   migrate-state        Migrate state between backends
   init-state           Seed the kafka_topic state backend (errors for other backends)
+  webhook-keygen       Mint a Standard Webhooks signing key for the HTTP sink
   snapshot             Backfill tables on a running instance via the admin API
 ```
 
@@ -246,6 +247,8 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | `rustcdc_runtime_idempotency_unidentifiable_total` | growth on a keyed table | Events with neither transaction metadata nor a resolvable primary key are deliberately **not** deduplicated. Expected for keyless tables; unexpected growth means a key is missing from the row image |
 | `rustcdc_runtime_events_skipped_total` | any increase | Events permanently dropped by `transform_error_policy = "skip"` — the checkpoint advances past them, so **any increase is confirmed data loss** |
 | `rustcdc_replication_slot_lag_bytes` | > 1 GiB sustained | PostgreSQL slot WAL retention; growth risks slot invalidation (`max_slot_wal_keep_size`) or a full WAL volume |
+| `rustcdc_sink_kafka_unkeyed_deletes_total` | any increase | A delete arrived with no row key, so no tombstone could be published — on a compacted topic, a key the log will never reclaim. The table has no primary key, and is logged once at WARN. Truncate and schema-change events are excluded |
+| `rustcdc_sink_kafka_tombstones_total` | **do not alert** | Tombstones published. Zero is normal for a pipeline with no deletes — read it beside the counter above, never as a condition |
 | `rustcdc_slo_checkpoint_age_seconds` | > 300 s | Checkpoint has not advanced — sink or source issue |
 | `rustcdc_source_consecutive_poll_errors` | > 0 | Source connection degraded |
 | `rustcdc_runtime_recoverable_breaker_open_total` | increasing | Circuit breaker firing repeatedly |
@@ -1132,6 +1135,7 @@ data:
     [sink]
     type    = "kafka"
     brokers = "kafka.default.svc.cluster.local:9092"
+    # `topic = "cdc.${schema}.${table}"` for one topic per table; create them first.
     topic   = "cdc.events"
 
     [state]

@@ -419,9 +419,12 @@ fn the_kafka_sink_delivers_events_in_order_through_the_router() {
 
         const COUNT: u64 = 200;
         runtime.block_on(async {
-            let binding = rustcdc_server::sink::build_binding(&kafka_sink_config(&topic), 1 << 20)
-                .await
-                .expect("kafka binding");
+            let binding = rustcdc_server::sink::build_binding(
+                &kafka_sink_config(&topic),
+                &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+            )
+            .await
+            .expect("kafka binding");
             let mut router = rustcdc_server::pipeline::router::single(binding);
             for id in 0..COUNT {
                 router.send(&sample_event(id)).await.expect("send");
@@ -476,9 +479,12 @@ fn keyless_events_carry_the_table_name_as_their_key() {
             .expect("runtime");
 
         runtime.block_on(async {
-            let binding = rustcdc_server::sink::build_binding(&kafka_sink_config(&topic), 1 << 20)
-                .await
-                .expect("kafka binding");
+            let binding = rustcdc_server::sink::build_binding(
+                &kafka_sink_config(&topic),
+                &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+            )
+            .await
+            .expect("kafka binding");
             let mut router = rustcdc_server::pipeline::router::single(binding);
             // No `primary_key`, so the codec has nothing to build a key from.
             let event = Event::builder("audit_log", Operation::Insert)
@@ -517,9 +523,12 @@ fn delivery_counters_survive_a_real_broker_round_trip() {
             .expect("runtime");
 
         let snapshot = runtime.block_on(async {
-            let binding = rustcdc_server::sink::build_binding(&kafka_sink_config(&topic), 1 << 20)
-                .await
-                .expect("kafka binding");
+            let binding = rustcdc_server::sink::build_binding(
+                &kafka_sink_config(&topic),
+                &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+            )
+            .await
+            .expect("kafka binding");
             let mut registry = rustcdc_server::sink::SinkMetricsRegistry::default();
             registry.register(binding.metrics_handle());
             let mut router = rustcdc_server::pipeline::router::single(binding);

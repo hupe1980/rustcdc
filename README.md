@@ -57,9 +57,11 @@ Every command runs from the repository root. `cargo build` builds both crates;
 
 - **`at_least_once`** — a crash can replay the events of one uncheckpointed batch.
   Duplicates are possible; loss is not. Sinks must be idempotent on a key you control.
-- **`effectively_once`** — a batch's records and its checkpoint commit in one Kafka
-  transaction, so a crash keeps both or neither. It is *not* end-to-end exactly-once in
-  every configuration, and [the window is described in full](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts)
+- **`effectively_once`** — a batch's records and its checkpoint commit together: in one
+  Kafka transaction, or against a destination-side offset token where the sink offers one.
+  A crash keeps both or neither. It is *not* available in every configuration — the ones
+  that cannot deliver it are rejected at startup rather than degraded quietly — and
+  [the limits are described in full](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts)
   rather than glossed over.
 
 Where a guarantee has a limit, the limit is written next to it.
