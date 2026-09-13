@@ -285,7 +285,7 @@ Declared as `[[pipeline.transforms]]` in TOML. Each rule has an optional
 
 | Action | Purpose |
 |---|---|
-| `filter` | Drop events that don't match `include_ops` / `include_tables` / `include_schemas` |
+| `filter` | Drop events that don't match `include_ops` / `include_tables` / `include_schemas`, or whose operation is in `exclude_ops` |
 | `unwrap` | Replace `after` with `after[field]` |
 | `flatten` | Merge keys from `after[field]` into `after` (with optional `prefix`) |
 | `route` | Rewrite the event's routing `schema` and/or `table` |
@@ -304,6 +304,10 @@ Declared as `[[pipeline.transforms]]` in TOML. Each rule has an optional
 | `ops` | string[] | `["insert", "update"]` |
 
 An empty `when` block matches every event.
+
+Operation names in `when.ops`, `include_ops` and `exclude_ops` are checked when the
+configuration loads. They ignore case; any name other than `insert`, `update`, `delete`,
+`read`, `schema_change` or `truncate` is a configuration error, not a rule that never matches.
 
 **Example — redact a column and add metadata:**
 

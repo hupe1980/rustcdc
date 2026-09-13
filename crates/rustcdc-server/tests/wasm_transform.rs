@@ -472,6 +472,7 @@ fn native_pipeline_filter_rule_drops_delete_events() {
             include_tables: vec![],                                        // all tables
             include_schemas: vec![],                                       // all schemas
             include_ops: vec!["insert".to_string(), "update".to_string()], // only keep these
+            exclude_ops: Vec::new(),
         }],
     }];
 

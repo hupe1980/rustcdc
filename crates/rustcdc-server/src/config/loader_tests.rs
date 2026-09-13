@@ -3736,3 +3736,55 @@ bearer_token = "super-secret-literal-token"
         "the error must name the sink by the name the operator gave it: {error}"
     );
 }
+
+#[test]
+fn rejects_filter_with_unknown_operation_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("cdc.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+api_version = "v1"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc_user"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+conn_timeout_secs = 10
+stream_poll_interval_ms = 100
+max_events_per_poll = 1000
+table_include_list = []
+table_exclude_list = []
+
+[source.postgres.transport]
+mode = "plaintext"
+
+[sink]
+type = "stdout"
+
+[state]
+dir = "{}"
+
+[[pipeline.transforms]]
+name = "skip-truncates"
+
+  [[pipeline.transforms.actions]]
+  type        = "filter"
+  exclude_ops = ["truncates"]
+"#,
+            dir.path().join("state").display()
+        ),
+    )
+    .expect("write config");
+
+    let err = load(&config_path)
+        .expect_err("a misspelt operation must fail at load")
+        .to_string();
+    assert!(err.contains("skip-truncates"), "{err}");
+    assert!(err.contains("unknown operation"), "{err}");
+}
