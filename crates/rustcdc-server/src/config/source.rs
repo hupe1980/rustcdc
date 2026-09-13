@@ -82,6 +82,33 @@ pub enum SourceDriver {
     Sqlserver(SqlServerProfileConfig),
 }
 
+impl SourceDriver {
+    /// The connector's table allowlist, whichever driver is configured.
+    ///
+    /// **These are glob patterns, not table names** — `public.*` and `orders_?` are
+    /// legal entries, and have been since the release that unified connector filtering
+    /// with the sink router's matcher. Anything rendering them into a concrete name
+    /// (Kafka topic preflight is the first) has to drop the patterned entries rather
+    /// than treat them as tables; `QualifiedTable::parse_concrete` is that filter.
+    ///
+    /// An empty list is the default and means *no* filtering — every table the
+    /// publication or binlog carries — so an empty return is not "no tables".
+    pub fn table_include_list(&self) -> &[String] {
+        match self {
+            #[cfg(feature = "postgres")]
+            SourceDriver::Postgres(cfg) => &cfg.table_include_list,
+            #[cfg(feature = "mysql")]
+            SourceDriver::Mysql(cfg) => &cfg.table_include_list,
+            #[cfg(feature = "mysql")]
+            SourceDriver::Mariadb(cfg) => &cfg.table_include_list,
+            #[cfg(feature = "sqlserver")]
+            SourceDriver::Sqlserver(cfg) => &cfg.table_include_list,
+            #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlserver")))]
+            _ => &[],
+        }
+    }
+}
+
 /// Every source driver this project knows about, compiled in or not.
 ///
 /// `(config name, aliases, cargo feature, compiled in this build)`. The single place the

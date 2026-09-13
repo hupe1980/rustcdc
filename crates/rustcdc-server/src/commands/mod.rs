@@ -13,6 +13,7 @@ pub(crate) use run::tests::minimal_config as minimal_config_for_tests;
 mod snapshot;
 pub(crate) mod status;
 mod validate_config;
+mod webhook_keygen;
 
 use std::path::Path;
 
@@ -30,5 +31,6 @@ pub async fn dispatch(command: Command, config_path: Option<&Path>) -> Result<()
         Command::InspectCheckpoint(args) => inspect_checkpoint::execute(args, config_path).await,
         Command::Replay(args) => replay::execute(args, config_path).await,
         Command::Snapshot(args) => snapshot::execute(args).await,
+        Command::WebhookKeygen(args) => webhook_keygen::execute(args).await,
     }
 }

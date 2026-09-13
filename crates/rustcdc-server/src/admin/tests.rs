@@ -768,6 +768,7 @@ pub(super) async fn admin_state_stores_redacted_config_json() {
         pool_idle_timeout_secs: None,
         tcp_keepalive_secs: None,
         codec: None,
+        signing: None,
     });
 
     let admin = AdminState::new(&cfg).await.expect("admin state");

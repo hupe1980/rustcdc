@@ -464,6 +464,33 @@ fn enforce_deferred_secret_literals(raw: &serde_json::Value) -> Result<(), Confi
                     ));
         }
 
+        // A signing key written as a literal is a signing key in the config file, in the
+        // `/status` snapshot, and in whatever backs them up. Same rule as `bearer_token`,
+        // and it matters more: a leaked signing key lets anyone forge events *as this
+        // pipeline*, which is the thing the signature exists to make impossible.
+        if sink_type == Some("http")
+            && let Some(signing) = sink.get("signing").and_then(serde_json::Value::as_object)
+        {
+            if signing.get("key").is_some_and(serde_json::Value::is_string) {
+                return Err(ConfigError::Invalid(
+                    "sink.http.signing.key must use deferred secret references (for \
+                     example { env = \"WEBHOOK_SIGNING_KEY\" })"
+                        .to_string(),
+                ));
+            }
+            if let Some(previous) = signing
+                .get("previous_keys")
+                .and_then(serde_json::Value::as_array)
+                && previous.iter().any(serde_json::Value::is_string)
+            {
+                return Err(ConfigError::Invalid(
+                    "sink.http.signing.previous_keys entries must use deferred secret \
+                     references (for example { env = \"WEBHOOK_SIGNING_KEY_PREVIOUS\" })"
+                        .to_string(),
+                ));
+            }
+        }
+
         if sink_type == Some("iceberg") {
             for field in ["token", "credential"] {
                 let value = sink
@@ -913,97 +940,9 @@ fn validate(config: &AppConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if let SinkConfig::Http(http) = &config.sink {
-        if http.url.trim().is_empty() {
-            return Err(ConfigError::Invalid(
-                "sink.http.url must not be empty".to_string(),
-            ));
-        }
-        if !http.verify_tls {
-            return Err(ConfigError::Invalid(
-                "sink.http.verify_tls must be true; insecure HTTP TLS bypass is unsupported"
-                    .to_string(),
-            ));
-        }
-        validate_http_sink_url_policy(&http.url)?;
-        if http.timeout_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.timeout_ms must be > 0".to_string(),
-            ));
-        }
-        if http.batch_max_events == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.batch_max_events must be > 0".to_string(),
-            ));
-        }
-        if http.batch_max_delay_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.batch_max_delay_ms must be > 0".to_string(),
-            ));
-        }
-        if http.max_pending_bytes == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.max_pending_bytes must be > 0".to_string(),
-            ));
-        }
-        if http.backoff_multiplier < 1.0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_multiplier must be >= 1.0".to_string(),
-            ));
-        }
-        if !http.backoff_multiplier.is_finite() {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_multiplier must be finite".to_string(),
-            ));
-        }
-        if http.backoff_initial_ms == 0 || http.backoff_max_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_initial_ms and backoff_max_ms must be > 0".to_string(),
-            ));
-        }
-        if http.backoff_initial_ms > http.backoff_max_ms {
-            return Err(ConfigError::Invalid(
-                "sink.http.backoff_initial_ms must be <= backoff_max_ms".to_string(),
-            ));
-        }
-        if http.batch_retry_time_budget_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "sink.http.batch_retry_time_budget_ms must be > 0".to_string(),
-            ));
-        }
-        if let Some(token) = &http.bearer_token {
-            // Plaintext literals in the config file are rejected earlier, on the
-            // raw document (`enforce_deferred_secret_literals`) — by this point
-            // an inline value is the resolved form of an `{ env = … }` reference.
-            let resolved = token.resolve().map_err(|e| {
-                ConfigError::Invalid(format!("sink.http.bearer_token could not be resolved: {e}"))
-            })?;
-            if resolved.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "sink.http.bearer_token must not be empty when configured".to_string(),
-                ));
-            }
-        }
-    }
-
-    if let SinkConfig::Kafka(kafka) = &config.sink {
-        kafka.validate().map_err(ConfigError::Invalid)?;
-    }
-
-    if let SinkConfig::Iceberg(iceberg) = &config.sink {
-        iceberg.validate().map_err(ConfigError::Invalid)?;
-    }
-
-    if let SinkConfig::Fan(fan) = &config.sink {
-        validate_fan_sink_config(fan)?;
-    }
-
-    // Codec configuration was never validated: a codec naming a plaintext registry URL,
-    // or a registry-backed codec with no registry at all, only failed when the sink was
-    // built — after the source had already connected.
-    validate_sink_codec("sink", &config.sink)?;
+    validate_sink_config("sink", &config.sink)?;
     for named in &config.sinks {
-        validate_sink_codec(&format!("sinks.{}", named.name), &named.sink)?;
+        validate_sink_config(&format!("sinks.{}", named.name), &named.sink)?;
     }
 
     validate_delivery_contract(config)?;
@@ -1275,6 +1214,48 @@ fn sink_transactional_checkpoint_barrier_capable(sink: &SinkConfig) -> bool {
 }
 
 /// Validate the codec of a sink (and, recursively, of every fan-out child).
+/// Validate one sink and, for fan-out, every child underneath it.
+///
+/// `path` names the sink the way the operator wrote it — `sink`, `sinks.warehouse`,
+/// `sink.sinks[1]` — so an error points at the block to edit rather than at "the Kafka
+/// sink" when three of them are configured.
+fn validate_sink_config(path: &str, sink: &SinkConfig) -> Result<(), ConfigError> {
+    let relabel = |e: String| ConfigError::Invalid(relabel_sink_error(path, e));
+
+    match sink {
+        SinkConfig::Fan(fan) => {
+            validate_fan_sink_config(path, fan)?;
+            for (i, child) in fan.sinks.iter().enumerate() {
+                validate_sink_config(&format!("{path}.sinks[{i}]"), child)?;
+            }
+        }
+        SinkConfig::Kafka(kafka) => kafka.validate().map_err(relabel)?,
+        SinkConfig::Iceberg(iceberg) => iceberg.validate().map_err(relabel)?,
+        SinkConfig::Http(http) => http.validate().map_err(relabel)?,
+        _ => {}
+    }
+
+    validate_sink_codec(path, sink)
+}
+
+/// Re-point a sink error written for the default `[sink]` block at the sink it came from.
+///
+/// The per-sink `validate()` methods spell their own paths (`sink.kafka.topic`), which is
+/// right for the default sink and wrong for every other one. Rewriting the prefix here
+/// keeps one message per rule instead of threading a path argument through every
+/// validator — and leaves a message that names no path alone.
+fn relabel_sink_error(path: &str, error: String) -> String {
+    if path == "sink" {
+        return error;
+    }
+    for kind in ["kafka", "iceberg", "http"] {
+        if let Some(rest) = error.strip_prefix(&format!("sink.{kind}.")) {
+            return format!("{path}.{kind}.{rest}");
+        }
+    }
+    format!("{path}: {error}")
+}
+
 fn validate_sink_codec(path: &str, sink: &SinkConfig) -> Result<(), ConfigError> {
     match sink {
         SinkConfig::Fan(fan) => {
@@ -1299,16 +1280,19 @@ fn validate_sink_codec(path: &str, sink: &SinkConfig) -> Result<(), ConfigError>
     }
 }
 
-fn validate_fan_sink_config(fan: &super::schema::FanSinkConfig) -> Result<(), ConfigError> {
+fn validate_fan_sink_config(
+    path: &str,
+    fan: &super::schema::FanSinkConfig,
+) -> Result<(), ConfigError> {
     if fan.sinks.is_empty() {
-        return Err(ConfigError::Invalid(
-            "sink.fan.sinks must contain at least one child sink".to_string(),
-        ));
+        return Err(ConfigError::Invalid(format!(
+            "{path}.sinks must contain at least one child sink"
+        )));
     }
     for (i, child) in fan.sinks.iter().enumerate() {
         if matches!(child, SinkConfig::Fan(_)) {
             return Err(ConfigError::Invalid(format!(
-                "sink.fan.sinks[{i}]: nested fan-out sinks are not supported"
+                "{path}.sinks[{i}]: nested fan-out sinks are not supported"
             )));
         }
     }
@@ -1355,3 +1339,7 @@ pub(crate) fn validate_http_sink_url_policy(url: &str) -> Result<(), ConfigError
 #[cfg(test)]
 #[path = "loader_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "loader_sink_tests.rs"]
+mod sink_tests;

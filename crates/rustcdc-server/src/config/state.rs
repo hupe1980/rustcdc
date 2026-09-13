@@ -238,9 +238,7 @@ impl KafkaTopicStateConfig {
             );
         }
 
-        if self.topic.trim().is_empty() {
-            return Err("state.backend.kafka_topic.topic must not be empty".to_string());
-        }
+        crate::topic::validate_literal_topic("state.backend.kafka_topic.topic", &self.topic)?;
 
         if self.client_id.trim().is_empty() {
             return Err("state.backend.kafka_topic.client_id must not be empty".to_string());

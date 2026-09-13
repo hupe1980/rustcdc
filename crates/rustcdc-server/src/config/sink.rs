@@ -709,6 +709,119 @@ pub struct HttpSinkConfig {
     /// Defaults to JSON if omitted.
     #[serde(default)]
     pub codec: Option<CodecConfig>,
+
+    /// [Standard Webhooks](https://www.standardwebhooks.com/) request signing.
+    ///
+    /// Absent by default, because there is no key to default to. Configure it whenever the
+    /// receiver is not you: `bearer_token` proves the sender holds a secret, but it does
+    /// not prove the body is unaltered, and it is replayable by anyone who captures a
+    /// request or reads a proxy log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<HttpSigningConfig>,
+}
+
+/// Standard Webhooks signing for the HTTP sink.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct HttpSigningConfig {
+    /// Signature scheme — `hmac_sha256` (`v1`) or `ed25519` (`v1a`).
+    ///
+    /// The specification recommends `ed25519`, and so does this: the receiver holds only
+    /// the public half, so a compromised receiver cannot forge events back at you. A shared
+    /// HMAC secret cannot promise that, because verifying and forging are the same
+    /// capability.
+    pub scheme: crate::webhook::WebhookSignatureScheme,
+
+    /// The signing key — `whsec_…` for `hmac_sha256`, `whsk_…` for `ed25519`.
+    ///
+    /// Must be a deferred reference (`{ env = "VAR" }`); a literal is rejected at load, the
+    /// same rule `bearer_token` follows. The prefix is optional but checked when present:
+    /// a key carrying the *other* scheme's prefix is refused, because an ed25519 private
+    /// key makes a perfectly valid HMAC secret and would sign requests no receiver on earth
+    /// could verify.
+    pub key: SecretString,
+
+    /// Keys still honoured during a rotation. Every one signs every request.
+    ///
+    /// `webhook-signature` is a space-delimited list, so a receiver holding either the old
+    /// or the new key finds a signature it can verify. That is what makes rotation
+    /// zero-downtime: publish the new key here first, let receivers move at their own pace,
+    /// then promote it to `key` and drop the old one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_keys: Vec<SecretString>,
+}
+
+impl HttpSinkConfig {
+    /// Every rule that was previously inline in the loader, and applied only to the
+    /// default `[sink]`.
+    ///
+    /// A named `[[sinks]]` HTTP entry and a fan-out HTTP child skipped all of it — the URL
+    /// policy included, so `verify_tls = false` or a plaintext `http://` endpoint was
+    /// rejected in one position and accepted in another. Same defect the Kafka and Iceberg
+    /// sinks had; found while adding signing, because signing would have inherited it.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.url.trim().is_empty() {
+            return Err("sink.http.url must not be empty".to_string());
+        }
+        if !self.verify_tls {
+            return Err(
+                "sink.http.verify_tls must be true; insecure HTTP TLS bypass is unsupported"
+                    .to_string(),
+            );
+        }
+        crate::config::loader::validate_http_sink_url_policy(&self.url)
+            .map_err(|e| e.to_string())?;
+        if self.timeout_ms == 0 {
+            return Err("sink.http.timeout_ms must be > 0".to_string());
+        }
+        if self.batch_max_events == 0 {
+            return Err("sink.http.batch_max_events must be > 0".to_string());
+        }
+        if self.batch_max_delay_ms == 0 {
+            return Err("sink.http.batch_max_delay_ms must be > 0".to_string());
+        }
+        if self.max_pending_bytes == 0 {
+            return Err("sink.http.max_pending_bytes must be > 0".to_string());
+        }
+        if !self.backoff_multiplier.is_finite() {
+            return Err("sink.http.backoff_multiplier must be finite".to_string());
+        }
+        if self.backoff_multiplier < 1.0 {
+            return Err("sink.http.backoff_multiplier must be >= 1.0".to_string());
+        }
+        if self.backoff_initial_ms == 0 || self.backoff_max_ms == 0 {
+            return Err("sink.http.backoff_initial_ms and backoff_max_ms must be > 0".to_string());
+        }
+        if self.backoff_initial_ms > self.backoff_max_ms {
+            return Err("sink.http.backoff_initial_ms must be <= backoff_max_ms".to_string());
+        }
+        if self.batch_retry_time_budget_ms == 0 {
+            return Err("sink.http.batch_retry_time_budget_ms must be > 0".to_string());
+        }
+        if let Some(signing) = &self.signing {
+            signing.validate()?;
+        }
+        if let Some(token) = &self.bearer_token {
+            // Plaintext literals in the config file are rejected earlier, on the raw
+            // document (`enforce_deferred_secret_literals`) — by this point an inline
+            // value is the resolved form of an `{ env = … }` reference.
+            let resolved = token
+                .resolve()
+                .map_err(|e| format!("sink.http.bearer_token could not be resolved: {e}"))?;
+            if resolved.trim().is_empty() {
+                return Err("sink.http.bearer_token must not be empty when configured".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HttpSigningConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        // Constructing the signer *is* the validation: it parses every key, so a
+        // misconfiguration fails at load rather than becoming a request every receiver
+        // rejects while this side reports success.
+        crate::webhook::WebhookSigner::new(self.scheme, &self.key, &self.previous_keys).map(|_| ())
+    }
 }
 
 fn default_http_timeout_ms() -> u64 {
@@ -1596,7 +1709,33 @@ pub struct KafkaSinkConfig {
     pub brokers: String,
 
     /// Kafka topic to write CDC events to.
+    ///
+    /// Either a literal name — one sink, one topic — or a template carrying
+    /// `${schema}` and `${table}`, resolved per event:
+    ///
+    /// ```toml
+    /// topic = "cdc.${schema}.${table}"
+    /// ```
+    ///
+    /// That is the layout Debezium produces from `topic.prefix`, and it collapses what
+    /// used to need one `[[sinks]]` block and one `[[pipeline.routes]]` entry per table
+    /// — plus one producer per table — into a single sink. A new table starts flowing
+    /// without a config change, because there is no per-table configuration left to
+    /// change.
+    ///
+    /// The template is parsed and checked at startup: an unknown placeholder, an
+    /// unterminated `${`, or a literal segment carrying characters Kafka forbids is a
+    /// config error, not a surprise on the first event. What cannot be checked at
+    /// startup is the identifier a placeholder will carry — see
+    /// [`topic_naming`](Self::topic_naming).
     pub topic: String,
+
+    /// How rendered topic names are made legal, and what happens when they cannot be.
+    ///
+    /// Only reachable through a templated [`topic`](Self::topic): a literal name is
+    /// validated in full at startup and never renders anything.
+    #[serde(default)]
+    pub topic_naming: crate::topic::TopicNamingConfig,
 
     /// Client identifier for broker-side observability.
     #[serde(default = "default_kafka_client_id")]
@@ -1695,9 +1834,146 @@ pub struct KafkaSinkConfig {
     /// Confluent wire-format Avro encoding with a schema registry.
     #[serde(default)]
     pub codec: Option<CodecConfig>,
+
+    /// Follow every delete with a **tombstone** — the same key with Kafka's null value
+    /// (default: `true`, matching Debezium's `tombstones.on.delete`).
+    ///
+    /// On a `cleanup.policy=compact` topic this is the difference between a working CDC
+    /// stream and one that grows without bound. Compaction retains the most recent record
+    /// per key and drops a key only when it sees a null value. Without a tombstone, every
+    /// row ever deleted stays in the compacted log forever, and a consumer rebuilding
+    /// state from the topic sees the delete event but never sees the key disappear.
+    ///
+    /// Default `true` because the asymmetry is not close: a consumer that does not care
+    /// about tombstones skips a null value in one line, while a consumer that needs one
+    /// cannot synthesise it. Turn it off for a non-compacted topic where the extra record
+    /// per delete is pure cost.
+    ///
+    /// A tombstone is a statement *about a row key*, so it is emitted only for a delete
+    /// that has one. See [`crate::sink::KafkaSink::send_delete_tombstone`] for what that
+    /// excludes and why.
+    #[serde(default = "default_tombstones_on_delete")]
+    pub tombstones_on_delete: bool,
+
+    /// Record headers attached to every published record, tombstones included
+    /// (default: `cdc`).
+    ///
+    /// Named `record_headers` rather than `headers` because `sink.http.headers` already
+    /// exists and means something entirely different — a map of user-supplied *request*
+    /// headers, which may carry credentials and which `redaction.rs` redacts by key. Both
+    /// sink configs flatten into `sink.*`, so a shared name would put two unrelated
+    /// meanings at one config path, and the redaction rule keyed on that path would have
+    /// to know which sink type it was looking at.
+    ///
+    /// See [`KafkaRecordHeaders`] for the trade and for why the default is on.
+    #[serde(default)]
+    pub record_headers: KafkaRecordHeaders,
+}
+
+fn default_tombstones_on_delete() -> bool {
+    true
+}
+
+/// Which Kafka record headers the sink attaches to every record it publishes.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaRecordHeaders {
+    /// Provenance headers on every record — operation, schema, table, source name,
+    /// source offset and source timestamp. The default.
+    ///
+    /// The body carries all of it too, so these are not new information; they are what
+    /// makes the information *reachable*. A consumer filtering a topic for one table's
+    /// deletes, a `kafka-console-consumer` triaging a backlog, or a lag calculation that
+    /// wants the source commit time — each of those means deserialising every payload
+    /// without them, and each is answered by a header value.
+    ///
+    /// **Tombstones carry them too, and that is the case that makes this the default.** A
+    /// tombstone has a key and a *null value*, so with no headers there is nothing on the
+    /// record naming the table it came from, the operation that produced it, or the log
+    /// position it corresponds to. On a topic-per-table layout the topic name recovers the
+    /// table; on a single-topic layout — which is the default — nothing does. Debezium
+    /// tombstones have exactly this problem.
+    #[default]
+    Cdc,
+
+    /// No headers.
+    ///
+    /// Roughly 90–140 bytes per record, so on a high-throughput topic of small payloads
+    /// the saving is real. Understand what a tombstone becomes first: an anonymous null
+    /// value on a key.
+    None,
 }
 
 impl KafkaSinkConfig {
+    /// Parse [`topic`](Self::topic) into the literal name or template it describes.
+    ///
+    /// The same parser runs at config validation, at sink construction and at preflight,
+    /// so none of the three can disagree about what a topic value means.
+    pub fn topic_template(&self) -> Result<crate::topic::TopicTemplate, String> {
+        crate::topic::TopicTemplate::parse(&self.topic)
+    }
+
+    /// Reject a templated topic paired with a registry subject strategy derived from the
+    /// topic name.
+    ///
+    /// The codec is built **once**, from the configured `topic` string, and a
+    /// registry-backed codec turns that string into its subject name. With
+    /// `subject_name_strategy = "topic_name"` — the Confluent default — a templated
+    /// topic would register every table's schema under the literal, unexpanded subject
+    /// `cdc.${schema}.${table}-value`. Nothing downstream could resolve it, and the
+    /// failure would arrive as a consumer that cannot decode rather than as a
+    /// configuration error.
+    ///
+    /// `record_name` is the strategy topic-per-table actually wants: the subject is the
+    /// fully-qualified record name, so each table gets its own subject without the topic
+    /// being involved at all.
+    ///
+    /// Resolving the subject per topic instead would mean a registry round-trip, and a
+    /// possible auto-registration, on the first event of every table discovered at
+    /// runtime — moving a startup failure into the stream, which is what every other
+    /// check here exists to avoid.
+    fn validate_subject_naming(
+        &self,
+        template: &crate::topic::TopicTemplate,
+    ) -> Result<(), String> {
+        use crate::config::registry::SubjectNameStrategy;
+
+        if !template.is_templated() {
+            return Ok(());
+        }
+
+        let Some(codec) = self.codec.as_ref() else {
+            return Ok(());
+        };
+        // A codec with no registry binding (json, avro, protobuf, cloudevents, glue)
+        // names no subject from the topic.
+        let Some(binding) = codec.binding() else {
+            return Ok(());
+        };
+        // Unresolvable bindings are reported by the codec's own validation; reporting
+        // them twice, in different words, is worse than reporting them once.
+        let Ok(registry) = binding.resolved() else {
+            return Ok(());
+        };
+
+        let strategy = match registry.subject_name_strategy {
+            SubjectNameStrategy::TopicName => "topic_name",
+            SubjectNameStrategy::TopicRecordName => "topic_record_name",
+            SubjectNameStrategy::RecordName => return Ok(()),
+        };
+
+        Err(format!(
+            "sink.kafka.topic = {:?} is a per-event template, but the codec's registry \
+             uses subject_name_strategy = \"{strategy}\", which derives the schema \
+             subject from the topic name. The codec is built once, at startup, so every \
+             table's schema would be registered under the literal subject \
+             \"{}-value\". Set subject_name_strategy = \"record_name\" — the \
+             fully-qualified table name, which is what a topic-per-table layout wants — \
+             or use a literal topic.",
+            self.topic, self.topic
+        ))
+    }
+
     pub fn normalized_brokers(&self) -> Vec<String> {
         self.brokers
             .split(',')
@@ -1718,9 +1994,11 @@ impl KafkaSinkConfig {
             return Err("sink.kafka.brokers must contain at least one broker".to_string());
         }
 
-        if self.topic.trim().is_empty() {
-            return Err("sink.kafka.topic must not be empty".to_string());
-        }
+        let template = self
+            .topic_template()
+            .map_err(|e| format!("sink.kafka.{e}"))?;
+        self.topic_naming.validate("sink.kafka.topic_naming")?;
+        self.validate_subject_naming(&template)?;
 
         if self.client_id.trim().is_empty() {
             return Err("sink.kafka.client_id must not be empty".to_string());
@@ -2265,9 +2543,7 @@ impl AdminNotificationKafkaConfig {
             );
         }
 
-        if self.topic.trim().is_empty() {
-            return Err("admin.notification_kafka.topic must not be empty".to_string());
-        }
+        crate::topic::validate_literal_topic("admin.notification_kafka.topic", &self.topic)?;
 
         if self.client_id.trim().is_empty() {
             return Err("admin.notification_kafka.client_id must not be empty".to_string());
@@ -2314,9 +2590,7 @@ impl AdminSignalIngressKafkaConfig {
             );
         }
 
-        if self.topic.trim().is_empty() {
-            return Err("admin.signal_ingress_kafka.topic must not be empty".to_string());
-        }
+        crate::topic::validate_literal_topic("admin.signal_ingress_kafka.topic", &self.topic)?;
 
         if self.group_id.trim().is_empty() {
             return Err("admin.signal_ingress_kafka.group_id must not be empty".to_string());

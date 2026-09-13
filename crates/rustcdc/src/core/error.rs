@@ -440,6 +440,86 @@ impl Error {
         }
     }
 
+    /// Is this failure a property of **this event**, rather than of the environment?
+    ///
+    /// [`kind`](Self::kind) answers "should I retry?". This answers the second question,
+    /// and the two are orthogonal: a failure can be permanent because the record is
+    /// malformed, or permanent because a credential is wrong, and those want opposite
+    /// handling. Only the first may be quarantined.
+    ///
+    /// # Why this is not a variant of [`ErrorKind`]
+    ///
+    /// Because it is a different axis. `ErrorKind` says what to *do* — retry, escalate,
+    /// fix the config, acknowledge a batch — and every terminal error gives the same
+    /// answer there. Splitting `Terminal` in two would put two questions in one enum and
+    /// make `Terminal` mean "don't retry, and also environmental", which is not what the
+    /// name says.
+    ///
+    /// # Why it belongs in this crate
+    ///
+    /// It decides whether it is safe to advance the durable position past an event that
+    /// was never delivered — the one decision in a CDC pipeline that silently destroys
+    /// data when it is wrong. Getting it wrong in the *permissive* direction is the
+    /// failure mode worth naming: quarantining an environmental error drains the entire
+    /// change stream into the dead-letter queue, one event at a time, while every health
+    /// check reports the pipeline as running. That is the data loss a dead-letter queue
+    /// exists to prevent, delivered by the dead-letter queue itself.
+    ///
+    /// This lived only in `rustcdc-server` until it was noticed that an embedder writing
+    /// their own quarantine path had `kind()` and nothing else — and `kind()` returns
+    /// [`ErrorKind::Terminal`] for both halves of exactly the distinction they needed.
+    ///
+    /// # The default is `false`, deliberately
+    ///
+    /// An unclassified failure is not attributable to the record. Halting is loud;
+    /// quarantining is quiet, and a quiet wrong answer here is undetectable downstream.
+    ///
+    /// # Recoverable errors answer `false` too
+    ///
+    /// Not because they are environmental, but because the question does not arise: the
+    /// caller retries them, and quarantine is only reached once retrying is off the
+    /// table. Test [`kind`](Self::kind) first.
+    ///
+    /// ```
+    /// use rustcdc::core::{Error, ErrorKind};
+    ///
+    /// // Malformed payload: the same bytes fail identically every time, and the event
+    /// // is the thing that is wrong.
+    /// let malformed = Error::ValidationError(vec!["row exceeds the column count".into()]);
+    /// assert_eq!(malformed.kind(), ErrorKind::Terminal);
+    /// assert!(malformed.is_record_attributable());
+    ///
+    /// // Equally permanent, and not this event's fault — the next event fails the same
+    /// // way, so quarantining is how the whole stream is lost.
+    /// let revoked = Error::Unrecoverable("topic ACL revoked".into());
+    /// assert_eq!(revoked.kind(), ErrorKind::Terminal);
+    /// assert!(!revoked.is_record_attributable());
+    /// ```
+    pub fn is_record_attributable(&self) -> bool {
+        match self {
+            // Context is transparent: the wrapper adds a message, not a cause.
+            Self::Context { source, .. } => source.is_record_attributable(),
+            // The envelope failed its own validation contract, or could not be encoded.
+            // Both are statements about the payload in hand.
+            Self::ValidationError(_) | Self::SerializationError(_) => true,
+            // `TransformError` is deliberately **not** here, and it is the closest call.
+            // A transform can fail because *this row* holds a value it cannot handle —
+            // attributable — or because the rule itself is broken, a WASM module will not
+            // instantiate, a key is missing: environmental, and identical for every event
+            // that follows. Nothing in the error distinguishes them, and the rule above
+            // says an ambiguous failure is not attributable. Transforms also already have
+            // their own disposition in `pipeline.transform_error_policy`, which is where
+            // an operator says which reading applies to their rules.
+            //
+            // An aggregate is attributable only if every branch is. One environmental
+            // failure in the set means quarantining would advance past that failure too.
+            Self::Aggregate { .. } => false,
+            // Everything else is the environment: a slot, a socket, a credential, a
+            // checkpoint store, a schema registry, a configuration.
+            _ => false,
+        }
+    }
+
     /// Combine several failures into one, classified by the most severe kind present.
     ///
     /// Returns `Ok(())` when `failures` is empty, so a caller can collect unconditionally
@@ -489,6 +569,80 @@ impl From<serde_json::Error> for Error {
 
 #[cfg(test)]
 mod tests {
+    /// The two axes are orthogonal, and the whole point is that `Terminal` spans both
+    /// answers. A test that only checked `kind()` would pass with the distinction absent.
+    #[test]
+    fn record_attribution_is_a_second_axis_that_terminal_does_not_settle() {
+        let malformed = Error::ValidationError(vec!["bad row".into()]);
+        let environmental = Error::Unrecoverable("topic ACL revoked".into());
+
+        assert_eq!(malformed.kind(), ErrorKind::Terminal);
+        assert_eq!(environmental.kind(), ErrorKind::Terminal);
+        assert!(malformed.is_record_attributable());
+        assert!(
+            !environmental.is_record_attributable(),
+            "quarantining this drains the whole stream into the DLQ one event at a time"
+        );
+    }
+
+    /// Serialising an event is a pure function of the event, so a failure is the
+    /// record's. One unserialisable row should not halt a pipeline.
+    #[test]
+    fn a_serialisation_failure_is_the_records_fault() {
+        assert!(Error::SerializationError("not representable".into()).is_record_attributable());
+    }
+
+    /// The closest call, and it goes the conservative way: a transform failure is
+    /// ambiguous between "this row" and "this rule is broken", and an ambiguous failure
+    /// must not be quarantined. `pipeline.transform_error_policy` is where that choice
+    /// actually belongs.
+    #[test]
+    fn a_transform_failure_is_ambiguous_and_therefore_not_attributable() {
+        assert!(!Error::TransformError("mask failed".into()).is_record_attributable());
+    }
+
+    /// An aggregate is only as attributable as its least attributable branch — one
+    /// environmental failure in the set means advancing past it loses that failure too.
+    #[test]
+    fn an_aggregate_is_not_attributable() {
+        let aggregate = Error::Aggregate {
+            kind: ErrorKind::Terminal,
+            detail: "one branch was a revoked credential".into(),
+        };
+        assert!(!aggregate.is_record_attributable());
+    }
+
+    /// Environmental failures are the default, so an unclassified one halts rather than
+    /// quietly draining the stream.
+    #[test]
+    fn the_default_for_an_unclassified_failure_is_not_attributable() {
+        for error in [
+            Error::StateError("checkpoint store unreachable".into()),
+            Error::CheckpointError("slot diverged".into()),
+            Error::SchemaError("registry rejected the subject".into()),
+            Error::IoError(std::io::Error::other("disk full")),
+            Error::ConfigError("missing broker".into()),
+            Error::SourceError("connection reset".into()),
+            Error::TimeoutError("broker slow".into()),
+        ] {
+            assert!(
+                !error.is_record_attributable(),
+                "{error:?} must not be quarantinable"
+            );
+        }
+    }
+
+    /// `Context` adds a message, not a cause, so it must not change the answer.
+    #[test]
+    fn context_is_transparent_to_record_attribution() {
+        let inner = Error::ValidationError(vec!["bad row".into()]);
+        let wrapped = inner.context("while encoding for the kafka sink");
+        assert!(
+            wrapped.is_record_attributable(),
+            "wrapping a malformed record in context must not make it environmental"
+        );
+    }
+
     use super::{Error, ErrorKind};
 
     #[test]

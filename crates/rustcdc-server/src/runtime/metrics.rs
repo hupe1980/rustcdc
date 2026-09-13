@@ -548,6 +548,8 @@ pub(crate) struct SinkMetricsSnapshot {
     sink_kafka_oauth_token_fetches_total: u64,
     sink_kafka_oauth_token_fetch_failures_total: u64,
     sink_kafka_oauth_token_expiry_epoch_ms: u64,
+    sink_kafka_tombstones_total: u64,
+    sink_kafka_unkeyed_deletes_total: u64,
     sink_snowflake_rows_appended_total: u64,
     sink_snowflake_rows_skipped_on_resume_total: u64,
     sink_snowflake_channel_reopens_total: u64,
@@ -1095,6 +1097,27 @@ impl SinkMetricsSnapshot {
             &sink_labels,
             self.sink_kafka_oauth_token_expiry_epoch_ms,
         );
+        encoder.counter(
+            "rustcdc_sink_kafka_tombstones_total",
+            "Total tombstones published after a delete. On a cleanup.policy=compact topic \
+             a deleted key is only removed when compaction sees a null value, so this \
+             staying at zero while deletes flow means the compacted log is growing \
+             without bound — check sink.kafka.tombstones_on_delete, and whether the \
+             tables have primary keys",
+            &sink_labels,
+            self.sink_kafka_tombstones_total,
+        );
+        encoder.counter(
+            "rustcdc_sink_kafka_unkeyed_deletes_total",
+            "Total deletes that could not be tombstoned because the event carried no row \
+             key — the table has no primary key. Every increment is a key a compacted \
+             topic will never reclaim. Such a table cannot be consumed from a compacted \
+             topic at all: all its events share the qualified-table-name key, so \
+             compaction retains only the newest. Truncate and schema-change events are \
+             not counted here",
+            &sink_labels,
+            self.sink_kafka_unkeyed_deletes_total,
+        );
         for (name, help, value) in [
             (
                 "rustcdc_sink_snowflake_rows_appended_total",
@@ -1564,6 +1587,8 @@ pub(crate) fn sink_metrics_snapshot(
         sink_zerobus_ack_wait_ms_total: 0,
         sink_zerobus_stream_opens_total: 0,
         sink_kafka_oauth_token_expiry_epoch_ms: 0,
+        sink_kafka_tombstones_total: 0,
+        sink_kafka_unkeyed_deletes_total: 0,
         data_events_total: 0,
         data_duplicates_total: 0,
         data_reorders_total: 0,
@@ -1686,6 +1711,8 @@ pub(crate) struct RuntimeLoopMetricsAccumulator {
     sink_kafka_oauth_token_fetches_total: u64,
     sink_kafka_oauth_token_fetch_failures_total: u64,
     sink_kafka_oauth_token_expiry_epoch_ms: u64,
+    sink_kafka_tombstones_total: u64,
+    sink_kafka_unkeyed_deletes_total: u64,
     sink_snowflake_rows_appended_total: u64,
     sink_snowflake_rows_skipped_on_resume_total: u64,
     sink_snowflake_channel_reopens_total: u64,
@@ -1805,6 +1832,8 @@ impl RuntimeLoopMetricsAccumulator {
             sink_kafka_oauth_token_fetches_total: 0,
             sink_kafka_oauth_token_fetch_failures_total: 0,
             sink_kafka_oauth_token_expiry_epoch_ms: 0,
+            sink_kafka_tombstones_total: 0,
+            sink_kafka_unkeyed_deletes_total: 0,
             sink_snowflake_rows_appended_total: 0,
             sink_snowflake_rows_skipped_on_resume_total: 0,
             sink_snowflake_channel_reopens_total: 0,
@@ -2146,6 +2175,20 @@ impl RuntimeLoopMetricsAccumulator {
             after.kafka_oauth_token_fetch_failures_total;
         self.sink_kafka_oauth_token_expiry_epoch_ms = after.kafka_oauth_token_expiry_epoch_ms;
         for (target, before_value, after_value) in [
+            // Unlike krafka's own counters above, this one is kept by the sink itself, so
+            // it accumulates from the before/after delta like every other sink-owned
+            // total — assigning it would make a fan-out's children overwrite each other
+            // instead of summing.
+            (
+                &mut self.sink_kafka_tombstones_total,
+                before.kafka_tombstones_total,
+                after.kafka_tombstones_total,
+            ),
+            (
+                &mut self.sink_kafka_unkeyed_deletes_total,
+                before.kafka_unkeyed_deletes_total,
+                after.kafka_unkeyed_deletes_total,
+            ),
             (
                 &mut self.sink_snowflake_rows_appended_total,
                 before.snowflake_rows_appended_total,
@@ -2347,6 +2390,8 @@ impl RuntimeLoopMetricsAccumulator {
             self.sink_kafka_oauth_token_fetch_failures_total;
         sink_metrics.sink_kafka_oauth_token_expiry_epoch_ms =
             self.sink_kafka_oauth_token_expiry_epoch_ms;
+        sink_metrics.sink_kafka_tombstones_total = self.sink_kafka_tombstones_total;
+        sink_metrics.sink_kafka_unkeyed_deletes_total = self.sink_kafka_unkeyed_deletes_total;
         sink_metrics.sink_snowflake_rows_appended_total = self.sink_snowflake_rows_appended_total;
         sink_metrics.sink_snowflake_rows_skipped_on_resume_total =
             self.sink_snowflake_rows_skipped_on_resume_total;

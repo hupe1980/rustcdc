@@ -302,6 +302,25 @@ groups:
             volume.  Check sink throughput and the RUSTCDCRuntimeStalled
             alert.
 
+      - alert: RUSTCDCKafkaDeleteCannotBeTombstoned
+        expr: increase(rustcdc_sink_kafka_unkeyed_deletes_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Deletes are arriving that carry no row key, so no tombstone can be
+            published for them.  On a cleanup.policy=compact topic every one of
+            these is a key the log will never reclaim.  The cause is always the
+            same: the table has no primary key, and such a table cannot be
+            consumed from a compacted topic at all — all of its events share the
+            qualified-table-name message key, so compaction retains only the
+            newest one.  Give the table a primary key (or, on PostgreSQL, a
+            REPLICA IDENTITY that yields one), or route it to a non-compacted
+            topic.  The server logs the table name once per table at WARN.
+            Note this counter deliberately excludes truncate and schema-change
+            events, which legitimately carry no row key.
+
       - alert: RUSTCDCKafkaOAuthTokenFetchFailing
         expr: increase(rustcdc_sink_kafka_oauth_token_fetch_failures_total[10m]) > 0
         for: 5m

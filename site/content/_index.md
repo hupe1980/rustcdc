@@ -28,7 +28,7 @@ mode = "tls"
 [sink]
 type    = "kafka"
 brokers = "broker1:9092,broker2:9092"
-topic   = "cdc.orders"
+topic   = "cdc.${schema}.${table}"   # one topic per table, resolved per event
 
 # Mask before the data ever leaves the process.
 [[pipeline.transforms]]

@@ -5,6 +5,364 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.16.0
+
+The Kafka sink grows the three things a compacted, topic-per-table deployment needs —
+per-event topic templates, delete tombstones and provenance headers — and the HTTP sink
+signs its requests to Standard Webhooks. Several audit findings came out of building them,
+all the same shape: a rule enforced in one place and skipped in another.
+
+It is a **breaking** release. See *Breaking* and *Migrating* below.
+
+### Added: Kafka topic templates — one sink, one topic per table
+
+`sink.kafka.topic` accepts `${schema}` and `${table}`, resolved per event:
+
+```toml
+topic = "cdc.${schema}.${table}"
+```
+
+That is the layout Debezium produces from `topic.prefix`, and what most Kafka CDC consumers
+expect. Expressing it before took one `[[sinks]]` block and one `[[pipeline.routes]]` entry
+**per table** — plus a producer each — and `validate_route_references` requires each named
+sink to be claimed by exactly one route, so the pairs could not be collapsed. A new table
+meant a config change and a restart. It is now a single `[sink]` with no routes, and
+`[[pipeline.routes]]` goes back to being an override for the unusual cases. A literal topic
+behaves exactly as before.
+
+**One parser, three call sites.** Config validation, preflight and the hot path must agree
+about a topic name, and they run at three different times; a rule enforced in only one is a
+name that passes startup and is rejected by the broker mid-stream. `crate::topic` holds the
+parser, the renderer and the character policy.
+
+**`${op}` is deliberately not a placeholder.** Splitting a table's inserts, updates and
+deletes across topics destroys per-key ordering — a consumer replaying them sees a delete
+before the insert it follows. Refused at parse with that reason, because a warning would be
+read after the topics existed.
+
+**Identifiers Kafka cannot spell.** `[sink.topic_naming] invalid_characters` chooses between
+`reject` (default — the event dead-letters, or halts when no `[dlq]` is configured) and
+`replace`, as Debezium does. `reject` is the default because a topic name is a published
+interface.
+
+`replace` carries the hazard that is the reason it is a choice: `my table` and `my_table`
+both render to `my_table`, interleaving two change streams under keys unique only per table.
+**That is detected rather than allowed** — the second table to reach an already-claimed name
+halts, naming both. Merges the template itself expresses (a literal topic, or
+`topic = "cdc.${schema}"`) are not collisions.
+
+**`${schema}` against an event with no schema** is an error, not an empty segment: dropping
+it would produce `cdc..orders`, a legal Kafka name that looks deliberate.
+
+**Preflight still fails at startup, for the tables knowable then.** A template has no finite
+topic set, so preflight renders it against `snapshot_tables`,
+`incremental_snapshot.tables` and the *concrete* entries of `table_include_list` — that list
+takes globs, so `public.*` is excluded rather than rendered into `cdc.public.*`. Each sink
+gets only the tables its own routes send it, first match wins, so a named sink does not fail
+startup demanding a topic for a table routed elsewhere. A named table that cannot be rendered
+is a startup warning, not a failure. Topics are **not** auto-created.
+
+**Schema registry.** A registry-backed codec derives its subject from the topic name and is
+built once at startup, so a templated topic with `subject_name_strategy = "topic_name"` (the
+Confluent default) or `"topic_record_name"` is rejected at load — every schema would
+otherwise register under the literal `cdc.${schema}.${table}-value`. Use `record_name`, which
+a topic-per-table layout wants anyway.
+
+### Added: Standard Webhooks request signing for the HTTP sink
+
+`[sink.http.signing]` signs every outgoing request to the
+[Standard Webhooks](https://www.standardwebhooks.com/) specification — the one behind
+Zapier, Twilio, Lob, Mux, ngrok, Supabase, Svix and Kong — so a receiver that already
+verifies webhooks from any of those verifies these with the same library.
+
+```toml
+[sink.signing]
+scheme        = "ed25519"                              # ed25519 | hmac_sha256
+key           = { env = "WEBHOOK_SIGNING_KEY" }        # whsk_… | whsec_…
+previous_keys = [{ env = "WEBHOOK_SIGNING_KEY_OLD" }]  # optional, for rotation
+```
+
+`bearer_token` proves the sender holds a secret. It does not prove the body is unaltered,
+and it is replayable by anyone who captures a request or reads a proxy log. A per-request
+signature over `{id}.{timestamp}.{payload}` does both. **ed25519 (`v1a`) is recommended over
+HMAC (`v1`)**, as the specification recommends: the receiver holds only the public half, so
+a compromised receiver cannot forge events back — verifying and forging are the same
+capability with a shared secret.
+
+**Two properties are the whole contract, and getting either backwards fails quietly.**
+
+`webhook-id` is **stable across retries**, because it is the receiver's deduplication key
+and at-least-once delivery *will* redeliver. It reuses the sink's existing content-derived
+idempotency key, which already had exactly that property, and is sent as `Idempotency-Key`
+too so the two cannot drift.
+
+`webhook-timestamp` is **regenerated per attempt**, and each attempt is therefore signed
+afresh. The timestamp is inside the signature and receivers reject one outside their
+tolerance — five minutes is the usual recommendation — so a signature frozen at the first
+attempt would have every retry past that rejected as a replay, while this sink's retry
+budget runs to minutes. The specification says the same: *"every time an attempt is retried
+the timestamp of the attempt is updated."*
+
+**Key rotation is zero-downtime.** `webhook-signature` is a space-delimited list and every
+configured key signs every request, so a receiver holding either the old or the new key
+finds one it can verify.
+
+**Two limits, stated rather than glossed.** This is *signature*-compatible, not
+*payload*-compatible: the spec recommends a `{type, timestamp, data}` body and this sink
+sends whatever `sink.http.codec` produces, because the codec is the operator's choice and a
+CDC envelope is not an application event. And the sink batches, while the spec is written
+for one event per request — so the batch is the message, and `webhook-id` identifies the
+batch rather than an individual row change.
+
+Correctness is pinned by the specification's **published test vector**, not by a round-trip
+against our own verifier: a round-trip would pass just as well with the delimiter, the
+base64 alphabet or the key decoding all wrong.
+
+A key carrying the wrong scheme's prefix is refused at load — an ed25519 private key is a
+perfectly valid HMAC secret, so the mistake would otherwise sign happily and produce
+requests no receiver on earth could verify. A `whpk_` public key gets its own message. And
+`signing.key` must be a deferred `{ env = … }` reference, the rule `bearer_token` already
+followed; it matters more here, because a leaked signing key lets anyone forge events *as
+this pipeline*.
+
+### Added: `rustcdc webhook-keygen`, and the public key is no longer unreachable
+
+Two gaps in the signing support above, both of the same kind — *what can an operator not
+find out that they need?*
+
+**Minting a key.** The encoding is the part that goes wrong, and every way of getting it
+wrong fails late: `openssl genpkey` emits PEM, most libraries export the 64-byte expanded
+ed25519 keypair rather than the 32-byte seed, and `head -c 32 /dev/urandom | base64` yields
+a secret with no prefix — which is *accepted*, so the mistake stays invisible until a
+receiver cannot verify. `parse_key` has a specific error for each of those, which is the
+wrong end of the problem; `webhook-keygen` is the right end. Key material comes from
+rustls's CSPRNG, already installed process-wide — no `rand` dependency was added, keeping
+the project's one-secure-random-source rule.
+
+**Reading the public key back.** `sink.http.signing.key` holds the *private* seed, so an
+operator who chose ed25519 had no way to obtain the `whpk_…` half the receiver needs —
+not from the config, not from the CLI, not from a running instance. `webhook-keygen` prints
+it, and the HTTP sink now logs it at startup, so it is recoverable from any running
+pipeline. It is not a secret; publishing it is the point.
+
+### Added: CDC provenance headers on every Kafka record
+
+Every record the Kafka sink publishes now carries `__rustcdc.op`,
+`__rustcdc.source.schema`, `__rustcdc.source.table`, `__rustcdc.source.name`,
+`__rustcdc.source.offset` and `__rustcdc.source.ts_ms`, controlled by `sink.kafka.record_headers`
+(`cdc`, the default, or `none`).
+
+Named `record_headers` rather than `headers` because `sink.http.headers` already means a map
+of user-supplied *request* headers that may carry credentials, and both sink configs flatten
+into `sink.*` — a shared name would put two unrelated meanings at one config path, and
+`redaction.rs` keys a rule on exactly that path.
+
+The body carries all of it too, so these are not new information — they are what makes it
+*reachable*. Filtering a topic for one table's deletes, triaging a backlog with
+`kafka-console-consumer`, or computing lag from the source commit time each meant
+deserialising every payload. The field set is the one the CloudEvents codec already
+publishes as `cdcop`/`cdctable`/`cdcschema`/`cdcsource`/`cdcoffset`, and the `__rustcdc.*`
+namespace matches the dead-letter headers, so the deployment sees one vocabulary rather than
+three.
+
+**Tombstones carry them too, and that is why the default is on.** A tombstone has a key and
+a null value, so without headers nothing on the record names the table it came from, the
+operation that produced it, or the log position it corresponds to. On a topic-per-table
+layout the topic name recovers the table; on a single topic — the default — nothing does.
+Debezium tombstones have exactly this problem, and the feature added in this same release
+would have inherited it.
+
+An absent schema is **omitted** rather than sent as a null or empty value: a null header
+value is a third state on the wire nobody asked for, and an empty one is indistinguishable
+from a schema genuinely named `""`. Source-supplied identifiers truncate at 512 bytes — far
+above any database's identifier limit — because the alternative is the broker rejecting the
+whole record over a diagnostic field.
+
+This also closed an inconsistency: the Kafka *dead-letter* target has published triage
+headers since it was written, with the rationale spelled out in its own module. The data
+path published none.
+
+### Added: delete tombstones
+
+A delete is now followed by a **tombstone** — the same key with Kafka's null value —
+controlled by `sink.kafka.tombstones_on_delete` (default `true`, matching Debezium's
+`tombstones.on.delete`).
+
+Before this, a delete emitted one record carrying the before-image and nothing ever removed
+the key. On a `cleanup.policy=compact` topic every row ever deleted stayed in the log
+forever, and a consumer rebuilding state saw the delete but never saw the key disappear.
+
+**A tombstone is a statement about a row key**, so it is emitted only when the codec produced
+one — `output.key.is_some()`, a single condition rather than a list of operations. That
+excludes the three cases where a tombstone would destroy data rather than prune it:
+`op = "truncate"` and `op = "schema_change"`, both keyed by the qualified table name, where
+a tombstone would compact away the marker itself; and a table with **no primary key**, where
+every event shares the `schema.table` key. Testing `event.op` and `primary_key_values()`
+separately would reach the same answer today and drift the moment a codec derives keys some
+other way.
+
+The third case is worth more than a suppression: such a table cannot be consumed from a
+compacted topic *at all*. The sink logs that once per table and counts it in
+**`rustcdc_sink_kafka_unkeyed_deletes_total`**, which is the alertable signal — every
+increment is a key a compacted topic will never reclaim.
+`rustcdc_sink_kafka_tombstones_total` counts the successful ones and is deliberately *not*
+alertable alone, because zero is normal for a pipeline with no deletes.
+`RUSTCDCKafkaDeleteCannotBeTombstoned` ships with the rules.
+
+**Ordering, durability and transactions are settled by placement.** The tombstone carries
+the delete's key and therefore its partition, and enters the same send window immediately
+after, so it cannot overtake the delete. That window means the batch's flush covers both and
+the checkpoint cannot advance past a delete whose tombstone is missing; emitting from inside
+`SinkBinding::send_event` also puts it on the same side of
+`runtime.sink_flush_interval_events`. Under `effectively_once` the pair lands in one producer
+transaction because the barrier opens it around the whole batch. And a tombstone cannot fail
+`runtime.max_event_bytes` when its delete did not.
+
+One case needs explicit handling, and exists only because the tombstone is the *second*
+record. `classify_krafka_error` maps `MessageTooLarge`, `InvalidRecord`, `Serialization` and
+`Compression` to `SinkPoisonRecord`, which is dead-letterable — right for a record, wrong
+here, because by then the delete is already in the send window. Quarantining would advance
+the checkpoint past a delete that reaches the topic with nothing behind it, invisible to
+every counter. A terminal tombstone failure is therefore escalated to `Unrecoverable` and
+halts; retriable failures pass through untouched.
+
+Kafka only: a null value in a JSONL file or an Iceberg table is a malformed row, not a
+deletion marker.
+
+### Fixed: a comment claimed the Kafka sink awaited every acknowledgement
+
+`linger_is_not_charged_per_record_at_the_default` carried a doc comment asserting that the
+sink "awaits each record's broker confirmation before returning from `send_encoded`" and
+that "a batch never accumulates across calls". That was true before `send_encoded` began
+pipelining into `SendWindow`, and `KafkaSinkConfig::linger_ms` has documented the change
+ever since — *"That advice no longer applies."* This comment did not, and a design proposal
+for the feature above built its durability argument on it before the contradiction was
+caught. Corrected, with the history kept so the next reader does not have to rediscover it.
+
+### Moved to the library: "is this failure the record's fault?"
+
+`rustcdc::core::Error::is_record_attributable()` is new, and `rustcdc-server`'s
+`AppError::is_dead_letterable` now delegates to it instead of spelling the rule a second
+time as `matches!(err, ValidationError(_))`.
+
+This is a crate-boundary fix. `ARCHITECTURE.md` says everything that decides correctness
+lives in the library, and this decides whether it is sound to advance the durable position
+past an event that was never delivered — the one decision in a CDC pipeline that destroys
+data silently when it is wrong. The library offered embedders `Error::kind()`, which returns
+`ErrorKind::Terminal` for *both* halves of the distinction: "this row is malformed" and
+"your credentials are wrong" are equally permanent and want opposite handling. An embedder
+writing their own quarantine path had no way to tell them apart, and the library's own
+documentation warns that conflating them is how a dead-letter queue becomes the data loss it
+exists to prevent.
+
+It is a **second axis**, not a new `ErrorKind` variant: `kind()` answers "should I retry?",
+and every terminal error gives the same answer there. Splitting `Terminal` in two would put
+two questions in one enum.
+
+The move widened the rule slightly and narrowed it once, both deliberately.
+`SerializationError` is now attributable — serialising an event is a pure function of the
+event, and one unserialisable row should not halt a pipeline. `TransformError` is **not**,
+which was the closest call: a transform can fail because this row holds a value it cannot
+handle, or because the rule itself is broken and every following event will fail the same
+way. Nothing in the error distinguishes them, an ambiguous failure must not be quarantined,
+and `pipeline.transform_error_policy` is where that choice already belongs.
+
+### Removed: `impl SinkAdapter for KafkaSink`
+
+Found while adding tombstones, and dead: nothing ever built a `BoxedSink` from a bare
+`KafkaSink`, because the router holds `SinkBinding`s. Had anyone reached for it, its `send`
+was wrong three times over — it serialised the event as JSON directly, ignoring the sink's
+configured codec; it passed an **empty** message key, which Kafka partitioners hash like any
+other key, pinning every event of every table to one `murmur2("")` partition, the exact
+defect `SinkBinding::send_event`'s key fallback exists to prevent; and it published no
+tombstone after a delete.
+
+A correct Kafka send needs the codec, and the codec lives in `SinkBinding`. The impl that
+suggested otherwise is gone rather than repaired, so reaching for it is now a compile error
+instead of three silent wrongs. The other sinks' `SinkAdapter` impls are unaffected.
+
+### Changed: the Kafka sink's tests moved to `sink/kafka_tests.rs`
+
+`sink/kafka.rs` passed the per-file line budget `tests/architecture.rs` enforces. Same split
+`config/loader_tests.rs` made, same `#[path]` wiring, so `super::` still reaches the sink's
+private items and nothing had to be widened to be testable.
+
+### Fixed: sink validation ran only for the default `[sink]`
+
+`KafkaSinkConfig::validate`, `IcebergSinkConfig::validate` and the HTTP sink's rules were
+reached only through `config.sink`. A named `[[sinks]]` entry or a fan-out child skipped all
+of them, so `ack_timeout_ms = 0`, an out-of-range compression level, `verify_tls = false` or
+a plaintext `http://` endpoint was rejected in one position and accepted in another — failing
+later at sink construction, after the source had connected. Every sink is validated now, and
+the error names the block it came from (`sinks.warehouse.kafka.topic`, `sink.sinks[1].http.url`).
+
+### Fixed: every other Kafka topic was checked only for emptiness
+
+`dlq.topic`, `state.backend.kafka_topic.topic` and both admin Kafka topics accepted any
+non-blank string, so a name the broker would reject — a space, a `#`, 300 characters, `..` —
+loaded cleanly and failed on first use. For the DLQ that is the worst moment: the
+dead-letter path runs during an incident. All four now use the same rules as
+`sink.kafka.topic`.
+
+### Breaking
+
+* **`sink.kafka.topic` is parsed, not taken literally.** A topic containing `${` must now be a
+  valid template. Existing literal topics are unaffected — `${` is not legal in a Kafka topic
+  name, so no working configuration can contain one.
+* **A literal `topic` is now validated at load**: length (Kafka's 249-character limit), the
+  reserved names `.` and `..`, and the legal character class `[a-zA-Z0-9._-]`. A topic the
+  broker would have rejected on first send is rejected at startup instead.
+* **Named `[[sinks]]` and fan-out children are validated** — Kafka, Iceberg and HTTP alike —
+  so a configuration that loaded and then failed at sink construction now fails at load. The
+  failure is the same one, reported earlier and with a path that names the sink.
+* **`dlq.topic`, the Kafka state topic and both admin Kafka topics are validated as Kafka topic
+  names.** A name the broker would have rejected now fails at load.
+* **`sink::build_binding` takes a `SinkBuildContext`** instead of a bare `max_event_bytes`.
+  `build_binding(&cfg, 1 << 20)` becomes `build_binding(&cfg, &SinkBuildContext::new(1 << 20))`.
+* **`KafkaSink::send_encoded` takes `(&Event, &str topic, key, value)`.** The topic is a
+  per-event value once it is a template, and the event supplies the record headers; there is
+  deliberately no header-free variant. `BuiltSink::send_encoded` takes the `&Event` alongside
+  the bytes and resolves the topic itself.
+* **Every Kafka record carries `__rustcdc.*` headers** (~90–140 bytes), tombstones included.
+  Set `record_headers = "none"` to restore the old shape.
+* **Deletes now produce two Kafka records.** A consumer counting records per delete, or a
+  non-compacted topic sized on one record per event, sees the difference. Set
+  `tombstones_on_delete = false` to restore the old shape.
+* **`KafkaSink::build_send` takes `Option<Bytes>`**, where `None` is a tombstone.
+  `Some(Bytes::new())` remains a zero-length value, which compaction preserves — the two are
+  not interchangeable.
+
+### Migrating
+
+A configuration that was working needs no change: every new rejection is a name or a setting
+the broker or the sink would have refused anyway, moved from first use to startup. If one of
+them fires, the message names the field and the block.
+
+To adopt topic-per-table, replace the per-table `[[sinks]]` / `[[pipeline.routes]]` pairs with
+one sink:
+
+```toml
+# Before — one pair per table, repeated
+[[sinks]]
+name    = "t_subject"
+type    = "kafka"
+brokers = "broker:9092"
+topic   = "cdc.public.subject"
+
+[[pipeline.routes]]
+table_pattern = "*subject"
+sink          = "t_subject"
+
+# After — one sink, every table
+[sink]
+type    = "kafka"
+brokers = "broker:9092"
+topic   = "cdc.${schema}.${table}"
+```
+
+The topics must already exist; preflight will name the missing ones at startup. If the sink uses
+a registry-backed codec, set `subject_name_strategy = "record_name"` on its registry.
+
 ## 0.15.0
 
 Two changes, and one of them is a repository move.

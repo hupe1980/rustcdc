@@ -628,10 +628,12 @@ pub(crate) mod tests {
     /// `SinkBinding`, so they check the limit where it now lives.
     #[tokio::test]
     async fn event_size_limit_rejects_an_oversized_encoded_payload() {
-        let mut binding =
-            crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()), 64)
-                .await
-                .expect("stdout binding");
+        let mut binding = crate::sink::build_binding(
+            &SinkConfig::Stdout(StdoutSinkConfig::default()),
+            &crate::sink::SinkBuildContext::new(64),
+        )
+        .await
+        .expect("stdout binding");
 
         let err = binding
             .send_event(&sample_event(&"x".repeat(4096)))
@@ -645,10 +647,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn event_size_limit_allows_a_payload_within_the_limit() {
-        let mut binding =
-            crate::sink::build_binding(&SinkConfig::Stdout(StdoutSinkConfig::default()), 4096)
-                .await
-                .expect("stdout binding");
+        let mut binding = crate::sink::build_binding(
+            &SinkConfig::Stdout(StdoutSinkConfig::default()),
+            &crate::sink::SinkBuildContext::new(4096),
+        )
+        .await
+        .expect("stdout binding");
 
         binding
             .send_event(&sample_event("ok"))

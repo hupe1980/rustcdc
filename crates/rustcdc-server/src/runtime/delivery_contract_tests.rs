@@ -243,9 +243,10 @@ impl Pipeline {
             "backoff_max_ms": 1,
         }))
         .expect("unreachable http sink config");
-        let binding = crate::sink::build_binding(&unreachable, 1 << 20)
-            .await
-            .expect("http binding");
+        let binding =
+            crate::sink::build_binding(&unreachable, &crate::sink::SinkBuildContext::new(1 << 20))
+                .await
+                .expect("http binding");
         let mut sink_metrics = crate::sink::SinkMetricsRegistry::default();
         sink_metrics.register(binding.metrics_handle());
         pipeline.router = crate::pipeline::router::single(binding);

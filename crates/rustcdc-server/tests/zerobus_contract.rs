@@ -210,9 +210,12 @@ fn event(id: u64) -> Event {
 }
 
 async fn build_router(addr: SocketAddr) -> rustcdc_server::pipeline::router::TableRouter {
-    let binding = rustcdc_server::sink::build_binding(&sink_config(addr), 1 << 20)
-        .await
-        .expect("zerobus binding");
+    let binding = rustcdc_server::sink::build_binding(
+        &sink_config(addr),
+        &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+    )
+    .await
+    .expect("zerobus binding");
     rustcdc_server::pipeline::router::single(binding)
 }
 
@@ -317,9 +320,12 @@ async fn the_sink_advertises_at_least_once_not_effectively_once() {
     let state: Shared = Arc::new(Mutex::new(FakeState::default()));
     let addr = start_fake(Arc::clone(&state)).await;
 
-    let binding = rustcdc_server::sink::build_binding(&sink_config(addr), 1 << 20)
-        .await
-        .expect("binding");
+    let binding = rustcdc_server::sink::build_binding(
+        &sink_config(addr),
+        &rustcdc_server::sink::SinkBuildContext::new(1 << 20),
+    )
+    .await
+    .expect("binding");
     assert_eq!(binding.name(), "zerobus");
     assert_eq!(
         binding.delivery_guarantee(),

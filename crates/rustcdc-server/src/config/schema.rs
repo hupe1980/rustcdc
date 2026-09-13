@@ -1087,6 +1087,9 @@ mod tests {
         KafkaSinkConfig {
             brokers: brokers.to_string(),
             topic: "cdc-events".to_string(),
+            topic_naming: crate::topic::TopicNamingConfig::default(),
+            tombstones_on_delete: true,
+            record_headers: crate::config::sink::KafkaRecordHeaders::Cdc,
             client_id: "cdc-test".to_string(),
             ack_timeout_ms: 1_000,
             retry_backoff_ms: 100,

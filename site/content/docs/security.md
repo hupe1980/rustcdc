@@ -66,10 +66,31 @@ called out here rather than left to be discovered:
   stored digest is a password equivalent, and PostgreSQL has deprecated the method.
 - **Cleartext** is refused unless the transport is TLS.
 
+### Outbound webhook signing
+
+The HTTP sink signs every request to
+[Standard Webhooks](https://www.standardwebhooks.com/): HMAC-SHA256 (`v1`) or ed25519
+(`v1a`) over `{id}.{timestamp}.{payload}`. Correctness is pinned against the
+specification's published test vector, so the check is interoperability with receiver
+libraries rather than self-consistency.
+
+- **The signed bytes are the sent bytes** — one `Bytes` buffer reaches both the signer and
+  the HTTP client, so no re-serialisation can slip between them.
+- **Each attempt is signed afresh**, because the timestamp is inside the signature and
+  receivers reject one outside their tolerance.
+- **Signing keys must be deferred references.** A literal `key` is refused at load; a leaked
+  one lets anyone forge events as this pipeline.
+- **A key with the wrong scheme's prefix is refused** — an ed25519 private key is a valid
+  HMAC secret and would otherwise sign requests nothing could verify.
+
+Prefer ed25519 whenever the receiver is not you: it holds only the public half, so a
+compromised receiver cannot forge events back.
+
 ## Secrets
 
 - Passwords and connection secrets are held in `SecretString`, which zeroizes on drop and
   redacts in `Debug` output.
+- The webhook signer's `Debug` prints its scheme and key *count*, never key material.
 - Structured log events redact credential-bearing fields. `tests/logging_structured.rs`
   asserts that a connection error carrying a JWT does not reproduce it in the log line.
 

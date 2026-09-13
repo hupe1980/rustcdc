@@ -308,6 +308,9 @@ Before going to production, work through these items:
 
 - [ ] **Sink** — swap `stdout` for `kafka`, `http`, or `iceberg`
   ([sink configuration](@/docs/configuration.md#3-sink-sink-sinks))
+- [ ] **Kafka topic layout** — one topic, or `topic = "cdc.${schema}.${table}"` for one per
+  table. Create them first; rustcdc does not
+  ([topic naming](@/docs/configuration.md#topic-naming))
 - [ ] **Delivery contract** — set `delivery_contract = "at_least_once"` (default)
   or `"effectively_once"` for Kafka
   ([delivery contracts](@/docs/concepts.md#3-delivery-contracts))
