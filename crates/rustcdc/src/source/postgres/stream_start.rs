@@ -87,6 +87,15 @@ pub(super) async fn start_postgres_stream(
     } else {
         0
     };
+    // Cloned before the SqlPeek branch can move `client` into the provider. Under that
+    // transport the reselect shares the provider's connection rather than opening a second
+    // one; under streaming replication the WAL has its own socket and this is the only
+    // ordinary SQL client there is.
+    let reselect_client = connection
+        .config
+        .reselect_unavailable_columns
+        .then(|| client.clone());
+
     let provider: Box<dyn super::decoder::PgOutputMessageProvider> =
         match connection.config.wal_transport {
             WalTransport::StreamingReplication => Box::new(
@@ -128,5 +137,6 @@ pub(super) async fn start_postgres_stream(
         connection.config.table_include_list.clone(),
         connection.config.table_exclude_list.clone(),
         catalog_primary_keys,
+        reselect_client,
     )))
 }

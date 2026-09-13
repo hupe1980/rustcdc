@@ -18,7 +18,7 @@
 //! [`crate::sink::kafka`], which drive a `FakeBroker` and assert on committed records
 //! and abort markers directly. What is asserted *here* is the property those tests
 //! cannot see: that the crash window documented at
-//! <https://hupe1980.github.io/rustcdc-server/docs/concepts/#3-delivery-contracts>
+//! <https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts>
 //! is real, and that the reconciliation marker detects it.
 
 use std::path::Path;

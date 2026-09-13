@@ -219,6 +219,21 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
     /// snapshot from a quiesced replica or restrict the snapshot with
     /// [`IncrementalSnapshotConfig::table_conditions`](crate::source::IncrementalSnapshotConfig::table_conditions).
     ///
+    /// # On MariaDB
+    ///
+    /// **Always the ordinal bracket.** The set is read from the last column of
+    /// `SHOW MASTER STATUS`, and MariaDB has no such column before 12.3 — so the value is absent,
+    /// the set is empty, and the fallback above applies to every MariaDB incremental snapshot.
+    /// That is safe rather than merely tolerable: the fallback is chosen because the watermarks
+    /// carry no set, not because a parse guessed.
+    ///
+    /// `@@gtid_binlog_pos` looks like the missing piece and is not. MariaDB advances it when the
+    /// event group is **written to the binlog** — the same flush-stage timing that makes
+    /// file-and-position unsound here. What makes the set-based bracket correct is that
+    /// `Executed_Gtid_Set` is updated *after* the engine commit, which is a property of MySQL's
+    /// implementation rather than of GTIDs as such. Debezium's read-only incremental snapshot is
+    /// MySQL-only for the same reason.
+    ///
     /// The bracket test itself lives in
     /// [`event_in_bracket`](crate::source::IncrementalSnapshotBackend::event_in_bracket), which
     /// this backend overrides to compare GTID sets. An earlier design instead reported in-flight

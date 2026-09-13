@@ -23,6 +23,7 @@ mod handoff;
 pub mod incremental_snapshot;
 mod parser;
 mod query;
+mod reselect;
 mod snapshot_chunk;
 mod snapshot_finalize;
 mod snapshot_start;
@@ -130,6 +131,15 @@ pub struct PostgresStreamHandle {
     last_slot_lag_bytes: u64,
     table_include_list: Vec<String>,
     table_exclude_list: Vec<String>,
+    /// Ordinary SQL client used to re-read unchanged TOASTed values, when
+    /// [`PostgresSourceConfig::reselect_unavailable_columns`] is on.
+    ///
+    /// `None` when the feature is off, so the client is not held — and under
+    /// [`WalTransport::SqlPeek`] the same client is owned by the provider, so the
+    /// `Arc` is shared rather than a second connection.
+    reselect_client: Option<Arc<Client>>,
+    /// Column types per table, for building the reselect predicate. Populated lazily.
+    reselect_column_types: reselect::ColumnTypeCache,
 }
 
 impl PostgresStreamHandle {
@@ -162,6 +172,7 @@ impl PostgresStreamHandle {
         table_include_list: Vec<String>,
         table_exclude_list: Vec<String>,
         catalog_primary_keys: HashMap<(String, String), Vec<String>>,
+        reselect_client: Option<Arc<Client>>,
     ) -> Self {
         Self {
             source_name,
@@ -185,6 +196,8 @@ impl PostgresStreamHandle {
             last_slot_lag_bytes: 0,
             table_include_list,
             table_exclude_list,
+            reselect_client,
+            reselect_column_types: reselect::ColumnTypeCache::new(),
         }
     }
 }
@@ -604,6 +617,26 @@ pub struct PostgresSourceConfig {
     /// How the WAL stream is read. Defaults to [`WalTransport::StreamingReplication`].
     #[serde(default)]
     pub wal_transport: WalTransport,
+
+    /// Re-read unchanged TOASTed values from the source instead of reporting them absent.
+    ///
+    /// PostgreSQL omits an unchanged out-of-line value from the WAL, so an `UPDATE` that does
+    /// not touch such a column emits an event without it and names it in
+    /// [`Event::unavailable_columns`](crate::Event::unavailable_columns). With this set, the
+    /// connector reads the missing values back by row key and fills them in, removing them
+    /// from that list. Recovered values use the same projection as the snapshot path, so they
+    /// match what the WAL would have carried.
+    ///
+    /// **Cost:** one extra `SELECT` per event that has holes, on the ordinary SQL connection.
+    ///
+    /// **Limits:** the value is read *now*, not at the event's LSN. The window is narrow —
+    /// PostgreSQL omits the value precisely because the statement did not modify it — but a
+    /// later `UPDATE` to that column can attach a newer value to this event, and a later
+    /// `DELETE` leaves the columns absent. Holes in the `before` image are never filled.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub reselect_unavailable_columns: bool,
 }
 
 /// How the connector reads the WAL stream from PostgreSQL.
@@ -1124,7 +1157,29 @@ impl StreamHandle for PostgresStreamHandle {
                 self.last_idle_advance_at = Some(std::time::Instant::now());
 
                 let lsn_before = self.stream.lsn_position;
-                let events = self.process_messages(xlog_data).await?;
+                let mut events = self.process_messages(xlog_data).await?;
+                // Fill unchanged-TOAST holes before the batch leaves the connector, so
+                // every downstream stage — transforms, the idempotency fingerprint, the
+                // sink — sees one shape of event rather than two.
+                if let Some(client) = self.reselect_client.clone()
+                    && events.iter().any(|e| !e.unavailable_columns.is_empty())
+                {
+                    let stats = reselect::reselect_events(
+                        &client,
+                        &mut events,
+                        &mut self.reselect_column_types,
+                    )
+                    .await;
+                    if stats.columns_filled > 0 || stats.events_unresolved > 0 {
+                        tracing::debug!(
+                            target: "rustcdc::source::postgres",
+                            events_filled = stats.events_filled,
+                            columns_filled = stats.columns_filled,
+                            events_unresolved = stats.events_unresolved,
+                            "postgres reselected unchanged TOASTed values",
+                        );
+                    }
+                }
                 if !events.is_empty() {
                     tracing::debug!(
                         target: "rustcdc::source::postgres",
@@ -1515,6 +1570,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            None,
         );
 
         let started = std::time::Instant::now();
@@ -1608,6 +1664,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            None,
         );
         let events = handle
             .next_events(2_000)
@@ -1658,6 +1715,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            None,
         );
 
         // Simulate having shrunk hard during an earlier spike.
@@ -1830,6 +1888,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             catalog_primary_keys,
+            None,
         );
         handle.stream.replication_status = StreamState::Streaming;
         handle
@@ -2295,6 +2354,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            None,
         );
         let result = handle.next_events(100).await;
         assert!(result.is_err());
@@ -3356,6 +3416,7 @@ mod tests {
             vec!["public.allowed_table".into()], // include-list excludes "excluded_table"
             Vec::new(),
             std::collections::HashMap::new(),
+            None,
         );
 
         // next_events times out with no events (batch is filtered) but must have
@@ -3431,6 +3492,7 @@ mod tests {
             vec!["public.allowed_table".into()],
             Vec::new(),
             std::collections::HashMap::new(),
+            None,
         );
 
         let events = handle.next_events(5).await.unwrap();

@@ -183,7 +183,17 @@ MariaDB is configured identically to MySQL. Use `type = "mariadb"` in `cdc.toml`
 ### MariaDB-specific notes
 
 - **GTID:** MariaDB uses a different GTID format (`domain_id-server_id-sequence_nr`).
-  rustcdc handles both MySQL and MariaDB GTID formats transparently.
+  rustcdc handles both MySQL and MariaDB GTID formats transparently for **offsets and
+  positioning**.
+- **Incremental snapshots use the ordinal bracket on MariaDB.** The GTID watermark that
+  sharpens the snapshot bracket is read from the last column of `SHOW MASTER STATUS`, which
+  MariaDB has only from 12.3. Below that the connector falls back to binlog
+  file-and-position — the same path MySQL takes with `gtid_mode = OFF`, and with the same
+  residual window: one commit's gap between the binlog flush and the engine commit,
+  affecting only a row *both* modified in that gap *and* present in the chunk being read.
+  `@@gtid_binlog_pos` is not a substitute — it advances at the binlog flush, which is the
+  timing that causes the gap. To close it, snapshot from a quiesced replica or narrow the
+  snapshot with `incremental_snapshot.table_conditions`.
 - **Binlog row annotations:** if `binlog_annotate_row_events = ON`, rustcdc logs
   the SQL statement that triggered each row event in structured log output.
 - **TLS:** some MariaDB test/development images do not have SSL capability.

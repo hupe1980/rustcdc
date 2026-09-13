@@ -722,6 +722,11 @@ pub struct TopicResolver {
     /// collision could be missed by a table arriving after an eviction. A few tens of
     /// bytes per table is not a budget worth managing.
     cache: HashMap<String, Arc<str>>,
+    /// The most recently resolved `(schema, table)` and the topic it produced.
+    ///
+    /// This is the single-entry fast path. It is kept beside the map rather than in it
+    /// because the win is skipping the hash, not skipping the lookup.
+    last: Option<(String, String, Arc<str>)>,
     /// Reusable buffer for building a cache key without allocating on lookup.
     key_scratch: String,
     /// Which table first claimed each topic name, and whether sanitisation was involved
@@ -745,6 +750,7 @@ impl TopicResolver {
             template,
             naming,
             cache: HashMap::new(),
+            last: None,
             key_scratch: String::new(),
             origins: HashMap::new(),
         }
@@ -757,27 +763,50 @@ impl TopicResolver {
     /// The topic for one event, rendering and validating it the first time its table is
     /// seen and returning the cached name afterwards.
     ///
-    /// The lookup key is built into a reusable buffer, so a cached hit costs one hash
-    /// and an `Arc` refcount — no allocation. That matters less than it looks: before
-    /// templates existed the sink cloned its topic `String` for every record, so even
-    /// rendering afresh each time would not have been a regression. What the cache
-    /// actually buys is the *checks* — the character scan, the length test, and the
-    /// collision test, which is only meaningful against the set of names already handed
-    /// out.
+    /// Three tiers, cheapest first: the single-entry fast path (two string comparisons and
+    /// an `Arc` clone — no hashing, no allocation), then the map, then a render. The fast
+    /// path is what the access pattern actually looks like: a transaction touches one
+    /// table many times before it touches another, so it hits on nearly every event after
+    /// the first.
+    ///
+    /// None of this is really about allocation — before templates existed the sink cloned
+    /// a topic `String` for every record, so even rendering afresh each time would not be
+    /// a regression. What the cache buys is the *checks*: the character scan, the length
+    /// test, and above all the collision test, which is only meaningful against the set of
+    /// names already handed out.
     pub fn resolve(
         &mut self,
         schema: Option<&str>,
         table: &str,
     ) -> Result<Arc<str>, TopicResolveError> {
+        // `None` and `Some("")` render identically, so they share one key here too.
+        let schema_key = schema.unwrap_or("");
+
+        if let Some((last_schema, last_table, topic)) = &self.last
+            && last_schema.as_str() == schema_key
+            && last_table.as_str() == table
+        {
+            return Ok(Arc::clone(topic));
+        }
+
         self.key_scratch.clear();
-        self.key_scratch.push_str(schema.unwrap_or(""));
+        self.key_scratch.push_str(schema_key);
         self.key_scratch.push(CACHE_KEY_SEPARATOR);
         self.key_scratch.push_str(table);
 
-        match self.cache.get(self.key_scratch.as_str()) {
-            Some(topic) => Ok(Arc::clone(topic)),
-            None => self.insert(schema, table),
-        }
+        let topic = match self.cache.get(self.key_scratch.as_str()) {
+            Some(topic) => Arc::clone(topic),
+            None => self.insert(schema, table)?,
+        };
+
+        // Only a successful resolve arms the fast path: a table whose name is rejected must
+        // be rejected again on its next event, not answered from a cache of one.
+        self.last = Some((
+            schema_key.to_string(),
+            table.to_string(),
+            Arc::clone(&topic),
+        ));
+        Ok(topic)
     }
 
     /// Render, check for a collision, and record the result. Cold path.
@@ -1125,6 +1154,30 @@ mod tests {
         let second = resolver.resolve(Some("public"), "orders").unwrap();
         assert_eq!(&*first, "cdc.public.orders");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// A rejected table must be rejected again on its next event.
+    ///
+    /// The single-entry fast path is armed only by a *successful* resolve. Arming it on
+    /// the way out of `resolve` regardless would cache nothing — the error is not an
+    /// `Arc<str>` — but arming it before the render would hand the previous table's topic
+    /// to a table whose own name was refused, publishing one table's rows under another
+    /// table's name.
+    #[test]
+    fn a_rejected_table_does_not_answer_from_the_fast_path() {
+        let mut resolver = TopicResolver::new(
+            TopicTemplate::parse("cdc.${schema}.${table}").unwrap(),
+            reject(),
+        );
+        resolver
+            .resolve(Some("public"), "orders")
+            .expect("a legal table arms the fast path");
+        resolver
+            .resolve(Some("public"), "order items")
+            .expect_err("a space is not a legal topic character");
+        resolver
+            .resolve(Some("public"), "order items")
+            .expect_err("and it must still be refused on the next event");
     }
 
     /// The cache key spans both halves: two schemas holding a same-named table are the

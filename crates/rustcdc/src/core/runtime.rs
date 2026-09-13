@@ -505,6 +505,11 @@ pub struct IdempotencyOptions {
     /// Sized for the replay distance of the deployment, not for the event rate: once the
     /// window fills, duplicates older than it stop being suppressed. Evictions are
     /// counted in `RuntimeAdminSnapshot::idempotency_evictions`.
+    ///
+    /// Raising it costs memory and nothing else. The fingerprint is 128 bits wide, so the
+    /// birthday bound stays unreachable at any window a process can hold — which is what
+    /// makes "size it for replay distance" the whole rule rather than a trade-off against
+    /// collision risk.
     pub capacity: usize,
     /// Optional fingerprint lifetime in milliseconds.
     ///

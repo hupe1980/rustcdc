@@ -2185,6 +2185,40 @@ impl AdminState {
         })
     }
 
+    /// The complete `/metrics` body, assembled from every renderer that contributes to it.
+    ///
+    /// # Why this is a function rather than the handler's body
+    ///
+    /// Because the exposition is a **concatenation of independently-built blocks**, and
+    /// the invariant that matters spans all of them: Prometheus and OpenMetrics both
+    /// require exactly one `# HELP`/`# TYPE` header per metric family, and two blocks
+    /// emitting the same family produce a document some parsers reject outright — taking
+    /// every metric down, not just the duplicated one.
+    ///
+    /// `PrometheusTextEncoder` already guards this *within* one block. Nothing guarded it
+    /// *across* blocks, because no test could reach the assembled document: the handler
+    /// built it inline and every test called one renderer directly. Naming the seam is
+    /// what lets `the_metrics_exposition_declares_each_family_once` stand on the real
+    /// output rather than on a reconstruction of it that could drift from the handler.
+    pub(crate) async fn metrics_exposition(&self) -> String {
+        let snapshot_prom = snapshot_progress_prometheus(self.incremental_snapshot_progress());
+        let data = self.data.read().await;
+        let prom = runtime_metrics_prometheus(&data);
+        let slo_prom = slo_prometheus(&data, self.signal_worker_alive());
+        let auth_prom = self.auth_prometheus();
+        let audit_drop = self
+            .audit_log_drop_counter
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        let audit_prom = format!(
+            "# HELP rustcdc_audit_log_drop_total Audit-log entries dropped because the write channel was full\n\
+             # TYPE rustcdc_audit_log_drop_total counter\n\
+             rustcdc_audit_log_drop_total {audit_drop}\n"
+        );
+        format!("{prom}{slo_prom}{auth_prom}{audit_prom}{snapshot_prom}")
+    }
+
     fn auth_prometheus(&self) -> String {
         let Ok(auth) = self.auth_state.read() else {
             return String::new();
@@ -3354,28 +3388,13 @@ async fn metrics(
         return unauthorized_response();
     }
 
-    let snapshot_prom = snapshot_progress_prometheus(admin.incremental_snapshot_progress());
-    let data = admin.data.read().await;
-    let prom = runtime_metrics_prometheus(&data);
-    let slo_prom = slo_prometheus(&data, admin.signal_worker_alive());
-    let auth_prom = admin.auth_prometheus();
-    let audit_drop = admin
-        .audit_log_drop_counter
-        .as_ref()
-        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(0);
-    let audit_prom = format!(
-        "# HELP rustcdc_audit_log_drop_total Audit-log entries dropped because the write channel was full\n\
-         # TYPE rustcdc_audit_log_drop_total counter\n\
-         rustcdc_audit_log_drop_total {audit_drop}\n"
-    );
     (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        format!("{prom}{slo_prom}{auth_prom}{audit_prom}{snapshot_prom}"),
+        admin.metrics_exposition().await,
     )
         .into_response()
 }
@@ -3570,6 +3589,8 @@ pub async fn serve(
 
 #[cfg(test)]
 mod auth_tests;
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 mod probe_tests;
 #[cfg(test)]

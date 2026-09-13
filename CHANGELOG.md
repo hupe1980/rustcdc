@@ -304,6 +304,161 @@ loaded cleanly and failed on first use. For the DLQ that is the worst moment: th
 dead-letter path runs during an incident. All four now use the same rules as
 `sink.kafka.topic`.
 
+### Fixed: `docker/Dockerfile.example` pinned a Rust below the MSRV
+
+`FROM rust:1.92-bookworm`, against a workspace `rust-version` of `1.94.1` — so the example
+could not build the crate it demonstrates. CI derives its own toolchain from the manifest and
+the main `Dockerfile` tracks it by hand, but nothing compared the two, so this drifted
+silently. The gate now asserts every Rust pin in every Dockerfile equals `rust-version`.
+
+### Fixed: a non-ASCII column name panicked the DDL parser
+
+`ALTER TABLE public.kunden ADD COLUMN kundennummerü VARCHAR(10)` panicked the poll loop.
+
+DDL arrives *from the database* — a MySQL binlog query event, a PostgreSQL event trigger — so
+the statement is whatever an operator actually ran, and accented or dotless-i identifiers are
+ordinary in German, Turkish, Nordic and Spanish schemas. Three sites took a byte offset from an
+uppercased copy of the statement and used it to index the statement itself:
+
+* `strip_optional_keyword` split at `"IF NOT EXISTS".len()` without checking the index was a
+  character boundary. `kundennummer` is 12 bytes, so `ü` occupies 12..14 and byte 13 is inside
+  it;
+* `RENAME COLUMN` searched for `" TO "` in an uppercased copy. `ı` is two bytes and folds to a
+  one-byte `I`, so every offset past it was one byte short — landing inside the character;
+* `extract_primary_keys` located `PRIMARY KEY` the same way, so a key list following such an
+  identifier was read from the wrong offset.
+
+The first two panic; the third returns the wrong columns, which is quieter and worse. All
+three now search the original case-insensitively (`find_ascii_ci`, `strip_prefix_ascii_ci`)
+and split with `split_at_checked`. Four regression tests, each verified against its planted
+defect.
+
+### Fixed: the idempotency fingerprint was 64 bits, and a match is irreversible
+
+`fingerprint_event_transient` returned a `u64`, and `EventIdempotencyGuard` keyed its window
+on it. A match there does two things that cannot be undone: the event is dropped and the
+checkpoint advances past it. So a hash collision is not a degraded answer — it is the exact
+silent data loss the guard exists to prevent, delivered by the guard.
+
+Expected collisions run at about `n · w / 2^64` for `n` events and a window of `w`. At the
+default window of 100 000 that is small — but the window is the knob operators are told to
+raise when evictions climb, so the exposure grows with careful tuning.
+
+The fingerprint is now **128 bits**, which puts the term out of reach and lets the window be
+sized for replay distance alone. Both halves come from independently-seeded `AHasher`s fed by
+a **single** traversal, so the JSON walk still happens once. The test pins the *entropy*, not
+the type: the regression worth catching is a `u128` filled only in its low half.
+
+### Added: `reselect_unavailable_columns` for PostgreSQL
+
+PostgreSQL never writes an **unchanged** out-of-line (TOASTed) value to the WAL, so an
+`UPDATE` that does not touch such a column emits an event without it. rustcdc has always
+reported that precisely — the column is named in `unavailable_columns` and absent rather
+than `NULL` — which is correct and leaves every consumer handling partial rows.
+
+```toml
+[source.postgres]
+reselect_unavailable_columns = true
+```
+
+One extra `SELECT` per affected event, keyed on the event's own row key, filling the
+after-image and removing the filled columns from `unavailable_columns`. Events without
+holes are untouched, and the per-table catalog lookup happens once per stream.
+
+**The recovered values go through the same projection as the snapshot path**, so they are
+byte-identical to what pgoutput would have sent. This is not incidental: an ordinary
+`::text` cast renders a `boolean` as `true` where the WAL carries `t`, so a sink comparing a
+reselected row against a streamed one would see a difference that is not there.
+
+**Off by default**, because the value is read *now* rather than at the event's LSN. The
+window is narrow — PostgreSQL withholds the value precisely *because* the statement did not
+modify it, so only a later transaction can falsify it — but it is not closed.
+
+Two behaviours are deliberate and tested against a live server: a row deleted before the
+reselect runs leaves the columns **absent** rather than `NULL`, and `before` holes are never
+filled, since reading the row now cannot recover what a column held beforehand. A reselect
+that cannot run never fails the pipeline.
+
+### Fixed: `effectively_once` was decided by `[sink]` alone
+
+The same shape as the entry above, on the rule where it costs the most. `validate_delivery_contract`
+read `config.sink` and nothing else, so three configurations loaded cleanly and delivered
+at-least-once under the stronger contract's name:
+
+* **A routed `[[sinks]]` entry that cannot honour it.** `delivery_contract = "effectively_once"`
+  with a transactional Kafka `[sink]` and a `file_jsonl` named sink behind a
+  `[[pipeline.routes]]` rule. Every event routed to that sink lost the guarantee; nothing
+  reported it at startup or afterwards.
+* **Two transactional Kafka sinks.** One transaction cannot span two producers, and
+  `BuiltRouter::transaction_handle` already declines to pick — it is `None` when a second
+  exists. A `None` handle builds a *separate* producer for the checkpoint, which then commits
+  outside either transaction: precisely the window the contract exists to close. The
+  binding's own doc comment said the loader rejected this. It did not.
+* **Fan-out**, even with every child a transactional Kafka sink. The children are erased to
+  `BoxedSink`, so no child's producer is reachable and no transaction spans them. The
+  capability test asked whether *all* children were capable and answered yes;
+  `BuiltSink::transaction_handle` returned `None` regardless. That comment, too, claimed a
+  rejection that was not implemented.
+
+All three are rejected at load now, naming the offending sink the way the operator wrote it
+(`sinks.audit`, not "the file sink") and naming the setting that would fix it.
+
+### Fixed: the documented Snowflake exception could not be configured
+
+`delivery_contract = "effectively_once"` with a Snowflake sink — the configuration the sink's
+own documentation describes, reaching exactly-once through the channel offset token with no
+Kafka anywhere — failed at load with *"missing idempotent delivery and transactional
+checkpoint barrier coupling"*, naming a capability that sink has.
+
+The cause was the model rather than a missing arm. The contract was tested by asking two
+yes/no questions — idempotent delivery? transactional barrier? — and requiring both. A Kafka
+sink in **idempotent** mode and a Snowflake sink answer that pair identically, yes and no,
+yet one reaches the contract and the other does not. No combination of the two flags
+separates them.
+
+The question that has an answer is *which mechanism*: a Kafka transaction, or a
+destination-side offset token. Only the first constrains the state backend, so the
+`kafka_topic` requirement now hangs off the mechanism instead of off the contract, and a
+pure-Snowflake pipeline is no longer asked for a Kafka cluster it does not use.
+
+### Fixed: nothing checked `/metrics` for a duplicate metric family
+
+The body is seven independently-built blocks concatenated — the library's runtime renderer,
+the recoverable-error and sink renderers, the SLO block, the auth block, the audit counter
+and snapshot progress. Prometheus and OpenMetrics both allow exactly one `# HELP`/`# TYPE`
+per family, and `PrometheusTextEncoder` tracks that — but only within one encoder instance,
+and three of those blocks never touch the encoder; they `push_str` their headers directly.
+
+So the invariant that spans the document had no guard, and its failure mode is not subtle:
+a strict parser rejects the **whole** scrape, so every metric disappears at once. The blocks
+are disjoint today and a test now keeps them that way, asserting against the real assembled
+body rather than a reconstruction of it — the handler and the test call the same
+`AdminState::metrics_exposition`.
+
+### Fixed: a topic-resolver fast path that was documented but never written
+
+`TopicResolver`'s doc described "a single-entry fast path … two string comparisons and an
+`Arc` clone, with no hashing and no allocation", and the method directly beneath it described
+the opposite — "a cached hit costs one hash". There was no fast path. It exists now, because
+the access pattern the comment described is the real one: a transaction touches one table
+many times before it touches another.
+
+### Fixed: three documentation links pointed at a site that does not exist
+
+`https://hupe1980.github.io/rustcdc-server/docs/…` in two production doc comments and one
+test. The site is served from `/rustcdc`. The `EffectivelyOnce` doc comment they sat in was
+also still describing the **superseded** ordering — "the transaction commits before the
+checkpoint, so a crash in between replays the batch" — which is the window the current design
+removed by writing the checkpoint inside the transaction.
+
+### Changed: the policy gate checks `concepts/` when it is present
+
+The architecture notes are gitignored, so they are absent in CI and nothing had ever
+validated them. They had rotted accordingly: three references to a `site/content/library/`
+directory that does not exist under that name, in the notes that define the rule about
+documentation rotting. The markdown link check now covers them when the directory is there,
+skipping the "target is gitignored" test that is normal for a local-only tree.
+
 ### Breaking
 
 * **`sink.kafka.topic` is parsed, not taken literally.** A topic containing `${` must now be a
@@ -331,12 +486,42 @@ dead-letter path runs during an incident. All four now use the same rules as
 * **`KafkaSink::build_send` takes `Option<Bytes>`**, where `None` is a tombstone.
   `Some(Bytes::new())` remains a zero-length value, which compaction preserves — the two are
   not interchangeable.
+* **`delivery_contract = "effectively_once"` is checked against every routed sink**, allows at
+  most one transactional Kafka sink, and rejects fan-out. A configuration doing any of those
+  loaded before and delivered at-least-once; it now fails at load, naming the sink. If you
+  relied on the old behaviour you were not getting the contract — `at_least_once` is the
+  honest spelling of what was actually happening.
+* **`delivery_contract = "effectively_once"` with a Snowflake sink now loads.** It was
+  rejected before, which was the defect; no configuration breaks, but a previously impossible
+  one becomes valid.
+* **`DeliveryContract::is_satisfied_by` takes `(SinkDeliveryGuarantee, bool)`** instead of two
+  booleans, and `requires_idempotent_delivery` / `requires_transactional_checkpoint_barrier`
+  are gone. The pair could not distinguish an idempotent Kafka producer from a Snowflake
+  channel. `rustcdc-server` is `publish = false`, so this is internal.
+* **`fingerprint_event_transient` returns `u128`** instead of `u64`. Callers that stored or
+  compared the value need the wider type; it was never stable across restarts, so nothing
+  persisted can be affected. `fingerprint_event_stable` is unchanged.
+* **`PostgresSourceConfig` gained `reselect_unavailable_columns`.** Struct literals that do
+  not use `..Default::default()` need the field; it defaults to `false`, which is the
+  previous behaviour.
 
 ### Migrating
 
-A configuration that was working needs no change: every new rejection is a name or a setting
-the broker or the sink would have refused anyway, moved from first use to startup. If one of
-them fires, the message names the field and the block.
+Most new rejections need no action: they are names or settings the broker or the sink would
+have refused anyway, moved from first use to startup. If one fires, the message names the
+field and the block.
+
+**One class is different and worth reading before you upgrade.** The `effectively_once`
+rules reject configurations that previously *ran* — a routed sink that cannot carry the
+contract, a second transactional Kafka sink, a fan-out sink. Nothing downstream refused
+those; they ran and delivered at-least-once while reporting the stronger contract. So the
+upgrade turns a silent guarantee failure into a startup error, and the fix is a decision
+rather than a typo:
+
+* if the guarantee is what you need, route through a single transactional Kafka sink (or a
+  Snowflake sink) and keep `effectively_once`;
+* if the extra destinations matter more, set `delivery_contract = "at_least_once"`, which
+  is what the pipeline was already delivering.
 
 To adopt topic-per-table, replace the per-table `[[sinks]]` / `[[pipeline.routes]]` pairs with
 one sink:

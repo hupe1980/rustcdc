@@ -23,7 +23,7 @@ delivery_contract = "at_least_once"   # at_least_once | effectively_once
 | Field | Required | Default | Description |
 |---|---|---|---|
 | `api_version` | yes | — | Schema version. Must be `"v1"`. |
-| `delivery_contract` | no | `"at_least_once"` | When the checkpoint advances relative to delivery. `"effectively_once"` additionally requires a transactional Kafka sink **and** `state.offset.backend = "kafka_topic"` on the same cluster, because it writes the checkpoint inside the sink's transaction; any other combination is rejected at load. See [delivery contracts](@/docs/concepts.md#3-delivery-contracts). |
+| `delivery_contract` | no | `"at_least_once"` | When the checkpoint advances relative to delivery. `"effectively_once"` needs either a transactional Kafka sink with `state.offset.backend = "kafka_topic"` on the same cluster, or a Snowflake sink (whose channel offset token needs no Kafka). It applies to **every** routed sink, allows at most one transactional Kafka sink, and rejects fan-out; any other combination is rejected at load, naming the sink at fault. See [delivery contracts](@/docs/concepts.md#3-delivery-contracts). |
 
 ### Unknown keys are rejected
 

@@ -294,7 +294,7 @@ async fn run_with_runtime_state(
         app_config.delivery_contract,
     )?;
     let delivery_contract_satisfied = app_config.delivery_contract.is_satisfied_by(
-        sink_idempotent_delivery_capable,
+        sink.delivery_guarantee(),
         sink_transactional_checkpoint_barrier_capable,
     );
     let checkpoint_txn_reconciliation_enabled = app_config.delivery_contract
@@ -985,6 +985,7 @@ pub(crate) mod tests {
             create_replication_slot_if_missing: false,
             failover_slot: false,
             wal_transport: Default::default(),
+            reselect_unavailable_columns: false,
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

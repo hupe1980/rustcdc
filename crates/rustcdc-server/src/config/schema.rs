@@ -210,13 +210,22 @@ pub enum DeliveryContract {
     #[default]
     AtLeastOnce,
 
-    /// Each delivered batch is atomic at the sink: a Kafka transaction commits all of
-    /// it or none of it.
+    /// A delivered batch and the checkpoint describing it become durable **together**.
     ///
-    /// **This is not end-to-end exactly-once.** The transaction commits before the
-    /// checkpoint, so a crash in between replays the batch under a new producer epoch
-    /// and the consumer sees duplicates. See
-    /// <https://hupe1980.github.io/rustcdc-server/docs/concepts/#3-delivery-contracts>.
+    /// Two mechanisms reach this, and the loader accepts only configurations that have
+    /// one of them:
+    ///
+    /// * a Kafka sink with `delivery_mode = "transactional"` and the checkpoint in a
+    ///   `kafka_topic` state backend on the same cluster — the checkpoint is written
+    ///   *through* the store inside the open transaction, so one `commit_transaction`
+    ///   makes the records and the position durable at once;
+    /// * a sink carrying a destination-side offset token (`snowflake`), which advances
+    ///   before `flush` returns, so a replayed batch is filtered at the destination.
+    ///
+    /// Committing the barrier first and checkpointing afterwards is the ordering this
+    /// replaced: it left a window in which a crash re-delivered the batch to a
+    /// `read_committed` consumer. See
+    /// <https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts>.
     EffectivelyOnce,
 }
 
@@ -228,30 +237,32 @@ impl DeliveryContract {
         }
     }
 
-    pub fn requires_idempotent_delivery(self) -> bool {
-        matches!(self, Self::EffectivelyOnce)
-    }
-
-    pub fn requires_transactional_checkpoint_barrier(self) -> bool {
-        matches!(self, Self::EffectivelyOnce)
-    }
-
+    /// Whether a built sink actually delivers this contract.
+    ///
+    /// # Why the guarantee and not a second boolean
+    ///
+    /// Because `effectively_once` is reached two different ways and the previous pair of
+    /// booleans could not tell them apart. A Kafka sink in **idempotent** mode and a
+    /// Snowflake sink both answer "idempotent delivery: yes, transactional barrier: no" —
+    /// identical answers, opposite verdicts. Snowflake reaches the contract through a
+    /// destination-side offset token, which is what
+    /// [`SinkDeliveryGuarantee::EffectivelyOnce`] records; an idempotent Kafka producer
+    /// does not, and reports `AtLeastOnceIdempotent`.
+    ///
+    /// Requiring both booleans therefore rejected the documented Snowflake path outright,
+    /// naming a capability that sink has as the one it lacks.
     pub fn is_satisfied_by(
         self,
-        idempotent_delivery_capable: bool,
+        guarantee: rustcdc::sink::SinkDeliveryGuarantee,
         transactional_checkpoint_barrier_capable: bool,
     ) -> bool {
-        if self.requires_idempotent_delivery() && !idempotent_delivery_capable {
-            return false;
+        match self {
+            Self::AtLeastOnce => true,
+            Self::EffectivelyOnce => {
+                transactional_checkpoint_barrier_capable
+                    || guarantee == rustcdc::sink::SinkDeliveryGuarantee::EffectivelyOnce
+            }
         }
-
-        if self.requires_transactional_checkpoint_barrier()
-            && !transactional_checkpoint_barrier_capable
-        {
-            return false;
-        }
-
-        true
     }
 }
 
