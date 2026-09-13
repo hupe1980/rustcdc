@@ -584,12 +584,14 @@ impl ZerobusSinkConfig {
 ///
 /// ```toml
 /// [[sinks]]
-/// name = "kafka_avro"
-/// type = "kafka"
-/// brokers = ["localhost:9092"]
-/// topic_prefix = "app"
-/// [sinks.codec]
-/// type = "avro_confluent"
+/// name    = "orders_kafka"
+/// type    = "kafka"
+/// brokers = "localhost:9092"
+/// topic   = "cdc.${schema}.${table}"
+///
+/// [[pipeline.routes]]
+/// table_pattern = "public.orders"
+/// sink          = "orders_kafka"
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct NamedSinkConfig {
