@@ -1328,6 +1328,8 @@ fn every_configuration_setting_is_read_by_something() {
         ("database", "source.rs: to_runtime_config"),
         ("capture_truncate_events", "source.rs: to_runtime_config"),
         ("instance_name", "source.rs: to_runtime_config"),
+        ("table_exclude_list", "source.rs: to_runtime_config"),
+        ("table_include_list", "source.rs: to_runtime_config"),
         // ── krafka builder mapping, src/config/sink.rs ─────────────────────────
         (
             "client_secret",
