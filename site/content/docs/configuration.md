@@ -1260,6 +1260,18 @@ name = "my-rule"
 
 See [transform pipeline](@/docs/concepts.md#4-transform-pipeline) for all action types.
 
+To skip a few operations rather than list the ones to keep — Debezium's
+`skipped.operations` — use `exclude_ops`. It cannot be combined with `include_ops`.
+
+```toml
+[[pipeline.transforms]]
+name = "skip-truncates"
+
+  [[pipeline.transforms.actions]]
+  type        = "filter"
+  exclude_ops = ["truncate"]
+```
+
 #### `mask` — redact, hash or encrypt fields
 
 ```toml

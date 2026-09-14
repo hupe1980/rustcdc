@@ -3,7 +3,7 @@ use rustcdc::transform::UnmatchedRule;
 use rustcdc::wasm::{TransformResult, WasmConfig as RustcdcWasmConfig, WasmRuntime};
 use rustcdc::{
     BeforeImage, Error, Event, FieldMappingConfig, FieldMappingTransform, MaskHashConfig,
-    MaskHashTransform, MaskRule, Operation, Result, fingerprint_event_stable,
+    MaskHashTransform, MaskRule, Result, fingerprint_event_stable,
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -569,14 +569,19 @@ fn apply_rules(event: Event, rules: &[CompiledRule]) -> Result<Option<Event>> {
 fn matches_when(event: &Event, when: &TransformWhenConfig) -> bool {
     matches_values(&event.table, &when.tables)
         && matches_optional_value(event.schema.as_deref(), &when.schemas)
-        && matches_values(op_name(&event.op), &when.ops)
+        && matches_values(event.op.to_str(), &when.ops)
 }
 
+/// An empty allow-list admits everything.
 fn matches_values(value: &str, allowed: &[String]) -> bool {
-    allowed.is_empty()
-        || allowed
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(value))
+    allowed.is_empty() || lists_value(value, allowed)
+}
+
+/// An empty list names nothing, which is what a deny-list needs.
+fn lists_value(value: &str, listed: &[String]) -> bool {
+    listed
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(value))
 }
 
 fn matches_optional_value(value: Option<&str>, allowed: &[String]) -> bool {
@@ -601,10 +606,13 @@ fn apply_action(event: Event, action: &TransformActionConfig) -> Result<Option<E
             include_tables,
             include_schemas,
             include_ops,
+            exclude_ops,
         } => {
+            let op = event.op.to_str();
             if !matches_values(&event.table, include_tables)
                 || !matches_optional_value(event.schema.as_deref(), include_schemas)
-                || !matches_values(op_name(&event.op), include_ops)
+                || !matches_values(op, include_ops)
+                || lists_value(op, exclude_ops)
             {
                 return Ok(None);
             }
@@ -751,7 +759,7 @@ fn project_metadata(
             TransformMetadataField::Operation => {
                 metadata.insert(
                     "operation".to_string(),
-                    Value::String(op_name(&event.op).to_string()),
+                    Value::String(event.op.to_str().to_string()),
                 );
             }
             TransformMetadataField::PrimaryKey => {
@@ -811,18 +819,6 @@ fn ensure_after_object_mut(event: &mut Event) -> Result<&mut Map<String, Value>>
     }
 }
 
-fn op_name(op: &Operation) -> &'static str {
-    match op {
-        Operation::Insert => "insert",
-        Operation::Update => "update",
-        Operation::Delete => "delete",
-        Operation::Read => "read",
-        Operation::SchemaChange => "schema_change",
-        Operation::Truncate => "truncate",
-        _ => "unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,6 +827,7 @@ mod tests {
     use crate::config::schema::{
         TransformRuntimeConfig, TransformRuntimeMode, WasmTransformConfig,
     };
+    use rustcdc::Operation;
     use rustcdc::core::SourceMetadata;
     use serde_json::json;
     use tempfile::TempDir;
@@ -896,10 +893,43 @@ mod tests {
                 include_tables: vec!["orders".to_string()],
                 include_schemas: Vec::new(),
                 include_ops: Vec::new(),
+                exclude_ops: Vec::new(),
             }],
         }];
 
         assert!(apply_rules(event, &rules).expect("apply").is_none());
+    }
+
+    #[test]
+    fn filter_exclude_ops_drops_only_the_listed_operations() {
+        let rules = vec![TransformRuleConfig {
+            name: "skip_truncates".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![TransformActionConfig::Filter {
+                include_tables: Vec::new(),
+                include_schemas: Vec::new(),
+                include_ops: Vec::new(),
+                exclude_ops: vec!["truncate".to_string()],
+            }],
+        }];
+
+        let mut truncate = sample_event();
+        truncate.op = Operation::Truncate;
+        assert!(apply_rules(truncate, &rules).expect("apply").is_none());
+
+        for op in [
+            Operation::Insert,
+            Operation::Update,
+            Operation::Delete,
+            Operation::Read,
+        ] {
+            let mut event = sample_event();
+            event.op = op;
+            assert!(
+                apply_rules(event, &rules).expect("apply").is_some(),
+                "{op:?} must pass a filter that excludes only truncate"
+            );
+        }
     }
 
     #[test]

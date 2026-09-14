@@ -250,7 +250,8 @@ pub enum TransformActionConfig {
         prefix: Option<String>,
     },
 
-    /// Keep event only when include lists match (empty list = wildcard).
+    /// Keep an event only when every include list matches (empty list = wildcard), and
+    /// drop it when its operation is in `exclude_ops`.
     Filter {
         #[serde(default)]
         include_tables: Vec<String>,
@@ -258,6 +259,10 @@ pub enum TransformActionConfig {
         include_schemas: Vec<String>,
         #[serde(default)]
         include_ops: Vec<String>,
+        /// Operations to drop — the complement of `include_ops`, for skipping a few
+        /// operations without listing every one to keep. Mutually exclusive with it.
+        #[serde(default)]
+        exclude_ops: Vec<String>,
     },
 
     /// Rewrite event routing target.
@@ -440,6 +445,7 @@ impl TransformRuleConfig {
                 self.name
             ));
         }
+        validate_operation_names(&self.name, "when.ops", &self.when.ops)?;
 
         for action in &self.actions {
             match action {
@@ -483,7 +489,21 @@ impl TransformRuleConfig {
                         ));
                     }
                 }
-                TransformActionConfig::Filter { .. } => {}
+                TransformActionConfig::Filter {
+                    include_ops,
+                    exclude_ops,
+                    ..
+                } => {
+                    validate_operation_names(&self.name, "filter.include_ops", include_ops)?;
+                    validate_operation_names(&self.name, "filter.exclude_ops", exclude_ops)?;
+                    if !include_ops.is_empty() && !exclude_ops.is_empty() {
+                        return Err(format!(
+                            "transform rule '{}' filter sets both include_ops and exclude_ops; \
+                             use one, since together they are redundant and can contradict",
+                            self.name
+                        ));
+                    }
+                }
                 TransformActionConfig::Mask { rules, .. } => {
                     if rules.is_empty() {
                         return Err(format!(
@@ -564,6 +584,22 @@ impl TransformRuleConfig {
 
         Ok(())
     }
+}
+
+/// A name that parses as no operation matches no event, so a typo silently disables a
+/// `when` block, drops every event through `include_ops`, or drops nothing through
+/// `exclude_ops`. Matching ignores case, so validation does too.
+fn validate_operation_names(rule: &str, field: &str, names: &[String]) -> Result<(), String> {
+    for name in names {
+        if let Err(error) = name.to_ascii_lowercase().parse::<rustcdc::Operation>() {
+            let detail = match error {
+                rustcdc::Error::ValidationError(messages) => messages.join("; "),
+                other => other.to_string(),
+            };
+            return Err(format!("transform rule '{rule}' {field}: {detail}"));
+        }
+    }
+    Ok(())
 }
 
 fn default_metadata_target_field() -> String {

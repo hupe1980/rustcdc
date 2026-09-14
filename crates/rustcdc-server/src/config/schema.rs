@@ -1651,6 +1651,56 @@ topic = "cdc-checkpoint-state"
     }
 
     #[test]
+    fn transform_rule_validate_rejects_unknown_operation_names() {
+        let filter = |include_ops: &[&str], exclude_ops: &[&str]| TransformRuleConfig {
+            name: "ops".to_string(),
+            actions: vec![TransformActionConfig::Filter {
+                include_tables: Vec::new(),
+                include_schemas: Vec::new(),
+                include_ops: include_ops.iter().map(|op| op.to_string()).collect(),
+                exclude_ops: exclude_ops.iter().map(|op| op.to_string()).collect(),
+            }],
+            ..Default::default()
+        };
+
+        for (rule, field) in [
+            (filter(&["deletes"], &[]), "filter.include_ops"),
+            (filter(&[], &["truncates"]), "filter.exclude_ops"),
+        ] {
+            let err = rule.validate().expect_err("unknown operation must fail");
+            assert!(err.contains(field), "{err}");
+            assert!(err.contains("unknown operation"), "{err}");
+        }
+
+        let mut rule = filter(&[], &[]);
+        rule.when.ops = vec!["upsert".to_string()];
+        let err = rule.validate().expect_err("unknown when.ops must fail");
+        assert!(err.contains("when.ops"), "{err}");
+
+        // Matching ignores case, so validation must accept whatever matching accepts.
+        assert!(filter(&["INSERT", "Update"], &[]).validate().is_ok());
+        assert!(filter(&[], &["Truncate"]).validate().is_ok());
+    }
+
+    #[test]
+    fn transform_rule_validate_rejects_include_and_exclude_ops_together() {
+        let rule = TransformRuleConfig {
+            name: "both".to_string(),
+            actions: vec![TransformActionConfig::Filter {
+                include_tables: Vec::new(),
+                include_schemas: Vec::new(),
+                include_ops: vec!["insert".to_string()],
+                exclude_ops: vec!["truncate".to_string()],
+            }],
+            ..Default::default()
+        };
+        let err = rule
+            .validate()
+            .expect_err("include_ops with exclude_ops must fail");
+        assert!(err.contains("include_ops and exclude_ops"), "{err}");
+    }
+
+    #[test]
     fn transform_runtime_native_mode_is_valid_by_default() {
         let cfg = TransformRuntimeConfig::default();
         assert!(cfg.validate().is_ok());
