@@ -164,6 +164,7 @@ impl SourceDriverEntry {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct SqlServerProfileConfig {
     pub host: String,
+    #[serde(default = "SqlServerSourceConfig::default_port")]
     pub port: u16,
     pub user: String,
     pub password: SecretString,

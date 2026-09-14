@@ -341,13 +341,14 @@ mode = "plaintext"    # plaintext | tls
 | Field | Default | Description |
 |---|---|---|
 | `type` | — | `"mysql"` or `"mariadb"` |
-| `host` / `port` / `user` / `password` / `database` | — | Connection parameters; `password` accepts `{ env = "VAR" }` |
-| `conn_timeout_secs` | — | Connection timeout in seconds |
+| `host` / `user` / `password` / `database` | — | Connection parameters; `password` accepts `{ env = "VAR" }` |
+| `port` | `3306` | Server port |
+| `conn_timeout_secs` | `30` | Connection timeout in seconds |
 | `server_id` | — | **Required.** Unique replica server ID. Must not collide with any other replica. |
-| `gtid_mode_enabled` | — | **Required.** Use GTID offsets (`true`) or binlog file/position (`false`) |
-| `binlog_format_check` | — | **Required.** Verify `binlog_format = ROW` at connect time |
-| `stream_poll_interval_ms` | — | Binlog poll interval |
-| `max_events_per_poll` | — | Maximum events yielded per poll cycle |
+| `gtid_mode_enabled` | `false` | Use GTID offsets (`true`) or binlog file/position (`false`). Enable wherever failover is possible |
+| `binlog_format_check` | `true` | Verify `binlog_format = ROW` at connect time |
+| `stream_poll_interval_ms` | `50` | Binlog poll interval |
+| `max_events_per_poll` | `1000` | Maximum events yielded per poll cycle |
 | `table_include_list` | empty (= all) | Exact `database.table` names; takes precedence over the exclude list |
 | `table_exclude_list` | empty | Exact `database.table` names to suppress; ignored when the include list is non-empty |
 | `auth_mode` | `password` | `password` or `aws_iam_token` (short-lived IAM auth; requires TLS) |

@@ -41,7 +41,7 @@ impl Default for MysqlSourceConfig {
     fn default() -> Self {
         Self {
             host: "localhost".into(),
-            port: 3306,
+            port: Self::default_port(),
             user: String::new(),
             password: SecretString::default(),
             auth_mode: DatabaseAuthMode::Password,
@@ -85,6 +85,11 @@ impl MysqlSourceConfig {
     /// Default for `binlog_format_check`: on. The serde `default` for the field.
     pub const fn default_binlog_format_check() -> bool {
         true
+    }
+
+    /// Default server port (3306). The serde `default` for the field.
+    pub const fn default_port() -> u16 {
+        3306
     }
 
     /// Default connection timeout (30 s). The serde `default`, so a config that

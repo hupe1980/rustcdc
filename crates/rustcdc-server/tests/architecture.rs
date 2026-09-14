@@ -1325,18 +1325,9 @@ fn every_configuration_setting_is_read_by_something() {
         // struct — the replication-slot lag side-channel that used to read
         // `pg.host/port/user/database/conn_timeout_secs` is gone, since rustcdc samples
         // slot lag itself.
-        ("conn_timeout_secs", "source.rs: to_runtime_config"),
         ("database", "source.rs: to_runtime_config"),
-        ("port", "source.rs: to_runtime_config"),
         ("capture_truncate_events", "source.rs: to_runtime_config"),
-        ("cdc_enabled", "source.rs: to_runtime_config"),
-        ("cdc_schema", "source.rs: to_runtime_config"),
         ("instance_name", "source.rs: to_runtime_config"),
-        ("max_events_per_poll", "source.rs: to_runtime_config"),
-        ("prereq_pool_size", "source.rs: to_runtime_config"),
-        ("stream_poll_interval_ms", "source.rs: to_runtime_config"),
-        ("table_exclude_list", "source.rs: to_runtime_config"),
-        ("table_include_list", "source.rs: to_runtime_config"),
         // ── krafka builder mapping, src/config/sink.rs ─────────────────────────
         (
             "client_secret",

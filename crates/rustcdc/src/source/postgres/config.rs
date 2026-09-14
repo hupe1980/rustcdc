@@ -42,7 +42,7 @@ impl Default for PostgresSourceConfig {
     fn default() -> Self {
         Self {
             host: "localhost".into(),
-            port: 5432,
+            port: Self::default_port(),
             user: String::new(),
             password: SecretString::default(),
             auth_mode: DatabaseAuthMode::Password,
@@ -79,6 +79,11 @@ impl PostgresSourceConfig {
     /// when deserializing configs that predate this field.
     pub const fn default_slot_idle_advance_interval_ms() -> u64 {
         30_000
+    }
+
+    /// Default server port (5432). The serde `default` for the field.
+    pub const fn default_port() -> u16 {
+        5432
     }
 
     /// Default connection timeout (30 s). The serde `default`, so a config that

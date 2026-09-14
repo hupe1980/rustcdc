@@ -40,7 +40,7 @@ impl Default for SqlServerSourceConfig {
     fn default() -> Self {
         Self {
             host: "localhost".into(),
-            port: 1433,
+            port: Self::default_port(),
             user: String::new(),
             password: SecretString::default(),
             database: String::new(),
@@ -63,6 +63,12 @@ impl SqlServerSourceConfig {
     /// Return the connector name used by the source abstraction.
     pub const fn source_type() -> &'static str {
         "sqlserver"
+    }
+
+    /// Default server port (1433). Referenced as the serde `default` by
+    /// configuration layers that deserialize this connector's settings.
+    pub const fn default_port() -> u16 {
+        1433
     }
 
     /// Default connection timeout (30 s). Referenced as the serde `default` by

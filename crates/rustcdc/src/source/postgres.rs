@@ -523,6 +523,7 @@ pub struct PostgresSourceConfig {
     /// Server hostname or IP.
     pub host: String,
     /// Server port.
+    #[serde(default = "PostgresSourceConfig::default_port")]
     pub port: u16,
     /// Login user. Needs the connector's replication/CDC privileges.
     pub user: String,

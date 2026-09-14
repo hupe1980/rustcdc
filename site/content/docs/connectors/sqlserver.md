@@ -307,14 +307,15 @@ mode = "tls"
 
 | Field | Default | Description |
 |---|---|---|
-| `host` / `port` / `user` / `password` / `database` | — | Connection parameters; `password` accepts `{ env = "VAR" }` |
+| `host` / `user` / `password` / `database` | — | Connection parameters; `password` accepts `{ env = "VAR" }` |
+| `port` | `1433` | Server port |
 | `instance_name` | none | Named SQL Server instance (`host\instance`) |
-| `conn_timeout_secs` | — | TCP connection timeout in seconds |
-| `cdc_enabled` | — | **Required.** Verify database-level CDC is enabled at connect time |
-| `cdc_schema` | — | Schema where CDC change tables and functions live (usually `cdc`) |
-| `stream_poll_interval_ms` | — | Milliseconds between change table polls |
-| `max_events_per_poll` | — | Maximum rows fetched per poll per table |
-| `prereq_pool_size` | — | Number of concurrent metadata connections |
+| `conn_timeout_secs` | `30` | TCP connection timeout in seconds |
+| `cdc_enabled` | `true` | Verify database-level CDC is enabled at connect time |
+| `cdc_schema` | `"cdc"` | Schema where CDC change tables and functions live |
+| `stream_poll_interval_ms` | `5000` | Milliseconds between change table polls |
+| `max_events_per_poll` | `10000` | Maximum rows fetched per poll per table |
+| `prereq_pool_size` | `4` | Number of concurrent metadata connections |
 | `capture_truncate_events` | `false` | Opt-in TRUNCATE capture via DDL trigger + shadow table; the connector reports the `truncate` capability only when enabled |
 | `table_include_list` | empty (= all CDC-enabled) | Exact `schema.table` names; takes precedence over the exclude list |
 | `table_exclude_list` | empty | Exact `schema.table` names to suppress; ignored when the include list is non-empty |

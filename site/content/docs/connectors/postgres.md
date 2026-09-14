@@ -521,15 +521,17 @@ mode = "plaintext"    # plaintext | tls
 
 | Field | Default | Description |
 |---|---|---|
-| `host` / `port` / `user` / `password` / `database` | — | Connection parameters; `password` accepts `{ env = "VAR" }` or a literal string (not recommended) |
+| `host` / `user` / `password` / `database` | — | Connection parameters; `password` accepts `{ env = "VAR" }` or a literal string (not recommended) |
+| `port` | `5432` | Server port |
 | `publication_name` | — | Publication name; must exist before startup |
 | `replication_slot_name` | — | Replication slot name; provision out of band, or set `create_replication_slot_if_missing = true` |
 | `create_replication_slot_if_missing` | `false` | Allow the connector to create a missing slot. Keep `false` in production: a vanished slot is a data-loss event, and recreating it silently resumes from "now" and skips everything in between |
 | `failover_slot` | `false` | PostgreSQL 17+: create the slot with `failover = true` so it is synchronized to standbys and capture survives promotion. Only applies when the connector creates the slot; requires cluster-side sync configuration |
 | `slot_idle_advance_interval_ms` | `30000` | Advance the slot when no committed events arrive so PostgreSQL can recycle WAL. `0` disables (not recommended for long-lived streams) |
 | `wal_transport` | `"streaming_replication"` | How the WAL stream is read. `"sql_peek"` is the fallback for a role without `REPLICATION` or a connection that must route through a pooler — see [WAL transport](#wal-transport-how-the-stream-is-read) for the cost |
-| `stream_poll_interval_ms` | — | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
-| `max_events_per_poll` | — | Maximum events yielded per poll cycle |
+| `conn_timeout_secs` | `30` | Connection timeout in seconds |
+| `stream_poll_interval_ms` | `50` | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
+| `max_events_per_poll` | `1000` | Maximum events yielded per poll cycle |
 | `table_include_list` | empty (= all) | Exact `schema.table` names to capture; takes precedence over the exclude list |
 | `table_exclude_list` | empty | Exact `schema.table` names to suppress; ignored when the include list is non-empty |
 | `require_primary` | `true` | (`[source]` level) Fail at startup if the server is a replica |
