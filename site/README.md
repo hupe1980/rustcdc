@@ -4,9 +4,8 @@ The published documentation at <https://hupe1980.github.io/rustcdc>, built with
 [Zola](https://www.getzola.org).
 
 One site covers both halves of the repository: `/docs/` is the **server**, `/library/` is
-the **`rustcdc` crate** you embed. They used to be two sites in two repositories, which
-meant two search indexes, two navigation trees, and a cross-reference between them that
-could only ever be a bare URL.
+the **`rustcdc` crate** you embed — one search index, one navigation tree, and
+cross-references that resolve at build time.
 
 > [!IMPORTANT]
 > **Zola 0.23 removed shortcodes and made every content file a Tera template.**

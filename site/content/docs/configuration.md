@@ -1529,10 +1529,9 @@ The limit applies to the bytes the sink actually transmits — for a Kafka or HT
 the codec output (key + value); for stdout, `file_jsonl` and Iceberg, which serialise the
 event themselves, the event's JSON.
 
-It previously measured a JSON rendering of the event in **all** cases, which for Avro or
-Protobuf is a payload that is never sent — usually several times larger than the real
-one. If you set this against a broker's `max.message.bytes`, you were calibrating against
-the wrong number and rejecting events that would have fitted.
+Calibrate it against the broker's `max.message.bytes`: for Avro or Protobuf the encoded
+payload is several times smaller than a JSON rendering of the same event, so sizing against
+JSON rejects events that would have fitted.
 
 An event over the limit fails the batch and is **never retried**: it is the same size on
 every attempt, so retrying makes no progress and never reaches the events behind it.

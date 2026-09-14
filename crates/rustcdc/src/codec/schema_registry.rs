@@ -498,14 +498,11 @@ fn schema_set_for(schema_type: SchemaType) -> Result<SchemaSet> {
 
 /// Map rustcdc's `auto_register` flag onto schemreg's resolution policy.
 ///
-/// `auto_register = false` used to be a half-measure on the JSON Schema and Protobuf
-/// encoders. schemreg had no lookup-only mode, so its resolution path was
-/// `register_schema` unconditionally, and the setting was **silently ignored** by both:
-/// an operator who turned it off got schemas registered anyway. rustcdc worked around it
-/// by asserting the subjects already existed at construction, which restored the identity
-/// check but could not stop the later registration call.
+/// `auto_register = false` must map to a resolution policy that genuinely does not write.
+/// Asserting at construction that the subjects already exist restores the identity check
+/// but cannot stop a later registration call, so the policy itself has to carry it.
 ///
-/// schemreg 0.5 closed it. `LookupOnly` resolves the id without writing, needs only
+/// `LookupOnly` resolves the id without writing, needs only
 /// `Subject:Read`, and reports a drifted local schema as a non-retryable not-found at
 /// startup rather than quietly creating a production version from a producer process.
 fn resolution_for(auto_register: bool) -> ::schemreg::SchemaResolution {
@@ -1037,13 +1034,13 @@ impl EventEncoder for ConfluentAvroEncoder {
     ///
     /// Returns [`Error::SerializationError`] if the key cannot be rendered.
     ///
-    /// Both failure paths used to be swallowed with `.ok()`, which turned an encoding failure
-    /// into `None` — indistinguishable from "this event has no key" — and a keyed sink then
-    /// published the record **unkeyed**: round-robin partitioning, ordering for that row lost,
-    /// log compaction no longer collapsing it, and nothing to see. Neither path is reachable
-    /// today (the key schema is fixed and single-field, and `serde_json` cannot fail on a
-    /// `Map<String, Value>`), which is exactly why swallowing them was cheap to do and would
-    /// have stayed invisible if it ever became reachable.
+    /// Neither failure may be swallowed with `.ok()`: that turns an encoding failure into
+    /// `None` — indistinguishable from "this event has no key" — and a keyed sink then
+    /// publishes the record **unkeyed**, with round-robin partitioning, ordering for that row
+    /// lost, log compaction no longer collapsing it, and nothing to see. Neither path is
+    /// reachable today (the key schema is fixed and single-field, and `serde_json` cannot fail
+    /// on a `Map<String, Value>`), which is exactly why swallowing them would stay invisible
+    /// if one ever became reachable.
     fn encode_key(&self, event: &Event) -> Result<Option<Vec<u8>>> {
         let key_json = match event.primary_key_values() {
             Some(value) => Some(serde_json::to_string(&value)?),

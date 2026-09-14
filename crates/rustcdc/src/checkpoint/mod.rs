@@ -175,12 +175,12 @@ pub struct MysqlOffset {
     pub binlog_pos: u32,
     /// Server flavor that produced this offset: `"mysql"` or `"mariadb"`.
     ///
-    /// This is part of the offset because it determines the **checkpoint file name**.
-    /// It was previously hardcoded to `"mysql"`, so a MariaDB stream wrote
-    /// `checkpoint_mysql.json`, found nothing under `checkpoint_mariadb.json` on
-    /// restart, and silently resumed from the *current* binlog position — losing every
-    /// change since the crash. It also guards against resuming a MariaDB position on a
-    /// MySQL server or vice versa, where the GTID formats are mutually unintelligible.
+    /// This is part of the offset because it determines the **checkpoint file name**. A
+    /// flavor fixed to `"mysql"` would make a MariaDB stream write `checkpoint_mysql.json`,
+    /// find nothing under `checkpoint_mariadb.json` on restart, and silently resume from the
+    /// *current* binlog position — losing every change since the crash. It also guards
+    /// against resuming a MariaDB position on a MySQL server or vice versa, where the GTID
+    /// formats are mutually unintelligible.
     #[serde(default = "MysqlOffset::default_flavor")]
     pub source_flavor: String,
     /// Progress of an in-flight incremental (DBLog) snapshot, when one is running.

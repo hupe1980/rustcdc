@@ -502,7 +502,7 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 - **`GET /config`** — the configuration this instance is *actually* running, after env-var layering and migration, with three independent redaction rules: enumerated paths, secret-looking key names (separator-insensitive, so `x-api-key` matches), and a value-driven URL rule that strips userinfo *and* secret-named query parameters under any key. Held by a property test that generates names rather than listing them
 - **Control-plane panic guard** — a panic in any admin handler becomes a logged `500`, not a bare connection reset; the payload never reaches the caller
 - **TLS everywhere** — admin API and all outbound connections use rustls (no OpenSSL). A TLS-configured source is TLS on *every* connection, including the replication-slot lag sampler; a server with `ssl = off` fails the connection rather than silently downgrading it
-- **No `unsafe` in the shipped binary** — `src/main.rs` carries `#![forbid(unsafe_code)]`, which no inner `#[allow]` can override. The library is `deny` with exactly one allowlisted site (`test_env`, for the `std::env::set_var` a few tests need), held to that one entry by [an architecture guard](https://hupe1980.github.io/rustcdc/docs/engineering/). This line previously claimed the lint was "enforced workspace-wide" while it was applied to nothing
+- **No `unsafe` in the shipped binary** — `src/main.rs` carries `#![forbid(unsafe_code)]`, which no inner `#[allow]` can override. The library is `deny` with exactly one allowlisted site (`test_env`, for the `std::env::set_var` a few tests need), held to that one entry by [an architecture guard](https://hupe1980.github.io/rustcdc/docs/engineering/)
 
 ---
 

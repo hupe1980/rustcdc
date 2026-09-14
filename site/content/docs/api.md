@@ -1265,10 +1265,8 @@ and `Passthrough`, plus `HmacSha256(SecretString)`, `Encrypt(..)` and `Decrypt(.
 > whole subtree, and `field.*` covers every element of a variable-length array. Order
 > `MaskHashTransform` before any path-mutating transform.
 >
-> **Default behaviour change in 0.2**: `MaskHashConfig::default()` now uses
-> `default_rule: MaskRule::Passthrough`, meaning unlisted fields are passed
-> through unchanged.  Use `MaskHashConfig::hash_all()` if you need the old
-> "hash everything" behaviour.
+> `MaskHashConfig::default()` uses `default_rule: MaskRule::Passthrough`: a field with no
+> rule is passed through unchanged. `MaskHashConfig::hash_all()` hashes every field instead.
 
 `MaskHashTransform::new` returns a `Result`: `MaskHashConfig::validate()` rejects rules that
 cannot do what they appear to. `Truncate(0)` and `Redact("")` both produce an empty string,
@@ -1534,8 +1532,7 @@ let encoder =
 `max_cache_entries`, `pool_max_idle_per_host`, `references` and `retry_policy` included. The
 conversion destructures `ApicurioRegistryConfig` exhaustively, so adding a field without
 deciding how it maps is a compile error rather than a setting that quietly stops taking
-effect. (Through 0.8 five of those were silently dropped; a caller who set a retry policy got
-the default with no indication it had been discarded.)
+effect.
 
 Two things do not carry over. `normalize_schemas` is a Confluent query parameter with no
 Apicurio v3 equivalent. And `url` is copied verbatim, which for this type is the Apicurio

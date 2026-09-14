@@ -560,16 +560,15 @@ impl ReplaySession {
 ///
 /// # Why these fields are here at all
 ///
-/// `before_is_key_only`, `unavailable_columns` and `before_unavailable_columns` used to be
-/// hardcoded to their empty defaults in [`ReplaySession::create_data_event`], and
-/// `parse_data_payload` did not read them. The fixture format therefore **could not express an
-/// incomplete payload**, so no golden fixture could exercise the PostgreSQL unchanged-TOAST
-/// contract — the case where a sink writing whole rows puts `NULL` over live data.
+/// `before_is_key_only`, `unavailable_columns` and `before_unavailable_columns` are carried in
+/// the fixture format so it can express an **incomplete** payload. Without them no golden
+/// fixture could exercise the PostgreSQL unchanged-TOAST contract — the case where a sink
+/// writing whole rows puts `NULL` over live data.
 ///
-/// That mattered more than a missing field usually does. `semantic_diff` compares
-/// `before_is_key_only`, and now compares both unavailable lists — but a comparison is vacuous
-/// when both sides are structurally always empty. The diff and the fixture format had never been
-/// reconciled, so the highest-risk field in the envelope had the appearance of replay coverage
+/// They must stay readable by `parse_data_payload` rather than defaulted in
+/// [`ReplaySession::create_data_event`]. `semantic_diff` compares `before_is_key_only` and both
+/// unavailable lists, and that comparison is vacuous when both sides are structurally always
+/// empty: the highest-risk field in the envelope would have the appearance of replay coverage
 /// and none of the substance.
 struct ReplayDataPayload {
     before: BeforeImage,

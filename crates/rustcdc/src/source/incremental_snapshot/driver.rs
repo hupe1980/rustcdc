@@ -311,21 +311,20 @@ fn lookup_condition(
 
 /// Resolve `table_ref` against the catalog **and** attach its row filter.
 ///
-/// The two steps live together because separating them is what broke them. The condition
-/// used to be applied at two of the three resolution sites — the startup tables and the
-/// tables adopted from a checkpoint — and not at
-/// [`IncrementalSnapshotDriver::enqueue_tables`], which services every on-demand request.
-/// A table requested at runtime therefore snapshotted **in full**, ignoring the operator's
-/// filter, with nothing to report it: the only symptom is volume, indistinguishable from a
-/// big table.
+/// The two steps live together because separating them lets them diverge. There are three
+/// resolution sites — the startup tables, the tables adopted from a checkpoint, and
+/// [`IncrementalSnapshotDriver::enqueue_tables`], which services every on-demand request —
+/// and a site that resolves without attaching the condition snapshots the table **in full**,
+/// ignoring the operator's filter, with nothing to report it: the only symptom is volume,
+/// indistinguishable from a big table.
 ///
-/// Worse than simply ignoring it, the two paths disagreed. A runtime-requested table ran
-/// unfiltered, and then a restart adopted it from the checkpoint *with* the filter applied —
-/// so the delivered rows corresponded to no single predicate, and the split depended on when
-/// the process happened to restart.
+/// Divergence is worse still than ignoring the filter everywhere. A runtime-requested table
+/// running unfiltered, then adopted from the checkpoint *with* the filter applied, delivers
+/// rows corresponding to no single predicate, split according to when the process happened
+/// to restart.
 ///
-/// One function, called from all three sites, is the fix. `describe_table` deliberately
-/// leaves `condition` unset so a backend cannot get this wrong either.
+/// So: one function, called from all three sites. `describe_table` deliberately leaves
+/// `condition` unset so a backend cannot get this wrong either.
 async fn describe_with_condition<B: IncrementalSnapshotBackend>(
     backend: &mut B,
     table_ref: &str,
@@ -473,9 +472,9 @@ pub struct IncrementalSnapshotDriver<B: IncrementalSnapshotBackend> {
     chunk_size: usize,
     /// Configured per-table row filters, retained for the lifetime of the driver.
     ///
-    /// `config` used to be a by-value parameter dropped once the startup tables were
-    /// resolved, which made it *structurally impossible* for `enqueue_tables` to honour a
-    /// filter — see [`describe_with_condition`].
+    /// Retained rather than taken by value and dropped once the startup tables are resolved,
+    /// which would make it *structurally impossible* for `enqueue_tables` to honour a filter
+    /// — see [`describe_with_condition`].
     table_conditions: ahash::AHashMap<String, String>,
     source_name: String,
     snapshot_id: String,
@@ -3192,11 +3191,10 @@ mod row_filter_tests {
 
     /// The configured filter must reach a table requested at **runtime**.
     ///
-    /// It used to be applied at two of the three resolution sites — startup tables and tables
-    /// adopted from a checkpoint — and not at `enqueue_tables`, which services every
-    /// on-demand request. The driver did not even retain the config, so honouring it there was
-    /// structurally impossible. An operator scoping a backfill to one tenant, then firing the
-    /// request, got the whole table, and the only symptom was volume.
+    /// `enqueue_tables` services every on-demand request, and needs the condition as much as
+    /// the startup and checkpoint-adoption sites do — it can only honour it while the driver
+    /// retains the config. An operator scoping a backfill to one tenant and then firing the
+    /// request must not get the whole table, whose only symptom would be volume.
     #[tokio::test]
     async fn a_runtime_requested_table_gets_the_configured_condition() {
         // `tables = []` plus a condition is the natural way to pre-declare a filter for an

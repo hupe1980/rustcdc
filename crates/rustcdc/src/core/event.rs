@@ -1599,10 +1599,10 @@ mod tests {
         );
     }
 
-    /// The combinations that used to need a validation rule are now unrepresentable:
-    /// there is no way to build a key-only pre-image without a row, or one carrying TOAST
-    /// holes. Both were runtime errors; the constructor is the only way in, so they cannot
-    /// be constructed to test — what remains testable is that decoding refuses them.
+    /// The contradictory combinations are unrepresentable rather than validated: there is
+    /// no way to build a key-only pre-image without a row, or one carrying TOAST holes. The
+    /// constructor is the only way in, so they cannot be constructed to test — what remains
+    /// testable is that decoding refuses them at the wire boundary.
     #[test]
     fn contradictory_wire_pre_images_are_refused_at_the_boundary() {
         let missing_row = BeforeImage::from_wire_parts(None, true, Vec::new());

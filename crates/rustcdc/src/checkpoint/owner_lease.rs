@@ -53,9 +53,9 @@ impl OwnerLease {
     /// Acquiring a lease once is not the same as holding it. An operator can delete
     /// the sentinel file to clear what looks like a stuck lease; a peer that saw this
     /// process as dead can take it over; a shared-filesystem mount can be swapped
-    /// underneath. In every one of those cases the original owner previously carried
-    /// on writing, and two writers rewriting the same whole-file store silently
-    /// destroy each other's records.
+    /// underneath. Unchecked, the original owner carries on writing in every one of those
+    /// cases, and two writers rewriting the same whole-file store silently destroy each
+    /// other's records.
     ///
     /// Checking costs one small read per durable write — the write itself is an
     /// fsync plus a rename, so the read is not measurable — and converts silent

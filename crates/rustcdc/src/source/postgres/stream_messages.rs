@@ -87,12 +87,13 @@ fn pg_type_name(oid: u32) -> String {
 impl PostgresStreamHandle {
     /// Decode a pgoutput tuple into a JSON object.
     ///
-    /// Returns `Err` rather than `None` for both failure modes. Both used to be
-    /// silent: an unknown relation OID made the caller discard the whole event with
-    /// no warning and no counter, and a column-count overflow collapsed every extra
-    /// column onto one key. A missing RELATION is a protocol violation, not a
-    /// filterable condition — pgoutput is required to send RELATION before any row
-    /// referencing it — so the only safe response to either is to stop.
+    /// Returns `Err` rather than `None` for both failure modes, because neither may be
+    /// silent: an unknown relation OID would make the caller discard the whole event with
+    /// no warning and no counter, and a column-count overflow would collapse every extra
+    /// column onto one key. A missing RELATION is a protocol violation, not a filterable
+    /// condition — pgoutput is required to send RELATION before any row referencing it —
+    /// so the only safe response to either is to stop.
+    ///
     /// Returns the decoded row plus the names of any columns the source could not
     /// supply (PostgreSQL unchanged-TOAST). Those columns are absent from the row, and
     /// the caller must surface them on the event so a consumer does not mistake

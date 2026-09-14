@@ -5,6 +5,172 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.17.0
+
+Three changes, all of the same shape: a rule the documentation stated and the code did not
+enforce. `exclude_ops` gives the filter action the complement it was missing, operation names
+are now checked instead of silently matching nothing, and the source settings the
+configuration reference documents as optional are finally optional.
+
+It is a **breaking** release for one narrow case — a configuration carrying a misspelt
+operation name. See *Breaking* and *Migrating* below.
+
+### Added: `exclude_ops` on the filter action
+
+The filter action could only *keep* operations, through `include_ops`. Skipping a few — the
+`truncate` events that are Debezium's most common `skipped.operations` entry — meant listing
+every operation to keep, and an operation added to rustcdc later would then be dropped by a
+configuration nobody had changed. That is an allow-list behaving as a deny-list, which is the
+wrong default for a schema that grows.
+
+`exclude_ops` is the complement: an event whose operation it lists is dropped, everything else
+passes.
+
+```toml
+[[pipeline.transforms]]
+name = "skip-truncates"
+
+  [[pipeline.transforms.actions]]
+  type        = "filter"
+  exclude_ops = ["truncate"]
+```
+
+It is **mutually exclusive with `include_ops`**, rejected at load when both are set. Together
+they are either redundant or contradictory, and a reader cannot tell which one the author meant
+to win.
+
+The allow-list and the deny-list now share one matcher (`lists_value`), so they cannot drift
+apart on how a candidate matches — `matches_values` is that matcher plus the "empty means
+everything" rule an allow-list needs, which a deny-list must not have.
+
+### Fixed: operation names were never checked
+
+Matching is by name, so a name that parses as no operation matched no event — and each of the
+three fields that take one failed differently and silently:
+
+* in `include_ops`, nothing matched, so **every** event was dropped;
+* in a `when` block, nothing matched, so the rule was **silently disabled**;
+* in `exclude_ops` it would have dropped nothing.
+
+`when.ops`, `include_ops` and `exclude_ops` are now validated when the rule is validated at
+load, through rustcdc's own `Operation` parser rather than a second list — so the accepted set
+cannot drift from the library's. Matching ignores case, so validation does too. The error names
+the rule and the field.
+
+The server's `op_name()` restated `Operation::to_str()` with an `"unknown"` arm that the
+library's exhaustive match does not need; it is deleted in favour of `to_str()`. An operation
+added to the library used to render as `"unknown"` in projected metadata and match nothing in a
+`when` block.
+
+### Fixed: the documented source defaults were not defaults
+
+The configuration reference documents defaults for `conn_timeout_secs` (30),
+`stream_poll_interval_ms` and `max_events_per_poll` on all three sources, for `transport`
+(TLS), for the table include/exclude lists, for `gtid_mode_enabled` and `binlog_format_check`
+on MySQL, and for `cdc_enabled`, `cdc_schema` and `prereq_pool_size` on SQL Server. The
+library's `Default` impls agreed with every one of those values — but the fields carried no
+serde `default`, so a configuration that omitted any of them failed to load with `missing
+field`. One field per attempt, so the way to find the list was to hit it eleven times.
+
+Each field now takes its serde `default` from a `const fn` on the library config, following the
+existing `default_slot_idle_advance_interval_ms` pattern, and the `Default` impls call the same
+functions. One value per setting, in one place. The server's `SqlServerProfileConfig`
+references the library's functions rather than restating the numbers, so the profile and the
+library cannot disagree about a documented default.
+
+`port` is included: 5432, 3306 and 1433 come from the library, as the reference says.
+
+**MySQL's `server_id` stays required.** Its default of `0` is a deliberate tripwire that
+`validate()` rejects — two connectors sharing a server ID lose events with no recoverable
+signal, so there is no safe value to supply on the author's behalf.
+
+The connector tables now show these defaults, and `gtid_mode_enabled`, `binlog_format_check`
+and `cdc_enabled` are no longer marked required.
+
+### Fixed: the `NamedSinkConfig` doc example could not load
+
+The example used `brokers = ["localhost:9092"]` and `topic_prefix = "app"`. `KafkaSinkConfig`
+takes `brokers` as a string and has no `topic_prefix` field, so the example copied into a
+configuration failed at load with `invalid type: sequence, expected a string`. The replacement
+uses the fields the struct actually has, a topic template, and the `[[pipeline.routes]]` entry
+that makes a named sink reachable — checked by loading it with `rustcdc validate-config`.
+
+### Fixed: two documentation blocks described the wrong item
+
+`parse_gtid_set` carried no documentation, and `binlog_read_timeout` opened with two
+paragraphs about parsing a GTID set — an item boundary lost between the two, so the block
+rendered against the wrong function. It is back on the function it describes.
+
+`FixtureMetadata::message_count` documented itself as "previously named `message_count`",
+which is the name it has. It now says what the field counts: messages, not the events
+replaying them produces — an aborted transaction discards its buffered events, so a correct
+fixture can replay to fewer events than it carries messages.
+
+### Changed: the source-config guard compares whole structs
+
+`every_configuration_setting_is_read_by_something` counts a field as read when something names
+it. The new loader tests asserted field by field, so reading `.table_include_list` and friends
+made the SQL Server profile's same-named fields look consumed — and the guard could no longer
+see a dead mapping in `to_runtime_config`. A test suite that defeats the guard covering it is
+worse than no test, because both look green.
+
+Each loaded config is now compared against an expected struct built from `Default`, so no field
+name is read and **every** field is pinned, including ones added later. A new SQL Server test
+sets every profile field away from its default and spells out the expected runtime config in
+full, so a mapping that drops a field and substitutes its default fails.
+
+### Changed: rustls 0.23.44 → 0.23.45 (RUSTSEC-2026-0285)
+
+rustls accepted TLS 1.3 handshake messages sent at the wrong encryption level when they
+followed a key-changing message in the same record — a plaintext `EncryptedExtensions` packed
+into the `ServerHello` record, for example — where RFC 8446 §5.1 requires an
+`unexpected_message` alert. The transcript stays authenticated, so this is not a handshake
+forgery; the effect is that a peer could send handshake messages in plaintext that should have
+been encrypted, without rustls refusing the connection. It is the same bug as Go's
+CVE-2025-61730.
+
+This is the TLS stack every source and sink connection uses, so the lockfile bump is the fix.
+The rest of the lockfile moved with a routine `cargo update`; the rustls 0.21 copy under
+`tiberius` is unaffected and unchanged.
+
+### Breaking
+
+* **A misspelt operation name now fails at load.** `when.ops`, `filter.include_ops` and
+  `filter.exclude_ops` are checked against rustcdc's `Operation` parser. A configuration
+  carrying `"deletes"` or `"upsert"` loaded before and now fails, naming the rule and the
+  field. It was never doing what it looked like — in `include_ops` it dropped every event, in
+  a `when` block it disabled the rule — so this converts a silent misconfiguration into a
+  startup error.
+* **`TransformActionConfig::Filter` gained `exclude_ops`.** `rustcdc-server` is
+  `publish = false`, so this is internal; struct literals that do not use
+  `..Default::default()` need the field, which defaults to empty — the previous behaviour.
+
+Nothing in the `rustcdc` library's public API changed incompatibly. The new serde `default`
+attributes only widen what deserializes, and the `default_*` constructors are additive.
+
+### Migrating
+
+Load your configuration once with `rustcdc validate-config` before upgrading the running
+process. If it passes, there is nothing to do.
+
+If it names a rule and an operation field, the name is not one rustcdc recognises. The accepted
+set is the [operation types](https://hupe1980.github.io/rustcdc/docs/concepts/#operation-types)
+table — `insert`, `update`, `delete`, `read`, `schema_change`, `truncate`, in any case. Fix the
+spelling, and check what the rule was supposed to be doing: if the typo was in `include_ops`,
+that rule has been dropping every event it matched.
+
+To replace an `include_ops` list written only to skip an operation:
+
+```toml
+# Before — every operation to keep, listed
+include_ops = ["insert", "update", "delete", "read", "schema_change"]
+
+# After — the one to drop
+exclude_ops = ["truncate"]
+```
+
+The two cannot be combined; set one or the other.
+
 ## 0.16.0
 
 The Kafka sink grows the three things a compacted, topic-per-table deployment needs —

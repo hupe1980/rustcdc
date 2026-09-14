@@ -141,9 +141,8 @@ captures **every table in the database**.
 ### `postgres at '<host>' refused TLS (the server replied 'N')`
 
 The connector is configured with `transport.mode = "tls"` and the server has
-`ssl = off`. It now fails instead of silently continuing unencrypted — previously
-this connection downgraded to plaintext with no error and no warning, detectable only
-with a packet capture.
+`ssl = off`. The connection fails rather than downgrading to plaintext, because a silent
+downgrade is detectable only with a packet capture.
 
 Enable TLS on the server, or state the trade-off explicitly:
 

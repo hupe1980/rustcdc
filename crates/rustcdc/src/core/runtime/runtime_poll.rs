@@ -1245,9 +1245,9 @@ impl CdcRuntime {
     ///
     /// # Cancellation is observed between polls
     ///
-    /// The token is checked before each poll rather than raced against one. This used to be
-    /// a `select!`, which silently discarded a batch the source had already handed over
-    /// whenever the token fired mid-poll — see
+    /// The token is checked before each poll rather than raced against one. A `select!`
+    /// would silently discard a batch the source had already handed over whenever the token
+    /// fired mid-poll — see
     /// [`poll_event_batch`](CdcRuntime::poll_event_batch)'s cancel-safety note. Termination
     /// therefore takes up to `max_poll_wait_ms`, which is the budget a poll already returns
     /// within.

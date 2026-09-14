@@ -248,12 +248,11 @@ pub struct MysqlSnapshotHandle {
 trait MysqlBinlogProvider: Send + Sync {
     /// Read up to `max_events` binlog messages, returning by `deadline` at the latest.
     ///
-    /// `deadline` is not advisory. Batch assembly used to be bounded only by
-    /// `max_events`, with a per-event read timeout and no wall-clock limit — so under a
-    /// writer that kept producing, the loop never broke early and kept accumulating until
-    /// it hit the cap. The first event of a 1,000-event batch therefore waited for the
-    /// other 999 to arrive, adding hundreds of milliseconds of capture latency that the
-    /// caller's `max_poll_wait_ms` was supposed to bound and did not.
+    /// `deadline` is not advisory. Bounded by `max_events` alone, a writer that keeps
+    /// producing never lets the loop break early: it accumulates to the cap, and the first
+    /// event of a 1,000-event batch waits for the other 999 — hundreds of milliseconds of
+    /// capture latency that the caller's `max_poll_wait_ms` is meant to bound. See
+    /// `binlog_read_timeout` for the measured effect.
     ///
     /// Returning fewer events than `max_events` is always correct: the remainder stays in
     /// the stream and arrives on the next poll.
@@ -314,25 +313,14 @@ const fn advance_binlog_pos(current: u32, event_log_pos: u32) -> u32 {
     }
 }
 
-/// Parse a MySQL GTID set into the `Sid` list `COM_BINLOG_DUMP_GTID` expects.
-///
-/// A GTID set is comma-separated `uuid_set`s, each `uuid:interval[:interval]...` with
-/// intervals written `m` or `m-n`. Per-UUID parsing is delegated to `mysql_common`'s
-/// `Sid: FromStr`, so the interval semantics (`m` means `[m, m+1)`, `m-n` means
-/// `[m, n+1)`) and the binary encoding come from the same crate that writes the packet —
-/// there is no place here for the two to disagree.
-///
-/// An empty or whitespace-only set yields an empty list, which the caller treats as
-/// "no GTID position known" and leaves `BINLOG_THROUGH_GTID` unset.
 /// How long the binlog read loop may block for its next event, or `None` to stop.
 ///
-/// Batch assembly used to be bounded only by `max_events_per_poll`, with a per-event read
-/// timeout and no wall-clock limit. Under a writer that kept producing, every
-/// `stream.next()` returned inside the per-event timeout, so the loop never broke early
-/// and kept accumulating until it hit the cap — and the *first* event of a 1,000-event
-/// batch waited for the other 999 to arrive. Measured against MySQL 8 that cost
-/// p50 431 ms / p95 1,559 ms of capture latency; bounding the loop brought it to
-/// p50 55 ms / p95 99 ms and raised sustained throughput 2.8×.
+/// The loop is bounded by a wall-clock deadline as well as `max_events_per_poll`. Bounded
+/// by the cap alone, a writer that keeps producing returns every `stream.next()` inside
+/// the per-event timeout, so the loop never breaks early and accumulates to the cap — and
+/// the *first* event of a 1,000-event batch waits for the other 999. Against MySQL 8 that
+/// is the difference between p50 431 ms / p95 1,559 ms of capture latency and
+/// p50 55 ms / p95 99 ms, at 2.8× the sustained throughput.
 ///
 /// Rules:
 ///
@@ -384,6 +372,16 @@ fn parse_mariadb_gtid_event(server_id: u32, data: &[u8]) -> Option<String> {
     Some(format!("{domain_id}-{server_id}-{sequence}"))
 }
 
+/// Parse a MySQL GTID set into the `Sid` list `COM_BINLOG_DUMP_GTID` expects.
+///
+/// A GTID set is comma-separated `uuid_set`s, each `uuid:interval[:interval]...` with
+/// intervals written `m` or `m-n`. Per-UUID parsing is delegated to `mysql_common`'s
+/// `Sid: FromStr`, so the interval semantics (`m` means `[m, m+1)`, `m-n` means
+/// `[m, n+1)`) and the binary encoding come from the same crate that writes the packet —
+/// there is no place here for the two to disagree.
+///
+/// An empty or whitespace-only set yields an empty list, which the caller treats as
+/// "no GTID position known" and leaves `BINLOG_THROUGH_GTID` unset.
 fn parse_gtid_set(gtid_set: &str) -> std::result::Result<Vec<Sid<'static>>, String> {
     use std::str::FromStr as _;
 

@@ -4,20 +4,14 @@
 # Run:  cargo deny check
 # CI:   the `policy-gate` job in .github/workflows/ci.yml, on every pull request.
 #
-# One policy for one workspace. There used to be two, in two repositories, checking
-# two different graphs against two different allowlists — so a crate banned for the
-# server was merely warned about for the library, and the `all-features = true` that
-# made the library's optional subtrees visible at all was absent from the server's.
+# One policy for one workspace: the library and the server are checked against the same
+# graph and the same allowlists.
 
 [graph]
-# Resolve the dependency graph with every feature enabled.
-#
-# Without this, cargo-deny builds the graph from the default features only, so every
-# optional dependency is invisible to the advisory, license and ban checks — including
-# the two highest-risk subtrees in the project: the wasmtime/cranelift JIT and the
-# aes-gcm/hkdf/hmac crypto stack, plus mysql_async, tiberius, opentelemetry, prost,
-# apache-avro and schemreg. A RUSTSEC advisory against any of them would not have
-# failed the gate.
+# Resolve the dependency graph with every feature enabled. Without this the graph is
+# built from default features only, and every optional dependency — the wasmtime JIT, the
+# crypto stack, mysql_async, tiberius, opentelemetry, apache-avro — is invisible to the
+# advisory, license and ban checks. An advisory against any of them would not fail the gate.
 all-features = true
 targets = [
     "x86_64-unknown-linux-gnu",
@@ -54,23 +48,22 @@ ignore = [
     # axum-server and tiberius move to rustls-pki-types.
     { id = "RUSTSEC-2025-0134" },
 
-    # RUSTSEC-2026-0098 / -0099 / -0104: rustls-webpki 0.101.x — URI name-constraint
-    # and wildcard-name-constraint acceptance, plus a CRL parsing panic.
+    # RUSTSEC-2026-0098 / -0099 / -0104: rustls-webpki 0.101.x — URI and wildcard
+    # name-constraint acceptance, plus a CRL parsing panic. Reachable only through the
+    # opt-in `sqlserver` feature: rustls-webpki 0.101.7 <- rustls 0.21 <- tokio-rustls
+    # 0.24 <- tiberius 0.12. They affect the SQL Server connector's TLS only — not the
+    # admin listener and not any sink.
     #
-    # **These three are absent from a default build.** Sole path: rustls-webpki 0.101.7
-    # <- rustls 0.21 <- tokio-rustls 0.24 <- tiberius 0.12 <- rustcdc's `sqlserver`
-    # feature, which is now opt-in (`--features sqlserver`). A PostgreSQL or MySQL
-    # deployment links exactly one rustls (0.23) and one webpki, and
-    # `cargo deny check advisories` on such a build reports all three as
-    # `advisory-not-detected` — that warning is the intended, load-bearing signal that
-    # the narrow build really is narrow, and `the_default_build_has_one_tls_stack`
-    # asserts it.
+    # Per-advisory reachability and the operator guidance are in
+    # site/content/docs/security.md, "Known exposure: `sqlserver` feature". Kept there
+    # rather than here so one assessment cannot drift from another.
     #
-    # They stay listed because CI audits `--all-features`, where the path does exist.
-    # Under that build they affect only the SQL Server connector's TLS — not the admin
-    # listener and not any sink — and none of the three is reachable without name
-    # constraints or CRLs in the chain. Blocked until tiberius releases against a
-    # current rustls; delete these three when it does, or when `sqlserver` is dropped.
+    # A default build links one rustls (0.23) and one webpki, so `cargo deny check
+    # advisories` reports all three as `advisory-not-detected` there — that warning is
+    # the load-bearing signal that the narrow build really is narrow, and
+    # `the_default_build_has_one_tls_stack` asserts it. They stay listed because CI
+    # audits `--all-features`, where the path exists. Delete all three when tiberius
+    # releases against rustls 0.23, or when `sqlserver` is dropped.
     { id = "RUSTSEC-2026-0098" },
     { id = "RUSTSEC-2026-0099" },
     { id = "RUSTSEC-2026-0104" },
@@ -84,70 +77,6 @@ ignore = [
     { id = "RUSTSEC-2026-0194" },
     { id = "RUSTSEC-2026-0195" },
 
-    # ── Carried over from the library's policy ───────────────────────────────
-    # ── Resolved by upgrades; kept here only as a record ─────────────────────
-    #
-    # The testcontainers 0.25 -> 0.27 and sqlx 0.8 -> 0.9 upgrades removed every
-    # advisory that used to be ignored in this section:
-    #
-    #   RUSTSEC-2026-0066/0112/0113  astral-tokio-tar, via testcontainers 0.25
-    #   RUSTSEC-2026-0145            testcontainers 0.25 itself
-    #   RUSTSEC-2025-0134            testcontainers 0.25 itself
-    #   RUSTSEC-2023-0071            rsa 0.9 (Marvin timing side-channel), via sqlx-mysql
-    #
-    # `cargo deny` warns on an ignore that no longer matches anything, so leaving
-    # them listed would train the reader to ignore that warning — which is exactly
-    # how a genuinely stale exception survives. They are deleted, not commented out.
-
-    # ── PRODUCTION dependency: sqlserver feature -> tiberius -> rustls 0.21 ──
-    #
-    # Unlike every entry above, these are NOT dev-dep only. They are reachable in
-    # production builds that enable the `sqlserver` feature, and they sit in the
-    # SQL Server TLS certificate-verification path.
-    #
-    # Chain: rustcdc -> tiberius 0.12.3 -> tokio-rustls 0.24.1 -> rustls 0.21.12
-    #        -> rustls-webpki 0.101.7
-    #
-    # Upstream blocker: tiberius 0.12.3 is the latest release and hard-pins
-    # `tokio-rustls = "0.24.0"`. The advisories are fixed only in
-    # rustls-webpki >= 0.103.12, which requires rustls 0.23 — not semver-reachable
-    # from tiberius' pin. rustcdc's own TLS stack is already rustls 0.23.19; this
-    # old copy exists solely inside tiberius.
-    #
-    # Reachability assessed per advisory rather than blanket-ignored:
-    #
-    #   RUSTSEC-2026-0104 (panic parsing certificate revocation lists):
-    #     NOT reachable. Triggered only when parsing a CRL. rustcdc never
-    #     configures a CRL, and tiberius exposes no API to supply one, so no CRL
-    #     is ever parsed on this path.
-    #
-    #   RUSTSEC-2026-0098 (URI name constraints ignored and therefore accepted):
-    #     Same class as 0099 below, and the same preconditions: reachable only
-    #     after signature verification, and only exploitable given CA misissuance.
-    #     webpki 0.101 provides no API for asserting URI names in the first place,
-    #     and rustcdc asserts none, so no rustcdc code path depends on a URI name
-    #     constraint being honoured.
-    #
-    #   RUSTSEC-2026-0099 (name constraints accepted for wildcard names):
-    #     Reachable in principle — it is in the server-certificate verification
-    #     path rustcdc uses. Exploitation additionally requires a CA the client
-    #     already trusts to have MISISSUED a wildcard certificate that escapes a
-    #     name constraint, and is only reached after signature verification
-    #     succeeds. Deployments that pin a private CA via
-    #     `TransportConfig::tls_with_ca_cert_path(...)` and do not rely on
-    #     name-constrained intermediates are not materially exposed.
-    #
-    # Users who cannot accept this should not enable the `sqlserver` feature.
-    # Documented in site/content/docs/security.md. Remove both entries as soon as tiberius
-    # releases against rustls 0.23.
-
-    #   RUSTSEC-2025-0134 (rustls-pemfile unmaintained):
-    #     Unmaintained, not a vulnerability. rustcdc's own code no longer uses it —
-    #     PEM parsing moved to `rustls_pki_types::pem::PemObject`, which is the
-    #     same implementation the final rustls-pemfile release wrapped — and the
-    #     direct dependency was removed. It survives only under the `sqlserver`
-    #     feature, via tiberius 0.12.3 -> rustls-native-certs 0.6 -> rustls-pemfile
-    #     1.0, on the same upstream blocker as the entries above.
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
@@ -174,21 +103,7 @@ allow = [
     # with no attribution requirement for binary distribution. Used by xxhash-rust
     # (via redis <- opendal's Redis state backend).
     "BSL-1.0",
-    # ── Carried over from the library's policy ───────────────────────────────
-    # `ring`'s custom OpenSSL-adjacent licence. Also pinned exactly by the
-    # `[[licenses.clarify]]` entry below; allowed here so the expression resolves
-    # for any other crate that carries the same term.
-    "OpenSSL",
-    # Superseded by Unicode-3.0 upstream, but still carried by pinned versions of
-    # some unicode-* crates in the graph.
-    "Unicode-DFS-2016",
 ]
-
-[[licenses.clarify]]
-# ring uses a custom OpenSSL-adjacent license — pre-approved.
-name = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 # ── Bans ──────────────────────────────────────────────────────────────────────
 [bans]

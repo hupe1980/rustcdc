@@ -35,12 +35,11 @@ pub struct FixtureMetadata {
     /// otherwise invisible: replay simply produces fewer events, the golden is re-recorded to
     /// match, and the scenario the fixture was written to cover quietly stops being covered.
     ///
-    /// It was previously named `message_count`, which said one thing and checked
-    /// another. The count of *events* is not the count of *messages* — an aborted transaction
-    /// discards its buffered events, so replay can legitimately produce fewer — and it was
-    /// checked against `messages.len()` regardless. Worse, it was checked **only** in
-    /// [`Fixture::new`], which the file-loading path never calls, so every fixture on disk
-    /// carried an unverified number that a reader could reasonably trust.
+    /// It counts *messages*, not the events replaying them produces: an aborted transaction
+    /// discards its buffered events, so a correct fixture can legitimately replay to fewer
+    /// events than it carries messages. Verified by [`Fixture::validate`], which the
+    /// file-loading path runs — a number checked only on construction would leave every
+    /// fixture on disk carrying an unverified count that a reader could reasonably trust.
     pub message_count: usize,
 
     /// Date fixture was captured (ISO 8601)

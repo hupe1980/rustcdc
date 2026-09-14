@@ -71,8 +71,8 @@ Where a guarantee has a limit, the limit is written next to it.
 **Pre-1.0.** The public API may still change; minor versions may contain breaking changes,
 and each one is listed in [CHANGELOG.md](CHANGELOG.md) with the migration it requires.
 
-Validated by 1 168 library and 446 server unit tests, 139 compiled documentation samples,
-41 deterministic-replay golden fixtures and 42 integration suites against real PostgreSQL,
+Validated by 1 181 library and 570 server unit tests, 141 compiled documentation samples,
+41 deterministic-replay golden fixtures and 43 integration suites against real PostgreSQL,
 MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka.
 
 ## Building it

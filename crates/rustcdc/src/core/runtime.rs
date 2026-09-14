@@ -4629,9 +4629,9 @@ mod tests {
 
     /// `max_event_bytes` must actually bound the batch.
     ///
-    /// It was previously declared, defaulted, settable and documented as a flush limit
-    /// — and never read anywhere. An operator setting it to protect a downstream with
-    /// a hard message-size limit got no protection and no warning.
+    /// Declared, defaulted, settable and documented as a flush limit, it is worthless
+    /// unless something reads it: an operator setting it to protect a downstream with a
+    /// hard message-size limit would get no protection and no warning.
     #[tokio::test]
     async fn max_event_bytes_bounds_the_delivered_batch() {
         let checkpoint = InMemoryCheckpoint::default();

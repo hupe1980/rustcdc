@@ -7,13 +7,9 @@
 #   crates/xtask           crash-worker binaries the integration suites spawn
 #
 [workspace]
-# A virtual manifest: the root defines the workspace and owns nothing itself.
-#
-# Every crate lives under `crates/`, so `cargo package` collects one crate's directory
-# and nothing else. While the library sat at the root it was *also* the workspace root,
-# and `cargo package` vacuumed the entire repository — the server, its fuzz corpus, the
-# demo stack, the CI scripts — which had to be held back by a hand-maintained `exclude`
-# list that grew with every new top-level directory.
+# A virtual manifest: the root defines the workspace and owns nothing itself. Every crate
+# lives under `crates/`, so `cargo package` collects one crate's directory and nothing else
+# — a package at the root would collect the whole repository.
 members = ["crates/*"]
 # `cargo build` builds the product: library *and* server binary. `xtask` is a member but
 # not a default one — it holds the crash-worker binaries the integration suites spawn, and
@@ -30,7 +26,7 @@ resolver = "2"
 # and are tested only against each other, so a split version line would encode a
 # compatibility question that does not exist.
 [workspace.package]
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 # The AWS SDK sets this floor; wasmtime is the next constraint at 1.94.0. Declaring the
 # lower number would hand anyone a resolver error instead of a documented requirement.
@@ -42,18 +38,15 @@ homepage = "https://github.com/hupe1980/rustcdc"
 
 # Dependencies shared by more than one crate, declared once.
 #
-# Two things this buys. The internal `rustcdc` dependency carries a version alongside its
-# path, which is what `cargo publish` needs and what stops `cargo deny` reporting it as a
-# wildcard; without the version, a published `rustcdc-server` could never resolve it.
+# The internal `rustcdc` dependency carries a version alongside its path: `cargo publish`
+# requires it, `cargo deny` reports a bare path as a wildcard, and without it a published
+# `rustcdc-server` could not resolve the library.
 #
-# And the third-party entries stop the members drifting apart. They had: the library was
-# on `base64 0.23` and `criterion 0.8` while the server was on `0.22` and `0.7`, so one
-# workspace resolved two copies of each — a duplicate `base64` that `deny.toml` had been
-# told to tolerate rather than fix. A member still narrows what it takes with
-# `default-features = false` and adds the features it needs; it cannot pick its own
-# version.
+# The third-party entries hold the members on one version, so the workspace cannot resolve
+# two copies of the same crate. A member narrows what it takes with
+# `default-features = false` and adds the features it needs; it cannot pick its own version.
 [workspace.dependencies]
-rustcdc = { path = "crates/rustcdc", version = "0.16.0", default-features = false }
+rustcdc = { path = "crates/rustcdc", version = "0.17.0", default-features = false }
 
 base64 = "0.23"
 bytes = "1"
@@ -78,7 +71,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # `deny`, not `forbid`: the Windows PID-liveness probe in `checkpoint::owner_lease` needs
 # one tightly-scoped `unsafe` block for the Win32 `OpenProcess`/`GetExitCodeProcess` FFI,
 # and the server's `test_env` needs `std::env::set_var`, which Rust 2024 makes unsafe.
-# `forbid` cannot be locally overridden, so it made the library impossible to compile for
+# `forbid` cannot be locally overridden, which would leave the library uncompilable for
 # `*-pc-windows-*` targets. Every exception carries an explicit `#[allow(unsafe_code)]`
 # with a safety comment, and `crates/rustcdc-server/tests/architecture.rs` holds the allowlist.
 unsafe_code = "deny"
