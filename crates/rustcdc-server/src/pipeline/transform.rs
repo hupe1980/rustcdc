@@ -572,13 +572,12 @@ fn matches_when(event: &Event, when: &TransformWhenConfig) -> bool {
         && matches_values(event.op.to_str(), &when.ops)
 }
 
+/// An empty allow-list admits everything.
 fn matches_values(value: &str, allowed: &[String]) -> bool {
-    allowed.is_empty()
-        || allowed
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(value))
+    allowed.is_empty() || lists_value(value, allowed)
 }
 
+/// An empty list names nothing, which is what a deny-list needs.
 fn lists_value(value: &str, listed: &[String]) -> bool {
     listed
         .iter()
@@ -609,10 +608,11 @@ fn apply_action(event: Event, action: &TransformActionConfig) -> Result<Option<E
             include_ops,
             exclude_ops,
         } => {
+            let op = event.op.to_str();
             if !matches_values(&event.table, include_tables)
                 || !matches_optional_value(event.schema.as_deref(), include_schemas)
-                || !matches_values(event.op.to_str(), include_ops)
-                || lists_value(event.op.to_str(), exclude_ops)
+                || !matches_values(op, include_ops)
+                || lists_value(op, exclude_ops)
             {
                 return Ok(None);
             }
