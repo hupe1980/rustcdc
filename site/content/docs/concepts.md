@@ -306,8 +306,9 @@ Declared as `[[pipeline.transforms]]` in TOML. Each rule has an optional
 An empty `when` block matches every event.
 
 Operation names in `when.ops`, `include_ops` and `exclude_ops` are checked when the
-configuration loads. They ignore case; any name other than `insert`, `update`, `delete`,
-`read`, `schema_change` or `truncate` is a configuration error, not a rule that never matches.
+configuration loads. They ignore case, and must be one of the values listed under
+[operation types](#operation-types); any other name is a configuration error, not a rule that
+never matches.
 
 **Example — redact a column and add metadata:**
 
