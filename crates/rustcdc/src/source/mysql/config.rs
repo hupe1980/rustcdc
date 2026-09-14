@@ -41,7 +41,7 @@ impl Default for MysqlSourceConfig {
     fn default() -> Self {
         Self {
             host: "localhost".into(),
-            port: 3306,
+            port: Self::default_port(),
             user: String::new(),
             password: SecretString::default(),
             auth_mode: DatabaseAuthMode::Password,
@@ -53,11 +53,11 @@ impl Default for MysqlSourceConfig {
             // event loss in multi-instance deployments with no recoverable signal.
             server_id: 0,
             gtid_mode_enabled: false,
-            binlog_format_check: true,
-            transport: TransportConfig::tls(),
-            conn_timeout_secs: 30,
-            stream_poll_interval_ms: STREAM_POLL_INTERVAL_MS,
-            max_events_per_poll: MAX_EVENTS_PER_POLL,
+            binlog_format_check: Self::default_binlog_format_check(),
+            transport: TransportConfig::default(),
+            conn_timeout_secs: Self::default_conn_timeout_secs(),
+            stream_poll_interval_ms: Self::default_stream_poll_interval_ms(),
+            max_events_per_poll: Self::default_max_events_per_poll(),
             table_include_list: Vec::new(),
             table_exclude_list: Vec::new(),
             server_flavor: ServerFlavor::Mysql,
@@ -80,6 +80,32 @@ impl MysqlSourceConfig {
     /// when deserializing configs that predate this field.
     pub const fn default_handoff_overlap_drain_budget_ms() -> u64 {
         STREAM_POLL_INTERVAL_MS * 8
+    }
+
+    /// Default for `binlog_format_check`: on. The serde `default` for the field.
+    pub const fn default_binlog_format_check() -> bool {
+        true
+    }
+
+    /// Default server port (3306). The serde `default` for the field.
+    pub const fn default_port() -> u16 {
+        3306
+    }
+
+    /// Default connection timeout (30 s). The serde `default`, so a config that
+    /// omits the field gets the documented value rather than a missing-field error.
+    pub const fn default_conn_timeout_secs() -> u64 {
+        30
+    }
+
+    /// Default stream poll interval. The serde `default` for the field.
+    pub const fn default_stream_poll_interval_ms() -> u64 {
+        STREAM_POLL_INTERVAL_MS
+    }
+
+    /// Default per-poll event cap. The serde `default` for the field.
+    pub const fn default_max_events_per_poll() -> usize {
+        MAX_EVENTS_PER_POLL
     }
 
     /// Enable AWS IAM token-based database authentication mode.

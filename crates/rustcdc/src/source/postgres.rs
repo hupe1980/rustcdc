@@ -523,6 +523,7 @@ pub struct PostgresSourceConfig {
     /// Server hostname or IP.
     pub host: String,
     /// Server port.
+    #[serde(default = "PostgresSourceConfig::default_port")]
     pub port: u16,
     /// Login user. Needs the connector's replication/CDC privileges.
     pub user: String,
@@ -547,23 +548,29 @@ pub struct PostgresSourceConfig {
     /// Publication the slot reads through. Must include every captured table.
     pub publication_name: String,
     /// Transport mode. TLS by default; plaintext is an explicit, loudly-logged opt-in.
+    #[serde(default)]
     pub transport: TransportConfig,
     /// Connection timeout in seconds.
+    #[serde(default = "PostgresSourceConfig::default_conn_timeout_secs")]
     pub conn_timeout_secs: u64,
     /// Stream poll interval in milliseconds.
+    #[serde(default = "PostgresSourceConfig::default_stream_poll_interval_ms")]
     pub stream_poll_interval_ms: u64,
     /// Maximum events yielded by a single stream poll cycle.
+    #[serde(default = "PostgresSourceConfig::default_max_events_per_poll")]
     pub max_events_per_poll: usize,
     /// Allowlist of tables to stream, in `"schema.table"` format.
     ///
     /// When non-empty, only tables in this list are forwarded to the caller.
     /// Takes precedence over [`table_exclude_list`](PostgresSourceConfig::table_exclude_list).
     /// An empty list means *all* tables are included (subject to the publication).
+    #[serde(default)]
     pub table_include_list: Vec<String>,
     /// Blocklist of tables to suppress, in `"schema.table"` format.
     ///
     /// Ignored when [`table_include_list`](PostgresSourceConfig::table_include_list) is non-empty.
     /// An empty list means no tables are excluded.
+    #[serde(default)]
     pub table_exclude_list: Vec<String>,
     /// Interval in milliseconds between WAL slot idle-advance calls.
     ///
