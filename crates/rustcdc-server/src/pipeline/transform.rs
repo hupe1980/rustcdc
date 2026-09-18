@@ -1,9 +1,10 @@
 use rustcdc::outbox::OutboxTransform;
+use rustcdc::schema_history::{ColumnDef, TableSchema};
 use rustcdc::transform::UnmatchedRule;
 use rustcdc::wasm::{TransformResult, WasmConfig as RustcdcWasmConfig, WasmRuntime};
 use rustcdc::{
-    BeforeImage, Error, Event, FieldMappingConfig, FieldMappingTransform, MaskHashConfig,
-    MaskHashTransform, MaskRule, Result, fingerprint_event_stable,
+    BeforeImage, CapturedDdl, Error, Event, FieldMappingConfig, FieldMappingTransform,
+    MaskHashConfig, MaskHashTransform, MaskRule, Result, fingerprint_event_stable,
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -570,31 +571,35 @@ fn apply_rules(event: Event, rules: &[CompiledRule]) -> Result<Option<Event>> {
 /// The known tables whose schema events the configured rules let through, under the name
 /// they reach the router with.
 ///
-/// Startup needs this to know which `<table>__ddl_events` topics a sink will be asked for.
-/// It runs the pipeline's own compiled rules and `apply_rules` on a schema event shaped like
-/// the one each connector emits, so startup and the hot path cannot disagree about which
-/// schema events survive. A rule that fails on that event counts as dropping it: failing
-/// startup over a topic the event would never reach is the worse mistake. A WASM transform
-/// runs after these rules and is not consulted.
+/// Startup needs this to know which schema-event topics a sink will be asked for. The probe
+/// is a real `READ_SCHEMA` announcement published through [`CapturedDdl::to_event`], the
+/// same call every connector makes, so a rule that reads the payload (`unwrap` or `flatten`
+/// on `result_schema`, a strict field mapping) sees the fields it sees at runtime. The
+/// one-column `result_schema` stands in for the catalogue read. A rule that still errors on
+/// it counts as dropping the event.
+///
+/// Returns nothing when the transform runtime is WASM. The module runs after these rules,
+/// cannot be run here, and may drop or rename schema events, so a topic predicted without it
+/// could fail startup although nothing is ever written to it.
 pub(crate) fn schema_event_tables(
+    runtime: &TransformRuntimeConfig,
     rules: &[TransformRuleConfig],
     tables: &[QualifiedTable],
 ) -> Vec<QualifiedTable> {
+    if runtime.mode == TransformRuntimeMode::Wasm {
+        return Vec::new();
+    }
     let Ok(compiled) = compile_rules(rules.to_vec()) else {
         return Vec::new();
     };
     tables
         .iter()
         .filter_map(|table| {
-            let mut event = Event::builder(
-                rustcdc::ddl_events_table(&table.table),
-                rustcdc::Operation::SchemaChange,
-            )
-            .after(Value::Object(Map::new()));
-            if let Some(schema) = &table.schema {
-                event = event.schema(schema.clone());
-            }
-            match apply_rules(event.build(), &compiled) {
+            let mut event = read_schema_probe(table);
+            // `to_event` always sets a schema. Keep the configured table's own, so an
+            // unqualified entry renders the way its data topic does.
+            event.schema = table.schema.clone();
+            match apply_rules(event, &compiled) {
                 Ok(Some(event)) => Some(QualifiedTable {
                     schema: event.schema,
                     table: event.table,
@@ -603,6 +608,32 @@ pub(crate) fn schema_event_tables(
             }
         })
         .collect()
+}
+
+/// The schema announcement a connector publishes before `table`'s first row.
+fn read_schema_probe(table: &QualifiedTable) -> Event {
+    let schema = table.schema.clone().unwrap_or_default();
+    CapturedDdl {
+        ddl_type: rustcdc::DDL_TYPE_READ_SCHEMA.to_string(),
+        schema: schema.clone(),
+        table: table.table.clone(),
+        statement: format!("/* schema of {} probed at startup */", table.display()),
+        result_schema: Some(TableSchema {
+            schema,
+            table: table.table.clone(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                nullable: false,
+                constraints: vec!["primary_key".to_string()],
+            }],
+            primary_keys: vec!["id".to_string()],
+            version: 0,
+        }),
+        schema_diff: None,
+        ts: 0,
+    }
+    .to_event("preflight", String::new(), 0)
 }
 
 fn matches_when(event: &Event, when: &TransformWhenConfig) -> bool {
@@ -870,6 +901,45 @@ mod tests {
     use rustcdc::core::SourceMetadata;
     use serde_json::json;
     use tempfile::TempDir;
+
+    fn table(entry: &str) -> QualifiedTable {
+        QualifiedTable::parse_concrete(entry).expect("concrete table")
+    }
+
+    /// The schema-event table keeps the configured schema half, whatever the connector
+    /// calls it: a PostgreSQL or SQL Server schema, or a MySQL database.
+    #[test]
+    fn schema_event_tables_keep_each_connectors_schema_half() {
+        let found = schema_event_tables(
+            &TransformRuntimeConfig::default(),
+            &[],
+            &[
+                table("inventory.orders"),
+                table("dbo.orders"),
+                table("orders"),
+            ],
+        );
+        let names: Vec<String> = found.iter().map(QualifiedTable::display).collect();
+        assert_eq!(
+            names,
+            vec![
+                "inventory.orders__ddl_events",
+                "dbo.orders__ddl_events",
+                "orders__ddl_events"
+            ]
+        );
+    }
+
+    /// A WASM module runs after the native rules and cannot be run at startup. It may drop
+    /// schema events, so none are predicted rather than demanding topics it never writes.
+    #[test]
+    fn schema_event_tables_predicts_nothing_under_a_wasm_runtime() {
+        let wasm = TransformRuntimeConfig {
+            mode: TransformRuntimeMode::Wasm,
+            ..TransformRuntimeConfig::default()
+        };
+        assert!(schema_event_tables(&wasm, &[], &[table("public.orders")]).is_empty());
+    }
 
     /// Compile config rules and run one event through them.
     fn apply_rules(event: Event, rules: &[TransformRuleConfig]) -> Result<Option<Event>> {

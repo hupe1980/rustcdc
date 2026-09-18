@@ -485,9 +485,11 @@ tables its routes send it.
 Schema events are published under a table of their own, `<table>__ddl_events`, so the
 template gives them their own topic: `cdc.${schema}.${table}` sends the announcement for
 `public.orders` to `cdc.public.orders__ddl_events`. Preflight checks those topics too,
-unless the pipeline's transforms drop schema events (`exclude_ops = ["schema_change"]`).
-They are routed by that name, so a route for `public.orders` does not claim them but one
-for `public.orders*` does. A WASM transform is not consulted.
+unless the pipeline's transforms drop schema events (`exclude_ops = ["schema_change"]`),
+under whatever name the transforms give them. They are routed by that name, so a route for
+`public.orders` does not claim them but one for `public.orders*` does. With
+`transform_runtime.mode = "wasm"` these topics are **not** checked, because the module cannot
+be run at startup: create them yourself if your module keeps schema events.
 
 Topics are **not** auto-created.
 

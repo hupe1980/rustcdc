@@ -131,10 +131,10 @@ pub use crate::core::{
 #[cfg(feature = "tls")]
 pub use crate::core::{RustlsClientConfig, rustls_client_config};
 pub use crate::ddl_capture::{
-    CapturedDdl, DdlDialect, DdlExtractor, DdlOperation, MysqlDdlExtractor, ParsedDdlStatement,
-    PostgresDdlExtractor, SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor, ddl_events_table,
-    extract_columns_from_create, extract_primary_keys, extract_qualified_name,
-    extract_qualified_name_with_default, normalize_identifier,
+    CapturedDdl, DDL_TYPE_READ_SCHEMA, DdlDialect, DdlExtractor, DdlOperation, MysqlDdlExtractor,
+    ParsedDdlStatement, PostgresDdlExtractor, SchemaDiff, SchemaDiffOperation,
+    SqlServerDdlExtractor, extract_columns_from_create, extract_primary_keys,
+    extract_qualified_name, extract_qualified_name_with_default, normalize_identifier,
 };
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
 pub use crate::source::IncrementalSnapshotConfig;

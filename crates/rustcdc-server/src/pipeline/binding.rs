@@ -59,8 +59,11 @@ pub async fn build_router(config: &AppConfig) -> Result<BuiltRouter, AppError> {
     // need a topic for its schema events. Whether it does is the transforms' decision, and
     // where they go is the routes'.
     let mut known = sink::SinkBuildContext::known_tables_from_config(config);
-    let schema_events =
-        crate::pipeline::transform::schema_event_tables(&config.pipeline.transforms, &known);
+    let schema_events = crate::pipeline::transform::schema_event_tables(
+        &config.pipeline.transform_runtime,
+        &config.pipeline.transforms,
+        &known,
+    );
     known.extend(schema_events);
     let assignment = assign_known_tables(known, &config.pipeline.routes);
     let context_for = |tables: Vec<crate::topic::QualifiedTable>| {

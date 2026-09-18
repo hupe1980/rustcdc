@@ -1,8 +1,8 @@
 //! Startup preflight for the topics schema events are published to.
 //!
-//! Every connector publishes schema events under the synthetic table
-//! `<table>__ddl_events` (see [`rustcdc::ddl_events_table`]), so a topic template renders
-//! them to a topic of their own. These tests go through the real `load()`, `build_router`
+//! Every connector publishes schema events through `CapturedDdl::to_event`, under the
+//! synthetic table `<table>__ddl_events`, so a topic template renders them to a topic of
+//! their own. These tests go through the real `load()`, `build_router`
 //! and router preflight against a fake broker, because the question is what an operator's
 //! pipeline demands at startup, not what one helper returns.
 
@@ -150,6 +150,84 @@ async fn schema_event_topics_follow_the_routes_that_would_carry_them() {
     let message = preflight(&config_path)
         .await
         .expect_err("the widened route now carries the schema events");
+    assert!(
+        message.contains("cdc.public.orders__ddl_events"),
+        "{message}"
+    );
+}
+
+/// A `route` action can rename a schema event's table, and that is the name its topic is
+/// rendered from. This is the case that makes running the rules necessary rather than just
+/// looking for `exclude_ops`.
+#[tokio::test]
+async fn a_route_action_that_renames_schema_events_moves_the_topic_checked() {
+    let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
+    let broker = krafka::testing::FakeBroker::start()
+        .await
+        .expect("fake broker");
+    broker.create_topic("cdc.public.orders", 1);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = pipeline_config(
+        dir.path(),
+        &kafka_sink("[sink]", &broker.bootstrap_servers()),
+        r#"
+[[pipeline.transforms]]
+name = "one-topic-for-schema-events"
+
+  [pipeline.transforms.when]
+  ops = ["schema_change"]
+
+  [[pipeline.transforms.actions]]
+  type  = "route"
+  table = "schema_events"
+"#,
+    );
+
+    let message = preflight(&config_path)
+        .await
+        .expect_err("the renamed topic does not exist yet");
+    assert!(message.contains("cdc.public.schema_events"), "{message}");
+    assert!(!message.contains("orders__ddl_events"), "{message}");
+
+    broker.create_topic("cdc.public.schema_events", 1);
+    preflight(&config_path)
+        .await
+        .expect("the topic the renamed events go to exists");
+}
+
+/// A rule that reads the schema event's payload must see the payload a connector sends.
+/// `unwrap` on `result_schema` succeeds on a real announcement, so the event is published
+/// and its topic has to be checked. A probe with an empty payload made this rule fail,
+/// counted the event as dropped, and left the topic unchecked: the stall from #21 again.
+#[tokio::test]
+async fn a_rule_that_reads_the_schema_payload_still_leaves_the_topic_checked() {
+    let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
+    let broker = krafka::testing::FakeBroker::start()
+        .await
+        .expect("fake broker");
+    broker.create_topic("cdc.public.orders", 1);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = pipeline_config(
+        dir.path(),
+        &kafka_sink("[sink]", &broker.bootstrap_servers()),
+        r#"
+[[pipeline.transforms]]
+name = "columns-only"
+
+  [pipeline.transforms.when]
+  ops = ["schema_change"]
+
+  [[pipeline.transforms.actions]]
+  type  = "unwrap"
+  field = "result_schema"
+"#,
+    );
+
+    let message = preflight(&config_path)
+        .await
+        .expect_err("the rule keeps the event, so its topic is required");
     assert!(
         message.contains("cdc.public.orders__ddl_events"),
         "{message}"
