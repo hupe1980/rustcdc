@@ -1,7 +1,11 @@
 use crate::core::{
     BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
 };
+use crate::ddl_capture::CapturedDdl;
 use crate::source::helpers::now_millis;
+use crate::source::schema_catalog::{
+    DDL_TYPE_READ_SCHEMA, observed_statement, table_schema_from_catalog,
+};
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, MysqlSnapshotHandle};
 
@@ -22,16 +26,57 @@ pub(super) async fn next_snapshot_chunk(
 
     while events.len() < requested && handle.current_table < handle.tables.len() {
         let table_index = handle.current_table;
-        let (table_name, live_query, cursor_position, primary_key_columns) = {
+        let (table_name, live_query, cursor_position, primary_key_columns, schema_name, bare_table) = {
             let table = &handle.tables[table_index];
             (
                 table.snapshot.table.clone(),
                 table.live_query,
                 table.snapshot.cursor_position.clone(),
                 table.primary_key_columns.clone(),
+                table.schema_name.clone(),
+                table.bare_table.clone(),
             )
         };
         let remaining = requested - events.len();
+
+        // Announce the table's schema before its first row. MySQL's schema events
+        // otherwise come only from DDL parsed out of the binlog, so a table whose
+        // `CREATE TABLE` predates capture had none at all — and snapshot rows carry text
+        // values like every other event.
+        if !handle.tables[table_index].schema_announced {
+            handle.tables[table_index].schema_announced = true;
+            let catalog = handle.tables[table_index].catalog_columns.clone();
+            if !catalog.is_empty() {
+                let ts = now_millis();
+                let captured = CapturedDdl {
+                    ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
+                    schema: schema_name.clone(),
+                    table: bare_table.clone(),
+                    statement: observed_statement(&schema_name, &bare_table, "information_schema"),
+                    result_schema: Some(table_schema_from_catalog(
+                        &schema_name,
+                        &bare_table,
+                        &catalog,
+                        &primary_key_columns,
+                    )),
+                    schema_diff: None,
+                    ts,
+                };
+                // The same offset shape the rows around it carry —
+                // `<binlog_file>:<binlog_pos>:<cursor>`. An event's offset is a source
+                // position the runtime parses when it builds a checkpoint, so a synthetic
+                // label is not merely uninformative: it fails the parse and takes the
+                // handoff with it.
+                events.push(captured.to_event(
+                    &handle.source_name,
+                    format!(
+                        "{}:{}:schema:{table_name}",
+                        handle.snapshot.binlog_file, handle.snapshot.binlog_pos
+                    ),
+                    ts,
+                ));
+            }
+        }
 
         if live_query {
             let rows = handle
@@ -67,8 +112,8 @@ pub(super) async fn next_snapshot_chunk(
                         timestamp: ts,
                     },
                     ts,
-                    schema: None,
-                    table: table_name.clone(),
+                    schema: Some(schema_name.clone()),
+                    table: bare_table.clone(),
                     primary_key: Some(primary_key_columns.clone()),
                     snapshot: Some(SnapshotMetadata {
                         snapshot_id: handle.snapshot.snapshot_id.clone(),
@@ -105,8 +150,10 @@ pub(super) async fn next_snapshot_chunk(
                         timestamp: ts,
                     },
                     ts,
-                    schema: None,
-                    table: table.snapshot.table.clone(),
+                    // Same identity as the live-query branch and the stream: schema and
+                    // bare table carried separately, never a joined string.
+                    schema: Some(table.schema_name.clone()),
+                    table: table.bare_table.clone(),
                     primary_key: Some(table.primary_key_columns.clone()),
                     snapshot: Some(SnapshotMetadata {
                         snapshot_id: handle.snapshot.snapshot_id.clone(),

@@ -242,7 +242,13 @@ async fn startup_self_heals_when_checkpoint_lsn_ahead_of_slot() {
 
     let mut events = Vec::new();
     for _ in 0..100 {
-        let batch = stream.next_events(200).await.unwrap();
+        let batch = stream
+            .next_events(200)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         events.extend(batch);
         if events.len() >= 5 {
             break;
@@ -324,7 +330,13 @@ async fn confirm_lsn_keeps_advancing_slot_across_batches() {
 
     let mut batch1 = Vec::new();
     for _ in 0..100 {
-        let events = stream.next_events(200).await.unwrap();
+        let events = stream
+            .next_events(200)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         batch1.extend(events);
         if batch1.len() >= 5 {
             break;
@@ -374,7 +386,13 @@ async fn confirm_lsn_keeps_advancing_slot_across_batches() {
 
     let mut batch2 = Vec::new();
     for _ in 0..100 {
-        let events = stream.next_events(200).await.unwrap();
+        let events = stream
+            .next_events(200)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         batch2.extend(events);
         if batch2.len() >= 5 {
             break;

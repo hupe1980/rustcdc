@@ -58,6 +58,10 @@ async fn collect_events_with_deadline(
     let cdc_scan_sql = format!("USE {database}; EXEC sys.sp_cdc_scan");
 
     while std::time::Instant::now() < deadline {
+        // Deliberately unfiltered. Both callers assert with `any(op == …)`, so the
+        // schema announcements that now precede each table's first row cost them
+        // nothing — and `sqlserver_stream_emits_schema_change_for_capture_metadata_refresh`
+        // asserts on exactly those events, so filtering here would make it unpassable.
         let mut batch = stream.next_events(200).await?;
         if batch.is_empty() {
             // Force a capture pass so CDC rows become visible promptly in CI/containers.
@@ -223,6 +227,10 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             continue;
         }
+        let batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         if batch.iter().any(|event| {
             // Compare the decoded value, not its JSON rendering: `to_string()` on a JSON
             // string yields `"\"3\""`, quotes included. Column values are text under the

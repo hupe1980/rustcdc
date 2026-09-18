@@ -118,7 +118,10 @@ async fn a_change_after_a_long_idle_period_is_still_captured() -> rustcdc::Resul
     // advances; under the old rule the read point ended up `IDLE_POLLS` minimal LSN steps above the
     // maximum, under the new one it parks at one step past and stays.
     for _ in 0..IDLE_POLLS {
-        let events = stream.next_events(100).await?;
+        let events = (stream.next_events(100).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         assert!(
             events.is_empty(),
             "nothing has been written yet, so no poll may produce an event: {events:?}"
@@ -143,6 +146,10 @@ async fn a_change_after_a_long_idle_period_is_still_captured() -> rustcdc::Resul
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             continue;
         }
+        let batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         captured = batch.into_iter().find(|event| {
             event.op == Operation::Insert && event.table.eq_ignore_ascii_case("idle_probe")
         });

@@ -986,6 +986,7 @@ pub(crate) mod tests {
             failover_slot: false,
             wal_transport: Default::default(),
             reselect_unavailable_columns: false,
+            capture_logical_messages: false,
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

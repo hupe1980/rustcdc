@@ -48,11 +48,11 @@ changes; each one is listed in the
 [changelog](https://github.com/hupe1980/rustcdc/blob/main/CHANGELOG.md) with the migration
 it requires.
 
-Core connector and runtime paths are validated by 1 168 library unit tests, 446 server unit
-tests, 139 documentation samples compiled as doctests, 41 deterministic-replay golden
-fixtures and 42 integration suites — the container-backed ones running against real
-PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6, SQL Server 2022 and Apicurio
-Registry 3.
+Core connector and runtime paths are validated by 1 204 library unit tests, 571 server unit
+tests, 141 documentation samples compiled as doctests, 41 deterministic-replay golden
+fixtures and 43 integration suites — the container-backed ones running against real
+PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6, SQL Server 2019/2022 and Apicurio
+Registry 3.0.6.
 
 The Snowflake source is the one connector with **no container-backed evidence** — Snowflake
 has no self-hostable implementation. Its semantics are unit-tested through a scripted

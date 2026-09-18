@@ -31,6 +31,16 @@ pub(super) async fn start_postgres_stream(
         super::query::query_publication_primary_keys(&client, &connection.config.publication_name)
             .await?;
 
+    // Second and last catalog read of stream start. pgoutput describes a column with a
+    // type OID and a modifier and says nothing about nullability, so a schema built from
+    // the wire alone loses `numeric(12,4)` to `numeric`, degrades every enum and domain to
+    // `pg_type_oid:<N>`, and has to invent `nullable`. `format_type` answers all three from
+    // the server, and reading it here keeps the query out of the WAL decode loop — which
+    // has no ordinary SQL connection of its own.
+    let catalog_columns =
+        super::query::query_publication_column_types(&client, &connection.config.publication_name)
+            .await?;
+
     let mut stream = PostgresStream {
         slot_name: connection.config.replication_slot_name.clone(),
         publication_name: connection.config.publication_name.clone(),
@@ -124,6 +134,7 @@ pub(super) async fn start_postgres_stream(
                     slot_name: stream.slot_name.clone(),
                     publication_name: stream.publication_name.clone(),
                     confirmed_lsn: initial_confirmed_lsn,
+                    capture_logical_messages: connection.config.capture_logical_messages,
                 })
             }
         };
@@ -137,6 +148,7 @@ pub(super) async fn start_postgres_stream(
         connection.config.table_include_list.clone(),
         connection.config.table_exclude_list.clone(),
         catalog_primary_keys,
+        catalog_columns,
         reselect_client,
     )))
 }

@@ -8,6 +8,7 @@ pub(super) use crate::core::rustls_client_config;
 pub(super) use crate::core::transport_tls::build_tls_client_config;
 
 use crate::core::{Error, Result};
+use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
 
 use super::parser::quote_pg_identifier;
 
@@ -52,6 +53,142 @@ impl ReconcileOps for Client {
 /// The flag is right for `DEFAULT` and `INDEX` identities, where it names the primary key or the
 /// nominated index. Only `FULL` needs this lookup, and only the catalog can answer it.
 ///
+/// Read every published table's declared column types and nullability, once per stream start.
+///
+/// # Why `format_type` and not the pgoutput type OID
+///
+/// pgoutput's RELATION message carries a type OID and a type modifier per column. Mapping
+/// the OID through a built-in table loses two things and misreports a third:
+///
+/// * **The modifier.** `numeric(12,4)`, `character varying(64)` and `timestamp(3)` all
+///   arrive as `numeric`, `varchar` and `timestamp`. The modifier *is* decoded from the
+///   wire and was never read, so an `ALTER COLUMN amount TYPE numeric(14,4)` produced a
+///   schema-change event whose payload was byte-identical to the previous one — an event
+///   announcing a change it could not describe.
+/// * **Every type that is not built in.** Enums, domains, ranges, `hstore` and PostGIS
+///   types have installation-specific OIDs, so they degraded to `pg_type_oid:<N>`.
+/// * **Nullability**, which pgoutput does not carry at all. It was inferred from the
+///   primary key, which marks every `NOT NULL` non-key column nullable.
+///
+/// `pg_catalog.format_type(atttypid, atttypmod)` is the function PostgreSQL's own
+/// `\d` uses. It answers all three, in the server's own syntax, for every type the server
+/// knows — including ones this crate has never heard of.
+///
+/// # Why once, over the publication, rather than per relation
+///
+/// This is a catalog round trip. Doing it when a RELATION message arrives would put a
+/// query in the middle of decoding a WAL stream, on a connection the streaming transport
+/// does not have. One query at stream start, keyed the same way as
+/// [`query_publication_primary_keys`], costs one round trip per pipeline and is the same
+/// shape that function already established.
+///
+/// A table added to the publication *after* this runs is absent from the map. That is the
+/// documented fallback in `relation_to_table_schema`, not a hole: the table's first DDL
+/// arrives as its own schema-change event.
+pub(super) async fn query_publication_column_types(
+    client: &Client,
+    publication: &str,
+) -> Result<CatalogSchemas> {
+    let rows = client
+        .query(
+            "
+            SELECT
+              published.schemaname,
+              published.tablename,
+              attribute.attname,
+              pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+              attribute.attnotnull
+            FROM pg_catalog.pg_publication_tables published
+            JOIN pg_catalog.pg_class class_def
+              ON class_def.relname = published.tablename
+            JOIN pg_catalog.pg_namespace namespace_def
+              ON namespace_def.oid = class_def.relnamespace
+             AND namespace_def.nspname = published.schemaname
+            JOIN pg_catalog.pg_attribute attribute
+              ON attribute.attrelid = class_def.oid
+            WHERE published.pubname = $1
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+            ORDER BY published.schemaname, published.tablename, attribute.attnum
+            ",
+            &[&publication],
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed querying column types for publication '{publication}': {error}"
+            ))
+        })?;
+
+    let mut schemas: CatalogSchemas = std::collections::HashMap::new();
+    for row in rows {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        let name: String = row.get(2);
+        let data_type: String = row.get(3);
+        let not_null: bool = row.get(4);
+        schemas
+            .entry((schema, table))
+            .or_default()
+            .push(CatalogColumn {
+                name,
+                data_type,
+                nullable: !not_null,
+            });
+    }
+    Ok(schemas)
+}
+
+/// Read one table's declared column types, for a path that knows its table but has no
+/// publication to enumerate.
+///
+/// The snapshot reads configured tables, which need not be in any publication — a
+/// snapshot-only deployment has no publication at all. Same projection as
+/// [`query_publication_column_types`] so the snapshot and the stream describe one table
+/// identically; a disagreement between the two phases is the failure class
+/// `split_qualified_table_name` exists to prevent, applied to the schema instead of the
+/// name.
+pub(super) async fn query_table_column_types(
+    client: &Client,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<CatalogColumn>> {
+    let rows = client
+        .query(
+            "
+            SELECT
+              attribute.attname,
+              pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+              attribute.attnotnull
+            FROM pg_catalog.pg_attribute attribute
+            JOIN pg_catalog.pg_class class_def ON class_def.oid = attribute.attrelid
+            JOIN pg_catalog.pg_namespace namespace_def
+              ON namespace_def.oid = class_def.relnamespace
+            WHERE namespace_def.nspname = $1
+              AND class_def.relname = $2
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+            ORDER BY attribute.attnum
+            ",
+            &[&schema, &table],
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed querying column types for '{schema}.{table}': {error}"
+            ))
+        })?;
+
+    Ok(rows
+        .iter()
+        .map(|row| CatalogColumn {
+            name: row.get(0),
+            data_type: row.get(1),
+            nullable: !row.get::<usize, bool>(2),
+        })
+        .collect())
+}
+
 /// Ordering matters: a composite key is returned in index order, matching
 /// [`query_primary_key_columns_and_types`] so the two paths produce identical keys.
 pub(super) async fn query_publication_primary_keys(

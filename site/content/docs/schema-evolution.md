@@ -33,6 +33,9 @@ Schema evolution behavior spans two modules:
 - `ALTER TABLE`
 - `DROP TABLE`
 
+Plus `READ_SCHEMA` — not a statement, but a table's shape announced before its first row.
+See [Every table is announced before its first row](#every-table-is-announced-before-its-first-row).
+
 ### Core Types
 
 - `CapturedDdl`
@@ -61,9 +64,17 @@ Schema evolution behavior spans two modules:
 
 #### `record_ddl` is idempotent on `ddl_id`
 
-`ddl_id` is a stable identity for the statement; the runtime passes the source log position
-the DDL was captured at. A DDL redelivered under at-least-once replay returns the version it
-was already assigned rather than appending a second entry. Pass an empty string to opt out.
+`ddl_id` is a stable identity for the entry, and a redelivered DDL returns the version it was
+already assigned rather than appending a second one. Pass an empty string to opt out.
+
+The runtime chooses it by kind:
+
+| Entry | Identity | Why |
+|---|---|---|
+| A captured statement (`CREATE_TABLE`, `ALTER_TABLE`, `DROP_TABLE`) | the source log position | A table altered A → B → A has three entries, and the third is not the first |
+| An observation (`READ_SCHEMA`) | a digest of the schema it carries | Announced every run, so an offset would append a version per table per restart |
+
+An observation of a table that changed while the pipeline was down still records.
 
 This is load-bearing, not a nicety. The runtime records a schema change *before* it enqueues
 the event announcing it, so a crash between the record and the checkpoint commit replays the
@@ -115,6 +126,54 @@ When converted to canonical events, DDL records use:
 - `after` payload with `ddl_type`, `schema`, `table`, `statement`
 - Optional `result_schema` and `schema_diff` for richer evolution metadata
 
+### Every table is announced before its first row
+
+**A consumer reading a stream from the start of a session sees each table's column types
+before any of that table's rows, in both the snapshot and the stream.**
+
+Column values are text
+([Column values are text](@/docs/api.md#column-values-are-text-on-every-connector-and-every-path)),
+and parsing text requires knowing what to parse it as — nothing in `{"id": "9"}` says whether
+`"9"` is a `bigint` or a `text` holding a digit.
+
+The announcement carries `ddl_type = "READ_SCHEMA"` and a complete `result_schema`. It is
+distinct from `CREATE_TABLE`, which reports a table that was actually created:
+
+```json
+{
+  "ddl_type": "READ_SCHEMA",
+  "schema": "public",
+  "table": "orders",
+  "result_schema": {
+    "schema": "public",
+    "table": "orders",
+    "primary_keys": ["id"],
+    "columns": [
+      { "name": "id",     "data_type": "bigint",        "nullable": false, "constraints": ["primary_key"] },
+      { "name": "amount", "data_type": "numeric(12,4)", "nullable": false, "constraints": [] },
+      { "name": "note",   "data_type": "varchar(64)",   "nullable": true,  "constraints": [] }
+    ]
+  }
+}
+```
+
+`data_type` is the **source's own type syntax**, modifier included, read from the catalogue:
+
+| Source | Read from | Example |
+|---|---|---|
+| PostgreSQL | `pg_catalog.format_type()` | `numeric(12,4)`, `character varying(64)`, enum and domain names |
+| MySQL / MariaDB | `information_schema.COLUMNS.COLUMN_TYPE` | `decimal(12,4)`, `int unsigned`, `enum('a','b')` |
+| SQL Server | `sys.columns` via the capture instance | `decimal(12,4)`, `nvarchar(255)`, `datetime2(3)` |
+
+`nullable` is read from the catalogue too, not derived from the primary key.
+
+A type that cannot be read is the literal `unknown` — never a guess. See each connector page
+for when that happens.
+
+**Cadence.** One announcement per table per run, before that table's first row. A restart
+re-announces, because a reconnecting consumer needs the schema before the rows it is about to
+receive. The schema history de-duplicates the repeat, so no extra schema version is recorded.
+
 ## Operational Guidance
 
 1. Treat DDL streams as first-class data for downstream compatibility checks.
@@ -127,6 +186,12 @@ When converted to canonical events, DDL records use:
 1. Parsing covers common CREATE/ALTER/DROP table shapes; exotic vendor-specific syntax can require parser extension.
 2. `DROP_TABLE` emits a schema-history tombstone and does not include `result_schema`.
 3. `FileSchemaHistory` is a single-process local durability backend; multi-process or externally replicated durability still requires a custom implementation.
+4. A PostgreSQL table added to the publication after the stream started is not in the
+   stream-start catalogue read, so its announcement reports `data_type` from the pgoutput
+   type OID — no modifier, and `unknown` for a type outside the built-in set. Its first DDL
+   carries the full declaration.
+5. An offline snapshot — one with no live connection — has no catalogue to read, so it
+   announces nothing rather than describing columns it did not read.
 
 ## Related Documentation
 

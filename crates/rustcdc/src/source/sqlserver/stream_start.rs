@@ -100,5 +100,6 @@ pub(super) async fn start_sqlserver_stream(
         max_events_per_poll: connection.max_events_per_poll,
         pending_update_befores: ahash::AHashMap::new(),
         window_buffer: Vec::new(),
+        schemas_announced: false,
     }))
 }

@@ -806,9 +806,22 @@ pub struct MysqlStreamHandle {
     stream_poll_interval_ms: u64,
     table_include_list: Vec<String>,
     table_exclude_list: Vec<String>,
+    /// Declared column types for every table in the configured database, read from
+    /// `information_schema` once at stream start.
+    ///
+    /// The binlog decode path is synchronous and holds no SQL connection, so this cannot
+    /// be read lazily. See
+    /// [`query_database_column_types`](super::mysql::query::query_database_column_types)
+    /// for why the table map is not a substitute.
+    catalog_columns: crate::source::schema_catalog::CatalogSchemas,
+    /// Primary key per table, in index order, from the same read.
+    catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
+    /// Tables whose schema this run has already announced.
+    announced_tables: std::collections::HashSet<(String, String)>,
 }
 
 impl MysqlStreamHandle {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source_name: String,
         stream: MysqlStream,
@@ -817,6 +830,8 @@ impl MysqlStreamHandle {
         stream_poll_interval_ms: u64,
         table_include_list: Vec<String>,
         table_exclude_list: Vec<String>,
+        catalog_columns: crate::source::schema_catalog::CatalogSchemas,
+        catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
     ) -> Self {
         Self {
             source_name,
@@ -831,6 +846,9 @@ impl MysqlStreamHandle {
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
             table_include_list,
             table_exclude_list,
+            catalog_columns,
+            catalog_primary_keys,
+            announced_tables: std::collections::HashSet::new(),
         }
     }
 }
@@ -1434,6 +1452,22 @@ impl Source for MysqlConnection {
 
         let start = resolve_stream_start_position(&pool, self.source_type(), resume_from).await?;
 
+        // Two catalog reads, once per stream start. The binlog decode path is synchronous
+        // and has no SQL connection, so the declared types of a table cannot be fetched
+        // when its first row arrives — and a row's values are text, so a consumer that
+        // never receives the types cannot decode them.
+        let (catalog_columns, catalog_primary_keys) = {
+            let mut conn = pool.get_conn().await.map_err(|error| {
+                Error::SourceError(format!(
+                    "failed acquiring a mysql connection for catalog metadata: {error}"
+                ))
+            })?;
+            let columns =
+                query::query_database_column_types(&mut conn, &self.config.database).await?;
+            let keys = query::query_database_primary_keys(&mut conn, &self.config.database).await?;
+            (columns, keys)
+        };
+
         let mut stream = MysqlStream {
             binlog_file: start.binlog_file.clone(),
             binlog_pos: start.binlog_pos,
@@ -1468,6 +1502,8 @@ impl Source for MysqlConnection {
             self.stream_poll_interval_ms,
             self.config.table_include_list.clone(),
             self.config.table_exclude_list.clone(),
+            catalog_columns,
+            catalog_primary_keys,
         )))
     }
 
@@ -2450,6 +2486,151 @@ mod tests {
         }
     }
 
+    /// A handle whose `information_schema` read is supplied by the test.
+    fn make_stream_handle_with_catalog(
+        provider: MockBinlogProvider,
+        catalog_columns: crate::source::schema_catalog::CatalogSchemas,
+        catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
+    ) -> MysqlStreamHandle {
+        MysqlStreamHandle::new(
+            "mysql".into(),
+            MysqlStream {
+                binlog_file: "mysql-bin.000001".into(),
+                binlog_pos: 4,
+                gtid: String::new(),
+                stream_state: StreamState::Streaming,
+            },
+            Box::new(provider),
+            super::MAX_EVENTS_PER_POLL,
+            super::STREAM_POLL_INTERVAL_MS,
+            Vec::new(),
+            Vec::new(),
+            catalog_columns,
+            catalog_primary_keys,
+        )
+    }
+
+    /// A table whose `CREATE TABLE` predates capture is announced before its first row.
+    ///
+    /// MySQL's schema events otherwise come only from DDL parsed out of the binlog, so a
+    /// table created before the pipeline started had none at all — and its rows carry text
+    /// values, which a consumer cannot decode without the types.
+    #[tokio::test]
+    async fn a_table_is_announced_before_its_first_row() {
+        use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
+
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert(
+            ("app".to_string(), "users".to_string()),
+            vec![
+                CatalogColumn {
+                    name: "id".into(),
+                    data_type: "bigint unsigned".into(),
+                    nullable: false,
+                },
+                CatalogColumn {
+                    name: "amount".into(),
+                    data_type: "decimal(12,4)".into(),
+                    nullable: true,
+                },
+            ],
+        );
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(
+            ("app".to_string(), "users".to_string()),
+            vec!["id".to_string()],
+        );
+
+        let mut handle = make_stream_handle_with_catalog(
+            MockBinlogProvider::new(vec![vec![
+                MysqlBinlogMessage::Begin {
+                    tx_id: 7,
+                    timestamp_ms: 1,
+                },
+                MysqlBinlogMessage::WriteRows(row_change(
+                    "users",
+                    None,
+                    Some(json!({"id": "1", "amount": "12345.6789"})),
+                )),
+                MysqlBinlogMessage::WriteRows(row_change(
+                    "users",
+                    None,
+                    Some(json!({"id": "2", "amount": "1.0000"})),
+                )),
+                MysqlBinlogMessage::Xid {
+                    tx_id: 7,
+                    timestamp_ms: 2,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 100,
+                    gtid: None,
+                },
+            ]]),
+            catalog,
+            keys,
+        );
+
+        let events = handle.next_events(50).await.unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "one announcement and two rows, got {:?}",
+            events.iter().map(|e| e.table.clone()).collect::<Vec<_>>()
+        );
+
+        let after = events[0].after.as_ref().expect("schema payload");
+        assert_eq!(events[0].op, crate::core::Operation::SchemaChange);
+        assert_eq!(events[0].table, "users__ddl_events");
+        assert_eq!(after["ddl_type"], "READ_SCHEMA");
+        assert_eq!(
+            after["result_schema"]["columns"][1]["data_type"],
+            json!("decimal(12,4)"),
+            "the declared type is MySQL's own spelling, complete with its modifier — the \
+             binlog table map would only give MYSQL_TYPE_NEWDECIMAL"
+        );
+        assert_eq!(
+            after["result_schema"]["columns"][0]["nullable"],
+            json!(false),
+            "nullability is read from information_schema, never derived from the key"
+        );
+        assert_eq!(after["result_schema"]["primary_keys"], json!(["id"]));
+
+        // The second row does not re-announce: one per table per run.
+        assert!(
+            events[1..]
+                .iter()
+                .all(|event| event.op != crate::core::Operation::SchemaChange),
+            "a table is announced once, not before every row"
+        );
+    }
+
+    /// A table the catalog read did not cover is a table created after the stream started,
+    /// and it needs no announcement — its `CREATE TABLE` is in the binlog.
+    #[tokio::test]
+    async fn a_table_outside_the_catalog_read_is_not_announced() {
+        let mut handle = make_stream_handle_with_catalog(
+            MockBinlogProvider::new(vec![vec![
+                MysqlBinlogMessage::Begin {
+                    tx_id: 7,
+                    timestamp_ms: 1,
+                },
+                MysqlBinlogMessage::WriteRows(row_change("users", None, Some(json!({"id": 1})))),
+                MysqlBinlogMessage::Xid {
+                    tx_id: 7,
+                    timestamp_ms: 2,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 100,
+                    gtid: None,
+                },
+            ]]),
+            crate::source::schema_catalog::CatalogSchemas::new(),
+            std::collections::HashMap::new(),
+        );
+
+        let events = handle.next_events(50).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, crate::core::Operation::Insert);
+    }
+
     fn make_stream_handle(
         file: &str,
         pos: u32,
@@ -2469,6 +2650,8 @@ mod tests {
             super::STREAM_POLL_INTERVAL_MS,
             Vec::new(),
             Vec::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
+            std::collections::HashMap::new(),
         )
     }
 
@@ -2618,6 +2801,8 @@ mod tests {
             super::STREAM_POLL_INTERVAL_MS,
             Vec::new(),
             vec!["app.secrets".into()],
+            crate::source::schema_catalog::CatalogSchemas::new(),
+            std::collections::HashMap::new(),
         );
 
         let events = handle.next_events(20).await.unwrap();
@@ -2766,6 +2951,10 @@ mod tests {
                 rows,
                 next_row: 0,
                 live_query: false,
+                schema_name: "testdb".into(),
+                bare_table: "users".into(),
+                catalog_columns: Vec::new(),
+                schema_announced: false,
             }],
             None,
             false,

@@ -86,6 +86,14 @@ pub struct PostgresStreamHandle {
     /// [`query_publication_primary_keys`](super::postgres::query::query_publication_primary_keys)
     /// for what reading the flag as a primary key breaks.
     catalog_primary_keys: HashMap<(String, String), Vec<String>>,
+    /// Declared column types and nullability of every published table, read from the
+    /// catalog once at stream start.
+    ///
+    /// pgoutput carries a type OID, a type modifier it never used to read, and no
+    /// nullability at all — so the schema a RELATION message can describe on its own is
+    /// incomplete in three ways. See
+    /// [`query_publication_column_types`](super::postgres::query::query_publication_column_types).
+    catalog_columns: crate::source::schema_catalog::CatalogSchemas,
     /// Relations already warned about for an unusable REPLICA IDENTITY.
     ///
     /// pgoutput re-sends RELATION on every poll, so without this the warning would
@@ -172,6 +180,7 @@ impl PostgresStreamHandle {
         table_include_list: Vec<String>,
         table_exclude_list: Vec<String>,
         catalog_primary_keys: HashMap<(String, String), Vec<String>>,
+        catalog_columns: crate::source::schema_catalog::CatalogSchemas,
         reselect_client: Option<Arc<Client>>,
     ) -> Self {
         Self {
@@ -180,6 +189,7 @@ impl PostgresStreamHandle {
             provider,
             relation_map: HashMap::new(),
             catalog_primary_keys,
+            catalog_columns,
             warned_replica_identity: std::collections::HashSet::new(),
             warned_unknown_messages: std::collections::HashSet::new(),
             current_xid: None,
@@ -644,6 +654,31 @@ pub struct PostgresSourceConfig {
     /// Default: `false`.
     #[serde(default)]
     pub reselect_unavailable_columns: bool,
+    /// Capture logical decoding messages — what `pg_logical_emit_message()` writes.
+    ///
+    /// This is the **table-free transactional outbox**. An application records an event in
+    /// the same transaction as the row change that caused it, with no outbox table to
+    /// create, index, poll or vacuum, and no window in which the row is committed and the
+    /// event is not. For an embedder — a Rust service that already owns the transaction —
+    /// it is strictly the better shape than the table-based `outbox` feature.
+    ///
+    /// With this set the connector adds `messages 'true'` to `START_REPLICATION` and emits
+    /// [`Operation::Message`](crate::Operation::Message) events under the synthetic table
+    /// `<prefix>__messages`, so a route can select by message prefix the same way
+    /// `<table>__ddl_events` lets one select schema changes.
+    ///
+    /// **Opt-in**, because it changes what the server sends and adds an event shape every
+    /// consumer of this stream then has to handle. A pipeline that does not use messages
+    /// should not pay to decode them.
+    ///
+    /// **A non-transactional message survives a rollback.** `pg_logical_emit_message(false, …)`
+    /// is written to the log immediately, so it is captured even if its surrounding
+    /// transaction aborts. The event carries `transactional: false` rather than being
+    /// filtered, because only the consumer knows whether that matters.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub capture_logical_messages: bool,
 }
 
 /// How the connector reads the WAL stream from PostgreSQL.
@@ -1577,6 +1612,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
             None,
         );
 
@@ -1671,6 +1707,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
             None,
         );
         let events = handle
@@ -1689,7 +1726,7 @@ mod tests {
             *smallest_window_seen.lock().await
         );
         assert_eq!(
-            events.len(),
+            rows_only(events).len(),
             1,
             "once the window is small enough to decode, the pending event must be delivered"
         );
@@ -1722,6 +1759,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
             None,
         );
 
@@ -1762,6 +1800,26 @@ mod tests {
         buf.extend_from_slice(&commit_lsn.to_be_bytes());
         buf.extend_from_slice(&end_lsn.to_be_bytes());
         buf.extend_from_slice(&timestamp_us.to_be_bytes());
+        buf
+    }
+
+    /// A pgoutput `Message` (`M`) as the server frames it under `proto_version '1'`.
+    ///
+    /// No transaction id: pgoutput prefixes one only for a *streamed* transaction, which
+    /// exists from v2. Building one here would pin a framing this connector refuses.
+    fn build_logical_message(
+        transactional: bool,
+        lsn: u64,
+        prefix: &str,
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = vec![b'M'];
+        buf.push(u8::from(transactional));
+        buf.extend_from_slice(&lsn.to_be_bytes());
+        buf.extend_from_slice(prefix.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&(content.len() as i32).to_be_bytes());
+        buf.extend_from_slice(content);
         buf
     }
 
@@ -1868,6 +1926,20 @@ mod tests {
         PgOutputXLogData { lsn, data }
     }
 
+    /// Row events only, with schema announcements filtered out.
+    ///
+    /// Every connector announces a table's schema before that table's first row, so a
+    /// test about row decoding would otherwise assert on an event it is not testing. The
+    /// announcement itself is pinned by its own tests — see
+    /// `a_table_is_announced_before_its_first_row` — which is where a regression in it
+    /// should fail, rather than in fourteen tests about inserts and updates.
+    fn rows_only(events: Vec<crate::core::Event>) -> Vec<crate::core::Event> {
+        events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect()
+    }
+
     fn make_stream_handle(
         initial_lsn: u64,
         provider: MockPgOutputProvider,
@@ -1879,6 +1951,25 @@ mod tests {
         initial_lsn: u64,
         provider: MockPgOutputProvider,
         catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
+    ) -> PostgresStreamHandle {
+        make_stream_handle_with_catalog(
+            initial_lsn,
+            provider,
+            catalog_primary_keys,
+            crate::source::schema_catalog::CatalogSchemas::new(),
+        )
+    }
+
+    /// A handle whose catalog read is supplied by the test.
+    ///
+    /// An empty map exercises the documented fallback — a table the stream-start catalog
+    /// read did not cover — which is what most of these tests want. The tests that assert
+    /// on declared types supply one.
+    fn make_stream_handle_with_catalog(
+        initial_lsn: u64,
+        provider: MockPgOutputProvider,
+        catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
+        catalog_columns: crate::source::schema_catalog::CatalogSchemas,
     ) -> PostgresStreamHandle {
         let mut handle = PostgresStreamHandle::new(
             "postgres".into(),
@@ -1895,6 +1986,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             catalog_primary_keys,
+            catalog_columns,
             None,
         );
         handle.stream.replication_status = StreamState::Streaming;
@@ -1946,7 +2038,7 @@ mod tests {
         #[tokio::test]
         async fn the_key_is_the_catalog_primary_key_not_every_flagged_column() {
             let mut handle = make_stream_handle_with_keys(0, batch(), catalog(&["id"]));
-            let events = handle.next_events(50).await.unwrap();
+            let events = rows_only(handle.next_events(50).await.unwrap());
 
             assert_eq!(
                 events[0].primary_key,
@@ -1988,7 +2080,7 @@ mod tests {
                 xlog(200, build_commit(200, 250, 0)),
             ]]);
             let mut handle = make_stream_handle_with_keys(0, provider, catalog(&["id"]));
-            let events = handle.next_events(50).await.unwrap();
+            let events = rows_only(handle.next_events(50).await.unwrap());
 
             assert_eq!(events[0].unavailable_columns, vec!["big".to_string()]);
             assert!(
@@ -2003,7 +2095,7 @@ mod tests {
         async fn a_full_table_without_a_primary_key_reports_no_key_rather_than_the_whole_row() {
             let mut handle =
                 make_stream_handle_with_keys(0, batch(), std::collections::HashMap::new());
-            let events = handle.next_events(50).await.unwrap();
+            let events = rows_only(handle.next_events(50).await.unwrap());
 
             assert_eq!(
                 events[0].primary_key, None,
@@ -2069,10 +2161,83 @@ mod tests {
                 );
                 assert_eq!(
                     column["nullable"].as_bool(),
-                    Some(!expected_key),
-                    "column '{name}' nullability follows the real key, not the identity flag"
+                    Some(true),
+                    "with no catalog for this table the connector falls back to the wire, \
+                     which carries no nullability — so it must report the weaker claim \
+                     rather than derive one from the key: {column}"
                 );
             }
+        }
+
+        /// Nullability is read, never derived — the regression this pins is the one the
+        /// test above used to assert *for*.
+        ///
+        /// `nullable` was `!is_primary_key`, so every `NOT NULL` non-key column was
+        /// published as nullable and a nullable key could not be expressed. pgoutput
+        /// carries no nullability at all, so the only way to be right is to read the
+        /// catalog.
+        #[tokio::test]
+        async fn the_published_schema_takes_nullability_from_the_catalog() {
+            use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
+
+            let mut catalog_columns = CatalogSchemas::new();
+            catalog_columns.insert(
+                ("public".to_string(), "toasty".to_string()),
+                vec![
+                    CatalogColumn {
+                        name: "id".into(),
+                        data_type: "bigint".into(),
+                        nullable: false,
+                    },
+                    CatalogColumn {
+                        name: "small".into(),
+                        // A NOT NULL column that is not the key: the case the old
+                        // inference got wrong every time.
+                        data_type: "numeric(12,4)".into(),
+                        nullable: false,
+                    },
+                    CatalogColumn {
+                        name: "big".into(),
+                        data_type: "text".into(),
+                        nullable: true,
+                    },
+                ],
+            );
+
+            let mut handle =
+                make_stream_handle_with_catalog(0, batch(), catalog(&["id"]), catalog_columns);
+            let events = handle.next_events(50).await.unwrap();
+
+            let schema = events
+                .iter()
+                .find(|event| event.op == crate::core::Operation::SchemaChange)
+                .and_then(|event| event.after.clone())
+                .and_then(|after| after.get("result_schema").cloned())
+                .expect("the first sighting of a relation publishes its schema");
+
+            let column = |name: &str| -> serde_json::Value {
+                schema["columns"]
+                    .as_array()
+                    .expect("columns array")
+                    .iter()
+                    .find(|column| column["name"] == name)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("column '{name}' missing from {schema}"))
+            };
+
+            assert_eq!(column("id")["nullable"], serde_json::json!(false));
+            assert_eq!(
+                column("small")["nullable"],
+                serde_json::json!(false),
+                "a NOT NULL non-key column must not be published as nullable"
+            );
+            assert_eq!(column("big")["nullable"], serde_json::json!(true));
+            assert_eq!(
+                column("small")["data_type"],
+                serde_json::json!("numeric(12,4)"),
+                "the declared type keeps its modifier; the wire type OID alone would say \
+                 'numeric'"
+            );
         }
     }
 
@@ -2258,7 +2423,7 @@ mod tests {
         ]]);
         let mut handle = make_stream_handle(0, provider);
 
-        let events = handle.next_events(100).await.unwrap();
+        let events = rows_only(handle.next_events(100).await.unwrap());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].op, crate::core::Operation::Insert);
         assert_eq!(events[0].table, "users");
@@ -2292,7 +2457,7 @@ mod tests {
         ]]);
         let mut handle = make_stream_handle(0, provider);
 
-        let events = handle.next_events(100).await.unwrap();
+        let events = rows_only(handle.next_events(100).await.unwrap());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].op, crate::core::Operation::Update);
         assert_eq!(
@@ -2319,7 +2484,7 @@ mod tests {
         ]]);
         let mut handle = make_stream_handle(0, provider);
 
-        let events = handle.next_events(100).await.unwrap();
+        let events = rows_only(handle.next_events(100).await.unwrap());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].op, crate::core::Operation::Delete);
         assert!(events[0].before.is_present());
@@ -2361,6 +2526,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
             None,
         );
         let result = handle.next_events(100).await;
@@ -2399,7 +2565,7 @@ mod tests {
             xlog(200, build_commit(200, 300, 0)),
         ]]);
         let mut handle = make_stream_handle(0, provider);
-        let events = handle.next_events(100).await.unwrap();
+        let events = rows_only(handle.next_events(100).await.unwrap());
 
         assert_eq!(events.len(), 2);
         let tx0 = events[0].transaction.as_ref().unwrap();
@@ -2441,12 +2607,12 @@ mod tests {
         ]);
         let mut handle = make_stream_handle(0, provider);
 
-        let first = handle.next_events(50).await.unwrap();
+        let first = rows_only(handle.next_events(50).await.unwrap());
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].table, "items");
 
         // relation_map preserved: second poll decodes correctly without a new RELATION.
-        let second = handle.next_events(50).await.unwrap();
+        let second = rows_only(handle.next_events(50).await.unwrap());
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].table, "items");
     }
@@ -2464,7 +2630,7 @@ mod tests {
             xlog(200, build_commit(200, 300, 0)),
         ]]);
         let mut handle = make_stream_handle(0, provider);
-        let events = handle.next_events(100).await.unwrap();
+        let events = rows_only(handle.next_events(100).await.unwrap());
 
         // `table` is the BARE name and `schema` carries the namespace; the envelope
         // joins them via `qualified_table_name()`. Putting the namespace in both
@@ -2502,7 +2668,7 @@ mod tests {
             xlog(200, build_commit(200, 300, 0)),
         ]]);
         let mut handle = make_stream_handle(0, provider);
-        let events = handle.next_events(100).await.unwrap();
+        let events = rows_only(handle.next_events(100).await.unwrap());
         assert_eq!(events.len(), 1);
 
         let after = events[0].after.as_ref().unwrap();
@@ -2549,7 +2715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_emits_schema_change_on_relation_update() {
+    async fn stream_announces_a_relation_then_reports_its_change() {
         const OID: u32 = 21;
         let provider = MockPgOutputProvider::new(vec![vec![
             xlog(
@@ -2569,13 +2735,39 @@ mod tests {
         let mut handle = make_stream_handle(0, provider);
 
         let events = handle.next_events(100).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].op, crate::core::Operation::SchemaChange);
-        assert_eq!(events[0].source.offset, "0/00000190");
-        assert_eq!(events[0].schema.as_deref(), Some("public"));
-        assert_eq!(events[0].table, "users__ddl_events");
+        // Two: the first sighting is announced, then the added column is a change.
+        //
+        // The first RELATION used to emit nothing at all — `unwrap_or(false)` — which is
+        // precisely the moment a consumer needs the schema, because pgoutput sends
+        // RELATION before a table's first row. A table that never underwent DDL therefore
+        // had no type information anywhere in the stream, and column values are text.
+        assert_eq!(events.len(), 2);
 
-        let after = events[0].after.as_ref().expect("schema event payload");
+        let observed = &events[0];
+        assert_eq!(observed.op, crate::core::Operation::SchemaChange);
+        assert_eq!(observed.source.offset, "0/00000064");
+        assert_eq!(observed.table, "users__ddl_events");
+        let after = observed.after.as_ref().expect("schema event payload");
+        assert_eq!(
+            after["ddl_type"], "READ_SCHEMA",
+            "a first sighting is an observation, not a change: reusing ALTER_TABLE would              tell every consumer that every table was altered on every restart"
+        );
+        assert_eq!(
+            after["result_schema"]["columns"]
+                .as_array()
+                .expect("columns")
+                .len(),
+            2,
+            "the observation carries the table's full column list"
+        );
+
+        let changed = &events[1];
+        assert_eq!(changed.op, crate::core::Operation::SchemaChange);
+        assert_eq!(changed.source.offset, "0/00000190");
+        assert_eq!(changed.schema.as_deref(), Some("public"));
+        assert_eq!(changed.table, "users__ddl_events");
+
+        let after = changed.after.as_ref().expect("schema event payload");
         assert_eq!(after["ddl_type"], "ALTER_TABLE");
         assert_eq!(after["schema"], "public");
         assert_eq!(after["table"], "users");
@@ -2601,7 +2793,7 @@ mod tests {
 
         let provider = MockPgOutputProvider::new(vec![batch]);
         let mut handle = make_stream_handle(0, provider);
-        let events = handle.next_events(100).await.unwrap();
+        let events = rows_only(handle.next_events(100).await.unwrap());
 
         assert_eq!(events.len(), 10_000);
         assert_eq!(events[0].table, "big_table");
@@ -3071,6 +3263,8 @@ mod tests {
                 live_query: false,
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
+                catalog_columns: Vec::new(),
+                schema_announced: false,
             }],
             None,
             false,
@@ -3118,6 +3312,8 @@ mod tests {
                 live_query: false,
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
+                catalog_columns: Vec::new(),
+                schema_announced: false,
             }],
             None,
             false,
@@ -3169,6 +3365,8 @@ mod tests {
                 live_query: true,
                 primary_key_columns: vec!["id".into()],
                 primary_key_types: vec!["bigint".into()],
+                catalog_columns: Vec::new(),
+                schema_announced: false,
             }],
             None,
             false,
@@ -3236,6 +3434,8 @@ mod tests {
                 live_query: false,
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
+                catalog_columns: Vec::new(),
+                schema_announced: false,
             }],
             None,
             false,
@@ -3281,6 +3481,8 @@ mod tests {
                 live_query: false,
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
+                catalog_columns: Vec::new(),
+                schema_announced: false,
             }],
             None,
             false,
@@ -3331,6 +3533,8 @@ mod tests {
                 live_query: true,
                 primary_key_columns: vec!["id".into()],
                 primary_key_types: vec!["bigint".into()],
+                catalog_columns: Vec::new(),
+                schema_announced: false,
             }],
             None,
             false,
@@ -3423,6 +3627,7 @@ mod tests {
             vec!["public.allowed_table".into()], // include-list excludes "excluded_table"
             Vec::new(),
             std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
             None,
         );
 
@@ -3499,27 +3704,234 @@ mod tests {
             vec!["public.allowed_table".into()],
             Vec::new(),
             std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
             None,
         );
 
         let events = handle.next_events(5).await.unwrap();
+        // Two for the allowed table — its first sighting is announced, and its added
+        // column is a change — and none at all for the excluded one.
+        let tables: Vec<String> = events.iter().map(|event| event.table.clone()).collect();
         assert_eq!(
-            events.len(),
-            1,
-            "exactly one schema change is inside the allowlist, got {:?}",
-            events.iter().map(|e| e.table.clone()).collect::<Vec<_>>()
+            tables,
+            vec![
+                "allowed_table__ddl_events".to_string(),
+                "allowed_table__ddl_events".to_string()
+            ],
+            "only the allowlisted table may publish a schema, got {tables:?}"
         );
         // A schema-change event is published under a synthetic `<table>__ddl_events`
         // name, which is exactly why the filter has to be applied at the source: no
         // downstream matcher on the real table name can ever see it.
-        assert_eq!(events[0].table, "allowed_table__ddl_events");
+        let ddl_types: Vec<String> = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .after
+                    .as_ref()?
+                    .get("ddl_type")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            ddl_types,
+            vec!["READ_SCHEMA".to_string(), "ALTER_TABLE".to_string()],
+            "the first sighting is an observation and the added column is a change; \
+             collapsing the two would tell a consumer every table was altered on every \
+             restart"
+        );
         assert!(
-            !format!("{:?}", events[0]).contains("ssn"),
+            !format!("{events:?}").contains("ssn"),
             "no column of an excluded table may reach a sink"
         );
         assert!(
             handle.relation_map.contains_key(&EXCLUDED),
             "the relation cache must still track excluded tables so rows stay attributable"
         );
+    }
+
+    // ─── Logical decoding messages ────────────────────────────────────────────
+
+    mod logical_message_tests {
+        use super::*;
+
+        /// The table-free outbox: a message emitted inside a transaction rides with it.
+        #[tokio::test]
+        async fn a_transactional_message_is_emitted_with_its_transaction() {
+            const OID: u32 = 77;
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(
+                    100,
+                    build_relation(OID, "public", "orders", &[("id", true)]),
+                ),
+                xlog(100, build_begin(400, 0, 9)),
+                xlog(150, build_insert(OID, &[Some("1")])),
+                xlog(
+                    160,
+                    build_logical_message(true, 160, "outbox", br#"{"kind":"OrderPlaced"}"#),
+                ),
+                xlog(400, build_commit(400, 450, 0)),
+            ]]);
+            let mut handle = make_stream_handle(0, provider);
+
+            let events = handle.next_events(100).await.unwrap();
+            let message = events
+                .iter()
+                .find(|event| event.op == crate::core::Operation::Message)
+                .expect("the logical decoding message must be captured");
+
+            assert_eq!(
+                message.table, "outbox__messages",
+                "the prefix is the only routing key a message has, so it is the table name"
+            );
+            assert_eq!(
+                message.schema, None,
+                "a message belongs to no schema; inventing 'public' would let a route for \
+                 public.* collect messages nobody asked for"
+            );
+            let after = message.after.as_ref().expect("message payload");
+            assert_eq!(after["prefix"], "outbox");
+            assert_eq!(after["content"], r#"{"kind":"OrderPlaced"}"#);
+            assert_eq!(after["content_encoding"], "utf8");
+            assert_eq!(after["transactional"], true);
+            assert!(
+                message.transaction.is_some(),
+                "a transactional message is part of the transaction that wrote it"
+            );
+
+            // Ordering is the point of the outbox: the row and the message commit together.
+            let positions: Vec<&str> = events
+                .iter()
+                .map(|event| match event.op {
+                    crate::core::Operation::Insert => "insert",
+                    crate::core::Operation::Message => "message",
+                    crate::core::Operation::SchemaChange => "schema",
+                    _ => "other",
+                })
+                .collect();
+            assert_eq!(positions, vec!["schema", "insert", "message"]);
+        }
+
+        /// A non-transactional message is released immediately, not held for a commit.
+        ///
+        /// `pg_logical_emit_message(false, …)` is written to the log outside any
+        /// transaction's fate. Holding it until a commit that may never come would strand
+        /// it for the life of the transaction — and forever if that transaction aborts.
+        #[tokio::test]
+        async fn a_non_transactional_message_does_not_wait_for_a_commit() {
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(100, build_begin(400, 0, 9)),
+                xlog(
+                    160,
+                    build_logical_message(false, 160, "audit", b"standalone"),
+                ),
+            ]]);
+            let mut handle = make_stream_handle(0, provider);
+
+            let events = handle.next_events(100).await.unwrap();
+            let message = events
+                .iter()
+                .find(|event| event.op == crate::core::Operation::Message)
+                .expect("a non-transactional message must be released without a commit");
+            assert_eq!(message.after.as_ref().unwrap()["transactional"], false);
+        }
+
+        /// Content with no valid UTF-8 reading is base64, and says so.
+        #[tokio::test]
+        async fn binary_content_is_base64_and_labelled() {
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(100, build_begin(400, 0, 9)),
+                xlog(
+                    160,
+                    build_logical_message(false, 160, "blob", &[0xDE, 0xAD, 0xBE, 0xEF]),
+                ),
+            ]]);
+            let mut handle = make_stream_handle(0, provider);
+
+            let events = handle.next_events(100).await.unwrap();
+            let after = events
+                .iter()
+                .find(|event| event.op == crate::core::Operation::Message)
+                .and_then(|event| event.after.clone())
+                .expect("message payload");
+            assert_eq!(after["content_encoding"], "base64");
+            assert_eq!(after["content"], "3q2+7w==");
+        }
+
+        /// Messages are filtered by the same include/exclude lists as rows.
+        ///
+        /// A message carries no table, so without the synthetic name an operator who
+        /// allow-listed one table would still receive every message reaching this slot.
+        #[tokio::test]
+        async fn a_message_outside_the_allowlist_is_not_emitted() {
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(100, build_begin(400, 0, 9)),
+                xlog(160, build_logical_message(false, 160, "secret", b"nope")),
+                xlog(170, build_logical_message(false, 170, "outbox", b"yes")),
+            ]]);
+            let mut handle = PostgresStreamHandle::new(
+                "postgres".into(),
+                PostgresStream {
+                    slot_name: "slot".into(),
+                    publication_name: "pub".into(),
+                    lsn_position: 0,
+                    replication_status: StreamState::Streaming,
+                },
+                Box::new(provider),
+                super::super::MAX_EVENTS_PER_POLL,
+                super::super::STREAM_POLL_INTERVAL_MS,
+                0,
+                vec!["outbox__messages".into()],
+                Vec::new(),
+                std::collections::HashMap::new(),
+                crate::source::schema_catalog::CatalogSchemas::new(),
+                None,
+            );
+
+            let events = handle.next_events(100).await.unwrap();
+            let prefixes: Vec<String> = events
+                .iter()
+                .filter(|event| event.op == crate::core::Operation::Message)
+                .map(|event| event.table.clone())
+                .collect();
+            assert_eq!(prefixes, vec!["outbox__messages".to_string()]);
+        }
+
+        /// A declared content length past the end of the frame is refused, not allocated.
+        #[test]
+        fn a_content_length_beyond_the_frame_is_rejected() {
+            let mut buf = vec![b'M'];
+            buf.push(1);
+            buf.extend_from_slice(&160u64.to_be_bytes());
+            buf.extend_from_slice(b"outbox");
+            buf.push(0);
+            // Claims 2 GB of content in a frame holding four bytes.
+            buf.extend_from_slice(&i32::MAX.to_be_bytes());
+            buf.extend_from_slice(b"tiny");
+
+            let error = decode_pgoutput_message(&buf).expect_err("must not allocate on a lie");
+            assert!(
+                format!("{error}").contains("content bytes but only"),
+                "the error must name the mismatch: {error}"
+            );
+        }
+
+        /// A negative declared length is refused rather than wrapping.
+        #[test]
+        fn a_negative_content_length_is_rejected() {
+            let mut buf = vec![b'M'];
+            buf.push(1);
+            buf.extend_from_slice(&160u64.to_be_bytes());
+            buf.extend_from_slice(b"p");
+            buf.push(0);
+            buf.extend_from_slice(&(-1i32).to_be_bytes());
+
+            let error = decode_pgoutput_message(&buf).expect_err("negative length is not a length");
+            assert!(
+                format!("{error}").contains("negative content length"),
+                "{error}"
+            );
+        }
     }
 }

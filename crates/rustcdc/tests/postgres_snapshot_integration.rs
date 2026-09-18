@@ -140,6 +140,10 @@ async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         chunk_count += 1;
         total_rows += events.len();
@@ -338,6 +342,10 @@ async fn postgres_incremental_snapshot_reads_all_seed_rows_once() -> rustcdc::Re
             }
             continue;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         empty_polls = 0;
 
         for event in events {
@@ -489,6 +497,10 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         total_first_read += events.len();
         for event in events {
             let after = event.after.ok_or_else(|| {
@@ -545,6 +557,10 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         resumed_count += events.len();
         for event in events {
@@ -715,6 +731,10 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         for event in events {
             let after = event.after.ok_or_else(|| {
                 rustcdc::Error::SourceError("snapshot row missing after payload".into())
@@ -782,6 +802,10 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         for event in events {
             let after = event.after.ok_or_else(|| {
@@ -980,6 +1004,10 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
                 "unexpected empty chunk before reaching boundary checkpoint target".into(),
             ));
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         for event in events {
             let after = event.after.ok_or_else(|| {
@@ -1051,6 +1079,10 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         for event in events {
             let after = event.after.ok_or_else(|| {
@@ -1208,7 +1240,10 @@ async fn postgres_snapshot_empty_table() -> rustcdc::Result<()> {
         .await?;
 
     // First next_chunk should return empty
-    let first_chunk = snapshot_handle.next_chunk(1000).await?;
+    let first_chunk = (snapshot_handle.next_chunk(1000).await?)
+        .into_iter()
+        .filter(|event| !event.op.is_schema_change())
+        .collect::<Vec<_>>();
     assert!(
         first_chunk.is_empty(),
         "empty table snapshot should return no rows"
@@ -1377,6 +1412,10 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::R
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         total_events += events.len();
         for event in events {
@@ -1578,6 +1617,10 @@ async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_res
                 }
                 continue;
             }
+            let events = events
+                .into_iter()
+                .filter(|event| !event.op.is_schema_change())
+                .collect::<Vec<_>>();
             empty_polls = 0;
             for event in events {
                 if let Some(id) = snapshot_row_id(&event, "incremental_resume_test") {
@@ -1642,6 +1685,10 @@ async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_res
                 }
                 continue;
             }
+            let events = events
+                .into_iter()
+                .filter(|event| !event.op.is_schema_change())
+                .collect::<Vec<_>>();
             empty_polls = 0;
             for event in events {
                 if let Some(id) = snapshot_row_id(&event, "incremental_resume_test") {

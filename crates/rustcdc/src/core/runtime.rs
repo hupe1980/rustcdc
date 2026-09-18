@@ -6142,6 +6142,81 @@ mod tests {
         assert_eq!(batch.events()[0].op, Operation::SchemaChange);
     }
 
+    /// A restart re-announces every table, and the history must not grow for it.
+    ///
+    /// Every connector announces a table's schema before that table's first row, in every
+    /// run. Keyed by the source offset the way a captured statement is, a pipeline that
+    /// restarted twice a day would append two schema versions per table per day recording
+    /// nothing having happened. Keyed by content, the repeat resolves to the version
+    /// already stored.
+    #[tokio::test]
+    async fn re_observing_an_unchanged_schema_appends_no_history_version() {
+        use crate::ddl_capture::CapturedDdl;
+        use crate::schema_history::{ColumnDef, TableSchema};
+
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        let observation = |offset: &str| {
+            CapturedDdl {
+                ddl_type: crate::source::schema_catalog::DDL_TYPE_READ_SCHEMA.to_string(),
+                schema: "public".into(),
+                table: "users".into(),
+                statement: "/* observed */".into(),
+                result_schema: Some(TableSchema {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    columns: vec![ColumnDef {
+                        name: "id".into(),
+                        data_type: "bigint".into(),
+                        nullable: false,
+                        constraints: vec!["primary_key".into()],
+                    }],
+                    primary_keys: vec!["id".into()],
+                    version: 0,
+                }),
+                schema_diff: None,
+                ts: 1,
+            }
+            .to_event("postgres", offset.to_string(), 1)
+        };
+
+        // Two runs of the same pipeline: the same table, the same schema, different log
+        // positions — because the second run resumed from a later checkpoint.
+        runtime
+            .record_schema_change_events(&[observation("0/00000064")])
+            .await
+            .unwrap();
+        let first = runtime
+            .config
+            .schema_history
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("the first observation is recorded");
+
+        runtime
+            .record_schema_change_events(&[observation("0/00ABCDEF")])
+            .await
+            .unwrap();
+        let second = runtime
+            .config
+            .schema_history
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("the schema is still there");
+
+        assert_eq!(
+            first.version, second.version,
+            "re-observing an unchanged schema at a later offset must resolve to the \
+             version already stored, not append a new one"
+        );
+    }
+
     #[tokio::test]
     async fn capture_alter_ddl_applies_schema_diff_without_erasing_schema_history() {
         let checkpoint = InMemoryCheckpoint::default();

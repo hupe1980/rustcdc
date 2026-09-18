@@ -527,6 +527,7 @@ it is a catch-all, not a no-op.
 | `slot_idle_advance_interval_ms` | `u64` | 30 000 | See "Idle slots retain WAL" below. `0` disables. |
 | `wal_transport` | `WalTransport` | `StreamingReplication` | How the WAL stream is read; see below. |
 | `reselect_unavailable_columns` | `bool` | `false` | Re-read unchanged TOASTed values from the source instead of reporting them absent; see below. |
+| `capture_logical_messages` | `bool` | `false` | Capture `pg_logical_emit_message()` output — the table-free transactional outbox; see below. |
 
 **`create_replication_slot_if_missing` is not a convenience flag.** A slot that vanishes
 mid-life — dropped by an operator, lost to a failover onto a replica that never had it, or
@@ -545,6 +546,50 @@ PostgreSQL cannot recycle WAL segments. `slot_idle_advance_interval_ms` makes th
 confirm the server's current WAL position after that much time without events. Disabling it on a
 long-lived stream is how a disk fills up.
 
+
+### `capture_logical_messages`
+
+Capture `pg_logical_emit_message()` output — an application event written straight into the
+WAL, inside the writing transaction:
+
+```sql
+BEGIN;
+INSERT INTO orders (id, total) VALUES (1, 42.50);
+SELECT pg_logical_emit_message(true, 'outbox', '{"kind":"OrderPlaced","id":1}');
+COMMIT;
+```
+
+The row and the event commit together, with no outbox table to create, index, poll or
+vacuum.
+
+```toml
+[source.postgres]
+capture_logical_messages = true
+```
+
+The connector then adds `messages 'true'` to `START_REPLICATION` and emits:
+
+```json
+{
+  "op": "message",
+  "table": "outbox__messages",
+  "schema": null,
+  "after": {
+    "prefix": "outbox",
+    "content": "{\"kind\":\"OrderPlaced\",\"id\":1}",
+    "content_encoding": "utf8",
+    "transactional": true,
+    "lsn": "0/1A2B3C4"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `table` | The synthetic `<prefix>__messages`. Routes and the include/exclude lists match on this, so `table_include_list = ["outbox__messages"]` selects exactly these |
+| `schema` | Always `null` — a message belongs to no schema |
+| `content_encoding` | `utf8` when the bytes are valid UTF-8, `base64` otherwise. Decode on this field, not on a guess |
+| `transactional` | `false` for `pg_logical_emit_message(false, …)`, which is written to the log immediately and **survives a rollback** of the surrounding transaction. Released as decoded rather than held for a commit |
 
 ### `reselect_unavailable_columns`
 
@@ -868,6 +913,12 @@ values against real databases.
 > depended on the value's magnitude would be undecodable without inspecting each value first.
 > Read with `value.as_str()` and parse — integers and floats arrive **quoted**, to keep the
 > full source precision that a JSON number would round.
+
+> **You do not have to know the types in advance.** Each table's column types are announced
+> on the stream before that table's first row, as a `SchemaChange` event with
+> `ddl_type = "READ_SCHEMA"` and a full `result_schema` — `data_type` in the source's own
+> syntax, modifier included, and `nullable` read from the catalogue. See
+> [Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
 
 ### Binary column encoding, per connector
 

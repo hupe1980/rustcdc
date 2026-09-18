@@ -56,6 +56,7 @@ impl StreamingPgOutputProvider {
             transport: &config.transport,
             start_lsn,
             connect_timeout: Duration::from_secs(config.conn_timeout_secs),
+            capture_logical_messages: config.capture_logical_messages,
         })
         .await?;
 

@@ -5,6 +5,216 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.18.0
+
+One change, and it closes the other half of a contract the project has had since 0.11.0.
+
+Column values are text on every connector and every capture path — deliberately, because a
+JSON number is an IEEE-754 double downstream and one representation is what lets a snapshot
+row and a stream row agree character for character. The published guidance is to read with
+`value.as_str()` and parse. **Parsing requires knowing what to parse it as, and the stream
+did not say.**
+
+It is a **breaking** release: a new event appears on every stream, and two connectors change
+the identity of their snapshot rows. See *Breaking* and *Migrating*.
+
+### Added: every table is announced before its first row
+
+Given `{"id": "9", "flag": "f", "tags": "{alpha,beta}", "amount": "12345.6789"}` a consumer
+could not tell whether `"9"` was a `bigint` or a `text` holding a digit, whether `"f"` was a
+`boolean` or a `char(1)`, whether `"{alpha,beta}"` was a `text[]` to parse or a string that
+happens to contain braces, or what precision to give the target column for `"12345.6789"`.
+
+The pipeline knew all of it and never said so. PostgreSQL emitted a schema event only when a
+relation *changed*, so the first sighting — which is exactly when pgoutput sends `RELATION`,
+immediately before a table's first row — emitted nothing; a table that never underwent DDL
+had no type information anywhere in the stream. MySQL's schema events came only from DDL
+parsed out of the binlog, so a table created before capture started had none. SQL Server
+seeded its capture metadata at stream start, so its first refresh compared a full set against
+a full set and emitted nothing. No connector emitted anything at all on the snapshot path.
+
+Now **every connector announces each table's declared columns before that table's first row**,
+in the snapshot and in the stream:
+
+```json
+{
+  "ddl_type": "READ_SCHEMA",
+  "schema": "public",
+  "table": "orders",
+  "result_schema": {
+    "primary_keys": ["id"],
+    "columns": [
+      { "name": "id",     "data_type": "bigint",        "nullable": false, "constraints": ["primary_key"] },
+      { "name": "amount", "data_type": "numeric(12,4)", "nullable": false, "constraints": [] }
+    ]
+  }
+}
+```
+
+`READ_SCHEMA` is a distinct `ddl_type` on purpose. Nothing was created and nothing changed;
+reusing `CREATE_TABLE` would tell every consumer that every table was new on every restart.
+
+### Fixed: the declared type was incomplete on all three connectors
+
+`data_type` is now read from the catalogue, in the source's own syntax, complete:
+
+| Connector | Was | Now |
+|---|---|---|
+| PostgreSQL | a 60-entry built-in OID map, `pg_type_oid:<N>` for everything else | `pg_catalog.format_type(atttypid, atttypmod)` — the function `\d` uses |
+| MySQL / MariaDB | the text of the DDL statement, when one had been captured | `information_schema.COLUMNS.COLUMN_TYPE` |
+| SQL Server | the literal string `"sqlserver_captured"` | `sys.columns` joined through `cdc.change_tables.source_object_id` |
+
+The PostgreSQL type modifier was **decoded from the wire and never read**. One consequence was
+worse than a missing suffix: because the modifier is part of the relation's identity, an
+`ALTER COLUMN amount TYPE numeric(14,4)` did fire a schema-change event — whose payload was
+byte-identical to the previous one, because both rendered as `numeric`. An event announcing a
+change it could not describe.
+
+### Fixed: `nullable` was inferred from the primary key
+
+It was `!is_primary_key` on PostgreSQL and SQL Server. Neither pgoutput nor the CDC capture
+tables carry nullability, so the flag was an invention: every `NOT NULL` non-key column was
+published as nullable, and a nullable key could not be expressed. A consumer building a target
+schema from that accepts rows the source would have rejected. It is now read from
+`attnotnull`, `IS_NULLABLE` and `sys.columns.is_nullable`.
+
+### Fixed: MySQL snapshot rows disagreed with MySQL stream rows about their own identity
+
+Snapshot events carried `schema: None` and the *configured* table string, so one physical
+table was `"app.users"` during the snapshot and `"users"` with `schema: Some("app")` during
+streaming — a router configured for one silently received nothing from the other phase.
+PostgreSQL fixed this in its own snapshot path previously; MySQL kept the mismatch. Both
+halves are now carried separately, in both phases.
+
+### Changed: schema history de-duplicates an unchanged observation
+
+`record_ddl` is idempotent on `ddl_id`, and the runtime now chooses that identity by kind: a
+captured statement is keyed by its source log position as before, an observation by a digest
+of the schema it carries.
+
+Without the split, a pipeline that restarts twice a day would append two schema versions per
+table per day recording nothing having happened. With it, a re-announcement of an unchanged
+table resolves to the version already stored — while an observation of a table that *did*
+change while the pipeline was down still records, which is the case a restart must not lose.
+
+A captured statement is deliberately *not* content-keyed: a table altered from shape A to B
+and back to A has three entries in its history, and the third is not the first.
+
+### Added: logical decoding messages — the table-free transactional outbox
+
+`pg_logical_emit_message()` writes an application-chosen `(prefix, content)` pair straight
+into the WAL, inside the writing transaction:
+
+```sql
+BEGIN;
+INSERT INTO orders (id, total) VALUES (1, 42.50);
+SELECT pg_logical_emit_message(true, 'outbox', '{"kind":"OrderPlaced","id":1}');
+COMMIT;
+```
+
+The row and the event commit together, with **no outbox table** to create, index, poll or
+vacuum and no window in which one is durable and the other is not — which is the property
+an outbox table exists to provide. For a service that already owns the transaction this is
+strictly the better shape than the table-based `outbox` transform, and it is the shape the
+embeddable wedge is aimed at.
+
+Previously pgoutput message type `M` fell through to `PgOutputMessage::Unknown` and
+`messages 'true'` was never requested, so the server did not send them at all.
+
+```toml
+[source]
+type                     = "postgres"
+capture_logical_messages = true    # opt-in; default false
+```
+
+Events arrive as `op = "message"` under the synthetic table `<prefix>__messages` — the
+prefix is the only routing key a message has, so putting it in the table name is what lets
+a route select by prefix with an ordinary glob, exactly as `<table>__ddl_events` does. The
+include/exclude lists match against that name. `schema` is `null`: inventing `public` would
+let a route for `public.*` collect messages nobody asked for.
+
+`content_encoding` says how to read `content` — `utf8` when the bytes are valid UTF-8, the
+common case since the content is usually JSON, and `base64` otherwise. The log declares no
+encoding, so a consumer decodes on the field rather than on a guess.
+
+A **non-transactional** message (`pg_logical_emit_message(false, …)`) is written to the log
+immediately and is captured even if the surrounding transaction later aborts. It carries
+`transactional: false` and is released as decoded rather than held for a commit that may
+never come.
+
+### Added: `Operation::Message`
+
+A first-class operation, across all four definitions — the Rust enum, `event.proto`
+(`MESSAGE = 7`), `event.avsc` (`MESSAGE`) and `EVENT_JSON_SCHEMA` (`"message"`) — which the
+schema-contract gate diffs against each other. Debezium models logical decoding messages as
+an operation too; the alternative, a fabricated row on a fabricated table, would make every
+row-consuming sink handle something that is not a row.
+
+`row_write()` returns `RowWrite::None` with the existing `NoRowWrite::SchemaChange` reason
+rather than a new one, so a sink's existing match arm stays correct instead of every sink
+author learning a variant.
+
+### Changed: dependencies
+
+`wasmtime` 47 → **48** and `krafka` 0.22 → **0.24**.
+
+`opendal` 0.57 → 0.59 and `apache-avro` 0.21 → 0.22 were **tried and reverted**, and the
+measurement is recorded rather than the intention: `iceberg-rust` 0.10.1 — the newest —
+requires `opendal ^0.57` and `apache-avro ^0.21`, so bumping either resolves both majors
+into the graph. `cargo deny` then fails with duplicates, and for opendal the two quick-xml
+advisories the bump was meant to clear still fire, because the vulnerable crate is still
+reached through Iceberg. One upstream release gates all three moves.
+
+### Breaking
+
+1. **A new event appears on every stream.** Each table now produces one `SchemaChange` event
+   with `ddl_type = "READ_SCHEMA"` before its first row, in every run. A consumer that
+   assumed the first event for a table was a row will now see a schema event first.
+2. **MySQL snapshot event identity changed.** `schema` is now populated and `table` is the
+   bare name. A consumer keyed on the old joined string, or a router pattern written against
+   it, must be updated.
+3. **SQL Server column types changed value.** `data_type` was the constant
+   `"sqlserver_captured"`; it is now the real declared type. Anything matching on the old
+   literal breaks.
+4. **`nullable` changed meaning** from "is not the primary key" to "the catalogue says this
+   column accepts NULL". Values will differ for every `NOT NULL` non-key column.
+5. **PostgreSQL unknown types** report `"unknown"` rather than `pg_type_oid:<N>`. The OID
+   identified nothing portable — enum, domain and extension OIDs are installation-specific —
+   and one spelling for "the type could not be read" lets a consumer branch on it across every
+   connector.
+6. **`Operation` gained a variant.** An exhaustive `match` over it no longer compiles, and a
+   consumer decoding the Avro or Protobuf enum must accept `MESSAGE` / `7`. Only PostgreSQL
+   emits it, and only with `capture_logical_messages = true`.
+
+### Migrating
+
+- **Filter schema events if you do not want them.** They have always been distinguishable:
+  `op == "schema_change"`, and a `<table>__ddl_events` table name. A `filter` transform with
+  `exclude_ops = ["schema_change"]` drops them.
+- **Use them if you decode typed columns.** Read `result_schema.columns[].data_type` when the
+  announcement arrives and keep it; it is the type to parse each subsequent row's text values
+  as.
+- **MySQL routers:** change a pattern of `app.users` matched against the joined name to one
+  matched against `schema = "app"`, `table = "users"` — the same shape every other connector
+  already used.
+- **No state migration is required.** Schema history entries written by 0.17 remain readable;
+  the identity change affects only which new entries are appended.
+
+### Evidence
+
+`1 204` library and `571` server unit tests, green, with `cargo deny`, `clippy -D warnings`
+and the policy gate clean.
+
+New unit coverage: the first-sight announcement on all three connectors; catalogue-backed
+types and nullability; the SQL Server type reassembly, including the `(max)` sentinel that
+must not be unit-converted; the schema-history identity split; the logical-message decoder,
+both release paths, the base64 fallback, prefix filtering and two malformed-length frames;
+the `messages 'true'` negotiation on and off; and the config key round-tripping *and
+remaining optional*.
+
+Container-verified against PostgreSQL 12–16, MySQL, MariaDB and SQL Server 2019/2022. The
+declared-type announcement and the outbox each have their own live PostgreSQL test.
+
 ## 0.17.0
 
 Three changes, all of the same shape: a rule the documentation stated and the code did not

@@ -72,8 +72,15 @@ ignore = [
     # scanning and unbounded namespace-declaration allocation (both DoS-class; no
     # memory unsafety). Path: quick-xml 0.39.4 <- opendal-core 0.57. Exposure is
     # limited to XML responses from the *configured* S3/Azure endpoints, not arbitrary
-    # input. Remove when opendal moves to quick-xml >= 0.41 (it already pulls 0.41
-    # elsewhere in the graph).
+    # input.
+    #
+    # NOT fixable by bumping our own `opendal`, which was tried and measured:
+    # `iceberg-storage-opendal` 0.10.1 — the newest — requires `opendal ^0.57`, so
+    # raising the server's direct dependency to 0.59 resolves *both* majors into the
+    # graph. quick-xml 0.39.4 stays (via opendal-core 0.57), both advisories still fire,
+    # and the tree gains a duplicate opendal that the version pin two entries below
+    # exists to prevent. Blocked on `iceberg-rust` moving to opendal 0.59; re-check when
+    # a release after 0.10.1 lands.
     { id = "RUSTSEC-2026-0194" },
     { id = "RUSTSEC-2026-0195" },
 

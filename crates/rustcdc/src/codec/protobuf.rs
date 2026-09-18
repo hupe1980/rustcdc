@@ -89,6 +89,8 @@ pub enum ProtoOperation {
     SchemaChange = 5,
     /// Table truncated.
     Truncate = 6,
+    /// Logical decoding message written by the application.
+    Message = 7,
 }
 
 impl ProtoOperation {
@@ -100,6 +102,7 @@ impl ProtoOperation {
             Operation::Read => Self::Read,
             Operation::SchemaChange => Self::SchemaChange,
             Operation::Truncate => Self::Truncate,
+            Operation::Message => Self::Message,
         }
     }
 
@@ -116,6 +119,7 @@ impl ProtoOperation {
             Self::Read => Ok(Operation::Read),
             Self::SchemaChange => Ok(Operation::SchemaChange),
             Self::Truncate => Ok(Operation::Truncate),
+            Self::Message => Ok(Operation::Message),
             Self::Unspecified => Err(Error::SerializationError(
                 "protobuf event carries OPERATION_UNSPECIFIED (the protobuf zero value), \
                  which means the `op` field was absent or the message was not produced by \

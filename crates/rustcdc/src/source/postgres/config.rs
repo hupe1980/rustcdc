@@ -65,6 +65,7 @@ impl Default for PostgresSourceConfig {
             // fallback for environments that cannot grant a replication connection.
             wal_transport: WalTransport::StreamingReplication,
             reselect_unavailable_columns: false,
+            capture_logical_messages: false,
         }
     }
 }

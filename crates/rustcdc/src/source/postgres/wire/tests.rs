@@ -313,7 +313,44 @@ fn params<'a>(port: u16, transport: &'a TransportConfig, start_lsn: u64) -> Repl
         transport,
         start_lsn,
         connect_timeout: Duration::from_secs(10),
+        capture_logical_messages: false,
     }
+}
+
+/// Turning on message capture adds `messages 'true'` and nothing else.
+///
+/// The option is what makes the server send `pg_logical_emit_message()` output at all, so
+/// the flag reaching the wire is the whole feature. Asserting the *rest* of the line is
+/// unchanged is the other half: a new option must not quietly alter the negotiated
+/// protocol version, which the decoder depends on.
+#[tokio::test]
+async fn capturing_logical_messages_adds_the_messages_option() {
+    // `Auth::None` over plaintext: the connector refuses cleartext password auth on an
+    // unencrypted socket, which is a different guard and has its own test.
+    let (port, _client_tls, server) =
+        spawn_server(None, Auth::None, Behaviour::SendOneRecord).await;
+    let transport = TransportConfig::plaintext();
+
+    let mut replication_params = params(port, &transport, 0x900);
+    replication_params.capture_logical_messages = true;
+    let mut stream = ReplicationStream::connect(replication_params)
+        .await
+        .expect("replication stream starts");
+    // Drain one record and hang up: the fake server's task returns its observations when
+    // the client disconnects, so holding the stream open deadlocks the await below.
+    let _ = stream.recv(Duration::from_secs(5)).await.expect("receives");
+    drop(stream);
+
+    let observed = server.await.expect("server task");
+    let query = &observed.replication_query;
+    assert!(
+        query.contains("messages 'true'"),
+        "message capture must reach the server, or nothing is captured: {query}"
+    );
+    assert!(
+        query.contains("proto_version '1'"),
+        "the negotiated version must not change with the option: {query}"
+    );
 }
 
 #[tokio::test]
@@ -394,6 +431,11 @@ async fn the_startup_packet_and_replication_command_reach_the_server_intact() {
     assert!(
         query.contains("proto_version '1'"),
         "the negotiated version must match what the decoder implements: {query}"
+    );
+    assert!(
+        !query.contains("messages"),
+        "logical decoding messages are opt-in: a pipeline that does not consume them must \
+         not ask the server to send them: {query}"
     );
     assert!(
         query.contains("publication_names 'rustcdc_pub'"),

@@ -29,6 +29,7 @@ replica with a unique `server_id`.
 | `UPDATE` | yes | `before` + `after` when `binlog_row_image = FULL` |
 | `DELETE` | yes | `before` when `binlog_row_image = FULL`; otherwise primary key only |
 | DDL changes | yes | Schema history is maintained for correct event decoding after column additions/renames |
+| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
 | `TRUNCATE` | yes | Parsed from the `TRUNCATE TABLE` query event in the binlog and emitted as a `truncate` operation (respects the table include/exclude lists) |
 
 ### Minimum requirements
@@ -63,6 +64,20 @@ the schema history so subsequent events can be decoded correctly.
 > backend), the connector cannot decode previously captured binlog events
 > reliably. Always include the schema history in any backup/migration of the
 > state backend.
+
+### Declared column types
+
+Column values are text, so a consumer needs the types to decode them. Every table's columns
+are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
+event with `ddl_type = "READ_SCHEMA"` — see
+[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+
+Types come from `information_schema.COLUMNS`, read once at stream start for the configured
+database. `COLUMN_TYPE` is MySQL's own spelling and is already complete — `decimal(12,4)`,
+`int unsigned`, `enum('a','b')` — and `IS_NULLABLE` is the real nullability.
+
+A table created *after* the stream starts is not in that read and needs nothing: its
+`CREATE TABLE` arrives in the binlog as its own schema event.
 
 ### GTID mode
 

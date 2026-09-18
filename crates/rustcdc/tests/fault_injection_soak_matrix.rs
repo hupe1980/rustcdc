@@ -227,6 +227,10 @@ async fn mysql_soak_checkpoint_slowness_and_duplicates_stay_within_bounds() {
         if events.is_empty() {
             break;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         for event in events {
             let offset = GenericOffset::new(

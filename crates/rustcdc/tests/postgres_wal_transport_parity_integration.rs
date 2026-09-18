@@ -176,7 +176,17 @@ async fn drain(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut collected = Vec::new();
     while collected.len() < want && std::time::Instant::now() < deadline {
-        collected.extend(stream.next_events(500).await?);
+        // Rows only, and `want` counts rows. The two transports are compared event for
+        // event below; the schema announcement each emits before a table's first row is
+        // not part of the decoded-row parity this test exists to pin, and counting it
+        // would make `want` mean different things for the two sides.
+        collected.extend(
+            stream
+                .next_events(500)
+                .await?
+                .into_iter()
+                .filter(|event| !event.op.is_schema_change()),
+        );
     }
     if collected.len() < want {
         return Err(rustcdc::Error::TimeoutError(format!(

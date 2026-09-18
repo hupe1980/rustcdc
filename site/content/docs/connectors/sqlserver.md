@@ -25,6 +25,7 @@ rows into the rustcdc event envelope.
 | `UPDATE` | yes | Full `before` + `after` |
 | `DELETE` | yes | Full `before` |
 | DDL changes | partial | Column additions captured; column drops may require re-enabling CDC on the table |
+| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
 | `TRUNCATE` | opt-in | SQL Server CDC alone cannot log TRUNCATE. With `capture_truncate_events = true` the connector installs a database-level DDL trigger + shadow table and emits a `truncate` event positioned after all DML at the captured LSN |
 
 ### Minimum requirements
@@ -53,6 +54,24 @@ captured change, with columns:
 | `__$operation` | `1` = delete, `2` = insert, `3` = before-update, `4` = after-update |
 | `__$update_mask` | Bitmask of changed columns |
 | _all source columns_ | Actual column values |
+
+### Declared column types
+
+Column values are text, so a consumer needs the types to decode them. Every table's columns
+are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
+event with `ddl_type = "READ_SCHEMA"` — see
+[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+
+Types come from `sys.columns`, reached through the capture instance, so lengths, precision
+and scale survive: `decimal(12,4)`, `nvarchar(255)`, `datetime2(3)`. An alias type or UDT
+reports its own name. `cdc.captured_columns` alone carries only the base type name, which is
+why it is not the source.
+
+No extra privilege beyond the `db_datareader` the connector already needs.
+
+**Limit.** A captured column whose source column has been dropped reports
+`data_type = "unknown"` rather than being omitted — omitting it would describe a table the
+change rows do not match.
 
 ### Polling
 

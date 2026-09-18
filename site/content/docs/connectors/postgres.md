@@ -27,7 +27,9 @@ additional installation required).
 | `UPDATE` | yes | `after` always; `before` requires `REPLICA IDENTITY FULL` or `USING INDEX` |
 | `DELETE` | yes | `before` requires `REPLICA IDENTITY FULL` or `USING INDEX`; otherwise primary key only |
 | `TRUNCATE` | yes | PostgreSQL ≥ 11; `pgoutput` only |
-| DDL changes | no | Logical decoding does not expose DDL; schema changes must be handled out-of-band |
+| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
+| Logical decoding messages | opt-in | `pg_logical_emit_message()` output — the table-free transactional outbox. Set [`capture_logical_messages`](@/docs/config-reference.md#capture-logical-messages) |
+| DDL statements | no | Logical decoding does not expose the statement text. A column added or retyped is reported as a schema event derived from the `RELATION` metadata, not as the `ALTER TABLE` that caused it |
 
 ### Minimum requirements
 
@@ -154,6 +156,46 @@ slot. PostgreSQL will replay all uncommitted WAL segments from that LSN forward.
 
 > **Important:** never drop a replication slot while the connector is stopped.
 > Doing so discards WAL and the connector cannot resume without a new snapshot.
+
+### Declared column types
+
+Column values are text, so a consumer needs the types to decode them. Every table's columns
+are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
+event with `ddl_type = "READ_SCHEMA"` — see
+[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+
+Types come from `pg_catalog.format_type()`, read once at stream start over the publication:
+`numeric(12,4)` keeps its modifier, and enums, domains and extension types report their own
+names. Nullability comes from `pg_attribute.attnotnull`.
+
+No extra privilege — `pg_catalog` is readable by every role.
+
+**Limit.** A table added to the publication *after* the stream started is not in that read,
+so its columns report the pgoutput type OID: no modifier, and `unknown` for a type outside
+the built-in set. Its first DDL carries the full declaration, and a restart re-reads the
+catalogue.
+
+### Logical decoding messages — the table-free outbox
+
+`pg_logical_emit_message()` writes an application event straight into the WAL, inside the
+writing transaction:
+
+```sql
+BEGIN;
+INSERT INTO orders (id, total) VALUES (1, 42.50);
+SELECT pg_logical_emit_message(true, 'outbox', '{"kind":"OrderPlaced","id":1}');
+COMMIT;
+```
+
+The row and the event commit together, with no outbox table and no window in which one is
+durable and the other is not.
+
+Set [`capture_logical_messages = true`](@/docs/config-reference.md#capture-logical-messages)
+and they arrive as `op = "message"` events under the synthetic table `<prefix>__messages`, in
+commit order with the rows they accompany.
+
+> **The message lives in the WAL, not in a table.** Nothing to migrate, and nothing to
+> prune — it is gone once the slot advances past it. Persisting it is the consumer's job.
 
 ### Replica identity
 

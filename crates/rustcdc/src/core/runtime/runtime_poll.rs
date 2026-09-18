@@ -1170,11 +1170,12 @@ impl CdcRuntime {
     ///
     /// # Why a rejected entry does not stop the pipeline
     ///
-    /// The event's source offset is passed as the DDL identity, which makes recording
-    /// idempotent under replay — the common case after a crash between the record and
-    /// the checkpoint commit. What remains is a history that genuinely cannot accept
-    /// the statement: an `ALTER TABLE` diff for a table the store has never seen,
-    /// which is what an `InMemorySchemaHistory` looks like after any restart.
+    /// A DDL identity is passed that makes recording idempotent under replay — the
+    /// common case after a crash between the record and the checkpoint commit — and, for
+    /// a schema *observation*, idempotent across restarts too
+    /// ([`CapturedDdl::history_identity`]). What remains is a history that genuinely
+    /// cannot accept the statement: an `ALTER TABLE` diff for a table the store has never
+    /// seen, which is what an `InMemorySchemaHistory` looks like after any restart.
     ///
     /// Propagating that fails the poll, and it fails identically on every subsequent
     /// restart because the same event is replayed from the same checkpoint — a
@@ -1185,7 +1186,7 @@ impl CdcRuntime {
     ///
     /// A store that is *broken* rather than merely inconsistent — an I/O failure, a
     /// lost owner lease — still propagates.
-    async fn record_schema_change_events(&mut self, events: &[Event]) -> Result<()> {
+    pub(crate) async fn record_schema_change_events(&mut self, events: &[Event]) -> Result<()> {
         for event in events.iter().filter(|event| event.op.is_schema_change()) {
             let Some(after) = event.after.as_ref() else {
                 continue;
@@ -1200,10 +1201,15 @@ impl CdcRuntime {
                 continue;
             };
 
+            // The identity is the offset for a captured statement and a content digest for
+            // an observation, so a restart that re-announces an unchanged table resolves to
+            // the version already stored instead of appending one. See
+            // [`CapturedDdl::history_identity`].
+            let ddl_id = captured.history_identity(&event.source.offset);
             match self
                 .config
                 .schema_history
-                .record_ddl(&event.source.offset, schema_event)
+                .record_ddl(&ddl_id, schema_event)
                 .await
             {
                 Ok(_) => {}

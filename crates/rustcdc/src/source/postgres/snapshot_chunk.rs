@@ -3,7 +3,11 @@ use crate::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SnapshotMetadata,
         SourceMetadata,
     },
-    source::helpers::now_millis,
+    ddl_capture::CapturedDdl,
+    source::{
+        helpers::now_millis,
+        schema_catalog::{DDL_TYPE_READ_SCHEMA, observed_statement, table_schema_from_catalog},
+    },
 };
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, PostgresSnapshotHandle};
@@ -81,6 +85,55 @@ pub(super) async fn next_postgres_snapshot_chunk(
         } else {
             Some(key_columns.clone())
         };
+
+        // Announce the table's schema before its first row.
+        //
+        // Snapshot rows carry text values like every other event, and a consumer that
+        // joins the pipeline at the initial load has no other way to learn what to parse
+        // them as — the snapshot path emitted no schema event at all, so a table that
+        // never underwent DDL had none anywhere in the stream. Emitting it here, ahead of
+        // the rows, means the schema is on the wire before anything that depends on it,
+        // which is the same ordering the runtime already enforces between schema history
+        // and delivery.
+        if !handle.tables[table_index].schema_announced {
+            handle.tables[table_index].schema_announced = true;
+            let catalog = handle.tables[table_index].catalog_columns.clone();
+            // An offline snapshot has no client and therefore no catalog. It says so by
+            // emitting nothing rather than by describing columns it did not read.
+            if !catalog.is_empty() {
+                let schema_for_event = schema_name.clone().unwrap_or_else(|| "public".to_string());
+                let ts_ms = now_millis();
+                let captured = CapturedDdl {
+                    ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
+                    schema: schema_for_event.clone(),
+                    table: bare_table.clone(),
+                    statement: observed_statement(
+                        &schema_for_event,
+                        &bare_table,
+                        "the PostgreSQL catalog",
+                    ),
+                    result_schema: Some(table_schema_from_catalog(
+                        &schema_for_event,
+                        &bare_table,
+                        &catalog,
+                        &key_columns,
+                    )),
+                    schema_diff: None,
+                    ts: ts_ms,
+                };
+                // The snapshot watermark, not a synthetic label. An event's offset is a
+                // source position that the runtime parses — `checkpoint_offset_for_event`
+                // reads it as an LSN — so a label like `users:schema` is not merely
+                // uninformative, it fails the parse and takes the handoff down with it.
+                // The watermark is also the honest answer: this is the schema as of the
+                // position the snapshot was taken at.
+                events.push(captured.to_event(
+                    &handle.source_name,
+                    super::format_pg_lsn(handle.snapshot_watermark),
+                    ts_ms,
+                ));
+            }
+        }
 
         if live_query {
             if handle.client.is_none() {

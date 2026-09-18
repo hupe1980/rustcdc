@@ -179,7 +179,10 @@ impl SqlServerStreamHandle {
         }
 
         let capture_instance = meta.capture_instance.as_str();
-        let columns = meta.captured_columns.as_slice();
+        // Names only: the projection and the row decoder address columns by name, while
+        // the declared types on the same metadata feed the schema event.
+        let column_names = meta.column_names();
+        let columns = column_names.as_slice();
         validate_capture_instance_name(capture_instance)?;
 
         let window_start = if compare_lsn(&meta.capture_floor, &self.stream.lsn_start).is_gt() {

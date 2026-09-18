@@ -3788,3 +3788,35 @@ name = "skip-truncates"
     assert!(err.contains("skip-truncates"), "{err}");
     assert!(err.contains("unknown operation"), "{err}");
 }
+
+/// `capture_logical_messages` reaches the connector, defaults off, and is optional.
+///
+/// Three properties, and the middle one is the regression: the field arrives through
+/// `#[serde(flatten)]` from rustcdc's own `PostgresSourceConfig`, so a field added there
+/// without `#[serde(default)]` becomes **required** — every existing configuration then
+/// fails to load with "missing field", which is a migration nobody was told to do for an
+/// opt-in feature that defaults to false.
+#[test]
+fn postgres_capture_logical_messages_round_trips_and_is_optional() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+
+    let default_cfg = write_postgres_config(dir.path(), "default.toml", &state_dir, "");
+    assert!(
+        !expect_postgres(&default_cfg).capture_logical_messages,
+        "a configuration that never mentions the key must load, with capture off: the \
+         option changes what the server sends, so it is opt-in"
+    );
+
+    let on_cfg = write_postgres_config(
+        dir.path(),
+        "on.toml",
+        &state_dir,
+        "capture_logical_messages = true\n",
+    );
+    assert!(
+        expect_postgres(&on_cfg).capture_logical_messages,
+        "the documented key must actually reach the connector; nothing else in this crate \
+         would notice if it went inert"
+    );
+}

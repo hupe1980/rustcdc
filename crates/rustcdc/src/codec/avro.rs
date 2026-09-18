@@ -58,6 +58,7 @@ fn op_avro_index(op: Operation) -> u32 {
         Operation::Read => 3,
         Operation::SchemaChange => 4,
         Operation::Truncate => 5,
+        Operation::Message => 6,
     }
 }
 
@@ -69,6 +70,7 @@ fn op_avro_symbol(op: Operation) -> &'static str {
         Operation::Read => "READ",
         Operation::SchemaChange => "SCHEMA_CHANGE",
         Operation::Truncate => "TRUNCATE",
+        Operation::Message => "MESSAGE",
     }
 }
 
@@ -608,6 +610,7 @@ pub fn avro_value_to_event(value: &AvroValue) -> Result<Event> {
         "READ" => Operation::Read,
         "SCHEMA_CHANGE" => Operation::SchemaChange,
         "TRUNCATE" => Operation::Truncate,
+        "MESSAGE" => Operation::Message,
         other => {
             // Defaulting an unknown symbol would fabricate an operation — an unrecognised
             // op silently read as INSERT turns a foreign message into a row creation a

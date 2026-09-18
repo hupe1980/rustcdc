@@ -121,7 +121,10 @@ async fn drain(
     install_rustls_provider();
     let mut collected = Vec::new();
     for _ in 0..80 {
-        let events = handle.next_events(200).await?;
+        let events = (handle.next_events(200).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         if events.is_empty() && !collected.is_empty() {
             break;
         }

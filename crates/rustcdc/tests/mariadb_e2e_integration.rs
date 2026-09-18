@@ -178,7 +178,10 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
         .start_snapshot(&["mariadb_resumption_test"])
         .await?;
 
-    let first_batch = snapshot_1.next_chunk(1000).await?;
+    let first_batch = (snapshot_1.next_chunk(1000).await?)
+        .into_iter()
+        .filter(|event| !event.op.is_schema_change())
+        .collect::<Vec<_>>();
     assert!(!first_batch.is_empty(), "expected initial snapshot batch");
     snapshot_1
         .checkpoint(&mut checkpoint, first_batch.len() as u64)
@@ -202,6 +205,10 @@ async fn run_mariadb_snapshot_resume_from_checkpoint(
         if chunk.is_empty() {
             break;
         }
+        let chunk = chunk
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         resumed_events.extend(chunk);
     }
 
@@ -330,7 +337,12 @@ async fn run_mariadb_stream_capture_insert_update_delete(
         if batch.is_empty() {
             sleep(Duration::from_millis(100)).await;
         } else {
-            events.extend(batch);
+            events.extend(
+                batch
+                    .into_iter()
+                    .filter(|event| !event.op.is_schema_change())
+                    .collect::<Vec<_>>(),
+            );
         }
         if events.len() >= 65 {
             break;
@@ -461,6 +473,10 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
         if batch.is_empty() {
             break;
         }
+        let batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         snapshot_events.extend(batch);
         if snapshot_events.len() >= 1000 {
             break;
@@ -495,7 +511,12 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
         if batch.is_empty() {
             sleep(Duration::from_millis(100)).await;
         } else {
-            stream_events.extend(batch);
+            stream_events.extend(
+                batch
+                    .into_iter()
+                    .filter(|event| !event.op.is_schema_change())
+                    .collect::<Vec<_>>(),
+            );
         }
         if stream_events.len() >= 100 {
             break;
