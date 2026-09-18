@@ -1,11 +1,9 @@
 use crate::core::{
     BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
 };
-use crate::ddl_capture::CapturedDdl;
+use crate::ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA};
 use crate::source::helpers::now_millis;
-use crate::source::schema_catalog::{
-    DDL_TYPE_READ_SCHEMA, observed_statement, table_schema_from_catalog,
-};
+use crate::source::schema_catalog::{observed_statement, table_schema_from_catalog};
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, MysqlSnapshotHandle};
 

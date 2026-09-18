@@ -28,6 +28,7 @@
 //! inferred.** Where the catalogue cannot be reached the connector says so rather than
 //! guessing ([`CatalogColumn::UNKNOWN_TYPE`]).
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use std::collections::HashMap;
 
 use crate::schema_history::{ColumnDef, TableSchema};
@@ -61,6 +62,15 @@ impl CatalogColumn {
     /// A distinguishable marker rather than a plausible-looking guess: a consumer can
     /// branch on it, and it cannot be mistaken for a real declaration the way `"text"` or
     /// an empty string could.
+    ///
+    /// Only two connectors can produce it. PostgreSQL falls back to the wire type OID for
+    /// a table added to the publication after stream start, and SQL Server cannot resolve
+    /// a captured column whose source column was dropped. MySQL reads `COLUMN_TYPE`, which
+    /// `information_schema` never leaves null, so under a MySQL-only build this is dead.
+    ///
+    /// `test` is in the gate because the test helpers below construct a column with it
+    /// whatever connector is compiled.
+    #[cfg(any(feature = "postgres", feature = "sqlserver", test))]
     pub(crate) const UNKNOWN_TYPE: &'static str = "unknown";
 }
 
@@ -83,15 +93,12 @@ impl From<&str> for CatalogColumn {
 }
 
 /// Declared columns per `(schema, table)`, read once and reused.
-pub(crate) type CatalogSchemas = HashMap<(String, String), Vec<CatalogColumn>>;
-
-/// `ddl_type` for a schema a connector **observed**, as distinct from one that changed.
 ///
-/// A consumer needs to tell "here is the shape of this table, before its first row" from
-/// "this table was altered". Both carry a complete `result_schema`; only the second is a
-/// change to react to. Reusing `CREATE_TABLE` for the first would tell a consumer a table
-/// had just been created on every pipeline restart.
-pub(crate) const DDL_TYPE_READ_SCHEMA: &str = "READ_SCHEMA";
+/// PostgreSQL reads a publication and MySQL a database, so both need the map. SQL Server
+/// reads per capture instance and carries the columns on its own metadata, so under a
+/// SQL-Server-only build this alias has no user.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub(crate) type CatalogSchemas = HashMap<(String, String), Vec<CatalogColumn>>;
 
 /// Build a [`TableSchema`] from catalogue columns and the resolved primary key.
 ///

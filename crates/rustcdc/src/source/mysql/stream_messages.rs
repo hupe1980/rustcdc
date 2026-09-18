@@ -2,9 +2,9 @@ use crate::{
     core::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
     },
-    ddl_capture::CapturedDdl,
+    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
     source::{
-        schema_catalog::{DDL_TYPE_READ_SCHEMA, observed_statement, table_schema_from_catalog},
+        schema_catalog::{observed_statement, table_schema_from_catalog},
         table_is_allowed,
     },
 };

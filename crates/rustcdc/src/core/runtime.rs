@@ -6162,7 +6162,7 @@ mod tests {
 
         let observation = |offset: &str| {
             CapturedDdl {
-                ddl_type: crate::source::schema_catalog::DDL_TYPE_READ_SCHEMA.to_string(),
+                ddl_type: crate::ddl_capture::DDL_TYPE_READ_SCHEMA.to_string(),
                 schema: "public".into(),
                 table: "users".into(),
                 statement: "/* observed */".into(),

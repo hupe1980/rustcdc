@@ -27,6 +27,17 @@ pub use self::parsing::{
 #[cfg(test)]
 mod tests;
 
+/// `ddl_type` for a schema a connector **observed**, as distinct from one that changed.
+///
+/// A consumer needs to tell "here is the shape of this table, before its first row" from
+/// "this table was altered". Both carry a complete `result_schema`; only the second is a
+/// change to react to. Reusing `CREATE_TABLE` for the first would tell a consumer a table
+/// had just been created on every pipeline restart.
+///
+/// Named rather than inlined because three connectors and the runtime compare against it,
+/// where `"CREATE_TABLE"` and its siblings appear at one site each.
+pub(crate) const DDL_TYPE_READ_SCHEMA: &str = "READ_SCHEMA";
+
 /// Database dialect used for DDL parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -202,7 +213,7 @@ impl CapturedDdl {
     /// The two are recorded under different identities; see [`Self::history_identity`].
     #[must_use]
     pub fn is_observation(&self) -> bool {
-        self.ddl_type == crate::source::schema_catalog::DDL_TYPE_READ_SCHEMA
+        self.ddl_type == DDL_TYPE_READ_SCHEMA
     }
 
     /// The identity the schema history records this under, given the source offset.
@@ -278,7 +289,7 @@ impl CapturedDdl {
             // table the history has never seen, which is what an `InMemorySchemaHistory`
             // looks like after any restart. A diff there is the `SchemaError` that used to
             // be logged and dropped.
-            crate::source::schema_catalog::DDL_TYPE_READ_SCHEMA | "CREATE_TABLE" => {
+            DDL_TYPE_READ_SCHEMA | "CREATE_TABLE" => {
                 self.result_schema.clone().map(DDLEvent::CreateTable)
             }
             "ALTER_TABLE" => {

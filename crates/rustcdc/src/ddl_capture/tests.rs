@@ -852,7 +852,7 @@ fn a_primary_key_is_found_past_length_changing_identifiers() {
 
 fn observation(table: &str, columns: &[(&str, &str, bool)]) -> CapturedDdl {
     CapturedDdl {
-        ddl_type: crate::source::schema_catalog::DDL_TYPE_READ_SCHEMA.to_string(),
+        ddl_type: crate::ddl_capture::DDL_TYPE_READ_SCHEMA.to_string(),
         schema: "public".into(),
         table: table.into(),
         statement: "/* observed */".into(),

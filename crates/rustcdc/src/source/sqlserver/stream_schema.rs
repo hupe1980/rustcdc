@@ -1,10 +1,10 @@
 use crate::{
     core::{Event, Result},
-    ddl_capture::CapturedDdl,
+    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
     schema_history::TableSchema,
     source::{
         helpers::now_millis,
-        schema_catalog::{DDL_TYPE_READ_SCHEMA, observed_statement, table_schema_from_catalog},
+        schema_catalog::{observed_statement, table_schema_from_catalog},
     },
 };
 

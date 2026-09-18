@@ -3,13 +3,11 @@ use crate::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SourceMetadata,
         TransactionMetadata,
     },
-    ddl_capture::CapturedDdl,
+    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
     schema_history::{ColumnDef, TableSchema},
     source::{
         helpers::now_millis,
-        schema_catalog::{
-            CatalogColumn, DDL_TYPE_READ_SCHEMA, observed_statement, table_schema_from_catalog,
-        },
+        schema_catalog::{CatalogColumn, observed_statement, table_schema_from_catalog},
         table_is_allowed,
     },
 };
