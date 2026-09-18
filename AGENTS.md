@@ -1,4 +1,4 @@
-# Copilot instructions — rustcdc
+# AGENTS.md — rustcdc
 
 ## What this repository is
 
@@ -14,7 +14,7 @@ A Cargo workspace shipping change data capture two ways from one version:
 Everything that decides correctness is in the library. The server adds configuration,
 sinks, state backends and an operational surface on top.
 
-Rust 1.94.1, edition 2024. Every command runs from the repository root.
+Rust 1.95.0, edition 2024. Every command runs from the repository root.
 
 ## Priorities
 

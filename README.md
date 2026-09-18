@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/rustcdc.svg)](https://crates.io/crates/rustcdc)
 [![docs.rs](https://img.shields.io/docsrs/rustcdc)](https://docs.rs/rustcdc)
 [![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
-[![Rust 1.94.1+](https://img.shields.io/badge/rust-1.94.1%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust 1.95.0+](https://img.shields.io/badge/rust-1.95.0%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
 **Change data capture in Rust.** PostgreSQL, MySQL, MariaDB, SQL Server and Snowflake
@@ -49,6 +49,7 @@ cargo add rustcdc --features postgres
 | [`docker/`](docker/) | The library's example stack and its Dockerfile |
 | [`monitoring/`](monitoring/) | Prometheus SLO alert rules, checked against the metrics the server actually emits |
 | [`scripts/`](scripts/) | CI gates, including `ci-policy-gate.sh` |
+| [`AGENTS.md`](AGENTS.md) | What a coding agent needs to know before changing this repository: the priorities, the gates to run, and the standing rules |
 
 Every command runs from the repository root. `cargo build` builds both crates;
 `-p rustcdc` and `-p rustcdc-server` address one.
@@ -77,7 +78,7 @@ MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka.
 
 ## Building it
 
-Rust 1.94.1+, and a C toolchain for the server's dependency graph (`cmake`, `clang`,
+Rust 1.95.0+, and a C toolchain for the server's dependency graph (`cmake`, `clang`,
 `perl`, `pkg-config`). Every command runs from the repository root.
 
 ```bash

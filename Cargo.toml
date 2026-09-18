@@ -28,9 +28,11 @@ resolver = "2"
 [workspace.package]
 version = "0.18.0"
 edition = "2024"
-# The AWS SDK sets this floor; wasmtime is the next constraint at 1.94.0. Declaring the
+# `wasmtime` sets this floor; the AWS SDK is the next constraint at 1.94.1. Declaring the
 # lower number would hand anyone a resolver error instead of a documented requirement.
-rust-version = "1.94.1"
+# It covers the server with every feature, which is what the MSRV job checks: `wasm` is
+# optional, but a floor that only held for the default build is not the one the image needs.
+rust-version = "1.95.0"
 authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/rustcdc"

@@ -154,6 +154,12 @@ row-consuming sink handle something that is not a row.
 rather than a new one, so a sink's existing match arm stays correct instead of every sink
 author learning a variant.
 
+### Changed: MSRV is now 1.95.0
+
+`wasmtime` 48 requires it, and the MSRV promise covers the server with every feature — a
+floor that only held for the default build is not the one the published image needs. The AWS
+SDK, which set the previous floor, is now the next constraint at 1.94.1.
+
 ### Changed: dependencies
 
 `wasmtime` 47 → **48** and `krafka` 0.22 → **0.24**.
@@ -185,6 +191,7 @@ reached through Iceberg. One upstream release gates all three moves.
 6. **`Operation` gained a variant.** An exhaustive `match` over it no longer compiles, and a
    consumer decoding the Avro or Protobuf enum must accept `MESSAGE` / `7`. Only PostgreSQL
    emits it, and only with `capture_logical_messages = true`.
+7. **MSRV raised to 1.95.0** from 1.94.1.
 
 ### Migrating
 

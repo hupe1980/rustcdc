@@ -80,8 +80,8 @@ docs_rs_url = "https://docs.rs/rustcdc"
 license = "MIT OR Apache-2.0"
 # Shown in the header and in the structured data. Checked against the workspace
 # manifest by `crates/rustcdc-server/tests/architecture.rs`, so it cannot drift.
-version = "0.17.0"
-rust_version = "1.94.1"
+version = "0.18.0"
+rust_version = "1.95.0"
 # Used for the Open Graph and Twitter card images.
 og_image = "/og.png"
 author = "hupe1980"
