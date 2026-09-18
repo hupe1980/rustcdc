@@ -3898,6 +3898,43 @@ mod tests {
             assert_eq!(prefixes, vec!["outbox__messages".to_string()]);
         }
 
+        /// A schema event never carries a zero LSN a checkpoint could rewind to.
+        ///
+        /// pgoutput does not stamp `RELATION` with a position, so the frame's `wal_start`
+        /// is routinely `0`. Inside a transaction that is harmless — `resume_offset_for`
+        /// answers with the transaction's end LSN. Outside one it returns `None`, the
+        /// runtime falls back to the event's own offset, and `0/00000000` resumes from the
+        /// start of the slot.
+        #[tokio::test]
+        async fn a_schema_event_outside_a_transaction_carries_the_stream_position() {
+            const OID: u32 = 31;
+            // A RELATION with no surrounding BEGIN, framed at wal_start 0 as pgoutput sends it.
+            let provider = MockPgOutputProvider::new(vec![vec![xlog(
+                0,
+                build_relation(OID, "public", "orders", &[("id", true)]),
+            )]]);
+            let mut handle = make_stream_handle(0x4000, provider);
+
+            let events = handle.next_events(50).await.unwrap();
+            let schema = events
+                .iter()
+                .find(|event| event.op == crate::core::Operation::SchemaChange)
+                .expect("the first sighting is announced");
+
+            assert!(
+                schema.transaction.is_none(),
+                "this test is about the no-transaction path; with one, the offset is never used"
+            );
+            assert_ne!(
+                schema.source.offset, "0/00000000",
+                "a zero offset is a checkpoint at the start of the slot"
+            );
+            assert_eq!(
+                schema.source.offset, "0/00004000",
+                "the stream's current position is the truthful answer"
+            );
+        }
+
         /// A declared content length past the end of the frame is refused, not allocated.
         #[test]
         fn a_content_length_beyond_the_frame_is_rejected() {
