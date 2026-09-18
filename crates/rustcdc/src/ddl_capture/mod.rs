@@ -356,7 +356,7 @@ impl CapturedDdl {
             },
             ts: ts_ms,
             schema: Some(self.schema.clone()),
-            table: format!("{}__ddl_events", self.table),
+            table: ddl_events_table(&self.table),
             primary_key: None,
             snapshot: None,
             transaction: None,
@@ -364,6 +364,20 @@ impl CapturedDdl {
             unavailable_columns: Vec::new(),
         }
     }
+}
+
+/// The synthetic table a schema-change event for `table` is published under.
+///
+/// Every connector emits schema events as `<table>__ddl_events`, so a route or a topic
+/// template sees them as a table of their own. Public so that a caller which has to predict
+/// the name — a sink checking its topics at startup — derives it here instead of restating
+/// the suffix.
+///
+/// ```
+/// assert_eq!(rustcdc::ddl_events_table("orders"), "orders__ddl_events");
+/// ```
+pub fn ddl_events_table(table: &str) -> String {
+    format!("{table}__ddl_events")
 }
 
 /// Trait for extracting DDL from source-specific message formats.

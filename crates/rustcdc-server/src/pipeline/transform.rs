@@ -14,6 +14,7 @@ use crate::config::schema::{
     TransformActionConfig, TransformKeySource, TransformMetadataField, TransformRuleConfig,
     TransformRuntimeConfig, TransformRuntimeMode, TransformWhenConfig,
 };
+use crate::topic::QualifiedTable;
 
 pub struct TransformPipeline {
     rules: Vec<CompiledRule>,
@@ -564,6 +565,44 @@ fn apply_rules(event: Event, rules: &[CompiledRule]) -> Result<Option<Event>> {
     }
 
     Ok(Some(current))
+}
+
+/// The known tables whose schema events the configured rules let through, under the name
+/// they reach the router with.
+///
+/// Startup needs this to know which `<table>__ddl_events` topics a sink will be asked for.
+/// It runs the pipeline's own compiled rules and `apply_rules` on a schema event shaped like
+/// the one each connector emits, so startup and the hot path cannot disagree about which
+/// schema events survive. A rule that fails on that event counts as dropping it: failing
+/// startup over a topic the event would never reach is the worse mistake. A WASM transform
+/// runs after these rules and is not consulted.
+pub(crate) fn schema_event_tables(
+    rules: &[TransformRuleConfig],
+    tables: &[QualifiedTable],
+) -> Vec<QualifiedTable> {
+    let Ok(compiled) = compile_rules(rules.to_vec()) else {
+        return Vec::new();
+    };
+    tables
+        .iter()
+        .filter_map(|table| {
+            let mut event = Event::builder(
+                rustcdc::ddl_events_table(&table.table),
+                rustcdc::Operation::SchemaChange,
+            )
+            .after(Value::Object(Map::new()));
+            if let Some(schema) = &table.schema {
+                event = event.schema(schema.clone());
+            }
+            match apply_rules(event.build(), &compiled) {
+                Ok(Some(event)) => Some(QualifiedTable {
+                    schema: event.schema,
+                    table: event.table,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn matches_when(event: &Event, when: &TransformWhenConfig) -> bool {

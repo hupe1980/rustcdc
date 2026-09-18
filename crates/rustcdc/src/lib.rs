@@ -132,7 +132,7 @@ pub use crate::core::{
 pub use crate::core::{RustlsClientConfig, rustls_client_config};
 pub use crate::ddl_capture::{
     CapturedDdl, DdlDialect, DdlExtractor, DdlOperation, MysqlDdlExtractor, ParsedDdlStatement,
-    PostgresDdlExtractor, SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor,
+    PostgresDdlExtractor, SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor, ddl_events_table,
     extract_columns_from_create, extract_primary_keys, extract_qualified_name,
     extract_qualified_name_with_default, normalize_identifier,
 };

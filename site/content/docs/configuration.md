@@ -482,6 +482,13 @@ within 249 characters, and not `.` or `..`.
 runtime are not covered; the log says how many were checked. Each sink checks only the
 tables its routes send it.
 
+Schema events are published under a table of their own, `<table>__ddl_events`, so the
+template gives them their own topic: `cdc.${schema}.${table}` sends the announcement for
+`public.orders` to `cdc.public.orders__ddl_events`. Preflight checks those topics too,
+unless the pipeline's transforms drop schema events (`exclude_ops = ["schema_change"]`).
+They are routed by that name, so a route for `public.orders` does not claim them but one
+for `public.orders*` does. A WASM transform is not consulted.
+
 Topics are **not** auto-created.
 
 **Ordering.** Per-key ordering is unaffected — a table's events share a topic and a key.

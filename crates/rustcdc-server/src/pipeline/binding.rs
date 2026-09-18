@@ -54,10 +54,15 @@ pub async fn build_router(config: &AppConfig) -> Result<BuiltRouter, AppError> {
     // table list. A named sink behind `table_pattern = "public.orders"` that demanded a
     // topic for `public.customers` — a table routed elsewhere — would fail startup over
     // a topic that will never receive an event.
-    let assignment = assign_known_tables(
-        sink::SinkBuildContext::known_tables_from_config(config),
-        &config.pipeline.routes,
-    );
+    //
+    // Schema events are published under `<table>__ddl_events`, so a known table can also
+    // need a topic for its schema events. Whether it does is the transforms' decision, and
+    // where they go is the routes'.
+    let mut known = sink::SinkBuildContext::known_tables_from_config(config);
+    let schema_events =
+        crate::pipeline::transform::schema_event_tables(&config.pipeline.transforms, &known);
+    known.extend(schema_events);
+    let assignment = assign_known_tables(known, &config.pipeline.routes);
     let context_for = |tables: Vec<crate::topic::QualifiedTable>| {
         sink::SinkBuildContext::new(config.runtime.max_event_bytes).with_known_tables(tables)
     };
@@ -242,6 +247,10 @@ fn validate_route_references(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "binding_preflight_tests.rs"]
+mod preflight_tests;
 
 #[cfg(test)]
 mod tests {
