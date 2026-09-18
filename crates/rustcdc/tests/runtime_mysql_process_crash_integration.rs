@@ -225,13 +225,46 @@ async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> 
         }
     }
 
+    // Normalise both sides before comparing. `event_ids` renders a `serde_json::Value`
+    // with `to_string()`, and a column value is **text** under the envelope contract — so
+    // the marker holds `"\"1\""` while the resume side parses to an integer and formats
+    // `"1"`. Compared raw, the two sets are disjoint whatever happens, and the assertion
+    // below could never fail.
+    let acked: std::collections::HashSet<String> = marker
+        .ids
+        .iter()
+        .map(|id| id.trim_matches('"').to_string())
+        .collect();
     assert!(
-        marker.ids.is_disjoint(&resumed_snapshot_ids),
-        "resumed snapshot should not replay ids already commit-acked before crash"
+        acked.is_disjoint(&resumed_snapshot_ids),
+        "resumed snapshot should not replay ids already commit-acked before crash: \
+         acked={acked:?} resumed={resumed_snapshot_ids:?}"
     );
     assert!(
-        resumed_snapshot_ids.len() >= (total_rows as usize).saturating_sub(marker.ids.len()),
-        "expected resumed snapshot to deliver remaining rows"
+        resumed_snapshot_ids.len() >= (total_rows as usize).saturating_sub(acked.len()),
+        "expected resumed snapshot to deliver remaining rows: total={total_rows} \
+         acked_before_crash={} resumed={}",
+        acked.len(),
+        resumed_snapshot_ids.len()
+    );
+
+    // **No row may be skipped.** Acked ∪ resumed must cover the table, and the gap this
+    // catches is a one-row hole at the resume boundary: a chunk that returns more events
+    // than the buffer holds has the overflow dropped by the runtime, while the snapshot
+    // cursor has already advanced past it. Counting alone does not see that — the totals
+    // still look plausible — so the assertion is on the set.
+    let covered: std::collections::HashSet<String> =
+        acked.union(&resumed_snapshot_ids).cloned().collect();
+    let missing: Vec<String> = (1..=total_rows)
+        .map(|id| id.to_string())
+        .filter(|id| !covered.contains(id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every row must be delivered either before the crash or after the resume; \
+         {} of {total_rows} were skipped entirely, first few: {:?}",
+        missing.len(),
+        &missing[..missing.len().min(10)]
     );
 
     Ok(())

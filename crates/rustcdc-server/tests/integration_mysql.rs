@@ -204,6 +204,14 @@ struct Fixture {
     events: PathBuf,
 }
 
+/// A row event, as opposed to a schema announcement.
+///
+/// Every table's columns are announced before its first row, so a sink file interleaves
+/// `schema_change` events with rows. The assertions in this suite are about rows.
+fn is_row_event(event: &serde_json::Value) -> bool {
+    event["op"].as_str() != Some("schema_change")
+}
+
 impl Fixture {
     fn new(server_id: u32, gtid: bool) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -283,7 +291,11 @@ enabled = false
             .unwrap_or_else(|e| format!("<could not read pipeline log: {e}>"))
     }
 
-    /// Every captured event, as `(op, id, note)`.
+    /// Every captured **row** event, as `(op, id, note)`.
+    ///
+    /// Schema announcements are filtered out: every table's columns are announced before
+    /// its first row, and these assertions are about rows. `schema_events` is the
+    /// complement.
     fn captured(&self) -> Vec<(String, String, String)> {
         let Ok(body) = std::fs::read_to_string(&self.events) else {
             return Vec::new();
@@ -291,8 +303,11 @@ enabled = false
         body.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                let event: serde_json::Value =
-                    serde_json::from_str(line).expect("each sink line is one JSON event");
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("each sink line is one JSON event")
+            })
+            .filter(is_row_event)
+            .map(|event| {
                 let row = event
                     .get("after")
                     .filter(|v| !v.is_null())
@@ -317,7 +332,7 @@ enabled = false
             .collect()
     }
 
-    /// The `primary_key` array of every captured event.
+    /// The `primary_key` array of every captured **row** event.
     fn primary_keys(&self) -> Vec<Vec<String>> {
         let Ok(body) = std::fs::read_to_string(&self.events) else {
             return Vec::new();
@@ -325,8 +340,11 @@ enabled = false
         body.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                let event: serde_json::Value =
-                    serde_json::from_str(line).expect("each sink line is one JSON event");
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("each sink line is one JSON event")
+            })
+            .filter(is_row_event)
+            .map(|event| {
                 event["primary_key"]
                     .as_array()
                     .map(|cols| {

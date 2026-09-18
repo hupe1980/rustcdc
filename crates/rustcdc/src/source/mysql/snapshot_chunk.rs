@@ -3,7 +3,9 @@ use crate::core::{
 };
 use crate::ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA};
 use crate::source::helpers::now_millis;
-use crate::source::schema_catalog::{observed_statement, table_schema_from_catalog};
+use crate::source::schema_catalog::{
+    mark_as_snapshot_event, observed_statement, table_schema_from_catalog,
+};
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, MysqlSnapshotHandle};
 
@@ -24,10 +26,9 @@ pub(super) async fn next_snapshot_chunk(
 
     while events.len() < requested && handle.current_table < handle.tables.len() {
         let table_index = handle.current_table;
-        let (table_name, live_query, cursor_position, primary_key_columns, schema_name, bare_table) = {
+        let (live_query, cursor_position, primary_key_columns, schema_name, bare_table) = {
             let table = &handle.tables[table_index];
             (
-                table.snapshot.table.clone(),
                 table.live_query,
                 table.snapshot.cursor_position.clone(),
                 table.primary_key_columns.clone(),
@@ -35,7 +36,6 @@ pub(super) async fn next_snapshot_chunk(
                 table.bare_table.clone(),
             )
         };
-        let remaining = requested - events.len();
 
         // Announce the table's schema before its first row. MySQL's schema events
         // otherwise come only from DDL parsed out of the binlog, so a table whose
@@ -60,21 +60,29 @@ pub(super) async fn next_snapshot_chunk(
                     schema_diff: None,
                     ts,
                 };
-                // The same offset shape the rows around it carry —
-                // `<binlog_file>:<binlog_pos>:<cursor>`. An event's offset is a source
-                // position the runtime parses when it builds a checkpoint, so a synthetic
-                // label is not merely uninformative: it fails the parse and takes the
-                // handoff with it.
-                events.push(captured.to_event(
+                let mut event = captured.to_event(
                     &handle.source_name,
                     format!(
-                        "{}:{}:schema:{table_name}",
+                        "{}:{}",
                         handle.snapshot.binlog_file, handle.snapshot.binlog_pos
                     ),
                     ts,
-                ));
+                );
+                mark_as_snapshot_event(
+                    &mut event,
+                    &handle.snapshot.snapshot_id,
+                    handle.next_chunk_index,
+                );
+                events.push(event);
             }
         }
+
+        // Computed **after** the announcement, not before: the announcement occupies a
+        // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
+        // `requested + 1` events. That overflow costs a row — the runtime delivers a
+        // buffer's worth and the extra one is dropped, while the snapshot cursor has
+        // already advanced past it.
+        let remaining = requested - events.len();
 
         if live_query {
             let rows = handle

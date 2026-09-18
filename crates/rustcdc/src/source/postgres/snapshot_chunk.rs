@@ -6,7 +6,7 @@ use crate::{
     ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
     source::{
         helpers::now_millis,
-        schema_catalog::{observed_statement, table_schema_from_catalog},
+        schema_catalog::{mark_as_snapshot_event, observed_statement, table_schema_from_catalog},
     },
 };
 
@@ -61,7 +61,6 @@ pub(super) async fn next_postgres_snapshot_chunk(
                 table.primary_key_types.clone(),
             )
         };
-        let remaining = requested - events.len();
 
         // Emit the same identity the streaming path emits.
         //
@@ -121,19 +120,26 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     schema_diff: None,
                     ts: ts_ms,
                 };
-                // The snapshot watermark, not a synthetic label. An event's offset is a
-                // source position that the runtime parses — `checkpoint_offset_for_event`
-                // reads it as an LSN — so a label like `users:schema` is not merely
-                // uninformative, it fails the parse and takes the handoff down with it.
-                // The watermark is also the honest answer: this is the schema as of the
-                // position the snapshot was taken at.
-                events.push(captured.to_event(
+                // The snapshot watermark: the position this schema is true as of.
+                let mut event = captured.to_event(
                     &handle.source_name,
                     super::format_pg_lsn(handle.snapshot_watermark),
                     ts_ms,
-                ));
+                );
+                mark_as_snapshot_event(
+                    &mut event,
+                    &handle.snapshot.snapshot_id,
+                    handle.next_chunk_index,
+                );
+                events.push(event);
             }
         }
+
+        // Computed **after** the announcement, not before: the announcement occupies a
+        // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
+        // `requested + 1` events. That overflow costs a row — the runtime delivers a
+        // buffer's worth and the extra one is dropped.
+        let remaining = requested - events.len();
 
         if live_query {
             if handle.client.is_none() {
