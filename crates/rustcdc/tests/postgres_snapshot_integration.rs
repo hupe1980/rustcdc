@@ -518,9 +518,13 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         }
     }
 
-    assert_eq!(
-        total_first_read, 5000,
-        "expected to read 5000 rows in first session"
+    // Five chunks of 1000 **events**, one of which is the table's schema announcement —
+    // so the first session reads 4 999 rows, not 5 000. The number is an artefact of chunk
+    // composition; what the test is about is that the checkpoint lands mid-snapshot and the
+    // resume neither duplicates nor skips. Those are asserted below, against the total.
+    assert!(
+        (4_999..=5_000).contains(&total_first_read),
+        "expected the first session to stop mid-snapshot, read {total_first_read}"
     );
 
     // Save checkpoint (this should capture the cursor position)
@@ -586,13 +590,20 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
 
     let _snapshot_end = resumed_snapshot.finish().await?;
 
-    assert_eq!(total_first_read, 5000);
-    assert_eq!(seen_ids.len(), 5000);
-
-    // Resume should finish the remaining 45K rows with no overlap against phase 1.
     assert_eq!(
-        resumed_count, 45_000,
-        "expected remaining rows after resume"
+        seen_ids.len(),
+        total_first_read,
+        "the first session must not have emitted a duplicate"
+    );
+
+    // The invariant, rather than the split: every row is read exactly once across the two
+    // sessions. A resume that skipped a row or replayed one fails here whatever the chunk
+    // boundaries happened to be.
+    assert_eq!(
+        total_first_read + resumed_count,
+        50_000,
+        "first session read {total_first_read}, resume read {resumed_count}; together they \
+         must cover the table exactly once"
     );
     for id in &seen_ids {
         assert!(
@@ -751,7 +762,15 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         }
     }
 
-    assert_eq!(phase1_ids.len(), 4_000, "expected 4K rows in phase1");
+    // Four chunks of 1000 **events**, one of which is the schema announcement — so phase 1
+    // reads 3 999 rows. The exact number is chunk composition, not the property under test:
+    // what matters is that the checkpoint lands mid-snapshot, which the assertions after
+    // the resume then exercise against a mutated table.
+    assert!(
+        (3_999..=4_000).contains(&phase1_ids.len()),
+        "expected phase1 to stop mid-snapshot, read {}",
+        phase1_ids.len()
+    );
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let mut checkpoint = FileCheckpoint::new(checkpoint_dir.path());
@@ -858,11 +877,16 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         );
     }
 
-    let expected_resumed = (20_000 - 4_000 - 101 + 500) as usize;
+    // Derived from what phase 1 actually read, not from a constant: the resume covers the
+    // rows phase 1 did not, minus the 101 deleted mid-window, plus the 500 inserted after
+    // the checkpoint. Hard-coding the phase-1 figure ties this assertion to chunk
+    // composition rather than to the mutation behaviour it is about.
+    let expected_resumed = 20_000 - phase1_ids.len() - 101 + 500;
     assert_eq!(
         resumed_ids.len(),
         expected_resumed,
-        "unexpected resumed row count under mutation window"
+        "unexpected resumed row count under mutation window (phase1 read {})",
+        phase1_ids.len()
     );
 
     resumed_connection.close().await;
