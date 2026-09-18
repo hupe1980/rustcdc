@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/rustcdc.svg)](https://crates.io/crates/rustcdc)
 [![docs.rs](https://img.shields.io/docsrs/rustcdc)](https://docs.rs/rustcdc)
 [![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
-[![Rust 1.94.1+](https://img.shields.io/badge/rust-1.94.1%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust 1.95.0+](https://img.shields.io/badge/rust-1.95.0%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
 **Change data capture you embed, not deploy.** PostgreSQL, MySQL, MariaDB, SQL Server and
@@ -48,11 +48,11 @@ changes; each one is listed in the
 [changelog](https://github.com/hupe1980/rustcdc/blob/main/CHANGELOG.md) with the migration
 it requires.
 
-Core connector and runtime paths are validated by 1 168 library unit tests, 446 server unit
-tests, 139 documentation samples compiled as doctests, 41 deterministic-replay golden
-fixtures and 42 integration suites — the container-backed ones running against real
-PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6, SQL Server 2022 and Apicurio
-Registry 3.
+Core connector and runtime paths are validated by 1 204 library unit tests, 571 server unit
+tests, 141 documentation samples compiled as doctests, 41 deterministic-replay golden
+fixtures and 43 integration suites — the container-backed ones running against real
+PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6, SQL Server 2019/2022 and Apicurio
+Registry 3.0.6.
 
 The Snowflake source is the one connector with **no container-backed evidence** — Snowflake
 has no self-hostable implementation. Its semantics are unit-tested through a scripted
@@ -459,13 +459,13 @@ zola --root site serve
 
 ## MSRV
 
-Rust 1.94.1+ or newer, matching `rust-version` in `[workspace.package]`. Raising it is a
+Rust 1.95.0+ or newer, matching `rust-version` in `[workspace.package]`. Raising it is a
 minor-version change. CI reads the number out of the manifest rather than restating it, and
 verifies both members on exactly that toolchain — `crates/rustcdc-server/tests/architecture.rs` fails the
 build if this README, the Dockerfile or the documentation site disagrees with it.
 
-The floor is set by the server's dependency graph (the AWS SDK), with wasmtime next at
-1.94.0. The library alone would compile on less, but one workspace publishes one number.
+The floor is set by `wasmtime`, which the `wasm` feature pulls in, with the AWS SDK next at
+1.94.1. The library alone would compile on less, but one workspace publishes one number.
 
 ## License
 

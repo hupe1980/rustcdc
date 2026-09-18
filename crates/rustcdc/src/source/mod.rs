@@ -10,6 +10,10 @@ use crate::{
 
 pub(crate) mod helpers;
 pub mod incremental_snapshot;
+// Only the relational connectors read a catalogue; with none of them compiled the module
+// has no callers and every item in it is dead code.
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
+pub(crate) mod schema_catalog;
 pub mod snapshot_progress;
 pub mod snapshot_tracker;
 pub mod snapshot_validator;

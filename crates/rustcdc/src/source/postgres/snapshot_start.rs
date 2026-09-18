@@ -109,6 +109,12 @@ async fn build_snapshot_setup(
         let (schema, name) = parse_table_reference(table)?;
         let (pk_columns, pk_types) =
             query_primary_key_columns_and_types(client, &schema, &name).await?;
+        // The same projection the stream uses, so one table is described identically in
+        // both phases. A snapshot has no publication to enumerate — a snapshot-only
+        // deployment need not have one — so this reads per table rather than per
+        // publication.
+        let catalog_columns =
+            super::query::query_table_column_types(client, &schema, &name).await?;
         if pk_columns.is_empty() {
             return Err(Error::ConfigError(format!(
                 "postgres snapshot requires a primary key for resumable table '{schema}.{name}'"
@@ -147,6 +153,8 @@ async fn build_snapshot_setup(
             rows: Vec::new(),
             next_row: 0,
             live_query: true,
+            catalog_columns,
+            schema_announced: false,
             primary_key_columns: pk_columns,
             primary_key_types: pk_types,
         });

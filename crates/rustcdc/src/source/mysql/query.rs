@@ -900,3 +900,107 @@ mod binary_column_tests {
         );
     }
 }
+
+/// Read every table's declared column types and nullability for one database.
+///
+/// # Why `information_schema` and not the binlog's table map
+///
+/// The TABLE_MAP event carries a protocol type code per column — `MYSQL_TYPE_NEWDECIMAL`,
+/// `MYSQL_TYPE_VAR_STRING` — plus a metadata block holding precision, scale, or a byte
+/// length. Reconstructing `decimal(12,4)` from that is possible: read the code, read the
+/// metadata, read the `SIGNEDNESS` optional-metadata field for the unsigned flag, divide
+/// the byte length by the charset's maximum character width.
+///
+/// It would also be **a second spelling**. The DDL-capture path already publishes
+/// `data_type` as the text of the statement MySQL executed, so a connector that
+/// synthesised types from the table map would describe one column two ways depending on
+/// whether the pipeline had seen its `CREATE TABLE` — and two implementations of one
+/// semantic drifting apart is the failure this tree has a standing rule against.
+///
+/// `information_schema.COLUMNS.COLUMN_TYPE` is the source's own spelling, complete:
+/// `decimal(12,4)`, `int unsigned`, `varchar(64)`, `enum('a','b')`. One read, one
+/// spelling.
+///
+/// # Why for the whole database, once
+///
+/// The binlog decode path is synchronous and holds no SQL connection. Reading every table
+/// in the database at stream start costs one round trip and makes first sight a map
+/// lookup. A table created *after* the stream starts is absent — and needs nothing, because
+/// its `CREATE TABLE` arrives in the binlog as its own schema-change event.
+pub(super) async fn query_database_column_types<C>(
+    connection: &mut C,
+    database: &str,
+) -> Result<crate::source::schema_catalog::CatalogSchemas>
+where
+    C: mysql_async::prelude::Queryable,
+{
+    use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
+
+    let rows: Vec<(String, String, String, String)> = connection
+        .exec(
+            "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = ? \
+             ORDER BY TABLE_NAME, ORDINAL_POSITION",
+            (database,),
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed querying mysql column types for database '{database}': {error}"
+            ))
+        })?;
+
+    let mut schemas: CatalogSchemas = std::collections::HashMap::new();
+    for (table, name, column_type, is_nullable) in rows {
+        schemas
+            .entry((database.to_string(), table))
+            .or_default()
+            .push(CatalogColumn {
+                name,
+                data_type: column_type,
+                // `IS_NULLABLE` is the string `"YES"` or `"NO"`, not a boolean.
+                nullable: is_nullable.eq_ignore_ascii_case("YES"),
+            });
+    }
+    Ok(schemas)
+}
+
+/// Read every table's primary key for one database, in index order.
+///
+/// `ORDER BY ORDINAL_POSITION` on `KEY_COLUMN_USAGE` is the position **within the
+/// constraint**, not within the table, so a composite key comes back in the order the
+/// index declares it. That matters: the key order decides the message key and the
+/// idempotency fingerprint, and a key assembled in table order would disagree with the
+/// snapshot path, which reads this same view.
+pub(super) async fn query_database_primary_keys<C>(
+    connection: &mut C,
+    database: &str,
+) -> Result<std::collections::HashMap<(String, String), Vec<String>>>
+where
+    C: mysql_async::prelude::Queryable,
+{
+    let rows: Vec<(String, String)> = connection
+        .exec(
+            "SELECT TABLE_NAME, COLUMN_NAME \
+             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND CONSTRAINT_NAME = 'PRIMARY' \
+             ORDER BY TABLE_NAME, ORDINAL_POSITION",
+            (database,),
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed querying mysql primary keys for database '{database}': {error}"
+            ))
+        })?;
+
+    let mut keys: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    for (table, column) in rows {
+        keys.entry((database.to_string(), table))
+            .or_default()
+            .push(column);
+    }
+    Ok(keys)
+}

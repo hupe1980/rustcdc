@@ -97,7 +97,15 @@ async fn replayed_after_clean_restart(image: &str, tag: &str) -> rustcdc::Result
 
     let mut delivered = Vec::new();
     for _ in 0..60 {
-        delivered.extend(stream.next_events(250).await?);
+        // Rows only: the schema announcement that precedes a table's first row would
+        // otherwise be counted as the delivery this test asserts on.
+        delivered.extend(
+            stream
+                .next_events(250)
+                .await?
+                .into_iter()
+                .filter(|event| !event.op.is_schema_change()),
+        );
         if !delivered.is_empty() {
             break;
         }
@@ -139,7 +147,13 @@ async fn replayed_after_clean_restart(image: &str, tag: &str) -> rustcdc::Result
 
     let mut replayed = Vec::new();
     for _ in 0..20 {
-        replayed.extend(stream.next_events(250).await?);
+        replayed.extend(
+            stream
+                .next_events(250)
+                .await?
+                .into_iter()
+                .filter(|event| !event.op.is_schema_change()),
+        );
     }
     for event in &replayed {
         println!("REPLAYED offset={} op={}", event.source.offset, event.op);

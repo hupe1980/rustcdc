@@ -147,6 +147,8 @@ pub(in crate::source::postgres) struct ReplicationParams<'a> {
     /// `confirmed_flush_lsn`, which is the right answer for an unresumed stream.
     pub(in crate::source::postgres) start_lsn: u64,
     pub(in crate::source::postgres) connect_timeout: Duration,
+    /// Request `messages 'true'`, so the server sends `pg_logical_emit_message()` output.
+    pub(in crate::source::postgres) capture_logical_messages: bool,
 }
 
 /// A live logical replication stream.
@@ -219,7 +221,12 @@ impl ReplicationStream {
             .await?;
         stream.await_ready().await?;
         stream
-            .start_replication(params.slot_name, params.publication_name, params.start_lsn)
+            .start_replication(
+                params.slot_name,
+                params.publication_name,
+                params.start_lsn,
+                params.capture_logical_messages,
+            )
             .await?;
 
         Ok(stream)
@@ -451,6 +458,7 @@ impl ReplicationStream {
         slot_name: &str,
         publication_name: &str,
         start_lsn: u64,
+        capture_logical_messages: bool,
     ) -> Result<()> {
         // The slot and publication names are server identifiers that reach the server as
         // part of a command string, so they are validated rather than escaped.
@@ -462,9 +470,19 @@ impl ReplicationStream {
         // `proto_version '1'` is what this crate's pgoutput decoder implements. Requesting
         // a higher version would make the server send v2 streaming and v3 two-phase
         // messages the decoder deliberately rejects rather than silently mishandles.
+        //
+        // `messages 'true'` is added only when the connector is configured to capture
+        // logical decoding messages. It is not free to leave on: the server then sends
+        // every `pg_logical_emit_message()` on the instance whose prefix reaches this
+        // slot, which a pipeline that does not consume them pays to decode and discard.
+        let messages_option = if capture_logical_messages {
+            ", messages 'true'"
+        } else {
+            ""
+        };
         let query = format!(
             "START_REPLICATION SLOT {slot_name} LOGICAL {start} \
-             (proto_version '1', publication_names '{publication_name}')"
+             (proto_version '1', publication_names '{publication_name}'{messages_option})"
         );
 
         let mut payload = query.into_bytes();

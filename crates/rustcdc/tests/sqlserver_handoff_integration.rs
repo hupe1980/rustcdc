@@ -13,11 +13,15 @@ async fn poll_stream_events(
 ) -> rustcdc::Result<Vec<rustcdc::Event>> {
     let mut out = Vec::new();
     for _ in 0..attempts {
-        let mut batch = stream.next_events(400).await?;
+        let batch = stream.next_events(400).await?;
         if batch.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             continue;
         }
+        let mut batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         out.append(&mut batch);
     }
     Ok(out)
@@ -78,6 +82,8 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
 
     // Drain snapshot before handoff.
     loop {
+        // Drained, not inspected: the handoff is the subject here, so the batch's
+        // contents — rows or the schema announcement that precedes them — do not matter.
         let chunk = snapshot.next_chunk(256).await?;
         if chunk.is_empty() {
             break;

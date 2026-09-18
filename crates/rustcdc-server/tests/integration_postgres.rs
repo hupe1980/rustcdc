@@ -208,6 +208,14 @@ struct Extras {
     toml: String,
 }
 
+/// A row event, as opposed to a schema announcement.
+///
+/// Every table's columns are announced before its first row, so a sink file interleaves
+/// `schema_change` events with rows. The assertions in this suite are about rows.
+fn is_row_event(event: &serde_json::Value) -> bool {
+    event["op"].as_str() != Some("schema_change")
+}
+
 impl Fixture {
     fn new(wal_transport: &str, slot: &str) -> Self {
         Self::with_extras(wal_transport, slot, Extras::default())
@@ -304,7 +312,7 @@ sink_flush_interval_events = 1
             .expect("spawn rustcdc")
     }
 
-    /// The `primary_key` array of every captured event, in order.
+    /// The `primary_key` array of every captured **row** event, in order.
     fn primary_keys(&self) -> Vec<Vec<String>> {
         let Ok(body) = std::fs::read_to_string(&self.events) else {
             return Vec::new();
@@ -312,8 +320,11 @@ sink_flush_interval_events = 1
         body.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                let event: serde_json::Value =
-                    serde_json::from_str(line).expect("each sink line is one JSON event");
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("each sink line is one JSON event")
+            })
+            .filter(is_row_event)
+            .map(|event| {
                 event["primary_key"]
                     .as_array()
                     .map(|columns| {
@@ -386,7 +397,10 @@ sink_flush_interval_events = 1
         }
     }
 
-    /// Every captured event, as `(op, id, note)`.
+    /// Every captured **row** event, as `(op, id, note)`.
+    ///
+    /// Schema announcements are filtered out: every table's columns are announced before
+    /// its first row, and these assertions are about rows.
     fn captured(&self) -> Vec<(String, String, String)> {
         let Ok(body) = std::fs::read_to_string(&self.events) else {
             return Vec::new();
@@ -394,8 +408,11 @@ sink_flush_interval_events = 1
         body.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                let event: serde_json::Value =
-                    serde_json::from_str(line).expect("each sink line is one JSON event");
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("each sink line is one JSON event")
+            })
+            .filter(is_row_event)
+            .map(|event| {
                 let row = event
                     .get("after")
                     .filter(|v| !v.is_null())

@@ -432,7 +432,7 @@ run_bench_invocation_check() {
     --glob '!crates/xtask/src/main.rs' \
     --glob '!scripts/ci-benchmark-gate.sh' \
     --glob '!scripts/ci-policy-gate.sh' \
-    --glob '!.github/copilot-instructions.md' \
+    --glob '!AGENTS.md' \
     . | grep -v 'cargo xtask bench' || true)"
 
   if [[ -n "$hits" ]]; then

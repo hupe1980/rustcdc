@@ -10,7 +10,7 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 [![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
 [![Docker](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
 [![GHCR](https://img.shields.io/badge/ghcr.io-hupe1980%2Frustcdc--server-blue?logo=docker)](https://github.com/hupe1980/rustcdc/pkgs/container/rustcdc-server)
-[![Rust 1.94.1+](https://img.shields.io/badge/rust-1.94.1%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust 1.95.0+](https://img.shields.io/badge/rust-1.95.0%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License: Apache 2.0 / MIT](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-green)](#-license)
 
 </div>
@@ -146,7 +146,7 @@ docker run --rm \
 ### Option C — Build from source
 
 ```bash
-# Requires Rust 1.94.1+ and cmake / clang / perl (for aws-lc-sys)
+# Requires Rust 1.95.0+ and cmake / clang / perl (for aws-lc-sys)
 git clone https://github.com/hupe1980/rustcdc
 cd rustcdc-server
 cargo build --release --all-features

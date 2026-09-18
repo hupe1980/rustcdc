@@ -1,7 +1,11 @@
 use crate::core::{
     BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
 };
+use crate::ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA};
 use crate::source::helpers::now_millis;
+use crate::source::schema_catalog::{
+    mark_as_snapshot_event, observed_statement, table_schema_from_catalog,
+};
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, MysqlSnapshotHandle};
 
@@ -22,15 +26,62 @@ pub(super) async fn next_snapshot_chunk(
 
     while events.len() < requested && handle.current_table < handle.tables.len() {
         let table_index = handle.current_table;
-        let (table_name, live_query, cursor_position, primary_key_columns) = {
+        let (live_query, cursor_position, primary_key_columns, schema_name, bare_table) = {
             let table = &handle.tables[table_index];
             (
-                table.snapshot.table.clone(),
                 table.live_query,
                 table.snapshot.cursor_position.clone(),
                 table.primary_key_columns.clone(),
+                table.schema_name.clone(),
+                table.bare_table.clone(),
             )
         };
+
+        // Announce the table's schema before its first row. MySQL's schema events
+        // otherwise come only from DDL parsed out of the binlog, so a table whose
+        // `CREATE TABLE` predates capture had none at all — and snapshot rows carry text
+        // values like every other event.
+        if !handle.tables[table_index].schema_announced {
+            handle.tables[table_index].schema_announced = true;
+            let catalog = handle.tables[table_index].catalog_columns.clone();
+            if !catalog.is_empty() {
+                let ts = now_millis();
+                let captured = CapturedDdl {
+                    ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
+                    schema: schema_name.clone(),
+                    table: bare_table.clone(),
+                    statement: observed_statement(&schema_name, &bare_table, "information_schema"),
+                    result_schema: Some(table_schema_from_catalog(
+                        &schema_name,
+                        &bare_table,
+                        &catalog,
+                        &primary_key_columns,
+                    )),
+                    schema_diff: None,
+                    ts,
+                };
+                let mut event = captured.to_event(
+                    &handle.source_name,
+                    format!(
+                        "{}:{}",
+                        handle.snapshot.binlog_file, handle.snapshot.binlog_pos
+                    ),
+                    ts,
+                );
+                mark_as_snapshot_event(
+                    &mut event,
+                    &handle.snapshot.snapshot_id,
+                    handle.next_chunk_index,
+                );
+                events.push(event);
+            }
+        }
+
+        // Computed **after** the announcement, not before: the announcement occupies a
+        // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
+        // `requested + 1` events. That overflow costs a row — the runtime delivers a
+        // buffer's worth and the extra one is dropped, while the snapshot cursor has
+        // already advanced past it.
         let remaining = requested - events.len();
 
         if live_query {
@@ -67,8 +118,8 @@ pub(super) async fn next_snapshot_chunk(
                         timestamp: ts,
                     },
                     ts,
-                    schema: None,
-                    table: table_name.clone(),
+                    schema: Some(schema_name.clone()),
+                    table: bare_table.clone(),
                     primary_key: Some(primary_key_columns.clone()),
                     snapshot: Some(SnapshotMetadata {
                         snapshot_id: handle.snapshot.snapshot_id.clone(),
@@ -105,8 +156,10 @@ pub(super) async fn next_snapshot_chunk(
                         timestamp: ts,
                     },
                     ts,
-                    schema: None,
-                    table: table.snapshot.table.clone(),
+                    // Same identity as the live-query branch and the stream: schema and
+                    // bare table carried separately, never a joined string.
+                    schema: Some(table.schema_name.clone()),
+                    table: table.bare_table.clone(),
                     primary_key: Some(table.primary_key_columns.clone()),
                     snapshot: Some(SnapshotMetadata {
                         snapshot_id: handle.snapshot.snapshot_id.clone(),

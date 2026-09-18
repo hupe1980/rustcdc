@@ -39,6 +39,24 @@ pub enum Operation {
     /// Only connectors that advertise [`crate::source::ConnectorCapabilities::truncate`]
     /// emit this variant.
     Truncate,
+    /// A logical decoding message written into the log by the application itself.
+    ///
+    /// PostgreSQL's `pg_logical_emit_message()` writes an arbitrary `(prefix, content)`
+    /// pair into the WAL, inside the writing transaction. It is the **table-free
+    /// transactional outbox**: an application records an event in the same transaction as
+    /// the row change that caused it, with no outbox table to create, index, poll or
+    /// vacuum, and no window in which the row is committed and the event is not.
+    ///
+    /// `before` is always `None`. `after` carries `prefix`, `content` and `transactional`;
+    /// the content is bytes the application chose, surfaced as a string when it is valid
+    /// UTF-8 and base64 otherwise, because the log says nothing about its encoding.
+    ///
+    /// A **non-transactional** message (`pg_logical_emit_message(false, …)`) is written to
+    /// the log immediately and is decoded even if its surrounding transaction later aborts.
+    /// The flag travels on the event rather than being filtered here, because "this may
+    /// describe work that was rolled back" is a fact about the message that only the
+    /// consumer can act on.
+    Message,
 }
 
 impl Display for Operation {
@@ -59,6 +77,7 @@ impl Operation {
             Self::Read => "read",
             Self::SchemaChange => "schema_change",
             Self::Truncate => "truncate",
+            Self::Message => "message",
         }
     }
 
@@ -138,8 +157,9 @@ impl std::str::FromStr for Operation {
             "read" => Ok(Self::Read),
             "schema_change" => Ok(Self::SchemaChange),
             "truncate" => Ok(Self::Truncate),
+            "message" => Ok(Self::Message),
             other => Err(Error::ValidationError(vec![format!(
-                "unknown operation '{}': expected one of insert, update, delete, read, schema_change, truncate",
+                "unknown operation '{}': expected one of insert, update, delete, read, schema_change, truncate, message",
                 other
             )])),
         }
@@ -920,7 +940,11 @@ impl Event {
     pub fn row_write(&self) -> RowWrite<'_> {
         match self.op {
             Operation::Truncate => RowWrite::Truncate,
-            Operation::SchemaChange => RowWrite::None {
+            // A logical decoding message names no row, in the same way a DDL event does:
+            // it is a record the application wrote into the log, not a change to a table.
+            // Reusing `NoRowWrite::SchemaChange` keeps a sink's existing match arm correct
+            // rather than adding a reason every sink author has to learn.
+            Operation::SchemaChange | Operation::Message => RowWrite::None {
                 reason: NoRowWrite::SchemaChange,
             },
             Operation::Delete => match self.primary_key_values() {
@@ -1121,6 +1145,23 @@ impl Event {
                     errors.push(ValidationError::new(
                         "after",
                         "truncate events must not include after",
+                    ));
+                }
+            }
+            Operation::Message => {
+                // `after` carries the message itself — prefix, content, transactional —
+                // so an absent one is an event that says a message happened without
+                // saying which. `before` is meaningless: there is no prior state.
+                if self.after.is_none() {
+                    errors.push(ValidationError::new(
+                        "after",
+                        "message events must include after",
+                    ));
+                }
+                if self.before.is_present() {
+                    errors.push(ValidationError::new(
+                        "before",
+                        "message events must not include before",
                     ));
                 }
             }

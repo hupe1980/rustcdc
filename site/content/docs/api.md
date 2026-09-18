@@ -226,6 +226,16 @@ fn as_i64(value: Option<&Value>) -> Option<i64> {
 # let _ = as_i64(None);
 ```
 
+#### The types come from the stream, not from you
+
+Parsing text requires knowing what to parse it as, and the row does not say — `"9"` could be
+a `bigint` or a `text` holding a digit.
+
+Every connector announces a table's column types before that table's first row, in the
+snapshot and the stream, as a `SchemaChange` event with `ddl_type = "READ_SCHEMA"`.
+`data_type` is the source's own syntax, modifier intact: `numeric(12,4)`, not `numeric`. See
+[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+
 #### Why text rather than typed JSON
 
 **It is the lossless form.** A JSON number is an IEEE-754 double by the time most consumers

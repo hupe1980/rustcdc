@@ -16,7 +16,7 @@ bare metal, or the container image for Kubernetes and CI.
 
 ## Install the binary
 
-Requires Rust 1.94.1 or later (`rustup update stable`).
+Requires Rust 1.95.0 or later (`rustup update stable`).
 
 ```bash
 git clone https://github.com/hupe1980/rustcdc

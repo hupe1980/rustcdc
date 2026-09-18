@@ -1224,7 +1224,7 @@ pub const EVENT_JSON_SCHEMA: &str = r#"{
     "op": {
       "description": "CRUD operation that produced this event.",
       "type": "string",
-      "enum": ["insert", "update", "delete", "read", "schema_change", "truncate"]
+      "enum": ["insert", "update", "delete", "read", "schema_change", "truncate", "message"]
     },
     "source": {
       "description": "Source identity and durable position metadata.",

@@ -27,6 +27,17 @@ pub use self::parsing::{
 #[cfg(test)]
 mod tests;
 
+/// `ddl_type` for a schema a connector **observed**, as distinct from one that changed.
+///
+/// A consumer needs to tell "here is the shape of this table, before its first row" from
+/// "this table was altered". Both carry a complete `result_schema`; only the second is a
+/// change to react to. Reusing `CREATE_TABLE` for the first would tell a consumer a table
+/// had just been created on every pipeline restart.
+///
+/// Named rather than inlined because three connectors and the runtime compare against it,
+/// where `"CREATE_TABLE"` and its siblings appear at one site each.
+pub(crate) const DDL_TYPE_READ_SCHEMA: &str = "READ_SCHEMA";
+
 /// Database dialect used for DDL parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -197,10 +208,90 @@ impl CapturedDdl {
         })
     }
 
+    /// Whether this is a schema **observation** rather than a captured statement.
+    ///
+    /// The two are recorded under different identities; see [`Self::history_identity`].
+    #[must_use]
+    pub fn is_observation(&self) -> bool {
+        self.ddl_type == DDL_TYPE_READ_SCHEMA
+    }
+
+    /// The identity the schema history records this under, given the source offset.
+    ///
+    /// `record_ddl` is idempotent on this value, and the two kinds of entry want two
+    /// different idempotency windows:
+    ///
+    /// * **A captured statement** is identified by its `offset` — the source log position
+    ///   it was read at. That is stable under at-least-once replay, which is the case that
+    ///   matters: a crash between recording the DDL and committing the checkpoint replays
+    ///   the event, and without the identity check the replay re-applies it. It is
+    ///   deliberately *not* content-derived, because a table altered from shape A to B and
+    ///   back to A has three entries in its history and the third is not the first.
+    ///
+    /// * **An observation** is identified by its content. Every connector announces each
+    ///   table before that table's first row, in every run, so a pipeline that restarts
+    ///   twice a day would otherwise append two schema versions per table per day that
+    ///   record nothing having happened. Keyed by content, the second and every later
+    ///   observation of an unchanged table resolve to the version already stored and
+    ///   append nothing — while an observation of a table that *did* change while the
+    ///   pipeline was down still records, which is exactly the case a restart must not
+    ///   lose.
+    #[must_use]
+    pub fn history_identity(&self, offset: &str) -> String {
+        if !self.is_observation() {
+            return offset.to_string();
+        }
+
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"rustcdc/v1/schema-observation\x00");
+        digest.update(self.schema.as_bytes());
+        digest.update(b"\x00");
+        digest.update(self.table.as_bytes());
+        digest.update(b"\x00");
+        if let Some(schema) = &self.result_schema {
+            for column in &schema.columns {
+                digest.update(column.name.as_bytes());
+                digest.update(b"\x1f");
+                digest.update(column.data_type.as_bytes());
+                digest.update(b"\x1f");
+                digest.update(if column.nullable { b"1" } else { b"0" });
+                digest.update(b"\x1f");
+                for constraint in &column.constraints {
+                    digest.update(constraint.as_bytes());
+                    digest.update(b"\x1e");
+                }
+                digest.update(b"\x00");
+            }
+            digest.update(b"\x00keys\x00");
+            for key in &schema.primary_keys {
+                digest.update(key.as_bytes());
+                digest.update(b"\x1f");
+            }
+        }
+        // RustCrypto 0.11 returns a `hybrid-array::Array`, which does not implement
+        // `LowerHex`; format the bytes explicitly, as `fingerprint_event_stable` does.
+        let hex: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("observed:{hex}")
+    }
+
     /// Convert a captured DDL into a SchemaHistory DDLEvent for persistence.
     pub fn to_schema_event(&self) -> Option<DDLEvent> {
         match self.ddl_type.as_str() {
-            "CREATE_TABLE" => self.result_schema.clone().map(DDLEvent::CreateTable),
+            // An observation records the table's shape as a **set**, not a diff.
+            //
+            // `CreateTable` and `AlterTable` are the same operation in the store — both
+            // append the schema whole — and a set is the only form that can be applied to a
+            // table the history has never seen, which is what an `InMemorySchemaHistory`
+            // looks like after any restart. A diff there is the `SchemaError` that used to
+            // be logged and dropped.
+            DDL_TYPE_READ_SCHEMA | "CREATE_TABLE" => {
+                self.result_schema.clone().map(DDLEvent::CreateTable)
+            }
             "ALTER_TABLE" => {
                 if let Some(schema) = self
                     .result_schema

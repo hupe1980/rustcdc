@@ -156,6 +156,10 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
         if chunk.is_empty() {
             break;
         }
+        let chunk = chunk
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         chunk_count += 1;
         for event in chunk {
@@ -264,6 +268,10 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         if batch.is_empty() {
             break;
         }
+        let batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         chunks = chunks.saturating_add(1);
         for event in batch {
@@ -309,6 +317,10 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         if batch.is_empty() {
             break;
         }
+        let batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
 
         for event in batch {
             let after = event.after.ok_or_else(|| {

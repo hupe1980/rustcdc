@@ -2,7 +2,11 @@ use crate::{
     core::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
     },
-    source::table_is_allowed,
+    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
+    source::{
+        schema_catalog::{observed_statement, table_schema_from_catalog},
+        table_is_allowed,
+    },
 };
 
 use super::{
@@ -95,6 +99,62 @@ impl MysqlStreamHandle {
         std::mem::take(&mut self.partial_tx_events)
     }
 
+    /// Announce a table's schema the first time this run sees a row for it.
+    ///
+    /// MySQL's schema-change events come from DDL statements parsed out of the binlog, so
+    /// a table whose `CREATE TABLE` ran before capture started had no schema event at all —
+    /// and its rows carry text values. This closes that, from the catalog read at stream
+    /// start rather than from the table map; see
+    /// [`query_database_column_types`](super::query::query_database_column_types).
+    ///
+    /// Returns `None` for a table the catalog has nothing for, which is a table created
+    /// after the stream started. That case needs nothing: its `CREATE TABLE` is in the
+    /// binlog and arrives as its own schema-change event.
+    fn announce_table_if_new(&mut self, schema: Option<&str>, table: &str) -> Option<Event> {
+        let database = schema?.to_string();
+        let key = (database.clone(), table.to_string());
+        if self.announced_tables.contains(&key) {
+            return None;
+        }
+        let columns = self.catalog_columns.get(&key)?.clone();
+        self.announced_tables.insert(key.clone());
+
+        let primary_keys = self
+            .catalog_primary_keys
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let ts_ms = if self.current_commit_ts == 0 {
+            crate::source::helpers::now_millis()
+        } else {
+            self.current_commit_ts
+        };
+        let captured = CapturedDdl {
+            ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
+            schema: database.clone(),
+            table: table.to_string(),
+            statement: observed_statement(&database, table, "information_schema"),
+            result_schema: Some(table_schema_from_catalog(
+                &database,
+                table,
+                &columns,
+                &primary_keys,
+            )),
+            schema_diff: None,
+            ts: ts_ms,
+        };
+        let offset = format_mysql_source_offset(
+            &self.stream.binlog_file,
+            self.stream.binlog_pos,
+            &self.stream.gtid,
+        );
+        let mut event = captured.to_event(&self.source_name, offset, ts_ms);
+        if self.current_tx_id.is_some() {
+            event.transaction = self.tx_meta();
+        }
+        Some(event)
+    }
+
     pub(super) fn process_messages(&mut self, messages: Vec<MysqlBinlogMessage>) -> Vec<Event> {
         let mut committed = Vec::new();
         for message in messages {
@@ -114,6 +174,13 @@ impl MysqlStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
+                        // Before the row, never after: a consumer that receives the row
+                        // first has already had to decide how to decode its text values.
+                        if let Some(schema_event) =
+                            self.announce_table_if_new(change.schema.as_deref(), &change.table)
+                        {
+                            self.partial_tx_events.push(schema_event);
+                        }
                         self.partial_tx_events
                             .push(self.build_event(Operation::Insert, change));
                     }
@@ -125,6 +192,13 @@ impl MysqlStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
+                        // Before the row, never after: a consumer that receives the row
+                        // first has already had to decide how to decode its text values.
+                        if let Some(schema_event) =
+                            self.announce_table_if_new(change.schema.as_deref(), &change.table)
+                        {
+                            self.partial_tx_events.push(schema_event);
+                        }
                         self.partial_tx_events
                             .push(self.build_event(Operation::Update, change));
                     }
@@ -136,6 +210,13 @@ impl MysqlStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
+                        // Before the row, never after: a consumer that receives the row
+                        // first has already had to decide how to decode its text values.
+                        if let Some(schema_event) =
+                            self.announce_table_if_new(change.schema.as_deref(), &change.table)
+                        {
+                            self.partial_tx_events.push(schema_event);
+                        }
                         self.partial_tx_events
                             .push(self.build_event(Operation::Delete, change));
                     }

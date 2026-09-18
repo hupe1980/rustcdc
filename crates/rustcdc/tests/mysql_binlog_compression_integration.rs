@@ -93,6 +93,10 @@ async fn drain(
             sleep(Duration::from_millis(100)).await;
             continue;
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         quiet = 0;
         collected.extend(events);
         if collected.len() >= want {

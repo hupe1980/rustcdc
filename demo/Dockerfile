@@ -4,7 +4,7 @@
 # NOT suitable for production. Use the workspace-root Dockerfile for production images.
 # ─────────────────────────────────────────────────────────────────────────────
 
-ARG RUST_VERSION=1.94.1
+ARG RUST_VERSION=1.95.0
 ARG DEBIAN_CODENAME=bookworm
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_CODENAME} AS builder

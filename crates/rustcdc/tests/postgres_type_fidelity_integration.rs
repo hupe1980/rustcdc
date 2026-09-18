@@ -111,7 +111,10 @@ async fn drain(
 ) -> rustcdc::Result<Vec<rustcdc::Event>> {
     let mut collected = Vec::new();
     for _ in 0..60 {
-        let events = handle.next_events(100).await?;
+        let events = (handle.next_events(100).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         if events.is_empty() && !collected.is_empty() {
             break;
         }

@@ -17,6 +17,21 @@ pub(super) struct TableSnapshotState {
     pub(super) rows: Vec<serde_json::Value>,
     pub(super) next_row: usize,
     pub(super) live_query: bool,
+    /// Schema (database) the table was resolved under, and the bare table name.
+    ///
+    /// Snapshot events used to carry `schema: None` and the *configured* table string, so
+    /// one physical table was `"app.users"` during the snapshot and `"users"` with
+    /// `schema: Some("app")` during streaming — a router configured for one silently
+    /// received nothing from the other phase. PostgreSQL fixed this in its own snapshot
+    /// path; MySQL kept the mismatch. Carrying both halves here is what lets the two
+    /// phases emit one identity.
+    pub(super) schema_name: String,
+    /// The bare table name, without the schema qualifier.
+    pub(super) bare_table: String,
+    /// The table's declared columns, read from `information_schema` at snapshot start.
+    pub(super) catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn>,
+    /// Whether this table's schema has been announced in this run.
+    pub(super) schema_announced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

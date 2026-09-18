@@ -158,6 +158,10 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
                 break;
             }
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         stream_events.extend(events);
         if stream_events.len() >= 80 {
             break;
@@ -307,6 +311,10 @@ async fn mysql_stream_resume_from_checkpoint() -> rustcdc::Result<()> {
                 break;
             }
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         all_events.extend(events);
         if all_events.len() >= 30 {
             break;
@@ -427,7 +435,10 @@ async fn mysql_stream_binlog_rotation() -> rustcdc::Result<()> {
     // Drain pre-rotation events
     let mut pre_events: Vec<rustcdc::Event> = Vec::new();
     for _ in 0..200 {
-        let batch = stream_handle.next_events(500).await?;
+        let batch = (stream_handle.next_events(500).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         pre_events.extend(batch);
         if pre_events.len() >= PRE_ROTATION_ROWS {
             break;
@@ -470,7 +481,10 @@ async fn mysql_stream_binlog_rotation() -> rustcdc::Result<()> {
     // Drain post-rotation events
     let mut post_events: Vec<rustcdc::Event> = Vec::new();
     for _ in 0..200 {
-        let batch = stream_handle.next_events(500).await?;
+        let batch = (stream_handle.next_events(500).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         post_events.extend(batch);
         if post_events.len() >= POST_ROTATION_ROWS {
             break;

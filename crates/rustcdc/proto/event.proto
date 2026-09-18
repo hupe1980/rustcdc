@@ -37,6 +37,8 @@ enum Operation {
   SCHEMA_CHANGE = 5;
   // TRUNCATE table.
   TRUNCATE = 6;
+  // Logical decoding message written by the application (pg_logical_emit_message).
+  MESSAGE = 7;
 }
 
 // ─── SourceMetadata ───────────────────────────────────────────────────────────

@@ -2,17 +2,23 @@
   "type": "record",
   "name": "Event",
   "namespace": "io.rustcdc",
-  "doc": "Canonical CDC event envelope — rustcdc envelope_version=1",
+  "doc": "Canonical CDC event envelope \u2014 rustcdc envelope_version=1",
   "fields": [
     {
       "name": "before",
-      "type": ["null", "bytes"],
+      "type": [
+        "null",
+        "bytes"
+      ],
       "default": null,
       "doc": "JSON-encoded before-image. null for INSERT events, and for UPDATE events whose source supplied no pre-image (PostgreSQL REPLICA IDENTITY DEFAULT when no key column changed). Read with before_is_key_only: absent, key-only and complete are three different states, and only the third is a row."
     },
     {
       "name": "after",
-      "type": ["null", "bytes"],
+      "type": [
+        "null",
+        "bytes"
+      ],
       "default": null,
       "doc": "JSON-encoded after-image. null for DELETE events."
     },
@@ -22,7 +28,15 @@
         "type": "enum",
         "name": "Operation",
         "namespace": "io.rustcdc",
-        "symbols": ["INSERT", "UPDATE", "DELETE", "READ", "SCHEMA_CHANGE", "TRUNCATE"],
+        "symbols": [
+          "INSERT",
+          "UPDATE",
+          "DELETE",
+          "READ",
+          "SCHEMA_CHANGE",
+          "TRUNCATE",
+          "MESSAGE"
+        ],
         "doc": "CRUD operation that produced this event."
       }
     },
@@ -33,9 +47,21 @@
         "name": "SourceMetadata",
         "namespace": "io.rustcdc",
         "fields": [
-          {"name": "source_name", "type": "string", "doc": "Logical connector name"},
-          {"name": "offset",      "type": "string", "doc": "Source-specific durable position"},
-          {"name": "timestamp",   "type": "long",   "doc": "Source timestamp in ms since epoch"}
+          {
+            "name": "source_name",
+            "type": "string",
+            "doc": "Logical connector name"
+          },
+          {
+            "name": "offset",
+            "type": "string",
+            "doc": "Source-specific durable position"
+          },
+          {
+            "name": "timestamp",
+            "type": "long",
+            "doc": "Source timestamp in ms since epoch"
+          }
         ]
       }
     },
@@ -46,7 +72,10 @@
     },
     {
       "name": "schema",
-      "type": ["null", "string"],
+      "type": [
+        "null",
+        "string"
+      ],
       "default": null,
       "doc": "Database schema name. null when unknown."
     },
@@ -57,37 +86,64 @@
     },
     {
       "name": "primary_key",
-      "type": {"type": "array", "items": "string"},
+      "type": {
+        "type": "array",
+        "items": "string"
+      },
       "default": [],
       "doc": "Ordered list of primary key column names."
     },
     {
       "name": "snapshot",
-      "type": ["null", {
-        "type": "record",
-        "name": "SnapshotMetadata",
-        "namespace": "io.rustcdc",
-        "fields": [
-          {"name": "snapshot_id",   "type": "string"},
-          {"name": "chunk_index",   "type": "int"},
-          {"name": "is_last_chunk", "type": "boolean"}
-        ]
-      }],
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "SnapshotMetadata",
+          "namespace": "io.rustcdc",
+          "fields": [
+            {
+              "name": "snapshot_id",
+              "type": "string"
+            },
+            {
+              "name": "chunk_index",
+              "type": "int"
+            },
+            {
+              "name": "is_last_chunk",
+              "type": "boolean"
+            }
+          ]
+        }
+      ],
       "default": null,
       "doc": "Snapshot phase metadata. null outside snapshot."
     },
     {
       "name": "transaction",
-      "type": ["null", {
-        "type": "record",
-        "name": "TransactionMetadata",
-        "namespace": "io.rustcdc",
-        "fields": [
-          {"name": "tx_id",        "type": "long"},
-          {"name": "total_events", "type": "int"},
-          {"name": "event_index",  "type": "int"}
-        ]
-      }],
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "TransactionMetadata",
+          "namespace": "io.rustcdc",
+          "fields": [
+            {
+              "name": "tx_id",
+              "type": "long"
+            },
+            {
+              "name": "total_events",
+              "type": "int"
+            },
+            {
+              "name": "event_index",
+              "type": "int"
+            }
+          ]
+        }
+      ],
       "default": null,
       "doc": "Transaction metadata. null for single-event transactions."
     },
@@ -105,13 +161,19 @@
     },
     {
       "name": "unavailable_columns",
-      "type": {"type": "array", "items": "string"},
+      "type": {
+        "type": "array",
+        "items": "string"
+      },
       "default": [],
       "doc": "Columns absent from 'after' because the source could not supply them (PostgreSQL unchanged-TOAST). Absent, not null: a consumer writing whole rows must exclude them rather than writing NULL over an unchanged value. REPLICA IDENTITY FULL does not avoid this."
     },
     {
       "name": "before_unavailable_columns",
-      "type": {"type": "array", "items": "string"},
+      "type": {
+        "type": "array",
+        "items": "string"
+      },
       "default": [],
       "doc": "The same, for 'before'. Never merged with unavailable_columns: the two sets differ, and merging them marks genuinely-changed columns as unwritable."
     }

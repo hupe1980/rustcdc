@@ -14,7 +14,7 @@ SQL Server differ only in the source config and the server prerequisites — see
 
 ## Prerequisites
 
-- Rust 1.94 or newer
+- Rust 1.95 or newer
 - A PostgreSQL 10+ server you can configure, with `wal_level = logical`
 - A role with the **`REPLICATION`** attribute, and a **direct** connection to the server — the
   default WAL transport runs `START_REPLICATION` and a pooler in transaction-pooling mode cannot

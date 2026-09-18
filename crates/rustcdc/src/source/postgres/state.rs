@@ -44,6 +44,18 @@ pub(super) struct TableSnapshotState {
     pub(super) live_query: bool,
     pub(super) primary_key_columns: Vec<String>,
     pub(super) primary_key_types: Vec<String>,
+    /// The table's declared columns, read from the catalog when the snapshot was set up.
+    ///
+    /// Empty only for an offline snapshot, which has no client to read a catalog with.
+    pub(super) catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn>,
+    /// Whether this table's schema has already been announced in this run.
+    ///
+    /// A snapshot resumes mid-table after a restart, and the announcement is per run
+    /// rather than per snapshot: a consumer that reconnects needs the schema before the
+    /// rows it is about to receive, and it has no way to ask for an event it missed. The
+    /// schema history de-duplicates the repeat, so the cost is one event per table per
+    /// restart and no extra history version.
+    pub(super) schema_announced: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

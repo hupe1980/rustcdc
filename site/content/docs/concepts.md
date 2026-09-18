@@ -45,7 +45,7 @@ change history.
 |---|---|---|---|
 | `before` | object \| null | no | Row image **before** the change — present for `update` and `delete` when the source is configured for full replica identity |
 | `after` | object \| null | no | Row image **after** the change — present for `insert`, `update`, and `read` |
-| `op` | string | yes | `insert` \| `update` \| `delete` \| `read` \| `schema_change` \| `truncate` |
+| `op` | string | yes | `insert` \| `update` \| `delete` \| `read` \| `schema_change` \| `truncate` \| `message` |
 | `source` | object | yes | Source identity and durable position: `source_name`, `offset` (WAL LSN / binlog position — used for checkpointing), `timestamp` (source-side ms since epoch) |
 | `ts` | u64 | yes | Event timestamp — milliseconds since epoch |
 | `schema` | string \| null | no | Source schema (PostgreSQL) or database (MySQL/MSSQL), when the source provides one |
@@ -66,8 +66,9 @@ change history.
 | `update` | WAL / binlog | An existing row was updated |
 | `delete` | WAL / binlog | A row was deleted |
 | `read` | snapshot | Row captured during initial snapshot; logically equivalent to `insert` for consumers |
-| `schema_change` | DDL log | A table or column definition changed (MySQL/MSSQL only) |
+| `schema_change` | DDL log, or the catalogue | A table's shape. `ddl_type = "READ_SCHEMA"` announces a table's declared columns before its first row on every connector; `CREATE_TABLE`/`ALTER_TABLE`/`DROP_TABLE` report a change. See [Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row) |
 | `truncate` | WAL / binlog / DDL trigger | The table was truncated. PostgreSQL (pgoutput) and MySQL/MariaDB (binlog query event) emit it natively; SQL Server requires `capture_truncate_events = true` |
+| `message` | WAL | A logical decoding message the application wrote with `pg_logical_emit_message()` — the table-free transactional outbox. PostgreSQL only, and opt-in via [`capture_logical_messages`](@/docs/config-reference.md#capture-logical-messages). `table` is the synthetic `<prefix>__messages`; `before` is always absent |
 
 ### `before` field availability
 

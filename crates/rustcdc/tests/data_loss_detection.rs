@@ -155,6 +155,10 @@ async fn data_loss_detection_with_fault_injected_stream_100k() -> rustcdc::Resul
         if batch.is_empty() {
             break;
         }
+        let batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         received.extend(batch);
     }
 
@@ -178,6 +182,10 @@ async fn data_loss_detection_catches_corruption_fault() -> rustcdc::Result<()> {
         if batch.is_empty() {
             break;
         }
+        let batch = batch
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         received.extend(batch);
     }
 

@@ -1,4 +1,4 @@
-# Copilot instructions — rustcdc
+# AGENTS.md — rustcdc
 
 ## What this repository is
 
@@ -14,7 +14,7 @@ A Cargo workspace shipping change data capture two ways from one version:
 Everything that decides correctness is in the library. The server adds configuration,
 sinks, state backends and an operational surface on top.
 
-Rust 1.94.1, edition 2024. Every command runs from the repository root.
+Rust 1.95.0, edition 2024. Every command runs from the repository root.
 
 ## Priorities
 
@@ -50,6 +50,30 @@ Also run when relevant:
 - Touched release evidence: `cargo xtask evidence`
 - Touched latency evidence: `cargo xtask latency-gate`
 - Touched dependencies: `cargo deny check`
+
+### Container-backed suites
+
+**None of the commands above run them**, and they are where connector behaviour is actually
+pinned. Run them for any change to event shape, connector capture, checkpointing or
+snapshot/stream handoff.
+
+```bash
+# Build every crash worker in one command. Building them one feature at a time leaves the
+# others as `#[cfg]`-gated no-op binaries, and a suite spawning one then times out.
+cargo build -p crash-workers --features postgres,mysql,mariadb,sqlserver
+
+CDC_RS_RUN_DOCKER_TESTS=1 cargo test -p rustcdc --all-features --test <suite> -- --test-threads=1
+RUSTCDC_INTEGRATION=1     cargo test -p rustcdc-server --all-features --test <suite> -- --test-threads=1
+```
+
+Three ways these mislead:
+
+- **Without the env var they skip and report `ok` in 0.00s.** A green line proves nothing;
+  check the duration.
+- **The crash workers are a separate package.** `cargo test -p rustcdc --bins` does not
+  rebuild them, so a source change can be invisible to the suite that exercises it.
+- **`--test-threads=1` is required for the server suites.** In parallel they contend for
+  container names and ports and fail for reasons unrelated to the change.
 
 ## Standing rules
 

@@ -163,19 +163,46 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> rustcdc
         .collect();
 
     // ── 8. Assertions ────────────────────────────────────────────────────────
+    let parsed: Vec<serde_json::Value> = collected
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("stdout line {i} is not valid JSON: {e}\nLine: {line}");
+            })
+        })
+        .collect();
+
+    // The table's columns are announced before its first row, so the stream carries one
+    // `schema_change` ahead of the ten inserts. The example prints every event it is
+    // handed, which is the behaviour being demonstrated.
+    let (schema_events, row_events): (Vec<_>, Vec<_>) = parsed
+        .iter()
+        .partition(|event| event["op"] == "schema_change");
+
     assert_eq!(
-        collected.len(),
+        schema_events.len(),
+        1,
+        "expected exactly one schema announcement, got {}\nstdout:\n{}\nstderr:\n{}",
+        schema_events.len(),
+        stdout_text,
+        stderr_text
+    );
+    assert_eq!(
+        schema_events[0]["after"]["ddl_type"], "READ_SCHEMA",
+        "the announcement is an observation, not a captured statement"
+    );
+
+    assert_eq!(
+        row_events.len(),
         10,
-        "expected 10 JSON events on stdout, got {}\nstdout:\n{}\nstderr:\n{}",
-        collected.len(),
+        "expected 10 row events on stdout, got {}\nstdout:\n{}\nstderr:\n{}",
+        row_events.len(),
         stdout_text,
         stderr_text
     );
 
-    for (i, line) in collected.iter().enumerate() {
-        let value: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
-            panic!("stdout line {i} is not valid JSON: {e}\nLine: {line}");
-        });
+    for (i, value) in parsed.iter().enumerate() {
         assert!(
             value.get("op").is_some(),
             "event {i} missing 'op' field: {value}"

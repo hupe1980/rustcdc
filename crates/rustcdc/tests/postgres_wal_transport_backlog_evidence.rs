@@ -147,7 +147,10 @@ async fn measure(
     let mut polls = 0u32;
 
     while events < ROWS as usize && Instant::now() < deadline {
-        let batch = stream.next_events(500).await?;
+        let batch = (stream.next_events(500).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         polls += 1;
         let captured = batch
             .iter()

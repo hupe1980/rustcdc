@@ -87,9 +87,12 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
             )));
         }
 
-        let all_columns: Vec<String> = connection
+        // Names and declared types in one read. The names drive the snapshot projection;
+        // the types are what the schema event announces before the first row, because a
+        // snapshot row's values are text like every other event's.
+        let catalog_rows: Vec<(String, String, String)> = connection
             .exec(
-                "SELECT COLUMN_NAME \
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE \
                  FROM INFORMATION_SCHEMA.COLUMNS \
                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                  ORDER BY ORDINAL_POSITION",
@@ -102,6 +105,18 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
                     table
                 ))
             })?;
+
+        let catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn> = catalog_rows
+            .iter()
+            .map(
+                |(name, column_type, is_nullable)| crate::source::schema_catalog::CatalogColumn {
+                    name: name.clone(),
+                    data_type: column_type.clone(),
+                    nullable: is_nullable.eq_ignore_ascii_case("YES"),
+                },
+            )
+            .collect();
+        let all_columns: Vec<String> = catalog_rows.into_iter().map(|(name, _, _)| name).collect();
 
         if all_columns.is_empty() {
             return Err(Error::SourceError(format!(
@@ -141,6 +156,10 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
             rows: Vec::new(),
             next_row: 0,
             live_query: true,
+            schema_name: table_schema.clone(),
+            bare_table: table_name.clone(),
+            catalog_columns,
+            schema_announced: false,
         });
     }
 

@@ -26,11 +26,13 @@ resolver = "2"
 # and are tested only against each other, so a split version line would encode a
 # compatibility question that does not exist.
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
-# The AWS SDK sets this floor; wasmtime is the next constraint at 1.94.0. Declaring the
+# `wasmtime` sets this floor; the AWS SDK is the next constraint at 1.94.1. Declaring the
 # lower number would hand anyone a resolver error instead of a documented requirement.
-rust-version = "1.94.1"
+# It covers the server with every feature, which is what the MSRV job checks: `wasm` is
+# optional, but a floor that only held for the default build is not the one the image needs.
+rust-version = "1.95.0"
 authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/rustcdc"
@@ -46,7 +48,7 @@ homepage = "https://github.com/hupe1980/rustcdc"
 # two copies of the same crate. A member narrows what it takes with
 # `default-features = false` and adds the features it needs; it cannot pick its own version.
 [workspace.dependencies]
-rustcdc = { path = "crates/rustcdc", version = "0.17.0", default-features = false }
+rustcdc = { path = "crates/rustcdc", version = "0.18.0", default-features = false }
 
 base64 = "0.23"
 bytes = "1"

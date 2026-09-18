@@ -310,6 +310,7 @@ impl OTelMetricsCollector {
                 Operation::Read => "rustcdc.runtime.events_polled[op=read]",
                 Operation::SchemaChange => "rustcdc.runtime.events_polled[op=schema_change]",
                 Operation::Truncate => "rustcdc.runtime.events_polled[op=truncate]",
+                Operation::Message => "rustcdc.runtime.events_polled[op=message]",
                 // Deliberately exhaustive: `Operation` is `#[non_exhaustive]` only for
                 // downstream crates, so a new variant added here is a compile error
                 // until it gets a metric key — which is what we want.

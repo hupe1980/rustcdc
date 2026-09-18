@@ -148,9 +148,19 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
             continue;
         }
 
-        let batch_len = batch.len();
+        // Rows only, in the count and in the sample. A table's columns are announced
+        // before its first row; that event carries no writer timestamp, so it would be
+        // tallied as an unstamped event and would inflate the committed count past the
+        // rows actually inserted. Capture latency is a statement about row changes.
+        let rows: Vec<rustcdc::Event> = batch
+            .events()
+            .iter()
+            .filter(|event| !event.op.is_schema_change())
+            .cloned()
+            .collect();
+        let batch_len = rows.len();
         recorder.observe_poll_ms(poll_ms);
-        recorder.observe_batch(batch.events(), delivered_at);
+        recorder.observe_batch(&rows, delivered_at);
 
         let commit_start = Instant::now();
         runtime.commit_ack(batch.ack_mode()).await?;

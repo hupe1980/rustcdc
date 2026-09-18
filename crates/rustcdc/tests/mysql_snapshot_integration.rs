@@ -184,6 +184,10 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         if chunk.is_empty() {
             break;
         }
+        let chunk = chunk
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         chunk_count += 1;
         snapshot_events.extend(chunk);
     }
@@ -330,7 +334,10 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> rustcdc::Result<()> {
     connection1.connect().await?;
     let mut snapshot_handle1 = connection1.start_snapshot(&["resumption_test"]).await?;
 
-    let first_chunk = snapshot_handle1.next_chunk(5000).await?;
+    let first_chunk = (snapshot_handle1.next_chunk(5000).await?)
+        .into_iter()
+        .filter(|event| !event.op.is_schema_change())
+        .collect::<Vec<_>>();
     println!("Phase 1 (Partial): Captured {} rows", first_chunk.len());
 
     let mut checkpoint1 = FileCheckpoint::new(checkpoint_dir.path());
@@ -357,6 +364,10 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> rustcdc::Result<()> {
         if chunk.is_empty() {
             break;
         }
+        let chunk = chunk
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         resumed_events.extend(chunk);
     }
 
@@ -480,7 +491,10 @@ async fn mysql_snapshot_empty_table() -> rustcdc::Result<()> {
     let mut snapshot_handle = connection.start_snapshot(&["empty_test"]).await?;
 
     // Request chunk from empty table
-    let chunk = snapshot_handle.next_chunk(5000).await?;
+    let chunk = (snapshot_handle.next_chunk(5000).await?)
+        .into_iter()
+        .filter(|event| !event.op.is_schema_change())
+        .collect::<Vec<_>>();
     assert!(chunk.is_empty(), "expected empty chunk for empty table");
 
     let _snapshot_end = snapshot_handle.finish().await?;

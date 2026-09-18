@@ -382,7 +382,7 @@ Every published record carries provenance headers, tombstones included:
 
 | Header | Value |
 |---|---|
-| `__rustcdc.op` | `insert` \| `update` \| `delete` \| `read` \| `truncate` \| `schema_change` |
+| `__rustcdc.op` | `insert` \| `update` \| `delete` \| `read` \| `truncate` \| `schema_change` \| `message` |
 | `__rustcdc.source.schema` | Source schema or database. **Omitted** when the event has none |
 | `__rustcdc.source.table` | Table name |
 | `__rustcdc.source.name` | Logical name of the source connector |
@@ -427,6 +427,7 @@ A tombstone is a statement about a **row key**, so three cases produce none:
 |---|---|
 | `op = "truncate"` | Keyed by the qualified table name — a tombstone would compact away the truncate marker |
 | `op = "schema_change"` | The same |
+| `op = "message"` | Keyed by the synthetic `<prefix>__messages` name; a logical decoding message names no row |
 | A table with **no primary key** | Every event shares the `schema.table` key, so a tombstone would erase the table's history |
 
 > A keyless table cannot be consumed from a compacted topic at all: all its events share

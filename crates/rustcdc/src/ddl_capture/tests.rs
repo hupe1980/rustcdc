@@ -847,3 +847,117 @@ fn a_primary_key_is_found_past_length_changing_identifiers() {
         "the key must be read from the original statement, not from an uppercased copy"
     );
 }
+
+// ─── Schema-history identity ──────────────────────────────────────────────────
+
+fn observation(table: &str, columns: &[(&str, &str, bool)]) -> CapturedDdl {
+    CapturedDdl {
+        ddl_type: crate::ddl_capture::DDL_TYPE_READ_SCHEMA.to_string(),
+        schema: "public".into(),
+        table: table.into(),
+        statement: "/* observed */".into(),
+        result_schema: Some(crate::schema_history::TableSchema {
+            schema: "public".into(),
+            table: table.into(),
+            columns: columns
+                .iter()
+                .map(
+                    |(name, data_type, nullable)| crate::schema_history::ColumnDef {
+                        name: (*name).to_string(),
+                        data_type: (*data_type).to_string(),
+                        nullable: *nullable,
+                        constraints: Vec::new(),
+                    },
+                )
+                .collect(),
+            primary_keys: vec!["id".into()],
+            version: 0,
+        }),
+        schema_diff: None,
+        ts: 0,
+    }
+}
+
+#[test]
+fn an_observation_is_identified_by_its_content_not_its_offset() {
+    // The restart case. Every connector announces each table before that table's first
+    // row, in every run, so an offset-keyed identity would append a schema version per
+    // table per restart recording nothing having happened.
+    let first = observation("users", &[("id", "bigint", false)]);
+    let second = observation("users", &[("id", "bigint", false)]);
+
+    assert_eq!(
+        first.history_identity("0/00000064"),
+        second.history_identity("0/00009999"),
+        "the same schema observed at two different log positions is one entry"
+    );
+    assert!(
+        first
+            .history_identity("0/00000064")
+            .starts_with("observed:")
+    );
+}
+
+#[test]
+fn an_observation_of_a_changed_table_is_a_different_entry() {
+    // The case a restart must not lose: the table changed while the pipeline was down, so
+    // the observation is the only record of it.
+    let before = observation("users", &[("id", "bigint", false)]);
+    let after = observation("users", &[("id", "bigint", false), ("email", "text", true)]);
+    assert_ne!(
+        before.history_identity("0/00000064"),
+        after.history_identity("0/00000064")
+    );
+}
+
+#[test]
+fn an_observation_distinguishes_a_type_modifier() {
+    // The regression that motivated reading `format_type`: under the old OID map both of
+    // these were `numeric`, so an `ALTER COLUMN ... TYPE numeric(14,4)` produced a
+    // schema-change event whose payload was byte-identical to the previous one.
+    let narrow = observation("orders", &[("amount", "numeric(12,4)", true)]);
+    let wide = observation("orders", &[("amount", "numeric(14,4)", true)]);
+    assert_ne!(
+        narrow.history_identity("x"),
+        wide.history_identity("x"),
+        "a widened numeric is a different schema and must record as one"
+    );
+}
+
+#[test]
+fn an_observation_distinguishes_nullability() {
+    let required = observation("users", &[("email", "text", false)]);
+    let optional = observation("users", &[("email", "text", true)]);
+    assert_ne!(
+        required.history_identity("x"),
+        optional.history_identity("x")
+    );
+}
+
+#[test]
+fn a_captured_statement_is_still_identified_by_its_offset() {
+    // Deliberately *not* content-derived: a table altered from shape A to B and back to A
+    // has three entries in its history, and the third is not the first.
+    let captured = CapturedDdl {
+        ddl_type: "ALTER_TABLE".into(),
+        schema: "public".into(),
+        table: "users".into(),
+        statement: "ALTER TABLE public.users ADD COLUMN email text".into(),
+        result_schema: None,
+        schema_diff: None,
+        ts: 0,
+    };
+    assert_eq!(captured.history_identity("0/00000064"), "0/00000064");
+    assert!(!captured.is_observation());
+}
+
+#[test]
+fn an_observation_records_as_a_whole_schema_not_a_diff() {
+    // A diff cannot be applied to a table the store has never seen, which is what an
+    // `InMemorySchemaHistory` looks like after any restart.
+    let observed = observation("users", &[("id", "bigint", false)]);
+    assert!(matches!(
+        observed.to_schema_event(),
+        Some(crate::schema_history::DDLEvent::CreateTable(_))
+    ));
+}

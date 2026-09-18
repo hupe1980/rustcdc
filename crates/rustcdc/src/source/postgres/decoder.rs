@@ -105,6 +105,24 @@ pub(super) struct PgTruncate {
     pub(super) relation_oids: Vec<u32>,
 }
 
+/// Logical decoding message — what `pg_logical_emit_message()` wrote into the WAL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PgLogicalMessage {
+    /// `true` when the message was emitted transactionally.
+    ///
+    /// A **non**-transactional message is written to the log immediately and is decoded
+    /// even if the surrounding transaction later aborts. The flag is carried rather than
+    /// acted on here: "this may describe work that was rolled back" is a fact about the
+    /// message that only the consumer can weigh.
+    pub(super) transactional: bool,
+    /// The message's own LSN, which is *not* the transaction's commit LSN.
+    pub(super) lsn: u64,
+    /// Application-chosen namespace for the message.
+    pub(super) prefix: String,
+    /// Application-chosen bytes. pgoutput says nothing about their encoding.
+    pub(super) content: Vec<u8>,
+}
+
 /// A decoded pgoutput protocol message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PgOutputMessage {
@@ -115,7 +133,8 @@ pub(super) enum PgOutputMessage {
     Update(PgUpdate),
     Delete(PgDelete),
     Truncate(PgTruncate),
-    /// Message type not handled by this decoder (Origin, Type, LogicalMessage, etc.).
+    LogicalMessage(PgLogicalMessage),
+    /// Message type not handled by this decoder (Origin, Type, etc.).
     Unknown(u8),
 }
 
@@ -225,8 +244,61 @@ pub(super) fn decode_pgoutput_message(data: &[u8]) -> Result<PgOutputMessage> {
         b'U' => Ok(PgOutputMessage::Update(decode_update(&mut cur)?)),
         b'D' => Ok(PgOutputMessage::Delete(decode_delete(&mut cur)?)),
         b'T' => Ok(PgOutputMessage::Truncate(decode_truncate(&mut cur)?)),
+        b'M' => Ok(PgOutputMessage::LogicalMessage(decode_logical_message(
+            &mut cur,
+        )?)),
         other => Ok(PgOutputMessage::Unknown(other)),
     }
+}
+
+/// Decode a `Message` (`M`) — a logical decoding message.
+///
+/// Wire layout under `proto_version '1'`:
+///
+/// | Field | Type | Note |
+/// |---|---|---|
+/// | flags | `Int8` | bit 0 set = transactional |
+/// | lsn | `Int64` | the message's own LSN |
+/// | prefix | `String` | NUL-terminated |
+/// | length | `Int32` | content length |
+/// | content | `Byten` | opaque application bytes |
+///
+/// **There is no transaction id here**, and that is a protocol-version property rather
+/// than an omission: pgoutput prefixes an `Xid` only for messages belonging to a *streamed*
+/// transaction, which exists from `proto_version '2'`. This decoder negotiates v1 and
+/// rejects v2 framing outright, so reading an `Xid` would consume the flags byte and
+/// misparse every field after it.
+///
+/// The length is checked against what the frame actually holds before allocating: a
+/// declared length is attacker-influenced in the sense that matters here — it comes off the
+/// wire — and `Vec::with_capacity` on an unchecked `Int32` is a 2 GB allocation from a
+/// corrupt four-byte field.
+fn decode_logical_message(cur: &mut BytesCursor) -> Result<PgLogicalMessage> {
+    let flags = cur.read_u8()?;
+    let lsn = cur.read_u64_be()?;
+    let prefix = cur.read_cstring()?;
+    let length = cur.read_i32_be()?;
+    let length = usize::try_from(length).map_err(|_| {
+        Error::SourceError(format!(
+            "pgoutput logical message declares a negative content length ({length})"
+        ))
+    })?;
+    if length > cur.remaining() {
+        return Err(Error::SourceError(format!(
+            "pgoutput logical message declares {length} content bytes but only {} remain in \
+             the frame",
+            cur.remaining()
+        )));
+    }
+    let content = cur.read_n_bytes(length)?.to_vec();
+    Ok(PgLogicalMessage {
+        // Bit 0 is the only flag pgoutput defines; the rest are reserved, and treating a
+        // reserved bit as "transactional" would be reading meaning into padding.
+        transactional: flags & 0x01 != 0,
+        lsn,
+        prefix,
+        content,
+    })
 }
 
 fn decode_begin(cur: &mut BytesCursor) -> Result<PgBegin> {
@@ -536,6 +608,8 @@ pub(super) struct LivePgOutputMessageProvider {
     pub(super) slot_name: String,
     pub(super) publication_name: String,
     pub(super) confirmed_lsn: u64,
+    /// Ask the slot for `pg_logical_emit_message()` output as well as row changes.
+    pub(super) capture_logical_messages: bool,
 }
 
 #[async_trait]
@@ -561,8 +635,15 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         let result = self
             .client
             .query(
-                "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
-                 $2, 'proto_version', '1', 'publication_names', $3)",
+                // The options array is built rather than interpolated: it is a `text[]`
+                // parameter, so `messages` is added as data instead of as SQL.
+                if self.capture_logical_messages {
+                    "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
+                     $2, 'proto_version', '1', 'publication_names', $3, 'messages', 'true')"
+                } else {
+                    "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
+                     $2, 'proto_version', '1', 'publication_names', $3)"
+                },
                 &[
                     &self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
                     &capped,

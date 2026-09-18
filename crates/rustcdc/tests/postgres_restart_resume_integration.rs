@@ -104,7 +104,10 @@ async fn run(transport: WalTransport, slot: &str) -> rustcdc::Result<usize> {
 
     let mut delivered = Vec::new();
     for _ in 0..60 {
-        let events = stream.next_events(250).await?;
+        let events = (stream.next_events(250).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         delivered.extend(events);
         if !delivered.is_empty() {
             break;
@@ -140,7 +143,10 @@ async fn run(transport: WalTransport, slot: &str) -> rustcdc::Result<usize> {
 
     let mut replayed = Vec::new();
     for _ in 0..20 {
-        let events = stream.next_events(250).await?;
+        let events = (stream.next_events(250).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         replayed.extend(events);
     }
     for event in &replayed {

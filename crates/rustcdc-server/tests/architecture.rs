@@ -943,6 +943,14 @@ fn every_statement_of_the_msrv_matches_cargo_toml() {
         ));
     }
 
+    // The agent instructions restate the number for anything reading the repo without
+    // opening the manifest. It drifted the first time the MSRV moved, because nothing here
+    // covered it — a file this check does not name is a file that goes stale silently.
+    let agents = read_repo("AGENTS.md");
+    if !agents.contains(&format!("Rust {msrv}, edition")) {
+        wrong.push(format!("AGENTS.md: expected `Rust {msrv}, edition 2024`"));
+    }
+
     // The CI job must *derive* the toolchain rather than restate it, or this test would
     // have to be updated in lockstep with a value it is supposed to be policing.
     let ci = read_repo(".github/workflows/ci.yml");

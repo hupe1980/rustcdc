@@ -3,7 +3,11 @@ use crate::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SnapshotMetadata,
         SourceMetadata,
     },
-    source::helpers::now_millis,
+    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
+    source::{
+        helpers::now_millis,
+        schema_catalog::{mark_as_snapshot_event, observed_statement, table_schema_from_catalog},
+    },
 };
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, PostgresSnapshotHandle};
@@ -57,7 +61,6 @@ pub(super) async fn next_postgres_snapshot_chunk(
                 table.primary_key_types.clone(),
             )
         };
-        let remaining = requested - events.len();
 
         // Emit the same identity the streaming path emits.
         //
@@ -81,6 +84,62 @@ pub(super) async fn next_postgres_snapshot_chunk(
         } else {
             Some(key_columns.clone())
         };
+
+        // Announce the table's schema before its first row.
+        //
+        // Snapshot rows carry text values like every other event, and a consumer that
+        // joins the pipeline at the initial load has no other way to learn what to parse
+        // them as — the snapshot path emitted no schema event at all, so a table that
+        // never underwent DDL had none anywhere in the stream. Emitting it here, ahead of
+        // the rows, means the schema is on the wire before anything that depends on it,
+        // which is the same ordering the runtime already enforces between schema history
+        // and delivery.
+        if !handle.tables[table_index].schema_announced {
+            handle.tables[table_index].schema_announced = true;
+            let catalog = handle.tables[table_index].catalog_columns.clone();
+            // An offline snapshot has no client and therefore no catalog. It says so by
+            // emitting nothing rather than by describing columns it did not read.
+            if !catalog.is_empty() {
+                let schema_for_event = schema_name.clone().unwrap_or_else(|| "public".to_string());
+                let ts_ms = now_millis();
+                let captured = CapturedDdl {
+                    ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
+                    schema: schema_for_event.clone(),
+                    table: bare_table.clone(),
+                    statement: observed_statement(
+                        &schema_for_event,
+                        &bare_table,
+                        "the PostgreSQL catalog",
+                    ),
+                    result_schema: Some(table_schema_from_catalog(
+                        &schema_for_event,
+                        &bare_table,
+                        &catalog,
+                        &key_columns,
+                    )),
+                    schema_diff: None,
+                    ts: ts_ms,
+                };
+                // The snapshot watermark: the position this schema is true as of.
+                let mut event = captured.to_event(
+                    &handle.source_name,
+                    super::format_pg_lsn(handle.snapshot_watermark),
+                    ts_ms,
+                );
+                mark_as_snapshot_event(
+                    &mut event,
+                    &handle.snapshot.snapshot_id,
+                    handle.next_chunk_index,
+                );
+                events.push(event);
+            }
+        }
+
+        // Computed **after** the announcement, not before: the announcement occupies a
+        // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
+        // `requested + 1` events. That overflow costs a row — the runtime delivers a
+        // buffer's worth and the extra one is dropped.
+        let remaining = requested - events.len();
 
         if live_query {
             if handle.client.is_none() {

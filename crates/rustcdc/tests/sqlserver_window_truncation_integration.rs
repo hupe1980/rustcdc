@@ -163,7 +163,10 @@ async fn run() -> rustcdc::Result<()> {
     let scan = format!("USE {DATABASE}; EXEC sys.sp_cdc_scan");
 
     while std::time::Instant::now() < deadline && seen.len() < expected {
-        let batch = stream.next_events(500).await?;
+        let batch = (stream.next_events(500).await?)
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         assert!(
             batch.len() <= MAX_EVENTS_PER_POLL,
             "a poll must not exceed max_events_per_poll; got {}",

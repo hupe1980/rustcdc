@@ -152,6 +152,10 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
         if chunk.is_empty() {
             break;
         }
+        let chunk = chunk
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         snapshot_events.extend(chunk);
         if snapshot_events.len() >= 1000 {
             break;
@@ -202,6 +206,10 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
                 break;
             }
         }
+        let events = events
+            .into_iter()
+            .filter(|event| !event.op.is_schema_change())
+            .collect::<Vec<_>>();
         stream_events.extend(events);
         if stream_events.len() >= 100 {
             break;
