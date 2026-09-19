@@ -38,11 +38,10 @@ CONTRIBUTING.md
 
 # ── not part of the repository, and not part of the image ────────────────────
 #
-# Both are gitignored, which `.dockerignore` does not inherit: a local working copy would
-# otherwise push internal notes and megabytes of third-party specifications into the build
-# context on every build.
+# Gitignored, which `.dockerignore` does not inherit: a local working copy would otherwise
+# push internal notes and megabytes of third-party specifications (`concepts/references/`)
+# into the build context on every build.
 concepts/
-specs/
 
 # ── things the binary does not need ──────────────────────────────────────────
 monitoring/

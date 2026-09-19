@@ -90,12 +90,15 @@ run_markdown_link_check() {
   # `concepts/` is gitignored, so it is absent in CI and present on a maintainer's disk.
   # Checking it only when it is there is the point rather than a compromise: these notes
   # are the only documents nothing validated, and they had rotted accordingly — three
-  # references to a `site/content/library/` directory that has not existed under that name,
-  # pointing at the very rule ("every documented sample compiles") they were describing.
+  # references to a `site/content/library/` directory that has not existed under that name.
+  #
+  # The notes are the flat files, so `-maxdepth 1` leaves out `concepts/references/`:
+  # verbatim third-party specifications whose links address the upstream site's layout,
+  # not this tree.
   if [[ -d concepts ]]; then
     while IFS= read -r file; do
       check_markdown_file "$file" local_only
-    done < <(find concepts -type f -name '*.md' | sort)
+    done < <(find concepts -maxdepth 1 -type f -name '*.md' | sort)
   fi
 
   if [[ "$failed" -gt 0 ]]; then

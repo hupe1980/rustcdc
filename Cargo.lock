@@ -1937,7 +1937,7 @@ checksum = "56caa8a7f1e0f2c61400996cc1567fb06dd417c49d5e673131a149cb9628625f"
 
 [[package]]
 name = "crash-workers"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rustcdc",
  "tokio",
@@ -6434,7 +6434,7 @@ dependencies = [
 
 [[package]]
 name = "rustcdc"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "ahash",
@@ -6487,7 +6487,7 @@ dependencies = [
 
 [[package]]
 name = "rustcdc-server"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -9552,7 +9552,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.18.0"
+version = "0.19.0"
 
 [[package]]
 name = "xxhash-rust"

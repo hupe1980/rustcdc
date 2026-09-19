@@ -5,6 +5,58 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.19.0
+
+A fix for the release before it. 0.18.0 announces every table before its first row; on a Kafka
+sink with a topic template, those announcements go to topics preflight never checked.
+
+### Fixed: schema-event topics were not preflighted
+
+Schema events carry the synthetic table name `<table>__ddl_events`, so a topic template renders
+them to a topic of their own: `cdc.${schema}.${table}` sends the announcement for `public.orders`
+to `cdc.public.orders__ddl_events`. Preflight checked only the data topics. When a schema-event
+topic was missing, the batch holding the event never reached the broker, every table behind it
+waited out the delivery timeout, and the pipeline exited with `no leader for …__ddl_events-0`.
+Because 0.18.0 announces every table, any templated deployment without those topics stalled on
+its first change.
+
+Preflight now adds each known table's schema-event table to the set it checks. Whether those
+events are published at all is decided by running the pipeline's own compiled transform rules
+against a real announcement, so a pipeline that filters them out with
+`exclude_ops = ["schema_change"]` is not asked for the topic, and a rule that renames them
+moves the topic that gets checked. The split across sinks uses the existing router-matcher
+assignment: a route for `public.orders` does not claim `public.orders__ddl_events`, and one
+for `public.orders*` does.
+
+Under `transform_runtime.mode = "wasm"` these topics are **not** checked. The module cannot be
+run at startup and may drop or rename schema events, so demanding topics from a prediction that
+cannot see it would fail startup over topics that are never written.
+
+### Added: `DDL_TYPE_READ_SCHEMA`
+
+The `READ_SCHEMA` DDL type is public and re-exported from the crate root. A caller that has to
+build the announcement a connector would emit — a sink checking its topics at startup, for
+instance — now uses the library's value instead of restating the string.
+
+### Migrating
+
+Nothing to do, unless you run a Kafka sink with a topic template *and* a WASM transform runtime
+that keeps schema events. Preflight cannot predict those topics, so create them yourself, under
+whatever name your module gives them.
+
+Everyone else gets the opposite change: startup now fails fast and names the missing
+schema-event topic, where before it stalled until the delivery timeout.
+
+### Evidence
+
+`1 206` library and `578` server unit tests, green, with `cargo deny`, `clippy -D warnings`
+and the policy gate clean.
+
+The seven new server tests are the preflight prediction: a pipeline that drops schema events,
+a `route` action that renames them, a rule that unwraps `result_schema`, the router split
+between an exact route and a prefix one, WASM mode, and PostgreSQL/SQL Server/MySQL-style
+table names. Each has a planted defect it catches.
+
 ## 0.18.0
 
 One change, and it closes the other half of a contract the project has had since 0.11.0.

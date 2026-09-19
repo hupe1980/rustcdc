@@ -29,12 +29,11 @@ target
 # public surface: they cite decisions and risks by identifiers that mean nothing outside
 # the folder, and a `(D12)` leaking into a doc comment renders on docs.rs as a reference
 # to a document the reader cannot open.
+#
+# This covers `concepts/references/` as well: protocol specifications and papers, which are
+# third-party copyrighted publications and so are not redistributed here. `REFERENCES.md`
+# indexes every one with its retrieval URL, so the folder can be rebuilt from scratch.
 /concepts/
-
-# Protocol specifications and papers — third-party copyrighted publications, so local
-# copies are not redistributed here. `concepts/REFERENCES.md` indexes every one with its
-# retrieval URL, so the folder can be rebuilt from scratch.
-/specs/
 
 # Generated local benchmark summary.
 /BENCHMARK_REPORT.md
