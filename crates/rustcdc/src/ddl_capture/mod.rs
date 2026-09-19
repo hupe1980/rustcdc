@@ -35,8 +35,10 @@ mod tests;
 /// had just been created on every pipeline restart.
 ///
 /// Named rather than inlined because three connectors and the runtime compare against it,
-/// where `"CREATE_TABLE"` and its siblings appear at one site each.
-pub(crate) const DDL_TYPE_READ_SCHEMA: &str = "READ_SCHEMA";
+/// where `"CREATE_TABLE"` and its siblings appear at one site each. Public so a caller that
+/// has to build the announcement a connector would emit, such as a sink checking its topics
+/// at startup, uses the same value rather than restating it.
+pub const DDL_TYPE_READ_SCHEMA: &str = "READ_SCHEMA";
 
 /// Database dialect used for DDL parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
