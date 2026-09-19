@@ -493,7 +493,9 @@ be run at startup: create them yourself if your module keeps schema events.
 
 Topics are **not** auto-created.
 
-**Ordering.** Per-key ordering is unaffected — a table's events share a topic and a key.
+**Ordering.** Per-key ordering among a table's row events is unaffected — they share a topic
+and a key. Schema announcements use a separate topic, so Kafka provides no ordering between
+them and the row events they describe.
 Cross-table ordering is not preserved, as with Debezium; `preserve_transactions` still
 stops a sink committing half a source transaction, and under `effectively_once` the whole
 batch commits across all its topics in one transaction.
