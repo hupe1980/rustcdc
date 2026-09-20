@@ -94,7 +94,7 @@ impl EventDiff {
 /// **Compared** — every field whose value is a deterministic function of the replayed input:
 /// `op`, `table`, `schema`, `source.source_name`, `source.offset`, `before`, `after`,
 /// `before_is_key_only`, `unavailable_columns`, `before_unavailable_columns`, `primary_key`,
-/// `envelope_version`, `transaction`, and the deterministic half of `snapshot`.
+/// `envelope_version`, `schema_id`, `transaction`, and the deterministic half of `snapshot`.
 ///
 /// **Not compared**, each for a reason rather than by omission:
 ///
@@ -246,6 +246,23 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
                 .with_path(field),
             );
         }
+    }
+
+    // The shape a row claims to have been captured under. A replay that stopped stamping it,
+    // or stamped a different shape, leaves consumers unable to tell a row they can apply from
+    // one whose announcement they have not seen.
+    if old.schema_id != new.schema_id {
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Semantic,
+                format!(
+                    "schema_id changed from {:?} to {:?}",
+                    old.schema_id, new.schema_id
+                ),
+                vec![],
+            )
+            .with_path("schema_id"),
+        );
     }
 
     // The resume coordinate. A checkpoint is only as good as this string, and getting it
@@ -423,6 +440,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -452,6 +470,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -519,6 +538,10 @@ mod field_coverage_tests {
             (
                 "unavailable_columns",
                 Box::new(|event: &mut Event| event.unavailable_columns = vec!["body".into()]),
+            ),
+            (
+                "schema_id",
+                Box::new(|event: &mut Event| event.schema_id = Some("deadbeef".into())),
             ),
             (
                 "before_unavailable_columns",

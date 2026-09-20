@@ -78,6 +78,9 @@ pub struct PostgresStreamHandle {
     stream: PostgresStream,
     provider: Box<dyn PgOutputMessageProvider>,
     relation_map: HashMap<u32, PgRelation>,
+    /// Per relation, the id of the shape it was last announced under; see
+    /// [`Event::schema_id`](crate::Event::schema_id).
+    relation_schema_ids: HashMap<u32, String>,
     /// Real primary key of each published table, by `(schema, table)`, read from the catalog
     /// once at stream start.
     ///
@@ -188,6 +191,7 @@ impl PostgresStreamHandle {
             stream,
             provider,
             relation_map: HashMap::new(),
+            relation_schema_ids: HashMap::new(),
             catalog_primary_keys,
             catalog_columns,
             warned_replica_identity: std::collections::HashSet::new(),
@@ -2577,6 +2581,77 @@ mod tests {
         assert_eq!(tx1.event_index, 1);
     }
 
+    /// The promise `schema_id` makes: a row names the announcement that describes it.
+    ///
+    /// Checked by equality against the announcement's own id rather than a recorded hash, so
+    /// the test still holds if the digest changes.
+    #[tokio::test]
+    async fn a_row_names_the_shape_its_announcement_carries() {
+        const OID: u32 = 7;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(OID, "public", "items", &[("id", true), ("name", false)]),
+            ),
+            xlog(100, build_begin(200, 0, 10)),
+            xlog(150, build_insert(OID, &[Some("1"), Some("a")])),
+            xlog(200, build_commit(200, 250, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let events = handle.next_events(50).await.unwrap();
+        let announcement = events
+            .iter()
+            .find(|event| event.op.is_schema_change())
+            .expect("the first sight of a relation announces its schema");
+        let row = events
+            .iter()
+            .find(|event| !event.op.is_schema_change())
+            .expect("the insert");
+
+        assert!(
+            announcement.schema_id.is_some(),
+            "announcement carries an id"
+        );
+        assert_eq!(
+            row.schema_id, announcement.schema_id,
+            "the row must name the shape it was captured under"
+        );
+    }
+
+    /// A shape change must change the id, or a consumer cannot tell the two apart.
+    #[tokio::test]
+    async fn a_relation_that_gains_a_column_gets_a_new_schema_id() {
+        const OID: u32 = 8;
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(100, build_relation(OID, "public", "items", &[("id", true)])),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(150, build_insert(OID, &[Some("1")])),
+                xlog(200, build_commit(200, 250, 0)),
+            ],
+            vec![
+                xlog(
+                    250,
+                    build_relation(OID, "public", "items", &[("id", true), ("name", false)]),
+                ),
+                xlog(250, build_begin(300, 0, 11)),
+                xlog(280, build_insert(OID, &[Some("2"), Some("b")])),
+                xlog(300, build_commit(300, 350, 0)),
+            ],
+        ]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let before = rows_only(handle.next_events(50).await.unwrap());
+        let after = rows_only(handle.next_events(50).await.unwrap());
+
+        assert!(before[0].schema_id.is_some());
+        assert_ne!(
+            before[0].schema_id, after[0].schema_id,
+            "a row captured under the widened table must not claim the old shape"
+        );
+    }
+
     #[tokio::test]
     async fn stream_confirm_lsn_delegates_to_provider() {
         let provider = MockPgOutputProvider::new(vec![]);
@@ -3265,6 +3340,7 @@ mod tests {
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,
@@ -3314,6 +3390,7 @@ mod tests {
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,
@@ -3367,6 +3444,7 @@ mod tests {
                 primary_key_types: vec!["bigint".into()],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,
@@ -3436,6 +3514,7 @@ mod tests {
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,
@@ -3483,6 +3562,7 @@ mod tests {
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,
@@ -3535,6 +3615,7 @@ mod tests {
                 primary_key_types: vec!["bigint".into()],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,

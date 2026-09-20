@@ -56,6 +56,12 @@ pub(super) struct TableSnapshotState {
     /// schema history de-duplicates the repeat, so the cost is one event per table per
     /// restart and no extra history version.
     pub(super) schema_announced: bool,
+    /// The id of the shape announced for this table, carried by the rows that follow it.
+    ///
+    /// `None` until the announcement is built, and for an offline snapshot, which reads no
+    /// catalog and so announces no shape for a row to name. See
+    /// [`Event::schema_id`](crate::Event::schema_id).
+    pub(super) schema_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

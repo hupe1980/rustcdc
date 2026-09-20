@@ -102,6 +102,19 @@ pub(super) async fn next_postgres_snapshot_chunk(
             if !catalog.is_empty() {
                 let schema_for_event = schema_name.clone().unwrap_or_else(|| "public".to_string());
                 let ts_ms = now_millis();
+                let result_schema = table_schema_from_catalog(
+                    &schema_for_event,
+                    &bare_table,
+                    &catalog,
+                    &key_columns,
+                );
+                // The shape the rows below are captured under, from the schema this
+                // announcement carries rather than a second read of the catalog.
+                handle.tables[table_index].schema_id = Some(crate::ddl_capture::schema_id(
+                    &schema_for_event,
+                    &bare_table,
+                    &result_schema,
+                ));
                 let captured = CapturedDdl {
                     ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
                     schema: schema_for_event.clone(),
@@ -111,12 +124,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                         &bare_table,
                         "the PostgreSQL catalog",
                     ),
-                    result_schema: Some(table_schema_from_catalog(
-                        &schema_for_event,
-                        &bare_table,
-                        &catalog,
-                        &key_columns,
-                    )),
+                    result_schema: Some(result_schema),
                     schema_diff: None,
                     ts: ts_ms,
                 };
@@ -140,6 +148,8 @@ pub(super) async fn next_postgres_snapshot_chunk(
         // `requested + 1` events. That overflow costs a row — the runtime delivers a
         // buffer's worth and the extra one is dropped.
         let remaining = requested - events.len();
+        // Cloned once: the row loops below borrow `handle.tables[table_index]` mutably.
+        let table_schema_id = handle.tables[table_index].schema_id.clone();
 
         if live_query {
             if handle.client.is_none() {
@@ -172,6 +182,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                         }),
                         transaction: None,
                         envelope_version: EVENT_ENVELOPE_VERSION,
+                        schema_id: table_schema_id.clone(),
                         unavailable_columns: Vec::new(),
                     });
                 }
@@ -233,6 +244,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
+                    schema_id: table_schema_id.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }
@@ -268,6 +280,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
+                    schema_id: table_schema_id.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }

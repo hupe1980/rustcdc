@@ -176,6 +176,15 @@
       },
       "default": [],
       "doc": "The same, for 'before'. Never merged with unavailable_columns: the two sets differ, and merging them marks genuinely-changed columns as unwritable."
+    },
+    {
+      "name": "schema_id",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null,
+      "doc": "The table shape this row was captured under, as named by the table's schema announcement, which carries the same id. Announcements travel on their own topic and Kafka orders nothing between two topics, so a consumer can be handed a row before the announcement describing it; comparing this id against the announcements it holds tells it the shape is one it has not seen. null when the connector could not derive the shape, and on events from a release that does not set it: null means unknown, not a new shape."
     }
   ]
 }

@@ -61,6 +61,7 @@ impl MysqlStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -339,6 +340,7 @@ impl MysqlStreamHandle {
                             snapshot: None,
                             transaction: None,
                             envelope_version: EVENT_ENVELOPE_VERSION,
+                            schema_id: None,
                             unavailable_columns: Vec::new(),
                         });
                         self.events_polled = self.events_polled.saturating_add(1);

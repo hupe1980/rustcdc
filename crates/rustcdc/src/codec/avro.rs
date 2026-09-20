@@ -171,6 +171,11 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
         None => AvroValue::Union(0, Box::new(AvroValue::Null)),
     };
 
+    let schema_id_val = match &event.schema_id {
+        Some(id) => AvroValue::Union(1, Box::new(AvroValue::String(id.clone()))),
+        None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+    };
+
     let primary_key = AvroValue::Array(
         event
             .primary_key
@@ -251,6 +256,7 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
                     .collect(),
             ),
         ),
+        ("schema_id".into(), schema_id_val),
     ]))
 }
 
@@ -284,6 +290,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -309,6 +316,7 @@ mod tests {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -695,6 +703,10 @@ pub fn avro_value_to_event(value: &AvroValue) -> Result<Event> {
         .ts(long_field(required("ts")?, "ts")? as u64)
         .primary_key(string_array(get("primary_key")))
         .unavailable_columns(string_array(get("unavailable_columns")));
+
+    if let Some(AvroValue::String(schema_id)) = get("schema_id").and_then(unwrap_union) {
+        builder = builder.schema_id(schema_id.clone());
+    }
 
     // Reassembled through the one shared constructor so Avro cannot accept an envelope
     // JSON and Protobuf reject.

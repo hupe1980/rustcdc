@@ -900,6 +900,10 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            // No shape to name: `SnapshotTable` carries the key columns, not a `TableSchema`,
+            // so there is nothing to derive an id from and nothing this row can claim. A
+            // consumer reads it as "unknown", as it would an event from an older release.
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -1479,6 +1483,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }

@@ -171,8 +171,8 @@ pub use crate::source::{SqlServerConnection, SqlServerSourceConfig};
 pub use crate::transform::{
     AsyncTransform, FieldMappingConfig, FieldMappingTransform, FilterField, FilterMode,
     FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule, MaskHashConfig,
-    MaskHashTransform, MaskRule, RouteConfig, RouteTransform, Transform, TransformPipeline,
-    UnmatchedRule, UnwrapConfig, UnwrapTransform,
+    MaskHashTransform, MaskRule, RouteConfig, RouteTransform, ShapeGuard, Transform,
+    TransformPipeline, UnmatchedRule, UnwrapConfig, UnwrapTransform,
 };
 #[cfg(feature = "outbox")]
 pub use crate::transform::{OutboxResult, OutboxTransform};

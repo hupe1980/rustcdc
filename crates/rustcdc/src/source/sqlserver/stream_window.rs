@@ -561,6 +561,7 @@ fn build_sqlserver_event(
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
+        schema_id: None,
         unavailable_columns: Vec::new(),
     }
 }
@@ -659,6 +660,7 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
+        schema_id: None,
         unavailable_columns: Vec::new(),
     }
 }

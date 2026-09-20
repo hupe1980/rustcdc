@@ -715,6 +715,21 @@ pub struct Event {
     /// rather than merely discouraged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_columns: Vec<String>,
+    /// The table shape this row was captured under, as named by its schema announcement.
+    ///
+    /// A connector announces a table's shape before that table's first row, on its own
+    /// `<table>__ddl_events` stream. Where the two travel as separate Kafka topics there is no
+    /// ordering between them, so a consumer can be handed a row before the announcement
+    /// describing it. This id is carried by both sides
+    /// ([`CapturedDdl::schema_id`](crate::ddl_capture::CapturedDdl::schema_id)), so a consumer
+    /// holding the announcements it has seen can tell "I know this shape" from "I have not seen
+    /// this shape yet" and wait for, or fetch, the announcement rather than guess.
+    ///
+    /// `None` when the connector could not derive the table's shape, and on events from a
+    /// connector or release that does not set it — absent, not a mismatch, so a consumer must
+    /// treat it as "unknown" rather than "new shape".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
 }
 
 /// Flat wire form of [`Event`].
@@ -748,6 +763,8 @@ struct EventWire {
     unavailable_columns: Vec<String>,
     #[serde(default)]
     before_unavailable_columns: Vec<String>,
+    #[serde(default)]
+    schema_id: Option<String>,
 }
 
 impl TryFrom<EventWire> for Event {
@@ -773,6 +790,7 @@ impl TryFrom<EventWire> for Event {
             transaction: wire.transaction,
             envelope_version: wire.envelope_version,
             unavailable_columns: wire.unavailable_columns,
+            schema_id: wire.schema_id,
         })
     }
 }
@@ -780,10 +798,12 @@ impl TryFrom<EventWire> for Event {
 impl Serialize for Event {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let before_unavailable_columns = self.before.unavailable_columns();
-        // Twelve always-present fields, plus the two lists that are omitted when empty.
+        // Twelve always-present fields, plus the two lists that are omitted when empty and the
+        // schema id that is omitted when unknown.
         let len = 12
             + usize::from(!self.unavailable_columns.is_empty())
-            + usize::from(!before_unavailable_columns.is_empty());
+            + usize::from(!before_unavailable_columns.is_empty())
+            + usize::from(self.schema_id.is_some());
 
         let mut state = serializer.serialize_struct("Event", len)?;
         state.serialize_field("before", &self.before.row())?;
@@ -807,6 +827,10 @@ impl Serialize for Event {
             state.skip_field("before_unavailable_columns")?;
         } else {
             state.serialize_field("before_unavailable_columns", before_unavailable_columns)?;
+        }
+        match &self.schema_id {
+            Some(schema_id) => state.serialize_field("schema_id", schema_id)?,
+            None => state.skip_field("schema_id")?,
         }
         state.end()
     }
@@ -909,6 +933,7 @@ impl Default for Event {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             unavailable_columns: Vec::new(),
+            schema_id: None,
         }
     }
 }
@@ -1453,6 +1478,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -2244,6 +2270,17 @@ impl EventBuilder {
         S: Into<String>,
     {
         self.event.unavailable_columns = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The table shape this row was captured under.
+    ///
+    /// See [`Event::schema_id`]. Set it from the same schema the connector announced, via
+    /// [`ddl_capture::schema_id`](crate::ddl_capture::schema_id), so the row and its
+    /// announcement carry one value.
+    #[must_use]
+    pub fn schema_id(mut self, schema_id: impl Into<String>) -> Self {
+        self.event.schema_id = Some(schema_id.into());
         self
     }
 

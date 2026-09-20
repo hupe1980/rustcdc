@@ -40,6 +40,60 @@ mod tests;
 /// at startup, uses the same value rather than restating it.
 pub const DDL_TYPE_READ_SCHEMA: &str = "READ_SCHEMA";
 
+/// The id naming a table shape, shared by a schema announcement and the rows captured under it.
+///
+/// Content-derived, so the same shape resolves to the same id in every run and on every
+/// connector: a consumer can match a row against an announcement it already holds without
+/// depending on cross-topic ordering, which Kafka does not provide.
+///
+/// Takes the shape rather than a [`CapturedDdl`] so a connector can compute it for a table it
+/// is about to emit rows for, from the same schema it announced.
+#[must_use]
+pub fn schema_id(schema: &str, table: &str, result_schema: &TableSchema) -> String {
+    digest_shape(schema, table, Some(result_schema))
+}
+
+/// The digest [`schema_id`] returns, over a shape that may be absent.
+///
+/// Kept private: a caller outside this module wants [`schema_id`], which cannot be handed a
+/// missing shape, or [`CapturedDdl::schema_id`], which answers `None` for one.
+fn digest_shape(schema: &str, table: &str, result_schema: Option<&TableSchema>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"rustcdc/v1/schema-observation\x00");
+    digest.update(schema.as_bytes());
+    digest.update(b"\x00");
+    digest.update(table.as_bytes());
+    digest.update(b"\x00");
+    if let Some(schema) = result_schema {
+        for column in &schema.columns {
+            digest.update(column.name.as_bytes());
+            digest.update(b"\x1f");
+            digest.update(column.data_type.as_bytes());
+            digest.update(b"\x1f");
+            digest.update(if column.nullable { b"1" } else { b"0" });
+            digest.update(b"\x1f");
+            for constraint in &column.constraints {
+                digest.update(constraint.as_bytes());
+                digest.update(b"\x1e");
+            }
+            digest.update(b"\x00");
+        }
+        digest.update(b"\x00keys\x00");
+        for key in &schema.primary_keys {
+            digest.update(key.as_bytes());
+            digest.update(b"\x1f");
+        }
+    }
+    // RustCrypto 0.11 returns a `hybrid-array::Array`, which does not implement
+    // `LowerHex`; format the bytes explicitly, as `fingerprint_event_stable` does.
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Database dialect used for DDL parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -244,41 +298,31 @@ impl CapturedDdl {
             return offset.to_string();
         }
 
-        use sha2::{Digest, Sha256};
-        let mut digest = Sha256::new();
-        digest.update(b"rustcdc/v1/schema-observation\x00");
-        digest.update(self.schema.as_bytes());
-        digest.update(b"\x00");
-        digest.update(self.table.as_bytes());
-        digest.update(b"\x00");
-        if let Some(schema) = &self.result_schema {
-            for column in &schema.columns {
-                digest.update(column.name.as_bytes());
-                digest.update(b"\x1f");
-                digest.update(column.data_type.as_bytes());
-                digest.update(b"\x1f");
-                digest.update(if column.nullable { b"1" } else { b"0" });
-                digest.update(b"\x1f");
-                for constraint in &column.constraints {
-                    digest.update(constraint.as_bytes());
-                    digest.update(b"\x1e");
-                }
-                digest.update(b"\x00");
-            }
-            digest.update(b"\x00keys\x00");
-            for key in &schema.primary_keys {
-                digest.update(key.as_bytes());
-                digest.update(b"\x1f");
-            }
-        }
-        // RustCrypto 0.11 returns a `hybrid-array::Array`, which does not implement
-        // `LowerHex`; format the bytes explicitly, as `fingerprint_event_stable` does.
-        let hex: String = digest
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        // Not `schema_id()`: an observation of a table whose shape could not be derived still
+        // needs a stable history identity, and the digest of its name alone is one. The two
+        // agree wherever the shape is known, which is what lets a row name its announcement.
+        let hex = digest_shape(&self.schema, &self.table, self.result_schema.as_ref());
         format!("observed:{hex}")
+    }
+
+    /// The shape this announcement describes, as a value a row event can name.
+    ///
+    /// A consumer reading a row from a different topic than the announcement cannot rely on
+    /// Kafka for ordering between the two, so it needs to tell "this row has the shape I was
+    /// told about" from "this row has a shape I have not seen". Both sides carry this id:
+    /// the announcement, and every row the connector captured under that shape
+    /// ([`Event::schema_id`](crate::Event::schema_id)).
+    ///
+    /// Derived from the shape and nothing else, so an ALTER that changes a table back to an
+    /// earlier shape resolves to that earlier id — which is what a consumer keyed on shape
+    /// wants, and the opposite of what the *history* wants (see [`Self::history_identity`]).
+    /// `None` when the connector could not derive the table's shape: one id standing for
+    /// "shape unknown" would compare equal across two different unknown shapes.
+    #[must_use]
+    pub fn schema_id(&self) -> Option<String> {
+        self.result_schema
+            .as_ref()
+            .map(|result| schema_id(&self.schema, &self.table, result))
     }
 
     /// Convert a captured DDL into a SchemaHistory DDLEvent for persistence.
@@ -364,6 +408,8 @@ impl CapturedDdl {
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
             unavailable_columns: Vec::new(),
+            // The shape this announcement describes, which the rows captured under it name.
+            schema_id: self.schema_id(),
         }
     }
 }

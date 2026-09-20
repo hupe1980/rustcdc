@@ -5,6 +5,40 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## Unreleased
+
+### Added: a row names the shape it was captured under
+
+0.19.0 made schema-event topics reachable; it did not make them ordered against the rows they
+describe, and Kafka cannot. A consumer reading `public.orders` and `public.orders__ddl_events`
+can be handed a row before the announcement for its shape.
+
+Every event now carries `schema_id`, an optional envelope field naming the table's shape,
+derived from the shape alone (columns, types, nullability, constraints, primary key). The
+announcement for a shape and the rows captured under it carry the same value, so a consumer
+holding the announcements it has seen can tell a row it can apply from one whose announcement
+has not arrived, without relying on cross-topic ordering.
+
+Absent means unknown, not "new shape": the field is `None` for a connector that could not derive
+the table's shape, for an offline snapshot, and for events from an older release. A transform
+that changes a row's columns clears it, because a row that no longer matches any announcement
+must not claim one.
+
+**Announcements** carry it wherever the shape is known, on every connector: they are all built
+through `CapturedDdl::to_event`. **Rows** are stamped by the PostgreSQL connector only, on its
+snapshot and streaming paths. So a MySQL or SQL Server announcement may carry an id that its own
+rows do not, which reads as "unknown" and costs a consumer nothing.
+
+Two paths do not stamp rows and say so rather than being counted as covered: the shared
+incremental-snapshot driver, whose per-table state holds no schema — and those rows are often the
+first a consumer sees for a table — and an offline snapshot, which reads no catalogue.
+
+Carried by every codec that decodes an event — JSON, Avro (`schema_id`, nullable, default
+`null`), Protobuf (field 15) — and by CloudEvents in `data`. Avro, Protobuf and serde JSON are
+backward compatible. The JSON Schema is not, for one case: `EVENT_JSON_SCHEMA` sets
+`additionalProperties: false`, so a consumer validating against a pinned copy of the old schema
+rejects an event carrying `schema_id` and must take this revision.
+
 ## 0.19.0
 
 A fix for the release before it. 0.18.0 announces every table before its first row; on a Kafka

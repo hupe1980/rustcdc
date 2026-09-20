@@ -195,6 +195,16 @@ impl PostgresStreamHandle {
             .map(|r| r.namespace.clone())
     }
 
+    /// The id of the shape this relation was last announced under.
+    ///
+    /// Read from the cache filled when the `RELATION` message arrived rather than hashed per
+    /// row, and from the same schema the announcement carried, so a row and its announcement
+    /// cannot disagree. `None` for a relation seen only on the wire — a row whose shape was
+    /// never announced must not claim an id.
+    fn relation_schema_id(&self, relation_oid: u32) -> Option<String> {
+        self.relation_schema_ids.get(&relation_oid).cloned()
+    }
+
     fn relation_primary_key(&self, relation_oid: u32) -> Option<Vec<String>> {
         let relation = self.relation_map.get(&relation_oid)?;
         self.resolve_primary_key(relation)
@@ -260,6 +270,7 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: self.relation_schema_id(insert.relation_oid),
             unavailable_columns,
         })
     }
@@ -313,6 +324,7 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: self.relation_schema_id(update.relation_oid),
         })
     }
 
@@ -348,6 +360,7 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: self.relation_schema_id(delete.relation_oid),
         })
     }
 
@@ -367,6 +380,7 @@ impl PostgresStreamHandle {
                 snapshot: None,
                 transaction: self.tx_meta(),
                 envelope_version: EVENT_ENVELOPE_VERSION,
+                schema_id: self.relation_schema_id(oid),
                 unavailable_columns: Vec::new(),
             })
             .collect()
@@ -521,6 +535,7 @@ impl PostgresStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -706,6 +721,20 @@ impl PostgresStreamHandle {
                     }
 
                     self.relation_map.insert(rel.oid, rel.clone());
+                    // The shape the announcement below describes, kept for the rows that follow
+                    // it. Recomputed on every RELATION message: pgoutput sends one whenever the
+                    // table's shape changes, which is exactly when the id must change.
+                    self.relation_schema_ids.insert(
+                        rel.oid,
+                        crate::ddl_capture::schema_id(
+                            &rel.namespace,
+                            &rel.name,
+                            &self.relation_to_table_schema(
+                                &rel,
+                                self.resolve_primary_key(&rel).as_ref(),
+                            ),
+                        ),
+                    );
 
                     // The cache above is updated for *every* relation, filtered or not:
                     // the decoder needs it to attribute any row it later sees. The

@@ -233,6 +233,10 @@ pub struct ProtoEvent {
     /// differ, and merging them marks genuinely-changed columns as unwritable.
     #[prost(string, repeated, tag = "14")]
     pub before_unavailable_columns: Vec<String>,
+    /// The table shape this row was captured under, as named by its schema announcement
+    /// (absent when the connector could not derive it) — see `Event::schema_id`.
+    #[prost(string, optional, tag = "15")]
+    pub schema_id: Option<String>,
 }
 
 /// Protobuf representation of a CDC event's primary key.
@@ -317,6 +321,7 @@ impl ProtoEvent {
                     event_index: t.event_index,
                 }),
             envelope_version: event.envelope_version as u32,
+            schema_id: event.schema_id.clone(),
             before_is_key_only: event.before.is_key_only(),
             unavailable_columns: event.unavailable_columns.clone(),
             before_unavailable_columns: event.before.unavailable_columns().to_vec(),
@@ -407,6 +412,7 @@ impl ProtoEvent {
                 event_index: t.event_index,
             }),
             envelope_version: self.envelope_version as u16,
+            schema_id: self.schema_id,
             unavailable_columns: self.unavailable_columns,
         })
     }
@@ -445,6 +451,7 @@ mod tests {
                 event_index: 1,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -466,6 +473,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }

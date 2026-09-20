@@ -415,6 +415,7 @@ impl TransformPipeline {
         // Only meaningful for data-change events; READ/SCHEMA_CHANGE/TRUNCATE carry no
         // row identity to preserve.
         let key_before = event.op.is_data_change() && event.has_resolvable_key();
+        let shape = ShapeGuard::capture(&event);
 
         for transform in &self.transforms {
             // Wrap with context rather than re-wrapping as `TransformError`.
@@ -465,7 +466,58 @@ impl TransformPipeline {
                 )));
             }
         }
+
+        shape.release(&mut event);
+
         Ok(Some(event))
+    }
+}
+
+/// The shape a row claimed on the way into a transform chain, checked again on the way out.
+///
+/// [`Event::schema_id`] is a promise that the row matches the announcement carrying the same
+/// id, and a consumer that trusts it writes the row without inspecting its columns. A
+/// projection that drops a column, a mapping that renames one, or an unwrap that replaces the
+/// payload all break that promise silently: the row still parses, and the consumer applies a
+/// shape the row no longer has. So the id is cleared whenever the after-image's columns
+/// changed.
+///
+/// One type rather than a check per stage — a stage added later would otherwise have to
+/// remember — and shared with the server's own chain, which runs WASM modules that can rewrite
+/// a payload wholesale.
+#[derive(Debug)]
+pub struct ShapeGuard {
+    /// The after-image's columns before the chain ran; `None` when the event claimed no shape.
+    columns: Option<Option<Vec<String>>>,
+}
+
+impl ShapeGuard {
+    /// Record the shape an event arrives with.
+    #[must_use]
+    pub fn capture(event: &Event) -> Self {
+        Self {
+            columns: event.schema_id.is_some().then(|| after_columns(event)),
+        }
+    }
+
+    /// Clear the event's [`Event::schema_id`] if its columns are no longer the ones captured.
+    pub fn release(self, event: &mut Event) {
+        if let Some(columns) = self.columns
+            && columns != after_columns(event)
+        {
+            event.schema_id = None;
+        }
+    }
+}
+
+/// The after-image's column names, in order, or `None` when there is no object payload.
+///
+/// Compared rather than hashed: the list is short, and the comparison runs only for an event
+/// that carries a schema id.
+fn after_columns(event: &Event) -> Option<Vec<String>> {
+    match event.after.as_ref()? {
+        serde_json::Value::Object(object) => Some(object.keys().cloned().collect()),
+        _ => None,
     }
 }
 
@@ -537,8 +589,53 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
+    }
+
+    /// A stage that changes the columns takes the shape claim with it.
+    ///
+    /// Without this a consumer reads `schema_id`, finds the announcement it already holds,
+    /// and writes the row as that shape — with a column the row no longer carries.
+    #[tokio::test]
+    async fn a_stage_that_changes_the_columns_clears_the_schema_id() {
+        let mut pipeline = TransformPipeline::default();
+        pipeline.add_transform(Box::new(AppendSuffix));
+        let mut input = event();
+        input.schema_id = Some("shape-of-items".into());
+
+        let output = pipeline.apply(input).await.unwrap().unwrap();
+
+        assert_eq!(output.schema_id, None);
+    }
+
+    /// A stage that rewrites values only leaves the shape — and its claim — intact.
+    #[tokio::test]
+    async fn a_stage_that_leaves_the_columns_alone_keeps_the_schema_id() {
+        #[derive(Debug)]
+        struct RewriteValue;
+        impl Transform for RewriteValue {
+            fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
+                if let Some(serde_json::Value::Object(after)) = &mut event.after {
+                    after.insert("id".into(), json!(2));
+                }
+                Ok(true)
+            }
+
+            fn name(&self) -> &str {
+                "rewrite_value"
+            }
+        }
+
+        let mut pipeline = TransformPipeline::default();
+        pipeline.add_transform(Box::new(RewriteValue));
+        let mut input = event();
+        input.schema_id = Some("shape-of-items".into());
+
+        let output = pipeline.apply(input).await.unwrap().unwrap();
+
+        assert_eq!(output.schema_id.as_deref(), Some("shape-of-items"));
     }
 
     #[tokio::test]

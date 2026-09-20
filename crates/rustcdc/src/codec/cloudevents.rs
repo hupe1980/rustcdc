@@ -193,6 +193,12 @@ impl EventEncoder for CloudEventsEncoder {
                 data.insert(field.into(), json!(columns));
             }
         }
+        // The shape this row was captured under, when the connector could name it: a
+        // consumer reading rows and announcements from two topics has no ordering between
+        // them and needs to recognise a shape it has not seen.
+        if let Some(schema_id) = &event.schema_id {
+            data.insert("schema_id".into(), json!(schema_id));
+        }
         // Carry the envelope version so consumers can detect a version bump.
         data.insert("envelope_version".into(), json!(event.envelope_version));
 
@@ -375,6 +381,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
     }

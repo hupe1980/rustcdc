@@ -127,4 +127,13 @@ message Event {
   // genuinely changed as unwritable and silently drop the update.
   // Always empty when before_is_key_only is true.
   repeated string before_unavailable_columns = 14;
+
+  // The table shape this row was captured under, as named by the table's schema
+  // announcement, which carries the same id. Schema announcements travel on their own
+  // topic, and Kafka orders nothing between two topics, so a consumer can be handed a row
+  // before the announcement describing it. Comparing this id against the announcements it
+  // holds tells a consumer it has not seen this shape yet. Absent when the connector could
+  // not derive the table's shape, and on events from a release that does not set it:
+  // absent means "unknown", not "new shape".
+  optional string schema_id = 15;
 }

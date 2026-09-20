@@ -1307,6 +1307,10 @@ pub const EVENT_JSON_SCHEMA: &str = r#"{
       "description": "Columns absent from `before`. Tracked separately from `unavailable_columns` — the two sets are not the same.",
       "type": "array",
       "items": {"type": "string"}
+    },
+    "schema_id": {
+      "description": "The table shape this row was captured under, as named by the table's schema announcement. Omitted when the connector could not derive the shape: absent means unknown, not a new shape.",
+      "type": "string"
     }
   },
   "required": ["before", "after", "op", "source", "ts", "table", "envelope_version", "before_is_key_only"],

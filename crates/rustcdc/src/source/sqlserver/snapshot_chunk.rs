@@ -127,6 +127,7 @@ pub(super) async fn next_sqlserver_snapshot_chunk(
                 }),
                 transaction: None,
                 envelope_version: EVENT_ENVELOPE_VERSION,
+                schema_id: None,
                 unavailable_columns: Vec::new(),
             });
         }

@@ -495,7 +495,10 @@ Topics are **not** auto-created.
 
 **Ordering.** Per-key ordering among a table's row events is unaffected — they share a topic
 and a key. Schema announcements use a separate topic, so Kafka provides no ordering between
-them and the row events they describe.
+them and the row events they describe. Each row names the shape it was captured under in
+`schema_id`, and the announcement for that shape carries the same id, so a consumer can tell a
+row it can apply from one whose announcement it has not seen
+([A row names the shape it was captured under](@/docs/schema-evolution.md#a-row-names-the-shape-it-was-captured-under)).
 Cross-table ordering is not preserved, as with Debezium; `preserve_transactions` still
 stops a sink committing half a source transaction, and under `effectively_once` the whole
 batch commits across all its topics in one transaction.

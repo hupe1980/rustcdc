@@ -1,6 +1,6 @@
 use rustcdc::outbox::OutboxTransform;
 use rustcdc::schema_history::{ColumnDef, TableSchema};
-use rustcdc::transform::UnmatchedRule;
+use rustcdc::transform::{ShapeGuard, UnmatchedRule};
 use rustcdc::wasm::{TransformResult, WasmConfig as RustcdcWasmConfig, WasmRuntime};
 use rustcdc::{
     BeforeImage, CapturedDdl, Error, Event, FieldMappingConfig, FieldMappingTransform,
@@ -458,20 +458,23 @@ impl TransformPipeline {
     }
 
     pub async fn apply(&self, event: Event) -> Result<Option<Event>> {
+        // The shape the row claimed on the way in. A rule — or a WASM module, which may
+        // rewrite the payload wholesale — that changes the columns invalidates the claim.
+        let shape = ShapeGuard::capture(&event);
         let native_rules_active = !self.rules.is_empty();
         let transformed = apply_rules(event, &self.rules)?;
         let Some(event) = transformed else {
             return Ok(None);
         };
 
-        match &self.runtime {
+        let transformed = match &self.runtime {
             TransformRuntime::Native => {
                 if native_rules_active {
-                    Ok(Some(finalize_transformed(event)?))
+                    Some(finalize_transformed(event)?)
                 } else {
                     // Pass-through: the source already validated its own envelope;
                     // re-validating every event here would only add hot-path cost.
-                    Ok(Some(event))
+                    Some(event)
                 }
             }
             TransformRuntime::Wasm(pool) => {
@@ -481,13 +484,16 @@ impl TransformPipeline {
                 // is needed here — doing so would allocate and serialize twice.
                 let mut guard = pool.acquire().await;
                 match guard.transform(&event).await? {
-                    TransformResult::Ok(transformed) => {
-                        Ok(Some(finalize_transformed(*transformed)?))
-                    }
-                    TransformResult::Filtered => Ok(None),
+                    TransformResult::Ok(transformed) => Some(finalize_transformed(*transformed)?),
+                    TransformResult::Filtered => None,
                 }
             }
-        }
+        };
+
+        Ok(transformed.map(|mut event| {
+            shape.release(&mut event);
+            event
+        }))
     }
 }
 

@@ -557,8 +557,39 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            schema_id: None,
             unavailable_columns: Vec::new(),
         }
+    }
+
+    /// The shape claim has to survive the wire, or only the JSON consumers can use it.
+    ///
+    /// One test over every codec that decodes: a codec added later without the field fails
+    /// here rather than silently dropping it.
+    #[test]
+    fn every_decoding_codec_round_trips_the_schema_id() {
+        let mut event = sample_event();
+        event.schema_id = Some("shape-of-t".into());
+
+        let json = JsonEncoder.encode(&event).unwrap();
+        let from_json: Event = serde_json::from_slice(&json.bytes).unwrap();
+        assert_eq!(from_json.schema_id.as_deref(), Some("shape-of-t"), "json");
+
+        let avro = crate::codec::AvroEncoder::new()
+            .unwrap()
+            .encode(&event)
+            .unwrap();
+        let from_avro = crate::codec::AvroDecoder::new()
+            .unwrap()
+            .decode(&avro.bytes)
+            .unwrap();
+        assert_eq!(from_avro.schema_id.as_deref(), Some("shape-of-t"), "avro");
+
+        let proto = crate::codec::protobuf::ProtoEvent::from_event(&event)
+            .unwrap()
+            .into_event()
+            .unwrap();
+        assert_eq!(proto.schema_id.as_deref(), Some("shape-of-t"), "protobuf");
     }
 
     #[test]

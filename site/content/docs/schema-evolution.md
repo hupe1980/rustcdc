@@ -174,6 +174,55 @@ for when that happens.
 re-announces, because a reconnecting consumer needs the schema before the rows it is about to
 receive. The schema history de-duplicates the repeat, so no extra schema version is recorded.
 
+### A row names the shape it was captured under
+
+"Before" holds on the stream the connector produces. It does not survive a Kafka sink with a
+topic template: announcements carry the synthetic table name `<table>__ddl_events` and so land
+on a topic of their own, and Kafka orders nothing between two topics. A consumer can be handed
+a row before the announcement describing it.
+
+So both sides carry `schema_id`, an envelope field naming the table's shape:
+
+```json
+{
+  "op": "INSERT",
+  "table": "orders",
+  "after": { "id": "9", "amount": "12.5000" },
+  "schema_id": "3f1c…"
+}
+```
+
+The announcement for that shape carries the same id. A consumer keeps the announcements it has
+seen and compares:
+
+- **id it holds** — the row has the shape that announcement describes; apply it.
+- **id it does not hold** — the announcement is still in flight, or was compacted away. Wait
+  for it on the schema-event topic, or read the shape from the schema history, rather than
+  parsing the row against an older shape.
+- **no id** — unknown, not "new shape". The connector could not derive the table's shape (an
+  offline snapshot reads no catalogue), the event came from a release that does not set the
+  field, or a transform reshaped the row (below). Fall back to whatever the consumer did
+  before this field existed.
+
+The id is derived from the shape alone — column names, types, nullability, constraints and the
+primary key — so a table altered from shape A to B and back to A carries A's id again. It
+identifies a shape, not a point in the table's history; the schema history is what orders
+versions.
+
+**A transform that changes a row's columns clears the id.** Dropping a column, renaming one, or
+replacing the payload leaves a row that no longer matches any announcement, and a claim a
+consumer would act on is worse than none. A transform that only rewrites values keeps it, so a
+mask, or a rule that turns `"9"` into `9`, leaves the id in place: the columns still match the
+announcement even though a value's JSON type does not.
+
+Two more cases to know:
+
+- **A WASM module owns the envelope it returns.** The column check still runs, but a module that
+  sets `schema_id` itself, or keeps one while rewriting values, is taken at its word.
+- **A route that renames `table` does not clear the id.** The shape is still the source table's,
+  which is what the id names; a consumer keying its announcements by the *current* table name
+  needs to account for the rename itself.
+
 ## Operational Guidance
 
 1. Treat DDL streams as first-class data for downstream compatibility checks.
@@ -191,7 +240,15 @@ receive. The schema history de-duplicates the repeat, so no extra schema version
    type OID — no modifier, and `unknown` for a type outside the built-in set. Its first DDL
    carries the full declaration.
 5. An offline snapshot — one with no live connection — has no catalogue to read, so it
-   announces nothing rather than describing columns it did not read.
+   announces nothing rather than describing columns it did not read. Its rows carry no
+   `schema_id` either: there is no announcement for them to name.
+6. Announcements carry `schema_id` on every connector — they are all built through the same
+   conversion — but only PostgreSQL stamps its **rows**. A MySQL, MariaDB, SQL Server or
+   Snowflake announcement can therefore carry an id that its own rows do not; the rows read as
+   "unknown", which is what a consumer did before the field existed.
+7. Rows from an **incremental snapshot** carry no `schema_id` on any connector, including
+   PostgreSQL: the shared driver's per-table state holds no schema to derive one from. Those
+   rows are often the first a consumer sees for a table.
 
 ## Related Documentation
 
