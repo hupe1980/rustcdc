@@ -38,9 +38,8 @@ async fn collect(
     let scan_sql = format!("USE {database}; EXEC sys.sp_cdc_scan");
     let mut collected = Vec::new();
     while std::time::Instant::now() < deadline {
-        // Rows only, and `want` counts rows. Every table is announced before its first
-        // row, so counting all events would satisfy `want == 1` with the announcement and
-        // return before the insert this test is about ever arrived.
+        // Rows only, and `want` counts rows: a schema-change event must not satisfy it
+        // before the insert this test is about arrives.
         collected.extend(
             stream
                 .next_events(500)

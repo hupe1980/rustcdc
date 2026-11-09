@@ -1189,12 +1189,14 @@ impl CdcRuntime {
     /// is enqueued for delivery, so a consumer can never observe a schema change the
     /// history does not already contain.
     ///
+    /// Rows record their shape here too, in batch order with the statements; see
+    /// [`record_row_shape`](Self::record_row_shape).
+    ///
     /// # Why a rejected entry does not stop the pipeline
     ///
-    /// A DDL identity is passed that makes recording idempotent under replay — the
-    /// common case after a crash between the record and the checkpoint commit — and, for
-    /// a schema *observation*, idempotent across restarts too
-    /// ([`CapturedDdl::history_identity`]). What remains is a history that genuinely
+    /// The DDL's identity ([`CapturedDdl::history_identity`]) makes recording idempotent under
+    /// replay — the common case after a crash between the record and the checkpoint
+    /// commit. What remains is a history that genuinely
     /// cannot accept the statement: an `ALTER TABLE` diff for a table the store has never
     /// seen, which is what an `InMemorySchemaHistory` looks like after any restart.
     ///
@@ -1208,7 +1210,11 @@ impl CdcRuntime {
     /// A store that is *broken* rather than merely inconsistent — an I/O failure, a
     /// lost owner lease — still propagates.
     pub(crate) async fn record_schema_change_events(&mut self, events: &[Event]) -> Result<()> {
-        for event in events.iter().filter(|event| event.op.is_schema_change()) {
+        for event in events {
+            if !event.op.is_schema_change() {
+                self.record_row_shape(event).await?;
+                continue;
+            }
             let Some(after) = event.after.as_ref() else {
                 continue;
             };
@@ -1221,16 +1227,17 @@ impl CdcRuntime {
             let Some(schema_event) = captured.to_schema_event() else {
                 continue;
             };
+            // The statement moves the history's latest schema; the next row compares
+            // against that rather than against what this cache last saw.
+            self.forget_recorded_shape(&captured.schema, &captured.table);
 
-            // The identity is the offset for a captured statement and a content digest for
-            // an observation, so a restart that re-announces an unchanged table resolves to
-            // the version already stored instead of appending one. See
-            // [`CapturedDdl::history_identity`].
-            let ddl_id = captured.history_identity(&event.source.offset);
             match self
                 .config
                 .schema_history
-                .record_ddl(&ddl_id, schema_event)
+                .record_ddl(
+                    &captured.history_identity(&event.source.offset),
+                    schema_event,
+                )
                 .await
             {
                 Ok(_) => {}

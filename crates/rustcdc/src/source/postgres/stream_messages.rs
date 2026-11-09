@@ -3,11 +3,11 @@ use crate::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SourceMetadata,
         TransactionMetadata,
     },
-    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
-    schema_history::{ColumnDef, TableSchema},
+    ddl_capture::CapturedDdl,
+    schema_history::TableSchema,
     source::{
         helpers::now_millis,
-        schema_catalog::{CatalogColumn, observed_statement, table_schema_from_catalog},
+        schema_catalog::{CatalogColumn, table_schema_from_catalog},
         table_is_allowed,
     },
 };
@@ -21,10 +21,9 @@ use super::{PostgresStreamHandle, format_pg_lsn, pg_timestamp_to_millis};
 /// Resolve a PostgreSQL built-in type OID to its canonical type name, **from the wire
 /// alone**.
 ///
-/// This is the fallback used when the catalog read at stream start has nothing for a
-/// table — a table added to the publication mid-stream. It is deliberately not the primary
-/// path: it covers 60 built-in OIDs and nothing else, and it has no access to the type
-/// modifier, so `numeric(12,4)` is reported as `numeric`.
+/// The fallback for a handle without a [`RelationCatalog`](super::relation_catalog::RelationCatalog),
+/// which only unit tests build. It covers 60 built-in OIDs and nothing else, and it has no
+/// access to the type modifier, so `numeric(12,4)` is reported as `numeric`.
 ///
 /// An OID outside the table yields [`CatalogColumn::UNKNOWN_TYPE`] rather than
 /// `pg_type_oid:<N>`. The OID was never usable by a consumer — enum, domain and extension
@@ -195,11 +194,8 @@ impl PostgresStreamHandle {
             .map(|r| r.namespace.clone())
     }
 
-    /// The shape this relation was last announced under.
-    ///
-    /// Read from the cache filled when the `RELATION` message arrived rather than built per
-    /// row, and from the same schema the announcement carried. `None` for a relation seen only
-    /// on the wire.
+    /// The shape of the relation's latest `RELATION` message, built once when it arrived and
+    /// shared by its rows.
     fn relation_shape(&self, relation_oid: u32) -> Option<std::sync::Arc<crate::RowShape>> {
         self.relation_shapes.get(&relation_oid).cloned()
     }
@@ -393,102 +389,81 @@ impl PostgresStreamHandle {
             .collect()
     }
 
-    /// Describe a relation using the catalog read at stream start, falling back to the
-    /// wire when the catalog has nothing for it.
+    /// Fill what `relation_to_table_schema` reads from the server: the declared type of each
+    /// of the relation's `(oid, typmod)` pairs, and — when the relation changed or the
+    /// stream-start catalogue lacks the table — its nullability and primary key.
+    ///
+    /// The types come from the message itself, so they are the row's own even when the
+    /// stream resumed before an `ALTER COLUMN … TYPE`. Nullability and key are the
+    /// catalogue's at the moment of the re-read: pgoutput carries neither.
+    async fn resolve_relation_catalog(
+        &mut self,
+        relation: &PgRelation,
+        changed: bool,
+    ) -> Result<()> {
+        let Some(catalog) = self.relation_catalog.as_ref() else {
+            return Ok(());
+        };
+        let key = (relation.namespace.clone(), relation.name.clone());
+        if changed || !self.catalog_columns.contains_key(&key) {
+            let (columns, primary_key) = catalog
+                .columns_and_key(&relation.namespace, &relation.name)
+                .await?;
+            self.catalog_columns.insert(key.clone(), columns);
+            self.catalog_primary_keys.insert(key, primary_key);
+        }
+
+        let mut missing: Vec<(u32, i32)> = Vec::new();
+        for column in &relation.columns {
+            let pair = (column.type_oid, column.type_modifier);
+            if !self.type_names.contains_key(&pair) && !missing.contains(&pair) {
+                missing.push(pair);
+            }
+        }
+        if !missing.is_empty() {
+            let names = catalog.type_names(&missing).await?;
+            self.type_names.extend(missing.into_iter().zip(names));
+        }
+        Ok(())
+    }
+
+    /// Describe a relation: its columns in the message's order, each declared type from the
+    /// message's `(oid, typmod)`, nullability from the catalogue.
     ///
     /// `primary_keys` is the resolved key from [`Self::resolve_primary_key`], not the raw
-    /// replica-identity flags: under `REPLICA IDENTITY FULL` every column carries the flag, and
-    /// deriving the schema from it published a table whose every column was a non-nullable primary
-    /// key.
+    /// replica-identity flags: under `REPLICA IDENTITY FULL` every column carries the flag.
     ///
-    /// # Why the catalog rather than the RELATION message
-    ///
-    /// The wire carries a type OID, a type modifier and no nullability. Used alone it
-    /// reports `numeric` for `numeric(12,4)`, `pg_type_oid:16385` for every enum and
-    /// domain, and a `nullable` flag invented from the primary key. The catalog answers
-    /// all three; see
-    /// [`query_publication_column_types`](super::query::query_publication_column_types).
-    ///
-    /// # The fallback, and why it is marked
-    ///
-    /// A table added to the publication after stream start is not in the map. Its columns
-    /// are then described from the wire — the same OID map as before, and
-    /// [`CatalogColumn::UNKNOWN_TYPE`] for an OID this crate does not know, rather than
-    /// `pg_type_oid:<N>`, so "we could not read the type" has one spelling across every
-    /// connector. Nullability is not guessed in that case: it is reported `true`, the
-    /// weaker claim, because a consumer that relaxes a column is recoverable and one that
-    /// tightens it rejects rows the source accepted.
+    /// A column the catalogue does not describe is reported nullable — the weaker claim,
+    /// because a consumer that relaxes a column is recoverable and one that tightens it
+    /// rejects rows the source accepted. A type not resolved (no catalogue, unit tests only)
+    /// falls back to the built-in OID map, [`CatalogColumn::UNKNOWN_TYPE`] beyond it.
     fn relation_to_table_schema(
         &self,
         relation: &PgRelation,
         primary_keys: Option<&Vec<String>>,
     ) -> TableSchema {
         let primary_keys: Vec<String> = primary_keys.cloned().unwrap_or_default();
-
-        if let Some(catalog) = self
+        let catalog = self
             .catalog_columns
-            .get(&(relation.namespace.clone(), relation.name.clone()))
-        {
-            // Project the catalog through the relation's own column list and order: a
-            // publication can publish a column subset (`FOR TABLE t (a, b)`), and the
-            // events carry exactly the columns pgoutput sent. Describing columns the
-            // stream will never deliver would be a schema no row matches.
-            let columns: Vec<CatalogColumn> = relation
-                .columns
-                .iter()
-                .map(|column| {
-                    catalog
-                        .iter()
-                        .find(|candidate| candidate.name == column.name)
-                        .cloned()
-                        .unwrap_or_else(|| CatalogColumn {
-                            name: column.name.clone(),
-                            data_type: wire_type_name(column.type_oid),
-                            nullable: true,
-                        })
-                })
-                .collect();
-            return table_schema_from_catalog(
-                &relation.namespace,
-                &relation.name,
-                &columns,
-                &primary_keys,
-            );
-        }
-
-        let columns = relation
+            .get(&(relation.namespace.clone(), relation.name.clone()));
+        let columns: Vec<CatalogColumn> = relation
             .columns
             .iter()
-            .map(|column| {
-                let is_primary_key = primary_keys.contains(&column.name);
-                ColumnDef {
-                    name: column.name.clone(),
-                    data_type: wire_type_name(column.type_oid),
-                    nullable: true,
-                    constraints: if is_primary_key {
-                        vec!["primary_key".to_string()]
-                    } else {
-                        Vec::new()
-                    },
-                }
+            .map(|column| CatalogColumn {
+                name: column.name.clone(),
+                data_type: self
+                    .type_names
+                    .get(&(column.type_oid, column.type_modifier))
+                    .cloned()
+                    .unwrap_or_else(|| wire_type_name(column.type_oid)),
+                nullable: catalog
+                    .and_then(|columns| columns.iter().find(|c| c.name == column.name))
+                    .is_none_or(|c| c.nullable),
             })
             .collect();
-
-        TableSchema {
-            schema: relation.namespace.clone(),
-            table: relation.name.clone(),
-            columns,
-            primary_keys,
-            version: 0,
-        }
+        table_schema_from_catalog(&relation.namespace, &relation.name, &columns, &primary_keys)
     }
 
-    /// Build the schema event for a relation, as either an observation or a change.
-    ///
-    /// `first_sight` picks the `ddl_type`, and the distinction is the reason a consumer can
-    /// use either. `READ_SCHEMA` says "this is the shape of the table, before its first
-    /// row"; `ALTER_TABLE` says "this table changed". Reusing `ALTER_TABLE` for both would
-    /// tell every consumer that every table was altered on every pipeline restart.
     /// Build the event for a logical decoding message.
     ///
     /// # Identity
@@ -550,8 +525,8 @@ impl PostgresStreamHandle {
     fn build_relation_schema_change_event(
         &self,
         relation: &PgRelation,
+        result_schema: TableSchema,
         lsn: u64,
-        first_sight: bool,
     ) -> Event {
         let ts_ms = if self.current_commit_ts == 0 {
             now_millis()
@@ -571,33 +546,18 @@ impl PostgresStreamHandle {
         } else {
             lsn
         };
-        let (ddl_type, statement) = if first_sight {
-            (
-                DDL_TYPE_READ_SCHEMA,
-                observed_statement(&relation.namespace, &relation.name, "pgoutput RELATION"),
-            )
-        } else {
-            (
-                "ALTER_TABLE",
-                format!(
-                    "ALTER TABLE {}.{} /* derived from pgoutput RELATION metadata */",
-                    relation.namespace, relation.name
-                ),
-            )
+        let captured = CapturedDdl {
+            ddl_type: "ALTER_TABLE".to_string(),
+            schema: relation.namespace.clone(),
+            table: relation.name.clone(),
+            statement: format!(
+                "ALTER TABLE {}.{} /* derived from pgoutput RELATION metadata */",
+                relation.namespace, relation.name
+            ),
+            result_schema: Some(result_schema),
+            schema_diff: None,
+            ts: ts_ms,
         };
-        let captured =
-            CapturedDdl {
-                ddl_type: ddl_type.to_string(),
-                schema: relation.namespace.clone(),
-                table: relation.name.clone(),
-                statement,
-                result_schema: Some(self.relation_to_table_schema(
-                    relation,
-                    self.resolve_primary_key(relation).as_ref(),
-                )),
-                schema_diff: None,
-                ts: ts_ms,
-            };
         captured.to_event(&self.source_name, format_pg_lsn(lsn), ts_ms)
     }
 
@@ -654,18 +614,6 @@ impl PostgresStreamHandle {
                     self.current_commit_ts = 0;
                 }
                 PgOutputMessage::Relation(rel) => {
-                    // **First sight emits too**, and that is the whole point of the split.
-                    //
-                    // pgoutput sends RELATION before the first row of each table in a
-                    // session, so the first sighting is exactly the moment a consumer
-                    // needs the schema — and it used to be the one case that emitted
-                    // nothing (`unwrap_or(false)`). On a fresh start, after a restart, or
-                    // for any table that never undergoes DDL, rows arrived with no type
-                    // information in the stream at all, and column values are text.
-                    //
-                    // The two cases stay distinguishable at the consumer through
-                    // `ddl_type`, and the schema history de-duplicates an unchanged
-                    // observation so a restart does not append a version per table.
                     let previous = self.relation_map.get(&rel.oid);
                     let first_sight = previous.is_none();
                     let changed = previous.is_some_and(|existing| existing != &rel);
@@ -728,16 +676,18 @@ impl PostgresStreamHandle {
                     }
 
                     self.relation_map.insert(rel.oid, rel.clone());
-                    // The shape the announcement below describes, kept for the rows that follow
-                    // it. Recomputed on every RELATION message: pgoutput sends one whenever the
-                    // table's shape changes, which is exactly when the shape must change.
+                    // pgoutput re-sends an unchanged RELATION every session; only a new or
+                    // changed one can change the shape its rows are captured under.
+                    if !(first_sight || changed) {
+                        continue;
+                    }
+                    self.resolve_relation_catalog(&rel, changed).await?;
+                    let table_schema = self
+                        .relation_to_table_schema(&rel, self.resolve_primary_key(&rel).as_ref());
                     match crate::RowShape::from_table_schema(
                         &rel.namespace,
                         &rel.name,
-                        &self.relation_to_table_schema(
-                            &rel,
-                            self.resolve_primary_key(&rel).as_ref(),
-                        ),
+                        &table_schema,
                     ) {
                         Some(shape) => {
                             self.relation_shapes
@@ -748,14 +698,11 @@ impl PostgresStreamHandle {
                         }
                     }
 
-                    // The cache above is updated for *every* relation, filtered or not:
-                    // the decoder needs it to attribute any row it later sees. The
-                    // schema-change **event** is a different matter — it carries the
-                    // table's full column list to the sink, so an excluded table must not
-                    // produce one. This path used to bypass the include/exclude lists
-                    // entirely, which meant an operator who allow-listed one table still
-                    // received the schema of every other table in the publication.
-                    let emit_schema_event = (first_sight || changed)
+                    // The caches above hold *every* relation, filtered or not: the decoder
+                    // needs them to attribute any row it later sees. The schema-change event
+                    // carries the table's column list to the sink, so an excluded table must
+                    // not produce one.
+                    let emit_schema_event = changed
                         && table_is_allowed(
                             Some(rel.namespace.as_str()),
                             &rel.name,
@@ -765,7 +712,7 @@ impl PostgresStreamHandle {
 
                     if emit_schema_event {
                         let mut schema_event =
-                            self.build_relation_schema_change_event(&rel, item.lsn, first_sight);
+                            self.build_relation_schema_change_event(&rel, table_schema, item.lsn);
                         if self.current_xid.is_some() {
                             schema_event.transaction = self.tx_meta();
                             self.partial_tx_events.push(schema_event);
@@ -893,8 +840,9 @@ impl PostgresStreamHandle {
                         // non-built-in type, to name that type. Values arrive as **text**
                         // under this decoder — the column type's own output form — so
                         // nothing downstream needs the OID-to-name mapping `Y` provides.
-                        // The *declared* type a consumer does need comes from the catalog
-                        // read at stream start, which resolves enums and domains by name.
+                        // The *declared* type a consumer does need is `format_type` of the
+                        // RELATION's OID and modifier, which resolves enums and domains by
+                        // name.
                         //
                         // `M` is no longer here: it is decoded when
                         // `capture_logical_messages` is set, and the server does not send
@@ -907,8 +855,8 @@ impl PostgresStreamHandle {
                                     "ignoring unhandled pgoutput message type; \
                                      'O' = Origin (bidirectional loop detection), \
                                      'Y' = Type (custom type identity, not needed because \
-                                     values are text and declared types come from the \
-                                     catalog). These are not surfaced as events.",
+                                     values are text and declared types come from \
+                                     format_type). These are not surfaced as events.",
                                 );
                             }
                         }

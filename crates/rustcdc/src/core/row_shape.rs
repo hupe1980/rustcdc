@@ -54,7 +54,7 @@ pub struct RowShape {
     table: String,
     definition: Option<Definition>,
     /// A transform dropped columns from the shape the connector captured. Not on the wire: it
-    /// tells the delivering process that no source ever announced this shape.
+    /// tells the delivering process that no source ever captured a row under this shape.
     narrowed: bool,
 }
 

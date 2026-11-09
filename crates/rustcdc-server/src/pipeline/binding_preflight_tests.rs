@@ -57,10 +57,9 @@ async fn preflight(config_path: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// The defect: preflight checked `cdc.public.orders` and passed, the first event for the
-/// table was its schema announcement, and that went to `cdc.public.orders__ddl_events`,
-/// which did not exist. The producer never created it, so the batch held every table
-/// behind it until the delivery timeout, and the pipeline then exited.
+/// A captured DDL statement for the table goes to `cdc.public.orders__ddl_events`. Were that
+/// topic missing, the producer would not create it, the batch would hold every table behind
+/// it until the delivery timeout, and the pipeline would exit — so startup demands it.
 #[tokio::test]
 async fn preflight_demands_the_schema_event_topic_of_each_configured_table() {
     let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
@@ -197,9 +196,9 @@ name = "one-topic-for-schema-events"
 }
 
 /// A rule that reads the schema event's payload must see the payload a connector sends.
-/// `unwrap` on `result_schema` succeeds on a real announcement, so the event is published
-/// and its topic has to be checked. A probe with an empty payload made this rule fail,
-/// counted the event as dropped, and left the topic unchecked: the stall from #21 again.
+/// `unwrap` on `result_schema` succeeds on a real schema-change event, so the event is
+/// published and its topic has to be checked. A probe with an empty payload would make this
+/// rule fail, count the event as dropped, and leave the topic unchecked.
 #[tokio::test]
 async fn a_rule_that_reads_the_schema_payload_still_leaves_the_topic_checked() {
     let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);

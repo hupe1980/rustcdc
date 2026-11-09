@@ -204,10 +204,7 @@ struct Fixture {
     events: PathBuf,
 }
 
-/// A row event, as opposed to a schema announcement.
-///
-/// Every table's columns are announced before its first row, so a sink file interleaves
-/// `schema_change` events with rows. The assertions in this suite are about rows.
+/// A row event, as opposed to a schema-change event from captured DDL.
 fn is_row_event(event: &serde_json::Value) -> bool {
     event["op"].as_str() != Some("schema_change")
 }
@@ -293,9 +290,7 @@ enabled = false
 
     /// Every captured **row** event, as `(op, id, note)`.
     ///
-    /// Schema announcements are filtered out: every table's columns are announced before
-    /// its first row, and these assertions are about rows. `schema_events` is the
-    /// complement.
+    /// Schema-change events are filtered out.
     fn captured(&self) -> Vec<(String, String, String)> {
         let Ok(body) = std::fs::read_to_string(&self.events) else {
             return Vec::new();

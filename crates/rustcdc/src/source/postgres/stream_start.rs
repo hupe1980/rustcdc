@@ -33,12 +33,8 @@ pub(super) async fn start_postgres_stream(
         super::query::query_publication_primary_keys(&client, &connection.config.publication_name)
             .await?;
 
-    // Second and last catalog read of stream start. pgoutput describes a column with a
-    // type OID and a modifier and says nothing about nullability, so a schema built from
-    // the wire alone loses `numeric(12,4)` to `numeric`, degrades every enum and domain to
-    // `pg_type_oid:<N>`, and has to invent `nullable`. `format_type` answers all three from
-    // the server, and reading it here keeps the query out of the WAL decode loop — which
-    // has no ordinary SQL connection of its own.
+    // pgoutput says nothing about nullability, so the shape takes it from the catalog: read
+    // here for every published table, and again for a table whose RELATION changes.
     let catalog_columns =
         super::query::query_publication_column_types(&client, &connection.config.publication_name)
             .await?;
@@ -107,6 +103,7 @@ pub(super) async fn start_postgres_stream(
         .config
         .reselect_unavailable_columns
         .then(|| client.clone());
+    let relation_catalog = super::relation_catalog::ClientRelationCatalog(client.clone());
 
     let provider: Box<dyn super::decoder::PgOutputMessageProvider> =
         match connection.config.wal_transport {
@@ -165,7 +162,8 @@ pub(super) async fn start_postgres_stream(
             catalog_columns,
             reselect_client,
         )
-        .with_slot_state_sample_interval_ms(connection.config.slot_state_sample_interval_ms),
+        .with_slot_state_sample_interval_ms(connection.config.slot_state_sample_interval_ms)
+        .with_relation_catalog(Box::new(relation_catalog)),
     ))
 }
 

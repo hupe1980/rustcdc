@@ -29,7 +29,7 @@ replica with a unique `server_id`.
 | `UPDATE` | yes | `before` + `after` when `binlog_row_image = FULL` |
 | `DELETE` | yes | `before` when `binlog_row_image = FULL`; otherwise primary key only |
 | DDL changes | yes | Schema history is maintained for correct event decoding after column additions/renames |
-| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
+| Column types | yes | Every row carries its table's declared columns in `shape` — see [Declared column types](#declared-column-types) |
 | `TRUNCATE` | yes | Parsed from the `TRUNCATE TABLE` query event in the binlog and emitted as a `truncate` operation (respects the table include/exclude lists) |
 
 ### Minimum requirements
@@ -75,12 +75,10 @@ re-read, and until a table map agrees the rows carry none. A change within one t
 (`varchar(64)` to `varchar(128)`) is not visible in the table map. See
 [Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape).
 
-Types come from `information_schema.COLUMNS`, read once at stream start for the configured
-database. `COLUMN_TYPE` is MySQL's own spelling and is already complete — `decimal(12,4)`,
-`int unsigned`, `enum('a','b')` — and `IS_NULLABLE` is the real nullability.
-
-A table created *after* the stream starts is not in that read and needs nothing: its
-`CREATE TABLE` arrives in the binlog as its own schema event.
+Types come from `information_schema.COLUMNS`, read at stream start for the configured
+database and again for a table after DDL names it, on resume, and at the first row of a table
+the start read did not cover. `COLUMN_TYPE` is MySQL's own spelling and is already complete —
+`decimal(12,4)`, `int unsigned`, `enum('a','b')` — and `IS_NULLABLE` is the real nullability.
 
 ### GTID mode
 

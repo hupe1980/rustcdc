@@ -979,6 +979,33 @@ pub(super) async fn query_table_catalog<C>(
 where
     C: mysql_async::prelude::Queryable,
 {
+    let columns = query_table_columns(connection, database, table).await?;
+    let keys: Vec<String> = connection
+        .exec(
+            "SELECT COLUMN_NAME \
+             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' \
+             ORDER BY ORDINAL_POSITION",
+            (database, table),
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed querying mysql primary key for '{database}.{table}': {error}"
+            ))
+        })?;
+    Ok((columns, keys))
+}
+
+/// One table's declared columns, in ordinal order.
+pub(super) async fn query_table_columns<C>(
+    connection: &mut C,
+    database: &str,
+    table: &str,
+) -> Result<Vec<crate::source::schema_catalog::CatalogColumn>>
+where
+    C: mysql_async::prelude::Queryable,
+{
     use crate::source::schema_catalog::CatalogColumn;
 
     let rows: Vec<(String, String, String)> = connection
@@ -995,29 +1022,14 @@ where
                 "failed querying mysql column types for '{database}.{table}': {error}"
             ))
         })?;
-    let columns = rows
+    Ok(rows
         .into_iter()
         .map(|(name, column_type, is_nullable)| CatalogColumn {
             name,
             data_type: column_type,
             nullable: is_nullable.eq_ignore_ascii_case("YES"),
         })
-        .collect();
-    let keys: Vec<String> = connection
-        .exec(
-            "SELECT COLUMN_NAME \
-             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' \
-             ORDER BY ORDINAL_POSITION",
-            (database, table),
-        )
-        .await
-        .map_err(|error| {
-            Error::SourceError(format!(
-                "failed querying mysql primary key for '{database}.{table}': {error}"
-            ))
-        })?;
-    Ok((columns, keys))
+        .collect())
 }
 
 /// Read every table's primary key for one database, in index order.

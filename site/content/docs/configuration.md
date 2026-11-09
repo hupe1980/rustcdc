@@ -484,7 +484,7 @@ runtime are not covered; the log says how many were checked. Each sink checks on
 tables its routes send it.
 
 Schema events are published under a table of their own, `<table>__ddl_events`, so the
-template gives them their own topic: `cdc.${schema}.${table}` sends the announcement for
+template gives them their own topic: `cdc.${schema}.${table}` sends a captured `ALTER` of
 `public.orders` to `cdc.public.orders__ddl_events`. Preflight checks those topics too,
 unless the pipeline's transforms drop schema events (`exclude_ops = ["schema_change"]`),
 under whatever name the transforms give them. They are routed by that name, so a route for

@@ -33,9 +33,6 @@ Schema evolution behavior spans two modules:
 - `ALTER TABLE`
 - `DROP TABLE`
 
-Plus `READ_SCHEMA` — not a statement, but a table's shape announced before its first row.
-See [Every table is announced before its first row](#every-table-is-announced-before-its-first-row).
-
 ### Core Types
 
 - `CapturedDdl`
@@ -72,9 +69,7 @@ The runtime chooses it by kind:
 | Entry | Identity | Why |
 |---|---|---|
 | A captured statement (`CREATE_TABLE`, `ALTER_TABLE`, `DROP_TABLE`) | the source log position | A table altered A → B → A has three entries, and the third is not the first |
-| An observation (`READ_SCHEMA`) | a digest of the schema it carries | Announced every run, so an offset would append a version per table per restart |
-
-An observation of a table that changed while the pipeline was down still records.
+| A row's shape | `shape:<schema>.<table>:<offset of that row>` | Per occurrence, so A → B → A records A again; stable under replay |
 
 This is load-bearing, not a nicety. The runtime records a schema change *before* it enqueues
 the event announcing it, so a crash between the record and the checkpoint commit replays the
@@ -85,6 +80,19 @@ restart from the same checkpoint. The pipeline never started again.
 
 A custom `SchemaHistory` implementation must honour the same contract.
 
+#### Row shapes enter the history from the rows
+
+A table that never undergoes DDL is in the history through its rows. The runtime records a
+row's [shape](#every-row-carries-its-shape) when it differs from the table's latest entry: it
+caches the id it last recorded per table, and on a miss — a fresh process — compares with
+`latest_schema`, so a restart records nothing for an unchanged table. A statement for the
+table clears the cache, and the next row is compared with the history again.
+
+Any error while recording a row's shape stops the pipeline with `Error::Unrecoverable`: the
+batch was already taken from the source, so a retried poll would read past it. A restart
+redelivers it from the checkpoint. `FileSchemaHistory` rolls its in-memory state back when
+persisting fails, so a retried record is written rather than answered from memory.
+
 #### A rejected entry does not stop capture
 
 If the history genuinely cannot accept a statement — an `ALTER TABLE` diff for a table the
@@ -92,7 +100,8 @@ store has never seen, which is what an `InMemorySchemaHistory` looks like after 
 the runtime logs at ERROR with the remedy and continues. Propagating it would fail the poll,
 and fail identically on every restart, for a gap in an auxiliary index; the event itself is
 self-describing and still reaches the consumer. A store that is *broken* rather than merely
-inconsistent — an I/O failure, a lost owner lease — still fails the poll.
+inconsistent — an I/O failure, a lost owner lease — still fails the poll. Recording a row's
+shape is stricter; see above.
 
 Runtime-managed retention is available through `RuntimeConfig::with_schema_history_retention(...)`.
 When configured, rustcdc applies the retention policy automatically after each persisted DDL mutation.
@@ -125,54 +134,6 @@ When converted to canonical events, DDL records use:
 - `table` encoded as `<table>__ddl_events`
 - `after` payload with `ddl_type`, `schema`, `table`, `statement`
 - Optional `result_schema` and `schema_diff` for richer evolution metadata
-
-### Every table is announced before its first row
-
-**A consumer reading a stream from the start of a session sees each table's column types
-before any of that table's rows, in both the snapshot and the stream.**
-
-Column values are text
-([Column values are text](@/docs/api.md#column-values-are-text-on-every-connector-and-every-path)),
-and parsing text requires knowing what to parse it as — nothing in `{"id": "9"}` says whether
-`"9"` is a `bigint` or a `text` holding a digit.
-
-The announcement carries `ddl_type = "READ_SCHEMA"` and a complete `result_schema`. It is
-distinct from `CREATE_TABLE`, which reports a table that was actually created:
-
-```json
-{
-  "ddl_type": "READ_SCHEMA",
-  "schema": "public",
-  "table": "orders",
-  "result_schema": {
-    "schema": "public",
-    "table": "orders",
-    "primary_keys": ["id"],
-    "columns": [
-      { "name": "id",     "data_type": "bigint",        "nullable": false, "constraints": ["primary_key"] },
-      { "name": "amount", "data_type": "numeric(12,4)", "nullable": false, "constraints": [] },
-      { "name": "note",   "data_type": "varchar(64)",   "nullable": true,  "constraints": [] }
-    ]
-  }
-}
-```
-
-`data_type` is the **source's own type syntax**, modifier included, read from the catalogue:
-
-| Source | Read from | Example |
-|---|---|---|
-| PostgreSQL | `pg_catalog.format_type()` | `numeric(12,4)`, `character varying(64)`, enum and domain names |
-| MySQL / MariaDB | `information_schema.COLUMNS.COLUMN_TYPE` | `decimal(12,4)`, `int unsigned`, `enum('a','b')` |
-| SQL Server | `sys.columns` via the capture instance | `decimal(12,4)`, `nvarchar(255)`, `datetime2(3)` |
-
-`nullable` is read from the catalogue too, not derived from the primary key.
-
-A type that cannot be read is the literal `unknown` — never a guess. See each connector page
-for when that happens.
-
-**Cadence.** One announcement per table per run, before that table's first row. A restart
-re-announces, because a reconnecting consumer needs the schema before the rows it is about to
-receive. The schema history de-duplicates the repeat, so no extra schema version is recorded.
 
 ### Every row carries its shape
 
@@ -207,11 +168,31 @@ shape (the server's `runtime.row_shape = "id"`) carries only `id`, `schema` and 
 CloudEvents output also sets `dataschema` to `urn:rustcdc:row-shape:<id>`, and the Kafka sink
 sets the `__rustcdc.row_shape` header.
 
+No separate event describes a table: its shape is on its rows. A schema-change event is
+emitted for captured DDL only, and carries the shape the statement leaves where it is known.
+
+`data_type` is the **source's own type syntax**, modifier included, read from the server:
+
+| Source | Read from | Example |
+|---|---|---|
+| PostgreSQL | `pg_catalog.format_type()` | `numeric(12,4)`, `character varying(64)`, enum and domain names |
+| MySQL / MariaDB | `information_schema.COLUMNS.COLUMN_TYPE` | `decimal(12,4)`, `int unsigned`, `enum('a','b')` |
+| SQL Server | `sys.columns` via the capture instance | `decimal(12,4)`, `nvarchar(255)`, `datetime2(3)` |
+
+`nullable` is read from the catalogue too, not derived from the primary key. A type that
+cannot be read is the literal `unknown` — never a guess.
+
 | Connector | Snapshot rows | Stream rows |
 |---|---|---|
-| PostgreSQL | the catalogue read at snapshot start | the shape announced for the relation, rebuilt on every `RELATION` message |
+| PostgreSQL | the catalogue read at snapshot start | types from each `RELATION` message; nullability and key from the catalogue (below) |
 | MySQL / MariaDB | `information_schema` read at snapshot start | `information_schema`, stamped only when it agrees with the row's binlog table map (below) |
 | SQL Server | `INFORMATION_SCHEMA` read at snapshot start | the capture instance's columns; a new capture instance brings a new shape |
+
+**PostgreSQL.** Each column's declared type is `format_type` of the type OID and modifier the
+`RELATION` message carries, so a row resumed from before an `ALTER COLUMN … TYPE` carries the
+type it was written under. pgoutput carries neither nullability nor the primary key; both are
+re-read from the catalogue when a `RELATION` changes. *Limit:* those two are the catalogue's
+at the moment of that read, not necessarily at the row's position.
 
 **MySQL and MariaDB.** The catalogue is read now; a row may be older — after a resume, or
 while the stream catches up past an `ALTER`. So a row carries the catalogue's shape only when
@@ -222,6 +203,11 @@ rows carry no shape. *Limit:* a change within one type family (`varchar(64)` to
 `varchar(128)`) is invisible to the table map, so a row captured before such a change and
 read after it carries the newer declaration.
 
+**Incremental snapshots.** The table is described (one catalogue query) before each chunk,
+and the chunk's rows carry that shape only when the columns the chunk read are exactly the
+described ones. *Limit:* a type change between that describe and the chunk's read is not
+detected.
+
 **Transforms.** A projection that only drops columns narrows the shape to the remaining
 columns, with a new id; dropping a primary-key column removes it. Anything else that changes
 the column set or what values mean removes the shape: a rename, copy or literal in a field
@@ -230,8 +216,9 @@ mapping, a mask or hash, an unwrap or flatten, the outbox router, and every WASM
 still names the source table.
 
 **No shape** means unknown, never "no columns". These paths carry none: an offline snapshot
-(no catalogue), the Snowflake source, an incremental snapshot, a truncate, MySQL/MariaDB rows
-whose table map disagrees with the catalogue, and rows a transform reshaped.
+(no catalogue), the Snowflake source, a truncate, MySQL/MariaDB rows whose table map
+disagrees with the catalogue, an incremental snapshot chunk whose columns differ from the shape
+described before it, and rows a transform reshaped.
 
 ## Operational Guidance
 
@@ -245,12 +232,10 @@ whose table map disagrees with the catalogue, and rows a transform reshaped.
 1. Parsing covers common CREATE/ALTER/DROP table shapes; exotic vendor-specific syntax can require parser extension.
 2. `DROP_TABLE` emits a schema-history tombstone and does not include `result_schema`.
 3. `FileSchemaHistory` is a single-process local durability backend; multi-process or externally replicated durability still requires a custom implementation.
-4. A PostgreSQL table added to the publication after the stream started is not in the
-   stream-start catalogue read, so its announcement reports `data_type` from the pgoutput
-   type OID — no modifier, and `unknown` for a type outside the built-in set. Its first DDL
-   carries the full declaration.
-5. An offline snapshot — one with no live connection — has no catalogue to read, so it
-   announces nothing and its rows carry no `shape`.
+4. A PostgreSQL row's nullability and primary key are the catalogue's when its `RELATION`
+   was last read, not necessarily at the row's position.
+5. An offline snapshot — one with no live connection — has no catalogue to read, so its rows
+   carry no `shape`.
 6. A MySQL/MariaDB type change within one binlog type family is not detected by the
    table-map comparison; see [Every row carries its shape](#every-row-carries-its-shape).
 

@@ -403,24 +403,13 @@ async fn postgres_stream_resume_from_lsn() -> rustcdc::Result<()> {
     Ok(())
 }
 
-/// Every table's declared column types reach the stream before that table's first row.
-///
-/// Column values are text on every capture path, so a consumer needs the types to decode
-/// them — and before this, a table that never underwent DDL had no type information
-/// anywhere in the stream. pgoutput sends `RELATION` immediately before a table's first
-/// row and the connector emitted nothing for it, because the schema event fired only when
-/// a relation *changed*.
-///
-/// This asserts the whole claim against a live server: the announcement arrives first, it
-/// carries the real declared types with their modifiers, and it carries the catalogue's
-/// nullability rather than one inferred from the primary key.
-#[tokio::test]
-async fn postgres_stream_announces_declared_types_before_the_first_row() -> rustcdc::Result<()> {
-    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping postgres schema announcement test (set CDC_RS_RUN_DOCKER_TESTS=1)");
-        return Ok(());
-    }
-
+/// A PostgreSQL 16 container with logical decoding, and an admin client on it.
+async fn start_logical_postgres() -> rustcdc::Result<(
+    testcontainers::ContainerAsync<GenericImage>,
+    String,
+    u16,
+    tokio_postgres::Client,
+)> {
     let container = GenericImage::new("postgres", "16-alpine")
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
@@ -441,16 +430,15 @@ async fn postgres_stream_announces_declared_types_before_the_first_row() -> rust
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-
     let host = container
         .get_host()
         .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .to_string();
     let port = container
         .get_host_port_ipv4(5432.tcp())
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-
     let admin_dsn = format!(
         "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
     );
@@ -460,15 +448,107 @@ async fn postgres_stream_announces_declared_types_before_the_first_row() -> rust
     tokio::spawn(async move {
         let _ = admin_conn.await;
     });
+    Ok((container, host, port, admin_client))
+}
 
-    // A schema chosen to break the old OID map in every way it could break:
-    // a modifier it dropped, a user-defined enum whose OID it could not know, and a
-    // NOT NULL non-key column whose nullability it inferred from the primary key.
+fn typed_stream_config(
+    host: &str,
+    port: u16,
+    slot: &str,
+    publication: &str,
+) -> PostgresSourceConfig {
+    PostgresSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "postgres".to_string(),
+        password: "postgres".to_string().into(),
+        database: "cdc".to_string(),
+        replication_slot_name: slot.to_string(),
+        publication_name: publication.to_string(),
+        create_replication_slot_if_missing: true,
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        transport: rustcdc::TransportConfig::plaintext(),
+        ..PostgresSourceConfig::default()
+    }
+}
+
+/// Poll until `inserts` insert events have arrived; every event polled is returned.
+async fn collect_inserts(
+    stream_handle: &mut Box<dyn rustcdc::source::StreamHandle>,
+    inserts: usize,
+) -> rustcdc::Result<Vec<rustcdc::Event>> {
+    let mut collected = Vec::new();
+    for _ in 0..100 {
+        collected.extend(stream_handle.next_events(100).await?);
+        if collected
+            .iter()
+            .filter(|event: &&rustcdc::Event| event.op == rustcdc::Operation::Insert)
+            .count()
+            >= inserts
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(collected)
+}
+
+/// `(name, declared type, nullable)` per column, as the catalogue holds them now.
+async fn catalogue_columns(
+    client: &tokio_postgres::Client,
+    table: &str,
+) -> rustcdc::Result<Vec<(String, String, bool)>> {
+    let rows = client
+        .query(
+            "SELECT attname, pg_catalog.format_type(atttypid, atttypmod), NOT attnotnull \
+             FROM pg_catalog.pg_attribute \
+             WHERE attrelid = ($1::text)::regclass AND attnum > 0 AND NOT attisdropped \
+             ORDER BY attnum",
+            &[&table],
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect())
+}
+
+fn shape_columns(event: &rustcdc::Event) -> Vec<(String, String, bool)> {
+    event
+        .shape
+        .as_ref()
+        .expect("the row carries a shape")
+        .columns()
+        .expect("an inline shape")
+        .iter()
+        .map(|column| {
+            (
+                column.name.clone(),
+                column.data_type.clone(),
+                column.nullable,
+            )
+        })
+        .collect()
+}
+
+/// A stream row carries its table's shape — the declared types with their modifiers, a
+/// user-defined enum by name, the catalogue's nullability — and no schema event precedes it.
+#[tokio::test]
+async fn postgres_stream_rows_carry_the_catalogue_shape() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres row shape test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin_client) = start_logical_postgres().await?;
+
+    // A modifier the OID alone loses, an enum whose OID is installation-specific, and a
+    // NOT NULL non-key column pgoutput says nothing about.
     admin_client
         .batch_execute(
             "
-            DROP TABLE IF EXISTS public.typed_test;
-            DROP TYPE IF EXISTS public.mood;
             CREATE TYPE public.mood AS ENUM ('sad', 'ok', 'happy');
             CREATE TABLE public.typed_test (
               id       BIGINT PRIMARY KEY,
@@ -476,153 +556,137 @@ async fn postgres_stream_announces_declared_types_before_the_first_row() -> rust
               label    VARCHAR(64),
               feeling  public.mood NOT NULL
             );
-            DROP PUBLICATION IF EXISTS typed_test_pub;
             CREATE PUBLICATION typed_test_pub FOR TABLE public.typed_test;
             ",
         )
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let source_cfg = PostgresSourceConfig {
-        host: host.to_string(),
+    let mut connection = PostgresConnection::new(typed_stream_config(
+        &host,
         port,
-        user: "postgres".to_string(),
-        password: "postgres".to_string().into(),
-        database: "cdc".to_string(),
-        replication_slot_name: "typed_test_slot".to_string(),
-        publication_name: "typed_test_pub".to_string(),
-        create_replication_slot_if_missing: true,
-        conn_timeout_secs: 30,
-        stream_poll_interval_ms: 50,
-        max_events_per_poll: 1_000,
-        transport: rustcdc::TransportConfig::plaintext(),
-        ..PostgresSourceConfig::default()
-    };
-
-    let mut connection = PostgresConnection::new(source_cfg);
+        "typed_test_slot",
+        "typed_test_pub",
+    ));
     connection.connect().await?;
     let mut stream_handle = connection.start_stream(None).await?;
 
     admin_client
-        .execute(
+        .batch_execute(
             "INSERT INTO public.typed_test (id, amount, label, feeling) \
-             VALUES (1, 12345.6789, 'hello', 'happy')",
-            &[],
+             VALUES (1, 12345.6789, 'hello', 'happy'); \
+             INSERT INTO public.typed_test (id, amount, label, feeling) \
+             VALUES (2, 1.0000, 'again', 'ok');",
         )
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-
-    let mut collected = Vec::new();
-    for _ in 0..100 {
-        let events = stream_handle.next_events(100).await?;
-        collected.extend(events);
-        if collected
-            .iter()
-            .any(|event: &rustcdc::Event| event.op == rustcdc::Operation::Insert)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    let insert_at = collected
-        .iter()
-        .position(|event| event.op == rustcdc::Operation::Insert)
-        .expect("the insert must arrive");
-    let schema_at = collected
-        .iter()
-        .position(|event| event.op == rustcdc::Operation::SchemaChange)
-        .expect("the table's schema must be announced");
+    let collected = collect_inserts(&mut stream_handle, 2).await?;
 
     assert!(
-        schema_at < insert_at,
-        "the schema must precede the first row it describes; got {:?}",
         collected
             .iter()
-            .map(|event| (event.op, event.table.clone()))
-            .collect::<Vec<_>>()
+            .all(|event| event.op == rustcdc::Operation::Insert),
+        "no schema event precedes the rows: {:?}",
+        collected.iter().map(|event| event.op).collect::<Vec<_>>()
     );
+    assert_eq!(collected.len(), 2);
+    let expected = catalogue_columns(&admin_client, "public.typed_test").await?;
+    assert_eq!(
+        expected,
+        vec![
+            ("id".to_string(), "bigint".to_string(), false),
+            ("amount".to_string(), "numeric(12,4)".to_string(), false),
+            (
+                "label".to_string(),
+                "character varying(64)".to_string(),
+                true
+            ),
+            ("feeling".to_string(), "mood".to_string(), false),
+        ],
+        "the fixture itself"
+    );
+    for row in &collected {
+        assert_eq!(
+            shape_columns(row),
+            expected,
+            "the row's shape is the catalogue's"
+        );
+        let shape = row.shape.as_ref().unwrap();
+        assert_eq!((shape.schema(), shape.table()), ("public", "typed_test"));
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
 
-    let after = collected[schema_at]
-        .after
-        .as_ref()
-        .expect("schema event payload");
-    assert_eq!(
-        after["ddl_type"], "READ_SCHEMA",
-        "a first sighting is an observation, not a change"
-    );
-    assert_eq!(collected[schema_at].table, "typed_test__ddl_events");
+    connection.close().await;
+    Ok(())
+}
 
-    let column = |name: &str| -> serde_json::Value {
-        after["result_schema"]["columns"]
-            .as_array()
-            .expect("columns array")
-            .iter()
-            .find(|column| column["name"] == name)
-            .cloned()
-            .unwrap_or_else(|| panic!("column '{name}' missing from {after}"))
-    };
-
-    assert_eq!(
-        column("amount")["data_type"],
-        serde_json::json!("numeric(12,4)"),
-        "the type modifier must survive; the pgoutput OID alone reports 'numeric'"
-    );
-    assert_eq!(
-        column("label")["data_type"],
-        serde_json::json!("character varying(64)"),
-        "format_type reports PostgreSQL's own spelling"
-    );
-    assert_eq!(
-        column("feeling")["data_type"],
-        serde_json::json!("mood"),
-        "a user-defined enum has an installation-specific OID, which the built-in map \
-         could only render as pg_type_oid:<N>"
-    );
-    assert_eq!(
-        column("amount")["nullable"],
-        serde_json::json!(false),
-        "a NOT NULL non-key column must not be published as nullable — pgoutput carries no \
-         nullability, so this can only come from the catalogue"
-    );
-    assert_eq!(column("label")["nullable"], serde_json::json!(true));
-    assert_eq!(column("id")["nullable"], serde_json::json!(false));
-    assert_eq!(
-        column("id")["constraints"],
-        serde_json::json!(["primary_key"])
-    );
-    assert_eq!(
-        after["result_schema"]["primary_keys"],
-        serde_json::json!(["id"])
-    );
-
-    // The announcement is once per table per run, not once per row.
+/// After `ALTER COLUMN … TYPE` the rows carry the new declared type: it comes from the
+/// `RELATION` message, not from the catalogue read when the stream started.
+#[tokio::test]
+async fn postgres_alter_column_type_reaches_the_row_shape() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres type change test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin_client) = start_logical_postgres().await?;
     admin_client
-        .execute(
-            "INSERT INTO public.typed_test (id, amount, label, feeling) \
-             VALUES (2, 1.0000, 'again', 'ok')",
-            &[],
+        .batch_execute(
+            "
+            CREATE TABLE public.priced (id BIGINT PRIMARY KEY, amount NUMERIC(12,4) NOT NULL);
+            CREATE PUBLICATION priced_pub FOR TABLE public.priced;
+            ",
         )
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let mut second = Vec::new();
-    for _ in 0..100 {
-        let events = stream_handle.next_events(100).await?;
-        second.extend(events);
-        if second
+    let mut connection = PostgresConnection::new(typed_stream_config(
+        &host,
+        port,
+        "priced_slot",
+        "priced_pub",
+    ));
+    connection.connect().await?;
+    let mut stream_handle = connection.start_stream(None).await?;
+
+    admin_client
+        .execute("INSERT INTO public.priced VALUES (1, 1.5)", &[])
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let before = collect_inserts(&mut stream_handle, 1).await?;
+
+    admin_client
+        .batch_execute(
+            "ALTER TABLE public.priced ALTER COLUMN amount TYPE NUMERIC(14,4); \
+             INSERT INTO public.priced VALUES (2, 2.5);",
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let after = collect_inserts(&mut stream_handle, 1).await?;
+
+    let row = |events: &[rustcdc::Event]| {
+        events
             .iter()
-            .any(|event: &rustcdc::Event| event.op == rustcdc::Operation::Insert)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(
-        second
-            .iter()
-            .all(|event| event.op != rustcdc::Operation::SchemaChange),
-        "an unchanged table must not be re-announced within a run"
+            .find(|event| event.op == rustcdc::Operation::Insert)
+            .cloned()
+            .expect("an insert")
+    };
+    assert_eq!(shape_columns(&row(&before))[1].1, "numeric(12,4)");
+    assert_eq!(
+        shape_columns(&row(&after))[1].1,
+        "numeric(14,4)",
+        "the row after the ALTER carries the type it was written under"
+    );
+    assert_eq!(
+        shape_columns(&row(&after)),
+        catalogue_columns(&admin_client, "public.priced").await?
+    );
+    let alter = after
+        .iter()
+        .find(|event| event.op == rustcdc::Operation::SchemaChange)
+        .expect("the changed RELATION is reported");
+    assert_eq!(
+        alter.after.as_ref().unwrap()["result_schema"]["columns"][1]["data_type"],
+        "numeric(14,4)"
     );
 
     connection.close().await;

@@ -158,10 +158,13 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
                 break;
             }
         }
-        let events = events
-            .into_iter()
-            .filter(|event| !event.op.is_schema_change())
-            .collect::<Vec<_>>();
+        // The table was created before the stream started; no schema event stands in
+        // front of its rows.
+        assert!(
+            events.iter().all(|event| !event.op.is_schema_change()),
+            "no schema event without DDL: {:?}",
+            events.iter().map(|event| event.op).collect::<Vec<_>>()
+        );
         stream_events.extend(events);
         if stream_events.len() >= 80 {
             break;

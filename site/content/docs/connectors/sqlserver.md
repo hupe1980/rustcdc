@@ -25,7 +25,7 @@ rows into the rustcdc event envelope.
 | `UPDATE` | yes | Full `before` + `after` |
 | `DELETE` | yes | Full `before` |
 | DDL changes | partial | Column additions captured; column drops may require re-enabling CDC on the table |
-| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
+| Column types | yes | Every row carries its table's declared columns in `shape` — see [Declared column types](#declared-column-types) |
 | `TRUNCATE` | opt-in | SQL Server CDC alone cannot log TRUNCATE. With `capture_truncate_events = true` the connector installs a database-level DDL trigger + shadow table and emits a `truncate` event positioned after all DML at the captured LSN |
 
 ### Minimum requirements

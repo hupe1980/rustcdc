@@ -518,12 +518,10 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         }
     }
 
-    // Five chunks of 1000 **events**, one of which is the table's schema announcement —
-    // so the first session reads 4 999 rows, not 5 000. The number is an artefact of chunk
-    // composition; what the test is about is that the checkpoint lands mid-snapshot and the
-    // resume neither duplicates nor skips. Those are asserted below, against the total.
-    assert!(
-        (4_999..=5_000).contains(&total_first_read),
+    // Five chunks of 1000 rows. What the test is about is that the checkpoint lands
+    // mid-snapshot and the resume neither duplicates nor skips; those are asserted below.
+    assert_eq!(
+        total_first_read, 5_000,
         "expected the first session to stop mid-snapshot, read {total_first_read}"
     );
 
@@ -762,12 +760,11 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         }
     }
 
-    // Four chunks of 1000 **events**, one of which is the schema announcement — so phase 1
-    // reads 3 999 rows. The exact number is chunk composition, not the property under test:
-    // what matters is that the checkpoint lands mid-snapshot, which the assertions after
-    // the resume then exercise against a mutated table.
-    assert!(
-        (3_999..=4_000).contains(&phase1_ids.len()),
+    // Four chunks of 1000 rows: the checkpoint lands mid-snapshot, which the assertions
+    // after the resume then exercise against a mutated table.
+    assert_eq!(
+        phase1_ids.len(),
+        4_000,
         "expected phase1 to stop mid-snapshot, read {}",
         phase1_ids.len()
     );
@@ -1853,31 +1850,46 @@ async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::
     let mut connection = PostgresConnection::new(snapshot_source_config(&host, port, "wide_slot"));
     connection.connect().await?;
     let mut handle = connection.start_snapshot(&["public.wide"]).await?;
-    let mut announcement_shape = None;
     let mut rows = Vec::new();
     loop {
         let chunk = handle.next_chunk(100).await?;
         if chunk.is_empty() {
             break;
         }
-        for event in chunk {
-            if event.op.is_schema_change() {
-                announcement_shape = event.shape.clone();
-            } else {
-                rows.push(event);
-            }
-        }
+        rows.extend(chunk);
     }
     handle.finish().await?;
     connection.close().await;
 
-    assert_eq!(rows.len(), 1, "the one row must be read: {rows:?}");
-    let announced = announcement_shape.expect("a live snapshot announces the table");
     assert_eq!(
-        rows[0].shape.as_ref(),
-        Some(&announced),
-        "a snapshot row carries the table's shape"
+        rows.len(),
+        1,
+        "the one row must be read, and nothing else: {rows:?}"
     );
+    let shape = rows[0]
+        .shape
+        .as_ref()
+        .expect("a snapshot row carries its shape");
+    let columns = shape.columns().expect("an inline shape");
+    assert_eq!(columns.len(), 60);
+    assert_eq!(
+        (
+            columns[0].name.as_str(),
+            columns[0].data_type.as_str(),
+            columns[0].nullable
+        ),
+        ("id", "bigint", false)
+    );
+    assert!(
+        columns[1..]
+            .iter()
+            .enumerate()
+            .all(|(i, column)| column.name == format!("c{}", i + 1)
+                && column.data_type == "text"
+                && column.nullable),
+        "each column as the table declares it: {columns:?}"
+    );
+    assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
     let after = rows[0]
         .after
         .as_ref()
@@ -2073,6 +2085,83 @@ async fn postgres_incremental_snapshot_reads_a_table_wider_than_fifty_columns()
     let second = rows[&2].as_object().expect("an object");
     assert_eq!(second["c1"], "", "an empty string is not NULL");
     assert!(second["c59"].is_null(), "a NULL column stays JSON null");
+    Ok(())
+}
+
+/// An incremental snapshot's rows carry the shape described before their chunk, matching
+/// the catalogue.
+#[tokio::test]
+async fn postgres_incremental_snapshot_rows_carry_the_shape() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres incremental shape test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+    admin
+        .batch_execute(
+            "CREATE TABLE public.shaped_inc (
+               id bigint PRIMARY KEY,
+               amount numeric(12,4) NOT NULL,
+               note varchar(10)
+             );
+             INSERT INTO public.shaped_inc VALUES (1, 1.5, 'a'), (2, 2.5, NULL), (3, 3.5, 'c');
+             CREATE PUBLICATION shaped_inc_slot_pub FOR TABLE public.shaped_inc;",
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut connection =
+        PostgresConnection::new(snapshot_source_config(&host, port, "shaped_inc_slot"));
+    connection.connect().await?;
+    let mut handle = connection
+        .start_incremental_snapshot(
+            IncrementalSnapshotConfig::new(vec!["public.shaped_inc".to_string()])
+                .with_chunk_size(2),
+            None,
+        )
+        .await?;
+
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        for event in handle.next_events(250).await? {
+            if snapshot_row_id(&event, "shaped_inc").is_some() {
+                rows.push(event);
+            }
+        }
+        if rows.len() == 3 {
+            break;
+        }
+    }
+    connection.close().await;
+
+    assert_eq!(rows.len(), 3, "every row must be read");
+    for row in &rows {
+        let shape = row
+            .shape
+            .as_ref()
+            .expect("an incremental snapshot row carries its shape");
+        let columns: Vec<_> = shape
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type.as_str(),
+                    column.nullable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                ("id", "bigint", false),
+                ("amount", "numeric(12,4)", false),
+                ("note", "character varying(10)", true)
+            ]
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
     Ok(())
 }
 

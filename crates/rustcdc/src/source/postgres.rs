@@ -25,6 +25,7 @@ pub mod incremental_snapshot;
 mod parser;
 mod pg_error;
 mod query;
+mod relation_catalog;
 mod reselect;
 mod snapshot_chunk;
 mod snapshot_finalize;
@@ -80,24 +81,25 @@ pub struct PostgresStreamHandle {
     stream: PostgresStream,
     provider: Box<dyn PgOutputMessageProvider>,
     relation_map: HashMap<u32, PgRelation>,
-    /// Per relation, the shape it was last announced under; see
-    /// [`Event::shape`](crate::Event::shape).
+    /// Per relation, the shape its rows carry, rebuilt on each changed `RELATION` message;
+    /// see [`Event::shape`](crate::Event::shape).
     relation_shapes: HashMap<u32, std::sync::Arc<crate::RowShape>>,
+    /// Resolves what a `RELATION` message does not carry. `None` only in unit tests, which
+    /// then describe types from the wire OID alone.
+    relation_catalog: Option<Box<dyn relation_catalog::RelationCatalog>>,
+    /// `format_type(oid, typmod)` per pair already resolved, so a type is asked for once.
+    type_names: HashMap<(u32, i32), String>,
     /// Real primary key of each published table, by `(schema, table)`, read from the catalog
-    /// once at stream start.
+    /// at stream start and again for a table whose `RELATION` changes.
     ///
     /// Needed because pgoutput's per-column key flag means "part of the replica identity", and
     /// under `REPLICA IDENTITY FULL` PostgreSQL sets it on every column. See
     /// [`query_publication_primary_keys`](super::postgres::query::query_publication_primary_keys)
     /// for what reading the flag as a primary key breaks.
     catalog_primary_keys: HashMap<(String, String), Vec<String>>,
-    /// Declared column types and nullability of every published table, read from the
-    /// catalog once at stream start.
-    ///
-    /// pgoutput carries a type OID, a type modifier it never used to read, and no
-    /// nullability at all — so the schema a RELATION message can describe on its own is
-    /// incomplete in three ways. See
-    /// [`query_publication_column_types`](super::postgres::query::query_publication_column_types).
+    /// Columns of every published table, read from the catalog at stream start and again for
+    /// a table whose `RELATION` changes. Only their nullability is used: pgoutput carries
+    /// none, while the declared type comes from the `RELATION` itself.
     catalog_columns: crate::source::schema_catalog::CatalogSchemas,
     /// Relations already warned about for an unusable REPLICA IDENTITY.
     ///
@@ -201,6 +203,8 @@ impl PostgresStreamHandle {
             provider,
             relation_map: HashMap::new(),
             relation_shapes: HashMap::new(),
+            relation_catalog: None,
+            type_names: HashMap::new(),
             catalog_primary_keys,
             catalog_columns,
             warned_replica_identity: std::collections::HashSet::new(),
@@ -229,6 +233,14 @@ impl PostgresStreamHandle {
 
     fn with_slot_state_sample_interval_ms(mut self, interval_ms: Option<u64>) -> Self {
         self.slot_state_sample_interval_ms = interval_ms;
+        self
+    }
+
+    fn with_relation_catalog(
+        mut self,
+        catalog: Box<dyn relation_catalog::RelationCatalog>,
+    ) -> Self {
+        self.relation_catalog = Some(catalog);
         self
     }
 }
@@ -2017,13 +2029,7 @@ mod tests {
         PgOutputXLogData { lsn, data }
     }
 
-    /// Row events only, with schema announcements filtered out.
-    ///
-    /// Every connector announces a table's schema before that table's first row, so a
-    /// test about row decoding would otherwise assert on an event it is not testing. The
-    /// announcement itself is pinned by its own tests — see
-    /// `a_table_is_announced_before_its_first_row` — which is where a regression in it
-    /// should fail, rather than in fourteen tests about inserts and updates.
+    /// Row events only, with the schema-change events a changed `RELATION` emits filtered out.
     fn rows_only(events: Vec<crate::core::Event>) -> Vec<crate::core::Event> {
         events
             .into_iter()
@@ -2299,36 +2305,23 @@ mod tests {
                 make_stream_handle_with_catalog(0, batch(), catalog(&["id"]), catalog_columns);
             let events = handle.next_events(50).await.unwrap();
 
-            let schema = events
-                .iter()
-                .find(|event| event.op == crate::core::Operation::SchemaChange)
-                .and_then(|event| event.after.clone())
-                .and_then(|after| after.get("result_schema").cloned())
-                .expect("the first sighting of a relation publishes its schema");
-
-            let column = |name: &str| -> serde_json::Value {
-                schema["columns"]
-                    .as_array()
-                    .expect("columns array")
+            let shape = events[0].shape.clone().expect("the row carries its shape");
+            let nullable = |name: &str| {
+                shape
+                    .columns()
+                    .unwrap()
                     .iter()
-                    .find(|column| column["name"] == name)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("column '{name}' missing from {schema}"))
+                    .find(|column| column.name == name)
+                    .unwrap_or_else(|| panic!("column '{name}' missing from {shape:?}"))
+                    .nullable
             };
 
-            assert_eq!(column("id")["nullable"], serde_json::json!(false));
-            assert_eq!(
-                column("small")["nullable"],
-                serde_json::json!(false),
+            assert!(!nullable("id"));
+            assert!(
+                !nullable("small"),
                 "a NOT NULL non-key column must not be published as nullable"
             );
-            assert_eq!(column("big")["nullable"], serde_json::json!(true));
-            assert_eq!(
-                column("small")["data_type"],
-                serde_json::json!("numeric(12,4)"),
-                "the declared type keeps its modifier; the wire type OID alone would say \
-                 'numeric'"
-            );
+            assert!(nullable("big"));
         }
     }
 
@@ -2668,9 +2661,184 @@ mod tests {
         assert_eq!(tx1.event_index, 1);
     }
 
-    /// A row carries the shape its relation was announced under.
+    /// Answers what a `RELATION` message leaves open from fixed maps, as the server would.
+    #[derive(Default)]
+    struct FakeRelationCatalog {
+        types: std::collections::HashMap<(u32, i32), String>,
+        tables: std::collections::HashMap<
+            (String, String),
+            (
+                Vec<crate::source::schema_catalog::CatalogColumn>,
+                Vec<String>,
+            ),
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl super::relation_catalog::RelationCatalog for FakeRelationCatalog {
+        async fn type_names(&self, types: &[(u32, i32)]) -> crate::core::Result<Vec<String>> {
+            Ok(types
+                .iter()
+                .map(|pair| self.types.get(pair).cloned().expect("type in the fake"))
+                .collect())
+        }
+
+        async fn columns_and_key(
+            &self,
+            schema: &str,
+            table: &str,
+        ) -> crate::core::Result<(
+            Vec<crate::source::schema_catalog::CatalogColumn>,
+            Vec<String>,
+        )> {
+            Ok(self
+                .tables
+                .get(&(schema.to_string(), table.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    const INT8: u32 = 20;
+    const NUMERIC: u32 = 1700;
+    const TEXT: u32 = 25;
+    /// `atttypmod` of `numeric(p,s)`: `((p << 16) | s) + VARHDRSZ`.
+    const fn numeric_typmod(precision: i32, scale: i32) -> i32 {
+        ((precision << 16) | scale) + 4
+    }
+
+    /// A `RELATION` message whose columns carry their own type OID and modifier.
+    fn build_typed_relation(
+        oid: u32,
+        name: &str,
+        replica_identity: u8,
+        cols: &[(&str, bool, u32, i32)],
+    ) -> Vec<u8> {
+        let mut buf = vec![b'R'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.extend_from_slice(b"public\0");
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.push(replica_identity);
+        buf.extend_from_slice(&(cols.len() as u16).to_be_bytes());
+        for (col, is_key, type_oid, typmod) in cols {
+            buf.push(u8::from(*is_key));
+            buf.extend_from_slice(col.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&type_oid.to_be_bytes());
+            buf.extend_from_slice(&typmod.to_be_bytes());
+        }
+        buf
+    }
+
+    fn catalog_column(
+        name: &str,
+        data_type: &str,
+        nullable: bool,
+    ) -> crate::source::schema_catalog::CatalogColumn {
+        crate::source::schema_catalog::CatalogColumn {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable,
+        }
+    }
+
+    fn shape_columns(event: &crate::core::Event) -> Vec<(String, String, bool)> {
+        event
+            .shape
+            .as_ref()
+            .expect("the row carries a shape")
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect()
+    }
+
+    fn owned(columns: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
+        columns
+            .iter()
+            .map(|(name, data_type, nullable)| {
+                ((*name).to_string(), (*data_type).to_string(), *nullable)
+            })
+            .collect()
+    }
+
+    fn items_types() -> std::collections::HashMap<(u32, i32), String> {
+        std::collections::HashMap::from([
+            ((INT8, -1), "bigint".to_string()),
+            ((TEXT, -1), "text".to_string()),
+            (
+                (NUMERIC, numeric_typmod(12, 4)),
+                "numeric(12,4)".to_string(),
+            ),
+            (
+                (NUMERIC, numeric_typmod(14, 4)),
+                "numeric(14,4)".to_string(),
+            ),
+        ])
+    }
+
+    /// A stream row carries the declared types of its `RELATION`, the catalogue's
+    /// nullability and the key.
     #[tokio::test]
-    async fn a_row_names_the_shape_its_announcement_carries() {
+    async fn postgres_rows_carry_the_catalogue_shape() {
+        const OID: u32 = 7;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_typed_relation(
+                    OID,
+                    "items",
+                    b'd',
+                    &[
+                        ("id", true, INT8, -1),
+                        ("amount", false, NUMERIC, numeric_typmod(12, 4)),
+                    ],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 10)),
+            xlog(150, build_insert(OID, &[Some("1"), Some("2.5000")])),
+            xlog(200, build_commit(200, 250, 0)),
+        ]]);
+        let catalog_columns = crate::source::schema_catalog::CatalogSchemas::from([(
+            ("public".to_string(), "items".to_string()),
+            vec![
+                catalog_column("id", "bigint", false),
+                catalog_column("amount", "numeric(12,4)", false),
+            ],
+        )]);
+        let mut handle = make_stream_handle_with_catalog(
+            0,
+            provider,
+            std::collections::HashMap::new(),
+            catalog_columns,
+        )
+        .with_relation_catalog(Box::new(FakeRelationCatalog {
+            types: items_types(),
+            ..FakeRelationCatalog::default()
+        }));
+
+        let events = handle.next_events(50).await.unwrap();
+
+        let shape = events[0].shape.as_ref().expect("the row carries a shape");
+        assert_eq!((shape.schema(), shape.table()), ("public", "items"));
+        assert_eq!(
+            shape_columns(&events[0]),
+            owned(&[("id", "bigint", false), ("amount", "numeric(12,4)", false)])
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
+
+    /// The first rows of a table in a run arrive alone; the shape is on each of them.
+    #[tokio::test]
+    async fn no_read_schema_event_is_emitted() {
         const OID: u32 = 7;
         let provider = MockPgOutputProvider::new(vec![vec![
             xlog(
@@ -2684,30 +2852,178 @@ mod tests {
         let mut handle = make_stream_handle(0, provider);
 
         let events = handle.next_events(50).await.unwrap();
-        let announcement = events
+
+        assert_eq!(
+            events.iter().map(|event| event.op).collect::<Vec<_>>(),
+            [crate::core::Operation::Insert],
+            "a RELATION seen for the first time emits no schema event"
+        );
+        assert!(events[0].shape.is_some());
+    }
+
+    /// After `ALTER COLUMN … TYPE` the rows carry the new type, taken from the `RELATION`
+    /// message — not the catalogue read at stream start, which still says the old one.
+    #[tokio::test]
+    async fn a_type_change_reaches_the_row_shape_from_the_relation() {
+        const OID: u32 = 9;
+        let relation = |typmod: i32| {
+            build_typed_relation(
+                OID,
+                "items",
+                b'd',
+                &[("id", true, INT8, -1), ("amount", false, NUMERIC, typmod)],
+            )
+        };
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(100, relation(numeric_typmod(12, 4))),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(150, build_insert(OID, &[Some("1"), Some("2.5000")])),
+                xlog(200, build_commit(200, 250, 0)),
+            ],
+            vec![
+                xlog(250, build_begin(300, 0, 11)),
+                xlog(260, relation(numeric_typmod(14, 4))),
+                xlog(280, build_insert(OID, &[Some("2"), Some("3.5000")])),
+                xlog(300, build_commit(300, 350, 0)),
+            ],
+        ]);
+        let catalog_columns = crate::source::schema_catalog::CatalogSchemas::from([(
+            ("public".to_string(), "items".to_string()),
+            vec![
+                catalog_column("id", "bigint", false),
+                catalog_column("amount", "numeric(12,4)", true),
+            ],
+        )]);
+        let mut handle = make_stream_handle_with_catalog(
+            0,
+            provider,
+            std::collections::HashMap::new(),
+            catalog_columns.clone(),
+        )
+        .with_relation_catalog(Box::new(FakeRelationCatalog {
+            types: items_types(),
+            tables: std::collections::HashMap::from([(
+                ("public".to_string(), "items".to_string()),
+                (
+                    catalog_columns[&("public".to_string(), "items".to_string())].clone(),
+                    vec!["id".to_string()],
+                ),
+            )]),
+        }));
+
+        let before = rows_only(handle.next_events(50).await.unwrap());
+        let after = handle.next_events(50).await.unwrap();
+
+        assert_eq!(shape_columns(&before[0])[1].1, "numeric(12,4)");
+        let row = after
+            .iter()
+            .find(|event| event.op == crate::core::Operation::Insert)
+            .expect("the row after the ALTER");
+        assert_eq!(
+            shape_columns(row)[1].1,
+            "numeric(14,4)",
+            "the type comes from the RELATION's modifier, not the stream-start catalogue"
+        );
+        let alter = after
             .iter()
             .find(|event| event.op.is_schema_change())
-            .expect("the first sight of a relation announces its schema");
-        let row = events
-            .iter()
-            .find(|event| !event.op.is_schema_change())
-            .expect("the insert");
-
-        assert!(announcement.shape.is_some(), "announcement carries a shape");
+            .expect("the changed RELATION is reported");
         assert_eq!(
-            row.shape, announcement.shape,
-            "the row must carry the shape it was captured under"
+            alter.after.as_ref().unwrap()["result_schema"]["columns"][1]["data_type"],
+            "numeric(14,4)"
         );
-        let columns: Vec<_> = row
-            .shape
-            .as_ref()
-            .unwrap()
-            .columns()
-            .unwrap()
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect();
-        assert_eq!(columns, ["id", "name"]);
+    }
+
+    /// pgoutput carries neither the primary key nor nullability, so a changed `RELATION`
+    /// re-reads both from the catalogue.
+    #[tokio::test]
+    async fn a_relation_change_rereads_the_key_and_nullability() {
+        const OID: u32 = 10;
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(
+                    100,
+                    build_typed_relation(
+                        OID,
+                        "items",
+                        b'f',
+                        &[("id", true, INT8, -1), ("code", true, TEXT, -1)],
+                    ),
+                ),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(150, build_insert(OID, &[Some("1"), Some("a")])),
+                xlog(200, build_commit(200, 250, 0)),
+            ],
+            vec![
+                xlog(250, build_begin(300, 0, 11)),
+                xlog(
+                    260,
+                    build_typed_relation(
+                        OID,
+                        "items",
+                        b'f',
+                        &[
+                            ("id", true, INT8, -1),
+                            ("code", true, TEXT, -1),
+                            ("region", true, TEXT, -1),
+                        ],
+                    ),
+                ),
+                xlog(280, build_insert(OID, &[Some("2"), Some("b"), Some("eu")])),
+                xlog(300, build_commit(300, 350, 0)),
+            ],
+        ]);
+        let key = ("public".to_string(), "items".to_string());
+        let mut handle = make_stream_handle_with_catalog(
+            0,
+            provider,
+            std::collections::HashMap::from([(key.clone(), vec!["id".to_string()])]),
+            crate::source::schema_catalog::CatalogSchemas::from([(
+                key.clone(),
+                vec![
+                    catalog_column("id", "bigint", false),
+                    catalog_column("code", "text", true),
+                ],
+            )]),
+        )
+        .with_relation_catalog(Box::new(FakeRelationCatalog {
+            types: items_types(),
+            tables: std::collections::HashMap::from([(
+                key,
+                (
+                    vec![
+                        catalog_column("id", "bigint", false),
+                        catalog_column("code", "text", false),
+                        catalog_column("region", "text", false),
+                    ],
+                    vec!["id".to_string(), "region".to_string()],
+                ),
+            )]),
+        }));
+
+        let before = rows_only(handle.next_events(50).await.unwrap());
+        let after = rows_only(handle.next_events(50).await.unwrap());
+
+        assert_eq!(before[0].primary_key, Some(vec!["id".to_string()]));
+        let shape = after[0].shape.as_ref().unwrap();
+        assert_eq!(
+            after[0].primary_key,
+            Some(vec!["id".to_string(), "region".to_string()]),
+            "the key the catalogue holds after the change"
+        );
+        assert_eq!(
+            shape.primary_key().unwrap(),
+            ["id".to_string(), "region".to_string()]
+        );
+        assert_eq!(
+            shape_columns(&after[0]),
+            owned(&[
+                ("id", "bigint", false),
+                ("code", "text", false),
+                ("region", "text", false)
+            ])
+        );
     }
 
     /// A shape change must reach the rows, or a consumer parses them with the old one.
@@ -3002,7 +3318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_announces_a_relation_then_reports_its_change() {
+    async fn stream_reports_a_relation_change() {
         const OID: u32 = 21;
         let provider = MockPgOutputProvider::new(vec![vec![
             xlog(
@@ -3022,33 +3338,10 @@ mod tests {
         let mut handle = make_stream_handle(0, provider);
 
         let events = handle.next_events(100).await.unwrap();
-        // Two: the first sighting is announced, then the added column is a change.
-        //
-        // The first RELATION used to emit nothing at all — `unwrap_or(false)` — which is
-        // precisely the moment a consumer needs the schema, because pgoutput sends
-        // RELATION before a table's first row. A table that never underwent DDL therefore
-        // had no type information anywhere in the stream, and column values are text.
-        assert_eq!(events.len(), 2);
+        // One: the first sighting describes the rows that follow it and emits nothing.
+        assert_eq!(events.len(), 1);
 
-        let observed = &events[0];
-        assert_eq!(observed.op, crate::core::Operation::SchemaChange);
-        assert_eq!(observed.source.offset, "0/00000064");
-        assert_eq!(observed.table, "users__ddl_events");
-        let after = observed.after.as_ref().expect("schema event payload");
-        assert_eq!(
-            after["ddl_type"], "READ_SCHEMA",
-            "a first sighting is an observation, not a change: reusing ALTER_TABLE would              tell every consumer that every table was altered on every restart"
-        );
-        assert_eq!(
-            after["result_schema"]["columns"]
-                .as_array()
-                .expect("columns")
-                .len(),
-            2,
-            "the observation carries the table's full column list"
-        );
-
-        let changed = &events[1];
+        let changed = &events[0];
         assert_eq!(changed.op, crate::core::Operation::SchemaChange);
         assert_eq!(changed.source.offset, "0/00000190");
         assert_eq!(changed.schema.as_deref(), Some("public"));
@@ -3058,6 +3351,14 @@ mod tests {
         assert_eq!(after["ddl_type"], "ALTER_TABLE");
         assert_eq!(after["schema"], "public");
         assert_eq!(after["table"], "users");
+        assert_eq!(
+            after["result_schema"]["columns"]
+                .as_array()
+                .expect("columns")
+                .len(),
+            3,
+            "the change carries the table's full column list"
+        );
     }
 
     #[tokio::test]
@@ -3675,7 +3976,6 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
                 shape: None,
             }],
             None,
@@ -3725,7 +4025,6 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
                 shape: None,
             }],
             None,
@@ -3779,7 +4078,6 @@ mod tests {
                 primary_key_columns: vec!["id".into()],
                 primary_key_types: vec!["bigint".into()],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
                 shape: None,
             }],
             None,
@@ -3849,7 +4147,6 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
                 shape: None,
             }],
             None,
@@ -3897,7 +4194,6 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
                 shape: None,
             }],
             None,
@@ -3950,7 +4246,6 @@ mod tests {
                 primary_key_columns: vec!["id".into()],
                 primary_key_types: vec!["bigint".into()],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
                 shape: None,
             }],
             None,
@@ -4126,37 +4421,11 @@ mod tests {
         );
 
         let events = handle.next_events(5).await.unwrap();
-        // Two for the allowed table — its first sighting is announced, and its added
-        // column is a change — and none at all for the excluded one.
         let tables: Vec<String> = events.iter().map(|event| event.table.clone()).collect();
         assert_eq!(
             tables,
-            vec![
-                "allowed_table__ddl_events".to_string(),
-                "allowed_table__ddl_events".to_string()
-            ],
+            vec!["allowed_table__ddl_events".to_string()],
             "only the allowlisted table may publish a schema, got {tables:?}"
-        );
-        // A schema-change event is published under a synthetic `<table>__ddl_events`
-        // name, which is exactly why the filter has to be applied at the source: no
-        // downstream matcher on the real table name can ever see it.
-        let ddl_types: Vec<String> = events
-            .iter()
-            .filter_map(|event| {
-                event
-                    .after
-                    .as_ref()?
-                    .get("ddl_type")?
-                    .as_str()
-                    .map(str::to_string)
-            })
-            .collect();
-        assert_eq!(
-            ddl_types,
-            vec!["READ_SCHEMA".to_string(), "ALTER_TABLE".to_string()],
-            "the first sighting is an observation and the added column is a change; \
-             collapsing the two would tell a consumer every table was altered on every \
-             restart"
         );
         assert!(
             !format!("{events:?}").contains("ssn"),
@@ -4227,7 +4496,7 @@ mod tests {
                     _ => "other",
                 })
                 .collect();
-            assert_eq!(positions, vec!["schema", "insert", "message"]);
+            assert_eq!(positions, vec!["insert", "message"]);
         }
 
         /// A non-transactional message is released immediately, not held for a commit.
@@ -4325,18 +4594,22 @@ mod tests {
         #[tokio::test]
         async fn a_schema_event_outside_a_transaction_carries_the_stream_position() {
             const OID: u32 = 31;
-            // A RELATION with no surrounding BEGIN, framed at wal_start 0 as pgoutput sends it.
-            let provider = MockPgOutputProvider::new(vec![vec![xlog(
-                0,
-                build_relation(OID, "public", "orders", &[("id", true)]),
-            )]]);
+            // A changed RELATION with no surrounding BEGIN, framed at wal_start 0 as pgoutput
+            // sends it.
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(0, build_relation(OID, "public", "orders", &[("id", true)])),
+                xlog(
+                    0,
+                    build_relation(OID, "public", "orders", &[("id", true), ("note", false)]),
+                ),
+            ]]);
             let mut handle = make_stream_handle(0x4000, provider);
 
             let events = handle.next_events(50).await.unwrap();
             let schema = events
                 .iter()
                 .find(|event| event.op == crate::core::Operation::SchemaChange)
-                .expect("the first sighting is announced");
+                .expect("the change is reported");
 
             assert!(
                 schema.transaction.is_none(),

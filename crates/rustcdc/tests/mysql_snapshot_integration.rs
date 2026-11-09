@@ -179,28 +179,26 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
     // Capture all snapshot chunks with bounded iterations to avoid infinite loops.
     let mut snapshot_events = Vec::new();
     let mut chunk_count = 0;
-    let mut announced: Option<std::sync::Arc<rustcdc::RowShape>> = None;
     for _ in 0..200 {
         let chunk = snapshot_handle.next_chunk(5000).await?;
         if chunk.is_empty() {
             break;
         }
-        let (announcements, chunk): (Vec<_>, Vec<_>) = chunk
-            .into_iter()
-            .partition(|event| event.op.is_schema_change());
-        if let Some(announcement) = announcements.first() {
-            announced = announcement.shape.clone();
-        }
         chunk_count += 1;
         snapshot_events.extend(chunk);
     }
     assert!(
-        announced.is_some(),
-        "the table is announced before its first row"
+        snapshot_events
+            .iter()
+            .all(|event| event.op == rustcdc::Operation::Read),
+        "a snapshot emits rows only; each carries its shape"
     );
+    let first_shape = snapshot_events[0].shape.clone();
     assert!(
-        snapshot_events.iter().all(|event| event.shape == announced),
-        "every snapshot row carries the table's shape"
+        snapshot_events
+            .iter()
+            .all(|event| event.shape == first_shape),
+        "every snapshot row carries the table's one shape"
     );
     // The shape is the catalogue's declaration, compared against information_schema itself.
     let declared: Vec<(String, String, String)> = sqlx::query_as(
@@ -212,7 +210,9 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
     .fetch_all(&admin_pool)
     .await
     .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-    let shape = announced.as_deref().expect("a shape");
+    let shape = first_shape
+        .as_deref()
+        .expect("a snapshot row carries a shape");
     let carried: Vec<(String, String, String)> = shape
         .columns()
         .expect("a complete shape")
@@ -538,5 +538,123 @@ async fn mysql_snapshot_empty_table() -> rustcdc::Result<()> {
     println!("✓ Empty table test: properly handled (0 events + snapshot end)");
 
     connection.close().await;
+    Ok(())
+}
+
+/// An incremental snapshot's rows carry the shape described before their chunk, matching
+/// `information_schema`.
+#[tokio::test]
+async fn mysql_incremental_snapshot_rows_carry_the_shape() -> rustcdc::Result<()> {
+    install_rustls_provider();
+    let _guard = mysql_snapshot_test_lock().lock().await;
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping mysql incremental shape test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let container = GenericImage::new("mysql", "8.0")
+        .with_exposed_port(3306.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
+        .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
+        .with_env_var("MYSQL_DATABASE", "cdc")
+        .with_cmd(vec![
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
+            "--server-id=1",
+        ])
+        .start()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let port = container
+        .get_host_port_ipv4(3306.tcp())
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let admin_pool =
+        connect_admin_pool(&format!("mysql://root:rootpass@{host}:{port}/cdc")).await?;
+    for statement in [
+        "CREATE TABLE shaped_inc (id BIGINT PRIMARY KEY, amount DECIMAL(12,4) NOT NULL, \
+         note VARCHAR(10)) ENGINE=InnoDB",
+        "INSERT INTO shaped_inc VALUES (1, 1.5, 'a'), (2, 2.5, NULL), (3, 3.5, 'c')",
+    ] {
+        sqlx::query(statement)
+            .execute(&admin_pool)
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    }
+
+    let mut connection = MysqlConnection::new(MysqlSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "root".to_string(),
+        password: "rootpass".to_string().into(),
+        database: "cdc".to_string(),
+        server_id: 300,
+        gtid_mode_enabled: false,
+        binlog_format_check: true,
+        transport: TransportConfig::tls_insecure_skip_verify(),
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        ..Default::default()
+    });
+    connection.connect().await?;
+    let mut handle = connection
+        .start_incremental_snapshot(
+            rustcdc::IncrementalSnapshotConfig::new(vec!["cdc.shaped_inc".to_string()])
+                .with_chunk_size(2),
+            None,
+        )
+        .await?;
+
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        rows.extend(
+            handle
+                .next_events(250)
+                .await?
+                .into_iter()
+                .filter(|event| event.op == rustcdc::Operation::Read),
+        );
+        if rows.len() == 3 {
+            break;
+        }
+    }
+    connection.close().await;
+
+    assert_eq!(rows.len(), 3, "every row must be read");
+    let declared: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT COLUMN_NAME, CAST(COLUMN_TYPE AS CHAR), IS_NULLABLE \
+         FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = 'cdc' AND TABLE_NAME = 'shaped_inc' \
+         ORDER BY ORDINAL_POSITION",
+    )
+    .fetch_all(&admin_pool)
+    .await
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    for row in &rows {
+        let shape = row
+            .shape
+            .as_ref()
+            .expect("an incremental snapshot row carries its shape");
+        let carried: Vec<(String, String, String)> = shape
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    if column.nullable { "YES" } else { "NO" }.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(carried, declared);
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
     Ok(())
 }
