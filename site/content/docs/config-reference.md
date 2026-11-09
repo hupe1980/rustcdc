@@ -652,7 +652,7 @@ needs `SqlPeek`.
 > **TLS means TLS.** `sslmode=require` is set on both connections whenever the transport is TLS.
 > `tokio-postgres` defaults to `prefer`, which silently falls back to plaintext against a server
 > with `ssl = off` — a config that says TLS and delivers cleartext, visible only in a packet
-> capture. A server that refuses TLS now fails the connection instead.
+> capture. A server that refuses TLS fails the connection.
 
 ### Large transactions spill on the server
 
@@ -965,10 +965,8 @@ for column names and key flags. Without it the values fall back to the raw ordin
 ### SQL Server
 
 `DECIMAL`, `NUMERIC`, `MONEY`, `DATETIME2`, `DATETIMEOFFSET`, `TIME`, `UNIQUEIDENTIFIER`,
-`VARBINARY` and `XML` all decode to their exact values. This is called out explicitly because
-an earlier version of the connector returned `null` for five of them — indistinguishable from a
-genuine SQL NULL, delivered as an authentic value, with no error anywhere. The fidelity suite
-now asserts non-null on every `NOT NULL` column precisely to catch a regression of that shape.
+`VARBINARY` and `XML` all decode to their exact values; the fidelity suite asserts non-null on
+every `NOT NULL` column, so a value decoded as `null` fails it.
 
 ## MySQL Source Configuration
 
@@ -1074,11 +1072,9 @@ sharing a `server_id` cause the server to evict one, and the eviction surfaces o
 generic disconnect. A deliberately invalid default forces the decision to be made once,
 explicitly.
 
-**Why the handoff drain has a time budget.** The previous implementation capped overlap
-draining at a hard-coded eight polls. On a high-traffic table with large batches that cap was
-exhausted before the overlap was drained, and the connector silently delivered duplicate rows.
-The budget is wall-clock instead, and exhausting it emits a `WARN` naming the residual count
-rather than passing the duplicates off as normal.
+**Why the handoff drain has a time budget.** A poll-count cap can be exhausted by large batches
+before the overlap is drained. The budget is wall-clock, and exhausting it emits a `WARN` naming
+the residual count.
 
 
 ### MySQL GTID String Format

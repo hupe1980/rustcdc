@@ -388,6 +388,19 @@ EXEC sys.sp_cdc_change_job
     @retention = 14400;   -- 14400 minutes = 10 days (default: 4320 = 3 days)
 ```
 
+### CDC disabled and re-enabled under the same capture instance
+
+**Symptom:** after `sp_cdc_disable_table` and `sp_cdc_enable_table` for a captured table, the
+connector stops with the same "no longer retained" error as above.
+
+**Cause:** changes made while CDC was off were never captured, and the new instance's history
+starts after the checkpoint. Continuing would hide that gap, so the connector stops.
+
+**Resolution:** to change a captured table's columns, add a second capture instance with a new
+`@capture_instance` name, let the connector pick it up, then disable the old one — SQL Server's
+documented way to evolve a captured table without a gap. If CDC was already disabled and
+re-enabled, re-snapshot as above.
+
 ### SQL Server Agent not running
 
 **Symptom:** CDC change tables exist but contain no rows even though the source

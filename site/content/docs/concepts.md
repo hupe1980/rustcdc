@@ -459,10 +459,8 @@ After `max_open_cycles` open cycles, the pipeline transitions to `Error` state.
 `/livez` returns 503, triggering a container restart in Kubernetes.
 
 **These parameters govern both halves of the pipeline.** Source poll failures and sink
-delivery failures share one policy and one breaker. That was not always true: sink
-treating such failures as unconditionally terminal would make a few-second broker leader election
-became a process exit and a full replay from the last checkpoint while these settings
-looked like they applied.
+delivery failures share one policy and one breaker, so a few-second broker leader election is a
+retry, not a process exit and a replay from the last checkpoint.
 
 A sink retry re-delivers the **same batch**. Under `at_least_once` that is duplication,
 which the contract permits; under `effectively_once` the aborted transaction discards

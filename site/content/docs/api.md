@@ -431,7 +431,7 @@ and silently drop the update — so they are never merged.
 
 It hangs off `Full` alone, which is where it was ever meaningful: a key-only image omits its
 non-key columns *by design*, not because of TOAST, and the two kinds of absence must not be
-conflated. Under the previous representation that was a validation rule; now it is unrepresentable.
+conflated. The type makes that unrepresentable.
 
 Only relevant if you consume the before-image (computing diffs, building compensating writes). A
 column listed here had *some* prior value; the source could not report it. Do not read its absence
@@ -441,9 +441,7 @@ as "was NULL".
 and CloudEvents each emit `before`, `before_is_key_only` and `before_unavailable_columns`, and the
 decoders read them back through one shared constructor, so a consumer's contract does not depend
 on which output format it reads — and a self-contradictory envelope is refused identically
-whichever codec carried it. Until 0.12.0 the CloudEvents encoder omitted
-`before_unavailable_columns`, which left its consumers unable to tell a TOASTed before-image column
-from a genuine `NULL` while consumers of the same stream in another format could.
+whichever codec carried it.
 
 ## Delivery And Acknowledgement Semantics
 
@@ -1043,9 +1041,8 @@ value — silently.
 - **PostgreSQL** overrides it with the engine's own visibility rule. A snapshot is
   `(xmin, xmax, xip)`, and a transaction is invisible exactly when `xid >= xmax || xip.contains(xid)`.
   Both halves matter: `xmax` is `latestCompletedXid + 1`, so a lone in-flight transaction sits *at*
-  `xmax` and never appears in `xip`. An earlier version tested `xip` alone and therefore missed
-  precisely the transactions it was added to catch — `pg_current_snapshot()` on a single-writer
-  database reports `733:733:` with 733 in flight.
+  `xmax` and never appears in `xip`: `pg_current_snapshot()` on a single-writer database reports
+  `733:733:` with 733 in flight.
 - **MySQL** overrides it with executed-GTID **set difference**, because `Executed_Gtid_Set` is
   updated after the engine commit while the binlog coordinate advances before it. A GTID set is
   only *partially* ordered, so no `>` comparison could express this. Requires `gtid_mode = ON`;
@@ -1418,18 +1415,13 @@ ways to hit it are all ordinary-looking config: an `include_columns` list that o
 PK, a `FieldMappingTransform` rename, or `MaskRule::Encrypt` on a key column (a fresh nonce
 per call gives every event for the same row a different key).
 
-**Declaring the events keyless is allowed.** The guard distinguishes two things that used
-to be one condition: an event whose `primary_key` still names columns the payload no longer
-carries (an accident — rejected), and one whose `primary_key` a stage set to `None` (a
-deliberate, visible choice — permitted). Before 0.13.0 the error message recommended
-clearing `Event::primary_key`, and doing so tripped the very guard that recommended it.
+**Declaring the events keyless is allowed.** The guard distinguishes an event whose
+`primary_key` still names columns the payload no longer carries (an accident — rejected) from one
+whose `primary_key` a stage set to `None` (a deliberate, visible choice — permitted).
 
-**A keyless table does not trip it.** The batch-path guard is evaluated per *table*: a
-table whose events resolved a key before the stage and do not after it. Until 0.13.0 it
-asked the much weaker question "did any event in this batch have a key, and does any event
-now lack one" — two different events — so a batch mixing a keyed table with a keyless one
-(no primary key, or `REPLICA IDENTITY NOTHING`) failed on **every** poll, permanently, for
-any pipeline with a transform configured.
+**A keyless table does not trip it.** The batch-path guard is evaluated per *table*: a table whose
+events resolved a key before the stage and do not after it. A batch mixing a keyed table with a
+keyless one (no primary key, or `REPLICA IDENTITY NOTHING`) passes.
 
 ### A transform that rewrites columns must keep `unavailable_columns` in step
 
@@ -1734,14 +1726,7 @@ so an incompatible auto-registration fails with a clear message rather than an o
 
 ### `auto_register = false` means no writes at all
 
-The setting is enforced by the encoders themselves, not only by an explicit preflight call.
-`ConfluentAvroEncoder` always resolved both subjects itself, so it honoured the setting.
-The JSON Schema and Protobuf encoders delegate subject resolution to `schemreg`, whose
-resolution path through its 0.4 release *was* `register_schema` with no lookup-only mode —
-so the setting was **silently ignored** by both, and an operator who set it got schemas
-registered anyway plus none of the schema-identity checking it exists to buy.
-
-Since schemreg 0.5 there is a lookup-only mode, and rustcdc uses it: with
+The setting is enforced by the encoders themselves, not only by an explicit preflight call: with
 `auto_register = false` all three encoders resolve through
 `SchemaResolution::LookupOnly`, which reads the id without writing. **A read-only
 producer principal — `Subject:Read` and nothing more — is a supported

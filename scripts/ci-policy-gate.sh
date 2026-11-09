@@ -994,6 +994,22 @@ run_reexport_coverage_check() {
   echo "Re-export coverage check passed."
 }
 
+run_published_docs_history_check() {
+  # Published docs describe current behaviour; history belongs in CHANGELOG.md. A page that
+  # narrates releases ("until 0.12", "used to", "we reported") reads as a changelog and goes
+  # stale with every release. A line that must name a past version carries <!-- history-ok -->.
+  local pattern hits
+  pattern='([Uu]ntil|[Ss]ince|[Bb]efore|[Aa]s of) (rustcdc |v)?0\.[0-9]+([^0-9]|$)|[Ss]ince [a-z][a-z0-9_-]* [0-9]+\.[0-9]|[Aa]n earlier (version|release)|[Ee]arlier releases|(^|[.:] )(Previously|Formerly)|[Uu]sed to (be|say|call|read|return|accept|reject|fail)|(was|did) not always|[Tt]he previous (implementation|representation|release|behaviou?r)|[Ww]e reported|[a-z]+ 0\.[0-9]+ (removed|added|fixed|changed)|its 0\.[0-9]+ release|[ (]now (fails|rejects|refuses|carries|emits) |[Nn]o [a-z ]*suite yet|[Uu]ntil it does'
+  hits="$(git grep -nE "$pattern" -- 'site/content/**/*.md' README.md 'crates/*/README.md' 'site/templates/*.html' \
+    | grep -v 'history-ok' || true)"
+  if [[ -n "$hits" ]]; then
+    echo "published docs history check failed: describe current behaviour; history goes in CHANGELOG.md" >&2
+    echo "$hits" >&2
+    exit 1
+  fi
+  echo "Published docs history check passed (no release narration in site/, READMEs or templates)."
+}
+
 run_floating_image_tag_check() {
   # No container image a suite, script or workflow pulls may use a `latest` tag, which
   # tests a different server on each pull, so a failure can be neither reproduced nor
@@ -1073,5 +1089,6 @@ run_licence_presence_check
 run_workflow_drift_check
 run_rust_version_pin_check
 run_floating_image_tag_check
+run_published_docs_history_check
 
 echo "Policy gate passed."
