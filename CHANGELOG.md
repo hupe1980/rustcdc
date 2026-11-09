@@ -20,11 +20,15 @@ its `id`, a digest of exactly those fields. A row decodes on its own: no second 
 ordering, no registry. The `READ_SCHEMA` announcement events are gone; the runtime records each new
 shape in schema history from the rows. Builds on #28 by vu2jpr.
 
-- **Never stale.** PostgreSQL takes declared types from the `RELATION` message
+- **Current, within stated limits.** PostgreSQL takes declared types from the `RELATION` message
   (`format_type(oid, typmod)`), so rows after `ALTER COLUMN … TYPE` carry the new type — 0.18 and
   0.19 announced the type read at stream start. MySQL and MariaDB stamp the catalogue's shape only
   when it agrees with the row's binlog table map (names, type family, nullability, key) and re-read
-  it after DDL and on resume; until it agrees, rows carry no shape.
+  it after DDL and on resume; until it agrees, rows carry no shape. *Limits:* PostgreSQL
+  nullability and key are the catalogue's at its last read; a MySQL/MariaDB change within one type
+  family (`varchar(64)` to `varchar(128)`) is invisible to the table map; an incremental chunk
+  does not see a type change between its describe and its read. See
+  [schema evolution](site/content/docs/schema-evolution.md#every-row-carries-its-shape).
 - **Everywhere it is known:** snapshot, incremental snapshot and stream rows on PostgreSQL, MySQL,
   MariaDB and SQL Server. No shape: the Snowflake source, truncate events, an offline snapshot.
 - **Transforms keep it honest.** A projection narrows the shape; a rename, mask, unwrap, outbox or
@@ -63,8 +67,8 @@ An unmodified column's new value is its old value, and under `FULL` the old tupl
 - **`delivery_failing`.** A sink that kept refusing a batch read as `idle`, and the runtime's own
   verdict for a held batch was `poll_loop_not_turning` — which `/livez` restarts on, replaying into
   the same refusal. `StallCause::DeliveryFailing` names it with the destination's last error;
-  embedders report failures with `CdcRuntime::record_delivery_failure`. SIGTERM interrupts a retry
-  backoff, and a send timeout names its table.
+  embedders report failures with `CdcRuntime::record_delivery_failure`. SIGTERM interrupts a sink
+  retry backoff, and a send timeout names its table.
 - **`source_position_lost`.** A slot PostgreSQL invalidates (`max_slot_wal_keep_size`, 18's
   `idle_replication_slot_timeout`) is `SourceErrorKind::SlotInvalidated`, decided by SQLSTATE and
   the slot's row in `pg_replication_slots`, never by message text. The server parks — alive,
@@ -99,8 +103,11 @@ An unmodified column's new value is its old value, and under `FULL` the old tupl
 1. **MSRV 1.97.0.**
 2. **`READ_SCHEMA` events are gone**, with `DDL_TYPE_READ_SCHEMA` and
    `CapturedDdl::is_observation`. PostgreSQL emits a schema event only when a relation changes.
-3. **`Event::schema_id` is replaced by `Event::shape`** in every envelope: `EVENT_JSON_SCHEMA`
-   (which sets `additionalProperties: false`), Avro, and Protobuf (field 15 reserved).
+   `CapturedDdl::history_identity` is now always position-derived; it was content-derived for
+   observations.
+3. **`Event` gained `shape`** in every envelope: `EVENT_JSON_SCHEMA` (closed by
+   `additionalProperties: false`, so a pinned copy rejects it), Avro, and Protobuf (field 16;
+   `ProtoEvent` gained `pub shape`, so its struct literals stop compiling).
 4. **`SnapshotTable` gained `shape`**, and `PostgresSourceConfig` gained
    `slot_state_sample_interval_ms`: struct literals without `..Default::default()` stop compiling.
 5. **Under `REPLICA IDENTITY FULL`, an unchanged-TOAST update is a full-row write:**
@@ -122,11 +129,11 @@ An unmodified column's new value is its old value, and under `FULL` the old tupl
 
 ### Evidence
 
-`1 258` library and `589` server unit tests and the doctests, green, with `clippy -D warnings`,
-`cargo deny` and the policy gate. Container suites: PostgreSQL 16 and 18 (snapshot, stream,
-handoff, type fidelity, reselect, slot invalidation, process crash), MySQL, MariaDB, SQL Server
-2019/2022/2025 and the server's Kafka and PostgreSQL suites. Every new test was run against its
-defect planted back and failed.
+`1 261` library and `592` server unit tests and the doctests, green, with `clippy -D warnings`,
+`cargo deny` and the policy gate. Container suites: PostgreSQL 16 (snapshot, incremental snapshot,
+stream, handoff, type fidelity, reselect, restart, process crash), connection on 12, 14 and 15,
+slot invalidation on 18; MySQL, MariaDB, SQL Server 2019/2022/2025 and the server's Kafka and
+PostgreSQL suites. Every new test was run against its defect planted back and failed.
 
 ## 0.19.0
 

@@ -128,7 +128,7 @@ message Event {
   // Always empty when before_is_key_only is true.
   repeated string before_unavailable_columns = 14;
 
-  // Reserved so a message from an older writer is never misread.
+  // Reserved: pre-release builds of this envelope wrote `schema_id` here.
   reserved 15;
   reserved "schema_id";
 
