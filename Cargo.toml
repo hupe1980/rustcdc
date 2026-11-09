@@ -38,7 +38,7 @@ rust-version = "1.97.0"
 authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/rustcdc"
-homepage = "https://github.com/hupe1980/rustcdc"
+homepage = "https://hupe1980.github.io/rustcdc"
 
 # Dependencies shared by more than one crate, declared once.
 #

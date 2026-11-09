@@ -170,6 +170,40 @@ impl From<AppError> for rustcdc::core::Error {
     }
 }
 
+// ── Config errors ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("no configuration file found; provide one via --config-file")]
+    NoConfigFile,
+
+    #[error("failed to load configuration: {0}")]
+    Load(Box<figment::Error>),
+
+    #[error("api_version must be \"v1\", got \"{0}\"")]
+    InvalidApiVersion(String),
+
+    #[error("no source configured; set exactly one [source.<connector>] block in the config file")]
+    NoSourceConfigured,
+
+    #[error("invalid source configuration: {0}")]
+    InvalidSource(String),
+
+    /// Any validation failure that is not source selection.
+    ///
+    /// The message names the section it came from (`registries.<name>: …`,
+    /// `pipeline.transforms[0]…`), so a variant per section would add nothing an
+    /// operator can act on.
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
+}
+
+impl From<figment::Error> for ConfigError {
+    fn from(value: figment::Error) -> Self {
+        Self::Load(Box::new(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::AppError;
@@ -235,39 +269,5 @@ mod tests {
             !AppError::Runtime(aggregated).is_recoverable(),
             "one terminal branch must make the aggregate terminal"
         );
-    }
-}
-
-// ── Config errors ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("no configuration file found; provide one via --config-file")]
-    NoConfigFile,
-
-    #[error("failed to load configuration: {0}")]
-    Load(Box<figment::Error>),
-
-    #[error("api_version must be \"v1\", got \"{0}\"")]
-    InvalidApiVersion(String),
-
-    #[error("no source configured; set exactly one [source.<connector>] block in the config file")]
-    NoSourceConfigured,
-
-    #[error("invalid source configuration: {0}")]
-    InvalidSource(String),
-
-    /// Any validation failure that is not source selection.
-    ///
-    /// The message names the section it came from (`registries.<name>: …`,
-    /// `pipeline.transforms[0]…`), so a variant per section would add nothing an
-    /// operator can act on.
-    #[error("invalid configuration: {0}")]
-    Invalid(String),
-}
-
-impl From<figment::Error> for ConfigError {
-    fn from(value: figment::Error) -> Self {
-        Self::Load(Box::new(value))
     }
 }
