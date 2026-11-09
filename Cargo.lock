@@ -3940,9 +3940,9 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60335c5de8ceea70f3673ea707daeba85adc069a04b13fb0046c32cdfbb12eb0"
+checksum = "19061a83b10619985cf9ba76a93fb4d842fdbc7c7963b849a5a29b383ed7a6b0"
 dependencies = [
  "ahash",
  "arc-swap",

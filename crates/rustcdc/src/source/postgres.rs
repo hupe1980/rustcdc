@@ -812,7 +812,7 @@ impl PostgresConnection {
                     .map_err(|error| {
                         Error::SourceError(format!(
                             "postgres plaintext connection failed: {}",
-                            crate::core::render_error_chain(&error)
+                            PgError::from(error)
                         ))
                     })?;
                 let connection_task = tokio::spawn(run_connection_task(connection));
@@ -881,7 +881,7 @@ impl PostgresConnection {
                         .map_err(|error| {
                             Error::SourceError(format!(
                                 "postgres tls connection failed: {}",
-                                crate::core::render_error_chain(&error)
+                                PgError::from(error)
                             ))
                         })?;
 
@@ -2868,6 +2868,39 @@ mod tests {
             }
             other => panic!("expected a full pre-image, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_key_only_pre_image_never_fills_a_hole() {
+        // `K`: DEFAULT identity, key changed. The key tuple's absent columns mean "not
+        // logged", not "unchanged", so `body` stays reported even though `K` is present.
+        const OID: u32 = 33;
+        let mut update = vec![b'U'];
+        update.extend_from_slice(&OID.to_be_bytes());
+        update.push(b'K');
+        append_tuple_data_with_toast(&mut update, &[Some(Some("1")), None, None]);
+        update.push(b'N');
+        append_tuple_data_with_toast(&mut update, &[Some(Some("2")), Some(Some("t")), Some(None)]);
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(
+                    OID,
+                    "public",
+                    "docs",
+                    &[("id", true), ("title", false), ("body", false)],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(150, update),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let events = rows_only(handle.next_events(100).await.unwrap());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].before, BeforeImage::KeyOnly { .. }));
+        assert_eq!(events[0].unavailable_columns, vec!["body".to_string()]);
+        assert!(events[0].after.as_ref().unwrap().get("body").is_none());
     }
 
     #[tokio::test]

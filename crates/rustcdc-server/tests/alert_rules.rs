@@ -303,3 +303,35 @@ fn no_alert_rule_depends_on_a_millisecond_denominated_latency_metric() {
         offenders.join("\n  ")
     );
 }
+
+/// Every `cause="…"` an alert selects on is a cause the runtime reports, and every cause the
+/// runtime reports is routed by a rule. The metric-name check cannot see either: the family
+/// `rustcdc_runtime_stall_cause` exists, so a misspelt label value matched nothing forever and
+/// read as coverage.
+#[test]
+fn every_stall_cause_is_routed_and_every_routed_cause_exists() {
+    let rules = std::fs::read_to_string(repo_root().join("monitoring/rustcdc_slo_alerts.yml"))
+        .expect("read alert rules");
+    let routed: BTreeSet<String> = rules
+        .match_indices("rustcdc_runtime_stall_cause{cause=\"")
+        .filter_map(|(at, prefix)| {
+            let rest = &rules[at + prefix.len()..];
+            rest.find('"').map(|end| rest[..end].to_string())
+        })
+        .collect();
+    let reported: BTreeSet<String> = rustcdc::core::StallCause::ALL
+        .iter()
+        .map(|cause| cause.as_str().to_string())
+        .collect();
+
+    let unknown: Vec<_> = routed.difference(&reported).collect();
+    assert!(
+        unknown.is_empty(),
+        "alert rules select causes the runtime never reports: {unknown:?}"
+    );
+    let unrouted: Vec<_> = reported.difference(&routed).collect();
+    assert!(
+        unrouted.is_empty(),
+        "stall causes no alert rule routes: {unrouted:?}"
+    );
+}

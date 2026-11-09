@@ -80,11 +80,13 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -151,15 +153,18 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
 
     let mut read_count = 0_u64;
     let mut chunk_count = 0_u32;
+    let mut announced: Option<String> = None;
     loop {
         let chunk = snapshot.next_chunk(128).await?;
         if chunk.is_empty() {
             break;
         }
-        let chunk = chunk
+        let (announcements, chunk): (Vec<_>, Vec<_>) = chunk
             .into_iter()
-            .filter(|event| !event.op.is_schema_change())
-            .collect::<Vec<_>>();
+            .partition(|event| event.op.is_schema_change());
+        if let Some(announcement) = announcements.first() {
+            announced = announcement.schema_id.clone();
+        }
 
         chunk_count += 1;
         for event in chunk {
@@ -168,6 +173,14 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
             assert_eq!(event.schema.as_deref(), Some("dbo"));
             assert!(event.snapshot.is_some());
             assert!(event.after.is_some());
+            assert!(
+                announced.is_some(),
+                "the table is announced before its first row"
+            );
+            assert_eq!(
+                event.schema_id, announced,
+                "a snapshot row must name its announcement's shape"
+            );
             read_count = read_count.saturating_add(1);
         }
     }
@@ -189,11 +202,13 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(

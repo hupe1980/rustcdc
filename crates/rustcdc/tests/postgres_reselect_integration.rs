@@ -334,3 +334,117 @@ async fn a_row_deleted_before_the_reselect_leaves_the_columns_absent() -> rustcd
 
     Ok(())
 }
+
+/// Reselect builds its projection from the holes alone, with the snapshot's row builder, so
+/// an event with more than 50 unavailable columns hit PostgreSQL's 100-argument limit. Sixty
+/// out-of-line columns, all left untouched by one update under DEFAULT identity.
+#[tokio::test]
+async fn reselect_fills_more_than_fifty_holes_in_one_event() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres wide reselect test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let container = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec!["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let (admin, admin_conn) = tokio_postgres::connect(
+        &format!("host={host} port={port} user=postgres password=postgres dbname=cdc"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+
+    let columns = (1..=60).map(|i| format!("b{i} text")).collect::<Vec<_>>();
+    let storage = (1..=60)
+        .map(|i| format!("ALTER TABLE public.wide_docs ALTER COLUMN b{i} SET STORAGE EXTERNAL;"))
+        .collect::<String>();
+    let values = (1..=60)
+        .map(|i| format!("repeat('{}', 3000)", (b'a' + (i % 26) as u8) as char))
+        .collect::<Vec<_>>();
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE public.wide_docs (id bigint PRIMARY KEY, title text, {});
+             {storage}
+             INSERT INTO public.wide_docs VALUES (1, 'first', {});
+             CREATE PUBLICATION wide_docs_pub FOR TABLE public.wide_docs;",
+            columns.join(", "),
+            values.join(", ")
+        ))
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut connection = PostgresConnection::new(PostgresSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "postgres".to_string(),
+        password: "postgres".to_string().into(),
+        database: "cdc".to_string(),
+        replication_slot_name: "wide_docs_slot".to_string(),
+        publication_name: "wide_docs_pub".to_string(),
+        create_replication_slot_if_missing: true,
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        transport: rustcdc::TransportConfig::plaintext(),
+        reselect_unavailable_columns: true,
+        ..PostgresSourceConfig::default()
+    });
+    connection.connect().await?;
+    let mut stream = connection.start_stream(None).await?;
+    admin
+        .execute(
+            "UPDATE public.wide_docs SET title = 'renamed' WHERE id = 1",
+            &[],
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut update = None;
+    for _ in 0..100 {
+        if let Some(event) = stream
+            .next_events(200)
+            .await?
+            .into_iter()
+            .find(|event| event.op == Operation::Update)
+        {
+            update = Some(event);
+            break;
+        }
+    }
+    let update = update.expect("an UPDATE within the poll budget");
+    connection.close().await;
+
+    assert!(
+        update.unavailable_columns.is_empty(),
+        "all sixty holes must be filled: {:?}",
+        update.unavailable_columns
+    );
+    let after = update
+        .after
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .expect("an after image");
+    assert_eq!(after.len(), 62, "id, title and sixty filled columns");
+    assert_eq!(after["b60"].as_str().map(str::len), Some(3000));
+    Ok(())
+}

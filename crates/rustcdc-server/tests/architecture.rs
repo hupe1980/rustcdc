@@ -1580,8 +1580,41 @@ fn every_integration_suite_is_run_by_ci() {
 /// tiberius at any version.
 #[test]
 fn the_default_build_has_one_tls_stack() {
+    let tree = normal_dependency_tree(&[]);
+    assert_one_tls_stack(&tree, "a default build");
+
+    let tiberius = crate_versions(&tree, "tiberius");
+    assert!(
+        tiberius.is_empty(),
+        "a default build must not link tiberius ({tiberius:?}). Something re-enabled the \
+         `sqlserver` feature, or a new dependency pulled it in transitively. Run `cargo tree \
+         --edges normal -i tiberius` to find the edge."
+    );
+}
+
+/// The published image is built `--all-features`, every connector included, and it too must
+/// link one TLS stack. `sqlserver` used to be the documented exception — its driver pinned an
+/// older rustls with its own verifier and advisories — and a guard that excused that build
+/// would let any future dependency re-add a second stack to exactly the artefact users run.
+#[test]
+fn the_all_features_build_has_one_tls_stack() {
+    let tree = normal_dependency_tree(&["--all-features"]);
+    assert_one_tls_stack(&tree, "an --all-features build (the published image)");
+}
+
+/// The check itself, against a planted second stack: a guard that cannot fire reads as coverage.
+#[test]
+#[should_panic(expected = "must link exactly one rustls")]
+fn the_tls_stack_check_fires_on_a_second_rustls() {
+    let planted = "rustcdc v0.20.0\nrustls v0.23.46\nrustls v0.21.12\nrustls-webpki v0.103.8\n";
+    assert_one_tls_stack(planted, "a planted tree");
+}
+
+fn normal_dependency_tree(extra: &[&str]) -> String {
+    let mut args = vec!["tree", "--edges", "normal", "--prefix", "none"];
+    args.extend_from_slice(extra);
     let output = std::process::Command::new(env!("CARGO"))
-        .args(["tree", "--edges", "normal", "--prefix", "none"])
+        .args(&args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("cargo tree");
@@ -1590,36 +1623,31 @@ fn the_default_build_has_one_tls_stack() {
         "cargo tree failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let tree = String::from_utf8_lossy(&output.stdout);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
 
-    let versions_of = |name: &str| -> std::collections::BTreeSet<String> {
-        tree.lines()
-            .filter_map(|line| {
-                let mut words = line.split_whitespace();
-                (words.next() == Some(name)).then(|| words.next().unwrap_or("").to_string())
-            })
-            .collect()
-    };
+fn crate_versions(tree: &str, name: &str) -> std::collections::BTreeSet<String> {
+    tree.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some(name)).then(|| words.next().unwrap_or("").to_string())
+        })
+        .collect()
+}
 
+fn assert_one_tls_stack(tree: &str, which: &str) {
     for name in ["rustls", "rustls-webpki"] {
-        let versions = versions_of(name);
+        let versions = crate_versions(tree, name);
         assert_eq!(
             versions.len(),
             1,
-            "a default build must link exactly one {name}, found {versions:?}. A second one is \
-             a second TLS stack with its own advisories. Run `cargo tree --edges normal -i \
+            "{which} must link exactly one {name}, found {versions:?}. A second one is a \
+             second TLS stack with its own advisories. Run `cargo tree --edges normal -i \
              {name}` to find the edge."
         );
     }
-
-    let tiberius = versions_of("tiberius");
-    assert!(
-        tiberius.is_empty(),
-        "a default build must not link tiberius ({tiberius:?}). Something re-enabled the \
-         `sqlserver` feature, or a new dependency pulled it in transitively. Run `cargo tree \
-         --edges normal -i tiberius` to find the edge."
-    );
 }
+
 /// Every `SourceDriver` variant must appear in `KNOWN_SOURCE_DRIVERS`.
 ///
 /// The two lists serve different masters: the enum is what serde can parse in *this*

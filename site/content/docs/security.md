@@ -105,41 +105,27 @@ Every advisory suppression in `deny.toml` must carry the RUSTSEC ID, the exact p
 chain, and the reason it cannot be fixed today. Suppressions are removed as soon as
 upstream ships a fix.
 
-## Known exposure: `sqlserver` feature
+## One TLS stack, in every build
 
-> **This is the only unfixed vulnerability class in a production code path.** Everything
-> else suppressed in `deny.toml` is dev-dependency-only and absent from released builds.
+Every TLS connection rustcdc makes — every source including SQL Server, every sink, the schema
+registries and the admin listener — goes through one `rustls` 0.23 and one `rustls-webpki`. A
+test asserts it against the resolved dependency graph of both the default build and the
+`--all-features` build the container image is made from, so a dependency that adds a second
+stack fails the build rather than shipping.
 
-Enabling the `sqlserver` feature pulls in `tiberius 0.12.3`, which hard-pins
-`tokio-rustls 0.24` and therefore `rustls 0.21` / `rustls-webpki 0.101.7`. That copy of
-webpki carries three advisories:
+The crypto backend under it is `aws-lc-rs` in the server, installed as the process default at
+startup. The library uses `ring` unless you install a process default; its `sqlserver` feature
+also compiles `aws-lc-rs`, which the SQL Server driver selects when you have not.
 
-| Advisory | Issue | Reachable in rustcdc? |
-|---|---|---|
-| [RUSTSEC-2026-0098](https://rustsec.org/advisories/RUSTSEC-2026-0098) | URI name constraints ignored, therefore accepted | No path depends on it — webpki 0.101 offers no API to assert URI names, and rustcdc asserts none |
-| [RUSTSEC-2026-0099](https://rustsec.org/advisories/RUSTSEC-2026-0099) | Name constraints accepted for wildcard names | **In principle yes** — it is in the server-certificate verification path |
-| [RUSTSEC-2026-0104](https://rustsec.org/advisories/RUSTSEC-2026-0104) | Reachable panic parsing certificate revocation lists | No — rustcdc never configures a CRL, and tiberius exposes no API to supply one |
+## What `deny.toml` still suppresses
 
-**Why it is not fixed:** `tiberius 0.12.3` is the latest published release. The advisories
-are fixed only in `rustls-webpki >= 0.103.12`, which requires `rustls 0.23` — not
-semver-reachable from tiberius' pin. rustcdc's *own* TLS stack is already `rustls 0.23`;
-this older copy exists solely inside tiberius and cannot be deduplicated away.
+Three advisories, none in a path that handles untrusted TLS or decrypts anything:
 
-**What exploitation requires.** All three are name-constraint or CRL parsing defects.
-Name constraints restrict certificates that are otherwise properly issued, so the bug is
-reached only *after* signature verification succeeds. Exploiting RUSTSEC-2026-0099
-additionally requires a CA the client already trusts to have **misissued** a wildcard
-certificate that escapes a name constraint.
-
-**Guidance:**
-
-- Deployments that pin a private CA via `TransportConfig::tls_with_ca_cert_path(...)` and
-  do not rely on name-constrained intermediates are not materially exposed.
-- Deployments that cannot accept this exposure should not enable the `sqlserver` feature.
-  It is opt-in; `--no-default-features` and the PostgreSQL/MySQL/MariaDB profiles do not
-  compile tiberius at all.
-- The suppressions in `deny.toml` will be removed as soon as tiberius publishes a release
-  built against `rustls 0.23`.
+| Advisory | Crate | Where | Why it stays |
+|---|---|---|---|
+| [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436) | `paste` | Proc-macro, compile time only | No fixed release exists |
+| [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) | `rsa` 0.9 | Azure Blob request signing, through OpenDAL | A timing side-channel in RSA *decryption*; signing does not decrypt. Clears when the signer moves to `rsa` 0.10 |
+| [RUSTSEC-2026-0440](https://rustsec.org/advisories/RUSTSEC-2026-0440) | `astral-tokio-tar` | `testcontainers`, a dev-dependency | Unmaintained notice; in no published crate and no image |
 
 ## Reporting
 

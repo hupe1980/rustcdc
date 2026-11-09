@@ -111,11 +111,13 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -277,11 +279,13 @@ async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh()
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(

@@ -179,18 +179,31 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
     // Capture all snapshot chunks with bounded iterations to avoid infinite loops.
     let mut snapshot_events = Vec::new();
     let mut chunk_count = 0;
+    let mut announced: Option<String> = None;
     for _ in 0..200 {
         let chunk = snapshot_handle.next_chunk(5000).await?;
         if chunk.is_empty() {
             break;
         }
-        let chunk = chunk
+        let (announcements, chunk): (Vec<_>, Vec<_>) = chunk
             .into_iter()
-            .filter(|event| !event.op.is_schema_change())
-            .collect::<Vec<_>>();
+            .partition(|event| event.op.is_schema_change());
+        if let Some(announcement) = announcements.first() {
+            announced = announcement.schema_id.clone();
+        }
         chunk_count += 1;
         snapshot_events.extend(chunk);
     }
+    assert!(
+        announced.is_some(),
+        "the table is announced before its first row"
+    );
+    assert!(
+        snapshot_events
+            .iter()
+            .all(|event| event.schema_id == announced),
+        "every snapshot row must name its announcement's shape"
+    );
 
     let _snapshot_end = snapshot_handle.finish().await?;
 

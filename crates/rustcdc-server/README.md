@@ -158,11 +158,9 @@ export POSTGRES_PASSWORD="mysecret"
 
 **Connectors are cargo features.** `--all-features` above builds them all; the *default*
 is PostgreSQL alone, and `--features mysql` / `--features sqlserver` add the others.
-That is a security boundary rather than packaging taste: `sqlserver` pulls `tiberius`,
-which pins rustls 0.21 — a second TLS stack with its own X.509 verifier and four
-suppressed RUSTSEC advisories that nothing else in the tree carries. A PostgreSQL-only
-build links exactly one rustls, and a config naming a connector the binary lacks is
-rejected at startup with the feature to rebuild with. The container image is built
+A connector you leave out is a driver you do not link. Every build links one TLS stack,
+whichever connectors it has, and a config naming a connector the binary lacks is rejected at
+startup with the feature to rebuild with. The container image is built
 `--all-features` and loses nothing.
 
 ### Minimal `config.toml`

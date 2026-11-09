@@ -161,7 +161,7 @@ one.
 
 ## 3. One TLS stack in the default build
 
-`tests/architecture.rs::the_default_build_has_one_tls_stack`
+`tests/architecture.rs::the_default_build_has_one_tls_stack`, `the_all_features_build_has_one_tls_stack`
 
 **The defect class.** A dependency quietly adding a second TLS implementation. Two stacks
 means two X.509 verifiers, two certificate-validation code paths and two advisory streams —
@@ -171,13 +171,15 @@ and the second one is invariably the unmaintained one.
 not against `Cargo.toml`. A transitive dependency is exactly as capable of adding a stack as
 a direct one.
 
-**Why it exists.** `tiberius 0.12` pins rustls 0.21 and brings four suppressed RUSTSEC
-advisories with it. That is why connectors are opt-in cargo features rather than always
-compiled: a PostgreSQL-only build links one stack and needs none of the reachability
-analysis that "unreachable in your configuration" requires.
+**Why it exists.** The SQL Server driver once pinned an older rustls and brought four
+suppressed RUSTSEC advisories with it, and "unreachable in your configuration" is not an answer
+an auditor accepts. The driver now shares the crate's stack, so the guard covers both the default
+build and the `--all-features` build the container image ships
+(`the_all_features_build_has_one_tls_stack`); a planted second `rustls` fails it
+(`the_tls_stack_check_fires_on_a_second_rustls`).
 
-**Does not catch:** a second stack in a non-default feature combination. Enabling
-`sqlserver` deliberately re-adds one, which is documented rather than prevented.
+**Does not catch:** a second TLS *implementation* that is not rustls — `native-tls`, OpenSSL.
+`cargo deny`'s bans are where that would be refused.
 
 
 ## 4. Spec drift between the router and `/openapi.json`

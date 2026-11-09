@@ -387,7 +387,8 @@ impl PostgresStreamHandle {
                 snapshot: None,
                 transaction: self.tx_meta(),
                 envelope_version: EVENT_ENVELOPE_VERSION,
-                schema_id: self.relation_schema_id(oid),
+                // A truncate carries no row, so it names no shape — the rule on every connector.
+                schema_id: None,
                 unavailable_columns: Vec::new(),
             })
             .collect()

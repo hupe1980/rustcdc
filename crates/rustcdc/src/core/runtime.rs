@@ -922,6 +922,17 @@ pub enum StallCause {
 }
 
 impl StallCause {
+    /// Every cause, in the order [`derive_health`](CdcRuntime::admin_snapshot) checks them.
+    ///
+    /// For routing tables and alert-rule checks that must cover each cause. A test with an
+    /// exhaustive `match` keeps it complete.
+    pub const ALL: &'static [StallCause] = &[
+        Self::UnconfirmedSourcePosition,
+        Self::DeliveryFailing,
+        Self::PollLoopNotTurning,
+        Self::ConsumerNotAcknowledging,
+    ];
+
     /// Short stable label for metrics, dashboards and log fields.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -5454,6 +5465,25 @@ mod tests {
         assert!(
             !matches!(&after_commit, HealthVerdict::Stalled { cause, .. } if *cause == StallCause::DeliveryFailing),
             "a commit must clear the delivery failure: {after_commit:?}"
+        );
+    }
+
+    /// `StallCause::ALL` lists every variant: the `match` below stops compiling when one is
+    /// added, and the count then fails until `ALL` gains it.
+    #[test]
+    fn stall_cause_all_lists_every_variant() {
+        let named = |cause: StallCause| match cause {
+            StallCause::UnconfirmedSourcePosition
+            | StallCause::DeliveryFailing
+            | StallCause::PollLoopNotTurning
+            | StallCause::ConsumerNotAcknowledging => cause.as_str(),
+        };
+        let labels: std::collections::BTreeSet<_> =
+            StallCause::ALL.iter().map(|c| named(*c)).collect();
+        assert_eq!(
+            labels.len(),
+            4,
+            "ALL must hold each variant once: {labels:?}"
         );
     }
 

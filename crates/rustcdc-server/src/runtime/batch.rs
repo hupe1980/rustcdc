@@ -501,6 +501,54 @@ pub(crate) async fn flush_sink_with_timeout(
 
 #[cfg(test)]
 mod tests {
+    /// A send that times out names what it was sending. The message used to be
+    /// "sink send operation timed out after N ms", so with a topic template and many tables
+    /// nothing said which table's destination was refusing writes.
+    #[tokio::test]
+    async fn a_send_timeout_names_the_table_and_operation() {
+        // Accepts the connection and never answers: the send neither succeeds nor fails.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let sink = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": format!("http://{addr}/events"),
+            "batch_max_events": 1,
+            "max_retries": 0,
+        }))
+        .expect("http sink config");
+        let binding =
+            crate::sink::build_binding(&sink, &crate::sink::SinkBuildContext::new(1 << 20))
+                .await
+                .expect("http binding");
+        let mut router = crate::pipeline::router::single(binding);
+        let event = rustcdc::core::Event::builder("orders", rustcdc::core::Operation::Update)
+            .after(serde_json::json!({ "id": 1 }))
+            .schema("app")
+            .primary_key(["id"])
+            .build();
+
+        let error = super::send_event_with_timeout(&mut router, &event, 100)
+            .await
+            .expect_err("a destination that never answers must time out");
+        let message = error.to_string();
+        assert!(
+            message.contains("app.orders"),
+            "the table must be named: {message}"
+        );
+        assert!(
+            message.contains("update"),
+            "the operation must be named: {message}"
+        );
+    }
+
     use super::process_batch_events;
     use crate::config::schema::{SinkConfig, StdoutSinkConfig, TransformRuntimeConfig};
     use crate::pipeline::transform::TransformPipeline;

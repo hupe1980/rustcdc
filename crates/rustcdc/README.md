@@ -307,17 +307,11 @@ TLS is the default for every connector and needs no feature flag for private-CA 
 deployments — configure `TransportConfig::tls_with_ca_cert_path(...)` or
 `TransportConfig::mtls(...)` directly.
 
-> **`sqlserver` negotiates TLS with a different stack than the rest of the crate.**
-> Everything else in rustcdc — every other connector, every sink — is on `rustls 0.23`.
-> `tiberius 0.12.3` hard-pins `tokio-rustls 0.24`, so enabling `sqlserver` adds a second,
-> older copy: `rustls 0.21` / `rustls-webpki 0.101.7`, carrying RUSTSEC-2026-0098, -0099
-> and -0104, plus the unmaintained `rustls-pemfile 1.0` via `rustls-native-certs 0.6`.
-> It is not deduplicable and not fixable from here — the fix needs a tiberius release
-> built against `rustls 0.23`. Two of the three advisories are unreachable on rustcdc's
-> code paths and the third needs CA misissuance to exploit; the per-advisory reachability
-> analysis, the `cargo deny` suppressions and the mitigations are in
-> [security](https://hupe1980.github.io/rustcdc/docs/security/#known-exposure-sqlserver-feature).
-> Deployments that cannot accept it should leave the feature off — it is not a default.
+Every connector, SQL Server included, negotiates TLS on the same `rustls` 0.23 stack as the rest
+of the crate; a test holds every feature combination to one `rustls` and one `rustls-webpki`.
+The crate's own connections use the `ring` crypto provider (or a process-wide default you
+install). `sqlserver` additionally compiles `aws-lc-rs`, which its driver selects for its own
+connections when no process default is installed — one TLS implementation, two crypto backends.
 
 ## Examples
 

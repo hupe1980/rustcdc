@@ -601,6 +601,11 @@ async fn a_failing_delivery_is_published_as_its_own_stall_while_the_batch_is_ret
         ),
         "the verdict published during the retries must name the failing delivery"
     );
+    assert_eq!(
+        pipeline.admin_state.batches_processed_for_tests().await,
+        0,
+        "publishing health during a retry must not count a batch that never delivered"
+    );
 }
 
 /// **A shutdown request is honoured during a retry backoff.**

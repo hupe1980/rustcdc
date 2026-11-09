@@ -31,11 +31,13 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin =

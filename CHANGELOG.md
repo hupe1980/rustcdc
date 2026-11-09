@@ -33,13 +33,14 @@ privilege briefly revoked) now recovers.
 
 The row was built with one `json_build_object` call taking two arguments per column, and
 PostgreSQL caps a call at 100 arguments. It is now `json_object(text[], text[])`, which has no
-column limit and renders byte-identical text. This affected the initial snapshot, the incremental
+column limit and produces the same JSON object. This affected the initial snapshot, the incremental
 snapshot and `reselect_unavailable_columns`. Thanks to rustama1211, whose fork carried the same
 fix.
 
 ### Fixed: PostgreSQL errors said only `db error` (#25)
 
-Every PostgreSQL client error the source reports now carries the server's SQLSTATE and message,
+Every PostgreSQL client error the source reports — at connect, in the snapshot, in the stream —
+now carries the server's SQLSTATE and message,
 and its detail and hint when sent — `42501: permission denied for table orders` rather than
 `db error`. A client-side failure carries its cause chain.
 
@@ -83,13 +84,37 @@ the rows captured under it carry the same value. Contributed by vu2jpr.
 - Carried by every codec that decodes — JSON, Avro (nullable, default `null`), Protobuf
   (field 15) — and by CloudEvents in `data`.
 
+### Changed: dependencies, and one TLS stack in every build
+
+`iceberg` 0.10.1 → **0.11.0**, `opendal` 0.57 → **0.58**, `krafka` 0.24 → **0.29**, `schemreg`
+0.6 → **0.7**, `wasmtime` 48 → **50**, `tiberius` 0.12 → **0.13**, `axum-server` 0.7 → **0.9**;
+`zip` removed (unused). The MSRV is **1.97.0**, set by `wasmtime` 50.
+
+- **`sqlserver` no longer links a second TLS stack.** `tiberius` 0.13 is on `rustls` 0.23, so the
+  four advisories that came with its old copy are gone and every build links one `rustls` and one
+  `rustls-webpki` — asserted for the default build and, newly, for the `--all-features` build the
+  image ships. `sqlserver` still compiles `aws-lc-rs` beside the library's `ring`; the driver uses
+  it when no process-wide crypto provider is installed. Tested on SQL Server 2019 CU32, 2022 CU27
+  and, newly, 2025 CU10. `tiberius` 0.13's 30 s per-round-trip default is turned off, so a large
+  snapshot query is not cut short.
+- **Fixed: an empty Kafka transaction failed its commit.** A route that received no record in a
+  batch still opened a Kafka transaction, and the broker refuses to commit one that carried
+  nothing. The transaction now opens on its first record; an empty barrier ends without contacting
+  the broker.
+- Ten advisories cleared (RUSTSEC-2025-0134, -2026-0098/-0099/-0104, -0194/-0195,
+  -0346/-0349/-0382, and four against `zip`). Three remain suppressed, none on a path that handles
+  untrusted TLS: `paste` (compile time), `rsa` 0.9 (Azure request *signing*), `astral-tokio-tar`
+  (a test dependency).
+- Every container image the suites pull is pinned — the brokers, and SQL Server, which floated as
+  `2022-latest` — and the policy gate fails on a floating tag.
+
 ### Breaking
 
-1. **`EVENT_JSON_SCHEMA` gained `schema_id`.** It sets `additionalProperties: false`, so a
+1. **MSRV raised to 1.97.0** from 1.95.0.
+2. **`EVENT_JSON_SCHEMA` gained `schema_id`.** It sets `additionalProperties: false`, so a
    consumer validating against a pinned copy of the previous schema rejects new events.
-2. **Under `REPLICA IDENTITY FULL`, an unchanged-TOAST update is a full-row write.**
+3. **Under `REPLICA IDENTITY FULL`, an unchanged-TOAST update is a full-row write.**
    `unavailable_columns` is empty and `row_write()` returns `Replace` where it returned `Merge`.
-3. **`StallCause` gained `DeliveryFailing`**; an exhaustive `match` must handle it.
 4. **A held, failing batch is no longer reported as `poll_loop_not_turning`**, so an alert or a
    runbook keyed on that cause for sink outages must move to `delivery_failing`.
 

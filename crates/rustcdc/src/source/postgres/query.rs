@@ -454,8 +454,8 @@ pub(super) async fn query_all_columns(
 /// The latter takes two arguments per column and PostgreSQL caps a call at `FUNC_MAX_ARGS`
 /// (100), so a table of 51 columns could not be read at all. `ARRAY[…]` is a constructor, not a
 /// call, so the two-array form has no column limit. The values array is cast to `text[]`
-/// because an all-NULL row otherwise has no resolvable element type. The rendered text is
-/// identical to `json_build_object`'s.
+/// because an all-NULL row otherwise has no resolvable element type. It yields the same JSON
+/// object as `json_build_object`.
 ///
 /// Verified against PostgreSQL 18:
 /// `{"b" : "t", "n" : null, "e" : "", "x" : "9223372036854775807"}`.

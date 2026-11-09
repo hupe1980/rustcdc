@@ -15,9 +15,7 @@
 //! # Connector features
 //!
 //! Source connectors are opt-in cargo features (`postgres`, `mysql`, `sqlserver`), so a
-//! deployment links only the drivers it uses — the point being that a PostgreSQL-only
-//! build stops shipping `tiberius`, and with it a second TLS stack carrying four
-//! suppressed RUSTSEC advisories.
+//! deployment links only the drivers it uses, and audits and patches only those.
 //!
 //! **At least one is required.** A binary with no source connector cannot capture
 //! anything: every config would be rejected by `reject_uncompiled_source_driver`, and the

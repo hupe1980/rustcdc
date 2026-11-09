@@ -610,7 +610,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
-        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-CU27-ubuntu-22.04
       - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features sqlserver
@@ -637,7 +637,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
-        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-CU27-ubuntu-22.04
       - name: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
         run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 

@@ -36,6 +36,12 @@ ignore = [
     # opendal-service-azblob <- opendal, i.e. only Azure request signing. Nothing here
     # performs RSA decryption. Remove when reqsign releases against rsa >= 0.10.
     { id = "RUSTSEC-2023-0071" },
+
+    # RUSTSEC-2026-0440: astral-tokio-tar is unmaintained (2026-11-03). Reached only through
+    # testcontainers, a dev-dependency of rustcdc (`cargo tree -i astral-tokio-tar -e all`),
+    # so it is in no published crate and no image. testcontainers 0.28 still depends on it.
+    # Remove when testcontainers moves off it.
+    { id = "RUSTSEC-2026-0440" },
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
@@ -90,6 +96,23 @@ deny = [
 # Remove entries when the upstream diamond is resolved.
 # ──────────────────────────────────────────────────────────────────────────
 skip = [
+    # Duplicates the 0.20 dependency move introduced, each traced with
+    # `cargo tree -i <crate>@<version> --target all -e normal,build` on 2026-11-09:
+    #   - zstd / zstd-safe 0.13 vs 0.14: apache-avro 0.21 (pinned by iceberg 0.11) vs krafka
+    #       0.29's `zstd` feature. Resolves when iceberg moves to apache-avro 0.22.
+    #   - strum / strum_macros 0.27 vs 0.28: apache-avro 0.21 (iceberg) vs jsonschema 0.61
+    #       (schemreg 0.7). Same trigger.
+    #   - asyncband 0.6 vs 0.7: fastpool (opendal-service-redis) vs reqsign-azure-storage
+    #       (opendal-service-azblob) — inside opendal 0.58's own service crates.
+    #   - spin 0.9 vs 0.10: lazy_static <- num-bigint-dig <- rsa 0.9 <- reqsign-azure-storage,
+    #       vs crc-fast <- opendal-service-s3. Inside opendal 0.58; resolves with rsa 0.10
+    #       (the same trigger as RUSTSEC-2023-0071 above).
+    { name = "zstd" },
+    { name = "zstd-safe" },
+    { name = "strum" },
+    { name = "strum_macros" },
+    { name = "asyncband" },
+    { name = "spin" },
     # RustCrypto generation split: rustcdc 0.8 moved to the 0.11/0.6 generation
     # (aes-gcm 0.11, sha2 0.11, hkdf 0.13) while iceberg 0.11 still pins aes-gcm 0.10
     # for its Puffin/KMS encryption. Both are pure-Rust AEAD implementations of the

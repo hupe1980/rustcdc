@@ -965,6 +965,31 @@ run_reexport_coverage_check() {
   echo "Re-export coverage check passed."
 }
 
+run_floating_image_tag_check() {
+  # No container image a suite, script or workflow pulls may float. A floating tag tests a
+  # different server on each pull, so a failure can be neither reproduced nor attributed —
+  # and every SQL Server suite pulled `2022-latest` while the notes said the brokers were the
+  # only unpinned images. Tracked files only; comments are skipped, and the release workflow's
+  # `:latest` is the tag rustcdc *publishes*, not one it pulls.
+  # Image references only: `repo/name:…latest`, a quoted `"…latest"` tag passed to a
+  # container helper in test code, and the CI pre-pull argument. A runner label such as
+  # `ubuntu-latest` is none of these.
+  local hits
+  hits="$( {
+    git grep -nE '[a-z0-9.-]+/[a-z0-9._/-]+:[A-Za-z0-9._-]*latest([^A-Za-z0-9_]|$)' -- \
+      'crates/*/tests/*' 'scripts/*' 'docker/*' 'demo/*' '.github/workflows/*' \
+      ':!.github/workflows/release.yml' ':!scripts/ci-policy-gate.sh'
+    git grep -nE '"[^"]*latest"' -- 'crates/*/tests/*.rs'
+    git grep -nE -- '--sqlserver-soft [^ ]*latest' -- '.github/workflows/*'
+  } | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(#|//)' || true)"
+  if [[ -n "$hits" ]]; then
+    echo "floating image tag check failed: pin these to a version" >&2
+    echo "$hits" >&2
+    exit 1
+  fi
+  echo "Floating image tag check passed (no :latest or -latest image in tests, scripts or workflows)."
+}
+
 run_rust_version_pin_check() {
   # Every Rust toolchain pinned in a Dockerfile must be the workspace MSRV.
   #
@@ -1018,5 +1043,6 @@ run_workflow_path_check
 run_licence_presence_check
 run_workflow_drift_check
 run_rust_version_pin_check
+run_floating_image_tag_check
 
 echo "Policy gate passed."

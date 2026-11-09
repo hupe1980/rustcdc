@@ -63,11 +63,13 @@ async fn sqlserver_decodes_non_trivial_types_without_loss() -> rustcdc::Result<(
     if sqlserver_testkit::skip_docker_test("sqlserver type-fidelity test") {
         return Ok(());
     }
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(container) => container,
-        Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
-        Err(error) => return Err(error),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(container) => container,
+            Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
     let database = "rustcdc_types";
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -301,11 +303,13 @@ async fn sqlserver_null_is_distinguishable_from_an_undecodable_value() -> rustcd
     if sqlserver_testkit::skip_docker_test("sqlserver null-fidelity test") {
         return Ok(());
     }
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(container) => container,
-        Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
-        Err(error) => return Err(error),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(container) => container,
+            Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
     let database = "rustcdc_nulls";
     let mut admin = sqlserver_testkit::connect_admin_with_retry(

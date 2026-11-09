@@ -1766,14 +1766,15 @@ fn snapshot_row_id(event: &rustcdc::Event, table: &str) -> Option<i64> {
         .or_else(|| event.after.as_ref()?.get("id")?.as_str()?.parse().ok())
 }
 
-/// A PostgreSQL 18 container with logical replication, and an admin client on it.
+/// A PostgreSQL container with logical replication, and an admin client on it.
 async fn start_snapshot_postgres() -> rustcdc::Result<(
     testcontainers::ContainerAsync<GenericImage>,
     String,
     u16,
     tokio_postgres::Client,
 )> {
-    let container = GenericImage::new("postgres", "18-alpine")
+    // The tag CI pre-pulls; nothing these tests pin is specific to a newer release.
+    let container = GenericImage::new("postgres", "16-alpine")
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -1852,22 +1853,32 @@ async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::
     let mut connection = PostgresConnection::new(snapshot_source_config(&host, port, "wide_slot"));
     connection.connect().await?;
     let mut handle = connection.start_snapshot(&["public.wide"]).await?;
+    let mut announcement_schema_id = None;
     let mut rows = Vec::new();
     loop {
         let chunk = handle.next_chunk(100).await?;
         if chunk.is_empty() {
             break;
         }
-        rows.extend(
-            chunk
-                .into_iter()
-                .filter(|event| !event.op.is_schema_change()),
-        );
+        for event in chunk {
+            if event.op.is_schema_change() {
+                announcement_schema_id = event.schema_id.clone();
+            } else {
+                rows.push(event);
+            }
+        }
     }
     handle.finish().await?;
     connection.close().await;
 
     assert_eq!(rows.len(), 1, "the one row must be read: {rows:?}");
+    // The row names the shape its announcement carries.
+    let announced = announcement_schema_id.expect("a live snapshot announces the table");
+    assert_eq!(
+        rows[0].schema_id.as_deref(),
+        Some(announced.as_str()),
+        "a snapshot row must name its announcement's shape"
+    );
     let after = rows[0]
         .after
         .as_ref()
@@ -2001,7 +2012,91 @@ async fn postgres_snapshot_recovers_from_a_failed_chunk_without_losing_rows() ->
     assert_eq!(
         second_ids,
         vec![1, 2, 3, 4, 5],
-        "the recovered snapshot must read one consistent point, not autocommit"
+        "after recovery the snapshot reads in a fresh REPEATABLE READ transaction, not in autocommit; a row inserted after it opened belongs to the stream"
+    );
+    Ok(())
+}
+
+/// The incremental snapshot builds its rows with the same projection, so it had the same
+/// 100-argument limit. Sixty columns, read through the incremental snapshot driver.
+#[tokio::test]
+async fn postgres_incremental_snapshot_reads_a_table_wider_than_fifty_columns()
+-> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping postgres wide incremental snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)"
+        );
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+    let columns = (1..60).map(|i| format!("c{i} text")).collect::<Vec<_>>();
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE public.wide_inc (id bigint PRIMARY KEY, {});
+             INSERT INTO public.wide_inc (id, c1, c59) VALUES (1, 'x', 'last'), (2, '', NULL);
+             CREATE PUBLICATION wide_inc_slot_pub FOR TABLE public.wide_inc;",
+            columns.join(", ")
+        ))
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut connection =
+        PostgresConnection::new(snapshot_source_config(&host, port, "wide_inc_slot"));
+    connection.connect().await?;
+    let mut handle = connection
+        .start_incremental_snapshot(
+            IncrementalSnapshotConfig::new(vec!["public.wide_inc".to_string()]).with_chunk_size(10),
+            None,
+        )
+        .await?;
+
+    let mut rows = std::collections::BTreeMap::new();
+    for _ in 0..100 {
+        for event in handle.next_events(250).await? {
+            if let Some(id) = snapshot_row_id(&event, "wide_inc") {
+                rows.insert(id, event.after.clone().expect("a read carries a row"));
+            }
+        }
+        if rows.len() == 2 {
+            break;
+        }
+    }
+    connection.close().await;
+
+    assert_eq!(rows.len(), 2, "both rows must be read: {rows:?}");
+    let first = rows[&1].as_object().expect("an object");
+    assert_eq!(
+        first.len(),
+        60,
+        "every column must be in the row: {first:?}"
+    );
+    assert_eq!(first["c59"], "last");
+    let second = rows[&2].as_object().expect("an object");
+    assert_eq!(second["c1"], "", "an empty string is not NULL");
+    assert!(second["c59"].is_null(), "a NULL column stays JSON null");
+    Ok(())
+}
+
+/// A server-side failure at connect carries the server's SQLSTATE, not only `db error`.
+#[tokio::test]
+async fn postgres_connect_errors_carry_the_servers_sqlstate() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres connect-error test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, _admin) = start_snapshot_postgres().await?;
+    let config = PostgresSourceConfig {
+        password: "wrong".to_string().into(),
+        ..snapshot_source_config(&host, port, "bad_auth_slot")
+    };
+    let connection = PostgresConnection::new(config);
+    let error = connection
+        .connect()
+        .await
+        .expect_err("a wrong password must be refused");
+    assert!(
+        error.to_string().contains("28P01"),
+        "the server's SQLSTATE for a failed password must reach the error: {error}"
     );
     Ok(())
 }
