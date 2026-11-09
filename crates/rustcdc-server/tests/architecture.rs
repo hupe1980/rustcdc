@@ -1566,22 +1566,18 @@ fn every_integration_suite_is_run_by_ci() {
 // Connectors are opt-in, and a narrow build must stay narrow
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A default build must link exactly one TLS stack.
+/// A default build must link exactly one TLS stack, and no SQL Server driver.
 ///
-/// The point of making connectors cargo features was that a PostgreSQL-only deployment
-/// stopped shipping `tiberius`, and with it rustls 0.21, a second webpki, a second X.509
-/// verifier, and four suppressed RUSTSEC advisories. That property is invisible in the
-/// source: it lives in `Cargo.toml`'s feature graph, and one careless
-/// `rustcdc = { features = ["sqlserver"] }` or a new dependency that happens to pull
-/// tiberius puts it all back with nothing failing.
+/// Connectors are cargo features so that a PostgreSQL-only deployment does not ship a
+/// database driver it never uses. That property is invisible in the source: it lives in
+/// `Cargo.toml`'s feature graph, and one careless `rustcdc = { features = ["sqlserver"] }`
+/// or a new dependency that happens to pull tiberius puts it back with nothing failing.
+/// The same goes for a second rustls major, which brings a second X.509 verifier and its
+/// own advisories.
 ///
 /// So it is asserted against the resolved graph. `cargo tree --edges normal` on the
-/// default feature set must contain no rustls 0.21 and no tiberius.
-///
-/// This is deliberately a *graph* assertion rather than a `deny.toml` one. cargo-deny
-/// reports the three webpki advisories as `advisory-not-detected` on a narrow build,
-/// which is the same signal — but it is a warning, and CI audits `--all-features` where
-/// they legitimately appear, so nothing would fail.
+/// default feature set must contain one rustls version, one rustls-webpki version, and no
+/// tiberius at any version.
 #[test]
 fn the_default_build_has_one_tls_stack() {
     let output = std::process::Command::new(env!("CARGO"))
@@ -1596,30 +1592,34 @@ fn the_default_build_has_one_tls_stack() {
     );
     let tree = String::from_utf8_lossy(&output.stdout);
 
-    for (crate_name, why) in [
-        (
-            "rustls v0.21",
-            "a second TLS stack, carrying RUSTSEC-2026-0098/-0099/-0104 via rustls-webpki \
-             0.101",
-        ),
-        (
-            "rustls-webpki v0.101",
-            "a second X.509 verifier with three open advisories",
-        ),
-        (
-            "tiberius v0.12",
-            "the SQL Server driver, which is what pins rustls 0.21",
-        ),
-    ] {
-        assert!(
-            !tree.contains(crate_name),
-            "a default build must not link {crate_name} — it is {why}. Something re-enabled \
-             the `sqlserver` feature, or a new dependency pulled it in transitively. Run \
-             `cargo tree --edges normal -i {crate_name}` to find the edge."
+    let versions_of = |name: &str| -> std::collections::BTreeSet<String> {
+        tree.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                (words.next() == Some(name)).then(|| words.next().unwrap_or("").to_string())
+            })
+            .collect()
+    };
+
+    for name in ["rustls", "rustls-webpki"] {
+        let versions = versions_of(name);
+        assert_eq!(
+            versions.len(),
+            1,
+            "a default build must link exactly one {name}, found {versions:?}. A second one is \
+             a second TLS stack with its own advisories. Run `cargo tree --edges normal -i \
+             {name}` to find the edge."
         );
     }
-}
 
+    let tiberius = versions_of("tiberius");
+    assert!(
+        tiberius.is_empty(),
+        "a default build must not link tiberius ({tiberius:?}). Something re-enabled the \
+         `sqlserver` feature, or a new dependency pulled it in transitively. Run `cargo tree \
+         --edges normal -i tiberius` to find the edge."
+    );
+}
 /// Every `SourceDriver` variant must appear in `KNOWN_SOURCE_DRIVERS`.
 ///
 /// The two lists serve different masters: the enum is what serde can parse in *this*

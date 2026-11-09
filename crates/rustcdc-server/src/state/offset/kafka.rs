@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use krafka::admin::{AdminClient, ConfigEntry, DescribeConfigsRequest};
+use krafka::KrafkaError;
+use krafka::admin::{ConfigEntry, ConfigResource, DescribeConfigsOptions, DescribeTopicsOptions};
 use krafka::consumer::CompactedTopicConsumer;
+use krafka::error::ErrorCode;
 use krafka::producer::TransactionalProducer;
 use rustcdc::checkpoint::{
     Checkpoint, FileCheckpoint, GenericOffset, StoredCheckpointRecord, validate_checkpoint_progress,
@@ -84,12 +86,12 @@ pub(crate) struct KafkaTopicSchemaHistoryRecord {
 ///   `effectively_once` was documented as *batch-atomic* rather than exactly-once.
 ///
 /// * [`StateProducer::Shared`] — the sink's own producer. The checkpoint record is written
-///   into the *same* transaction as the batch's data, so a single `commit_transaction`
+///   into the *same* transaction as the batch's data, so a single `commit`
 ///   makes both durable together and there is no window between them. A crash before the
 ///   commit discards both; after it, both survive.
 ///
 /// Either way the producer is transactional, because that is also what fences a second
-/// writer: `init_transactions()` bumps the producer epoch at the broker and permanently
+/// writer: `build_transactional()` bumps the producer epoch at the broker and permanently
 /// fences any earlier holder of the same `transactional.id` (KIP-447). This topic once
 /// used a plain idempotent producer, so two instances — which a rolling update creates on
 /// every deploy — both wrote, and last-write-wins could move the durable position
@@ -129,7 +131,7 @@ impl KafkaTopicStateWriter {
 
     /// Build a writer that produces through the sink's transaction.
     ///
-    /// The handle's producer is *already* fenced by its own `init_transactions()`, and it
+    /// The handle's producer is *already* fenced by its own `build_transactional()`, and it
     /// is deliberately the only writer of this topic in this mode: a second transactional
     /// id writing the same topic would give two independent fencing domains, so neither
     /// would exclude the other.
@@ -163,27 +165,35 @@ impl KafkaTopicStateWriter {
         // a cluster.
         let transactional_id = format!("{}-state-{}", config.client_id, config.topic);
 
-        let producer = TransactionalProducer::builder()
-            .bootstrap_servers(config.brokers.clone())
-            .client_id(format!("{}-state-writer", config.client_id))
-            .transactional_id(transactional_id.clone())
-            .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
-            .connect_timeout(crate::sink::kafka_connect_timeout(
-                std::time::Duration::from_millis(config.request_timeout_ms),
-            ))
-            .auth(auth)
-            .build()
-            .await
-            .map_err(|e| {
-                AppError::Other(format!("failed to build kafka topic state producer: {e}"))
-            })?;
-
-        // Fences any previous owner of this transactional id.
-        producer.init_transactions().await.map_err(|e| {
+        let kafka = crate::sink::kafka_builder(
+            config.brokers.clone(),
+            format!("{}-state-writer", config.client_id),
+            std::time::Duration::from_millis(config.request_timeout_ms),
+            auth,
+        )
+        .connect()
+        .await
+        .map_err(|e| {
             AppError::Other(format!(
-                "failed to initialize the kafka state producer's transactional state                  (transactional_id '{transactional_id}'): {e}. If another instance is                  running against this pipeline, stop it first — two writers on one state                  topic interleave checkpoints and the durable position can move backwards."
+                "failed to connect the kafka topic state producer to '{}': {e}",
+                config.brokers
             ))
         })?;
+
+        // `build_transactional` registers the id with the coordinator, which fences any
+        // previous owner of it.
+        let producer = kafka
+            .producer()
+            .build_transactional(transactional_id.clone())
+            .await
+            .map_err(|e| {
+                AppError::Other(format!(
+                    "failed to initialize the kafka state producer's transactional state \
+                     (transactional_id '{transactional_id}'): {e}. If another instance is \
+                     running against this pipeline, stop it first — two writers on one state \
+                     topic interleave checkpoints and the durable position can move backwards."
+                ))
+            })?;
 
         tracing::info!(
             transactional_id = %transactional_id,
@@ -216,18 +226,20 @@ impl KafkaTopicStateWriter {
             StateProducer::Own(producer) => {
                 let producer = producer.lock().await;
 
-                producer.begin_transaction().map_err(|e| {
+                producer.begin().map_err(|e| {
                     AppError::Other(format!("failed to begin kafka state transaction: {e}"))
                 })?;
 
-                let send_result = producer.send(&self.topic, Some(key), Some(payload)).await;
+                let record =
+                    krafka::Record::new(self.topic.as_str(), payload.to_vec()).key(key.to_vec());
+                let send_result = producer.send(record).await;
 
                 let record_metadata = match send_result {
                     Ok(metadata) => metadata,
                     Err(e) => {
                         // Abort is best-effort: a fenced producer cannot abort either, and
                         // the send error is the one worth surfacing.
-                        if let Err(abort_err) = producer.abort_transaction().await {
+                        if let Err(abort_err) = producer.abort().await {
                             tracing::warn!(
                                 error = %abort_err,
                                 "aborting the kafka state transaction failed after a send error"
@@ -242,7 +254,7 @@ impl KafkaTopicStateWriter {
                     }
                 };
 
-                producer.commit_transaction().await.map_err(|e| {
+                producer.commit().await.map_err(|e| {
                     AppError::Other(format!(
                         "failed to commit the kafka state transaction for topic '{}': {e}",
                         self.topic
@@ -792,24 +804,26 @@ fn now_unix_ms() -> u64 {
 
 async fn validate_prerequisites(config: &KafkaTopicStateConfig) -> Result<(), AppError> {
     let auth = config.security.to_auth_config().map_err(AppError::Other)?;
-    let admin = AdminClient::builder()
-        .bootstrap_servers(config.brokers.clone())
-        .client_id(format!("{}-state-admin", config.client_id))
-        .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
-        .connect_timeout(crate::sink::kafka_connect_timeout(
-            std::time::Duration::from_millis(config.request_timeout_ms),
+    let admin = crate::sink::kafka_builder(
+        config.brokers.clone(),
+        format!("{}-state-admin", config.client_id),
+        std::time::Duration::from_millis(config.request_timeout_ms),
+        auth,
+    )
+    .connect()
+    .await
+    .map_err(|e| {
+        AppError::Other(format!(
+            "failed to build kafka admin client for state backend durability checks: {e}"
         ))
-        .auth(auth)
-        .build()
-        .await
-        .map_err(|e| {
-            AppError::Other(format!(
-                "failed to build kafka admin client for state backend durability checks: {e}"
-            ))
-        })?;
+    })?
+    .admin();
 
-    let topics = admin
-        .describe_topics(std::slice::from_ref(&config.topic))
+    let mut topics = admin
+        .describe_topics(
+            std::slice::from_ref(&config.topic),
+            DescribeTopicsOptions::default(),
+        )
         .await
         .map_err(|e| {
             AppError::Other(format!(
@@ -818,11 +832,24 @@ async fn validate_prerequisites(config: &KafkaTopicStateConfig) -> Result<(), Ap
             ))
         })?;
 
-    let Some((_, topic)) = topics.into_iter().find(|(name, _)| name == &config.topic) else {
-        return Err(AppError::Other(format!(
-            "state.backend.kafka_topic.topic '{}' not found in broker metadata",
-            config.topic
-        )));
+    let topic = match topics.remove(&config.topic) {
+        Some(Ok(topic)) => topic,
+        None
+        | Some(Err(KrafkaError::Broker {
+            code: ErrorCode::UnknownTopicOrPartition,
+            ..
+        })) => {
+            return Err(AppError::Other(format!(
+                "state.backend.kafka_topic.topic '{}' not found in broker metadata",
+                config.topic
+            )));
+        }
+        Some(Err(e)) => {
+            return Err(AppError::Other(format!(
+                "failed to describe kafka topic '{}' for state backend: {e}",
+                config.topic
+            )));
+        }
     };
 
     if topic.partitions.is_empty() {
@@ -832,7 +859,7 @@ async fn validate_prerequisites(config: &KafkaTopicStateConfig) -> Result<(), Ap
         )));
     }
 
-    for partition in topic.partitions.values() {
+    for partition in &topic.partitions {
         let replication_factor = partition.replicas.len() as u16;
         let in_sync_replicas = partition.isr.len() as u16;
 
@@ -860,9 +887,17 @@ async fn validate_prerequisites(config: &KafkaTopicStateConfig) -> Result<(), Ap
         }
     }
 
+    let resource = ConfigResource::topic(config.topic.clone());
     let config_entries = admin
-        .describe_configs(DescribeConfigsRequest::for_topic(config.topic.clone()))
+        .describe_configs([resource.clone()], DescribeConfigsOptions::default())
         .await
+        .and_then(|mut results| {
+            results.remove(&resource).unwrap_or_else(|| {
+                Err(KrafkaError::IllegalState {
+                    message: "the broker returned no result for the topic".to_string(),
+                })
+            })
+        })
         .map_err(|e| {
             AppError::Other(format!(
                 "failed to describe kafka topic configs for '{}': {e}",
@@ -964,21 +999,23 @@ async fn build_state_scanner(
     config: &KafkaTopicStateConfig,
 ) -> Result<CompactedTopicConsumer, AppError> {
     let auth = config.security.to_auth_config().map_err(AppError::Other)?;
-    let connect_timeout = crate::sink::kafka_connect_timeout(std::time::Duration::from_millis(
-        config.request_timeout_ms,
-    ));
-    // krafka validates `request_timeout >= connect_timeout` at build time, and readback is
-    // a startup-time operation where a generous network budget costs nothing.
-    let request_timeout =
-        std::time::Duration::from_millis(config.request_timeout_ms).max(connect_timeout);
+    let kafka = crate::sink::kafka_builder(
+        config.brokers.clone(),
+        format!("{}-state-readback", config.client_id),
+        std::time::Duration::from_millis(config.request_timeout_ms),
+        auth,
+    )
+    .connect()
+    .await
+    .map_err(|e| {
+        AppError::Other(format!(
+            "failed to connect the state readback consumer for topic '{}': {e}",
+            config.topic
+        ))
+    })?;
 
     CompactedTopicConsumer::from_consumer_builder(
-        krafka::consumer::Consumer::builder()
-            .bootstrap_servers(config.brokers.clone())
-            .client_id(format!("{}-state-readback", config.client_id))
-            .request_timeout(request_timeout)
-            .connect_timeout(connect_timeout)
-            .auth(auth),
+        kafka.consumer_without_group(),
         config.topic.clone(),
     )
     .await
@@ -1213,19 +1250,25 @@ mod tests {
 
     /// Read a topic as a `read_committed` consumer does — aborted records excluded.
     async fn committed_values(brokers: &str, topic: &str) -> Vec<String> {
-        use krafka::consumer::{AutoOffsetReset, Consumer, IsolationLevel};
+        use krafka::consumer::{AutoOffsetReset, IsolationLevel};
 
-        let consumer = Consumer::builder()
-            .bootstrap_servers(brokers.to_string())
-            .group_id(format!("{topic}-verify"))
-            .client_id(format!("{topic}-verify"))
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .isolation_level(IsolationLevel::ReadCommitted)
-            .enable_auto_commit(false)
-            .build()
-            .await
-            .expect("verification consumer");
-        consumer.subscribe(&[topic]).await.expect("subscribe");
+        let consumer = crate::sink::kafka_builder(
+            brokers.to_string(),
+            format!("{topic}-verify"),
+            std::time::Duration::from_secs(30),
+            krafka::auth::AuthConfig::plaintext(),
+        )
+        .connect()
+        .await
+        .expect("kafka should connect")
+        .consumer(format!("{topic}-verify"))
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .enable_auto_commit(false)
+        .build()
+        .await
+        .expect("verification consumer");
+        consumer.subscribe([topic]).await.expect("subscribe");
 
         let mut values = Vec::new();
         for _ in 0..8 {
@@ -1466,7 +1509,7 @@ mod tests {
     /// This state topic used to use a plain idempotent producer, so two instances — which
     /// a Kubernetes rolling update creates on every deploy — both wrote checkpoints, and
     /// last-write-wins could move the durable position *backwards*. A transactional id
-    /// makes the broker enforce single-writer: `init_transactions()` bumps the producer
+    /// makes the broker enforce single-writer: `build_transactional()` bumps the producer
     /// epoch and permanently fences the previous holder.
     ///
     /// Asserting on the epoch is the real check. A test that only asserted "the second

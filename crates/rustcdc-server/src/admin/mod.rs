@@ -29,8 +29,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
 use ed25519_dalek::{Signer, SigningKey};
 use futures::FutureExt as _;
-use krafka::consumer::{AutoOffsetReset, Consumer, ConsumerRecord};
-use krafka::producer::{Acks, Producer, ProducerRecord};
+use krafka::Record;
+use krafka::consumer::{AutoOffsetReset, ConsumerRecord};
+use krafka::producer::{Acks, Producer};
 use notify::*;
 use prometheus::*;
 use rate_limit::{AbuseLimitScope, AdminAbuseGuard, RATE_LIMIT_STALE_CLIENT_TTL};
@@ -1092,36 +1093,33 @@ impl AdminState {
                         }
                     };
 
-                    let consumer = match Consumer::builder()
-                        .bootstrap_servers(config.normalized_brokers().join(","))
-                        .group_id(config.group_id.clone())
-                        .client_id(config.client_id.clone())
-                        // **A signal is a command, not state.** `Earliest` meant that a
-                        // group with no committed offset — a first start, a renamed
-                        // `group_id`, or a group whose offsets aged out of
-                        // `offsets.retention.minutes` — replayed the entire signal topic
-                        // and **re-executed every `execute_snapshot` in its history**.
-                        // rustcdc rewinds an already-complete table and reads it again, so
-                        // that is a full re-scan of every table ever requested, plus the
-                        // duplicate `read` events downstream.
-                        //
-                        // The in-memory idempotency guard does not cover it: replayed
-                        // signal ids are deduplicated against `audit_recent_entries`, which
-                        // holds 512 entries and starts empty on every boot.
-                        //
-                        // `Latest` keeps the useful case — a committed offset still wins,
-                        // so signals sent during a brief restart are processed — and drops
-                        // only commands issued to a consumer that had never run.
+                    // **A signal is a command, not state.** `Earliest` meant that a group with
+                    // no committed offset — a first start, a renamed `group_id`, or a group
+                    // whose offsets aged out of `offsets.retention.minutes` — replayed the
+                    // entire signal topic and **re-executed every `execute_snapshot` in its
+                    // history**: a full re-scan of every table ever requested, plus the
+                    // duplicate `read` events downstream.
+                    //
+                    // The in-memory idempotency guard (`audit_recent_entries`: 512 entries,
+                    // empty on every boot) does not cover it. `Latest` keeps the useful case —
+                    // a committed offset still wins, so signals sent during a brief restart
+                    // are processed — and drops only commands to a consumer that never ran.
+                    let consumer = async {
+                        crate::sink::kafka_builder(
+                            config.normalized_brokers().join(","),
+                            config.client_id.clone(),
+                            Duration::from_millis(1_000),
+                            auth,
+                        )
+                        .connect()
+                        .await?
+                        .consumer(config.group_id.clone())
                         .auto_offset_reset(AutoOffsetReset::Latest)
                         .enable_auto_commit(false)
-                        .request_timeout(Duration::from_millis(1_000))
-                        .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-                            1_000,
-                        )))
-                        .auth(auth)
                         .build()
                         .await
-                    {
+                    };
+                    let consumer = match consumer.await {
                         Ok(consumer) => consumer,
                         Err(error) => {
                             tracing::warn!(
@@ -1135,7 +1133,7 @@ impl AdminState {
                         }
                     };
 
-                    if let Err(error) = consumer.subscribe(&[config.topic.as_str()]).await {
+                    if let Err(error) = consumer.subscribe([config.topic.as_str()]).await {
                         tracing::warn!(
                             target: "rustcdc_audit",
                             action = "signal_ingress_kafka_subscribe_failed",

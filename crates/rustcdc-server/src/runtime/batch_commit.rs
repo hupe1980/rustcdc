@@ -152,7 +152,7 @@ pub(crate) async fn handle_polled_batch(
     //
     // `commit_ack` writes the durable position through the checkpoint store. With a Kafka
     // state backend sharing the sink's producer, that write lands **inside the open
-    // transaction**, so the single `commit_transaction` below makes the batch's data and
+    // transaction**, so the single `commit` below makes the batch's data and
     // the position that describes it durable together. There is no window between them:
     // a crash before the commit discards both and the batch replays cleanly; a crash after
     // it keeps both and the batch is not replayed.

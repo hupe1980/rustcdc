@@ -217,7 +217,7 @@ pub enum DeliveryContract {
     ///
     /// * a Kafka sink with `delivery_mode = "transactional"` and the checkpoint in a
     ///   `kafka_topic` state backend on the same cluster — the checkpoint is written
-    ///   *through* the store inside the open transaction, so one `commit_transaction`
+    ///   *through* the store inside the open transaction, so one `commit`
     ///   makes the records and the position durable at once;
     /// * a sink carrying a destination-side offset token (`snowflake`), which advances
     ///   before `flush` returns, so a replayed batch is filtered at the destination.

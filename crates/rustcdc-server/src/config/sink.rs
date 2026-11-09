@@ -1421,21 +1421,21 @@ pub enum KafkaDeliveryMode {
 }
 
 impl KafkaCompression {
-    pub fn to_krafka(self) -> Result<krafka::protocol::Compression, String> {
+    pub fn to_krafka(self) -> Result<krafka::Compression, String> {
         let codec = match self {
-            Self::None => krafka::protocol::Compression::None,
-            Self::Gzip => krafka::protocol::Compression::Gzip,
-            Self::Snappy => krafka::protocol::Compression::Snappy,
-            Self::Lz4 => krafka::protocol::Compression::Lz4,
-            Self::Zstd => krafka::protocol::Compression::Zstd,
+            Self::None => krafka::Compression::None,
+            Self::Gzip => krafka::Compression::Gzip,
+            Self::Snappy => krafka::Compression::Snappy,
+            Self::Lz4 => krafka::Compression::Lz4,
+            Self::Zstd => krafka::Compression::Zstd,
         };
 
         if codec.is_available() {
             Ok(codec)
         } else {
-            let feature = codec.required_feature().unwrap_or("compression");
+            // Only zstd can be missing: krafka encodes it behind its `zstd` feature.
             Err(format!(
-                "krafka compression codec {self:?} is unavailable in this build; enable the `{feature}` feature"
+                "krafka compression codec {self:?} is unavailable in this build; enable krafka's `zstd` feature"
             ))
         }
     }
@@ -1649,18 +1649,18 @@ pub struct KafkaTransportConfig {
 }
 
 impl KafkaTransportConfig {
-    /// Map every transport setting — including the proxy — onto krafka's `TransportConfig`.
+    /// Apply every transport setting — including the proxy — to a krafka connection.
     ///
     /// **Including the proxy** — one storage location, no precedence rule, and no second
-    /// accessor to forget to call. When `socks5_proxy` lived on a separate accessor it was
-    /// validated for `host:port` shape and then silently discarded, which in the topology
-    /// the setting exists for (brokers behind a bastion that also resolves their
-    /// hostnames) looked like a broker outage, and everywhere else sent traffic by the
-    /// route the operator had configured it not to take.
-    pub fn to_krafka(&self) -> Result<krafka::network::TransportConfig, String> {
-        let mut builder = krafka::network::TransportConfig::builder();
+    /// accessor to forget to call. A proxy setting that is validated and then not applied
+    /// looks like a broker outage in the topology it exists for (brokers behind a bastion
+    /// that also resolves their hostnames), and everywhere else sends traffic by the route
+    /// the operator configured it not to take.
+    ///
+    /// krafka validates the values when the connection is opened, naming the setting.
+    pub fn apply(&self, mut builder: krafka::KafkaBuilder) -> krafka::KafkaBuilder {
         if let Some(proxy) = &self.socks5_proxy {
-            builder = builder.proxy(krafka::network::ProxyConfig::new(proxy.clone()));
+            builder = builder.proxy(krafka::ProxyConfig::new(proxy.clone()));
         }
         if self.max_in_flight > 0 {
             builder = builder.max_in_flight_requests(self.max_in_flight);
@@ -1680,8 +1680,6 @@ impl KafkaTransportConfig {
                 .tls_reload_interval(Some(Duration::from_millis(self.tls_reload_interval_ms)));
         }
         builder
-            .build()
-            .map_err(|e| format!("sink.kafka.transport is invalid: {e}"))
     }
 
     pub fn validate(&self, protocol: KafkaSecurityProtocol) -> Result<(), String> {
@@ -2180,8 +2178,7 @@ impl KafkaSecurityConfig {
             KafkaSaslMechanism::Plain => AuthConfig::sasl_plain(
                 username(sasl.mechanism)?,
                 credential("password", sasl.password.as_ref())?,
-            )
-            .map_err(|e| format!("sink.kafka.security.sasl: {e}"))?,
+            ),
             KafkaSaslMechanism::ScramSha256 => AuthConfig::sasl_scram_sha256(
                 username(sasl.mechanism)?,
                 credential("password", sasl.password.as_ref())?,

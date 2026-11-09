@@ -639,22 +639,23 @@ max_event_bytes = {}
 
         let auth = kafka_auth_from_env();
         let group_id = format!("cdc-replay-e2e-{suffix}");
-        let consumer_a = Consumer::builder()
-            .bootstrap_servers(brokers.clone())
-            .group_id(group_id.clone())
-            .client_id(format!("cdc-replay-e2e-a-{suffix}"))
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false)
-            .request_timeout(Duration::from_millis(1_000))
-            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-                1_000,
-            )))
-            .auth(auth.clone())
-            .build()
-            .await
-            .expect("consumer A should build");
+        let consumer_a = crate::sink::kafka_builder(
+            brokers.clone(),
+            format!("cdc-replay-e2e-a-{suffix}"),
+            Duration::from_millis(1_000),
+            auth.clone(),
+        )
+        .connect()
+        .await
+        .expect("kafka should connect")
+        .consumer(group_id.clone())
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .build()
+        .await
+        .expect("consumer A should build");
         consumer_a
-            .subscribe(&[topic.as_str()])
+            .subscribe([topic.as_str()])
             .await
             .expect("consumer A should subscribe");
 
@@ -690,22 +691,23 @@ max_event_bytes = {}
         .await
         .expect("second replay execute should succeed");
 
-        let consumer_b = Consumer::builder()
-            .bootstrap_servers(brokers)
-            .group_id(group_id)
-            .client_id(format!("cdc-replay-e2e-b-{suffix}"))
-            .auto_offset_reset(AutoOffsetReset::Earliest)
-            .enable_auto_commit(false)
-            .request_timeout(Duration::from_millis(1_000))
-            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-                1_000,
-            )))
-            .auth(auth)
-            .build()
-            .await
-            .expect("consumer B should build");
+        let consumer_b = crate::sink::kafka_builder(
+            brokers,
+            format!("cdc-replay-e2e-b-{suffix}"),
+            Duration::from_millis(1_000),
+            auth,
+        )
+        .connect()
+        .await
+        .expect("kafka should connect")
+        .consumer(group_id)
+        .auto_offset_reset(AutoOffsetReset::Earliest)
+        .enable_auto_commit(false)
+        .build()
+        .await
+        .expect("consumer B should build");
         consumer_b
-            .subscribe(&[topic.as_str()])
+            .subscribe([topic.as_str()])
             .await
             .expect("consumer B should subscribe");
 

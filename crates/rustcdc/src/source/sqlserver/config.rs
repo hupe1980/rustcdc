@@ -232,6 +232,13 @@ impl SqlServerSourceConfig {
         config.database(&self.database);
         let password = self.password.resolve()?;
         config.authentication(tiberius::AuthMethod::sql_server(&self.user, &password));
+        // tiberius bounds the handshake by its own 15 s default; `conn_timeout_secs` is the
+        // one connect budget this connector documents, so it governs the handshake too.
+        config.handshake_timeout(Some(std::time::Duration::from_secs(self.conn_timeout_secs)));
+        // No per-round-trip deadline: a snapshot query may legitimately sort a large table
+        // for longer than tiberius' 30 s default before its first row, and failing it there
+        // would make large-table snapshots unrunnable with no setting to raise.
+        config.command_timeout(None);
 
         #[cfg(feature = "tls")]
         if self.transport.is_tls() {
