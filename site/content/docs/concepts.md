@@ -66,7 +66,7 @@ change history.
 | `update` | WAL / binlog | An existing row was updated |
 | `delete` | WAL / binlog | A row was deleted |
 | `read` | snapshot | Row captured during initial snapshot; logically equivalent to `insert` for consumers |
-| `schema_change` | DDL log, or the catalogue | A table's shape. `ddl_type = "READ_SCHEMA"` announces a table's declared columns before its first row on every connector; `CREATE_TABLE`/`ALTER_TABLE`/`DROP_TABLE` report a change. See [Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row) |
+| `schema_change` | DDL log, or the catalogue | A table's shape. `ddl_type = "READ_SCHEMA"` announces a table's declared columns before its first row on every connector; `CREATE_TABLE`/`ALTER_TABLE`/`DROP_TABLE` report a change. Rows do not depend on these events: each carries its own `shape`. See [Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape) |
 | `truncate` | WAL / binlog / DDL trigger | The table was truncated. PostgreSQL (pgoutput) and MySQL/MariaDB (binlog query event) emit it natively; SQL Server requires `capture_truncate_events = true` |
 | `message` | WAL | A logical decoding message the application wrote with `pg_logical_emit_message()` — the table-free transactional outbox. PostgreSQL only, and opt-in via [`capture_logical_messages`](@/docs/config-reference.md#capture-logical-messages). `table` is the synthetic `<prefix>__messages`; `before` is always absent |
 

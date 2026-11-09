@@ -575,9 +575,8 @@ fn build_sqlserver_event(
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
-        // The digest the announcement for this capture instance carries: both are taken
-        // from the same metadata, through the same function.
-        schema_id: Some(SqlServerStreamHandle::schema_id_for_meta(meta)),
+        // Built once per capture instance; a capture-instance change brings a new meta.
+        shape: meta.shape.clone(),
         unavailable_columns: Vec::new(),
     }
 }
@@ -676,7 +675,7 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
-        schema_id: None,
+        shape: None,
         unavailable_columns: Vec::new(),
     }
 }

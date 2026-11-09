@@ -67,10 +67,13 @@ the schema history so subsequent events can be decoded correctly.
 
 ### Declared column types
 
-Column values are text, so a consumer needs the types to decode them. Every table's columns
-are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
-event with `ddl_type = "READ_SCHEMA"` — see
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Column values are text, so a consumer needs the types to decode them. Every row carries its
+table's `shape` — declared types, nullability and key. A stream row carries the
+`information_schema` shape only when it agrees with the row's binlog table map (column count,
+names, type family, nullability, primary key); a DDL statement for the table triggers a
+re-read, and until a table map agrees the rows carry none. A change within one type family
+(`varchar(64)` to `varchar(128)`) is not visible in the table map. See
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape).
 
 Types come from `information_schema.COLUMNS`, read once at stream start for the configured
 database. `COLUMN_TYPE` is MySQL's own spelling and is already complete — `decimal(12,4)`,

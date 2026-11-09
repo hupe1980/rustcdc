@@ -128,6 +128,7 @@ pub use crate::core::{
 pub use crate::core::{
     MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord,
 };
+pub use crate::core::{ROW_SHAPE_DIGEST_VERSION, RowShape, ShapeColumn};
 #[cfg(feature = "tls")]
 pub use crate::core::{RustlsClientConfig, rustls_client_config};
 pub use crate::ddl_capture::{
@@ -184,8 +185,6 @@ pub use crate::wasm::{
 
 #[cfg(feature = "apicurio")]
 pub use crate::codec::ApicurioRegistryConfig;
-#[cfg(feature = "cloudevents")]
-pub use crate::codec::CloudEventsEncoder;
 #[cfg(feature = "avro")]
 pub use crate::codec::{AVRO_SCHEMA, AvroDecoder, AvroEncoder, avro_value_to_event};
 #[cfg(feature = "schemreg")]
@@ -205,6 +204,8 @@ pub use crate::codec::{
     AsyncCodec, BoxedAsyncCodec, BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec,
     EventEncoder, JsonCodec, JsonEncoder, JsonPrettyEncoder,
 };
+#[cfg(feature = "cloudevents")]
+pub use crate::codec::{CloudEventsEncoder, row_shape_dataschema};
 #[cfg(feature = "glue")]
 pub use crate::codec::{GlueAvroConfig, GlueAvroDecoder, GlueAvroEncoder};
 #[cfg(feature = "protobuf")]

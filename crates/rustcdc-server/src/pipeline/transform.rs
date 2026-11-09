@@ -20,6 +20,8 @@ use crate::topic::QualifiedTable;
 pub struct TransformPipeline {
     rules: Vec<CompiledRule>,
     runtime: TransformRuntime,
+    /// Applied after the rules, so a narrowed shape is known for what it is.
+    row_shapes: crate::runtime::row_shapes::RowShapeDeliveryPlan,
 }
 
 /// A transform rule with its actions built once, at startup.
@@ -353,7 +355,22 @@ impl TransformPipeline {
         Ok(Self {
             rules: compile_rules(rules)?,
             runtime,
+            row_shapes: crate::runtime::row_shapes::RowShapeDeliveryPlan::default(),
         })
+    }
+
+    /// Deliver row shapes per `runtime.row_shape`, recording them for `GET /schemas/{id}`.
+    #[must_use]
+    pub fn with_row_shapes(
+        mut self,
+        plan: crate::runtime::row_shapes::RowShapeDeliveryPlan,
+    ) -> Self {
+        self.row_shapes = plan;
+        self
+    }
+
+    pub fn row_shapes(&self) -> &crate::runtime::row_shapes::RowShapeDeliveryPlan {
+        &self.row_shapes
     }
 
     /// Every configured rule that has never matched, across every stage.
@@ -484,7 +501,14 @@ impl TransformPipeline {
                 // is needed here — doing so would allocate and serialize twice.
                 let mut guard = pool.acquire().await;
                 match guard.transform(&event).await? {
-                    TransformResult::Ok(transformed) => Some(finalize_transformed(*transformed)?),
+                    TransformResult::Ok(transformed) => {
+                        let mut transformed = finalize_transformed(*transformed)?;
+                        // A module can rewrite any value under any name, which no comparison
+                        // of column names can see; and whatever shape it returns is its own
+                        // claim, not one a connector made.
+                        transformed.shape = None;
+                        Some(transformed)
+                    }
                     TransformResult::Filtered => None,
                 }
             }
@@ -674,9 +698,19 @@ fn matches_optional_value(value: Option<&str>, allowed: &[String]) -> bool {
 
 fn apply_action(event: Event, action: &TransformActionConfig) -> Result<Option<Event>> {
     match action {
-        TransformActionConfig::Unwrap { field } => unwrap_after_field(event, field).map(Some),
+        // Both put a nested value's fields where the table's columns were; whatever names
+        // result, the table's shape no longer describes them.
+        TransformActionConfig::Unwrap { field } => {
+            unwrap_after_field(event, field).map(|mut event| {
+                event.shape = None;
+                Some(event)
+            })
+        }
         TransformActionConfig::Flatten { field, prefix } => {
-            flatten_after_field(event, field, prefix.as_deref()).map(Some)
+            flatten_after_field(event, field, prefix.as_deref()).map(|mut event| {
+                event.shape = None;
+                Some(event)
+            })
         }
         TransformActionConfig::Filter {
             include_tables,
@@ -1184,6 +1218,7 @@ mod tests {
         let pipeline = TransformPipeline {
             rules: compile_rules(rules).expect("compile"),
             runtime: TransformRuntime::Native,
+            row_shapes: Default::default(),
         };
         super::apply_rules(sample_event(), &pipeline.rules).expect("apply");
 

@@ -25,8 +25,9 @@ pub(super) struct TableSnapshotState {
     pub(super) catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn>,
     /// Whether this table's schema has been announced in this run.
     pub(super) schema_announced: bool,
-    /// The id of the announced shape, carried by the rows that follow it.
-    pub(super) schema_id: Option<String>,
+    /// The shape the snapshot's rows carry, built from `catalog_columns` before the table's
+    /// first chunk. `None` when the catalogue read nothing.
+    pub(super) shape: Option<std::sync::Arc<crate::RowShape>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

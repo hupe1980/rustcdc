@@ -715,21 +715,18 @@ pub struct Event {
     /// rather than merely discouraged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_columns: Vec<String>,
-    /// The table shape this row was captured under, as named by its schema announcement.
+    /// The table shape this row was captured under: columns with declared types and
+    /// nullability, the primary key, and a content id.
     ///
-    /// A connector announces a table's shape before that table's first row, on its own
-    /// `<table>__ddl_events` stream. Where the two travel as separate Kafka topics there is no
-    /// ordering between them, so a consumer can be handed a row before the announcement
-    /// describing it. This id is carried by both sides
-    /// ([`CapturedDdl::schema_id`](crate::ddl_capture::CapturedDdl::schema_id)), so a consumer
-    /// holding the announcements it has seen can tell "I know this shape" from "I have not seen
-    /// this shape yet" and wait for, or fetch, the announcement rather than guess.
+    /// Column values are text, so the declared type is what says how to parse them. Carried
+    /// in the row rather than in a separate event because nothing orders two events across
+    /// Kafka topics or keys: a row decodes on its own.
     ///
-    /// `None` when the connector could not derive the table's shape, and on events from a
-    /// connector or release that does not set it — absent, not a mismatch, so a consumer must
-    /// treat it as "unknown" rather than "new shape".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema_id: Option<String>,
+    /// `None` where the connector cannot vouch for the shape the row was captured under — see
+    /// the schema-evolution guide for the paths that carry none — and after a transform that
+    /// changed the columns' meaning. Absent means unknown, never "no columns". Behind an
+    /// [`Arc`](std::sync::Arc) so the rows of one table share one shape.
+    pub shape: Option<std::sync::Arc<crate::core::RowShape>>,
 }
 
 /// Flat wire form of [`Event`].
@@ -764,7 +761,7 @@ struct EventWire {
     #[serde(default)]
     before_unavailable_columns: Vec<String>,
     #[serde(default)]
-    schema_id: Option<String>,
+    shape: Option<crate::core::RowShape>,
 }
 
 impl TryFrom<EventWire> for Event {
@@ -790,7 +787,7 @@ impl TryFrom<EventWire> for Event {
             transaction: wire.transaction,
             envelope_version: wire.envelope_version,
             unavailable_columns: wire.unavailable_columns,
-            schema_id: wire.schema_id,
+            shape: wire.shape.map(std::sync::Arc::new),
         })
     }
 }
@@ -799,11 +796,11 @@ impl Serialize for Event {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let before_unavailable_columns = self.before.unavailable_columns();
         // Twelve always-present fields, plus the two lists that are omitted when empty and the
-        // schema id that is omitted when unknown.
+        // shape that is omitted when unknown.
         let len = 12
             + usize::from(!self.unavailable_columns.is_empty())
             + usize::from(!before_unavailable_columns.is_empty())
-            + usize::from(self.schema_id.is_some());
+            + usize::from(self.shape.is_some());
 
         let mut state = serializer.serialize_struct("Event", len)?;
         state.serialize_field("before", &self.before.row())?;
@@ -828,9 +825,9 @@ impl Serialize for Event {
         } else {
             state.serialize_field("before_unavailable_columns", before_unavailable_columns)?;
         }
-        match &self.schema_id {
-            Some(schema_id) => state.serialize_field("schema_id", schema_id)?,
-            None => state.skip_field("schema_id")?,
+        match &self.shape {
+            Some(shape) => state.serialize_field("shape", shape.as_ref())?,
+            None => state.skip_field("shape")?,
         }
         state.end()
     }
@@ -933,7 +930,7 @@ impl Default for Event {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             unavailable_columns: Vec::new(),
-            schema_id: None,
+            shape: None,
         }
     }
 }
@@ -1478,7 +1475,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -2273,14 +2270,10 @@ impl EventBuilder {
         self
     }
 
-    /// The table shape this row was captured under.
-    ///
-    /// See [`Event::schema_id`]. Set it from the same schema the connector announced, via
-    /// [`ddl_capture::schema_id`](crate::ddl_capture::schema_id), so the row and its
-    /// announcement carry one value.
+    /// The table shape this row was captured under. See [`Event::shape`].
     #[must_use]
-    pub fn schema_id(mut self, schema_id: impl Into<String>) -> Self {
-        self.event.schema_id = Some(schema_id.into());
+    pub fn shape(mut self, shape: std::sync::Arc<crate::core::RowShape>) -> Self {
+        self.event.shape = Some(shape);
         self
     }
 

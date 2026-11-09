@@ -33,16 +33,6 @@ impl SqlServerStreamHandle {
         )
     }
 
-    /// The id of the shape rows decoded against `meta` are captured under — the same digest
-    /// the announcement built from `meta` carries.
-    pub(super) fn schema_id_for_meta(meta: &CaptureInstanceMeta) -> String {
-        crate::ddl_capture::schema_id(
-            &meta.schema,
-            &meta.table,
-            &Self::table_schema_from_meta(meta),
-        )
-    }
-
     fn build_schema_event_for_meta(
         &self,
         ddl_type: &str,
@@ -208,6 +198,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor,
+            shape: None,
         }
     }
 
@@ -222,8 +213,8 @@ mod tests {
     fn a_known_table_is_announced_with_its_declared_types() {
         use crate::source::schema_catalog::CatalogColumn;
 
-        let mut handle =
-            super::super::tests::stream_handle_for_schema_tests(vec![CaptureInstanceMeta {
+        let mut handle = super::super::tests::stream_handle_for_schema_tests(vec![
+            CaptureInstanceMeta {
                 capture_instance: "dbo_orders".into(),
                 schema: "dbo".into(),
                 table: "orders".into(),
@@ -246,7 +237,10 @@ mod tests {
                     },
                 ],
                 capture_floor: [0u8; 10],
-            }]);
+                shape: None,
+            }
+            .with_shape(),
+        ]);
 
         let events = handle.announce_known_schemas();
         assert_eq!(events.len(), 1);
@@ -274,18 +268,71 @@ mod tests {
             serde_json::json!(["primary_key"])
         );
 
-        // A row decoded against this capture instance names the announcement's shape.
         let row = super::super::stream_window::build_sqlserver_event_for_tests(&handle.metas[0]);
-        assert!(events[0].schema_id.is_some());
+        assert!(events[0].shape.is_some());
         assert_eq!(
-            row.schema_id, events[0].schema_id,
-            "a row must name the shape its announcement carries"
+            row.shape, events[0].shape,
+            "a row must carry the shape its announcement carries"
         );
 
         assert!(
             handle.announce_known_schemas().is_empty(),
             "announcing is once per run, not once per poll"
         );
+    }
+
+    /// A stream row carries the capture instance's columns, declared types, nullability and
+    /// key, and shares the instance's one `Arc` rather than building its own.
+    #[test]
+    fn sqlserver_rows_carry_the_capture_shape() {
+        use crate::source::schema_catalog::CatalogColumn;
+
+        let meta = CaptureInstanceMeta {
+            capture_instance: "dbo_orders".into(),
+            schema: "dbo".into(),
+            table: "orders".into(),
+            primary_key: vec!["id".into()],
+            captured_columns: vec![
+                CatalogColumn {
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    nullable: false,
+                },
+                CatalogColumn {
+                    name: "note".into(),
+                    data_type: "nvarchar(255)".into(),
+                    nullable: true,
+                },
+            ],
+            capture_floor: [0u8; 10],
+            shape: None,
+        }
+        .with_shape();
+
+        let row = super::super::stream_window::build_sqlserver_event_for_tests(&meta);
+        let shape = row
+            .shape
+            .as_ref()
+            .expect("a captured row carries its shape");
+        assert!(std::sync::Arc::ptr_eq(shape, meta.shape.as_ref().unwrap()));
+        assert_eq!((shape.schema(), shape.table()), ("dbo", "orders"));
+        let columns: Vec<_> = shape
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type.as_str(),
+                    column.nullable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [("id", "bigint", false), ("note", "nvarchar(255)", true)]
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
     }
 
     #[test]

@@ -153,7 +153,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
 
     let mut read_count = 0_u64;
     let mut chunk_count = 0_u32;
-    let mut announced: Option<String> = None;
+    let mut announced: Option<std::sync::Arc<rustcdc::RowShape>> = None;
     loop {
         let chunk = snapshot.next_chunk(128).await?;
         if chunk.is_empty() {
@@ -163,7 +163,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
             .into_iter()
             .partition(|event| event.op.is_schema_change());
         if let Some(announcement) = announcements.first() {
-            announced = announcement.schema_id.clone();
+            announced = announcement.shape.clone();
         }
 
         chunk_count += 1;
@@ -178,8 +178,8 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
                 "the table is announced before its first row"
             );
             assert_eq!(
-                event.schema_id, announced,
-                "a snapshot row must name its announcement's shape"
+                event.shape, announced,
+                "a snapshot row carries the table's shape"
             );
             read_count = read_count.saturating_add(1);
         }
@@ -187,6 +187,25 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
 
     assert!(chunk_count > 1, "snapshot should emit more than one chunk");
     assert_eq!(read_count, expected_count);
+    // dbo.users is (id INT NOT NULL PRIMARY KEY, name NVARCHAR(100) NOT NULL).
+    let shape = announced.as_deref().expect("a shape");
+    let carried: Vec<_> = shape
+        .columns()
+        .expect("a complete shape")
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_str(),
+                column.data_type.as_str(),
+                column.nullable,
+            )
+        })
+        .collect();
+    assert_eq!(
+        carried,
+        [("id", "int", false), ("name", "nvarchar(100)", false)]
+    );
+    assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
 
     let end = snapshot.finish().await?;
     assert!(end.snapshot_end_ts > 0);

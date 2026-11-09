@@ -192,9 +192,23 @@ struct CaptureInstanceMeta {
     /// read yet, that *is* data loss, and a stale floor here is what makes it surface
     /// instead of being silently clamped away.
     capture_floor: [u8; 10],
+    /// The shape rows decoded against this instance are captured under, built once from the
+    /// fields above by [`Self::with_shape`] so every row shares one `Arc`.
+    shape: Option<Arc<crate::RowShape>>,
 }
 
 impl CaptureInstanceMeta {
+    /// Fill [`Self::shape`] from the captured columns and primary key.
+    fn with_shape(mut self) -> Self {
+        self.shape = crate::source::schema_catalog::row_shape_from_catalog(
+            &self.schema,
+            &self.table,
+            &self.captured_columns,
+            &self.primary_key,
+        );
+        self
+    }
+
     /// The captured column names, in source-table order.
     ///
     /// The poll projection and the row decoder want names; the schema event wants types.
@@ -705,14 +719,18 @@ async fn load_capture_metas_for_config(
             .filter(|value| !value.is_empty())
             .map_or(Ok([0u8; 10]), lsn_hex_to_bytes)?;
 
-        metas.push(CaptureInstanceMeta {
-            capture_instance: capture_instance.to_string(),
-            schema,
-            table,
-            primary_key,
-            captured_columns,
-            capture_floor,
-        });
+        metas.push(
+            CaptureInstanceMeta {
+                capture_instance: capture_instance.to_string(),
+                schema,
+                table,
+                primary_key,
+                captured_columns,
+                capture_floor,
+                shape: None,
+            }
+            .with_shape(),
+        );
     }
 
     if require_non_empty_metas && metas.is_empty() {
@@ -1358,7 +1376,7 @@ impl SqlServerConnection {
                 column_names,
                 catalog_columns,
                 schema_announced: false,
-                schema_id: None,
+                shape: None,
             });
         }
 
@@ -2291,6 +2309,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
 
         // A realistic CDC window: INSERT, UPDATE (op=3 before-image then op=4 after-image), DELETE.
@@ -2402,6 +2421,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
 
         // Poll 1: only the op=3 before-image (OLD values) arrives.
@@ -2463,6 +2483,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             }],
             events_polled: 0,
             requeued_events: Vec::new(),
@@ -2480,6 +2501,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into(), "email".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             },
             CaptureInstanceMeta {
                 capture_instance: "sales_orders".into(),
@@ -2488,6 +2510,7 @@ mod tests {
                 primary_key: vec!["order_id".into()],
                 captured_columns: vec!["order_id".into(), "total".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             },
         ];
 
@@ -2539,6 +2562,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             }],
             events_polled: 0,
             requeued_events: Vec::new(),
@@ -2725,7 +2749,7 @@ mod tests {
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
             schema_announced: false,
-            schema_id: None,
+            shape: None,
         };
 
         let mut handle = SqlServerSnapshotHandle::new(snapshot, vec![table_state], None, false);
@@ -2758,7 +2782,7 @@ mod tests {
                 column_names: vec!["id".into(), "name".into()],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
-                schema_id: None,
+                shape: None,
             }],
             None,
             false,
@@ -2797,7 +2821,7 @@ mod tests {
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
             schema_announced: false,
-            schema_id: None,
+            shape: None,
         };
 
         let fetcher = Arc::new(MockSnapshotRowFetcher::with_table_pages(
@@ -2870,7 +2894,7 @@ mod tests {
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
             schema_announced: false,
-            schema_id: None,
+            shape: None,
         };
 
         let first_fetcher = Arc::new(MockSnapshotRowFetcher::with_table_pages(
@@ -2977,7 +3001,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -3024,6 +3048,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
         let changes_a = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000000A0003".into(), // later LSN
@@ -3041,6 +3066,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
         let changes_b = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000000A0001".into(), // earlier LSN

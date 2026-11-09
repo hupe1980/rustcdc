@@ -40,23 +40,11 @@ mod tests;
 /// at startup, uses the same value rather than restating it.
 pub const DDL_TYPE_READ_SCHEMA: &str = "READ_SCHEMA";
 
-/// The id naming a table shape, shared by a schema announcement and the rows captured under it.
+/// The history identity of an observation: a digest over the shape, which may be absent.
 ///
-/// Content-derived, so the same shape resolves to the same id in every run and on every
-/// connector: a consumer can match a row against an announcement it already holds without
-/// depending on cross-topic ordering, which Kafka does not provide.
-///
-/// Takes the shape rather than a [`CapturedDdl`] so a connector can compute it for a table it
-/// is about to emit rows for, from the same schema it announced.
-#[must_use]
-pub fn schema_id(schema: &str, table: &str, result_schema: &TableSchema) -> String {
-    digest_shape(schema, table, Some(result_schema))
-}
-
-/// The digest [`schema_id`] returns, over a shape that may be absent.
-///
-/// Kept private: a caller outside this module wants [`schema_id`], which cannot be handed a
-/// missing shape, or [`CapturedDdl::schema_id`], which answers `None` for one.
+/// Not the row-shape id ([`RowShape::id`](crate::RowShape::id)): this one also covers column
+/// constraints and an observation whose shape could not be derived, and the history keys on
+/// it, so changing it would re-record every table once.
 fn digest_shape(schema: &str, table: &str, result_schema: Option<&TableSchema>) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
@@ -298,31 +286,22 @@ impl CapturedDdl {
             return offset.to_string();
         }
 
-        // Not `schema_id()`: an observation of a table whose shape could not be derived still
-        // needs a stable history identity, and the digest of its name alone is one. The two
-        // agree wherever the shape is known, which is what lets a row name its announcement.
+        // An observation of a table whose shape could not be derived still needs a stable
+        // history identity, and the digest of its name alone is one.
         let hex = digest_shape(&self.schema, &self.table, self.result_schema.as_ref());
         format!("observed:{hex}")
     }
 
-    /// The shape this announcement describes, as a value a row event can name.
+    /// The table shape this statement leaves, as rows carry it ([`Event::shape`]).
     ///
-    /// A consumer reading a row from a different topic than the announcement cannot rely on
-    /// Kafka for ordering between the two, so it needs to tell "this row has the shape I was
-    /// told about" from "this row has a shape I have not seen". Both sides carry this id:
-    /// the announcement, and every row the connector captured under that shape
-    /// ([`Event::schema_id`](crate::Event::schema_id)).
-    ///
-    /// Derived from the shape and nothing else, so an ALTER that changes a table back to an
-    /// earlier shape resolves to that earlier id — which is what a consumer keyed on shape
-    /// wants, and the opposite of what the *history* wants (see [`Self::history_identity`]).
-    /// `None` when the connector could not derive the table's shape: one id standing for
-    /// "shape unknown" would compare equal across two different unknown shapes.
+    /// `None` when the statement carries no resulting schema (a `DROP`, an `ALTER` the parser
+    /// could not apply): one shape standing for "unknown" would compare equal across two
+    /// different unknown shapes.
     #[must_use]
-    pub fn schema_id(&self) -> Option<String> {
-        self.result_schema
-            .as_ref()
-            .map(|result| schema_id(&self.schema, &self.table, result))
+    pub fn row_shape(&self) -> Option<crate::RowShape> {
+        self.result_schema.as_ref().and_then(|result| {
+            crate::RowShape::from_table_schema(&self.schema, &self.table, result)
+        })
     }
 
     /// Convert a captured DDL into a SchemaHistory DDLEvent for persistence.
@@ -408,8 +387,8 @@ impl CapturedDdl {
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
             unavailable_columns: Vec::new(),
-            // The shape this announcement describes, which the rows captured under it name.
-            schema_id: self.schema_id(),
+            // The shape the statement leaves, so the event decodes on its own like a row.
+            shape: self.row_shape().map(std::sync::Arc::new),
         }
     }
 }

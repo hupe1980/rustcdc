@@ -5,6 +5,8 @@ mod openapi;
 mod probes;
 mod prometheus;
 mod rate_limit;
+mod routes;
+pub use routes::router;
 mod signal_ledger;
 mod signals;
 mod tls;
@@ -19,12 +21,11 @@ use auth::{
 };
 
 use axum::{
-    Json, Router,
+    Json,
     extract::{ConnectInfo, State},
     http::StatusCode,
     http::{HeaderMap, HeaderValue, header::RETRY_AFTER},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
@@ -580,6 +581,8 @@ pub struct AdminState {
     /// forwards that as an explicit `lagged` SSE event, so a slow client learns it has a
     /// gap instead of silently receiving an incomplete sequence.
     notification_broadcast: Arc<tokio::sync::broadcast::Sender<ControlNotification>>,
+    /// The shapes `GET /schemas/{id}` resolves; filled by the delivery path.
+    delivered_shapes: crate::runtime::row_shapes::DeliveredShapes,
 }
 
 /// How many notifications a slow `/notifications/stream` subscriber may fall behind
@@ -782,6 +785,7 @@ impl AdminState {
             signal_terminal_budget: Duration::from_secs(SIGNAL_TERMINAL_TIMEOUT_SECONDS as u64),
             signal_ledger,
             workers: AdminWorkers::new(),
+            delivered_shapes: Default::default(),
             notification_broadcast: Arc::new(
                 tokio::sync::broadcast::channel(NOTIFICATION_STREAM_BUFFER).0,
             ),
@@ -3508,26 +3512,6 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "<non-string panic payload>".to_string()
     }
-}
-
-pub fn router(state: AdminState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/livez", get(livez))
-        .route("/readyz", get(readyz))
-        .route("/status", get(status_authed))
-        .route("/config", get(config_authed))
-        .route("/metrics", get(metrics))
-        .route("/signals", post(signal_action))
-        .route("/notifications", get(notifications_authed))
-        .route(
-            "/notifications/cloudevents",
-            get(notifications_cloudevents_authed),
-        )
-        .route("/notifications/stream", get(notifications_stream_authed))
-        .route("/openapi.json", get(openapi_document))
-        .with_state(state)
-        .layer(panic_guard())
 }
 
 /// Spawn the admin HTTP server as a background tokio task.

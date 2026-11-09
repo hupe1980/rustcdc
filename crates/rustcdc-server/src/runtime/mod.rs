@@ -40,6 +40,7 @@ pub(crate) mod metrics;
 pub(crate) mod park;
 pub(crate) mod reconciliation;
 pub(crate) mod recovery;
+pub mod row_shapes;
 
 /// Crash-injecting end-to-end proof of the delivery contracts.
 ///

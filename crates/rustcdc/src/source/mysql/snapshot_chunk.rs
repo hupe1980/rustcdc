@@ -4,7 +4,7 @@ use crate::core::{
 use crate::ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA};
 use crate::source::helpers::now_millis;
 use crate::source::schema_catalog::{
-    mark_as_snapshot_event, observed_statement, table_schema_from_catalog,
+    mark_as_snapshot_event, observed_statement, row_shape_from_catalog, table_schema_from_catalog,
 };
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, MysqlSnapshotHandle};
@@ -73,11 +73,22 @@ pub(super) async fn next_snapshot_chunk(
                     &handle.snapshot.snapshot_id,
                     handle.next_chunk_index,
                 );
-                handle.tables[table_index].schema_id = event.schema_id.clone();
                 events.push(event);
             }
         }
-        let table_schema_id = handle.tables[table_index].schema_id.clone();
+        // Built from the catalogue read at snapshot start. The snapshot's projection selects
+        // exactly these columns, so the shape names the columns its rows carry.
+        if handle.tables[table_index].shape.is_none() {
+            let table = &handle.tables[table_index];
+            let shape = row_shape_from_catalog(
+                &schema_name,
+                &bare_table,
+                &table.catalog_columns,
+                &primary_key_columns,
+            );
+            handle.tables[table_index].shape = shape;
+        }
+        let table_shape = handle.tables[table_index].shape.clone();
 
         // Computed **after** the announcement, not before: the announcement occupies a
         // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
@@ -130,7 +141,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    schema_id: table_schema_id.clone(),
+                    shape: table_shape.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }
@@ -171,7 +182,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    schema_id: table_schema_id.clone(),
+                    shape: table_shape.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }

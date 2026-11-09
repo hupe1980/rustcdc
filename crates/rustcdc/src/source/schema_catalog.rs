@@ -135,6 +135,29 @@ pub(crate) fn table_schema_from_catalog(
     }
 }
 
+/// The [`RowShape`](crate::RowShape) catalogue columns describe, shared by every row of the
+/// table through one `Arc`.
+///
+/// `None` for no columns — an offline snapshot reads no catalogue and must not describe
+/// columns it did not read.
+pub(crate) fn row_shape_from_catalog(
+    schema: &str,
+    table: &str,
+    columns: &[CatalogColumn],
+    primary_keys: &[String],
+) -> Option<std::sync::Arc<crate::RowShape>> {
+    crate::RowShape::new(
+        schema,
+        table,
+        columns
+            .iter()
+            .map(|column| crate::ShapeColumn::new(&column.name, &column.data_type, column.nullable))
+            .collect(),
+        primary_keys.to_vec(),
+    )
+    .map(std::sync::Arc::new)
+}
+
 /// The statement text carried by an observation event.
 ///
 /// Not SQL that was run — nothing ran. It is a comment naming the source of the

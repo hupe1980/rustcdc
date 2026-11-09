@@ -57,10 +57,11 @@ captured change, with columns:
 
 ### Declared column types
 
-Column values are text, so a consumer needs the types to decode them. Every table's columns
-are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
-event with `ddl_type = "READ_SCHEMA"` — see
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Column values are text, so a consumer needs the types to decode them. Every row carries its
+table's `shape` — declared types, nullability and key. Stream rows take it from the capture
+instance they were read through, so a new capture instance brings a new shape; snapshot rows
+take it from the catalogue read at snapshot start. See
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape).
 
 Types come from `sys.columns`, reached through the capture instance, so lengths, precision
 and scale survive: `decimal(12,4)`, `nvarchar(255)`, `datetime2(3)`. An alias type or UDT

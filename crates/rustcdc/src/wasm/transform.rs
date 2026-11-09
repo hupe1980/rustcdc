@@ -71,6 +71,8 @@ impl AsyncTransform for WasmTransform {
         match guard.transform(event).await? {
             TransformResult::Ok(transformed) => {
                 *event = *transformed;
+                // A module can rewrite any value under any name; no name comparison sees it.
+                event.shape = None;
                 Ok(true)
             }
             TransformResult::Filtered => Ok(false),
@@ -98,6 +100,7 @@ impl AsyncTransform for WasmTransform {
             match guard.transform(&event).await? {
                 TransformResult::Ok(transformed) => {
                     event = *transformed;
+                    event.shape = None;
                     kept.push(event);
                 }
                 TransformResult::Filtered => {}

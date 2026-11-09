@@ -253,7 +253,7 @@ pub(super) fn events_from_changes(
             // that never existed.
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             // Every column of the row image is present or explicitly NULL. Snowflake has
             // no equivalent of PostgreSQL's unchanged-TOAST omission.
             unavailable_columns: Vec::new(),
@@ -344,7 +344,7 @@ pub(super) fn events_from_snapshot_rows(
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         });
     }

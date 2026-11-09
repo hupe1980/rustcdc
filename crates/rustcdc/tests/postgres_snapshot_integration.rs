@@ -1853,7 +1853,7 @@ async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::
     let mut connection = PostgresConnection::new(snapshot_source_config(&host, port, "wide_slot"));
     connection.connect().await?;
     let mut handle = connection.start_snapshot(&["public.wide"]).await?;
-    let mut announcement_schema_id = None;
+    let mut announcement_shape = None;
     let mut rows = Vec::new();
     loop {
         let chunk = handle.next_chunk(100).await?;
@@ -1862,7 +1862,7 @@ async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::
         }
         for event in chunk {
             if event.op.is_schema_change() {
-                announcement_schema_id = event.schema_id.clone();
+                announcement_shape = event.shape.clone();
             } else {
                 rows.push(event);
             }
@@ -1872,12 +1872,11 @@ async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::
     connection.close().await;
 
     assert_eq!(rows.len(), 1, "the one row must be read: {rows:?}");
-    // The row names the shape its announcement carries.
-    let announced = announcement_schema_id.expect("a live snapshot announces the table");
+    let announced = announcement_shape.expect("a live snapshot announces the table");
     assert_eq!(
-        rows[0].schema_id.as_deref(),
-        Some(announced.as_str()),
-        "a snapshot row must name its announcement's shape"
+        rows[0].shape.as_ref(),
+        Some(&announced),
+        "a snapshot row carries the table's shape"
     );
     let after = rows[0]
         .after

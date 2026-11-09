@@ -212,6 +212,61 @@ run_schema_contract_check() {
   check_equal_sets "operation symbols (Rust vs Protobuf)" "$rust_operation_symbols" "$proto_operation_symbols"
   check_equal_sets "operation symbols (Rust vs Avro)" "$rust_operation_symbols" "$avro_operation_symbols"
 
+  # The JSON Schema is the fourth definition of the envelope, and the row shape is nested in
+  # all four, so both levels are compared. An empty extraction would compare equal to another
+  # empty one; every list is required to be non-empty first.
+  local json_schema="$tmp_dir/event_json_schema.json"
+  sed -n '/^pub const EVENT_JSON_SCHEMA: &str = r##"{/,/^}"##;/p' crates/rustcdc/src/codec/schema_registry.rs \
+    | sed -e '1s/.*/{/' -e '$s/.*/}/' > "$json_schema"
+  local json_event_fields="$tmp_dir/json_event_fields.txt"
+  jq -r '.properties | keys[]' "$json_schema" | sort -u > "$json_event_fields"
+  check_equal_sets "event fields (Rust vs EVENT_JSON_SCHEMA)" "$rust_event_fields" "$json_event_fields"
+
+  local nested
+  for nested in RowShape ShapeColumn; do
+    local rust_nested="$tmp_dir/rust_${nested}.txt"
+    local serialized_nested="$tmp_dir/serialized_${nested}.txt"
+    local proto_nested="$tmp_dir/proto_${nested}.txt"
+    local avro_nested="$tmp_dir/avro_${nested}.txt"
+    local json_nested="$tmp_dir/json_${nested}.txt"
+
+    if [[ "$nested" == "RowShape" ]]; then
+      # `RowShapeWire` is what decodes; the hand-written `Serialize` is what encodes.
+      sed -n '/^struct RowShapeWire {/,/^}/p' crates/rustcdc/src/core/row_shape.rs \
+        | sed -nE 's/^[[:space:]]*([a-z_][a-z0-9_]*)[[:space:]]*:.*/\1/p' \
+        | sort -u > "$rust_nested"
+      sed -n '/^impl Serialize for RowShape {/,/^}/p' crates/rustcdc/src/core/row_shape.rs \
+        | grep -oE '(serialize_field|skip_field)\("[a-z_]+"' \
+        | sed -E 's/.*\("([a-z_]+)"/\1/' \
+        | sort -u > "$serialized_nested"
+    else
+      # Derived serde on both directions: the struct is the wire.
+      sed -n '/^pub struct ShapeColumn {/,/^}/p' crates/rustcdc/src/core/row_shape.rs \
+        | sed -nE 's/^[[:space:]]*pub[[:space:]]+([a-z_][a-z0-9_]*)[[:space:]]*:.*/\1/p' \
+        | sort -u > "$rust_nested"
+      cp "$rust_nested" "$serialized_nested"
+    fi
+    sed -n "/^message ${nested} {/,/^}/p" crates/rustcdc/proto/event.proto \
+      | sed -E 's,//.*$,,' \
+      | sed -nE 's/^[[:space:]]*(optional[[:space:]]+|repeated[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]+([a-z_][a-z0-9_]*)[[:space:]]*=.*/\2/p' \
+      | sort -u > "$proto_nested"
+    jq -r --arg name "$nested" '.. | objects | select(.type == "record" and .name == $name) | .fields[].name' \
+      crates/rustcdc/schemas/event.avsc | sort -u > "$avro_nested"
+    jq -r --arg name "$nested" '."$defs"[$name].properties | keys[]' "$json_schema" | sort -u > "$json_nested"
+
+    local list
+    for list in "$rust_nested" "$serialized_nested" "$proto_nested" "$avro_nested" "$json_nested"; do
+      if [[ ! -s "$list" ]]; then
+        echo "Policy gate failed: no ${nested} fields extracted into $(basename "$list")" >&2
+        exit 1
+      fi
+    done
+    check_equal_sets "${nested} fields (decode vs Serialize impl)" "$rust_nested" "$serialized_nested"
+    check_equal_sets "${nested} fields (Rust vs Protobuf)" "$rust_nested" "$proto_nested"
+    check_equal_sets "${nested} fields (Rust vs Avro)" "$rust_nested" "$avro_nested"
+    check_equal_sets "${nested} fields (Rust vs EVENT_JSON_SCHEMA)" "$rust_nested" "$json_nested"
+  done
+
   echo "Schema contract gate passed."
 }
 

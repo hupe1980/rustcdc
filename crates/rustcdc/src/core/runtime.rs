@@ -2502,7 +2502,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -7241,7 +7241,7 @@ mod tests {
                     timestamp: 1,
                 },
                 envelope_version: EVENT_ENVELOPE_VERSION,
-                schema_id: None,
+                shape: None,
                 ..Event::default()
             },
             Event {
@@ -7257,7 +7257,7 @@ mod tests {
                     timestamp: 2,
                 },
                 envelope_version: EVENT_ENVELOPE_VERSION,
-                schema_id: None,
+                shape: None,
                 ..Event::default()
             },
             Event {
@@ -7272,7 +7272,7 @@ mod tests {
                     timestamp: 3,
                 },
                 envelope_version: EVENT_ENVELOPE_VERSION,
-                schema_id: None,
+                shape: None,
                 ..Event::default()
             },
         ])

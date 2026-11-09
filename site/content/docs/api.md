@@ -231,10 +231,12 @@ fn as_i64(value: Option<&Value>) -> Option<i64> {
 Parsing text requires knowing what to parse it as, and the row does not say — `"9"` could be
 a `bigint` or a `text` holding a digit.
 
-Every connector announces a table's column types before that table's first row, in the
-snapshot and the stream, as a `SchemaChange` event with `ddl_type = "READ_SCHEMA"`.
-`data_type` is the source's own syntax, modifier intact: `numeric(12,4)`, not `numeric`. See
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Every row carries its table's shape in `Event::shape` (a `RowShape`): the
+columns in ordinal order with `data_type` and `nullable`, the primary key, and a content `id`.
+`data_type` is the source's own syntax, modifier intact: `numeric(12,4)`, not `numeric`.
+`None` means unknown — see
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape) for the paths that
+carry none.
 
 #### Why text rather than typed JSON
 

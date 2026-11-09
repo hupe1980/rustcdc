@@ -44,8 +44,12 @@ impl MysqlStreamHandle {
         }
     }
 
-    fn build_event(&self, op: Operation, change: MysqlRowChange) -> Event {
-        let schema_id = self.row_schema_id(change.schema.as_deref(), &change.table);
+    fn build_event(
+        &self,
+        op: Operation,
+        change: MysqlRowChange,
+        shape: Option<std::sync::Arc<crate::RowShape>>,
+    ) -> Event {
         Event {
             // A row-based binlog event carries the whole prior row or none of it — MySQL
             // has no key-only pre-image, so there is no third case to distinguish here.
@@ -62,9 +66,21 @@ impl MysqlStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id,
+            shape,
             unavailable_columns: Vec::new(),
         }
+    }
+
+    /// The shape a row was captured under: the catalogue's, when it agrees with the row's
+    /// own table map; see [`row_shape`](super::row_shape).
+    async fn row_shape(
+        &mut self,
+        change: &MysqlRowChange,
+    ) -> Option<std::sync::Arc<crate::RowShape>> {
+        let schema = change.schema.as_deref()?;
+        self.shapes
+            .shape_for(schema, &change.table, &change.table_map)
+            .await
     }
 
     fn commit_current_transaction(
@@ -115,7 +131,7 @@ impl MysqlStreamHandle {
     fn announce_table_if_new(&mut self, schema: Option<&str>, table: &str) -> Option<Event> {
         let database = schema?.to_string();
         let key = (database.clone(), table.to_string());
-        if self.announced_tables.contains_key(&key) {
+        if self.announced_tables.contains(&key) {
             return None;
         }
         let columns = self.catalog_columns.get(&key)?.clone();
@@ -150,20 +166,18 @@ impl MysqlStreamHandle {
             &self.stream.gtid,
         );
         let mut event = captured.to_event(&self.source_name, offset, ts_ms);
-        self.announced_tables.insert(key, event.schema_id.clone());
+        self.announced_tables.insert(key);
         if self.current_tx_id.is_some() {
             event.transaction = self.tx_meta();
         }
         Some(event)
     }
 
-    /// The id of the shape a row of this table is captured under, if this run knows one.
-    fn row_schema_id(&self, schema: Option<&str>, table: &str) -> Option<String> {
-        let key = (schema?.to_string(), table.to_string());
-        self.announced_tables.get(&key).cloned().flatten()
-    }
-
-    pub(super) fn process_messages(&mut self, messages: Vec<MysqlBinlogMessage>) -> Vec<Event> {
+    pub(super) async fn process_messages(
+        &mut self,
+        messages: Vec<MysqlBinlogMessage>,
+    ) -> Vec<Event> {
+        self.shapes.start_batch();
         let mut committed = Vec::new();
         for message in messages {
             match message {
@@ -189,8 +203,12 @@ impl MysqlStreamHandle {
                         {
                             self.partial_tx_events.push(schema_event);
                         }
-                        self.partial_tx_events
-                            .push(self.build_event(Operation::Insert, change));
+                        let shape = self.row_shape(&change).await;
+                        self.partial_tx_events.push(self.build_event(
+                            Operation::Insert,
+                            change,
+                            shape,
+                        ));
                     }
                 }
                 MysqlBinlogMessage::UpdateRows(change) => {
@@ -207,8 +225,12 @@ impl MysqlStreamHandle {
                         {
                             self.partial_tx_events.push(schema_event);
                         }
-                        self.partial_tx_events
-                            .push(self.build_event(Operation::Update, change));
+                        let shape = self.row_shape(&change).await;
+                        self.partial_tx_events.push(self.build_event(
+                            Operation::Update,
+                            change,
+                            shape,
+                        ));
                     }
                 }
                 MysqlBinlogMessage::DeleteRows(change) => {
@@ -225,8 +247,12 @@ impl MysqlStreamHandle {
                         {
                             self.partial_tx_events.push(schema_event);
                         }
-                        self.partial_tx_events
-                            .push(self.build_event(Operation::Delete, change));
+                        let shape = self.row_shape(&change).await;
+                        self.partial_tx_events.push(self.build_event(
+                            Operation::Delete,
+                            change,
+                            shape,
+                        ));
                     }
                 }
                 MysqlBinlogMessage::Xid {
@@ -280,6 +306,9 @@ impl MysqlStreamHandle {
 
                     self.stream.binlog_file = binlog_file;
                     self.stream.binlog_pos = binlog_pos;
+                    // Whatever the catalogue said about this table may be stale from here on,
+                    // filtered or not: it is re-read before a later row may carry it.
+                    self.shapes.invalidate(&captured.schema, &captured.table);
                     // The position advances whether or not the statement is emitted — a
                     // filtered DDL still moved the binlog on, and a checkpoint that
                     // pretended otherwise would replay it.
@@ -300,12 +329,8 @@ impl MysqlStreamHandle {
                             &self.stream.gtid,
                         );
                         let event = captured.to_event(&self.source_name, offset, timestamp_ms);
-                        // The shape changed here. Rows after this statement name the shape
-                        // it describes, or none when it carries no resulting schema.
-                        self.announced_tables.insert(
-                            (captured.schema.clone(), captured.table.clone()),
-                            event.schema_id.clone(),
-                        );
+                        self.announced_tables
+                            .insert((captured.schema.clone(), captured.table.clone()));
                         committed.push(event);
                         self.events_polled = self.events_polled.saturating_add(1);
                     }
@@ -354,7 +379,7 @@ impl MysqlStreamHandle {
                             snapshot: None,
                             transaction: None,
                             envelope_version: EVENT_ENVELOPE_VERSION,
-                            schema_id: None,
+                            shape: None,
                             unavailable_columns: Vec::new(),
                         });
                         self.events_polled = self.events_polled.saturating_add(1);

@@ -694,6 +694,23 @@ pub struct RuntimeTuningConfig {
     /// deployment; only the versions spanning the replay window are ever read.
     #[serde(default)]
     pub schema_history_max_versions_per_table: usize,
+
+    /// How a row's table shape is delivered: whole (`inline`, default) or as its id (`id`).
+    #[serde(default)]
+    pub row_shape: RowShapeDelivery,
+}
+
+/// How a row's table shape (`Event::shape`) is delivered.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RowShapeDelivery {
+    /// Columns, declared types, nullability and key in every row: each row decodes alone.
+    #[default]
+    Inline,
+    /// Only the shape's id, schema and table; the columns resolve through
+    /// `GET /schemas/{id}` on the admin API. A shape a transform narrowed is still delivered
+    /// inline, since no source declared it.
+    Id,
 }
 
 /// Where a delivered batch is allowed to end.
@@ -830,6 +847,7 @@ impl Default for RuntimeTuningConfig {
             validate_events: true,
             sink_close_timeout_ms: default_runtime_sink_close_timeout_ms(),
             schema_history_max_versions_per_table: 0,
+            row_shape: RowShapeDelivery::default(),
         }
     }
 }
