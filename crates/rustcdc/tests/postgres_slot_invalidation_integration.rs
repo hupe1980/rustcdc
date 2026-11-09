@@ -366,7 +366,7 @@ async fn a_refused_start_replication_is_classified_as_an_invalidated_slot() -> r
         slot_idle_advance_interval_ms: 0,
         ..PostgresSourceConfig::default()
     });
-    rustcdc::source::Source::connect(&mut connection).await?;
+    rustcdc::source::Source::connect(&connection).await?;
 
     burst_wal(&admin).await?;
     admin
