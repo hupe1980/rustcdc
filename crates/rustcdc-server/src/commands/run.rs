@@ -607,19 +607,12 @@ impl Drop for StateDirLock {
     }
 }
 
-/// Returns `true` if the process with `pid` is currently alive **and** its
-/// command line indicates it is a `cdc` process.
-///
-/// The name-verification step prevents a recycled PID from blocking startup:
-/// if an unrelated process now holds that PID the lock is considered stale
-/// and is overwritten.
-///
-/// Existence is checked via POSIX `kill -0` semantics (no signal is sent).
-/// The name is then verified via `/proc/{pid}/cmdline` (Linux) or
-/// `ps -o comm= -p {pid}` (macOS / other Unix).
-/// Falls back to `false` on unsupported platforms so the guard is never a
-/// hard blocker on Windows CI.
 /// Is a PID on **this host** a live cdc process?
+///
+/// Existence is checked with `kill -0` (no signal is sent), then the name via
+/// `/proc/{pid}/cmdline` (Linux) or `ps -o comm=` (other Unix), so a recycled PID held by
+/// an unrelated process reads as stale rather than blocking startup. Always `false` on
+/// non-Unix platforms.
 ///
 /// Shared with the `local_fs` state lease, which uses it to distinguish a crashed owner
 /// from a live one *on the same host* — the one piece of evidence a local filesystem
@@ -671,7 +664,7 @@ pub(crate) fn is_cdc_process_alive(pid: u32) -> bool {
     #[cfg(not(unix))]
     {
         let _ = pid;
-        false // Conservative: never evict on unsupported platforms.
+        false // Cannot tell here, so a stale lock never blocks startup.
     }
 }
 
@@ -701,12 +694,9 @@ pub(crate) mod tests {
             .build()
     }
 
-    /// The limit is enforced against the payload the transport actually sends.
-    ///
-    /// It used to be enforced against a JSON rendering produced solely to be measured
-    /// and then discarded — 13.9 us per event of waste, and for a non-JSON codec it
-    /// measured bytes that were never transmitted. These tests drive a real
-    /// `SinkBinding`, so they check the limit where it now lives.
+    /// The limit is enforced against the payload the transport actually sends — for a
+    /// non-JSON codec, a JSON rendering would measure bytes never transmitted. These tests
+    /// drive a real `SinkBinding`, where the limit lives.
     #[tokio::test]
     async fn event_size_limit_rejects_an_oversized_encoded_payload() {
         let mut binding = crate::sink::build_binding(

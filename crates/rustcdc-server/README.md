@@ -18,11 +18,9 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 ---
 
 > [!NOTE]
-> **This is a workspace member, not a standalone repository.** `rustcdc-server` is the
-> configured binary; [`rustcdc`](../README.md) at the workspace root is the library it is
-> built from. They share one version, one CI configuration and one dependency policy, and
-> every command below is run from the **repository root** — `cargo run -p rustcdc-server`,
-> not `cd server`.
+> `rustcdc-server` is the configured binary; [`rustcdc`](../rustcdc/README.md) is the library
+> it is built from, in the same workspace and at the same version. Every command below runs
+> from the **repository root**.
 
 ---
 
@@ -30,23 +28,12 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 
 | | |
 |---|---|
-| 🚀 **Zero-copy streaming** | Low-latency WAL/binlog tailing with back-pressure across all sources |
-| 🔌 **Four sources, seven sinks** | Postgres · MySQL · MariaDB · SQL Server → stdout · JSONL · HTTP · Kafka · Iceberg · Snowflake · **Databricks**. [Not all are equally proven](#connector-maturity) — see below |
-| 📐 **Nine wire formats** | JSON · CloudEvents 1.0 · Avro · Protobuf, plus Confluent framing (Avro / JSON Schema / Protobuf) against Confluent **or** Apicurio registries, and AWS Glue framing |
-| 🌊 **Non-blocking backfill** | DBLog watermark incremental snapshots interleave with the live stream and resume mid-chunk after a restart — no held replication slot, no re-read from row zero |
-| 🧩 **Transform pipeline** | Native rules — masking (redact / HMAC / AES-GCM), field mapping, transactional outbox, routing — plus sandboxed WASM modules in any language. A rule that never matches is a metric, not a silent no-op |
-| 🏷️ **Topic per table, from one sink** | `topic = "cdc.${schema}.${table}"` gives the Debezium layout without a `[[sinks]]` block, a route and a producer per table; a new table needs no config change. Identifiers Kafka cannot spell are rejected, or sanitised on request — and a sanitised name that would merge two tables onto one topic halts rather than interleaving them |
-| 🏷️ **Provenance headers** | Every record carries `__rustcdc.op` and the source schema, table, connector, offset and commit time, so a consumer filters without deserialising. Tombstones carry them too — otherwise a null value names nothing |
-| 🪦 **Delete tombstones** | A delete is followed by a null-value record on the same key, so a compacted topic drops the row instead of keeping it forever. Debezium's `tombstones.on.delete`, on by default — and never emitted where the key names a table rather than a row, which would compact away the history it exists to prune |
-| 📦 **Pluggable state** | Checkpoint anywhere: local FS · Kafka topic · Redis · PostgreSQL |
-| ☠️ **Sink-agnostic dead-letter queue** | Permanently undeliverable events are quarantined to a file, a Kafka topic or **Amazon SQS** with their source offset and cause, so a poison record cannot crash-loop the pipeline. SQS brings redrive-to-source and broker-level age alarms; it is offered as a DLQ and deliberately *not* as a sink, [with the reasoning written down](https://hupe1980.github.io/rustcdc/docs/configuration/). Opt-in, because advancing past an undelivered event is data loss and should be a decision |
-| 🧮 **Failures classified on two axes** | Permanent and *this record's fault* (`MessageTooLarge`) is quarantined; permanent and *environmental* (a revoked ACL) halts the pipeline instead of draining the change stream into the DLQ one event at a time; transient is retried. Conflating the first two is how a dead-letter queue becomes the data loss it exists to prevent |
-| 🎯 **End-to-end exactly-once, two ways** | `effectively_once` writes the checkpoint *inside* the sink's Kafka transaction, so the data and the position commit together. The **Snowflake** sink reaches the same guarantee with no Kafka at all: a Snowpipe Streaming channel's offset token is a destination-side record of what is durable, and `flush` does not return until it has advanced. Plus `at_least_once`, and an optional `preserve_transactions` boundary so a sink never commits half a source transaction |
-| 🔭 **First-class observability** | Prometheus `/metrics` + OTLP traces & metrics (gRPC/HTTP), a one-hot runtime health verdict (`healthy · idle · stalled · not_running`) that distinguishes a quiet database from a dead socket, and a data-loss tripwire counter |
-| 🧬 **Partial-image safety** | PostgreSQL unchanged-TOAST holes are tracked per image (`unavailable_columns` / `before_unavailable_columns`) and survive transforms, sinks, and the Iceberg schema — absent is never conflated with `NULL`. `reselect_unavailable_columns` fills them from the source when you would rather have a complete row |
-| ✍️ **Signed webhooks** | The HTTP sink signs every request to [Standard Webhooks](https://www.standardwebhooks.com/) — ed25519 or HMAC-SHA256, with zero-downtime key rotation — so any receiver built against Zapier, Twilio, ngrok or Svix verifies it unchanged. `rustcdc webhook-keygen` mints the key |
-| 🔒 **Security by default** | Kafka SASL (PLAIN · SCRAM · OAUTHBEARER with a built-in OIDC provider · AWS MSK IAM), mTLS with hot certificate reload, Ed25519-signed audit trail, token-manifest auth, per-IP rate limiting, IP pseudonymisation (GDPR) |
-| 🐳 **Distroless multi-arch image** | `linux/amd64` + `linux/arm64`, SLSA provenance + SBOM, no shell inside |
+| 🔌 **Four sources, seven sinks** | PostgreSQL · MySQL · MariaDB · SQL Server → stdout · JSONL · HTTP · Kafka · Iceberg · Snowflake · Databricks, plus fan-out to several at once. [Not all are equally proven](#connector-maturity) |
+| 🎯 **Explicit delivery contracts** | `at_least_once`, or `effectively_once`: a batch's records and its checkpoint commit together (Kafka transaction or Snowflake offset token). Configurations that cannot deliver it are rejected at startup. Optional `preserve_transactions` so a sink never commits half a source transaction |
+| 🌊 **Non-blocking backfill** | DBLog watermark incremental snapshots interleave with the live stream and resume mid-chunk after a restart; tables can be added to a running pipeline |
+| 🧩 **Transforms and codecs** | Masking (redact / HMAC / AES-GCM), field mapping, outbox, routing, sandboxed WASM; JSON, CloudEvents, Avro and Protobuf, with Confluent, Apicurio or AWS Glue registry framing |
+| ☠️ **Dead-letter queue** | Opt-in. A poison record is quarantined to a file, a Kafka topic or Amazon SQS with its source offset and cause; an environmental failure (a revoked ACL) halts instead of draining the stream into the DLQ |
+| 🔭 **Operable** | Prometheus and OTLP, a health verdict that tells a quiet database from a dead socket, a signed audit trail, and a distroless multi-arch image with SLSA provenance and SBOM |
 
 ---
 
@@ -61,8 +48,8 @@ than leaving for you to discover:
 |---|---|---|
 | PostgreSQL | ✅ | A real server, both WAL transports, resume, TLS enforcement, on-demand snapshots, row filters |
 | MySQL | ✅ | A real server, GTID and file+position, resume, primary-key shape |
-| MariaDB | ⚠️ unit-tested only | Shares the MySQL binlog connector; no container suite of its own yet |
-| SQL Server | ⚠️ unit-tested only | No container suite yet |
+| MariaDB | ✅ library suites | MariaDB 10.5 / 10.6 / 10.11: connection, end-to-end capture and process-crash replay. No server-binary suite |
+| SQL Server | ✅ library suites | 2022 for capture, snapshot, handoff, type fidelity and process-crash replay; lifecycle on 2019 / 2022 / 2025. No server-binary suite |
 
 **Sinks**
 
@@ -70,10 +57,10 @@ than leaving for you to discover:
 |---|---|---|
 | Kafka | ✅ | **Apache Kafka and Redpanda**, both — ordering through the real router, keyless partitioning, delivery counters |
 | stdout · JSONL | ✅ | Covered by the delivery-contract suite, which crash-injects |
-| HTTP | ⚠️ unit-tested only | Status-class and retry behaviour against a refused socket; no container suite yet |
+| HTTP | ⚠️ unit-tested only | Status-class and retry behaviour against a refused socket; no container suite |
 | Iceberg | ⚠️ unit-tested only | REST-catalog tests are env-gated on an external catalog. Supports Iceberg REST **and** AWS S3 Tables |
-| Snowflake | ⚠️ contract-tested | The commit wait, stale-sequencer recovery, resume filtering and NDJSON framing are asserted against a **local fake** of the Snowpipe Streaming API on every build. No account-backed suite yet |
-| Databricks (Zerobus) | ⚠️ contract-tested | The durability wait, failure path, JSON framing and advertised contract are asserted against an in-process fake built from the SDK's **own generated gRPC server trait**, so a contract change stops it compiling. No workspace-backed suite yet |
+| Snowflake | ⚠️ contract-tested | The commit wait, stale-sequencer recovery, resume filtering and NDJSON framing are asserted against a **local fake** of the Snowpipe Streaming API on every build. No account-backed suite |
+| Databricks (Zerobus) | ⚠️ contract-tested | The durability wait, failure path, JSON framing and advertised contract are asserted against an in-process fake built from the SDK's **own generated gRPC server trait**, so a contract change stops it compiling. No workspace-backed suite |
 
 Every container suite manages its own broker or database, so a local run and CI execute the
 same command against the same fixture, and a test asserts that CI still runs every suite
@@ -83,9 +70,6 @@ that exists — an env-gated test nobody runs reports success, which is worse th
 protocol, so a green run against one says nothing about the other — Apache Kafka propagates
 new-topic metadata asynchronously and elects a group coordinator lazily, and Redpanda does
 neither.
-
-The gap is closing in the order above. Until it does, these tables are the honest answer to
-"how well is this exercised?"
 
 ---
 
@@ -123,15 +107,18 @@ cd rustcdc/demo
 docker compose up
 ```
 
-See [demo/README.md](../demo/README.md) for what to expect and how to explore the admin API.
+See [demo/README.md](../../demo/README.md) for what to expect and how to explore the admin API.
 
-The admin API describes itself: `GET /openapi.json` serves an OpenAPI 3.1 document —
-unauthenticated, since it describes the shape of the API rather than any state — that a
-generator will turn into a typed client. It is built from the same crate as the handlers,
-and a test fails the build if the router and the document ever disagree in either
-direction.
+### Option B — Homebrew
 
-### Option B — Docker with your own config
+```bash
+brew install hupe1980/tap/rustcdc   # macOS Apple Silicon, Linux x86_64 / arm64
+rustcdc init --output cdc.toml --profile dev
+```
+
+The formula installs the release binary, built with every connector and sink.
+
+### Option C — Docker with your own config
 
 ```bash
 # Pull the latest multi-arch image
@@ -143,13 +130,13 @@ docker run --rm \
   ghcr.io/hupe1980/rustcdc-server:latest
 ```
 
-### Option C — Build from source
+### Option D — Build from source
 
 ```bash
 # Requires Rust 1.97.0+ and cmake / clang / perl (for aws-lc-sys)
 git clone https://github.com/hupe1980/rustcdc
-cd rustcdc-server
-cargo build --release --all-features
+cd rustcdc
+cargo build -p rustcdc-server --release --all-features
 
 export POSTGRES_PASSWORD="mysecret"
 ./target/release/rustcdc run --config-file config.toml
@@ -225,11 +212,11 @@ dir = "./state"
 │                                    │   table glob → named sinks   │  │
 │                                    └──────────────────────────────┘  │
 │                                                    │                 │
-│             ┌────────────┬────────────┬────────────┼                 │
-│             ▼            ▼            ▼            ▼                 │
-│        ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐            │
-│        │  Kafka  │  │ Iceberg │  │   HTTP  │  │  JSONL  │            │
-│        └─────────┘  └─────────┘  └─────────┘  └─────────┘            │
+│                                                    ▼                 │
+│     ┌─────────────────────────────────────────────────────────────┐  │
+│     │  Kafka · Iceberg · Snowflake · Databricks · HTTP · JSONL ·  │  │
+│     │  stdout — one sink, or fan-out to several                   │  │
+│     └─────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │    ┌────────────────────────────────────────────────────────────┐    │
 │    │     State: local FS · Kafka topic · Redis · PostgreSQL     │    │
@@ -309,6 +296,9 @@ a pooler.
 | **HTTP** | at_least_once | Batched, configurable retry |
 | **Apache Kafka** | at_least_once · effectively_once | Pure-Rust client (krafka), idempotent + transactional producers, pipelined sends with per-record delivery confirmation and per-partition ordering, PK-keyed partitioning with per-table fallback, SASL + mTLS + OIDC |
 | **Apache Iceberg** | at_least_once | REST catalog, S3/GCS/ABS storage, zstd Parquet, periodic snapshot expiry |
+| **Snowflake** | at_least_once · effectively_once | Snowpipe Streaming high-performance REST API; `flush` waits for the channel's offset token |
+| **Databricks** (`zerobus`) | at_least_once | Unity Catalog Delta tables via Zerobus Ingest |
+| **fan** | weakest child | Delivers each event to every child sink; all must flush before the checkpoint advances |
 
 ---
 
@@ -348,7 +338,7 @@ delivery_contract = "effectively_once"  # at_least_once | effectively_once
 | Contract | Guarantee | Kafka | HTTP |
 |---|---|---|---|
 | `at_least_once` | Delivered ≥ 1×; checkpoint advances only after durable delivery | ✅ | ✅ |
-| `effectively_once` | **Exactly-once, end to end.** Either the records and the checkpoint commit in one Kafka transaction, or the sink carries a destination-side offset token (Snowflake). The Kafka route needs a transactional sink and `state.offset.backend = "kafka_topic"` on the same cluster. It must hold for **every** routed sink; anything that cannot deliver it is rejected at load, naming the sink. [How it works](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts). | ✅ | ❌ |
+| `effectively_once` | A batch's records and its checkpoint commit together: in one Kafka transaction, or against the sink's destination-side offset token (Snowflake). A crash keeps both or neither. The Kafka route needs a transactional sink and `state.offset.backend = "kafka_topic"` on the same cluster. It must hold for **every** routed sink; anything that cannot deliver it is rejected at load, naming the sink. [How it works](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts). | ✅ | ❌ |
 
 ---
 
@@ -467,10 +457,10 @@ rustcdc snapshot public.invoices --admin-write-token-env RUSTCDC_WRITE_TOKEN
 docker pull ghcr.io/hupe1980/rustcdc-server:latest
 
 # Pin to a specific version
-docker pull ghcr.io/hupe1980/rustcdc-server:1.2.3
+docker pull ghcr.io/hupe1980/rustcdc-server:0.19.0
 ```
 
-Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](../Dockerfile) for build details.
+Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](../../Dockerfile) for build details.
 
 ---
 
@@ -482,7 +472,8 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 | **OTLP traces** | `otlp_endpoint` in `[observability]` (gRPC or HTTP) |
 | **OTLP metrics** | Same or separate `otlp_metrics_endpoint` |
 | **Structured logs** | `log_format = "json"` → ships to any log aggregator |
-| **SLO alert rules** | [monitoring/rustcdc_slo_alerts.yml](../monitoring/rustcdc_slo_alerts.yml) — 26 rules, `promtool`-validated |
+| **SLO alert rules** | [monitoring/rustcdc_slo_alerts.yml](../../monitoring/rustcdc_slo_alerts.yml) — 39 rules, `promtool`-validated |
+| **OpenAPI** | `GET /openapi.json` (unauthenticated) serves an OpenAPI 3.1 document of the admin API; a test fails the build if it and the router disagree |
 | **Kafka OAuth health** | `rustcdc_sink_kafka_oauth_token_fetch_failures_total` and `..._expiry_epoch_ms` — a failing OIDC refresh loop is otherwise indistinguishable from an unreachable broker |
 
 ---
@@ -500,21 +491,21 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 - **`GET /config`** — the configuration this instance is *actually* running, after env-var layering and migration, with three independent redaction rules: enumerated paths, secret-looking key names (separator-insensitive, so `x-api-key` matches), and a value-driven URL rule that strips userinfo *and* secret-named query parameters under any key. Held by a property test that generates names rather than listing them
 - **Control-plane panic guard** — a panic in any admin handler becomes a logged `500`, not a bare connection reset; the payload never reaches the caller
 - **TLS everywhere** — admin API and all outbound connections use rustls (no OpenSSL). A TLS-configured source is TLS on *every* connection, including the replication-slot lag sampler; a server with `ssl = off` fails the connection rather than silently downgrading it
-- **No `unsafe` in the shipped binary** — `src/main.rs` carries `#![forbid(unsafe_code)]`, which no inner `#[allow]` can override. The library is `deny` with exactly one allowlisted site (`test_env`, for the `std::env::set_var` a few tests need), held to that one entry by [an architecture guard](https://hupe1980.github.io/rustcdc/docs/engineering/)
+- **No `unsafe` in the shipped binary** — `src/main.rs` carries `#![forbid(unsafe_code)]`, which no inner `#[allow]` can override. Both crates are `deny`, with two allowlisted sites across them — the server's `test_env` (the `std::env::set_var` a few tests need) and the library's Windows process-liveness FFI in `checkpoint/owner_lease.rs` — held to that list by [an architecture guard](https://hupe1980.github.io/rustcdc/docs/engineering/)
 
 ---
 
 ## 🧪 Development
 
 ```bash
-# Check everything (warnings-as-errors, all targets, all features)
-RUSTFLAGS='-D warnings' cargo check --all-targets --all-features
+# Lint (warnings-as-errors, all targets, all features)
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Run tests
-cargo test --all-features
+# Unit tests
+cargo test -p rustcdc-server --lib --all-features
 
-# Lint
-cargo clippy --all-targets --all-features -- -D warnings
+# The gate a pull request must pass
+cargo xtask policy-gate
 
 # Audit licenses and duplicate dependencies (--all-features matches CI and the
 # published image; a narrower run reports the duplicate skips as unnecessary)
@@ -524,12 +515,12 @@ cargo deny check --all-features
 cargo xtask bench -p rustcdc-server --bench throughput -- --save-baseline main
 
 # End-to-end against a real PostgreSQL (manages its own container; needs Docker)
-RUSTCDC_INTEGRATION=1 cargo test --all-features --test integration_postgres -- --test-threads=1
+RUSTCDC_INTEGRATION=1 cargo test -p rustcdc-server --all-features --test integration_postgres -- --test-threads=1
 
-# Specific integration suites
-cargo test --test config_roundtrip
-cargo test --test sink_conformance
-cargo test --test wasm_transform
+# Specific suites
+cargo test -p rustcdc-server --all-features --test config_roundtrip
+cargo test -p rustcdc-server --all-features --test sink_conformance
+cargo test -p rustcdc-server --all-features --test wasm_transform
 ```
 
 ---
@@ -538,7 +529,7 @@ cargo test --test wasm_transform
 
 Licensed under either of
 
-- [Apache License 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
+- [Apache License 2.0](../../LICENSE-APACHE)
+- [MIT License](../../LICENSE-MIT)
 
 at your option.

@@ -76,19 +76,12 @@ impl AppError {
     ///
     /// # Flush errors keep their classification
     ///
-    /// `TableRouter::send` passes a sink's error through untouched. `flush_all` and
-    /// `close_all` must not flatten every branch's error into one string and return
-    /// `Error::StateError`, which is `ErrorKind::Terminal`: a broker leader election
-    /// surfacing during flush would become a
-    /// process exit, a restart and a full replay, while the identical failure surfacing
-    /// from `send` was retried. Which one you got was decided by batch boundaries.
-    ///
-    /// We refused to work around that by matching on message text — a classifier built on
-    /// string contents is worse than one that is conservative — and reported it upstream
-    /// instead. 0.11 returns `Error::Aggregate { kind, detail }` from both, where `kind`
-    /// is the most severe `ErrorKind` among the branches, so `Error::kind` (and therefore
-    /// the `Self::Runtime` arm below) now classifies a fan-out failure by what actually
-    /// went wrong. `a_transient_flush_failure_is_retryable` holds that.
+    /// `TableRouter::send` passes a sink's error through untouched, and `flush_all` /
+    /// `close_all` return `Error::Aggregate { kind, detail }` with the most severe
+    /// `ErrorKind` among the branches. So the `Self::Runtime` arm classifies a fan-out
+    /// failure by what went wrong, and a broker leader election is retried whether it
+    /// surfaces from `send` or from flush, never by matching on message text.
+    /// `a_transient_flush_failure_is_retryable` holds that.
     pub fn is_recoverable(&self) -> bool {
         match self {
             Self::Runtime(err) => err.is_recoverable(),
@@ -103,9 +96,8 @@ impl AppError {
 
     /// Whether quarantining **this event** and advancing past it is a sound response.
     ///
-    /// `!is_recoverable()` used to be the sole test, which conflated two failures that
-    /// want opposite handling. "This record is malformed" and "your credentials are
-    /// wrong" are both permanent, but only the first is a property of the event. Treating
+    /// `!is_recoverable()` is not enough: "this record is malformed" and "your credentials
+    /// are wrong" are both permanent, but only the first is a property of the event. Treating
     /// the second as dead-letterable drains the whole change stream into the DLQ, one
     /// event at a time, while every health check reports the pipeline as running — the
     /// silent data loss the DLQ exists to prevent, delivered by the DLQ itself.
@@ -126,9 +118,7 @@ impl AppError {
             // the durable position past an undelivered event, so it belongs in the
             // library — an embedder writing their own quarantine path needs the same
             // answer, and `Error::kind()` returns `Terminal` for both halves of the
-            // distinction. It used to be spelled here as `matches!(err,
-            // ValidationError(_))`, which was the same rule in a second place and would
-            // have drifted the first time the library learned a new terminal variant.
+            // distinction.
             Self::Runtime(err) => err.is_record_attributable(),
         }
     }
@@ -160,10 +150,8 @@ impl From<AppError> for rustcdc::core::Error {
             AppError::Runtime(inner) => inner,
             AppError::Config(inner) => rustcdc::core::Error::ConfigError(inner.to_string()),
             AppError::Io(inner) => rustcdc::core::Error::StateError(inner.to_string()),
-            // `ValidationError` is Terminal upstream. `SourceError` — the old catch-all
-            // — is Transient, so an event that is permanently too large came back as
-            // "retry me", and the batch loop dutifully retried a failure that is the
-            // same size every time.
+            // `ValidationError` is Terminal upstream; `SourceError` is Transient and would
+            // retry an event that is the same size every time.
             AppError::EventTooLarge(message) => {
                 rustcdc::core::Error::ValidationError(vec![message])
             }

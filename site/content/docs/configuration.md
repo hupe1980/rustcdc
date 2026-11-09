@@ -100,11 +100,8 @@ mode = "plaintext"                   # plaintext | tls (ca_cert_path, client_cer
 `*` and `?` work inside a segment and do not cross the `.`, so `public.*` never matches
 `other.orders`. Blank entries are ignored rather than treated as catch-alls.
 
-> **These were exact-match before rustcdc 0.12.** `table_exclude_list = ["public.tmp_*"]`
-> excluded nothing, which is indistinguishable from a set of tables that never changed;
-> an include list matching nothing is indistinguishable from an idle database. If either
-> list carried a literal `*` as a no-op placeholder, **it is now a catch-all** — audit
-> both before upgrading. Entries containing neither `*` nor `?` behave exactly as before.
+A literal `*` entry is a catch-all, not a placeholder. Entries containing neither `*` nor
+`?` match exactly.
 
 An unqualified entry on the *include* side widens the very thing the list exists to bound,
 so the connector logs a WARN naming each one at startup. Qualify them unless you mean the
@@ -122,7 +119,7 @@ by construction and its cost grows with the source's longest-running transaction
 selecting it logs a warning at startup and from `validate-config`. See
 [WAL transport](@/docs/connectors/postgres.md#wal-transport-how-the-stream-is-read).
 
-`mode = "tls"` now **requires** TLS: a connector pointed at a server with `ssl = off`
+`mode = "tls"` **requires** TLS: a connector pointed at a server with `ssl = off`
 fails to connect instead of silently downgrading to an unencrypted connection.
 
 See the [PostgreSQL connector guide](@/docs/connectors/postgres.md#7-configuration-reference) for field-by-field documentation.
@@ -608,18 +605,12 @@ tls_reload_interval_ms  = 300000   # 0 = never re-read the certificate (KIP-1288
 socks5_proxy            = "bastion.internal:1080"   # omit for a direct connection
 ```
 
-`max_in_flight` lives here rather than under `[sink.kafka]`, and has no cap. It would be
-rejected above 5, on the usual reasoning that an idempotent producer preserves ordering
-only up to `max.in.flight.requests.per.connection = 5` (KIP-679) and that a retried batch
-could otherwise land after one produced later.
-
-That rule protects against several batches for the *same partition* being on the wire at
-once, which krafka's record accumulator does not do: it holds one in-flight slot per
-partition and only dispatches partitions whose slot is idle, so batches reach the wire in
-seal order and sequence order cannot diverge from wire order. krafka 0.18 removed its own
-producer-level knob for that reason, leaving the per-*connection* ceiling — which is a
-transport concern, hence the move. Raising it lets more partitions have requests in flight
-over one connection; it does not let a partition get ahead of itself.
+`max_in_flight` is a per-connection pipelining depth, not capped at 5. KIP-679's
+`max.in.flight.requests.per.connection <= 5` rule guards against several batches for the
+*same partition* on the wire at once, which krafka's accumulator never sends: it holds one
+in-flight slot per partition, so batches reach the wire in seal order. Raising it lets
+more partitions have requests in flight over one connection; it does not let a partition
+get ahead of itself.
 
 `socks5_proxy` tunnels **every** broker connection, and the proxy performs the DNS
 resolution — which is the point in a VPN or bastion topology where broker hostnames do
@@ -1239,7 +1230,7 @@ lease is live — is fully covered. If you need a hard guarantee, use `kafka_top
 
 **This is not a substitute for `strategy: Recreate`.** See the
 [Kubernetes deployment](@/docs/operations.md#11-kubernetes-deployment) section: a Deployment
-without it surges to two pods on every rollout, and the second will now refuse to start
+without it surges to two pods on every rollout, and the second refuses to start
 rather than corrupt state — which turns a silent data problem into a stuck rollout. Set
 `Recreate` and neither happens.
 
@@ -1751,16 +1742,9 @@ A filter that fails to parse surfaces as a chunk-read error naming the table, at
 first chunk — not as a silently empty backfill.
 
 A condition may be pre-declared for a table that is not in `tables` — that is how you
-scope a backfill you intend to request later through `execute_snapshot`. Since rustcdc
-0.12 all three resolution paths (startup, checkpoint resume, on-demand request) go through
-one function, so a configured filter applies wherever the table is resolved.
-
-That was not always true. Until 0.12 the on-demand path could not see `table_conditions`
-at all, and worse, the two paths disagreed with *each other*: a runtime-requested table ran
-unfiltered and a restart then adopted it **with** the filter, so the rows delivered
-corresponded to no single predicate and where the split fell depended on when the process
-happened to restart. We reported it; this project refused the combination outright until
-the fix landed.
+scope a backfill you intend to request later through `execute_snapshot`. All three
+resolution paths (startup, checkpoint resume, on-demand request) go through one function,
+so a configured filter applies wherever the table is resolved.
 
 ### Snapshotting a table without a restart
 
@@ -2060,12 +2044,6 @@ Pause and resume report whether they changed anything, so a redundant call is
 distinguishable from an effective one. `stop_snapshot` reports how many tables it
 dropped. A paused snapshot survives a restart: the pause flag is part of the snapshot
 state carried in the checkpoint.
-
-These endpoints answered `501 Not Implemented` until rustcdc 0.11 shipped the controls.
-Before that they answered `200 OK` and recorded `PAUSED` / `RESUMED` / `ABORTED` while
-doing nothing at all — an operator pausing a snapshot would have watched it keep running
-under a green audit trail saying it had stopped. Refusing outright was the interim fix;
-this is the real one.
 
 Progress is observable while any of this is happening:
 
