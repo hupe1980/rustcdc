@@ -133,7 +133,7 @@ An unmodified column's new value is its old value, and under `FULL` the old tupl
 
 ### Evidence
 
-`1 261` library and `592` server unit tests and the doctests, green, with `clippy -D warnings`,
+`1 262` library and `592` server unit tests and the doctests, green, with `clippy -D warnings`,
 `cargo deny` and the policy gate. Container suites: PostgreSQL 16 (snapshot, incremental snapshot,
 stream, handoff, type fidelity, reselect, restart, process crash), connection on 12, 14 and 15,
 slot invalidation on 18; MySQL, MariaDB, SQL Server 2019/2022/2025 and the server's Kafka and
