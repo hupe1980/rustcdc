@@ -37,8 +37,8 @@ pub use runtime::{
     AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch,
     HEALTH_MIN_CONFIGURABLE_STALL_MS, HealthVerdict, IdempotencyOptions,
     PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl,
-    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, StallCause,
-    TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
+    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SlotWalStatus,
+    StallCause, TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
 #[cfg(feature = "tls")]

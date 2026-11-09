@@ -84,6 +84,37 @@ the rows captured under it carry the same value. Contributed by vu2jpr.
 - Carried by every codec that decodes — JSON, Avro (nullable, default `null`), Protobuf
   (field 15) — and by CloudEvents in `data`.
 
+### Added: a verdict for a replication slot PostgreSQL invalidates
+
+A slot invalidated while the pipeline ran (`max_slot_wal_keep_size`, PostgreSQL 18's
+`idle_replication_slot_timeout`) showed up as a reconnect loop reported `poll_loop_not_turning`,
+the cause `/livez` restarts on — and no restart recreates the removed WAL. The old stale-slot
+check matched message text, which on the SQL-peek transport was the literal `db error`, so it
+never fired; the streaming transport had none.
+
+- **`SourceErrorKind::SlotInvalidated`** (`slot_invalidated`, not recoverable), decided by SQLSTATE
+  `55000` plus the slot's own row in `pg_replication_slots` (`wal_status = 'lost'`, or an
+  `invalidation_reason` on 17+), never by the message. One classifier serves the peek poll,
+  `START_REPLICATION`, the periodic slot sample and startup validation. The message names the
+  slot and the server's `invalidation_reason`.
+- **`StallCause::SourcePositionLost`** (`source_position_lost`), checked first and before
+  `NotRunning`, set by a failed poll or `start()`. Alert `RUSTCDCStallSourcePositionLost`
+  (team `database`).
+- **The server parks** on it, mid-run or at startup: alive, not capturing, `/livez` 200,
+  `/readyz` 503, SIGTERM honoured. It never re-snapshots on its own — a re-snapshot cannot
+  replay rows deleted in the gap.
+- **Early warning:** `rustcdc_replication_slot_wal_status{status}` (one-hot) and
+  `rustcdc_replication_slot_safe_wal_size_bytes`, also on `RuntimeAdminSnapshot`
+  (`replication_slot_wal_status`, `replication_slot_safe_wal_size_bytes`, new `SlotWalStatus`).
+  Alert `RUSTCDCReplicationSlotUnreserved` fires while the slot can still be saved. The state is
+  read on the slot-lag cadence; `PostgresSourceConfig::slot_state_sample_interval_ms` overrides
+  it. On the streaming transport this sample is now one catalogue query on the existing SQL
+  connection.
+- **Reconnects stop on what a retry cannot fix:** a non-recoverable `SourceErrorKind` or
+  `Error::Unrecoverable` from a reconnect's `connect` or stream restart is returned at once with
+  its kind. A `ConfigError` (a deferred secret that failed to resolve) is still retried.
+- The incremental-snapshot stream now reports the slot's lag and state; it reported neither.
+
 ### Changed: dependencies, and one TLS stack in every build
 
 `iceberg` 0.10.1 → **0.11.0**, `opendal` 0.57 → **0.58**, `krafka` 0.24 → **0.29**, `schemreg`
@@ -117,6 +148,11 @@ the rows captured under it carry the same value. Contributed by vu2jpr.
    `unavailable_columns` is empty and `row_write()` returns `Replace` where it returned `Merge`.
 4. **A held, failing batch is no longer reported as `poll_loop_not_turning`**, so an alert or a
    runbook keyed on that cause for sink outages must move to `delivery_failing`.
+5. **`PostgresSourceConfig` gained `slot_state_sample_interval_ms`.** A struct literal without
+   `..Default::default()` no longer compiles.
+6. **An invalidated slot is `source_position_lost`**, not `poll_loop_not_turning`, and the server
+   parks instead of exiting or restarting. A reconnect that fails with a non-recoverable source
+   kind or `Error::Unrecoverable` returns at once instead of using the retry budget.
 
 ### Migrating
 
@@ -125,6 +161,11 @@ the rows captured under it carry the same value. Contributed by vu2jpr.
   the merge is now a no-op.
 - Route `rustcdc_runtime_stall_cause{cause="delivery_failing"}` to whoever owns the destination.
   The shipped alert rules do.
+- Add `slot_state_sample_interval_ms: None` (or `..Default::default()`) to `PostgresSourceConfig`
+  literals.
+- Route `rustcdc_runtime_stall_cause{cause="source_position_lost"}` and
+  `rustcdc_replication_slot_wal_status{status="unreserved"}` to the database team. A parked
+  process is recovered by recreating the slot and re-snapshotting, then SIGTERM.
 
 ## 0.19.0
 

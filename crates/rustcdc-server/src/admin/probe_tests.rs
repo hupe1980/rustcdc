@@ -108,7 +108,10 @@ pub(super) async fn livez_fails_when_the_poll_loop_has_been_wedged_long_enough()
     assert_eq!(body, "poll-loop-stalled");
 }
 
-/// Restarting is the wrong remedy for three of the four stall causes.
+/// Restarting is the wrong remedy for every stall cause but a wedged poll loop.
+///
+/// `SourcePositionLost` is the clearest: the source discarded the WAL the slot was holding,
+/// and no restart recreates it — each one would replay into the same refusal.
 ///
 /// `UnconfirmedSourcePosition` is the important one: a restart replays from the same
 /// checkpoint and fails identically, while the source keeps retaining log. A crash-loop
@@ -125,6 +128,7 @@ pub(super) async fn livez_stays_green_for_stalls_a_restart_cannot_fix() {
     let admin = probe_admin().await;
 
     for cause in [
+        StallCause::SourcePositionLost,
         StallCause::UnconfirmedSourcePosition,
         StallCause::ConsumerNotAcknowledging,
         StallCause::DeliveryFailing,
@@ -191,11 +195,7 @@ pub(super) async fn the_stall_clock_restarts_when_the_cause_changes() {
 pub(super) async fn readyz_reports_a_stall_and_names_its_cause() {
     let admin = probe_admin().await;
 
-    for cause in [
-        StallCause::PollLoopNotTurning,
-        StallCause::UnconfirmedSourcePosition,
-        StallCause::ConsumerNotAcknowledging,
-    ] {
+    for cause in StallCause::ALL.iter().copied() {
         set_health(&admin, stalled(cause)).await;
         let (status, body) = readyz_body(&admin).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{cause}");

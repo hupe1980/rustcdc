@@ -77,11 +77,31 @@ struct ScriptedStream {
     total: u64,
     next_seq: u64,
     batch_size: usize,
+    /// Fail every read as a source whose replication slot was invalidated.
+    slot_lost: bool,
+}
+
+/// Where a scripted source reports its replication slot as invalidated, if anywhere.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LostSlot {
+    Never,
+    OnPoll,
+    OnStart,
+}
+
+fn slot_invalidated() -> rustcdc::core::Error {
+    rustcdc::core::Error::source_error(
+        rustcdc::core::SourceErrorKind::SlotInvalidated,
+        "postgres invalidated replication slot 'cdc' (invalidation_reason = wal_removed)",
+    )
 }
 
 #[async_trait]
 impl StreamHandle for ScriptedStream {
     async fn next_events(&mut self, _timeout_ms: u64) -> rustcdc::core::Result<Vec<Event>> {
+        if self.slot_lost {
+            return Err(slot_invalidated());
+        }
         let mut events = Vec::new();
         while events.len() < self.batch_size && self.next_seq < self.total {
             self.next_seq += 1;
@@ -136,6 +156,7 @@ struct ScriptedSource {
     batch_size: usize,
     /// Where `start_stream` was asked to resume from, recorded for assertion.
     resumed_from: Arc<Mutex<Option<u64>>>,
+    lost_slot: LostSlot,
 }
 
 #[async_trait]
@@ -151,12 +172,16 @@ impl Source for ScriptedSource {
         &mut self,
         resume_from: Option<&dyn Offset>,
     ) -> rustcdc::core::Result<Box<dyn StreamHandle>> {
+        if self.lost_slot == LostSlot::OnStart {
+            return Err(slot_invalidated());
+        }
         let next_seq = resume_sequence(resume_from);
         *self.resumed_from.lock().expect("resume lock") = Some(next_seq);
         Ok(Box::new(ScriptedStream {
             total: self.total,
             next_seq,
             batch_size: self.batch_size,
+            slot_lost: self.lost_slot == LostSlot::OnPoll,
         }))
     }
 
@@ -244,6 +269,7 @@ impl Pipeline {
             &[],
             1 << 20,
             health_stall_threshold_ms,
+            LostSlot::Never,
         )
         .await;
 
@@ -288,8 +314,15 @@ impl Pipeline {
             faults,
             max_event_bytes,
             None,
+            LostSlot::Never,
         )
         .await
+    }
+
+    /// A pipeline whose source reports its replication slot invalidated. Under
+    /// [`LostSlot::OnStart`] the runtime is left unstarted, for the caller to start.
+    async fn start_with_lost_slot(state_dir: &Path, output_path: &Path, lost: LostSlot) -> Self {
+        Self::start_with_options(state_dir, output_path, 3, 3, &[], 1 << 20, None, lost).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -301,6 +334,7 @@ impl Pipeline {
         faults: &[CheckpointFault],
         max_event_bytes: usize,
         health_stall_threshold_ms: Option<u64>,
+        lost_slot: LostSlot,
     ) -> Self {
         let mut app_config = config_for(state_dir, output_path);
         app_config.runtime.max_event_bytes = max_event_bytes;
@@ -337,8 +371,11 @@ impl Pipeline {
             total,
             batch_size,
             resumed_from: Arc::clone(&resumed_from),
+            lost_slot,
         }));
-        runtime.start().await.expect("runtime start");
+        if lost_slot != LostSlot::OnStart {
+            runtime.start().await.expect("runtime start");
+        }
 
         let recovery_policy = RecoveryPolicyConfig {
             initial_backoff_ms: 1,
@@ -993,5 +1030,160 @@ async fn the_at_least_once_crash_window_replays_the_uncheckpointed_batch() {
          duplicates stop appearing here, something has changed the checkpoint ordering \
          for a non-transactional sink — that is a behaviour change to investigate, not \
          an improvement to accept silently."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A lost replication slot
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wait until the published verdict names the lost slot, then return the `/metrics` body.
+async fn await_parked_verdict(admin_state: &AdminState) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let health = admin_state.health_snapshot_for_tests().await;
+        if health
+            == (
+                Some("stalled".to_string()),
+                Some("source_position_lost".to_string()),
+            )
+        {
+            return admin_state.metrics_exposition().await;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the verdict was never published as stalled/source_position_lost: {health:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Drive `parked` to completion while `observe` runs, and report whether `parked` returned
+/// only after `observe` released it.
+async fn returns_only_when_released<F, O>(
+    parked: F,
+    observe: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> O,
+) -> (F::Output, bool)
+where
+    F: std::future::Future,
+    O: std::future::Future<Output = ()>,
+{
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watched = {
+        let released = Arc::clone(&released);
+        async move {
+            let outcome = parked.await;
+            let was_released = released.load(std::sync::atomic::Ordering::SeqCst);
+            (outcome, was_released)
+        }
+    };
+    let (result, ()) = tokio::join!(watched, observe(released));
+    result
+}
+
+/// **A slot the source invalidated mid-run parks the process instead of ending it.**
+///
+/// Exiting hands the orchestrator a restart that replays into the same refusal, and a
+/// restart cannot recreate the discarded WAL. The loop must publish the verdict — on the
+/// `/metrics` body an alert reads, not only on the latch — stay up, and stop cleanly when
+/// asked.
+#[tokio::test]
+async fn the_server_parks_rather_than_exits_on_a_lost_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline = Pipeline::start_with_lost_slot(dir.path(), &output, LostSlot::OnPoll).await;
+    let (trigger, signals) = super::event_loop::ShutdownSignals::for_tests();
+    let admin_state = pipeline.admin_state.clone();
+    let mut admin_exit_rx = None;
+
+    let parked = super::event_loop::execute_event_loop(
+        &mut pipeline.runtime,
+        &mut pipeline.router,
+        &pipeline.transform_pipeline,
+        &pipeline.admin_state,
+        &mut admin_exit_rx,
+        &pipeline.checkpoint_age_source,
+        &mut pipeline.reconciler,
+        &pipeline.sink_metrics,
+        None,
+        loop_config_for(&config_for(dir.path(), &output)),
+        signals,
+    );
+    let (outcome, released) = returns_only_when_released(parked, |released| async move {
+        let metrics = await_parked_verdict(&admin_state).await;
+        assert!(
+            metrics.contains("cause=\"source_position_lost\"} 1"),
+            "the /metrics body must carry the cause an alert routes on:\n{metrics}"
+        );
+        // Long enough for an exit, or a retry loop, to have happened.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = trigger.send(());
+    })
+    .await;
+
+    assert!(released, "the loop returned before it was told to stop");
+    assert!(
+        matches!(
+            outcome,
+            crate::runtime::lifecycle::RuntimeLoopOutcome::Clean(
+                crate::runtime::lifecycle::RuntimeTerminalReasonCode::ShutdownSignal
+            )
+        ),
+        "a parked process must stop cleanly on a signal"
+    );
+}
+
+/// **A slot found invalidated at startup parks exactly as one lost mid-run does.**
+#[tokio::test]
+async fn a_lost_slot_at_startup_parks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline = Pipeline::start_with_lost_slot(dir.path(), &output, LostSlot::OnStart).await;
+    pipeline
+        .admin_state
+        .set_state(crate::admin::InstanceState::Running)
+        .await;
+    let (trigger, mut signals) = super::event_loop::ShutdownSignals::for_tests();
+    let admin_state = pipeline.admin_state.clone();
+    let mut admin_exit_rx = None;
+    let metrics = RuntimeLoopMetricsAccumulator::new(
+        "file_jsonl",
+        DeliveryContract::AtLeastOnce.as_label(),
+        true,
+        "at_least_once",
+        false,
+        false,
+        16,
+        1024,
+    );
+
+    let parked = crate::commands::run::start_or_park(
+        &mut pipeline.runtime,
+        &pipeline.admin_state,
+        &mut admin_exit_rx,
+        metrics,
+        &mut signals,
+    );
+    let (outcome, released) = returns_only_when_released(parked, |released| async move {
+        await_parked_verdict(&admin_state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = trigger.send(());
+    })
+    .await;
+
+    assert!(
+        released,
+        "start_or_park returned before it was told to stop"
+    );
+    assert!(
+        matches!(
+            outcome,
+            Ok(Some(crate::runtime::lifecycle::RuntimeLoopOutcome::Clean(
+                crate::runtime::lifecycle::RuntimeTerminalReasonCode::ShutdownSignal
+            )))
+        ),
+        "a lost slot at startup must park and then stop cleanly, not fail the start"
     );
 }

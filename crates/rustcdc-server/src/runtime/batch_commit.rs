@@ -409,7 +409,7 @@ async fn record_batch_metrics_and_admin(
         .await;
 }
 
-async fn publish_health_during_retry(
+pub(super) async fn publish_health_during_retry(
     runtime: &CdcRuntime,
     admin_state: &AdminState,
     recoverable: &RecoverableErrorState,

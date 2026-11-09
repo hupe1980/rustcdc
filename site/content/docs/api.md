@@ -1077,6 +1077,7 @@ match &snapshot.health {
         // `reason` is prose for a human and includes live measurements.
         eprintln!("cdc stalled ({cause}): {reason}");
         match cause {
+            StallCause::SourcePositionLost => { /* the database invalidated the slot */ }
             StallCause::UnconfirmedSourcePosition => { /* the database is retaining log */ }
             StallCause::PollLoopNotTurning => { /* the process, or the source socket */ }
             StallCause::ConsumerNotAcknowledging => { /* your commit_ack loop */ }
@@ -1127,10 +1128,11 @@ metadata nor a resolvable primary key — see [Idempotency guard safety](#idempo
 gate on it without matching every variant. The enum is `#[non_exhaustive]` — match with a
 wildcard arm.
 
-`Stalled` carries one of four `StallCause`s, checked in this order:
+`Stalled` carries one of five `StallCause`s, checked in this order:
 
 | `StallCause` | Condition | Whose problem |
 |---|---|---|
+| `SourcePositionLost` | A poll or `start()` failed with `SourceErrorKind::SlotInvalidated`. Checked before `NotRunning` too, and never cleared within a run | The database — the slot's WAL is gone; recreate the slot and re-snapshot |
 | `UnconfirmedSourcePosition` | A position was durably checkpointed but the source refused to confirm it | The database — it keeps retaining log (WAL on a PostgreSQL primary) |
 | `DeliveryFailing` | You reported delivery failures with `record_delivery_failure`, the first longer ago than the stall threshold, and nothing has committed since | The destination — it is refusing the batch you are holding |
 | `PollLoopNotTurning` | `poll_event_batch` has not returned within `max_poll_wait_ms × 6` (floor 30s) | The process, or a socket wedged inside the source |

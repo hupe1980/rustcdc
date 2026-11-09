@@ -1459,6 +1459,20 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
         self.inner.confirm_lsn(lsn).await
     }
+
+    // The slot belongs to the inner stream; without these the slot signals vanish for the
+    // whole of an incremental snapshot, which is when a backlog is most likely to build.
+    fn replication_slot_lag_bytes(&self) -> Option<u64> {
+        self.inner.replication_slot_lag_bytes()
+    }
+
+    fn replication_slot_wal_status(&self) -> Option<crate::core::SlotWalStatus> {
+        self.inner.replication_slot_wal_status()
+    }
+
+    fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
+        self.inner.replication_slot_safe_wal_size_bytes()
+    }
 }
 
 #[cfg(test)]

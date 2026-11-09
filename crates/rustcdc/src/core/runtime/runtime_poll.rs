@@ -107,6 +107,9 @@ impl CdcRuntime {
         }
 
         let outcome = self.poll_event_batch_inner().await;
+        if let Err(error) = &outcome {
+            self.note_source_position_lost(error);
+        }
 
         // Every return, including an error. This answers one question — "is the poll loop
         // turning?" — so an idle source returning empty batches must keep it fresh, and a
@@ -231,6 +234,9 @@ impl CdcRuntime {
                             );
                         }
                         if let Err(connect_error) = self.source.connect().await {
+                            if restart_cannot_help(&connect_error) {
+                                break Err(connect_error);
+                            }
                             tracing::warn!(
                                 target: "rustcdc::core::runtime",
                                 attempt = attempt + 1,
@@ -291,6 +297,9 @@ impl CdcRuntime {
                                 );
                             }
                             Err(start_error) => {
+                                if restart_cannot_help(&start_error) {
+                                    break Err(start_error);
+                                }
                                 tracing::warn!(
                                     target: "rustcdc::core::runtime",
                                     attempt = attempt + 1,
@@ -329,10 +338,13 @@ impl CdcRuntime {
                             "poll loop entered with no active stream".into(),
                         )
                     })?;
-                    match stream
+                    let polled = stream
                         .next_events(self.config.options.max_poll_wait_ms)
-                        .await
-                    {
+                        .await;
+                    // Before the match: a recoverable error drops the stream, and the slot
+                    // state it sampled is what an operator needs while it reconnects.
+                    self.capture_slot_state();
+                    match polled {
                         Ok(events) => break Ok(events),
                         Err(error) if error.is_recoverable() => {
                             let exhausted = policy
@@ -376,6 +388,9 @@ impl CdcRuntime {
                                 );
                             }
                             if let Err(connect_error) = self.source.connect().await {
+                                if restart_cannot_help(&connect_error) {
+                                    break Err(connect_error);
+                                }
                                 tracing::warn!(
                                     target: "rustcdc::core::runtime",
                                     attempt = attempt + 1,
@@ -413,6 +428,9 @@ impl CdcRuntime {
                                         );
                                     }
                                     Err(start_error) => {
+                                        if restart_cannot_help(&start_error) {
+                                            break Err(start_error);
+                                        }
                                         tracing::warn!(
                                             target: "rustcdc::core::runtime",
                                             attempt = attempt + 1,
@@ -434,7 +452,8 @@ impl CdcRuntime {
                     }
                 }
             } else {
-                self.stream
+                let polled = self
+                    .stream
                     .as_mut()
                     .ok_or_else(|| {
                         crate::core::Error::SourceError(
@@ -442,7 +461,9 @@ impl CdcRuntime {
                         )
                     })?
                     .next_events(self.config.options.max_poll_wait_ms)
-                    .await
+                    .await;
+                self.capture_slot_state();
+                polled
             };
             let events = result
                 .inspect_err(|error| metrics.record_error(error, "runtime.poll.stream_events"))?;
@@ -1302,4 +1323,17 @@ fn estimate_event_bytes(event: &Event) -> usize {
             .map_or(0, |keys| keys.iter().map(String::len).sum::<usize>())
         // Envelope scaffolding: field names, quoting, separators, timestamps.
         + 128
+}
+
+/// Whether a failed reconnect step is one no retry can fix, so the loop returns it now.
+///
+/// Retrying is for conditions that can clear; a slot the source invalidated, missing
+/// credentials or an exhausted budget will not, and retrying them turns a page into a
+/// reconnect loop reported as a poll loop that is not turning. A `ConfigError` stays
+/// retried: a deferred secret that failed to resolve can resolve on the next attempt.
+fn restart_cannot_help(error: &Error) -> bool {
+    error
+        .source_kind()
+        .is_some_and(|kind| !kind.is_recoverable())
+        || matches!(error.root_cause(), Error::Unrecoverable(_))
 }

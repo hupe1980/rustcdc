@@ -492,6 +492,36 @@ Alert when `retained_wal` exceeds a threshold (e.g., 10 GiB).
    and the pipeline must re-snapshot. Alert well before the cap using the
    `rustcdc_replication_slot_lag_bytes` gauge (see
    `RUSTCDCReplicationSlotLagHigh` in the shipped alert rules).
+
+### An invalidated slot
+
+Two server settings invalidate a slot while the pipeline depends on it:
+
+| Setting | Invalidates when | `invalidation_reason` (17+) |
+|---|---|---|
+| `max_slot_wal_keep_size` (13+) | the slot retains more WAL than the cap, at the next checkpoint | `wal_removed` |
+| `idle_replication_slot_timeout` (18+) | the slot has been inactive longer than the timeout, at the next checkpoint | `idle_timeout` |
+
+The connector samples the slot's `wal_status` and `safe_wal_size` with its lag
+(every `slot_idle_advance_interval_ms`, 15 s when idle advance is off, or
+`slot_state_sample_interval_ms`). `unreserved` is exported and alerted
+(`RUSTCDCReplicationSlotUnreserved`) while the slot can still be saved.
+
+Once the slot is invalidated, the next poll, reconnect or startup fails with
+`SourceErrorKind::SlotInvalidated`, decided from SQLSTATE `55000` and the slot's
+row in `pg_replication_slots`, and the runtime reports
+`StallCause::SourcePositionLost`. The server parks rather than restarting; see the
+runbook. The sample raises the same error when it reads `lost`, which is what
+names the condition when connection retries are disabled — without it the
+verdict would be `poll_loop_not_turning`.
+
+Limits:
+
+- Under `sql_peek` the slot is active only during each peek, so
+  `idle_replication_slot_timeout` can invalidate it between peeks when the timeout
+  is shorter than the poll interval plus any backoff. The same classifier names it.
+- The sample is one catalogue query on the connection's SQL client, per sample, on
+  both transports.
 3. **Drop idle slots** if a pipeline is permanently retired:
    ```sql
    SELECT pg_drop_replication_slot('cdc_slot');
@@ -541,6 +571,7 @@ replication_slot_name = "cdc_slot"      # name of the replication slot
 create_replication_slot_if_missing = false   # true only for first-time provisioning / ephemeral envs
 failover_slot                      = false   # PostgreSQL 17+: create failover-enabled slots
 slot_idle_advance_interval_ms      = 30000   # idle slot advance; 0 disables (not recommended)
+# slot_state_sample_interval_ms    = 15000   # slot lag/wal_status sample; defaults to the idle-advance cadence
 
 # WAL transport
 wal_transport = "streaming_replication"   # streaming_replication | sql_peek
@@ -574,6 +605,7 @@ mode = "plaintext"    # plaintext | tls
 | `create_replication_slot_if_missing` | `false` | Allow the connector to create a missing slot. Keep `false` in production: a vanished slot is a data-loss event, and recreating it silently resumes from "now" and skips everything in between |
 | `failover_slot` | `false` | PostgreSQL 17+: create the slot with `failover = true` so it is synchronized to standbys and capture survives promotion. Only applies when the connector creates the slot; requires cluster-side sync configuration |
 | `slot_idle_advance_interval_ms` | `30000` | Advance the slot when no committed events arrive so PostgreSQL can recycle WAL. `0` disables (not recommended for long-lived streams) |
+| `slot_state_sample_interval_ms` | unset | How often to sample the slot's lag and `wal_status`. Unset follows `slot_idle_advance_interval_ms`, or 15 s when that is `0`. Must be greater than zero when set |
 | `wal_transport` | `"streaming_replication"` | How the WAL stream is read. `"sql_peek"` is the fallback for a role without `REPLICATION` or a connection that must route through a pooler — see [WAL transport](#wal-transport-how-the-stream-is-read) for the cost |
 | `conn_timeout_secs` | `30` | Connection timeout in seconds |
 | `stream_poll_interval_ms` | `50` | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
@@ -591,7 +623,9 @@ metrics:
 | Metric | Type | Description |
 |---|---|---|
 | `rustcdc_runtime_health{verdict=…}` | gauge (one-hot) | Derived health verdict: `healthy` \| `idle` \| `stalled` \| `not_running`. Exactly one series is 1. Alert on `verdict="stalled"` — `idle` is deliberately not alertable (a quiet database is not an incident) |
-| `rustcdc_runtime_stall_cause{cause=…}` | gauge | Present only while stalled: `unconfirmed_source_position` \| `poll_loop_not_turning` \| `consumer_not_acknowledging`. Route the page on this |
+| `rustcdc_runtime_stall_cause{cause=…}` | gauge | Present only while stalled: `source_position_lost` \| `unconfirmed_source_position` \| `delivery_failing` \| `poll_loop_not_turning` \| `consumer_not_acknowledging`. Route the page on this |
+| `rustcdc_replication_slot_wal_status{status=…}` | gauge | The slot's `wal_status`, one-hot. Page on `unreserved` |
+| `rustcdc_replication_slot_safe_wal_size_bytes` | gauge | The slot's `safe_wal_size`; negative once `unreserved` |
 | `rustcdc_runtime_poll_age_ms` | gauge | Milliseconds since the last poll returned, empty batches included — the poll loop's own liveness |
 | `rustcdc_runtime_delivery_age_ms` | gauge | Milliseconds since events last arrived. High on its own just means the source is quiet — do not alert on it |
 | `rustcdc_replication_slot_lag_bytes` | gauge | Slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). Unbounded growth risks slot invalidation |

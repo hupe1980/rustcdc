@@ -11,6 +11,7 @@ use crate::{
 use super::batch_commit::handle_polled_batch;
 use super::lifecycle::{RuntimeLoopOutcome, RuntimeTerminalReasonCode};
 use super::metrics::RuntimeLoopMetricsAccumulator;
+use super::park::{is_lost_source_position, park_on_lost_source_position};
 use super::reconciliation::CheckpointTxnReconciler;
 use super::recovery::{RecoverableErrorState, RecoveryAction, RecoveryPolicyConfig, jitter_seed};
 
@@ -49,6 +50,9 @@ pub(crate) async fn execute_event_loop(
     sink_metrics: &crate::sink::SinkMetricsRegistry,
     dlq: Option<&tokio::sync::Mutex<crate::dlq::DeadLetterQueue>>,
     config: RuntimeLoopConfig,
+    // Installed by the caller before `start()`, never inside the `select!`: see
+    // [`ShutdownSignals`].
+    mut shutdown_signals: ShutdownSignals,
 ) -> RuntimeLoopOutcome {
     let recovery_policy = RecoveryPolicyConfig {
         initial_backoff_ms: config.recoverable_error_backoff_initial_ms,
@@ -72,9 +76,6 @@ pub(crate) async fn execute_event_loop(
         config.queue_depth_p95_window_samples,
         config.correctness_dedup_window_size,
     );
-
-    // Installed before the loop, not inside the `select!`: see [`ShutdownSignals`].
-    let mut shutdown_signals = ShutdownSignals::install();
 
     let mut loop_iteration: u64 = 0;
     'event_loop: loop {
@@ -133,6 +134,18 @@ pub(crate) async fn execute_event_loop(
                         .await {
                             break 'event_loop outcome;
                         }
+                    }
+                    Err(e) if is_lost_source_position(&e) => {
+                        break 'event_loop park_on_lost_source_position(
+                            runtime,
+                            admin_state,
+                            &recoverable,
+                            &mut metrics_accumulator,
+                            &mut shutdown_signals,
+                            admin_exit_rx,
+                            &e,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         if let Some(outcome) =

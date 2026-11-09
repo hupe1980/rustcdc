@@ -628,10 +628,14 @@ streaming from a quiet database and one hung on a dead socket both report `state
 | `NotRunning` | The runtime has not been started, or has stopped. | No — but check it was intentional |
 
 `HealthVerdict::is_alertable()` returns `true` for exactly `Stalled`, so an embedder's health
-endpoint can gate on it directly. The verdict is derived from three independent signals, checked
+endpoint can gate on it directly. The verdict is derived from these signals, checked
 in this order. Each carries a stable `StallCause` to route on, and a `reason` naming the
 condition, the measurements and the remedy:
 
+0. **`SourcePositionLost`** — a poll or `start()` failed with
+   `SourceErrorKind::SlotInvalidated`: PostgreSQL invalidated the replication slot. Checked
+   first, and before `NotRunning`, because it explains every other symptom. Never cleared
+   within a run; the remedy is a new slot and a re-snapshot, not a restart.
 1. **`UnconfirmedSourcePosition`** — a checkpoint committed but the source-side confirmation
    (`confirmed_flush_lsn` and equivalents) failed repeatedly. Retention keeps growing at the
    source even though the consumer is making progress.
@@ -689,8 +693,14 @@ an incident. It is a diagnostic to read beside the poll age, not a condition.
 Route on the cause rather than fanning one page out to everyone:
 
 ```promql
+# The database invalidated the replication slot — re-snapshot, do not restart.
+rustcdc_runtime_stall_cause{cause="source_position_lost"} == 1
+
 # The database is retaining log — a disk-fill risk on the source, not on this process.
 rustcdc_runtime_stall_cause{cause="unconfirmed_source_position"} == 1
+
+# The slot is lost at the next checkpoint unless the pipeline catches up.
+rustcdc_replication_slot_wal_status{status="unreserved"} == 1
 
 # The poll loop is not turning — this process, or the socket to the source.
 rustcdc_runtime_stall_cause{cause="poll_loop_not_turning"} == 1

@@ -600,6 +600,24 @@ async fn a_server_that_refuses_replication_surfaces_its_own_reason() {
 }
 
 #[tokio::test]
+async fn a_refused_start_replication_keeps_its_sqlstate_as_a_field() {
+    // The caller classifies a refusal from its SQLSTATE, so the code has to arrive as a
+    // value rather than inside a rendered sentence.
+    let (port, _, server) = spawn_server(None, Auth::None, Behaviour::RefuseReplication).await;
+    let transport = TransportConfig::plaintext();
+
+    match ReplicationStream::connect(params(port, &transport, 0)).await {
+        Err(super::OpenError::Refused(refusal)) => {
+            assert_eq!(refusal.code.as_deref(), Some("55006"));
+        }
+        Err(other) => panic!("a refusal must stay structured, got {other}"),
+        Ok(_) => panic!("a refused START_REPLICATION must not yield a stream"),
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn a_server_that_declines_tls_is_refused_rather_than_downgraded() {
     // Continuing unencrypted here is the silent-downgrade failure that `sslmode=prefer`
     // produced on the SQL connection. The replication transport must fail instead.

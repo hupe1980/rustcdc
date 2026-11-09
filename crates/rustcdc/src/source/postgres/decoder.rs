@@ -602,6 +602,14 @@ pub(super) trait PgOutputMessageProvider: Send + Sync {
     async fn measure_slot_lag(&mut self) -> Result<Option<u64>> {
         Ok(None)
     }
+
+    /// The slot's row in `pg_replication_slots`, read without touching the slot.
+    ///
+    /// `None` means "not readable here" (test doubles). Sampled on the same cadence as the
+    /// lag, so it is one catalogue query per sample and none per event.
+    async fn sample_slot_state(&mut self) -> Result<Option<super::parser::SlotState>> {
+        Ok(None)
+    }
 }
 
 pub(super) struct LivePgOutputMessageProvider {
@@ -681,8 +689,23 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
                 return Ok(PollOutcome::TimedOut);
             }
             Err(e) => {
+                let sqlstate = e.code().map(|code| code.code().to_string());
+                // Only a `55000` can be an invalidated slot, so only then is the slot read;
+                // the classifier decides from what the read returns.
+                let slot_state = if sqlstate.as_deref()
+                    == Some(parser::SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+                {
+                    super::query::query_slot_state(&self.client, &self.slot_name)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
                 return Err(parser::map_pgoutput_poll_error(
                     &self.slot_name,
+                    sqlstate.as_deref(),
+                    slot_state.as_ref(),
                     &PgError::from(e).to_string(),
                 ));
             }
@@ -754,6 +777,10 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         Ok(row
             .and_then(|row| row.try_get::<_, Option<i64>>(0).ok().flatten())
             .map(|lag| u64::try_from(lag).unwrap_or(0)))
+    }
+
+    async fn sample_slot_state(&mut self) -> Result<Option<super::parser::SlotState>> {
+        super::query::query_slot_state(&self.client, &self.slot_name).await
     }
 
     async fn idle_advance(&mut self) -> Result<u64> {
