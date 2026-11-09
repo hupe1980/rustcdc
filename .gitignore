@@ -63,3 +63,16 @@ target
 *.log
 *.tmp
 *.swp
+
+# ── Agent instructions and feature specifications ────────────────────────────
+
+# The round procedure and the `/speckit-*` skills. Internal for the same reason
+# `concepts/` is: they cite its `D` and `R` numbers and describe the private design
+# folder they operate on, none of which resolves for a reader of the published tree.
+/.claude/
+
+# Feature specifications and the Spec Kit machinery that produces them: one
+# `specs/NNN-slug/` per roadmap item and the constitution plans are checked against.
+# They cite `concepts/` numbers, so nothing published may cite a path in either.
+/specs/
+/.specify/
