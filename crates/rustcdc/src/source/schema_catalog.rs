@@ -31,6 +31,7 @@
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 use std::collections::HashMap;
 
+#[cfg(any(feature = "postgres", feature = "sqlserver"))]
 use crate::schema_history::{ColumnDef, TableSchema};
 
 /// One column as the source's catalogue declares it.
@@ -106,6 +107,9 @@ pub(crate) type CatalogSchemas = HashMap<(String, String), Vec<CatalogColumn>>;
 /// key flag: under PostgreSQL's `REPLICA IDENTITY FULL` pgoutput flags *every* column as
 /// part of the replica identity, and treating that as the key published a table whose
 /// every column was a non-nullable primary key.
+///
+/// MySQL builds its shape from the binlog table map instead, so it has no caller there.
+#[cfg(any(feature = "postgres", feature = "sqlserver"))]
 pub(crate) fn table_schema_from_catalog(
     schema: &str,
     table: &str,
@@ -158,7 +162,7 @@ pub(crate) fn row_shape_from_catalog(
     .map(std::sync::Arc::new)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "postgres", feature = "sqlserver")))]
 mod tests {
     use super::*;
 
