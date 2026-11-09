@@ -38,24 +38,12 @@ Replace these placeholders with your environment equivalents:
 
 If your deployment does not provide these wrappers, see [Deployment](@/docs/deployment.md) first and wire health/metrics/service controls before applying this runbook verbatim.
 
-> **The `rustcdc` crate ships no binary.** It has no `[[bin]]` target; `systemctl stop rustcdc`
-> and `curl localhost:9090/metrics` below refer to **your** wrapper, not to anything this crate
-> installs.
->
-> If you would rather not build that wrapper, [`rustcdc-server`](@/docs/_index.md) is it —
-> the same runtime with a supervised process, an admin API, Prometheus and OTLP, graceful
-> drain on `SIGTERM` and a container image. This runbook is for embedders who want the
-> runtime inside their own process. In particular:
->
-> - **Nothing flushes on SIGTERM unless you implement it.** Graceful drain is
->   `CdcRuntime::drain_and_stop()` — which returns the drained events and commits them, so **you
->   must consume the returned `Vec<Event>`**; dropping it is unrecoverable data loss. Use
->   `stop()` (refuses while events are uncommitted) or `force_stop()` (discards explicitly, returns
->   them for replay) if you do not intend to process them.
-> - **No HTTP server is provided.** The crate exposes `admin_snapshot_json()` and a Prometheus text
->   *renderer*; binding a port is the embedder's job.
-> - **Restart does not drain automatically.** Any "will drain pending events before restart"
->   behaviour is a property of your supervisor.
+> **The `rustcdc` crate ships no binary.** `systemctl stop rustcdc` and
+> `curl localhost:9090/metrics` below refer to **your** wrapper; [`rustcdc-server`](@/docs/_index.md)
+> is a ready-made one. Nothing flushes on SIGTERM unless you implement it:
+> `CdcRuntime::drain_and_stop()` commits and returns the drained events, so **you must consume
+> the returned `Vec<Event>`** — dropping it is data loss. No HTTP server is provided either:
+> the crate renders `admin_snapshot_json()` and Prometheus text; binding a port is yours.
 
 ---
 
@@ -472,7 +460,7 @@ Drop them with `sys.sp_cdc_disable_table` if needed.
 
 ### SQL Server Connection and Poll Tuning
 
-`SqlServerSourceConfig` now exposes explicit concurrency/throughput controls:
+`SqlServerSourceConfig` exposes explicit concurrency/throughput controls:
 
 - `prereq_pool_size`
 - `stream_poll_interval_ms`
@@ -661,13 +649,8 @@ which moves only when events actually arrive:
 | low | high | `Idle` — the database is quiet | **No.** Never page on this |
 | high | any | `Stalled { PollLoopNotTurning }` | **Yes** |
 
-This distinction is the entire reason the verdict exists, and it is worth stating what goes
-wrong without it. Until 0.15.0 the poll timestamp was recorded only on the path that
-*delivered* events, so on an idle source it froze at the last event while the loop kept
-turning perfectly. Thirty seconds of quiet then reported
-`Stalled { reason: "…the poll loop is blocked, not idle" }` — the alertable verdict, asserting
-the exact opposite of what was happening, on the most common benign state a pipeline has. If
-you are running an older build, that is what you are seeing, and the pipeline is fine.
+This distinction is the reason the verdict exists: a quiet database is the most common
+benign state a pipeline has, and it must never page.
 
 ### Comparing verdicts in your own code
 

@@ -20,26 +20,15 @@ ordinary Rust crate that links into your binary and runs on your Tokio runtime.
 
 ## Why this exists
 
-Embedding multi-database CDC today means embedding a JVM: Debezium's engine is a Java library,
-and Materialize and RisingWave are platforms rather than crates. The Rust alternatives are
-single-database primitives, and the most complete of them — Supabase's `etl` — is a Git
-dependency rather than a published crate, because it takes `tokio-postgres` and
-`postgres-replication` from a fork of `rust-postgres` and a crates.io release may not depend on
-a Git revision.
-
-That is not a mistake on their part; it is the consequence of a real constraint. Stock
-`tokio-postgres` exposes no replication-mode API, so a project that needs one either patches the
-client or implements the wire protocol. rustcdc implements it — `START_REPLICATION ... LOGICAL`
-and its own pgoutput parser against stock `tokio-postgres` — which is why it installs as an
-ordinary dependency, with no sidecar to supervise and no control plane to operate. The
+Embedding multi-database CDC usually means embedding a JVM (Debezium's engine) or running a
+platform; the Rust alternatives are single-database, and Supabase's `etl` is a Git dependency
+because stock `tokio-postgres` has no replication-mode API. rustcdc implements
+`START_REPLICATION ... LOGICAL` and its own pgoutput parser against stock `tokio-postgres`, on
+the same `rustls` stack as the rest of the crate, so it installs as an ordinary dependency. A
+SQL-based fallback (`WalTransport::SqlPeek`) serves environments without a replication
+connection; the two are asserted to decode identical event streams against a live server. The
 [comparison page](https://hupe1980.github.io/rustcdc/docs/library-parity-matrix/) has the
 side-by-side, including where `etl` is the better pick.
-
-That replication client speaks the streaming replication protocol PostgreSQL's own subscribers
-use, on the same `rustls` stack as the rest of the crate rather than a second TLS dependency. A
-SQL-based fallback (`WalTransport::SqlPeek`) remains for environments that cannot grant a
-replication connection; the two are asserted to decode identical event streams against a live
-server.
 
 ## Status
 
@@ -48,11 +37,10 @@ changes; each one is listed in the
 [changelog](https://github.com/hupe1980/rustcdc/blob/main/CHANGELOG.md) with the migration
 it requires.
 
-Core connector and runtime paths are validated by 1 204 library unit tests, 571 server unit
-tests, 141 documentation samples compiled as doctests, 41 deterministic-replay golden
-fixtures and 43 integration suites — the container-backed ones running against real
-PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6, SQL Server 2019/2022 and Apicurio
-Registry 3.0.6.
+Core connector and runtime paths are validated by unit tests, documentation samples compiled
+as doctests, deterministic-replay golden fixtures and container-backed integration suites
+against real PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6/10.11, SQL Server
+2019/2022/2025 and Apicurio Registry 3.0.6.
 
 The Snowflake source is the one connector with **no container-backed evidence** — Snowflake
 has no self-hostable implementation. Its semantics are unit-tested through a scripted
@@ -60,8 +48,7 @@ transport; what a live account actually does is
 [stated as a gap](https://hupe1980.github.io/rustcdc/docs/snowflake/#evidence-and-the-gap-in-it)
 rather than implied away.
 
-The public API may still change. Delivery is **at-least-once**; see
-[Delivery guarantees](#delivery-guarantees).
+Delivery is **at-least-once**; see [Delivery guarantees](#delivery-guarantees).
 
 ## Install
 
@@ -289,7 +276,7 @@ as `rustcdc_runtime_health{verdict="stalled"} == 1`. See the
 | `postgres` *(default)* | PostgreSQL connector (pulls in `tls`) |
 | `tls` *(default)* | TLS transport surface |
 | `mysql` / `mariadb` | MySQL and MariaDB connectors (shared transport stack, distinct source identity) |
-| `sqlserver` | SQL Server connector. **Brings a second, older TLS stack** — see the note below |
+| `sqlserver` | SQL Server connector. Same `rustls` stack; also compiles `aws-lc-rs` — see the note below |
 | `snowflake` | Snowflake source over the `CHANGES` clause. **No dependencies** — you supply the transport |
 | `wasm` | WASM transform sandbox via wasmtime (~15 MB release overhead; opt-in by design) |
 | `outbox` | Outbox pattern helpers and transforms |
@@ -315,21 +302,23 @@ connections when no process default is installed — one TLS implementation, two
 
 ## Examples
 
+From the root of a clone of the repository:
+
 ```bash
 # PostgreSQL → stdout
-cargo run --example pg_to_stdout --features postgres -- \
+cargo run -p rustcdc --example pg_to_stdout --features postgres -- \
   --host localhost --port 5432 --database testdb --snapshot-tables public.users
 
 # MariaDB → stdout (same pipeline, driven by the runtime via run_to_completion)
-cargo run --example mariadb_to_stdout --features mariadb -- \
+cargo run -p rustcdc --example mariadb_to_stdout --features mariadb -- \
   --host localhost --port 3306 --database testdb --snapshot-tables app.users
 
 # Full local stack: PostgreSQL + pg_to_stdout
-docker compose -f ../../docker/compose.example.yml up --build
-docker compose -f ../../docker/compose.example.yml down -v
+docker compose -f docker/compose.example.yml up --build
+docker compose -f docker/compose.example.yml down -v
 
 # …or the server against a seeded database, which is the product rather than an example
-docker compose -f ../../demo/compose.yml up --build
+docker compose -f demo/compose.yml up --build
 ```
 
 The two stdout examples deliberately show the two shapes: `pg_to_stdout` drives
@@ -345,51 +334,38 @@ related variables, and commit every 100 events by default.
 gated in CI. For a library whose public surface *is* the product, an undocumented `pub fn` on a
 checkpoint or connector type is a reader guessing at a correctness contract.
 
-**The documentation compiles.** Every Rust block in this README and under `site/content/docs/` (repository root)
-is compiled and run by `cargo test --doc --all-features`, gated in CI. Wiring the Markdown into
-the doctest run immediately surfaced 36 broken samples out of 96, including wrong field names
-and methods that had moved between types; extending it to the last five pages surfaced four
-more, among them an unterminated raw string in the deployment guide's health-endpoint example.
-Blocks that cannot run in a doctest — they need a live database, or a dependency this crate
-does not have — are marked `ignore` with a one-line reason; an unmarked block that fails to
-compile is a defect.
+**The documentation compiles.** Every Rust block in this README and under
+`site/content/docs/` is compiled and run by `cargo test --doc --all-features`, gated in CI.
+Blocks that cannot run are `ignore` with a reason; an unmarked block that fails to compile
+fails CI.
 
 **Failure paths are exercised, not assumed.** Deterministic replay, fault injection and
 process-kill crash tests are part of the suite, and are available to *your* tests too via the
-`test-harnesses` feature. The replay comparison names every field it checks **and every field it
-skips, with the reason** — a golden suite is only as strong as its diff, and a field the diff
-ignores is invisible to every fixture in it. Comparing a field is also not enough on its own: if
-the fixture format cannot produce a differing value, the comparison is vacuous, so the fixtures
-carry the partial-payload shape explicitly and every replayed event is validated rather than only
-matched. See
+`test-harnesses` feature. See
 [reliability testing](https://hupe1980.github.io/rustcdc/docs/reliability-testing/).
-
-**Suites run against the configurations that break things, not the defaults.** A resume
-coordinate is only as good as the server option it was captured under, and the permissive
-setting hides the failure — binlog compression off, one CDC capture instance, a snapshot chunk
-that drains inside a single poll. Those options are pinned explicitly, and every correctness fix
-is confirmed to fail with the fix reverted before it lands.
 
 ## Development
 
+From the repository root:
+
 ```bash
-cargo check --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-bash scripts/ci-policy-gate.sh
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test -p rustcdc --lib --all-features
+cargo test -p rustcdc --doc --all-features
+cargo xtask policy-gate
 ```
 
 Foundation-only profile, without any connector:
 
 ```bash
-cargo test --lib --no-default-features
+cargo test -p rustcdc --lib --no-default-features
 ```
 
 Connector-backed evidence (requires a running Docker daemon):
 
 ```bash
-bash scripts/run_full_integration_matrix_evidence.sh
-bash scripts/ci-benchmark-gate.sh
+cargo xtask evidence
+cargo xtask benchmark-gate
 ```
 
 Most benchmarks are in-process microbenchmarks with no connector I/O — a regression signal for
@@ -426,7 +402,7 @@ The evidence policy, including release-grade classification, is documented under
 the throughput harness has its own
 [section](https://hupe1980.github.io/rustcdc/docs/reliability-testing/#end-to-end-runtime-throughput).
 
-The documentation site lives in [`site/`](site/) and is built with [Zola](https://www.getzola.org/):
+The documentation site lives in [`site/`](https://github.com/hupe1980/rustcdc/tree/main/site) and is built with [Zola](https://www.getzola.org/):
 
 ```bash
 zola --root site serve
@@ -453,13 +429,14 @@ zola --root site serve
 
 ## MSRV
 
-Rust 1.97.0+ or newer, matching `rust-version` in `[workspace.package]`. Raising it is a
+Rust 1.97.0+, matching `rust-version` in `[workspace.package]`. Raising it is a
 minor-version change. CI reads the number out of the manifest rather than restating it, and
-verifies both members on exactly that toolchain — `crates/rustcdc-server/tests/architecture.rs` fails the
+verifies both members on exactly that toolchain — [`architecture.rs`](https://github.com/hupe1980/rustcdc/blob/main/crates/rustcdc-server/tests/architecture.rs) fails the
 build if this README, the Dockerfile or the documentation site disagrees with it.
 
-The floor is set by `wasmtime`, which the `wasm` feature pulls in, with the AWS SDK next at
-1.94.1. The library alone would compile on less, but one workspace publishes one number.
+The floor is set by `wasmtime`, which the `wasm` feature pulls in; the server's `krafka` and
+`iceberg` are next at 1.95. Without `wasm` the library would compile on less, but one
+workspace publishes one number.
 
 ## License
 

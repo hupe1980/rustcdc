@@ -72,10 +72,9 @@ enum SendSlot {
 /// `FuturesUnordered` exists to avoid exactly that sweep; here the sweep *is* the
 /// guarantee, and 128 cheap polls are worth rather less than ordered change data.
 ///
-/// Every slot now holds a krafka `DeliveryHandle`, whose record was appended before the
-/// handle existed, so append order no longer depends on this sweep. It still decides the
-/// order *results* are reported in, which is what attributes a failure to the right
-/// record.
+/// Every slot holds a krafka `DeliveryHandle`, whose record was appended before the
+/// handle existed, so append order does not depend on this sweep. It decides the order
+/// *results* are reported in, which is what attributes a failure to the right record.
 #[derive(Default)]
 struct SendWindow {
     slots: VecDeque<SendSlot>,
@@ -488,12 +487,8 @@ pub struct KafkaSink {
     closed: bool,
     /// Sends handed to krafka whose broker acknowledgement has not been collected yet.
     ///
-    /// Every send used to be awaited to completion before
-    /// the next one was created, so the sink produced exactly one record per broker
-    /// round-trip: measured at 5 700 events/s against an in-process broker, and far worse
-    /// across a real network. Worse, it made `linger_ms` actively harmful — a partially
-    /// filled batch had nothing to wait *for*, so each record paid the full linger by
-    /// itself and the documentation had to tell operators to leave it at zero.
+    /// Awaiting each send before creating the next would cost one broker round-trip per
+    /// record and make `linger_ms` pure delay, since a batch could never fill.
     ///
     /// See [`SendWindow`] for why this is not a `FuturesOrdered`.
     inflight: SendWindow,
@@ -1373,19 +1368,11 @@ pub(crate) fn kafka_builder(
 
 /// Classify a krafka failure into the three responses the pipeline can actually take.
 ///
-/// Every Kafka failure used to become `RtError::SourceError`, which upstream classifies
-/// as `Transient`. That single mapping produced two distinct defects:
-///
-/// * A **poison record** — one the broker will reject identically forever, such as
-///   `MessageTooLarge` or `InvalidRecord` — was retried until the circuit breaker gave
-///   up, then killed the process, then failed again on the same record after restart.
-///   The dead-letter queue added in Round 4 was unreachable from this sink, because its
-///   branch is only taken for a non-recoverable error and this sink never produced one.
-/// * A **fatal misconfiguration** — bad SASL credentials, a revoked topic ACL — was also
-///   retried forever, so `TopicAuthorizationFailed` looked exactly like a broker restart.
-///
-/// The three-way split maps onto [`AppError::is_recoverable`] and
-/// [`AppError::is_dead_letterable`]:
+/// Mapping every failure to one `Transient` error would retry a **poison record** (one
+/// the broker rejects identically forever) until the circuit breaker kills the process,
+/// with the dead-letter queue unreachable, and would make a **fatal misconfiguration**
+/// (a revoked topic ACL) look exactly like a broker restart. The three-way split maps onto
+/// [`AppError::is_recoverable`] and [`AppError::is_dead_letterable`]:
 ///
 /// | Class | Example | Response |
 /// |---|---|---|

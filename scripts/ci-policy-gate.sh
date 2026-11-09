@@ -72,8 +72,7 @@ run_markdown_link_check() {
       elif [[ -z "$local_only" ]] && git -C "$repo_root" check-ignore -q "$resolved" 2>/dev/null; then
         # Existence on the author's disk is not the test: a gitignored target is not in
         # the repository, so the link is broken for CI and for every reader while looking
-        # fine locally. This is how a link to a local-only audit note reached a released
-        # CHANGELOG — it resolved for the person who wrote it and for nobody else.
+        # fine locally.
         echo "markdown link in $markdown_file -> $target resolves only locally (gitignored)" >&2
         failed=$((failed + 1))
       fi
@@ -88,9 +87,8 @@ run_markdown_link_check() {
   done < <(find site/content -type f -name '*.md' | sort)
 
   # `concepts/` is gitignored, so it is absent in CI and present on a maintainer's disk.
-  # Checking it only when it is there is the point rather than a compromise: these notes
-  # are the only documents nothing validated, and they had rotted accordingly — three
-  # references to a `site/content/library/` directory that has not existed under that name.
+  # Checking it only when it is there is the point rather than a compromise: nothing else
+  # validates these notes.
   #
   # The notes are the flat files, so `-maxdepth 1` leaves out `concepts/references/`:
   # verbatim third-party specifications whose links address the upstream site's layout,
@@ -163,11 +161,10 @@ run_schema_contract_check() {
   # tag in every codec (breaking every JSON path over the stream), or exempt the two
   # highest-risk fields in the envelope from the gate entirely.
   #
-  # Comparing wire to wire is what this check always meant, and it is now four-way rather
-  # than three: `EventWire` (what the JSON decoder reads) is also checked against the
-  # hand-written `Serialize` (what the JSON encoder writes). That seam did not exist while
-  # both directions were derived, and a field written but never read — or read but never
-  # written — is exactly the silent envelope divergence this gate exists to catch.
+  # So the comparison is wire to wire, four ways: `EventWire` (what the JSON decoder
+  # reads) is also checked against the hand-written `Serialize` (what the JSON encoder
+  # writes), because a field written but never read — or read but never written — is
+  # exactly the silent envelope divergence this gate exists to catch.
   sed -n '/^struct EventWire {/,/^}/p' crates/rustcdc/src/core/event.rs \
     | sed -nE 's/^[[:space:]]*([a-z_][a-z0-9_]*)[[:space:]]*:.*/\1/p' \
     | sort -u > "$rust_event_fields"
@@ -302,13 +299,9 @@ run_async_trait_policy_check() {
 run_cargo_profile_safety_check() {
   # Delegated to `cargo xtask profile-check`, which is compiled and unit-tested.
   #
-  # This was awk, and on macOS it did nothing at all: the profile name was extracted with
-  # gawk's three-argument `match($0, /…/, arr)`, a GNU extension that BSD awk rejects as a
-  # syntax error. The program aborted, `|| true` swallowed it, and the gate printed
-  # "passed" having read nothing — silently vacuous for every developer not on Linux, and
-  # it stayed that way through a change that added the exact profile it rejects.
-  #
-  # A check whose correctness depends on which `awk` is installed is not a check.
+  # A check whose correctness depends on which `awk` is installed is not a check: GNU and
+  # BSD awk disagree, and a syntax error under `|| true` prints "passed" having read
+  # nothing.
   if ! cargo xtask profile-check; then
     exit 1
   fi
@@ -382,10 +375,8 @@ require_file_present() {
 # Every published crate must carry the licence texts, and they must be the repository's.
 #
 # `license = "MIT OR Apache-2.0"` is an SPDX expression, not a grant. `cargo package`
-# collects only files beneath the crate directory, so moving the library into `crates/`
-# silently dropped both texts from the `.crate` — the metadata still claimed the licences
-# while the artefact no longer contained them. Copies are the only option cargo offers;
-# this is what stops the copies drifting from the originals.
+# collects only files beneath the crate directory, so the crate needs its own copies of the
+# texts; this is what stops the copies drifting from the originals.
 # Every path a workflow names must exist.
 #
 # A `working-directory:`, a local `uses: ./…` or a script path that points at a directory
@@ -396,8 +387,7 @@ require_file_present() {
 #   An error occurred trying to start process '/usr/bin/bash' with working directory
 #   '/home/runner/work/rustcdc/rustcdc/server'. No such file or directory
 #
-# That is what a rename leaves behind when the search-and-replace only matched the form
-# with a trailing slash. This is the cheap check that would have caught it before the push.
+# A rename leaves this behind when the search-and-replace misses one spelling of a path.
 # Every job must say which half of the workspace it covers.
 #
 # GitHub shows a job's `name:` in the checks list, falling back to the job id. Without a
@@ -411,10 +401,8 @@ run_release_evidence_contract_check() {
   # the only contract between the two files, and nothing else would notice it breaking:
   # the release simply fails at the tag, which is the worst moment to find out.
   #
-  # This check exists because the gate did break, in a way no test could catch. It used
-  # to match the *job* named `release-evidence`; the GitHub API returns a job's display
-  # name, so renaming the job to "workspace: release evidence" made the lookup match
-  # nothing, and the failure only appeared on a pushed tag.
+  # The contract is the artifact name, not a job name: the GitHub API returns a job's
+  # display name, which a rename changes silently.
   local expected uploaded
   expected="$(rg -o --no-heading --no-line-number \
     "const EVIDENCE_ARTIFACT = '([^']+)'" -r '$1' .github/workflows/release.yml || true)"
@@ -437,16 +425,11 @@ run_cargo_scope_check() {
   #
   # Without `-p`, cargo selects every default workspace member and unifies features
   # across the whole set — so a flag meant for one crate silently reshapes another
-  # crate's build. Both of the release-evidence failures were this:
-  #
-  #   * `cargo bench --bench quality_perf` pulled in `rustcdc-server`'s dev-dependency on
-  #     `rustcdc/test-harnesses` and tripped the release guard in `fault_injection`.
-  #   * `cargo test --test mysql_connection_integration` enabled both rustls providers
-  #     (`ring` via testcontainers, `aws-lc-rs` via reqwest) and rustls will not guess
-  #     between two, so the suite panicked on a CryptoProvider that CI resolves fine.
-  #
-  # Neither failed at the seam that was wrong, and neither reproduced under the scoped
-  # command CI runs — which is exactly why this is a static check.
+  # crate's build. For example, an unscoped `cargo bench` pulls in `rustcdc-server`'s
+  # dev-dependency on `rustcdc/test-harnesses` and trips the release guard in
+  # `fault_injection`; an unscoped `cargo test --test <mysql suite>` enables both rustls
+  # providers and panics on the CryptoProvider. Neither fails at the seam that is wrong,
+  # nor under the scoped command CI runs, which is why this is a static check.
   #
   # `--workspace` counts as naming the scope: that is the deliberate whole-workspace case.
   local hits
@@ -470,14 +453,11 @@ run_cargo_scope_check() {
 }
 
 run_bench_invocation_check() {
-  # Every documented `cargo bench` in this repository was wrong, and silently so.
-  #
   # Benchmarks build in the release profile, where the guard in `fault_injection` rejects
   # `test-harnesses` — and `rustcdc-server` dev-depends on `rustcdc` with that feature, so
   # cargo's feature unification turns it on for any unscoped build. Two bench targets are
-  # also named `throughput`, one per crate, so `--bench throughput` is ambiguous. Six
-  # documents and four `//!` headers told the reader to run a command that cannot work,
-  # and CI ran one too. `cargo xtask bench` carries the hatch and the `-p`.
+  # also named `throughput`, one per crate, so `--bench throughput` is ambiguous.
+  # `cargo xtask bench` carries the hatch and the `-p`.
   #
   # Allowed to say `cargo bench`: the xtask that wraps it, the gate that scopes it, the
   # instructions that explain why not to, and CHANGELOG.md, which is a record of what was
@@ -586,9 +566,7 @@ expression without the grant it names" >&2
 }
 
 # The release pipeline's job graph, asserted as a graph rather than as four loose
-# greps for "needs: <something>". Those greps passed no matter which job carried which
-# edge, so reordering the pipeline left them green with labels that described the old
-# order — a check that agreed with whatever it was shown.
+# greps for "needs: <something>", which pass no matter which job carries which edge.
 #
 # Compared in file order, so the jobs must also be *written* in the order they run. A
 # release file that reads top to bottom is the whole point of having one.
@@ -635,8 +613,7 @@ run_workflow_drift_check() {
   require_match "bash scripts/ci-policy-gate.sh" "$CI_WORKFLOW" "policy gate"
   # Both doc lanes, not just one. The all-features build is blind to a link from an
   # ungated doc comment into a feature-gated item, because every gate is on; the
-  # no-default-features build is what catches it. Losing either lane restores the blind
-  # spot that hid twelve such links.
+  # no-default-features build is what catches it.
   #
   # Anchored on `run:` rather than on the bare command: a step's `name:` usually repeats
   # the command, so an unanchored pattern is satisfied by the label alone and would still
@@ -668,14 +645,13 @@ run_workflow_drift_check() {
   # request is what keeps that discovery off the release tag.
   require_match "^ +run: cargo package -p rustcdc --locked$" "$CI_WORKFLOW" "packaged crate is built"
 
-  # Repository-level gates must cover *both* workspace members. Scoping either to one
-  # package is how the server's 50k lines went unlinted for as long as it was a separate
-  # repository with its own, narrower, CI.
+  # Repository-level gates must cover *both* workspace members; scoping either to one
+  # package leaves the other unlinted.
   require_match "^ +run: cargo fmt --all --check$" "$CI_WORKFLOW" "workspace-wide formatting"
   require_match "^ +run: cargo clippy --workspace --all-targets --all-features -- -D warnings$" \
     "$CI_WORKFLOW" "workspace-wide clippy"
-  # The MSRV job must *derive* the toolchain from the manifest rather than restate it.
-  # Two sources of truth for one number is exactly how the previous pin drifted.
+  # The MSRV job must *derive* the toolchain from the manifest rather than restate it:
+  # two sources of truth for one number drift.
   require_match "steps.msrv.outputs.version" "$CI_WORKFLOW" "MSRV derived from the manifest"
 
   # One workflow for the whole workspace. Two files could not express the only thing
@@ -712,9 +688,9 @@ run_workflow_drift_check() {
   require_match "^name: release$" "$RELEASE_WORKFLOW" "release workflow name"
   require_release_job_order
 
-  # The tag trigger belongs to release.yml and to nothing else. When ci.yml also had one,
-  # every tag push ran the whole matrix a second time on a commit main had already tested,
-  # and release.yml ignored that run anyway — it reads evidence from the run on main.
+  # The tag trigger belongs to release.yml and to nothing else. A tag trigger in ci.yml
+  # would re-run the whole matrix on a commit main already tested, and release.yml reads
+  # evidence from the run on main anyway.
   require_match "^    tags:$" "$RELEASE_WORKFLOW" "release is what a tag triggers"
   require_absent "^      - \"v\\*\"$" "$CI_WORKFLOW" "tag trigger in ci.yml (releases are release.yml's job)"
   require_match "\-\-notes-file release-notes.md" "$RELEASE_WORKFLOW" "release notes come from CHANGELOG.md"
@@ -769,7 +745,7 @@ mints a short-lived token instead" >&2
 # The pre-pull exists to fetch images from a mirror rather than from rate-limited Docker Hub.
 # When it drifts from the matrices it fails silently in the worst direction: the warmed
 # images go unused and the images the tests actually need are fetched at run time, from
-# exactly the registry the script was written to avoid. It had drifted by two of four.
+# exactly the registry the script was written to avoid.
 run_relational_image_drift_check() {
   local pull_script="scripts/ci-pull-relational-images.sh"
   local missing=()
@@ -802,9 +778,7 @@ run_relational_image_drift_check() {
 # The checks above are an *allow-list*: they assert that named suites appear in the
 # workflow. That is silent about suites nobody added — and a test that never runs is
 # indistinguishable from a test that does not exist, while looking like evidence in a
-# review. Sixteen suites had accumulated outside CI when this check was written, including
-# the end-to-end coverage of `register_source` (the crate's headline extension-point claim)
-# and the structured-log schema.
+# review.
 #
 # A suite counts as covered when its name appears in the CI workflow, in a script the
 # workflow runs, or as a `#[path]`-included helper module of another suite. Anything else
@@ -863,9 +837,8 @@ run_test_suite_coverage_check() {
 }
 
 # Every public field of a user-facing config struct must appear in the configuration
-# reference. These tables used to be hand-copied `pub struct` dumps in the docs, which
-# drifted silently: eleven fields existed in code and were documented nowhere. A field
-# nobody can find is a field nobody sets, and the defaults here are load-bearing.
+# reference. A field nobody can find is a field nobody sets, and the defaults here are
+# load-bearing.
 run_config_docs_coverage_check() {
   local doc="site/content/docs/config-reference.md"
   local failed=0
@@ -923,9 +896,7 @@ run_config_docs_coverage_check() {
 run_markdown_link_check
 # A public type inside a submodule that its parent never re-exports is unreachable in
 # practice: `codec::schema_registry` is `pub`, but every doc example and every downstream
-# import names `codec::…`. `ConfluentProtobufEncoder` and `ConfluentProtobufDecoder` sat
-# unexported for an entire release cycle — the codec with no live test coverage was also
-# the one nobody could import.
+# import names `codec::…`.
 run_reexport_coverage_check() {
   local failed=0
 
@@ -950,15 +921,9 @@ run_reexport_coverage_check() {
 
   # Crate-root parity, one level further up than module→parent.
   #
-  # Module→parent alone left items reachable only as `rustcdc::codec::X` while their
-  # direct counterparts were `rustcdc::X`: `ConfluentProtobufEncoder`/`Decoder` next to
-  # the Avro and JSON Schema pairs, `AvroDecoder` next to `AvroEncoder`,
-  # `OutboxTransform`/`OutboxResult` next to every other shipped transform, the three
-  # concrete `DdlExtractor` implementations next to the trait, and
-  # `IncrementalSnapshotBackend` — the custom-source extension point the audit calls a
-  # differentiator — next to the `IncrementalSnapshotConfig` and handles already there.
-  # Nothing was broken; it cost a docs search per item and made the surface look
-  # arbitrary.
+  # Module→parent alone can leave an item reachable only as `rustcdc::codec::X` while
+  # its direct counterpart is `rustcdc::X` (say, `AvroDecoder` next to `AvroEncoder`),
+  # which costs a docs search per item and makes the surface look arbitrary.
   #
   # The rule is **all-or-nothing per module**, and it configures itself: if `crates/rustcdc/src/lib.rs`
   # re-exports anything from a module, it must re-export everything that module
@@ -1030,11 +995,11 @@ run_reexport_coverage_check() {
 }
 
 run_floating_image_tag_check() {
-  # No container image a suite, script or workflow pulls may float. A floating tag tests a
-  # different server on each pull, so a failure can be neither reproduced nor attributed —
-  # and every SQL Server suite pulled `2022-latest` while the notes said the brokers were the
-  # only unpinned images. Tracked files only; comments are skipped, and the release workflow's
-  # `:latest` is the tag rustcdc *publishes*, not one it pulls.
+  # No container image a suite, script or workflow pulls may use a `latest` tag, which
+  # tests a different server on each pull, so a failure can be neither reproduced nor
+  # attributed. (Version tags such as `16-alpine` still take patch releases.) Tracked files
+  # only; comments are skipped, and the release workflow's `:latest` is the tag rustcdc
+  # *publishes*, not one it pulls.
   # Image references only: `repo/name:…latest`, a quoted `"…latest"` tag passed to a
   # container helper in test code, and the CI pre-pull argument. A runner label such as
   # `ubuntu-latest` is none of these.
