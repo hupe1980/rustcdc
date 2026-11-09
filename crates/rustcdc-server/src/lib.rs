@@ -1,16 +1,9 @@
-// `unsafe` is denied crate-wide by `[workspace.lints]`, which this package opts into.
-//
-// It is `deny` rather than `forbid` for exactly one reason: `test_env::write_env` calls
-// `std::env::set_var`, which Rust 2024 makes `unsafe`, and several tests need a variable in
-// the process environment because `SecretString`'s only deferred form is `{ env = "VAR" }`
-// and krafka resolves the MSK IAM chain from `AWS_*`. That module cannot be `#[cfg(test)]`
-// — `tests/config_roundtrip.rs` is a separate crate and would have to duplicate the
-// `unsafe` — so it is compiled into the library and denied-with-one-exemption instead.
-//
-// `src/main.rs` carries `forbid`, which cannot be overridden at all: the **binary** this
-// project ships contains no `unsafe`, and that is the claim the README makes.
-// `tests/architecture.rs::unsafe_code_appears_only_where_the_allowlist_says_it_may` holds
-// the exemption list to exactly one entry, in both directions.
+// `unsafe` is denied crate-wide by `[workspace.lints]`, `deny` rather than `forbid` because
+// `test_env::write_env` needs `std::env::set_var` (unsafe in Rust 2024): `SecretString`'s
+// deferred form reads `{ env = "VAR" }`, and `tests/` is a separate crate, so the helper
+// cannot be `#[cfg(test)]`. `src/main.rs` carries `forbid`, so the shipped binary contains no
+// `unsafe`. `tests/architecture.rs::unsafe_code_appears_only_where_the_allowlist_says_it_may`
+// holds both crates to their allowlist, in both directions.
 
 //! # Connector features
 //!
