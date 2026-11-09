@@ -85,7 +85,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
     // Drain snapshot before handoff.
     loop {
         // Drained, not inspected: the handoff is the subject here, so the batch's
-        // contents — rows or the schema announcement that precedes them — do not matter.
+        // contents do not matter.
         let chunk = snapshot.next_chunk(256).await?;
         if chunk.is_empty() {
             break;

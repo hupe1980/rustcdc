@@ -813,20 +813,9 @@ pub struct MysqlStreamHandle {
     stream_poll_interval_ms: u64,
     table_include_list: Vec<String>,
     table_exclude_list: Vec<String>,
-    /// Declared column types for every table in the configured database, read from
-    /// `information_schema` once at stream start.
-    ///
-    /// The binlog decode path is synchronous and holds no SQL connection, so this cannot
-    /// be read lazily. See
-    /// [`query_database_column_types`](super::mysql::query::query_database_column_types)
-    /// for why the table map is not a substitute.
-    catalog_columns: crate::source::schema_catalog::CatalogSchemas,
-    /// Primary key per table, in index order, from the same read.
-    catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
-    /// Tables this run has announced.
-    announced_tables: std::collections::HashSet<(String, String)>,
-    /// The catalogue shape per table, stamped on a row only when it agrees with the row's
-    /// table map; see [`row_shape`].
+    /// The catalogue shape per table, seeded from the `information_schema` read at stream
+    /// start and stamped on a row only when it agrees with the row's table map; see
+    /// [`row_shape`].
     shapes: row_shape::StreamShapes,
 }
 
@@ -857,9 +846,6 @@ impl MysqlStreamHandle {
             table_include_list,
             table_exclude_list,
             shapes: row_shape::StreamShapes::new(&catalog_columns, &catalog_primary_keys),
-            catalog_columns,
-            catalog_primary_keys,
-            announced_tables: std::collections::HashSet::new(),
         }
     }
 }
@@ -2556,13 +2542,10 @@ mod tests {
         )
     }
 
-    /// A table whose `CREATE TABLE` predates capture is announced before its first row.
-    ///
-    /// MySQL's schema events otherwise come only from DDL parsed out of the binlog, so a
-    /// table created before the pipeline started had none at all — and its rows carry text
-    /// values, which a consumer cannot decode without the types.
+    /// A table's first rows in a run arrive alone: the shape is on each row, and no schema
+    /// event stands in front of them.
     #[tokio::test]
-    async fn a_table_is_announced_before_its_first_row() {
+    async fn no_read_schema_event_is_emitted() {
         use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
 
         let mut catalog = CatalogSchemas::new();
@@ -2619,45 +2602,14 @@ mod tests {
 
         let events = handle.next_events(50).await.unwrap();
         assert_eq!(
-            events.len(),
-            3,
-            "one announcement and two rows, got {:?}",
-            events.iter().map(|e| e.table.clone()).collect::<Vec<_>>()
+            events.iter().map(|event| event.op).collect::<Vec<_>>(),
+            [
+                crate::core::Operation::Insert,
+                crate::core::Operation::Insert
+            ],
+            "a row carries its shape; no schema event precedes it"
         );
-
-        let after = events[0].after.as_ref().expect("schema payload");
-        assert_eq!(events[0].op, crate::core::Operation::SchemaChange);
-        assert_eq!(events[0].table, "users__ddl_events");
-        assert_eq!(after["ddl_type"], "READ_SCHEMA");
-        assert_eq!(
-            after["result_schema"]["columns"][1]["data_type"],
-            json!("decimal(12,4)"),
-            "the declared type is MySQL's own spelling, complete with its modifier — the \
-             binlog table map would only give MYSQL_TYPE_NEWDECIMAL"
-        );
-        assert_eq!(
-            after["result_schema"]["columns"][0]["nullable"],
-            json!(false),
-            "nullability is read from information_schema, never derived from the key"
-        );
-        assert_eq!(after["result_schema"]["primary_keys"], json!(["id"]));
-
-        // The second row does not re-announce: one per table per run.
-        assert!(
-            events[1..]
-                .iter()
-                .all(|event| event.op != crate::core::Operation::SchemaChange),
-            "a table is announced once, not before every row"
-        );
-
-        let announced = events[0].shape.clone();
-        assert!(
-            announced.is_some(),
-            "an announcement with a shape carries it"
-        );
-        for row in &events[1..] {
-            assert_eq!(row.shape, announced, "a row carries the catalogue's shape");
-        }
+        assert!(events.iter().all(|event| event.shape.is_some()));
     }
 
     fn users_table_map() -> Arc<row_shape::TableMapColumns> {
@@ -3138,34 +3090,6 @@ mod tests {
         );
     }
 
-    /// A table the catalog read did not cover is a table created after the stream started,
-    /// and it needs no announcement — its `CREATE TABLE` is in the binlog.
-    #[tokio::test]
-    async fn a_table_outside_the_catalog_read_is_not_announced() {
-        let mut handle = make_stream_handle_with_catalog(
-            MockBinlogProvider::new(vec![vec![
-                MysqlBinlogMessage::Begin {
-                    tx_id: 7,
-                    timestamp_ms: 1,
-                },
-                MysqlBinlogMessage::WriteRows(row_change("users", None, Some(json!({"id": 1})))),
-                MysqlBinlogMessage::Xid {
-                    tx_id: 7,
-                    timestamp_ms: 2,
-                    binlog_file: "mysql-bin.000001".into(),
-                    binlog_pos: 100,
-                    gtid: None,
-                },
-            ]]),
-            crate::source::schema_catalog::CatalogSchemas::new(),
-            std::collections::HashMap::new(),
-        );
-
-        let events = handle.next_events(50).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].op, crate::core::Operation::Insert);
-    }
-
     fn make_stream_handle(
         file: &str,
         pos: u32,
@@ -3489,7 +3413,6 @@ mod tests {
                 schema_name: "testdb".into(),
                 bare_table: "users".into(),
                 catalog_columns: Vec::new(),
-                schema_announced: false,
                 shape: None,
             }],
             None,

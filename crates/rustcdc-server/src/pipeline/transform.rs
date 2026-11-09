@@ -601,12 +601,12 @@ fn apply_rules(event: Event, rules: &[CompiledRule]) -> Result<Option<Event>> {
 /// The known tables whose schema events the configured rules let through, under the name
 /// they reach the router with.
 ///
-/// Startup needs this to know which schema-event topics a sink will be asked for. The probe
-/// is a real `READ_SCHEMA` announcement published through [`CapturedDdl::to_event`], the
-/// same call every connector makes, so a rule that reads the payload (`unwrap` or `flatten`
-/// on `result_schema`, a strict field mapping) sees the fields it sees at runtime. The
-/// one-column `result_schema` stands in for the catalogue read. A rule that still errors on
-/// it counts as dropping the event.
+/// Startup needs this to know which schema-event topics a sink will be asked for: a
+/// connector writes one when it captures DDL for the table. The probe is an `ALTER_TABLE`
+/// event published through [`CapturedDdl::to_event`], the same call every connector makes,
+/// so a rule that reads the payload (`unwrap` or `flatten` on `result_schema`, a strict field
+/// mapping) sees the fields it sees at runtime. The one-column `result_schema` stands in for
+/// the table's. A rule that still errors on it counts as dropping the event.
 ///
 /// Returns nothing when the transform runtime is WASM. The module runs after these rules,
 /// cannot be run here, and may drop or rename schema events, so a topic predicted without it
@@ -625,7 +625,7 @@ pub(crate) fn schema_event_tables(
     tables
         .iter()
         .filter_map(|table| {
-            let mut event = read_schema_probe(table);
+            let mut event = schema_change_probe(table);
             // `to_event` always sets a schema. Keep the configured table's own, so an
             // unqualified entry renders the way its data topic does.
             event.schema = table.schema.clone();
@@ -640,14 +640,14 @@ pub(crate) fn schema_event_tables(
         .collect()
 }
 
-/// The schema announcement a connector publishes before `table`'s first row.
-fn read_schema_probe(table: &QualifiedTable) -> Event {
+/// The schema-change event a connector publishes when it captures DDL for `table`.
+fn schema_change_probe(table: &QualifiedTable) -> Event {
     let schema = table.schema.clone().unwrap_or_default();
     CapturedDdl {
-        ddl_type: rustcdc::DDL_TYPE_READ_SCHEMA.to_string(),
+        ddl_type: "ALTER_TABLE".to_string(),
         schema: schema.clone(),
         table: table.table.clone(),
-        statement: format!("/* schema of {} probed at startup */", table.display()),
+        statement: format!("ALTER TABLE {} /* probed at startup */", table.display()),
         result_schema: Some(TableSchema {
             schema,
             table: table.table.clone(),

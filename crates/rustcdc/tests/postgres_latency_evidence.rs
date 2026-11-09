@@ -213,10 +213,8 @@ async fn postgres_connector_latency_evidence_stream_commit_percentiles() -> rust
             continue;
         }
 
-        // Rows only, in the count and in the sample. A table's columns are announced
-        // before its first row; that event carries no writer timestamp, so it would be
-        // tallied as an unstamped event and would inflate the committed count past the
-        // rows actually inserted. Capture latency is a statement about row changes.
+        // Rows only, in the count and in the sample: a schema-change event carries no
+        // writer timestamp, and capture latency is a statement about row changes.
         let rows: Vec<rustcdc::Event> = batch
             .events()
             .iter()

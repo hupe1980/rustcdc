@@ -2095,6 +2095,9 @@ pub struct CdcRuntime {
     /// Consecutive polls that produced events but had every one suppressed by the
     /// idempotency guard while `pending_confirmation_lsn` was set.
     unconfirmed_stall_polls: u32,
+    /// The row-shape id the schema history last holds, per `schema.table`; see
+    /// [`record_row_shape`](CdcRuntime::record_row_shape).
+    recorded_shapes: std::collections::HashMap<String, String>,
 }
 
 /// Consecutive fully-suppressed polls tolerated before a stalled, unconfirmed
@@ -2313,6 +2316,7 @@ impl CdcRuntime {
             last_checkpoint_saved_at_ms: None,
             pending_confirmation_lsn: None,
             unconfirmed_stall_polls: 0,
+            recorded_shapes: std::collections::HashMap::new(),
             transform_pipeline: TransformPipeline::default(),
             idempotency_guard,
             registered_sink: None,
@@ -2439,6 +2443,7 @@ mod control;
 mod runtime_admin;
 mod runtime_lifecycle;
 mod runtime_poll;
+mod runtime_shapes;
 
 pub use control::RuntimeControl;
 pub use runtime_admin::write_runtime_metrics_prometheus;
@@ -6357,81 +6362,6 @@ mod tests {
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.events()[0].op, Operation::SchemaChange);
-    }
-
-    /// A restart re-announces every table, and the history must not grow for it.
-    ///
-    /// Every connector announces a table's schema before that table's first row, in every
-    /// run. Keyed by the source offset the way a captured statement is, a pipeline that
-    /// restarted twice a day would append two schema versions per table per day recording
-    /// nothing having happened. Keyed by content, the repeat resolves to the version
-    /// already stored.
-    #[tokio::test]
-    async fn re_observing_an_unchanged_schema_appends_no_history_version() {
-        use crate::ddl_capture::CapturedDdl;
-        use crate::schema_history::{ColumnDef, TableSchema};
-
-        let checkpoint = InMemoryCheckpoint::default();
-        let schema_history = InMemorySchemaHistory::default();
-        let config = RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
-        let mut runtime = CdcRuntime::new(config).unwrap();
-        runtime.start().await.unwrap();
-
-        let observation = |offset: &str| {
-            CapturedDdl {
-                ddl_type: crate::ddl_capture::DDL_TYPE_READ_SCHEMA.to_string(),
-                schema: "public".into(),
-                table: "users".into(),
-                statement: "/* observed */".into(),
-                result_schema: Some(TableSchema {
-                    schema: "public".into(),
-                    table: "users".into(),
-                    columns: vec![ColumnDef {
-                        name: "id".into(),
-                        data_type: "bigint".into(),
-                        nullable: false,
-                        constraints: vec!["primary_key".into()],
-                    }],
-                    primary_keys: vec!["id".into()],
-                    version: 0,
-                }),
-                schema_diff: None,
-                ts: 1,
-            }
-            .to_event("postgres", offset.to_string(), 1)
-        };
-
-        // Two runs of the same pipeline: the same table, the same schema, different log
-        // positions — because the second run resumed from a later checkpoint.
-        runtime
-            .record_schema_change_events(&[observation("0/00000064")])
-            .await
-            .unwrap();
-        let first = runtime
-            .config
-            .schema_history
-            .latest_schema("public.users")
-            .await
-            .unwrap()
-            .expect("the first observation is recorded");
-
-        runtime
-            .record_schema_change_events(&[observation("0/00ABCDEF")])
-            .await
-            .unwrap();
-        let second = runtime
-            .config
-            .schema_history
-            .latest_schema("public.users")
-            .await
-            .unwrap()
-            .expect("the schema is still there");
-
-        assert_eq!(
-            first.version, second.version,
-            "re-observing an unchanged schema at a later offset must resolve to the \
-             version already stored, not append a new one"
-        );
     }
 
     #[tokio::test]

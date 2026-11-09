@@ -97,8 +97,8 @@ async fn replayed_after_clean_restart(image: &str, tag: &str) -> rustcdc::Result
 
     let mut delivered = Vec::new();
     for _ in 0..60 {
-        // Rows only: the schema announcement that precedes a table's first row would
-        // otherwise be counted as the delivery this test asserts on.
+        // Rows only: a schema-change event must not count as the delivery this test
+        // asserts on.
         delivered.extend(
             stream
                 .next_events(250)

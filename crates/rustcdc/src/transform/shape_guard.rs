@@ -264,14 +264,42 @@ mod tests {
         }
     }
 
+    /// A stage that renames a column without saying so: the guard sees a column dropped and
+    /// another added, and removes the shape rather than narrowing it.
     #[tokio::test]
     async fn a_rename_removes_the_shape() {
-        let mut config = FieldMappingConfig::default();
-        config.rename.push(("name".into(), "label".into()));
-        let pipeline =
-            TransformPipeline::default().with(FieldMappingTransform::new(config).unwrap());
+        #[derive(Debug)]
+        struct SilentRename;
+        impl Transform for SilentRename {
+            fn apply(&self, event: &mut Event) -> crate::core::Result<bool> {
+                if let Some(serde_json::Value::Object(after)) = &mut event.after
+                    && let Some(value) = after.remove("name")
+                {
+                    after.insert("label".into(), value);
+                }
+                Ok(true)
+            }
+            fn name(&self) -> &str {
+                "silent_rename"
+            }
+        }
+        let pipeline = TransformPipeline::default().with(SilentRename);
         let output = pipeline.apply(row("1")).await.unwrap().unwrap();
         assert!(output.shape.is_none());
+    }
+
+    /// The field mapping removes the shape itself: a `set` or `copy` onto an existing name
+    /// rewrites a value under a name the guard sees unchanged.
+    #[test]
+    fn a_field_mapping_rename_removes_the_shape_itself() {
+        let mut config = FieldMappingConfig::default();
+        config.rename.push(("name".into(), "label".into()));
+        let mut event = row("1");
+        FieldMappingTransform::new(config)
+            .unwrap()
+            .apply(&mut event)
+            .unwrap();
+        assert!(event.shape.is_none());
     }
 
     #[tokio::test]

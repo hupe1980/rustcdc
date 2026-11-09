@@ -3,11 +3,7 @@ use crate::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Error, Event, Operation, Result, SnapshotMetadata,
         SourceMetadata,
     },
-    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
-    source::{
-        helpers::now_millis,
-        schema_catalog::{mark_as_snapshot_event, observed_statement, table_schema_from_catalog},
-    },
+    source::{helpers::now_millis, schema_catalog::row_shape_from_catalog},
 };
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, PostgresSnapshotHandle};
@@ -87,69 +83,18 @@ pub(super) async fn next_postgres_snapshot_chunk(
             Some(key_columns.clone())
         };
 
-        // Announce the table's schema before its first row.
-        //
-        // Snapshot rows carry text values like every other event, and a consumer that
-        // joins the pipeline at the initial load has no other way to learn what to parse
-        // them as — the snapshot path emitted no schema event at all, so a table that
-        // never underwent DDL had none anywhere in the stream. Emitting it here, ahead of
-        // the rows, means the schema is on the wire before anything that depends on it,
-        // which is the same ordering the runtime already enforces between schema history
-        // and delivery.
-        if !handle.tables[table_index].schema_announced {
-            handle.tables[table_index].schema_announced = true;
-            let catalog = handle.tables[table_index].catalog_columns.clone();
-            // An offline snapshot has no client and therefore no catalog. It says so by
-            // emitting nothing rather than by describing columns it did not read.
-            if !catalog.is_empty() {
-                let schema_for_event = schema_name.clone().unwrap_or_else(|| "public".to_string());
-                let ts_ms = now_millis();
-                let result_schema = table_schema_from_catalog(
-                    &schema_for_event,
-                    &bare_table,
-                    &catalog,
-                    &key_columns,
-                );
-                // The shape the rows below are captured under, from the schema this
-                // announcement carries rather than a second read of the catalog.
-                handle.tables[table_index].shape = crate::RowShape::from_table_schema(
-                    &schema_for_event,
-                    &bare_table,
-                    &result_schema,
-                )
-                .map(std::sync::Arc::new);
-                let captured = CapturedDdl {
-                    ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
-                    schema: schema_for_event.clone(),
-                    table: bare_table.clone(),
-                    statement: observed_statement(
-                        &schema_for_event,
-                        &bare_table,
-                        "the PostgreSQL catalog",
-                    ),
-                    result_schema: Some(result_schema),
-                    schema_diff: None,
-                    ts: ts_ms,
-                };
-                // The snapshot watermark: the position this schema is true as of.
-                let mut event = captured.to_event(
-                    &handle.source_name,
-                    super::format_pg_lsn(handle.snapshot_watermark),
-                    ts_ms,
-                );
-                mark_as_snapshot_event(
-                    &mut event,
-                    &handle.snapshot.snapshot_id,
-                    handle.next_chunk_index,
-                );
-                events.push(event);
-            }
+        // Derived once per table per run from the catalog read at snapshot setup. An offline
+        // snapshot has no catalog, and its rows carry no shape rather than an invented one.
+        if handle.tables[table_index].shape.is_none() {
+            let schema_for_shape = schema_name.as_deref().unwrap_or("public");
+            handle.tables[table_index].shape = row_shape_from_catalog(
+                schema_for_shape,
+                &bare_table,
+                &handle.tables[table_index].catalog_columns,
+                &key_columns,
+            );
         }
 
-        // Computed **after** the announcement, not before: the announcement occupies a
-        // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
-        // `requested + 1` events. That overflow costs a row — the runtime delivers a
-        // buffer's worth and the extra one is dropped.
         let remaining = requested - events.len();
         // Cloned once: the row loops below borrow `handle.tables[table_index]` mutably.
         let table_shape = handle.tables[table_index].shape.clone();
@@ -211,7 +156,7 @@ pub(super) async fn next_postgres_snapshot_chunk(
                 Err(error) => {
                     abandon_aborted_snapshot_transaction(handle).await;
                     // Events already in this chunk have moved their table's cursor, its
-                    // completion flag or its announcement flag. Dropping them with the error
+                    // completion flag. Dropping them with the error
                     // would leave that state past rows nobody received, and a retry would
                     // never produce them again. Hand them over; the next call meets the
                     // error again if it is still there.

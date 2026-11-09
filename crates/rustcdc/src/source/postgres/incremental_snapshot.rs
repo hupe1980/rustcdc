@@ -220,6 +220,7 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
         Ok(SnapshotTable {
             // Filled in by the driver from `IncrementalSnapshotConfig::table_conditions`.
             condition: None,
+            shape: None,
             schema,
             name,
             qualified,
@@ -227,6 +228,21 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
             pk_types,
             columns,
         })
+    }
+
+    async fn describe_shape(
+        &mut self,
+        table: &SnapshotTable,
+    ) -> Result<Option<Arc<crate::RowShape>>> {
+        let columns =
+            super::query::query_table_column_types(&self.query_client, &table.schema, &table.name)
+                .await?;
+        Ok(crate::source::schema_catalog::row_shape_from_catalog(
+            &table.schema,
+            &table.name,
+            &columns,
+            &table.pk_columns,
+        ))
     }
 
     /// The current WAL position **and** the snapshot visibility fence, in one round trip.

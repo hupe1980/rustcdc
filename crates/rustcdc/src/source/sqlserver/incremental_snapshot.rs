@@ -137,6 +137,7 @@ impl IncrementalSnapshotBackend for SqlServerSnapshotBackend {
         Ok(SnapshotTable {
             // Filled in by the driver from `IncrementalSnapshotConfig::table_conditions`.
             condition: None,
+            shape: None,
             schema,
             name,
             qualified,
@@ -144,6 +145,20 @@ impl IncrementalSnapshotBackend for SqlServerSnapshotBackend {
             pk_types: Vec::new(),
             columns,
         })
+    }
+
+    async fn describe_shape(
+        &mut self,
+        table: &SnapshotTable,
+    ) -> Result<Option<std::sync::Arc<crate::RowShape>>> {
+        let columns =
+            super::load_table_catalog_columns(&mut self.client, &table.schema, &table.name).await?;
+        Ok(crate::source::schema_catalog::row_shape_from_catalog(
+            &table.schema,
+            &table.name,
+            &columns,
+            &table.pk_columns,
+        ))
     }
 
     /// The highest LSN the CDC **capture tables** hold.

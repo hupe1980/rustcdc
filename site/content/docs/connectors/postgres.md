@@ -27,7 +27,7 @@ additional installation required).
 | `UPDATE` | yes | `after` always; `before` requires `REPLICA IDENTITY FULL` or `USING INDEX` |
 | `DELETE` | yes | `before` requires `REPLICA IDENTITY FULL` or `USING INDEX`; otherwise primary key only |
 | `TRUNCATE` | yes | PostgreSQL ≥ 11; `pgoutput` only |
-| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
+| Column types | yes | Every row carries its table's declared columns in `shape` — see [Declared column types](#declared-column-types) |
 | Logical decoding messages | opt-in | `pg_logical_emit_message()` output — the table-free transactional outbox. Set [`capture_logical_messages`](@/docs/config-reference.md#capture-logical-messages) |
 | DDL statements | no | Logical decoding does not expose the statement text. A column added or retyped is reported as a schema event derived from the `RELATION` metadata, not as the `ALTER TABLE` that caused it |
 
@@ -159,21 +159,21 @@ slot. PostgreSQL will replay all uncommitted WAL segments from that LSN forward.
 
 ### Declared column types
 
-Column values are text, so a consumer needs the types to decode them. Every table's columns
-are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
-event with `ddl_type = "READ_SCHEMA"` — see
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Column values are text, so a consumer needs the types to decode them. Every row, in the
+snapshot and the stream, carries its table's columns in `shape` — see
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape).
 
-Types come from `pg_catalog.format_type()`, read once at stream start over the publication:
-`numeric(12,4)` keeps its modifier, and enums, domains and extension types report their own
-names. Nullability comes from `pg_attribute.attnotnull`.
+Types are `pg_catalog.format_type()`: `numeric(12,4)` keeps its modifier, and enums, domains
+and extension types report their own names. A stream row's types come from the type OID and
+modifier of its `RELATION` message, resolved once per distinct pair on the connector's SQL
+connection, so a row written before an `ALTER COLUMN … TYPE` carries the type it was written
+under. Nullability comes from `pg_attribute.attnotnull` and the key from the primary-key
+index, read at stream start and again when a table's `RELATION` changes.
 
 No extra privilege — `pg_catalog` is readable by every role.
 
-**Limit.** A table added to the publication *after* the stream started is not in that read,
-so its columns report the pgoutput type OID: no modifier, and `unknown` for a type outside
-the built-in set. Its first DDL carries the full declaration, and a restart re-reads the
-catalogue.
+**Limit.** pgoutput carries neither nullability nor the key, so a stream row's are the
+catalogue's at the last read, not necessarily at the row's position.
 
 ### Logical decoding messages — the table-free outbox
 

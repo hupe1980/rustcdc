@@ -592,4 +592,33 @@ pub(super) mod tests {
         );
         assert_eq!(*reads.lock().unwrap(), 1, "the held shape agrees: no read");
     }
+
+    /// Two different table maps that both disagree, in one batch, cost one read: the second
+    /// would find the same catalogue the first just read.
+    #[tokio::test]
+    async fn one_read_per_table_per_batch() {
+        let reads = Arc::new(Mutex::new(0));
+        let mut shapes = StreamShapes::new(&HashMap::new(), &HashMap::new());
+        shapes.set_reader(Box::new(FakeCatalogue {
+            shapes: Arc::new(Mutex::new(HashMap::from([(
+                ("app".to_string(), "users".to_string()),
+                users(),
+            )]))),
+            reads: Arc::clone(&reads),
+        }));
+
+        shapes.start_batch();
+        let narrow = table_map(&[("id", TypeFamily::Integer, false)], &["id"]);
+        let wide = table_map(
+            &[
+                ("id", TypeFamily::Integer, false),
+                ("email", TypeFamily::String, true),
+                ("extra", TypeFamily::String, true),
+            ],
+            &["id"],
+        );
+        assert!(shapes.shape_for("app", "users", &narrow).await.is_none());
+        assert!(shapes.shape_for("app", "users", &wide).await.is_none());
+        assert_eq!(*reads.lock().unwrap(), 1);
+    }
 }

@@ -88,8 +88,8 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
         }
 
         // Names and declared types in one read. The names drive the snapshot projection;
-        // the types are what the schema event announces before the first row, because a
-        // snapshot row's values are text like every other event's.
+        // the types go into the shape every row carries, because a snapshot row's values are
+        // text like every other event's.
         let catalog_rows: Vec<(String, String, String)> = connection
             .exec(
                 "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE \
@@ -159,7 +159,6 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
             schema_name: table_schema.clone(),
             bare_table: table_name.clone(),
             catalog_columns,
-            schema_announced: false,
             shape: None,
         });
     }
