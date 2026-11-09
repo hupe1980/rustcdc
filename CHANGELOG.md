@@ -7,172 +7,126 @@ what breaks and what to do about it.
 
 ## 0.20.0
 
-Field reports from one deployment, each with a reproduction, and the fixes they led to — one of
-which uncovered a data-loss path in the PostgreSQL snapshot that nobody had reported. Plus a row
-that names the shape it was captured under, on every connector.
+Every row now carries its table's shape. Fixes for the PostgreSQL snapshot (one of them a
+data-loss path), a health verdict for a failing destination and for a lost replication slot,
+current dependencies with one TLS stack in every build, and Homebrew. **Breaking**: see below.
 
-It is a **breaking** release. See *Breaking* and *Migrating*.
+### Added: every row carries its table's shape (#27)
+
+Column values are text, so a consumer needs the declared types to parse them. 0.18 announced them
+in a separate event, which can reach a consumer after the rows it describes. Every row event now
+carries `shape` — schema, table, columns (name, declared type, nullability) and primary key — and
+its `id`, a digest of exactly those fields. A row decodes on its own: no second event, no topic
+ordering, no registry. The `READ_SCHEMA` announcement events are gone; the runtime records each new
+shape in schema history from the rows. Builds on #28 by vu2jpr.
+
+- **Never stale.** PostgreSQL takes declared types from the `RELATION` message
+  (`format_type(oid, typmod)`), so rows after `ALTER COLUMN … TYPE` carry the new type — 0.18 and
+  0.19 announced the type read at stream start. MySQL and MariaDB stamp the catalogue's shape only
+  when it agrees with the row's binlog table map (names, type family, nullability, key) and re-read
+  it after DDL and on resume; until it agrees, rows carry no shape.
+- **Everywhere it is known:** snapshot, incremental snapshot and stream rows on PostgreSQL, MySQL,
+  MariaDB and SQL Server. No shape: the Snowflake source, truncate events, an offline snapshot.
+- **Transforms keep it honest.** A projection narrows the shape; a rename, mask, unwrap, outbox or
+  WASM stage removes it.
+- **Compact mode:** `runtime.row_shape = "id"` delivers the id alone, resolvable at
+  `GET /schemas/{id}` for every shape the server has delivered since it started. Kafka records
+  carry the id in the `__rustcdc.row_shape` header; CloudEvents set
+  `dataschema = urn:rustcdc:row-shape:<id>`. JSON, Avro and Protobuf carry the shape.
 
 ### Fixed: a PostgreSQL snapshot lost rows when a read failed part-way through a chunk
 
-A snapshot chunk can span tables. When the read for the second table failed after the first
-table's last rows were in the chunk, the chunk was discarded with the error — but the first
-table's progress had already moved past those rows. They were never delivered and never read
-again. Rows already read are now delivered, and the failure surfaces on the next read if it
-persists.
+A chunk can span tables. When the read for the second table failed after the first table's last
+rows were in the chunk, the chunk was discarded with the error after that table's progress had
+moved past them — rows never delivered and never read again. They are now delivered, and the
+failure surfaces on the next read.
 
-### Fixed: a failed snapshot read could never be retried (#26)
+### Fixed: PostgreSQL snapshots (#24, #25, #26)
 
-A failed statement aborts the snapshot's `REPEATABLE READ` transaction, and every retry ran in it
-and failed with `25P02 current transaction is aborted`. The transaction is now rolled back and the
-next read opens a fresh one, keeping the original watermark — the same guarantee a snapshot
-resumed from a checkpoint gives. A transient error (a lock timeout, a serialization failure, a
-privilege briefly revoked) now recovers.
-
-### Fixed: tables of more than 50 columns could not be snapshotted (#24)
-
-The row was built with one `json_build_object` call taking two arguments per column, and
-PostgreSQL caps a call at 100 arguments. It is now `json_object(text[], text[])`, which has no
-column limit and produces the same JSON object. This affected the initial snapshot, the incremental
-snapshot and `reselect_unavailable_columns`. Thanks to rustama1211, whose fork carried the same
-fix.
-
-### Fixed: PostgreSQL errors said only `db error` (#25)
-
-Every PostgreSQL client error the source reports — at connect, in the snapshot, in the stream —
-now carries the server's SQLSTATE and message,
-and its detail and hint when sent — `42501: permission denied for table orders` rather than
-`db error`. A client-side failure carries its cause chain.
+- **Retry after a failed read (#26).** A failed statement aborted the snapshot's
+  `REPEATABLE READ` transaction and every retry failed with `25P02`. The next read now opens a
+  fresh one, keeping the original watermark: the snapshot continues from a new read point, and
+  changes in between arrive through the stream.
+- **More than 50 columns (#24).** The row was built with one `json_build_object` call, two
+  arguments per column, and PostgreSQL caps a call at 100. It is `json_object(text[], text[])`
+  now, on the initial snapshot, the incremental snapshot and `reselect_unavailable_columns`.
+- **The server's error (#25).** Every PostgreSQL client error carries the SQLSTATE and message,
+  and the detail and hint when sent — `42501: permission denied for table orders`, not `db error`.
 
 ### Changed: unmodified TOAST under `REPLICA IDENTITY FULL` is completed (#22)
 
-Under `FULL` an `UPDATE` that left a large out-of-line value untouched arrived without it in
-`after` and listed in `unavailable_columns`, although `before` held the value. An unmodified
-column's new value is its old value, and under `FULL` the old tuple carries it from the same WAL
-record, so `after` is now completed from it and the column is not listed. A column missing from
-both images stays listed. Under `DEFAULT` and `USING INDEX` nothing changes.
+An unmodified column's new value is its old value, and under `FULL` the old tuple carries it, so
+`after` is completed from the same WAL record instead of listing the column as unavailable.
 
-### Added: a failing delivery has its own health verdict, and SIGTERM stops a retry (#21)
+### Added: health verdicts that route to the right owner (#21)
 
-When a sink kept refusing a batch, health reported `idle` for the whole outage. The runtime's own
-verdict for a held batch was worse: "the poll loop is not turning", the cause `/livez` restarts on
-— and a restart creates no topic and grants no ACL; it replays the batch into the same refusal.
+- **`delivery_failing`.** A sink that kept refusing a batch read as `idle`, and the runtime's own
+  verdict for a held batch was `poll_loop_not_turning` — which `/livez` restarts on, replaying into
+  the same refusal. `StallCause::DeliveryFailing` names it with the destination's last error;
+  embedders report failures with `CdcRuntime::record_delivery_failure`. SIGTERM interrupts a retry
+  backoff, and a send timeout names its table.
+- **`source_position_lost`.** A slot PostgreSQL invalidates (`max_slot_wal_keep_size`, 18's
+  `idle_replication_slot_timeout`) is `SourceErrorKind::SlotInvalidated`, decided by SQLSTATE and
+  the slot's row in `pg_replication_slots`, never by message text. The server parks — alive,
+  `/livez` 200, `/readyz` 503 — and never re-snapshots on its own: a re-snapshot cannot replay rows
+  deleted in the gap. `rustcdc_replication_slot_wal_status` and
+  `rustcdc_replication_slot_safe_wal_size_bytes` warn while the slot is still `unreserved`.
+- Both causes keep `/livez` green and have alert rules; a test holds the rules to every cause.
+- A reconnect returns a non-recoverable source error at once instead of spending its retry budget.
 
-- `StallCause::DeliveryFailing` (`delivery_failing`) names it, with the destination's last error
-  in the reason, once failures outlast the stall threshold. `/livez` stays green for it; a new
-  alert, `RUSTCDCStallDeliveryFailing`, routes it.
-- An embedder that holds and retries a batch reports each failure with
-  `CdcRuntime::record_delivery_failure`; the next successful `commit_ack` clears it.
-- The server republishes health and metrics during the retry.
-- SIGTERM during a retry backoff stops the pipeline cleanly; the batch redelivers from the
-  checkpoint.
-- A send timeout names the table and operation it was sending.
+### Fixed
 
-### Added: a row names the shape it was captured under (#27, #28)
+- **Empty Kafka transactions.** A route that received no record in a batch still committed an
+  empty transaction, which the broker refuses. The transaction now opens on its first record.
+- **A built-in connector held as `dyn Source` never connected.** `Source::connect` and
+  `Source::close` default to no-ops and the three built-in connectors did not override them.
 
-The announcement of a table's shape can arrive on a topic of its own, and nothing orders two
-topics, so a consumer can be handed a row before the announcement for its shape. Every event now
-carries `schema_id`, an optional envelope field naming the table's shape, derived from the shape
-alone (columns, types, nullability, constraints, primary key). The announcement for a shape and
-the rows captured under it carry the same value. Contributed by vu2jpr.
+### Changed: dependencies and packaging
 
-- **Rows** carry it on PostgreSQL, MySQL, MariaDB and SQL Server, in the snapshot and in the
-  stream. On MySQL and MariaDB a DDL statement in the binlog replaces the shape rows name; a parsed
-  `ALTER TABLE` has no resulting schema, so rows after it carry none rather than the old shape.
-- **Absent means unknown**, not "new shape": the Snowflake source, incremental-snapshot rows, an
-  offline snapshot, truncate events, and any row a transform reshaped carry none.
-- Carried by every codec that decodes — JSON, Avro (nullable, default `null`), Protobuf
-  (field 15) — and by CloudEvents in `data`.
+`iceberg` **0.11**, `opendal` **0.58**, `krafka` **0.29**, `schemreg` **0.7**, `wasmtime` **50**,
+`tiberius` **0.13**, `axum-server` **0.9**; `zip` removed. **MSRV 1.97.0**, set by `wasmtime` 50.
 
-### Added: a verdict for a replication slot PostgreSQL invalidates
-
-A slot invalidated while the pipeline ran (`max_slot_wal_keep_size`, PostgreSQL 18's
-`idle_replication_slot_timeout`) showed up as a reconnect loop reported `poll_loop_not_turning`,
-the cause `/livez` restarts on — and no restart recreates the removed WAL. The old stale-slot
-check matched message text, which on the SQL-peek transport was the literal `db error`, so it
-never fired; the streaming transport had none.
-
-- **`SourceErrorKind::SlotInvalidated`** (`slot_invalidated`, not recoverable), decided by SQLSTATE
-  `55000` plus the slot's own row in `pg_replication_slots` (`wal_status = 'lost'`, or an
-  `invalidation_reason` on 17+), never by the message. One classifier serves the peek poll,
-  `START_REPLICATION`, the periodic slot sample and startup validation. The message names the
-  slot and the server's `invalidation_reason`.
-- **`StallCause::SourcePositionLost`** (`source_position_lost`), checked first and before
-  `NotRunning`, set by a failed poll or `start()`. Alert `RUSTCDCStallSourcePositionLost`
-  (team `database`).
-- **The server parks** on it, mid-run or at startup: alive, not capturing, `/livez` 200,
-  `/readyz` 503, SIGTERM honoured. It never re-snapshots on its own — a re-snapshot cannot
-  replay rows deleted in the gap.
-- **Early warning:** `rustcdc_replication_slot_wal_status{status}` (one-hot) and
-  `rustcdc_replication_slot_safe_wal_size_bytes`, also on `RuntimeAdminSnapshot`
-  (`replication_slot_wal_status`, `replication_slot_safe_wal_size_bytes`, new `SlotWalStatus`).
-  Alert `RUSTCDCReplicationSlotUnreserved` fires while the slot can still be saved. The state is
-  read on the slot-lag cadence; `PostgresSourceConfig::slot_state_sample_interval_ms` overrides
-  it. On the streaming transport this sample is now one catalogue query on the existing SQL
-  connection.
-- **Reconnects stop on what a retry cannot fix:** a non-recoverable `SourceErrorKind` or
-  `Error::Unrecoverable` from a reconnect's `connect` or stream restart is returned at once with
-  its kind. A `ConfigError` (a deferred secret that failed to resolve) is still retried.
-- The incremental-snapshot stream now reports the slot's lag and state; it reported neither.
-
-### Changed: dependencies, and one TLS stack in every build
-
-`iceberg` 0.10.1 → **0.11.0**, `opendal` 0.57 → **0.58**, `krafka` 0.24 → **0.29**, `schemreg`
-0.6 → **0.7**, `wasmtime` 48 → **50**, `tiberius` 0.12 → **0.13**, `axum-server` 0.7 → **0.9**;
-`zip` removed (unused). The MSRV is **1.97.0**, set by `wasmtime` 50.
-
-- **`sqlserver` no longer links a second TLS stack.** `tiberius` 0.13 is on `rustls` 0.23, so the
-  four advisories that came with its old copy are gone and every build links one `rustls` and one
-  `rustls-webpki` — asserted for the default build and, newly, for the `--all-features` build the
-  image ships. `sqlserver` still compiles `aws-lc-rs` beside the library's `ring`; the driver uses
-  it when no process-wide crypto provider is installed. Tested on SQL Server 2019 CU32, 2022 CU27
-  and, newly, 2025 CU10. `tiberius` 0.13's 30 s per-round-trip default is turned off, so a large
-  snapshot query is not cut short.
-- **Fixed: an empty Kafka transaction failed its commit.** A route that received no record in a
-  batch still opened a Kafka transaction, and the broker refuses to commit one that carried
-  nothing. The transaction now opens on its first record; an empty barrier ends without contacting
-  the broker.
-- Ten advisories cleared (RUSTSEC-2025-0134, -2026-0098/-0099/-0104, -0194/-0195,
-  -0346/-0349/-0382, and four against `zip`). Three remain suppressed, none on a path that handles
-  untrusted TLS: `paste` (compile time), `rsa` 0.9 (Azure request *signing*), `astral-tokio-tar`
-  (a test dependency).
-- Every container image the suites pull is pinned — the brokers, and SQL Server, which floated as
-  `2022-latest` — and the policy gate fails on a floating tag.
-
-### Fixed: a built-in connector held as `dyn Source` never connected
-
-`PostgresConnection`, `MysqlConnection` and `SqlServerConnection` did not override
-`Source::connect` and `Source::close`, whose defaults do nothing, so a connector registered with
-`register_source` or wrapped in another `Source` failed its first stream with "connection must
-be established". The trait methods now call the connectors' own.
+- **One TLS stack in every build.** `tiberius` 0.13 is on `rustls` 0.23, removing the second stack
+  `sqlserver` linked and its four advisories. Six suppressions left `deny.toml`; three remain, none
+  on an untrusted-TLS path. SQL Server 2025 joins 2019 and 2022 in the tested matrix.
+- **No suite pulls a `latest` image.** The brokers and SQL Server (which floated as `2022-latest`)
+  are pinned, and the policy gate fails on a `latest` tag.
+- **Homebrew:** `brew install hupe1980/tap/rustcdc` (macOS Apple Silicon, Linux x86_64 and arm64,
+  static musl). Each release attaches the binaries and `checksums.txt`.
 
 ### Breaking
 
-1. **MSRV raised to 1.97.0** from 1.95.0.
-2. **`EVENT_JSON_SCHEMA` gained `schema_id`.** It sets `additionalProperties: false`, so a
-   consumer validating against a pinned copy of the previous schema rejects new events.
-3. **Under `REPLICA IDENTITY FULL`, an unchanged-TOAST update is a full-row write.**
-   `unavailable_columns` is empty and `row_write()` returns `Replace` where it returned `Merge`.
-4. **A held, failing batch is no longer reported as `poll_loop_not_turning`**, so an alert or a
-   runbook keyed on that cause for sink outages must move to `delivery_failing`.
-5. **`PostgresSourceConfig` gained `slot_state_sample_interval_ms`.** A struct literal without
-   `..Default::default()` no longer compiles.
-6. **An invalidated slot is `source_position_lost`**, not `poll_loop_not_turning`, and the server
-   parks instead of exiting or restarting. A reconnect that fails with a non-recoverable source
-   kind or `Error::Unrecoverable` returns at once instead of using the retry budget.
+1. **MSRV 1.97.0.**
+2. **`READ_SCHEMA` events are gone**, with `DDL_TYPE_READ_SCHEMA` and
+   `CapturedDdl::is_observation`. PostgreSQL emits a schema event only when a relation changes.
+3. **`Event::schema_id` is replaced by `Event::shape`** in every envelope: `EVENT_JSON_SCHEMA`
+   (which sets `additionalProperties: false`), Avro, and Protobuf (field 15 reserved).
+4. **`SnapshotTable` gained `shape`**, and `PostgresSourceConfig` gained
+   `slot_state_sample_interval_ms`: struct literals without `..Default::default()` stop compiling.
+5. **Under `REPLICA IDENTITY FULL`, an unchanged-TOAST update is a full-row write:**
+   `row_write()` returns `Replace` where it returned `Merge`.
+6. **New stall causes.** A held, failing batch is `delivery_failing` and a lost slot is
+   `source_position_lost`; both were `poll_loop_not_turning`, and the server parks on a lost slot
+   instead of exiting.
 
 ### Migrating
 
-- Take the new JSON Schema if you validate events against a pinned copy.
-- A consumer that merged `before` into `after` for unchanged-TOAST columns under `FULL` can stop;
-  the merge is now a no-op.
-- Route `rustcdc_runtime_stall_cause{cause="delivery_failing"}` to whoever owns the destination.
-  The shipped alert rules do.
-- Add `slot_state_sample_interval_ms: None` (or `..Default::default()`) to `PostgresSourceConfig`
-  literals.
-- Route `rustcdc_runtime_stall_cause{cause="source_position_lost"}` and
-  `rustcdc_replication_slot_wal_status{status="unreserved"}` to the database team. A parked
-  process is recovered by recreating the slot and re-snapshotting, then SIGTERM.
+- Read column types from each row's `shape`. A consumer that waited for `READ_SCHEMA` can stop;
+  DDL still arrives as `op = "schema_change"` on `<table>__ddl_events`, and a templated Kafka sink
+  still needs those topics.
+- Take the new JSON Schema if you validate against a pinned copy.
+- Under `FULL`, a consumer that merged `before` into `after` for TOAST columns can stop.
+- Route `rustcdc_runtime_stall_cause{cause="delivery_failing"}` to the destination's owner and
+  `source_position_lost` and `rustcdc_replication_slot_wal_status{status="unreserved"}` to the
+  database team; the shipped alert rules do.
+
+### Evidence
+
+`1 258` library and `589` server unit tests and the doctests, green, with `clippy -D warnings`,
+`cargo deny` and the policy gate. Container suites: PostgreSQL 16 and 18 (snapshot, stream,
+handoff, type fidelity, reselect, slot invalidation, process crash), MySQL, MariaDB, SQL Server
+2019/2022/2025 and the server's Kafka and PostgreSQL suites. Every new test was run against its
+defect planted back and failed.
 
 ## 0.19.0
 
