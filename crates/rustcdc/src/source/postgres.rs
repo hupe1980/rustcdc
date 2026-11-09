@@ -2674,7 +2674,7 @@ mod tests {
         >,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl super::relation_catalog::RelationCatalog for FakeRelationCatalog {
         async fn type_names(&self, types: &[(u32, i32)]) -> crate::core::Result<Vec<String>> {
             Ok(types

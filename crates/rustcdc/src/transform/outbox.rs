@@ -250,6 +250,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unwrapped_outbox_event_carries_no_shape() {
+        let transform = OutboxTransform::new("outbox");
+        let mut e = event(
+            "outbox",
+            json!({"aggregate_id": "o1", "event_type": "order.placed", "payload": {"id": 1}}),
+        );
+        e.shape = Some(std::sync::Arc::new(
+            crate::core::RowShape::new(
+                "public",
+                "outbox",
+                vec![
+                    crate::core::ShapeColumn::new("aggregate_id", "text", false),
+                    crate::core::ShapeColumn::new("event_type", "text", false),
+                    crate::core::ShapeColumn::new("payload", "jsonb", false),
+                ],
+                vec!["aggregate_id".into()],
+            )
+            .unwrap(),
+        ));
+        transform.apply(&mut e).unwrap();
+        assert!(
+            e.shape.is_none(),
+            "the payload is the application's document, not the outbox table's row"
+        );
+    }
+
     // ── Operation guard: Delete / Update / Truncate on outbox table ──────────
 
     #[tokio::test]

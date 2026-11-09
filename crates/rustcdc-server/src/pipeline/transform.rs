@@ -1449,13 +1449,7 @@ mod tests {
         path
     }
 
-    #[tokio::test]
-    async fn wasm_runtime_can_pass_through_event_json() {
-        let dir = wasm_fixture_dir();
-        let module_path = write_wasm_module(
-            &dir,
-            "passthrough.wasm",
-            r#"
+    const PASS_THROUGH_WAT: &str = r#"
             (module
               (memory (export "memory") 2 2)
               (global $heap (mut i32) (i32.const 8))
@@ -1482,8 +1476,12 @@ mod tests {
                 local.get $len
                 i64.extend_i32_u
                 i64.or))
-            "#,
-        );
+            "#;
+
+    #[tokio::test]
+    async fn wasm_runtime_can_pass_through_event_json() {
+        let dir = wasm_fixture_dir();
+        let module_path = write_wasm_module(&dir, "passthrough.wasm", PASS_THROUGH_WAT);
 
         let runtime_cfg = TransformRuntimeConfig {
             mode: TransformRuntimeMode::Wasm,
@@ -1505,6 +1503,98 @@ mod tests {
 
         assert_eq!(transformed.table, event.table);
         assert_eq!(transformed.after, event.after);
+    }
+
+    /// A row whose shape describes `id` and `inner`. Unwrapping or flattening `inner` below
+    /// leaves the same two names, so the chain's name comparison keeps the shape; only the
+    /// action's own removal drops it.
+    fn shaped_nested_event() -> Event {
+        let shape = rustcdc::RowShape::new(
+            "public",
+            "users",
+            vec![
+                rustcdc::ShapeColumn::new("id", "bigint", false),
+                rustcdc::ShapeColumn::new("inner", "jsonb", true),
+            ],
+            vec!["id".into()],
+        )
+        .expect("shape");
+        Event::builder("users", Operation::Insert)
+            .after(json!({"id": 1, "inner": {"id": 7, "inner": 5}}))
+            .source(SourceMetadata::new("postgres", "0/1", 1))
+            .ts(1)
+            .schema("public")
+            .primary_key(["id"])
+            .shape(std::sync::Arc::new(shape))
+            .build()
+    }
+
+    async fn apply_one_action(action: TransformActionConfig, event: Event) -> Event {
+        let rules = vec![TransformRuleConfig {
+            name: "reshape".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![action],
+        }];
+        TransformPipeline::from_config(TransformRuntimeConfig::default(), rules)
+            .expect("pipeline")
+            .apply(event)
+            .await
+            .expect("apply")
+            .expect("kept")
+    }
+
+    #[tokio::test]
+    async fn an_unwrapped_row_carries_no_shape() {
+        let event = apply_one_action(
+            TransformActionConfig::Unwrap {
+                field: "inner".to_string(),
+            },
+            shaped_nested_event(),
+        )
+        .await;
+        assert_eq!(event.after, Some(json!({"id": 7, "inner": 5})));
+        assert!(event.shape.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_flattened_row_carries_no_shape() {
+        let event = apply_one_action(
+            TransformActionConfig::Flatten {
+                field: "inner".to_string(),
+                prefix: None,
+            },
+            shaped_nested_event(),
+        )
+        .await;
+        assert_eq!(event.after, Some(json!({"id": 7, "inner": 5})));
+        assert!(event.shape.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_wasm_module_s_output_carries_no_shape() {
+        let dir = wasm_fixture_dir();
+        let module_path = write_wasm_module(&dir, "passthrough.wasm", PASS_THROUGH_WAT);
+        let runtime_cfg = TransformRuntimeConfig {
+            mode: TransformRuntimeMode::Wasm,
+            wasm: WasmTransformConfig {
+                module_path: Some(module_path),
+                max_memory_bytes: 128 * 1024,
+                max_event_bytes: 64 * 1024,
+                ..WasmTransformConfig::default()
+            },
+        };
+        let pipeline = TransformPipeline::from_config(runtime_cfg, Vec::new()).expect("pipeline");
+        let event = shaped_nested_event();
+        let transformed = pipeline
+            .apply(event.clone())
+            .await
+            .expect("apply")
+            .expect("kept");
+        assert_eq!(
+            transformed.after, event.after,
+            "the module passed the row through"
+        );
+        assert!(transformed.shape.is_none());
     }
 
     #[tokio::test]
