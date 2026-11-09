@@ -2,15 +2,16 @@
 //!
 //! # Why a test needs this when the library does not
 //!
-//! `rustcdc` never relies on rustls's process-default provider: `core::transport_tls` builds
-//! every client through `ClientConfig::builder_with_provider`, so its TLS works whatever else is
-//! in the dependency graph. That is deliberate and documented there.
+//! `rustcdc` builds its own TLS clients through `ClientConfig::builder_with_provider`, and the
+//! MySQL connector, whose driver reads only the process default, installs `ring` when nothing
+//! is installed. `mysql_connection_integration` deliberately does not call this helper, so it
+//! exercises that path.
 //!
 //! `sqlx` — which these suites use to *drive* the database, separately from the connector under
 //! test — does rely on the default. rustls resolves that default automatically only when exactly
 //! one provider feature is enabled, and under `--all-features` there are two: `ring`, from
-//! rustcdc's own rustls, and `aws-lc-rs`, pulled in by the AWS SDK behind the `glue` feature.
-//! rustls cannot choose, so it panics:
+//! rustcdc's own rustls, and `aws-lc-rs`, pulled in by `sqlserver` (tiberius) and the AWS SDK
+//! behind `glue`. rustls cannot choose, so it panics:
 //!
 //! ```text
 //! Could not automatically determine the process-level CryptoProvider from Rustls crate features.

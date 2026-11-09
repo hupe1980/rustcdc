@@ -182,6 +182,18 @@ mod tests {
         }
     }
 
+    /// The MySQL driver reads only rustls's process default, and rustls cannot pick one when
+    /// both `ring` and `aws-lc-rs` are linked (`--all-features`, or `mysql` with `sqlserver`):
+    /// the first TLS connection panicked inside the driver.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_options_leave_a_process_crypto_provider_for_the_driver() {
+        config(DatabaseAuthMode::Password, SecretString::new("pw"))
+            .build_pool_opts()
+            .expect("options build");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
     #[test]
     fn an_iam_token_config_opens_a_fresh_connection_per_request() {
         // The defect this exists for: a pool resolves the password once and then

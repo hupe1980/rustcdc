@@ -352,6 +352,12 @@ mode = "plaintext"    # plaintext | tls
 # allow_invalid_hostnames    = false                   # local testing only
 ```
 
+**Embedding the library with TLS.** The MySQL driver takes its rustls crypto provider from the
+process default. If none is installed at the first TLS connection, the connector installs
+`ring`. To use `aws-lc-rs` (for FIPS, say), install it before connecting:
+`rustls::crypto::aws_lc_rs::default_provider().install_default()`. The server binary installs
+`aws-lc-rs` at startup.
+
 ### Field details
 
 | Field | Default | Description |

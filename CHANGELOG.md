@@ -84,6 +84,10 @@ An unmodified column's new value is its old value, and under `FULL` the old tupl
   empty transaction, which the broker refuses. The transaction now opens on its first record.
 - **A built-in connector held as `dyn Source` never connected.** `Source::connect` and
   `Source::close` default to no-ops and the three built-in connectors did not override them.
+- **MySQL TLS panicked in a build linking two rustls providers** (`mysql` with `glue` or
+  `sqlserver`): the driver reads only the process default, which rustls cannot pick between
+  `ring` and `aws-lc-rs`. The connector installs `ring` when no default is installed; an
+  embedder that wants `aws-lc-rs` installs it before connecting.
 
 ### Changed: dependencies and packaging
 
