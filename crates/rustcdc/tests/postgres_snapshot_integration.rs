@@ -1765,3 +1765,243 @@ fn snapshot_row_id(event: &rustcdc::Event, table: &str) -> Option<i64> {
         .as_i64()
         .or_else(|| event.after.as_ref()?.get("id")?.as_str()?.parse().ok())
 }
+
+/// A PostgreSQL 18 container with logical replication, and an admin client on it.
+async fn start_snapshot_postgres() -> rustcdc::Result<(
+    testcontainers::ContainerAsync<GenericImage>,
+    String,
+    u16,
+    tokio_postgres::Client,
+)> {
+    let container = GenericImage::new("postgres", "18-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec!["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let admin = connect_admin(&host, port).await?;
+    Ok((container, host, port, admin))
+}
+
+async fn connect_admin(host: &str, port: u16) -> rustcdc::Result<tokio_postgres::Client> {
+    let dsn = format!(
+        "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
+    );
+    let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(client)
+}
+
+fn snapshot_source_config(host: &str, port: u16, slot: &str) -> PostgresSourceConfig {
+    PostgresSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "postgres".to_string(),
+        password: "postgres".to_string().into(),
+        database: "cdc".to_string(),
+        replication_slot_name: slot.to_string(),
+        publication_name: format!("{slot}_pub"),
+        create_replication_slot_if_missing: true,
+        conn_timeout_secs: 30,
+        transport: rustcdc::TransportConfig::plaintext(),
+        ..PostgresSourceConfig::default()
+    }
+}
+
+/// PostgreSQL caps a function call at 100 arguments. A row payload built as one
+/// `json_build_object(k, v, …)` call takes two per column, so a table of 51 columns could not
+/// be snapshotted at all. Sixty columns, with a NULL and an empty string kept apart.
+#[tokio::test]
+async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres wide-table snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+
+    let columns = (1..60).map(|i| format!("c{i} text")).collect::<Vec<_>>();
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE public.wide (id bigint PRIMARY KEY, {});
+             INSERT INTO public.wide (id, c1, c2) VALUES (1, 'x', '');
+             CREATE PUBLICATION wide_slot_pub FOR TABLE public.wide;",
+            columns.join(", ")
+        ))
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut connection = PostgresConnection::new(snapshot_source_config(&host, port, "wide_slot"));
+    connection.connect().await?;
+    let mut handle = connection.start_snapshot(&["public.wide"]).await?;
+    let mut rows = Vec::new();
+    loop {
+        let chunk = handle.next_chunk(100).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        rows.extend(
+            chunk
+                .into_iter()
+                .filter(|event| !event.op.is_schema_change()),
+        );
+    }
+    handle.finish().await?;
+    connection.close().await;
+
+    assert_eq!(rows.len(), 1, "the one row must be read: {rows:?}");
+    let after = rows[0]
+        .after
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .expect("after image");
+    assert_eq!(
+        after.len(),
+        60,
+        "every column must be in the row: {after:?}"
+    );
+    assert_eq!(after["c1"], "x");
+    assert_eq!(after["c2"], "", "an empty string is not NULL");
+    assert!(after["c59"].is_null(), "a NULL column stays JSON null");
+    Ok(())
+}
+
+/// A failed snapshot statement aborts the `REPEATABLE READ` transaction, and a retry on the
+/// same transaction fails with `25P02` forever. A failure part-way through a chunk must also
+/// not drop the rows already read into it: their table's cursor has moved past them.
+///
+/// Two tables in one chunk, read by a role that loses `SELECT` on the second after the
+/// snapshot starts — permission is checked against the current catalog, not the snapshot's —
+/// so the fetch fails after the first table's rows are in the chunk. The server's SQLSTATE must
+/// be in the error, the snapshot must recover once the grant is restored, and every row of both
+/// tables must arrive exactly once.
+#[tokio::test]
+async fn postgres_snapshot_recovers_from_a_failed_chunk_without_losing_rows() -> rustcdc::Result<()>
+{
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres failed-chunk snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+    let pg = |error: tokio_postgres::Error| rustcdc::Error::SourceError(format!("{error:?}"));
+    admin
+        .batch_execute(
+            "CREATE TABLE public.first_t (id bigint PRIMARY KEY, v text);
+             CREATE TABLE public.second_t (id bigint PRIMARY KEY, v text);
+             INSERT INTO public.first_t SELECT g, 'a' FROM generate_series(1, 5) g;
+             INSERT INTO public.second_t SELECT g, 'b' FROM generate_series(1, 5) g;
+             CREATE PUBLICATION retry_slot_pub FOR TABLE public.first_t, public.second_t;
+             CREATE ROLE cdc LOGIN REPLICATION PASSWORD 'cdc';
+             GRANT SELECT ON public.first_t, public.second_t TO cdc;",
+        )
+        .await
+        .map_err(pg)?;
+
+    let config = PostgresSourceConfig {
+        user: "cdc".to_string(),
+        password: "cdc".to_string().into(),
+        ..snapshot_source_config(&host, port, "retry_slot")
+    };
+    let mut connection = PostgresConnection::new(config);
+    connection.connect().await?;
+    let mut handle = connection
+        .start_snapshot(&["public.first_t", "public.second_t"])
+        .await?;
+    admin
+        .batch_execute("REVOKE SELECT ON public.second_t FROM cdc")
+        .await
+        .map_err(pg)?;
+
+    // Drive it the way the runtime does: a failed chunk is retried. The grant comes back
+    // after two failures, and a row is inserted after the first recovered chunk — a snapshot
+    // reading in a reopened `REPEATABLE READ` transaction must not see it, because a change
+    // after the snapshot's start belongs to the stream.
+    let mut first_ids = Vec::new();
+    let mut second_ids = Vec::new();
+    let mut errors = Vec::new();
+    let mut chunk_size = 100;
+    let mut inserted_after_recovery = false;
+    loop {
+        match handle.next_chunk(chunk_size).await {
+            Ok(chunk) if chunk.is_empty() => break,
+            Ok(chunk) => {
+                for event in &chunk {
+                    if let Some(id) = snapshot_row_id(event, "first_t") {
+                        first_ids.push(id);
+                    }
+                    if let Some(id) = snapshot_row_id(event, "second_t") {
+                        second_ids.push(id);
+                    }
+                }
+                if errors.len() >= 2 && !inserted_after_recovery {
+                    inserted_after_recovery = true;
+                    admin
+                        .batch_execute("INSERT INTO public.second_t VALUES (6, 'late')")
+                        .await
+                        .map_err(pg)?;
+                }
+            }
+            Err(error) => {
+                errors.push(error.to_string());
+                assert!(
+                    errors.len() <= 4,
+                    "the snapshot never recovered: {errors:#?}"
+                );
+                if errors.len() == 2 {
+                    admin
+                        .batch_execute("GRANT SELECT ON public.second_t TO cdc")
+                        .await
+                        .map_err(pg)?;
+                    chunk_size = 2;
+                }
+            }
+        }
+    }
+    handle.finish().await?;
+    connection.close().await;
+
+    assert_eq!(
+        errors.len(),
+        2,
+        "two failed chunks, then recovery: {errors:#?}"
+    );
+    assert!(
+        errors.iter().all(|message| message.contains("42501")),
+        "the server's SQLSTATE must reach the error, not `db error`: {errors:#?}"
+    );
+    assert!(
+        errors.iter().all(|message| !message.contains("25P02")),
+        "a retry must run in a fresh transaction, not the aborted one: {errors:#?}"
+    );
+    first_ids.sort_unstable();
+    second_ids.sort_unstable();
+    assert_eq!(
+        first_ids,
+        vec![1, 2, 3, 4, 5],
+        "rows read before the failure were lost"
+    );
+    assert_eq!(
+        second_ids,
+        vec![1, 2, 3, 4, 5],
+        "the recovered snapshot must read one consistent point, not autocommit"
+    );
+    Ok(())
+}

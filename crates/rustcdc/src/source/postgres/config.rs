@@ -1,3 +1,4 @@
+use super::pg_error::PgError;
 use std::{fmt, time::Duration};
 
 #[cfg(feature = "tls")]
@@ -326,6 +327,7 @@ async fn query_is_primary(
         let row = client
             .query_one("SELECT pg_is_in_recovery()", &[])
             .await
+            .map_err(PgError::from)
             .map_err(|e| Error::SourceError(format!("check_is_primary: query failed: {e}")))?;
         let is_in_recovery: bool = row.get(0);
         Ok(!is_in_recovery)
@@ -336,6 +338,7 @@ async fn query_is_primary(
             let (client, connection) = connect_config
                 .connect(tokio_postgres::NoTls)
                 .await
+                .map_err(PgError::from)
                 .map_err(|e| {
                     Error::SourceError(format!(
                         "check_is_primary: postgres plaintext connection failed: {e}"
@@ -364,6 +367,7 @@ async fn query_is_primary(
             let (client, connection) = connect_config
                 .connect(MakeRustlsConnect::new(tls_config))
                 .await
+                .map_err(PgError::from)
                 .map_err(|e| {
                     Error::SourceError(format!(
                         "check_is_primary: postgres tls connection failed: {e}"
@@ -382,6 +386,7 @@ async fn query_is_primary(
             let (client, connection) = connect_config
                 .connect(MakeRustlsConnect::new((*rustls_cfg.0).clone()))
                 .await
+                .map_err(PgError::from)
                 .map_err(|e| {
                     Error::SourceError(format!(
                         "check_is_primary: postgres rustls connection failed: {e}"

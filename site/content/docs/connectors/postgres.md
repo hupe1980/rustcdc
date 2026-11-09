@@ -218,10 +218,14 @@ ALTER TABLE public.orders REPLICA IDENTITY FULL;
 ### Unchanged TOAST columns (partial after-images)
 
 PostgreSQL stores large values (roughly > 8 KB: `text`, `bytea`, `jsonb`) out of
-line ("TOAST"). When an `UPDATE` does not modify such a value, PostgreSQL omits it
-from the WAL record entirely — **under every `REPLICA IDENTITY` setting**. Replica
-identity governs the *old* tuple only; it does not and cannot make the after-image
-complete.
+line ("TOAST"). When an `UPDATE` does not modify such a value, pgoutput sends it as
+*unchanged* in the new tuple rather than sending the value — under every `REPLICA IDENTITY`
+setting.
+
+**Under `REPLICA IDENTITY FULL` the connector completes the row.** The old tuple carries the
+column's value, and an unmodified column's new value is its old one, so `after` is filled from
+the same WAL record and the column is not reported. A column the old tuple *also* lacks stays
+reported. Under `DEFAULT` and `USING INDEX` there is no old value to use:
 
 The connector surfaces this precisely instead of papering over it: affected column
 names are listed in the event's `unavailable_columns` (holes in `after`) and

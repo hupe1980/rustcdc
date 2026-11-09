@@ -92,8 +92,11 @@ and lists their names in `unavailable_columns` (for `after`) and
 > from the write — in SQL terms, `UPDATE … SET <present columns> WHERE <key>`, never an
 > upsert built from the full column list.
 >
-> `REPLICA IDENTITY FULL` does **not** avoid this: replica identity governs the old
-> tuple only, and the after-image omits unmodified TOASTed values under every setting.
+> Under `REPLICA IDENTITY FULL` the hole does not reach you. pgoutput still marks the
+> unmodified column as unchanged in the new tuple, but the old tuple carries its value, and an
+> unmodified column's new value is its old one — so the connector completes `after` from the
+> same WAL record and the column is not listed. Under `DEFAULT` and `USING INDEX` there is no
+> old value to copy, and the column stays listed.
 
 The two lists are tracked per image and are never merged: a TOASTed column that *was*
 modified arrives present in `after` and absent from `before`. Embedders consuming

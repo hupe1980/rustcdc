@@ -4,6 +4,7 @@
 //! logical replication pgoutput protocol.  It is intentionally kept free of any
 //! connection-management or snapshot logic so that it can be read and tested in isolation.
 
+use super::pg_error::PgError;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -630,6 +631,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         self.client
             .execute(&format!("SET statement_timeout = {timeout_ms}"), &[])
             .await
+            .map_err(PgError::from)
             .map_err(|e| Error::SourceError(format!("failed setting statement_timeout: {e}")))?;
 
         let result = self
@@ -681,7 +683,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             Err(e) => {
                 return Err(parser::map_pgoutput_poll_error(
                     &self.slot_name,
-                    &e.to_string(),
+                    &PgError::from(e).to_string(),
                 ));
             }
         };
@@ -720,6 +722,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
                 ],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!(
                     "failed advancing replication slot '{}' to {}: {error}",
@@ -741,6 +744,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
                 &[&self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!(
                     "failed measuring replication slot lag for '{}': {error}",
@@ -760,6 +764,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             .client
             .query("SELECT pg_current_wal_lsn()::text", &[])
             .await
+            .map_err(PgError::from)
             .map_err(|e| {
                 Error::SourceError(format!(
                     "idle advance: failed querying current WAL LSN: {e}"
@@ -785,6 +790,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
                     ],
                 )
                 .await
+                .map_err(PgError::from)
                 .map_err(|e| {
                     Error::SourceError(format!(
                         "idle advance: failed advancing slot '{}' to {}: {e}",

@@ -276,7 +276,7 @@ impl PostgresStreamHandle {
     }
 
     fn build_update_event(&self, update: &PgUpdate, lsn: u64) -> Result<Event> {
-        let (after, unavailable_columns) =
+        let (mut after, mut unavailable_columns) =
             self.tuple_to_json(update.relation_oid, &update.new_tuple)?;
 
         // The three shapes pgoutput can send map one-to-one onto `BeforeImage`, so the
@@ -291,8 +291,15 @@ impl PostgresStreamHandle {
             // unavailable, and a correct sink would then skip writing a value that
             // genuinely changed — silent data loss. `BeforeImage` keeps them separate by
             // construction: only `Full` carries a hole list at all.
+            //
+            // A column `'u'` in the new tuple was not modified, so its new value *is* its old
+            // value — and under FULL the old tuple carries that value, from the same WAL
+            // record. Completing `after` from it is a copy, not a guess, so a consumer
+            // upserting `after` writes the row as it is. A column that is a hole in both
+            // images stays reported: there is no value anywhere in the record.
             Some(tuple) => {
                 let (row, unavailable) = self.tuple_to_json(update.relation_oid, tuple)?;
+                fill_unchanged_from_old_tuple(&mut after, &mut unavailable_columns, &row);
                 BeforeImage::full_with_holes(row, unavailable)
             }
             None => match update.key_tuple.as_deref() {
@@ -906,4 +913,25 @@ impl PostgresStreamHandle {
         }
         Ok(committed)
     }
+}
+
+/// Move each after-image hole that the full old tuple carries into `after`.
+///
+/// Only for `REPLICA IDENTITY FULL`. A key-only pre-image omits non-key columns by design,
+/// so it cannot be used: absence there means "not logged", not "unchanged".
+fn fill_unchanged_from_old_tuple(
+    after: &mut serde_json::Value,
+    unavailable_columns: &mut Vec<String>,
+    old_row: &serde_json::Value,
+) {
+    let (Some(after), Some(old_row)) = (after.as_object_mut(), old_row.as_object()) else {
+        return;
+    };
+    unavailable_columns.retain(|column| match old_row.get(column) {
+        Some(value) => {
+            after.insert(column.clone(), value.clone());
+            false
+        }
+        None => true,
+    });
 }

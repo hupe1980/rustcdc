@@ -1,3 +1,4 @@
+use super::pg_error::PgError;
 use async_trait::async_trait;
 use tokio_postgres::Client;
 
@@ -93,6 +94,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[&slot_name],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!("failed to inspect replication slots: {error}"))
             })?;
@@ -115,6 +117,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                     &[&slot_name],
                 )
                 .await
+                .map_err(PgError::from)
                 .map_err(|error| {
                     Error::SourceError(format!(
                         "failed creating failover-enabled replication slot '{slot_name}': \
@@ -132,7 +135,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[&slot_name],
             )
             .await
-            .map_err(|error| Error::SourceError(format!("failed to create replication slot: {error}")))?;
+            .map_err(PgError::from).map_err(|error| Error::SourceError(format!("failed to create replication slot: {error}")))?;
         Ok(())
     }
 
@@ -144,6 +147,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[&publication_name],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!("failed to inspect publications: {error}"))
             })?;
@@ -158,6 +162,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!("failed to inspect role privileges: {error}"))
             })?;

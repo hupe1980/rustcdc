@@ -1,5 +1,6 @@
 //! PostgreSQL source configuration, connection lifecycle, and validation helpers.
 
+use pg_error::PgError;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ mod decoder;
 mod handoff;
 pub mod incremental_snapshot;
 mod parser;
+mod pg_error;
 mod query;
 mod reselect;
 mod snapshot_chunk;
@@ -486,7 +488,7 @@ impl PostgresSnapshotHandle {
             client
                 .query(&query, &params)
                 .await
-                .map_err(|error| {
+                .map_err(PgError::from).map_err(|error| {
                     Error::SourceError(format!(
                         "failed fetching snapshot rows for table '{schema}.{table_name}' after cursor {last_pk_cursor}: {error}"
                     ))
@@ -498,11 +500,15 @@ impl PostgresSnapshotHandle {
                  ORDER BY {order_expr} \
                  LIMIT $1"
             );
-            client.query(&query, &[&limit]).await.map_err(|error| {
-                Error::SourceError(format!(
-                    "failed fetching snapshot rows for table '{schema}.{table_name}': {error}"
-                ))
-            })?
+            client
+                .query(&query, &[&limit])
+                .await
+                .map_err(PgError::from)
+                .map_err(|error| {
+                    Error::SourceError(format!(
+                        "failed fetching snapshot rows for table '{schema}.{table_name}': {error}"
+                    ))
+                })?
         };
 
         let mut decoded = Vec::with_capacity(rows.len());
@@ -896,15 +902,13 @@ impl PostgresConnection {
                 use tokio_postgres_rustls::MakeRustlsConnect;
                 let tls_connector = MakeRustlsConnect::new((*rustls_cfg.0).clone());
                 let connect_config = self.config.build_connect_config()?;
-                let (client, connection) =
-                    connect_config
-                        .connect(tls_connector)
-                        .await
-                        .map_err(|error| {
-                            Error::SourceError(format!(
-                                "postgres rustls connection failed: {error}"
-                            ))
-                        })?;
+                let (client, connection) = connect_config
+                    .connect(tls_connector)
+                    .await
+                    .map_err(PgError::from)
+                    .map_err(|error| {
+                        Error::SourceError(format!("postgres rustls connection failed: {error}"))
+                    })?;
                 let connection_task = tokio::spawn(run_connection_task(connection));
                 self.validate_connected_client(&client).await?;
                 let client = Arc::new(client);
@@ -997,7 +1001,7 @@ impl PostgresConnection {
             let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
             loop {
                 interval.tick().await;
-                if let Err(error) = client.simple_query("SELECT 1").await {
+                if let Err(error) = client.simple_query("SELECT 1").await.map_err(PgError::from) {
                     logger.connection_error(&format!("heartbeat query failed: {error}"));
                     break;
                 }
@@ -1460,6 +1464,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::checkpoint::{Checkpoint, InMemoryCheckpoint, PostgresOffset};
+    use crate::core::{BeforeImage, Event, RowWrite};
     use crate::source::{SnapshotHandle, Source, StreamHandle};
 
     use super::PostgresSourceConfig;
@@ -1893,6 +1898,22 @@ mod tests {
     fn build_update_with_toast(oid: u32, new: &[Option<Option<&str>>]) -> Vec<u8> {
         let mut buf = vec![b'U'];
         buf.extend_from_slice(&oid.to_be_bytes());
+        buf.push(b'N');
+        append_tuple_data_with_toast(&mut buf, new);
+        buf
+    }
+
+    /// An UPDATE under `REPLICA IDENTITY FULL` (`'O'` old tuple) where either tuple can
+    /// carry the `'u'` unchanged-TOAST placeholder.
+    fn build_full_update_with_toast(
+        oid: u32,
+        old: &[Option<Option<&str>>],
+        new: &[Option<Option<&str>>],
+    ) -> Vec<u8> {
+        let mut buf = vec![b'U'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.push(b'O');
+        append_tuple_data_with_toast(&mut buf, old);
         buf.push(b'N');
         append_tuple_data_with_toast(&mut buf, new);
         buf
@@ -2760,6 +2781,93 @@ mod tests {
 
         // A column whose value IS present must never be reported unavailable.
         assert!(!events[0].unavailable_columns.contains(&"title".to_string()));
+    }
+
+    /// Decode one FULL-identity UPDATE of `docs(id, title, body)` and return the event.
+    async fn decode_full_update(
+        old: &[Option<Option<&str>>],
+        new: &[Option<Option<&str>>],
+    ) -> Event {
+        const OID: u32 = 32;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(
+                    OID,
+                    "public",
+                    "docs",
+                    &[("id", true), ("title", false), ("body", false)],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(150, build_full_update_with_toast(OID, old, new)),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let mut events = rows_only(handle.next_events(100).await.unwrap());
+        assert_eq!(events.len(), 1);
+        events.remove(0)
+    }
+
+    #[tokio::test]
+    async fn under_full_identity_an_unchanged_toast_column_is_filled_from_the_old_tuple() {
+        // `body` was not modified, so its new value is its old one, and FULL logged it.
+        let event = decode_full_update(
+            &[
+                Some(Some("1")),
+                Some(Some("old")),
+                Some(Some("the document")),
+            ],
+            &[Some(Some("1")), Some(Some("new")), Some(None)],
+        )
+        .await;
+        let after = event.after.as_ref().unwrap();
+        assert_eq!(after.get("body").unwrap(), "the document");
+        assert_eq!(after.get("title").unwrap(), "new");
+        assert!(
+            event.unavailable_columns.is_empty(),
+            "a filled column is not unavailable: {:?}",
+            event.unavailable_columns
+        );
+        assert!(matches!(event.row_write(), RowWrite::Replace { .. }));
+        event.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn under_full_identity_a_column_missing_from_both_images_stays_reported() {
+        let event = decode_full_update(
+            &[Some(Some("1")), Some(Some("old")), Some(None)],
+            &[Some(Some("1")), Some(Some("new")), Some(None)],
+        )
+        .await;
+        assert!(event.after.as_ref().unwrap().get("body").is_none());
+        assert_eq!(event.unavailable_columns, vec!["body".to_string()]);
+        event.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn under_full_identity_a_modified_toast_column_keeps_its_new_value() {
+        // Present in the new tuple, a hole in the old: the change must win, and the
+        // before-image's own hole must not leak into `unavailable_columns`.
+        let event = decode_full_update(
+            &[Some(Some("1")), Some(Some("old")), Some(None)],
+            &[Some(Some("1")), Some(Some("old")), Some(Some("rewritten"))],
+        )
+        .await;
+        assert_eq!(
+            event.after.as_ref().unwrap().get("body").unwrap(),
+            "rewritten"
+        );
+        assert!(event.unavailable_columns.is_empty());
+        match &event.before {
+            BeforeImage::Full {
+                unavailable_columns,
+                ..
+            } => {
+                assert_eq!(unavailable_columns, &vec!["body".to_string()]);
+            }
+            other => panic!("expected a full pre-image, got {other:?}"),
+        }
     }
 
     #[tokio::test]

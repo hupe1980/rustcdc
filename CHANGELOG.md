@@ -5,39 +5,101 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
-## Unreleased
+## 0.20.0
 
-### Added: a row names the shape it was captured under
+Field reports from one deployment, each with a reproduction, and the fixes they led to — one of
+which uncovered a data-loss path in the PostgreSQL snapshot that nobody had reported. Plus a row
+that names the shape it was captured under, on every connector.
 
-0.19.0 made schema-event topics reachable; it did not make them ordered against the rows they
-describe, and Kafka cannot. A consumer reading `public.orders` and `public.orders__ddl_events`
-can be handed a row before the announcement for its shape.
+It is a **breaking** release. See *Breaking* and *Migrating*.
 
-Every event now carries `schema_id`, an optional envelope field naming the table's shape,
-derived from the shape alone (columns, types, nullability, constraints, primary key). The
-announcement for a shape and the rows captured under it carry the same value, so a consumer
-holding the announcements it has seen can tell a row it can apply from one whose announcement
-has not arrived, without relying on cross-topic ordering.
+### Fixed: a PostgreSQL snapshot lost rows when a read failed part-way through a chunk
 
-Absent means unknown, not "new shape": the field is `None` for a connector that could not derive
-the table's shape, for an offline snapshot, and for events from an older release. A transform
-that changes a row's columns clears it, because a row that no longer matches any announcement
-must not claim one.
+A snapshot chunk can span tables. When the read for the second table failed after the first
+table's last rows were in the chunk, the chunk was discarded with the error — but the first
+table's progress had already moved past those rows. They were never delivered and never read
+again. Rows already read are now delivered, and the failure surfaces on the next read if it
+persists.
 
-**Announcements** carry it wherever the shape is known, on every connector: they are all built
-through `CapturedDdl::to_event`. **Rows** are stamped by the PostgreSQL connector only, on its
-snapshot and streaming paths. So a MySQL or SQL Server announcement may carry an id that its own
-rows do not, which reads as "unknown" and costs a consumer nothing.
+### Fixed: a failed snapshot read could never be retried (#26)
 
-Two paths do not stamp rows and say so rather than being counted as covered: the shared
-incremental-snapshot driver, whose per-table state holds no schema — and those rows are often the
-first a consumer sees for a table — and an offline snapshot, which reads no catalogue.
+A failed statement aborts the snapshot's `REPEATABLE READ` transaction, and every retry ran in it
+and failed with `25P02 current transaction is aborted`. The transaction is now rolled back and the
+next read opens a fresh one, keeping the original watermark — the same guarantee a snapshot
+resumed from a checkpoint gives. A transient error (a lock timeout, a serialization failure, a
+privilege briefly revoked) now recovers.
 
-Carried by every codec that decodes an event — JSON, Avro (`schema_id`, nullable, default
-`null`), Protobuf (field 15) — and by CloudEvents in `data`. Avro, Protobuf and serde JSON are
-backward compatible. The JSON Schema is not, for one case: `EVENT_JSON_SCHEMA` sets
-`additionalProperties: false`, so a consumer validating against a pinned copy of the old schema
-rejects an event carrying `schema_id` and must take this revision.
+### Fixed: tables of more than 50 columns could not be snapshotted (#24)
+
+The row was built with one `json_build_object` call taking two arguments per column, and
+PostgreSQL caps a call at 100 arguments. It is now `json_object(text[], text[])`, which has no
+column limit and renders byte-identical text. This affected the initial snapshot, the incremental
+snapshot and `reselect_unavailable_columns`. Thanks to rustama1211, whose fork carried the same
+fix.
+
+### Fixed: PostgreSQL errors said only `db error` (#25)
+
+Every PostgreSQL client error the source reports now carries the server's SQLSTATE and message,
+and its detail and hint when sent — `42501: permission denied for table orders` rather than
+`db error`. A client-side failure carries its cause chain.
+
+### Changed: unmodified TOAST under `REPLICA IDENTITY FULL` is completed (#22)
+
+Under `FULL` an `UPDATE` that left a large out-of-line value untouched arrived without it in
+`after` and listed in `unavailable_columns`, although `before` held the value. An unmodified
+column's new value is its old value, and under `FULL` the old tuple carries it from the same WAL
+record, so `after` is now completed from it and the column is not listed. A column missing from
+both images stays listed. Under `DEFAULT` and `USING INDEX` nothing changes.
+
+### Added: a failing delivery has its own health verdict, and SIGTERM stops a retry (#21)
+
+When a sink kept refusing a batch, health reported `idle` for the whole outage. The runtime's own
+verdict for a held batch was worse: "the poll loop is not turning", the cause `/livez` restarts on
+— and a restart creates no topic and grants no ACL; it replays the batch into the same refusal.
+
+- `StallCause::DeliveryFailing` (`delivery_failing`) names it, with the destination's last error
+  in the reason, once failures outlast the stall threshold. `/livez` stays green for it; a new
+  alert, `RUSTCDCStallDeliveryFailing`, routes it.
+- An embedder that holds and retries a batch reports each failure with
+  `CdcRuntime::record_delivery_failure`; the next successful `commit_ack` clears it.
+- The server republishes health and metrics during the retry.
+- SIGTERM during a retry backoff stops the pipeline cleanly; the batch redelivers from the
+  checkpoint.
+- A send timeout names the table and operation it was sending.
+
+### Added: a row names the shape it was captured under (#27, #28)
+
+The announcement of a table's shape can arrive on a topic of its own, and nothing orders two
+topics, so a consumer can be handed a row before the announcement for its shape. Every event now
+carries `schema_id`, an optional envelope field naming the table's shape, derived from the shape
+alone (columns, types, nullability, constraints, primary key). The announcement for a shape and
+the rows captured under it carry the same value. Contributed by vu2jpr.
+
+- **Rows** carry it on PostgreSQL, MySQL, MariaDB and SQL Server, in the snapshot and in the
+  stream. On MySQL and MariaDB a DDL statement in the binlog replaces the shape rows name; a parsed
+  `ALTER TABLE` has no resulting schema, so rows after it carry none rather than the old shape.
+- **Absent means unknown**, not "new shape": the Snowflake source, incremental-snapshot rows, an
+  offline snapshot, truncate events, and any row a transform reshaped carry none.
+- Carried by every codec that decodes — JSON, Avro (nullable, default `null`), Protobuf
+  (field 15) — and by CloudEvents in `data`.
+
+### Breaking
+
+1. **`EVENT_JSON_SCHEMA` gained `schema_id`.** It sets `additionalProperties: false`, so a
+   consumer validating against a pinned copy of the previous schema rejects new events.
+2. **Under `REPLICA IDENTITY FULL`, an unchanged-TOAST update is a full-row write.**
+   `unavailable_columns` is empty and `row_write()` returns `Replace` where it returned `Merge`.
+3. **`StallCause` gained `DeliveryFailing`**; an exhaustive `match` must handle it.
+4. **A held, failing batch is no longer reported as `poll_loop_not_turning`**, so an alert or a
+   runbook keyed on that cause for sink outages must move to `delivery_failing`.
+
+### Migrating
+
+- Take the new JSON Schema if you validate events against a pinned copy.
+- A consumer that merged `before` into `after` for unchanged-TOAST columns under `FULL` can stop;
+  the merge is now a no-op.
+- Route `rustcdc_runtime_stall_cause{cause="delivery_failing"}` to whoever owns the destination.
+  The shipped alert rules do.
 
 ## 0.19.0
 

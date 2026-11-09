@@ -910,6 +910,15 @@ pub enum StallCause {
     /// A *consumer* stall: the source and the poll loop are both fine and the embedder
     /// has stopped calling [`commit_ack`](CdcRuntime::commit_ack).
     ConsumerNotAcknowledging,
+    /// The embedder is retrying a batch its destination keeps refusing.
+    ///
+    /// Reported by [`record_delivery_failure`](CdcRuntime::record_delivery_failure) and
+    /// cleared by the next successful [`commit_ack`](CdcRuntime::commit_ack). While it holds,
+    /// the poll loop is not turning and nothing is being acknowledged — both *because* of the
+    /// delivery — so it takes precedence over [`PollLoopNotTurning`](Self::PollLoopNotTurning)
+    /// and [`ConsumerNotAcknowledging`](Self::ConsumerNotAcknowledging), which would route the
+    /// page to the wrong place. A restart does not fix a destination that refuses writes.
+    DeliveryFailing,
 }
 
 impl StallCause {
@@ -919,8 +928,17 @@ impl StallCause {
             Self::UnconfirmedSourcePosition => "unconfirmed_source_position",
             Self::PollLoopNotTurning => "poll_loop_not_turning",
             Self::ConsumerNotAcknowledging => "consumer_not_acknowledging",
+            Self::DeliveryFailing => "delivery_failing",
         }
     }
+}
+
+/// A delivery failure the embedder reported, outstanding until the next commit.
+#[derive(Debug, Clone)]
+pub(crate) struct DeliveryFailure {
+    pub(crate) since_ms: u64,
+    pub(crate) attempts: u64,
+    pub(crate) last_error: String,
 }
 
 impl std::fmt::Display for StallCause {
@@ -1942,6 +1960,9 @@ pub struct CdcRuntime {
     last_delivery_at_ms: Option<u64>,
     last_source_event_ts_ms: Option<u64>,
     last_commit_at_ms: Option<u64>,
+    /// Set while the embedder reports that a batch is failing to deliver. See
+    /// [`StallCause::DeliveryFailing`].
+    delivery_failure: Option<DeliveryFailure>,
     total_events_polled: u64,
     total_events_committed: u64,
     total_events_deduplicated: u64,
@@ -2167,6 +2188,7 @@ impl CdcRuntime {
             last_delivery_at_ms: None,
             last_source_event_ts_ms: None,
             last_commit_at_ms: None,
+            delivery_failure: None,
             total_events_polled: 0,
             total_events_committed: 0,
             total_events_deduplicated: 0,
@@ -5378,6 +5400,61 @@ mod tests {
         // …and the default still derives, so nothing changes for anyone who sets nothing.
         let runtime = CdcRuntime::new(config_with(60_000, None)).unwrap();
         assert!(runtime.config.options.health_stall_threshold_ms.is_none());
+    }
+
+    /// A batch the embedder keeps failing to deliver is its own stall, and it outranks the
+    /// two causes its symptoms resemble. While a batch is held for retry nothing polls and
+    /// nothing commits, so without the report the verdict was `PollLoopNotTurning` — which
+    /// `/livez` restarts on, and a restart cannot fix a destination that refuses writes.
+    #[tokio::test]
+    async fn health_verdict_names_a_failing_delivery_rather_than_its_symptoms() {
+        let checkpoint = InMemoryCheckpoint::default();
+        let schema_history = InMemorySchemaHistory::default();
+        let mut config =
+            RuntimeConfig::new(RuntimeSourceConfig::Disabled, checkpoint, schema_history);
+        config.options.max_poll_wait_ms = 1;
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.start().await.unwrap();
+
+        runtime.enqueue_event(event()).unwrap();
+        let held = runtime.poll_event_batch().await.unwrap();
+        let polled_at = runtime.last_poll_at_ms.unwrap();
+        // Ten minutes of no poll and no commit: without a report, a poll-loop stall.
+        runtime.last_poll_at_ms = Some(polled_at - 600_000);
+        runtime.last_commit_at_ms = Some(polled_at - 600_000);
+        let unreported = runtime.derive_health(polled_at);
+        assert!(
+            matches!(&unreported, HealthVerdict::Stalled { cause, .. } if *cause == StallCause::PollLoopNotTurning),
+            "the control: unreported, the symptoms read as a poll stall: {unreported:?}"
+        );
+
+        // Reported, but only just: inside the threshold it is neither cause.
+        runtime.record_delivery_failure(&"no leader for cdc.app.orders__ddl_events-0");
+        let fresh = runtime.derive_health(polled_at);
+        assert!(
+            !matches!(fresh, HealthVerdict::Stalled { .. }),
+            "a fresh failure is explained by the retry, not a stall: {fresh:?}"
+        );
+
+        // Past the threshold it is the stall, and the reason carries the destination's words.
+        runtime.record_delivery_failure(&"no leader for cdc.app.orders__ddl_events-0");
+        let failing_since = runtime.delivery_failure.as_ref().unwrap().since_ms;
+        let verdict = runtime.derive_health(failing_since + 600_000);
+        let HealthVerdict::Stalled { cause, reason } = &verdict else {
+            panic!("a delivery failing for ten minutes is a stall, got {verdict:?}");
+        };
+        assert_eq!(*cause, StallCause::DeliveryFailing);
+        assert!(reason.contains("2 time(s)"), "{reason}");
+        assert!(reason.contains("__ddl_events-0"), "{reason}");
+
+        // A successful commit clears it; the old poll gap is then reported for what it is.
+        runtime.commit_ack(held.ack_mode()).await.unwrap();
+        assert!(runtime.delivery_failure.is_none());
+        let after_commit = runtime.derive_health(failing_since + 600_000);
+        assert!(
+            !matches!(&after_commit, HealthVerdict::Stalled { cause, .. } if *cause == StallCause::DeliveryFailing),
+            "a commit must clear the delivery failure: {after_commit:?}"
+        );
     }
 
     /// A consumer that stops acknowledging is a stall, and must say so.

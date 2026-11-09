@@ -32,6 +32,9 @@ pub(super) struct TableSnapshotState {
     pub(super) catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn>,
     /// Whether this table's schema has been announced in this run.
     pub(super) schema_announced: bool,
+    /// The id of the announced shape, carried by the rows that follow it. `None` until the
+    /// announcement is built, and when the catalog read nothing to announce.
+    pub(super) schema_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

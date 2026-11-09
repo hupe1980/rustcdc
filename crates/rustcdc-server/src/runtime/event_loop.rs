@@ -127,6 +127,7 @@ pub(crate) async fn execute_event_loop(
                             &mut metrics_accumulator,
                             sink_metrics,
                             dlq,
+                            Some(&mut shutdown_signals),
                             batch,
                         )
                         .await {
@@ -186,6 +187,9 @@ pub(crate) struct ShutdownSignals {
     sigterm: Option<signal::unix::Signal>,
     #[cfg(unix)]
     sigint: Option<signal::unix::Signal>,
+    /// A test's stand-in for an OS signal: tests cannot send SIGTERM to their own process.
+    #[cfg(test)]
+    test_trigger: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl ShutdownSignals {
@@ -212,14 +216,40 @@ impl ShutdownSignals {
             Self {
                 sigterm: stream(signal::unix::SignalKind::terminate(), "SIGTERM"),
                 sigint: stream(signal::unix::SignalKind::interrupt(), "SIGINT"),
+                #[cfg(test)]
+                test_trigger: None,
             }
         }
         #[cfg(not(unix))]
-        Self {}
+        Self {
+            #[cfg(test)]
+            test_trigger: None,
+        }
+    }
+
+    /// Signals that fire only when the returned sender is used.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> (tokio::sync::oneshot::Sender<()>, Self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            tx,
+            Self {
+                #[cfg(unix)]
+                sigterm: None,
+                #[cfg(unix)]
+                sigint: None,
+                test_trigger: Some(rx),
+            },
+        )
     }
 
     /// Resolve when a shutdown signal arrives. Cancel-safe.
     pub(crate) async fn recv(&mut self) {
+        #[cfg(test)]
+        if let Some(trigger) = self.test_trigger.as_mut() {
+            let _ = trigger.await;
+            return;
+        }
         #[cfg(unix)]
         {
             match (&mut self.sigterm, &mut self.sigint) {

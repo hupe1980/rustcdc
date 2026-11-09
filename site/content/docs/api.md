@@ -382,10 +382,11 @@ out-of-band would race concurrent writes and return a value from a different poi
 > and the event, which is precisely what a fresh read does not. Outside that window the
 > paragraph above stands, so a sink must still handle `RowWrite::Merge`.
 
-> ⚠️ **`REPLICA IDENTITY FULL` does not avoid this.** Replica identity governs the *old*
-> tuple only. The after-image still omits unmodified TOASTed values under every replica
-> identity setting. `FULL` gives you a `BeforeImage::Full` (see `before` below); it does not
-> make `after` complete.
+> **Under `REPLICA IDENTITY FULL` this list is empty for an unmodified column.** The old tuple
+> carries the value, and an unmodified column's new value is its old one, so the connector
+> completes `after` from it — same WAL record, no extra read — and `row_write()` is a
+> `Replace`. A column missing from the old tuple too stays listed, so a sink must still handle
+> `RowWrite::Merge`.
 
 This is also why the failure mode is so late-breaking: it only begins once rows cross the
 TOAST threshold, typically long after the pipeline was validated against small test rows.
@@ -1079,6 +1080,7 @@ match &snapshot.health {
             StallCause::UnconfirmedSourcePosition => { /* the database is retaining log */ }
             StallCause::PollLoopNotTurning => { /* the process, or the source socket */ }
             StallCause::ConsumerNotAcknowledging => { /* your commit_ack loop */ }
+            StallCause::DeliveryFailing => { /* the destination you deliver to */ }
             _ => {}
         }
     }
@@ -1125,13 +1127,21 @@ metadata nor a resolvable primary key — see [Idempotency guard safety](#idempo
 gate on it without matching every variant. The enum is `#[non_exhaustive]` — match with a
 wildcard arm.
 
-`Stalled` carries one of three `StallCause`s, checked in this order:
+`Stalled` carries one of four `StallCause`s, checked in this order:
 
 | `StallCause` | Condition | Whose problem |
 |---|---|---|
 | `UnconfirmedSourcePosition` | A position was durably checkpointed but the source refused to confirm it | The database — it keeps retaining log (WAL on a PostgreSQL primary) |
+| `DeliveryFailing` | You reported delivery failures with `record_delivery_failure`, the first longer ago than the stall threshold, and nothing has committed since | The destination — it is refusing the batch you are holding |
 | `PollLoopNotTurning` | `poll_event_batch` has not returned within `max_poll_wait_ms × 6` (floor 30s) | The process, or a socket wedged inside the source |
 | `ConsumerNotAcknowledging` | Events delivered but not committed, with a stale last commit | Your loop — it stopped calling `commit_ack` |
+
+**Report a failing delivery, or it is misreported.** A loop that holds a batch and retries it
+stops polling and stops committing, which is exactly what `PollLoopNotTurning` and
+`ConsumerNotAcknowledging` describe. Call `runtime.record_delivery_failure(&error)` on each
+failed attempt: the verdict then names the destination, carries its last error in `reason`,
+and stays `Healthy`/`Idle` for failures younger than the threshold. The next successful
+`commit_ack` clears it.
 
 **`PollLoopNotTurning` is not source idleness.** A quiet source returns an empty batch on
 schedule, and every returned poll — empty or not — keeps the signal fresh. The verdict goes

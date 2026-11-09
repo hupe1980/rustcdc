@@ -1369,6 +1369,7 @@ impl SqlServerConnection {
                 column_names,
                 catalog_columns,
                 schema_announced: false,
+                schema_id: None,
             });
         }
 
@@ -2725,6 +2726,7 @@ mod tests {
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
             schema_announced: false,
+            schema_id: None,
         };
 
         let mut handle = SqlServerSnapshotHandle::new(snapshot, vec![table_state], None, false);
@@ -2757,6 +2759,7 @@ mod tests {
                 column_names: vec!["id".into(), "name".into()],
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,
@@ -2795,6 +2798,7 @@ mod tests {
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
             schema_announced: false,
+            schema_id: None,
         };
 
         let fetcher = Arc::new(MockSnapshotRowFetcher::with_table_pages(
@@ -2867,6 +2871,7 @@ mod tests {
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
             schema_announced: false,
+            schema_id: None,
         };
 
         let first_fetcher = Arc::new(MockSnapshotRowFetcher::with_table_pages(

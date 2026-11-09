@@ -473,7 +473,10 @@ async fn send_event_with_timeout(
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(AppError::Runtime(err)),
         Err(_) => Err(AppError::SinkTimeout(format!(
-            "sink send operation timed out after {sink_send_timeout_ms} ms"
+            "sink send for {} ({}) timed out after {sink_send_timeout_ms} ms; the destination \
+             accepted nothing for it in that time",
+            event.qualified_table_name(),
+            event.op
         ))),
     }
 }

@@ -73,9 +73,11 @@ pub(super) async fn next_snapshot_chunk(
                     &handle.snapshot.snapshot_id,
                     handle.next_chunk_index,
                 );
+                handle.tables[table_index].schema_id = event.schema_id.clone();
                 events.push(event);
             }
         }
+        let table_schema_id = handle.tables[table_index].schema_id.clone();
 
         // Computed **after** the announcement, not before: the announcement occupies a
         // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
@@ -128,7 +130,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    schema_id: None,
+                    schema_id: table_schema_id.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }
@@ -169,7 +171,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
-                    schema_id: None,
+                    schema_id: table_schema_id.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }

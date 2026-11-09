@@ -386,16 +386,15 @@ async fn postgres_replica_identity_default_reports_key_only_before_image() -> ru
     Ok(())
 }
 
-/// Unchanged-TOAST is the one case where the **after**-image is incomplete, and it is
-/// widely misunderstood as something `REPLICA IDENTITY FULL` fixes. It is not: replica
-/// identity governs the *old* tuple only. This test forces `FULL` and still expects the
-/// hole, so the documented guidance stays honest.
+/// Replica identity governs the *old* tuple, and pgoutput still sends an unmodified TOASTed
+/// column as `'u'` in the new one. Under `FULL`, though, the old tuple carries that column's
+/// value, and since it was not modified the value is also its new one — so the event's `after`
+/// is completed from the same WAL record, and nothing is reported unavailable.
 ///
 /// It also pins the per-image split. A TOASTed column that *was* modified is present in
-/// `after` and absent from `before` — if the two lists were merged, a correct sink would
-/// skip writing a value that genuinely changed.
+/// `after` and absent from `before`; the change must win and must never be reported missing.
 #[tokio::test]
-async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_identity_full()
+async fn postgres_unchanged_toast_is_completed_from_the_old_tuple_under_replica_identity_full()
 -> rustcdc::Result<()> {
     if skip() {
         return Ok(());
@@ -413,8 +412,7 @@ async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_ident
               big_kept TEXT,
               big_changed TEXT
             );
-            -- FULL is deliberate: it is the setting operators reach for expecting it to
-            -- close this hole.
+            -- FULL is the setting under which the old tuple carries the unchanged value.
             ALTER TABLE public.toast_test REPLICA IDENTITY FULL;
             -- STORAGE EXTERNAL disables compression, so a large value is guaranteed to
             -- go out-of-line. With the default EXTENDED, a compressible value is stored
@@ -480,16 +478,16 @@ async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_ident
         .as_ref()
         .expect("update must carry an after image");
 
-    // The claim under test: FULL does not make the after-image complete.
-    assert!(
-        update.unavailable_columns.contains(&"big_kept".to_string()),
-        "an unmodified TOASTed column must be reported unavailable even under \
-         REPLICA IDENTITY FULL; got {:?}",
-        update.unavailable_columns
+    // The claim under test: FULL completes the after-image from the old tuple.
+    assert_eq!(
+        after.get("big_kept").and_then(|v| v.as_str()),
+        Some(big_kept.as_str()),
+        "an unmodified TOASTed column must be completed from the FULL old tuple"
     );
     assert!(
-        after.get("big_kept").is_none(),
-        "an unavailable column must be ABSENT from after, not present as a placeholder"
+        update.unavailable_columns.is_empty(),
+        "nothing is unavailable when the old tuple carries it: {:?}",
+        update.unavailable_columns
     );
 
     // The modified TOASTed column is fully present and must not be marked unavailable —
@@ -519,28 +517,42 @@ async fn postgres_unchanged_toast_is_reported_per_image_even_under_replica_ident
         .expect("a real unchanged-TOAST event must satisfy the envelope invariants");
 
     // The write plan must degrade to a merge, never a full-row replace.
+    // Complete, so a sink writes the whole row — and the value it writes for `big_kept` is
+    // the one the table holds, not a NULL over a 40 kB value that never changed.
     match update.row_write() {
-        RowWrite::Merge {
-            key,
-            columns,
-            unavailable_columns,
-        } => {
-            // pgoutput delivers values in their text form, so the key is "1", not 1.
-            let id = key
-                .get("id")
-                .expect("the merge key must carry the primary key");
-            assert!(
-                id.as_str() == Some("1") || id.as_i64() == Some(1),
-                "unexpected key encoding: {id}"
+        RowWrite::Replace { row, .. } => {
+            assert_eq!(
+                row.get("big_kept").and_then(|v| v.as_str()),
+                Some(big_kept.as_str())
             );
-            assert!(columns.get("big_kept").is_none());
-            assert!(unavailable_columns.contains(&"big_kept".to_string()));
         }
-        other => panic!(
-            "an unchanged-TOAST update must yield a partial write, not {other:?} — a \
-             full-row write would erase a 40 kB value that never changed"
-        ),
+        other => panic!("a completed after-image must be a full-row write, not {other:?}"),
     }
+
+    // Under DEFAULT identity there is no old tuple to complete from, so the same update
+    // must still be reported partial. Same table, same values, identity lowered.
+    admin
+        .batch_execute("ALTER TABLE public.toast_test REPLICA IDENTITY DEFAULT")
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    admin
+        .execute(
+            "UPDATE public.toast_test SET small = 'small-v3' WHERE id = 1",
+            &[],
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let events = drain(&mut stream).await?;
+    let update = events
+        .iter()
+        .find(|event| event.op == Operation::Update)
+        .expect("expected the DEFAULT-identity update");
+    assert!(
+        update.unavailable_columns.contains(&"big_kept".to_string()),
+        "without a FULL old tuple the hole must stay reported: {:?}",
+        update.unavailable_columns
+    );
+    assert!(matches!(update.row_write(), RowWrite::Merge { .. }));
 
     Ok(())
 }

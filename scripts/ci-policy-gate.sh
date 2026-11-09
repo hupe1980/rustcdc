@@ -992,7 +992,9 @@ run_rust_version_pin_check() {
     done < <(rg --no-line-number --no-filename --pcre2 -o \
       '(?:FROM rust:|ARG RUST_VERSION=)([0-9]+\.[0-9]+(?:\.[0-9]+)?)' \
       -r '$1' "$dockerfile" 2>/dev/null)
-  done < <(find . -name 'Dockerfile*' -not -path './target/*' | sort)
+  # Tracked files only: the verdict is about the tree under review. A filesystem walk also
+  # read gitignored worktrees and scratch copies, so the gate failed on files no commit has.
+  done < <(git ls-files -- ':(glob)**/Dockerfile*' | sort)
 
   if [[ "$failed" -gt 0 ]]; then
     echo "rust version pin check failed: $failed pin(s) disagree with the manifest" >&2

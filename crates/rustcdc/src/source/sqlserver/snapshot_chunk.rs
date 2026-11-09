@@ -73,6 +73,7 @@ pub(super) async fn next_sqlserver_snapshot_chunk(
                     &handle.snapshot.snapshot_id,
                     handle.next_chunk_index,
                 );
+                handle.tables[table_index].schema_id = event.schema_id.clone();
                 events.push(event);
             }
         }
@@ -127,7 +128,7 @@ pub(super) async fn next_sqlserver_snapshot_chunk(
                 }),
                 transaction: None,
                 envelope_version: EVENT_ENVELOPE_VERSION,
-                schema_id: None,
+                schema_id: handle.tables[table_index].schema_id.clone(),
                 unavailable_columns: Vec::new(),
             });
         }

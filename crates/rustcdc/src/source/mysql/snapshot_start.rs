@@ -160,6 +160,7 @@ pub(super) async fn begin_snapshot_and_collect_table_states(
             bare_table: table_name.clone(),
             catalog_columns,
             schema_announced: false,
+            schema_id: None,
         });
     }
 

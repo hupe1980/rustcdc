@@ -1,3 +1,4 @@
+use super::pg_error::PgError;
 use std::time::Duration;
 
 use tokio_postgres::Client;
@@ -114,6 +115,7 @@ pub(super) async fn query_publication_column_types(
             &[&publication],
         )
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "failed querying column types for publication '{publication}': {error}"
@@ -173,6 +175,7 @@ pub(super) async fn query_table_column_types(
             &[&schema, &table],
         )
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "failed querying column types for '{schema}.{table}': {error}"
@@ -221,6 +224,7 @@ pub(super) async fn query_publication_primary_keys(
             &[&publication],
         )
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "failed querying primary keys for publication '{publication}': {error}"
@@ -264,6 +268,7 @@ pub(super) async fn query_primary_key_columns_and_types(
             &[&schema, &table],
         )
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "failed querying primary key columns for table '{schema}.{table}': {error}"
@@ -349,6 +354,7 @@ pub(super) async fn advance_replication_slot(
             &[&slot_name.to_string(), &lsn_str],
         )
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "failed to advance replication slot '{slot_name}' to LSN {lsn_str}: {error}"
@@ -361,6 +367,7 @@ pub(super) async fn query_current_wal_lsn(client: &Client) -> Result<u64> {
     let lsn: String = client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await
+        .map_err(PgError::from)
         .map_err(|error| Error::SourceError(format!("failed querying WAL LSN: {error}")))?
         .get(0);
     parse_pg_lsn(&lsn)
@@ -373,7 +380,7 @@ async fn query_slot_confirmed_lsn(client: &Client, slot_name: &str) -> Result<u6
             &[&slot_name],
         )
         .await
-        .map_err(|error| {
+        .map_err(PgError::from).map_err(|error| {
             Error::SourceError(format!(
                 "failed querying replication slot state for '{slot_name}': {error}"
             ))
@@ -411,6 +418,7 @@ pub(super) async fn query_all_columns(
             &[&schema, &table],
         )
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "failed reading columns for '{schema}.{table}': {error}"
@@ -440,26 +448,35 @@ pub(super) async fn query_all_columns(
 ///
 /// `format` renders SQL NULL as the empty string, which would erase the distinction between
 /// a NULL column and an empty one — so each column is guarded by a `CASE`, leaving NULL as
-/// SQL NULL for `json_build_object` to render as JSON `null`.
+/// SQL NULL for `json_object` to render as JSON `null`.
 ///
-/// Verified against PostgreSQL 16:
-/// `{"b": "t", "n": null, "e": "", "x": "9223372036854775807"}`.
+/// The object is `json_object(keys text[], values text[])`, not `json_build_object(k, v, …)`.
+/// The latter takes two arguments per column and PostgreSQL caps a call at `FUNC_MAX_ARGS`
+/// (100), so a table of 51 columns could not be read at all. `ARRAY[…]` is a constructor, not a
+/// call, so the two-array form has no column limit. The values array is cast to `text[]`
+/// because an all-NULL row otherwise has no resolvable element type. The rendered text is
+/// identical to `json_build_object`'s.
+///
+/// Verified against PostgreSQL 18:
+/// `{"b" : "t", "n" : null, "e" : "", "x" : "9223372036854775807"}`.
 pub(super) fn row_as_text_json(columns: &[String]) -> String {
     if columns.is_empty() {
         return "'{}'::json::text".to_string();
     }
-    let pairs = columns
+    let keys = columns
+        .iter()
+        .map(|column| quote_pg_literal(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = columns
         .iter()
         .map(|column| {
             let quoted = quote_pg_identifier(column);
-            format!(
-                "{}, CASE WHEN t.{quoted} IS NULL THEN NULL ELSE format('%s', t.{quoted}) END",
-                quote_pg_literal(column)
-            )
+            format!("CASE WHEN t.{quoted} IS NULL THEN NULL ELSE format('%s', t.{quoted}) END")
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("json_build_object({pairs})::text")
+    format!("json_object(ARRAY[{keys}]::text[], ARRAY[{values}]::text[])::text")
 }
 
 /// Quote a string as a SQL literal, doubling any embedded quote.

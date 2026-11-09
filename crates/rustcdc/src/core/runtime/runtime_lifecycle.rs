@@ -170,6 +170,7 @@ impl CdcRuntime {
         self.last_delivery_at_ms = None;
         self.last_source_event_ts_ms = None;
         self.last_commit_at_ms = None;
+        self.delivery_failure = None;
         self.total_events_polled = 0;
         self.total_events_committed = 0;
         self.total_events_deduplicated = 0;

@@ -816,8 +816,10 @@ pub struct MysqlStreamHandle {
     catalog_columns: crate::source::schema_catalog::CatalogSchemas,
     /// Primary key per table, in index order, from the same read.
     catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
-    /// Tables whose schema this run has already announced.
-    announced_tables: std::collections::HashSet<(String, String)>,
+    /// Tables this run has announced, each with the id of the shape its rows are now
+    /// captured under. `None` once a DDL event left the shape unknown — a parsed `ALTER`
+    /// carries no resulting schema — so rows after it claim no shape rather than a stale one.
+    announced_tables: std::collections::HashMap<(String, String), Option<String>>,
 }
 
 impl MysqlStreamHandle {
@@ -848,7 +850,7 @@ impl MysqlStreamHandle {
             table_exclude_list,
             catalog_columns,
             catalog_primary_keys,
-            announced_tables: std::collections::HashSet::new(),
+            announced_tables: std::collections::HashMap::new(),
         }
     }
 }
@@ -2601,6 +2603,100 @@ mod tests {
                 .all(|event| event.op != crate::core::Operation::SchemaChange),
             "a table is announced once, not before every row"
         );
+
+        // Each row names the shape the announcement describes — compared to the
+        // announcement's id, not to a recorded hash, so a change to the digest cannot hide it.
+        let announced = events[0].schema_id.clone();
+        assert!(
+            announced.is_some(),
+            "an announcement with a shape carries its id"
+        );
+        for row in &events[1..] {
+            assert_eq!(
+                row.schema_id, announced,
+                "a row must name its announcement's shape"
+            );
+        }
+    }
+
+    /// After a DDL statement the rows name the shape that statement describes — and a parsed
+    /// `ALTER` describes none, so they name nothing. Keeping the announcement's id would make
+    /// every row after an `ALTER` claim a shape it no longer has.
+    #[tokio::test]
+    async fn rows_after_an_alter_claim_no_stale_shape() {
+        use crate::ddl_capture::{DdlDialect, parse_ddl_statement};
+        use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
+
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert(
+            ("app".to_string(), "users".to_string()),
+            vec![CatalogColumn {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                nullable: false,
+            }],
+        );
+        let alter = parse_ddl_statement(
+            DdlDialect::Mysql,
+            "ALTER TABLE app.users ADD COLUMN note text",
+        )
+        .expect("a parseable ALTER")
+        .into_captured();
+        let mut handle = make_stream_handle_with_catalog(
+            MockBinlogProvider::new(vec![vec![
+                MysqlBinlogMessage::Begin {
+                    tx_id: 1,
+                    timestamp_ms: 1,
+                },
+                MysqlBinlogMessage::WriteRows(row_change("users", None, Some(json!({"id": "1"})))),
+                MysqlBinlogMessage::Xid {
+                    tx_id: 1,
+                    timestamp_ms: 2,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 100,
+                    gtid: None,
+                },
+                MysqlBinlogMessage::Ddl {
+                    captured: alter,
+                    timestamp_ms: 3,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 200,
+                },
+                MysqlBinlogMessage::Begin {
+                    tx_id: 2,
+                    timestamp_ms: 4,
+                },
+                MysqlBinlogMessage::WriteRows(row_change(
+                    "users",
+                    None,
+                    Some(json!({"id": "2", "note": "x"})),
+                )),
+                MysqlBinlogMessage::Xid {
+                    tx_id: 2,
+                    timestamp_ms: 5,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 300,
+                    gtid: None,
+                },
+            ]]),
+            catalog,
+            std::collections::HashMap::new(),
+        );
+
+        let events = handle.next_events(50).await.unwrap();
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|event| event.op == crate::core::Operation::Insert)
+            .collect();
+        assert_eq!(rows.len(), 2, "{events:?}");
+        assert!(
+            rows[0].schema_id.is_some(),
+            "before the ALTER the row names its shape"
+        );
+        assert_eq!(
+            rows[1].schema_id, None,
+            "after an ALTER with no resulting schema the shape is unknown, not the old one"
+        );
     }
 
     /// A table the catalog read did not cover is a table created after the stream started,
@@ -2955,6 +3051,7 @@ mod tests {
                 bare_table: "users".into(),
                 catalog_columns: Vec::new(),
                 schema_announced: false,
+                schema_id: None,
             }],
             None,
             false,

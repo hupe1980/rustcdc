@@ -267,6 +267,22 @@ groups:
             the sink or the commit path is not draining.  Check sink delivery
             errors and rustcdc_runtime_checkpoint_age_ms.
 
+      - alert: RUSTCDCStallDeliveryFailing
+        expr: rustcdc_runtime_stall_cause{cause="delivery_failing"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: >
+            The sink keeps refusing the batch the pipeline is holding — a
+            missing topic, a revoked ACL, a destination that is down.  Nothing
+            behind that batch is delivered until it goes through.  /livez stays
+            green on purpose: a restart creates no topic and grants no ACL, and
+            replays the batch from the checkpoint.  The stall reason and the
+            server's "recoverable sink delivery error" WARN lines carry the
+            destination's last error.
+
       # Deliberately absent: an alert on rustcdc_runtime_delivery_age_ms.
       #
       # A high delivery age on its own means the source is quiet, which is the

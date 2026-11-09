@@ -1,3 +1,4 @@
+use super::pg_error::PgError;
 use std::sync::Arc;
 
 use tokio_postgres::Client;
@@ -33,6 +34,7 @@ pub(super) async fn start_postgres_snapshot_internal(
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "failed to begin postgres snapshot transaction: {error}"
@@ -127,6 +129,7 @@ async fn build_snapshot_setup(
         let total_rows = client
             .query_one(&total_rows_query, &[])
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!(
                     "failed counting rows for table '{schema}.{name}': {error}"

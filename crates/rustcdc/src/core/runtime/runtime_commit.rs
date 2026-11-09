@@ -144,6 +144,7 @@ impl CdcRuntime {
         self.total_events_committed = self.total_events_committed.saturating_add(count as u64);
         let now_ms = now_millis();
         self.last_commit_at_ms = Some(now_ms);
+        self.delivery_failure = None;
         self.last_checkpoint_saved_at_ms = Some(now_ms);
         if let Some(pending) = self.pending_delivery.as_mut() {
             pending.committed_prefix += count;

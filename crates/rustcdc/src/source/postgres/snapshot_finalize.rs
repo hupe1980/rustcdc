@@ -1,3 +1,4 @@
+use super::pg_error::PgError;
 use crate::{
     checkpoint::GenericOffset,
     core::{Error, Result},
@@ -62,11 +63,15 @@ pub(super) async fn finish_postgres_snapshot(
                 "postgres snapshot transaction is open but snapshot client is unavailable".into(),
             )
         })?;
-        client.batch_execute("COMMIT").await.map_err(|error| {
-            Error::SourceError(format!(
-                "failed to commit postgres snapshot transaction: {error}"
-            ))
-        })?;
+        client
+            .batch_execute("COMMIT")
+            .await
+            .map_err(PgError::from)
+            .map_err(|error| {
+                Error::SourceError(format!(
+                    "failed to commit postgres snapshot transaction: {error}"
+                ))
+            })?;
         handle.transaction_open = false;
     }
 

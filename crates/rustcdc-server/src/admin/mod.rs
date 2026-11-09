@@ -2264,6 +2264,24 @@ impl AdminState {
         )
     }
 
+    /// Publish the runtime's verdict and metrics while a batch is being retried.
+    ///
+    /// `record_batch` runs only after a batch commits, so during a delivery retry the
+    /// published verdict froze at the last good batch — `idle` for the whole outage. This
+    /// latches the current one without counting a batch or resetting error state.
+    pub(crate) async fn record_runtime_health(&self, runtime_metrics: RuntimeMetricsSnapshot) {
+        let mut d = self.data.write().await;
+        d.record_health_verdict(&runtime_metrics.runtime_admin.health);
+        d.runtime_metrics = runtime_metrics.render_prometheus();
+    }
+
+    /// The latched verdict and stall cause, as `/livez` and `/readyz` read them.
+    #[cfg(test)]
+    pub(crate) async fn health_snapshot_for_tests(&self) -> (Option<String>, Option<String>) {
+        let d = self.data.read().await;
+        (d.health_verdict.clone(), d.health_stall_cause.clone())
+    }
+
     /// Convenience helper called by the main loop after every batch.
     pub(crate) async fn record_batch(
         &self,

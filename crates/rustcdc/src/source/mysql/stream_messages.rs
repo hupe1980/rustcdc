@@ -45,6 +45,7 @@ impl MysqlStreamHandle {
     }
 
     fn build_event(&self, op: Operation, change: MysqlRowChange) -> Event {
+        let schema_id = self.row_schema_id(change.schema.as_deref(), &change.table);
         Event {
             // A row-based binlog event carries the whole prior row or none of it — MySQL
             // has no key-only pre-image, so there is no third case to distinguish here.
@@ -61,7 +62,7 @@ impl MysqlStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            schema_id,
             unavailable_columns: Vec::new(),
         }
     }
@@ -114,11 +115,10 @@ impl MysqlStreamHandle {
     fn announce_table_if_new(&mut self, schema: Option<&str>, table: &str) -> Option<Event> {
         let database = schema?.to_string();
         let key = (database.clone(), table.to_string());
-        if self.announced_tables.contains(&key) {
+        if self.announced_tables.contains_key(&key) {
             return None;
         }
         let columns = self.catalog_columns.get(&key)?.clone();
-        self.announced_tables.insert(key.clone());
 
         let primary_keys = self
             .catalog_primary_keys
@@ -150,10 +150,17 @@ impl MysqlStreamHandle {
             &self.stream.gtid,
         );
         let mut event = captured.to_event(&self.source_name, offset, ts_ms);
+        self.announced_tables.insert(key, event.schema_id.clone());
         if self.current_tx_id.is_some() {
             event.transaction = self.tx_meta();
         }
         Some(event)
+    }
+
+    /// The id of the shape a row of this table is captured under, if this run knows one.
+    fn row_schema_id(&self, schema: Option<&str>, table: &str) -> Option<String> {
+        let key = (schema?.to_string(), table.to_string());
+        self.announced_tables.get(&key).cloned().flatten()
     }
 
     pub(super) fn process_messages(&mut self, messages: Vec<MysqlBinlogMessage>) -> Vec<Event> {
@@ -292,7 +299,14 @@ impl MysqlStreamHandle {
                             self.stream.binlog_pos,
                             &self.stream.gtid,
                         );
-                        committed.push(captured.to_event(&self.source_name, offset, timestamp_ms));
+                        let event = captured.to_event(&self.source_name, offset, timestamp_ms);
+                        // The shape changed here. Rows after this statement name the shape
+                        // it describes, or none when it carries no resulting schema.
+                        self.announced_tables.insert(
+                            (captured.schema.clone(), captured.table.clone()),
+                            event.schema_id.clone(),
+                        );
+                        committed.push(event);
                         self.events_polled = self.events_polled.saturating_add(1);
                     }
                 }

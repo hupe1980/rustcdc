@@ -163,6 +163,7 @@ was fine.
 | `poll_loop_not_turning` | **503** after `LIVEZ_STALL_TIMEOUT` (120 s) | 503 | The process is wedged; a restart is the remedy |
 | `unconfirmed_source_position` | 200 | 503 | A restart replays from the same checkpoint and fails identically, while the source keeps retaining log — crash-looping makes a full `pg_wal` volume arrive *sooner*. Page, do not reboot |
 | `consumer_not_acknowledging` | 200 | 503 | The sink is not draining; restarting thrashes against an already-unhealthy downstream |
+| `delivery_failing` | 200 | 503 | The sink refuses the held batch — a missing topic, a revoked ACL. A restart creates neither, and replays the batch |
 
 Readiness excludes no cause because it costs nothing — it takes the pod out of rotation
 and stops a rollout rather than destroying in-flight work, and a stalled replica that
@@ -240,7 +241,7 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | Metric | Alert threshold | Description |
 |---|---|---|
 | `rustcdc_runtime_health{verdict="stalled"}` | == 1 | Runtime is running but progress stopped. One-hot gauge: exactly one verdict label is 1. `verdict="idle"` is deliberately not alertable — a quiet database is not an incident, and is a verdict a healthy pipeline reaches whenever its source goes quiet. Logged once at WARN on entry, once at INFO on recovery |
-| `rustcdc_runtime_stall_cause{cause=…}` | present | Which signal stalled: `unconfirmed_source_position` (the database is retaining log), `poll_loop_not_turning` (this process or the source socket), `consumer_not_acknowledging` (the sink). Emitted only while stalled, so presence is the condition — route pages on this rather than fanning one alert out to every team |
+| `rustcdc_runtime_stall_cause{cause=…}` | present | Which signal stalled: `unconfirmed_source_position` (the database is retaining log), `poll_loop_not_turning` (this process or the source socket), `consumer_not_acknowledging` (the commit path), `delivery_failing` (the sink refuses the held batch). Emitted only while stalled, so presence is the condition — route pages on this rather than fanning one alert out to every team |
 | `rustcdc_runtime_poll_age_ms` | see runbook | Milliseconds since `poll_event_batch` last returned, empty batches included. Stays low on an idle source; growth means the loop itself has stopped turning |
 | `rustcdc_runtime_delivery_age_ms` | **do not alert** | Milliseconds since events last arrived. High on its own is a quiet database. A diagnostic to read beside the poll age, never a condition |
 | `rustcdc_runtime_idempotency_evictions_total` | sustained growth | The dedup window is too small for this deployment's replay distance, so duplicates older than the window stop being suppressed. Raise `runtime.idempotency.capacity` |

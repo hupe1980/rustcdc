@@ -7,6 +7,7 @@
 //! [`PostgresOffset`](crate::checkpoint::PostgresOffset) encoding that carries the
 //! snapshot state inside the checkpoint record.
 
+use super::pg_error::PgError;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -241,6 +242,7 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
                 &[],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!(
                     "failed reading WAL LSN and snapshot fence: {error}. The incremental \
@@ -383,6 +385,7 @@ impl IncrementalSnapshotBackend for PostgresSnapshotBackend {
             );
             self.query_client.query(&query, &[&limit]).await
         }
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "incremental snapshot chunk failed for '{}': {error}",

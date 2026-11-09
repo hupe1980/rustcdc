@@ -635,9 +635,12 @@ condition, the measurements and the remedy:
 1. **`UnconfirmedSourcePosition`** — a checkpoint committed but the source-side confirmation
    (`confirmed_flush_lsn` and equivalents) failed repeatedly. Retention keeps growing at the
    source even though the consumer is making progress.
-2. **`PollLoopNotTurning`** — `now - last_poll_at_ms` exceeds `max_poll_wait_ms × 6` (floor
+2. **`DeliveryFailing`** — the embedder reported, through `record_delivery_failure`, that the
+   batch it holds keeps failing, for longer than the stall threshold. It is checked before the
+   next two because a held batch produces both of their symptoms.
+3. **`PollLoopNotTurning`** — `now - last_poll_at_ms` exceeds `max_poll_wait_ms × 6` (floor
    30s). Either a poll is blocked inside the source or nothing is calling `poll_event_batch`.
-3. **`ConsumerNotAcknowledging`** — events were polled but not committed, and
+4. **`ConsumerNotAcknowledging`** — events were polled but not committed, and
    `last_commit_at_ms` is stale. The embedder has stopped calling `commit_ack`; this is *not*
    a source problem.
 
@@ -694,6 +697,9 @@ rustcdc_runtime_stall_cause{cause="poll_loop_not_turning"} == 1
 
 # Nothing is acknowledging — the embedder's commit path.
 rustcdc_runtime_stall_cause{cause="consumer_not_acknowledging"} == 1
+
+# The destination keeps refusing the held batch.
+rustcdc_runtime_stall_cause{cause="delivery_failing"} == 1
 ```
 
 The series is emitted only while stalled, so its presence is the condition; there is nothing

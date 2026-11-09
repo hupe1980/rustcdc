@@ -242,13 +242,15 @@ Two more cases to know:
 5. An offline snapshot — one with no live connection — has no catalogue to read, so it
    announces nothing rather than describing columns it did not read. Its rows carry no
    `schema_id` either: there is no announcement for them to name.
-6. Announcements carry `schema_id` on every connector — they are all built through the same
-   conversion — but only PostgreSQL stamps its **rows**. A MySQL, MariaDB, SQL Server or
-   Snowflake announcement can therefore carry an id that its own rows do not; the rows read as
-   "unknown", which is what a consumer did before the field existed.
-7. Rows from an **incremental snapshot** carry no `schema_id` on any connector, including
-   PostgreSQL: the shared driver's per-table state holds no schema to derive one from. Those
-   rows are often the first a consumer sees for a table.
+6. Rows carry `schema_id` on PostgreSQL, MySQL, MariaDB and SQL Server, in the snapshot and in
+   the stream. On MySQL and MariaDB a DDL statement in the binlog replaces the shape the rows
+   that follow it name: a `CREATE TABLE` names the shape it declares, and an `ALTER TABLE`,
+   which is parsed without a resulting schema, leaves the rows after it without an id until the
+   next restart's announcement — unknown rather than the shape before the `ALTER`.
+7. Rows from the **Snowflake** source and from an **incremental snapshot** carry no
+   `schema_id`. The Snowflake stream reads no catalogue shape for its rows. An incremental
+   snapshot chunk is a `SELECT` that can straddle a DDL statement, so its rows cannot be
+   tied to one shape; they are often the first a consumer sees for a table.
 
 ## Related Documentation
 

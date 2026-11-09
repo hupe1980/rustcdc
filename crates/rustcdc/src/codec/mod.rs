@@ -566,6 +566,7 @@ mod tests {
     ///
     /// One test over every codec that decodes: a codec added later without the field fails
     /// here rather than silently dropping it.
+    #[cfg(all(feature = "avro", feature = "protobuf"))]
     #[test]
     fn every_decoding_codec_round_trips_the_schema_id() {
         let mut event = sample_event();

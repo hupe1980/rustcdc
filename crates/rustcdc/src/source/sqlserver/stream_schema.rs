@@ -33,6 +33,16 @@ impl SqlServerStreamHandle {
         )
     }
 
+    /// The id of the shape rows decoded against `meta` are captured under — the same digest
+    /// the announcement built from `meta` carries.
+    pub(super) fn schema_id_for_meta(meta: &CaptureInstanceMeta) -> String {
+        crate::ddl_capture::schema_id(
+            &meta.schema,
+            &meta.table,
+            &Self::table_schema_from_meta(meta),
+        )
+    }
+
     fn build_schema_event_for_meta(
         &self,
         ddl_type: &str,
@@ -262,6 +272,14 @@ mod tests {
         assert_eq!(
             columns[0]["constraints"],
             serde_json::json!(["primary_key"])
+        );
+
+        // A row decoded against this capture instance names the announcement's shape.
+        let row = super::super::stream_window::build_sqlserver_event_for_tests(&handle.metas[0]);
+        assert!(events[0].schema_id.is_some());
+        assert_eq!(
+            row.schema_id, events[0].schema_id,
+            "a row must name the shape its announcement carries"
         );
 
         assert!(

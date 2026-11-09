@@ -219,13 +219,31 @@ impl Pipeline {
         total: u64,
         batch_size: usize,
     ) -> Self {
-        let mut pipeline = Self::start_with_max_event_bytes(
+        Self::start_with_unreachable_sink_and_threshold(
+            state_dir,
+            output_path,
+            total,
+            batch_size,
+            None,
+        )
+        .await
+    }
+
+    async fn start_with_unreachable_sink_and_threshold(
+        state_dir: &Path,
+        output_path: &Path,
+        total: u64,
+        batch_size: usize,
+        health_stall_threshold_ms: Option<u64>,
+    ) -> Self {
+        let mut pipeline = Self::start_with_options(
             state_dir,
             output_path,
             total,
             batch_size,
             &[],
             1 << 20,
+            health_stall_threshold_ms,
         )
         .await;
 
@@ -262,6 +280,28 @@ impl Pipeline {
         faults: &[CheckpointFault],
         max_event_bytes: usize,
     ) -> Self {
+        Self::start_with_options(
+            state_dir,
+            output_path,
+            total,
+            batch_size,
+            faults,
+            max_event_bytes,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_options(
+        state_dir: &Path,
+        output_path: &Path,
+        total: u64,
+        batch_size: usize,
+        faults: &[CheckpointFault],
+        max_event_bytes: usize,
+        health_stall_threshold_ms: Option<u64>,
+    ) -> Self {
         let mut app_config = config_for(state_dir, output_path);
         app_config.runtime.max_event_bytes = max_event_bytes;
         app_config.runtime.sink_flush_interval_events = 1;
@@ -283,11 +323,15 @@ impl Pipeline {
         }
 
         let resumed_from = Arc::new(Mutex::new(None));
-        let runtime_config = RuntimeConfig::new(
+        let mut runtime_config = RuntimeConfig::new(
             RuntimeSourceConfig::disabled(),
             checkpoint,
             state.schema_history,
         );
+        if let Some(threshold_ms) = health_stall_threshold_ms {
+            runtime_config.options.max_poll_wait_ms = 10;
+            runtime_config.options.health_stall_threshold_ms = Some(threshold_ms);
+        }
         let mut runtime = CdcRuntime::new(runtime_config).expect("runtime");
         runtime.register_source(Box::new(ScriptedSource {
             total,
@@ -361,6 +405,7 @@ impl Pipeline {
                 &mut self.recoverable,
                 &mut self.metrics,
                 &self.sink_metrics,
+                None,
                 None,
                 batch,
             )
@@ -481,6 +526,7 @@ async fn a_transient_sink_failure_is_retried_under_the_recovery_policy_then_esca
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
         None,
+        None,
         batch,
     )
     .await;
@@ -499,6 +545,121 @@ async fn a_transient_sink_failure_is_retried_under_the_recovery_policy_then_esca
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(1),
         "the retries must actually back off rather than spin"
+    );
+}
+
+/// **While a batch is retried, the published verdict says delivery is failing.**
+///
+/// The verdict was latched only after a committed batch, so a sink that refused writes for
+/// five minutes was reported `idle` for five minutes. And once the runtime's own verdict
+/// was consulted, a held batch looked like a poll loop that stopped turning — the cause
+/// `/livez` restarts on, which cannot fix a destination that refuses writes.
+///
+/// A 1 s stall threshold and 200 ms backoffs: the retries outlast the threshold, and the
+/// last publish before escalation must name the delivery.
+#[tokio::test]
+async fn a_failing_delivery_is_published_as_its_own_stall_while_the_batch_is_retried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline =
+        Pipeline::start_with_unreachable_sink_and_threshold(dir.path(), &output, 3, 3, Some(1_000))
+            .await;
+    pipeline.recovery_policy.initial_backoff_ms = 200;
+    pipeline.recovery_policy.max_backoff_ms = 200;
+    pipeline.recovery_policy.breaker_consecutive_threshold = 8;
+    pipeline.recoverable = RecoverableErrorState::new(200);
+
+    let batch = pipeline.runtime.poll_event_batch().await.expect("poll");
+    let outcome = handle_polled_batch(
+        &mut pipeline.runtime,
+        &mut pipeline.router,
+        &pipeline.transform_pipeline,
+        &pipeline.admin_state,
+        &pipeline.checkpoint_age_source,
+        &mut pipeline.reconciler,
+        &pipeline.loop_config,
+        &pipeline.recovery_policy,
+        &mut pipeline.recoverable,
+        &mut pipeline.metrics,
+        &pipeline.sink_metrics,
+        None,
+        None,
+        batch,
+    )
+    .await;
+    assert!(
+        outcome.is_some(),
+        "the unreachable sink must eventually escalate"
+    );
+
+    let health = pipeline.admin_state.health_snapshot_for_tests().await;
+    assert_eq!(
+        health,
+        (
+            Some("stalled".to_string()),
+            Some("delivery_failing".to_string())
+        ),
+        "the verdict published during the retries must name the failing delivery"
+    );
+}
+
+/// **A shutdown request is honoured during a retry backoff.**
+///
+/// The event loop's signal arm cannot run while a batch is held, so SIGTERM during a
+/// backoff was ignored until the batch delivered or escalated — an orchestrator then
+/// SIGKILLs. The batch stays uncommitted and redelivers from the checkpoint.
+#[tokio::test]
+async fn a_shutdown_request_interrupts_a_retry_backoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline = Pipeline::start_with_unreachable_sink(dir.path(), &output, 3, 3).await;
+    // A minute between attempts: without the signal the test would hang here.
+    pipeline.recovery_policy.initial_backoff_ms = 60_000;
+    pipeline.recovery_policy.max_backoff_ms = 60_000;
+    pipeline.recoverable = RecoverableErrorState::new(60_000);
+
+    let (trigger, mut signals) = super::event_loop::ShutdownSignals::for_tests();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = trigger.send(());
+    });
+
+    let started = std::time::Instant::now();
+    let batch = pipeline.runtime.poll_event_batch().await.expect("poll");
+    let outcome = handle_polled_batch(
+        &mut pipeline.runtime,
+        &mut pipeline.router,
+        &pipeline.transform_pipeline,
+        &pipeline.admin_state,
+        &pipeline.checkpoint_age_source,
+        &mut pipeline.reconciler,
+        &pipeline.loop_config,
+        &pipeline.recovery_policy,
+        &mut pipeline.recoverable,
+        &mut pipeline.metrics,
+        &pipeline.sink_metrics,
+        None,
+        Some(&mut signals),
+        batch,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Some(crate::runtime::lifecycle::RuntimeLoopOutcome::Clean(
+                crate::runtime::lifecycle::RuntimeTerminalReasonCode::ShutdownSignal
+            ))
+        ),
+        "a shutdown during the backoff must stop cleanly"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the backoff must not run to completion first"
+    );
+    assert!(
+        pipeline.runtime.stop().await.is_err(),
+        "the held batch stays uncommitted, so it redelivers from the checkpoint"
     );
 }
 
@@ -531,6 +692,7 @@ async fn an_oversized_event_fails_immediately_without_retrying() {
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
+        None,
         None,
         batch,
     )
@@ -592,6 +754,7 @@ async fn a_poison_event_is_quarantined_and_the_batch_completes() {
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
         Some(&dlq),
+        None,
         batch,
     )
     .await;
@@ -648,6 +811,7 @@ async fn without_a_dead_letter_target_a_poison_event_still_halts() {
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
+        None,
         None,
         batch,
     )
