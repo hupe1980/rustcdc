@@ -388,6 +388,7 @@ Every published record carries provenance headers, tombstones included:
 | `__rustcdc.source.name` | Logical name of the source connector |
 | `__rustcdc.source.offset` | Source log position (LSN, binlog coordinates) |
 | `__rustcdc.source.ts_ms` | Source commit time, ms since epoch, as decimal text |
+| `__rustcdc.row_shape` | The id of the row's shape. **Omitted** when the row carries none |
 
 The body carries all of it too; the headers are what make it reachable without
 deserialising every payload. The field set matches the CloudEvents codec's
@@ -494,11 +495,9 @@ be run at startup: create them yourself if your module keeps schema events.
 Topics are **not** auto-created.
 
 **Ordering.** Per-key ordering among a table's row events is unaffected — they share a topic
-and a key. Schema announcements use a separate topic, so Kafka provides no ordering between
-them and the row events they describe. Each row names the shape it was captured under in
-`schema_id`, and the announcement for that shape carries the same id, so a consumer can tell a
-row it can apply from one whose announcement it has not seen
-([A row names the shape it was captured under](@/docs/schema-evolution.md#a-row-names-the-shape-it-was-captured-under)).
+and a key. Schema events use a separate topic, so Kafka provides no ordering between
+them and the row events. A row does not depend on them: it carries its own shape
+([Every row carries its shape](@/docs/schema-evolution.md#every-row-carries-its-shape)).
 Cross-table ordering is not preserved, as with Debezium; `preserve_transactions` still
 stops a sink committing half a source transaction, and under `effectively_once` the whole
 batch commits across all its topics in one transaction.
@@ -1589,6 +1588,9 @@ sink_close_timeout_ms = 30000    # 0 = wait indefinitely
 # Schema-history retention (0 = keep every version)
 schema_history_max_versions_per_table = 0
 
+# Row shape per event: "inline" (default) or "id"
+row_shape = "inline"
+
 # Runtime duplicate suppression
 [runtime.idempotency]
 enabled  = true
@@ -1630,6 +1632,7 @@ max_delay_ms     = 10000
 | `validate_events` | `true` | Validate every envelope inside the runtime. Turning it off removes the check that catches a self-contradictory envelope (a column both listed unavailable and present in the payload) before a sink acts on it. |
 | `sink_close_timeout_ms` | `30000` | Deadline for the sink's `close()` at shutdown; `0` waits indefinitely. A sink wedged on an unreachable broker otherwise hangs past the supervisor's grace period, turning an orderly drain into a SIGKILL. |
 | `schema_history_max_versions_per_table` | `0` (unbounded) | Historical schema versions retained per table. Unbounded history grows for the deployment's lifetime while only the versions spanning the replay window are ever read. |
+| `row_shape` | `"inline"` | How each row's [shape](@/docs/schema-evolution.md#every-row-carries-its-shape) is delivered. `inline`: columns, types, nullability and key in every row. `id`: only `id`, `schema` and `table`; resolve the rest with `GET /schemas/{id}` on the admin API (read token). A shape a transform narrowed stays inline. *Limit:* the lookup knows only shapes this process delivered since it started — it is not a durable registry. |
 | `idempotency.enabled` | `true` | Sliding-window duplicate suppression across restarts. The guard suppresses only events it can *identify* — one carrying transaction metadata, or a primary key whose columns are present in the row image. Everything else passes through and is counted: at-least-once is the documented contract, while dropping a distinct row is not recoverable by anyone. |
 | `idempotency.capacity` | `100000` | Fingerprints retained. Size for the deployment's **replay distance**, not its event rate: once the window fills, older duplicates stop being suppressed. Evictions are exported as `rustcdc_runtime_idempotency_evictions_total`. |
 | `idempotency.ttl_ms` | `0` | Optional fingerprint lifetime; `0` keeps one until capacity evicts it. |
@@ -1877,6 +1880,7 @@ cheap to refuse. A `429` therefore does not imply your credentials are wrong.
 | `POST` | `/signals` | write | Send a control-plane signal |
 | `GET` | `/notifications` | read | Recent CloudEvents notification log |
 | `GET` | `/notifications/stream` | read | Server-sent events stream (long-lived) |
+| `GET` | `/schemas/{id}` | read | A row shape this process delivered since it started; 404 when unknown, 400 for an id that is not 64 lowercase hex |
 
 #### `/config`
 

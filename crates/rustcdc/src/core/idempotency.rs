@@ -475,7 +475,7 @@ mod tests {
                 event_index,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

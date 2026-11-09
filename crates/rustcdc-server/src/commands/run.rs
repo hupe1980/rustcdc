@@ -116,7 +116,11 @@ async fn run_pipeline(
     let transform_pipeline = transform::TransformPipeline::from_config(
         app_config.pipeline.transform_runtime.clone(),
         app_config.pipeline.transforms.clone(),
-    )?;
+    )?
+    .with_row_shapes(crate::runtime::row_shapes::RowShapeDeliveryPlan::new(
+        app_config.runtime.row_shape,
+        admin_state.delivered_shapes(),
+    ));
 
     // ── Backend dispatch ──────────────────────────────────────────────────
     let state = crate::state::build(&app_config.state, transaction_handle).await?;

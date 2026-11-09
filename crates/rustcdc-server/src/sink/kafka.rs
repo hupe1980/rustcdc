@@ -371,6 +371,11 @@ pub const HEADER_SOURCE_OFFSET: &str = "__rustcdc.source.offset";
 /// consumer, and none of those can decode a binary integer. Every other header here is
 /// text for the same reason; making one of them binary would be the surprise.
 pub const HEADER_SOURCE_TS_MS: &str = "__rustcdc.source.ts_ms";
+/// The id of the row's shape (`Event::shape`), omitted when the row carries none.
+///
+/// Lets a consumer of a compact (`row_shape = "id"`) or Avro/Protobuf stream look a shape up
+/// without decoding the value — the role a registry schema-id header plays elsewhere.
+pub const HEADER_ROW_SHAPE: &str = "__rustcdc.row_shape";
 
 /// A source-supplied identifier can be no longer than this in a header value.
 ///
@@ -402,7 +407,7 @@ fn cdc_headers(event: &rustcdc::Event) -> Vec<(String, Option<Bytes>)> {
         ))
     }
 
-    let mut headers = Vec::with_capacity(6);
+    let mut headers = Vec::with_capacity(7);
     headers.push((HEADER_OP.to_string(), identifier(event.op.to_str())));
     if let Some(schema) = event.schema.as_deref().filter(|s| !s.is_empty()) {
         headers.push((HEADER_SOURCE_SCHEMA.to_string(), identifier(schema)));
@@ -420,6 +425,9 @@ fn cdc_headers(event: &rustcdc::Event) -> Vec<(String, Option<Bytes>)> {
         HEADER_SOURCE_TS_MS.to_string(),
         identifier(&event.source.timestamp.to_string()),
     ));
+    if let Some(shape) = event.shape.as_deref() {
+        headers.push((HEADER_ROW_SHAPE.to_string(), identifier(shape.id())));
+    }
     headers
 }
 

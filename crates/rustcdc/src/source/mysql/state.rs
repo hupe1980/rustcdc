@@ -32,9 +32,9 @@ pub(super) struct TableSnapshotState {
     pub(super) catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn>,
     /// Whether this table's schema has been announced in this run.
     pub(super) schema_announced: bool,
-    /// The id of the announced shape, carried by the rows that follow it. `None` until the
-    /// announcement is built, and when the catalog read nothing to announce.
-    pub(super) schema_id: Option<String>,
+    /// The shape the snapshot's rows carry, built from `catalog_columns` before the table's
+    /// first chunk. `None` when the catalogue read nothing.
+    pub(super) shape: Option<std::sync::Arc<crate::RowShape>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +110,9 @@ pub(super) struct MysqlRowChange {
     pub(super) primary_key: Option<Vec<String>>,
     pub(super) before: Option<serde_json::Value>,
     pub(super) after: Option<serde_json::Value>,
+    /// The table map the row was written under, which a catalogue shape must agree with
+    /// before the row may carry it.
+    pub(super) table_map: std::sync::Arc<super::row_shape::TableMapColumns>,
 }
 
 #[derive(Debug, Clone)]

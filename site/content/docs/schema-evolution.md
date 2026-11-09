@@ -174,54 +174,64 @@ for when that happens.
 re-announces, because a reconnecting consumer needs the schema before the rows it is about to
 receive. The schema history de-duplicates the repeat, so no extra schema version is recorded.
 
-### A row names the shape it was captured under
+### Every row carries its shape
 
-"Before" holds on the stream the connector produces. It does not survive a Kafka sink with a
-topic template: announcements carry the synthetic table name `<table>__ddl_events` and so land
-on a topic of their own, and Kafka orders nothing between two topics. A consumer can be handed
-a row before the announcement describing it.
-
-So both sides carry `schema_id`, an envelope field naming the table's shape:
+Each row event carries `shape`: the table's columns (name, declared type, nullability) in
+ordinal order, its primary key, and a content `id`. A consumer parses a row's text values
+with the types in the row itself — no other event, topic ordering or registry is needed.
 
 ```json
 {
-  "op": "INSERT",
+  "op": "insert",
   "table": "orders",
   "after": { "id": "9", "amount": "12.5000" },
-  "schema_id": "3f1c…"
+  "shape": {
+    "id": "3f1c…",
+    "schema": "public",
+    "table": "orders",
+    "columns": [
+      { "name": "id",     "data_type": "bigint",        "nullable": false },
+      { "name": "amount", "data_type": "numeric(12,4)", "nullable": false }
+    ],
+    "primary_key": ["id"]
+  }
 }
 ```
 
-The announcement for that shape carries the same id. A consumer keeps the announcements it has
-seen and compares:
+`id` is the lowercase hex SHA-256 of the bytes `rustcdc/v2/row-shape` followed by, each
+string as a 4-byte big-endian length and its UTF-8 bytes and each count as 4 bytes
+big-endian: `schema`, `table`, the column count, then per column `name`, `data_type` and one
+byte (`1` nullable, `0` not), then the key count and each key column. It names a shape, not a
+point in history: a table altered from A to B and back to A carries A's id again. A *compact*
+shape (the server's `runtime.row_shape = "id"`) carries only `id`, `schema` and `table`.
+CloudEvents output also sets `dataschema` to `urn:rustcdc:row-shape:<id>`, and the Kafka sink
+sets the `__rustcdc.row_shape` header.
 
-- **id it holds** — the row has the shape that announcement describes; apply it.
-- **id it does not hold** — the announcement is still in flight, or was compacted away. Wait
-  for it on the schema-event topic, or read the shape from the schema history, rather than
-  parsing the row against an older shape.
-- **no id** — unknown, not "new shape". The connector could not derive the table's shape (an
-  offline snapshot reads no catalogue), the event came from a release that does not set the
-  field, or a transform reshaped the row (below). Fall back to whatever the consumer did
-  before this field existed.
+| Connector | Snapshot rows | Stream rows |
+|---|---|---|
+| PostgreSQL | the catalogue read at snapshot start | the shape announced for the relation, rebuilt on every `RELATION` message |
+| MySQL / MariaDB | `information_schema` read at snapshot start | `information_schema`, stamped only when it agrees with the row's binlog table map (below) |
+| SQL Server | `INFORMATION_SCHEMA` read at snapshot start | the capture instance's columns; a new capture instance brings a new shape |
 
-The id is derived from the shape alone — column names, types, nullability, constraints and the
-primary key — so a table altered from shape A to B and back to A carries A's id again. It
-identifies a shape, not a point in the table's history; the schema history is what orders
-versions.
+**MySQL and MariaDB.** The catalogue is read now; a row may be older — after a resume, or
+while the stream catches up past an `ALTER`. So a row carries the catalogue's shape only when
+its table map agrees on column count, names, each column's binlog type family, nullability and
+primary key (`binlog_row_metadata = FULL` supplies names and key). A DDL statement naming the
+table, and a table map the held shape disagrees with, trigger a re-read; until one agrees the
+rows carry no shape. *Limit:* a change within one type family (`varchar(64)` to
+`varchar(128)`) is invisible to the table map, so a row captured before such a change and
+read after it carries the newer declaration.
 
-**A transform that changes a row's columns clears the id.** Dropping a column, renaming one, or
-replacing the payload leaves a row that no longer matches any announcement, and a claim a
-consumer would act on is worse than none. A transform that only rewrites values keeps it, so a
-mask, or a rule that turns `"9"` into `9`, leaves the id in place: the columns still match the
-announcement even though a value's JSON type does not.
+**Transforms.** A projection that only drops columns narrows the shape to the remaining
+columns, with a new id; dropping a primary-key column removes it. Anything else that changes
+the column set or what values mean removes the shape: a rename, copy or literal in a field
+mapping, a mask or hash, an unwrap or flatten, the outbox router, and every WASM module.
+`before` and `after` are both compared. A route that renames `table` keeps the shape, which
+still names the source table.
 
-Two more cases to know:
-
-- **A WASM module owns the envelope it returns.** The column check still runs, but a module that
-  sets `schema_id` itself, or keeps one while rewriting values, is taken at its word.
-- **A route that renames `table` does not clear the id.** The shape is still the source table's,
-  which is what the id names; a consumer keying its announcements by the *current* table name
-  needs to account for the rename itself.
+**No shape** means unknown, never "no columns". These paths carry none: an offline snapshot
+(no catalogue), the Snowflake source, an incremental snapshot, a truncate, MySQL/MariaDB rows
+whose table map disagrees with the catalogue, and rows a transform reshaped.
 
 ## Operational Guidance
 
@@ -240,17 +250,9 @@ Two more cases to know:
    type OID — no modifier, and `unknown` for a type outside the built-in set. Its first DDL
    carries the full declaration.
 5. An offline snapshot — one with no live connection — has no catalogue to read, so it
-   announces nothing rather than describing columns it did not read. Its rows carry no
-   `schema_id` either: there is no announcement for them to name.
-6. Rows carry `schema_id` on PostgreSQL, MySQL, MariaDB and SQL Server, in the snapshot and in
-   the stream. On MySQL and MariaDB a DDL statement in the binlog replaces the shape the rows
-   that follow it name: a `CREATE TABLE` names the shape it declares, and an `ALTER TABLE`,
-   which is parsed without a resulting schema, leaves the rows after it without an id until the
-   next restart's announcement — unknown rather than the shape before the `ALTER`.
-7. Rows from the **Snowflake** source and from an **incremental snapshot** carry no
-   `schema_id`. The Snowflake stream reads no catalogue shape for its rows. An incremental
-   snapshot chunk is a `SELECT` that can straddle a DDL statement, so its rows cannot be
-   tied to one shape; they are often the first a consumer sees for a table.
+   announces nothing and its rows carry no `shape`.
+6. A MySQL/MariaDB type change within one binlog type family is not detected by the
+   table-map comparison; see [Every row carries its shape](#every-row-carries-its-shape).
 
 ## Related Documentation
 

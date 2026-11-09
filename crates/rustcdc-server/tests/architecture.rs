@@ -1721,7 +1721,7 @@ fn every_source_driver_is_known_to_the_gate() {
 /// endpoints are removed.
 #[test]
 fn every_admin_route_appears_in_the_openapi_document() {
-    let admin = read_src("src/admin/mod.rs");
+    let admin = read_src("src/admin/routes.rs");
 
     // Routes as declared: `.route("/path", ...)`.
     let router_body = admin

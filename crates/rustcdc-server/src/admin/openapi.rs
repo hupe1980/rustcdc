@@ -50,6 +50,7 @@ pub(crate) const DOCUMENTED_PATHS: &[&str] = &[
     "/notifications",
     "/notifications/cloudevents",
     "/notifications/stream",
+    "/schemas/{id}",
     "/openapi.json",
 ];
 
@@ -492,6 +493,62 @@ pub(crate) fn document(version: &str) -> Value {
                             "content": { "text/event-stream": { "schema": { "type": "string" } } }
                         },
                         "401": { "$ref": "#/components/responses/Unauthorized" }
+                    }
+                }
+            },
+            "/schemas/{id}": {
+                "get": {
+                    "tags": ["observability"],
+                    "summary": "A row shape this process has delivered, by its id.",
+                    "description": concat!(
+                        "Resolves the `shape.id` a row carries under `runtime.row_shape = ",
+                        "\"id\"`. Only shapes delivered since this process started are known: ",
+                        "this is not a durable registry."
+                    ),
+                    "security": [{ "readToken": [] }],
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "The complete shape.",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["id", "schema", "table", "columns", "primary_key"],
+                                        "properties": {
+                                            "id": { "type": "string" },
+                                            "schema": { "type": "string" },
+                                            "table": { "type": "string" },
+                                            "columns": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "required": ["name", "data_type", "nullable"],
+                                                    "properties": {
+                                                        "name": { "type": "string" },
+                                                        "data_type": { "type": "string" },
+                                                        "nullable": { "type": "boolean" }
+                                                    }
+                                                }
+                                            },
+                                            "primary_key": {
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "400": { "description": "The id is not 64 lowercase hexadecimal characters." },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "404": { "description": "No row with this shape was delivered since the process started." },
+                        "429": { "$ref": "#/components/responses/RateLimited" }
                     }
                 }
             },

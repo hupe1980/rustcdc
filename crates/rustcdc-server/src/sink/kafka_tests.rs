@@ -1877,6 +1877,47 @@ async fn every_record_carries_its_cdc_provenance_headers() {
         Some("0/16B6A71")
     );
     assert_eq!(header(r, super::HEADER_SOURCE_TS_MS).as_deref(), Some("1"));
+    assert_eq!(
+        header(r, super::HEADER_ROW_SHAPE),
+        None,
+        "a row without a shape carries no shape header"
+    );
+    binding.close().await.expect("binding close");
+}
+
+/// A row with a shape names it in `__rustcdc.row_shape`.
+#[tokio::test]
+async fn kafka_records_carry_the_shape_header() {
+    let broker = krafka::testing::FakeBroker::start()
+        .await
+        .expect("fake broker");
+    broker.create_topic("cdc.fake.shape", 1);
+    let cfg = sample_kafka_config(&broker.bootstrap_servers(), "cdc.fake.shape");
+    let mut binding = crate::sink::build_binding(
+        &crate::config::schema::SinkConfig::Kafka(cfg),
+        &crate::sink::SinkBuildContext::new(usize::MAX),
+    )
+    .await
+    .expect("sink binding");
+
+    let shape = rustcdc::RowShape::new(
+        "public",
+        "users",
+        vec![rustcdc::ShapeColumn::new("id", "integer", false)],
+        vec!["id".into()],
+    )
+    .unwrap();
+    let mut event = sample_event();
+    event.shape = Some(std::sync::Arc::new(shape.clone()));
+    binding.send_event(&event).await.expect("send");
+    use rustcdc::sink::SinkAdapter as _;
+    binding.flush().await.expect("flush");
+
+    let records = read_raw(&broker, "cdc.fake.shape").await;
+    assert_eq!(
+        header(&records[0], super::HEADER_ROW_SHAPE).as_deref(),
+        Some(shape.id())
+    );
     binding.close().await.expect("binding close");
 }
 

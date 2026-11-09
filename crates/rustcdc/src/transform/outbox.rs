@@ -120,6 +120,8 @@ impl Transform for OutboxTransform {
                 // partition / ordering key (e.g., Kafka partition key for per-aggregate
                 // ordering guarantees).
                 event.primary_key = Some(vec![aggregate_id]);
+                // The payload is the application's document, not the outbox table's row.
+                event.shape = None;
                 Ok(true)
             }
         }
@@ -157,7 +159,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -272,7 +274,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         // Must not error — cleanup rows must be passed through (or filtered upstream).
@@ -302,7 +304,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         assert!(
@@ -339,7 +341,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
-            schema_id: None,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());

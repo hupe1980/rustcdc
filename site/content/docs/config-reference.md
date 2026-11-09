@@ -914,11 +914,11 @@ values against real databases.
 > Read with `value.as_str()` and parse — integers and floats arrive **quoted**, to keep the
 > full source precision that a JSON number would round.
 
-> **You do not have to know the types in advance.** Each table's column types are announced
-> on the stream before that table's first row, as a `SchemaChange` event with
-> `ddl_type = "READ_SCHEMA"` and a full `result_schema` — `data_type` in the source's own
-> syntax, modifier included, and `nullable` read from the catalogue. See
-> [Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+> **You do not have to know the types in advance.** Every row carries its table's shape in
+> `Event::shape` — each column's `data_type` in the source's own syntax, modifier included,
+> and `nullable` read from the catalogue. See
+> [Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape) for the paths
+> that carry none.
 
 ### Binary column encoding, per connector
 

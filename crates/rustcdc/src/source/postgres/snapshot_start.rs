@@ -158,7 +158,7 @@ async fn build_snapshot_setup(
             live_query: true,
             catalog_columns,
             schema_announced: false,
-            schema_id: None,
+            shape: None,
             primary_key_columns: pk_columns,
             primary_key_types: pk_types,
         });

@@ -179,7 +179,7 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
     // Capture all snapshot chunks with bounded iterations to avoid infinite loops.
     let mut snapshot_events = Vec::new();
     let mut chunk_count = 0;
-    let mut announced: Option<String> = None;
+    let mut announced: Option<std::sync::Arc<rustcdc::RowShape>> = None;
     for _ in 0..200 {
         let chunk = snapshot_handle.next_chunk(5000).await?;
         if chunk.is_empty() {
@@ -189,7 +189,7 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
             .into_iter()
             .partition(|event| event.op.is_schema_change());
         if let Some(announcement) = announcements.first() {
-            announced = announcement.schema_id.clone();
+            announced = announcement.shape.clone();
         }
         chunk_count += 1;
         snapshot_events.extend(chunk);
@@ -199,11 +199,34 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         "the table is announced before its first row"
     );
     assert!(
-        snapshot_events
-            .iter()
-            .all(|event| event.schema_id == announced),
-        "every snapshot row must name its announcement's shape"
+        snapshot_events.iter().all(|event| event.shape == announced),
+        "every snapshot row carries the table's shape"
     );
+    // The shape is the catalogue's declaration, compared against information_schema itself.
+    let declared: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT COLUMN_NAME, CAST(COLUMN_TYPE AS CHAR), IS_NULLABLE \
+         FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = 'cdc' AND TABLE_NAME = 'snapshot_test' \
+         ORDER BY ORDINAL_POSITION",
+    )
+    .fetch_all(&admin_pool)
+    .await
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let shape = announced.as_deref().expect("a shape");
+    let carried: Vec<(String, String, String)> = shape
+        .columns()
+        .expect("a complete shape")
+        .iter()
+        .map(|column| {
+            (
+                column.name.clone(),
+                column.data_type.clone(),
+                if column.nullable { "YES" } else { "NO" }.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(carried, declared);
+    assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
 
     let _snapshot_end = snapshot_handle.finish().await?;
 
