@@ -6,7 +6,9 @@ use crate::{
 };
 
 use super::decoder::LivePgOutputMessageProvider;
+use super::parser::{SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, classify_slot_failure};
 use super::streaming::StreamingPgOutputProvider;
+use super::wire::{OpenError, ServerError};
 use super::{
     PostgresConnection, PostgresStream, PostgresStreamHandle, StreamState, WalTransport,
     decode_stream_resume_lsn, query_current_wal_lsn, reconcile_stream_resume_lsn_with_retry,
@@ -108,10 +110,21 @@ pub(super) async fn start_postgres_stream(
 
     let provider: Box<dyn super::decoder::PgOutputMessageProvider> =
         match connection.config.wal_transport {
-            WalTransport::StreamingReplication => Box::new(
-                StreamingPgOutputProvider::connect(&connection.config, initial_confirmed_lsn)
-                    .await?,
-            ),
+            WalTransport::StreamingReplication => {
+                match StreamingPgOutputProvider::connect(
+                    &connection.config,
+                    initial_confirmed_lsn,
+                    client.clone(),
+                )
+                .await
+                {
+                    Ok(provider) => Box::new(provider),
+                    Err(OpenError::Refused(refusal)) => {
+                        return Err(classify_refusal(&client, &stream.slot_name, refusal).await);
+                    }
+                    Err(other) => return Err(other.into_error()),
+                }
+            }
             WalTransport::SqlPeek => {
                 // Loud on purpose: this transport re-reads WAL from the slot's
                 // `restart_lsn` on every poll, so its cost grows with the source's
@@ -138,17 +151,39 @@ pub(super) async fn start_postgres_stream(
                 })
             }
         };
-    Ok(Box::new(PostgresStreamHandle::new(
-        connection.source_type().to_string(),
-        stream,
-        provider,
-        connection.max_events_per_poll,
-        connection.stream_poll_interval_ms,
-        connection.slot_idle_advance_interval_ms,
-        connection.config.table_include_list.clone(),
-        connection.config.table_exclude_list.clone(),
-        catalog_primary_keys,
-        catalog_columns,
-        reselect_client,
-    )))
+    Ok(Box::new(
+        PostgresStreamHandle::new(
+            connection.source_type().to_string(),
+            stream,
+            provider,
+            connection.max_events_per_poll,
+            connection.stream_poll_interval_ms,
+            connection.slot_idle_advance_interval_ms,
+            connection.config.table_include_list.clone(),
+            connection.config.table_exclude_list.clone(),
+            catalog_primary_keys,
+            catalog_columns,
+            reselect_client,
+        )
+        .with_slot_state_sample_interval_ms(connection.config.slot_state_sample_interval_ms),
+    ))
+}
+
+/// The error for a refused `START_REPLICATION`: an invalidated slot when the slot's own
+/// state confirms it, otherwise the server's refusal as it was.
+async fn classify_refusal(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+    refusal: ServerError,
+) -> Error {
+    let slot_state = if refusal.code.as_deref() == Some(SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE) {
+        super::query::query_slot_state(client, slot_name)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    classify_slot_failure(slot_name, refusal.code.as_deref(), slot_state.as_ref())
+        .unwrap_or_else(|| OpenError::Refused(refusal).into_error())
 }

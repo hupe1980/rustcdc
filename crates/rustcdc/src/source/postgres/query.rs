@@ -363,6 +363,46 @@ pub(super) async fn advance_replication_slot(
     Ok(())
 }
 
+/// Read `wal_status`, `safe_wal_size` and, on PostgreSQL 17+, `invalidation_reason` for
+/// one slot, in one query. `None` when the slot does not exist.
+///
+/// The row is read as JSON so one statement serves every version: naming
+/// `invalidation_reason` would fail on a server that predates the column.
+pub(super) async fn query_slot_state(
+    client: &Client,
+    slot_name: &str,
+) -> Result<Option<super::parser::SlotState>> {
+    let row = client
+        .query_opt(
+            "SELECT to_jsonb(s)::text FROM pg_catalog.pg_replication_slots s \
+             WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .map_err(PgError::from)
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "failed reading the state of replication slot '{slot_name}': {error}"
+            ))
+        })?;
+    row.map(|row| parse_slot_state(&row.get::<usize, String>(0)))
+        .transpose()
+}
+
+fn parse_slot_state(row_json: &str) -> Result<super::parser::SlotState> {
+    let row: serde_json::Value = serde_json::from_str(row_json).map_err(|error| {
+        Error::SourceError(format!(
+            "pg_replication_slots returned a row that is not JSON: {error}"
+        ))
+    })?;
+    let text = |field: &str| row.get(field).and_then(serde_json::Value::as_str);
+    Ok(super::parser::SlotState {
+        wal_status: text("wal_status").and_then(crate::core::SlotWalStatus::from_pg),
+        safe_wal_size: row.get("safe_wal_size").and_then(serde_json::Value::as_i64),
+        invalidation_reason: text("invalidation_reason").map(str::to_string),
+    })
+}
+
 pub(super) async fn query_current_wal_lsn(client: &Client) -> Result<u64> {
     let lsn: String = client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
@@ -489,6 +529,33 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn a_slot_row_reads_the_same_with_and_without_invalidation_reason() {
+        use crate::core::SlotWalStatus;
+
+        // PostgreSQL 16: no `invalidation_reason` column at all.
+        let pg16 = parse_slot_state(
+            r#"{"slot_name":"s1","wal_status":"unreserved","safe_wal_size":-1048576}"#,
+        )
+        .unwrap();
+        assert_eq!(pg16.wal_status, Some(SlotWalStatus::Unreserved));
+        assert_eq!(pg16.safe_wal_size, Some(-1_048_576));
+        assert_eq!(pg16.invalidation_reason, None);
+
+        // PostgreSQL 18, invalidated: `safe_wal_size` is null.
+        let pg18 = parse_slot_state(
+            r#"{"wal_status":"lost","safe_wal_size":null,"invalidation_reason":"idle_timeout"}"#,
+        )
+        .unwrap();
+        assert_eq!(pg18.wal_status, Some(SlotWalStatus::Lost));
+        assert_eq!(pg18.safe_wal_size, None);
+        assert_eq!(pg18.invalidation_reason.as_deref(), Some("idle_timeout"));
+
+        // A spelling this crate does not know is unknown, not a guess.
+        let future = parse_slot_state(r#"{"wal_status":"someday"}"#).unwrap();
+        assert_eq!(future.wal_status, None);
+    }
 
     // ── Mock ReconcileOps ─────────────────────────────────────────────────────
 

@@ -223,6 +223,25 @@ groups:
       # The stall cause, split out so each goes to the team that can act on it.
       # `rustcdc_runtime_stall_cause` is emitted only while stalled, so presence
       # is the condition; there is nothing to compare against zero.
+      - alert: RUSTCDCStallSourcePositionLost
+        expr: rustcdc_runtime_stall_cause{cause="source_position_lost"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: database
+        annotations:
+          summary: >
+            PostgreSQL invalidated the replication slot (max_slot_wal_keep_size
+            or idle_replication_slot_timeout) and removed the WAL it was
+            holding.  The changes between the last confirmed position and the
+            invalidation are gone from the source.  The process is parked on
+            purpose — alive, not capturing, /readyz failing — because no
+            restart can recreate that WAL.  Recover by dropping and recreating
+            the slot and re-snapshotting the captured tables; a re-snapshot
+            does not replay rows deleted during the gap, so a mirror keeps
+            them until reconciled.  /status carries the server's
+            invalidation_reason.
+
       - alert: RUSTCDCStallUnconfirmedSourcePosition
         expr: rustcdc_runtime_stall_cause{cause="unconfirmed_source_position"} == 1
         for: 2m
@@ -317,6 +336,25 @@ groups:
             invalidation = unrecoverable data loss) or filling the WAL
             volume.  Check sink throughput and the RUSTCDCRuntimeStalled
             alert.
+
+      # No `for:` on purpose — `unreserved` is lost at the next checkpoint, which
+      # can be minutes away, and this is the only alert that fires while the
+      # slot can still be saved.  `extended` does not page: it is within
+      # max_slot_wal_keep_size.
+      - alert: RUSTCDCReplicationSlotUnreserved
+        expr: rustcdc_replication_slot_wal_status{status="unreserved"} == 1
+        labels:
+          severity: critical
+          team: database
+        annotations:
+          summary: >
+            The PostgreSQL replication slot is past max_slot_wal_keep_size:
+            the WAL it needs is removed at the next checkpoint unless the
+            pipeline catches up first, and the slot is then lost for good.
+            rustcdc_replication_slot_safe_wal_size_bytes is negative by the
+            amount it is over.  Unblock the pipeline now (sink throughput,
+            RUSTCDCRuntimeStalled), or raise max_slot_wal_keep_size to buy
+            time.
 
       - alert: RUSTCDCKafkaDeleteCannotBeTombstoned
         expr: increase(rustcdc_sink_kafka_unkeyed_deletes_total[15m]) > 0

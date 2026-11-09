@@ -1,6 +1,6 @@
 use crate::{
     checkpoint::PostgresOffset,
-    core::{Error, Offset, Result},
+    core::{Error, Offset, Result, SlotWalStatus, SourceErrorKind},
 };
 
 pub(super) fn parse_table_reference(table: &str) -> Result<(String, String)> {
@@ -206,19 +206,132 @@ pub(super) fn reconcile_stream_resume_lsn(
     )))
 }
 
-pub(super) fn map_pgoutput_poll_error(slot_name: &str, error_message: &str) -> Error {
-    let lower = error_message.to_ascii_lowercase();
-    if lower.contains("required wal segment has been removed")
-        || lower.contains("could not find record at")
-        || lower.contains("replication slot") && lower.contains("invalid")
-    {
-        return Error::SourceError(format!(
-            "replication slot '{slot_name}' appears stale or dead: {error_message}. \
-             Recreate the slot or restart from a newer checkpoint/LSN."
-        ));
+/// What `pg_replication_slots` says about one slot, read once per sample.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SlotState {
+    /// `wal_status`; `None` when the server leaves it null or spells it in a way this
+    /// crate does not know.
+    pub(super) wal_status: Option<SlotWalStatus>,
+    /// `safe_wal_size` in bytes; `None` when `max_slot_wal_keep_size` is unlimited.
+    pub(super) safe_wal_size: Option<i64>,
+    /// `invalidation_reason` (PostgreSQL 17+): `wal_removed`, `idle_timeout`, ….
+    pub(super) invalidation_reason: Option<String>,
+}
+
+impl SlotState {
+    fn is_invalidated(&self) -> bool {
+        self.wal_status == Some(SlotWalStatus::Lost) || self.invalidation_reason.is_some()
+    }
+}
+
+/// SQLSTATE `object_not_in_prerequisite_state`, which PostgreSQL raises for a slot it has
+/// invalidated — and for much else, which is why the slot state has to confirm it.
+pub(super) const SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
+
+/// The one rule for "the source has invalidated this slot", for every caller: the peek
+/// poll, `START_REPLICATION` on the streaming transport, the periodic slot sample and
+/// startup validation.
+///
+/// Decided by the slot's own state, never by the server's message: the wording differs
+/// between PostgreSQL 16 and 18, and `55000` alone covers unrelated conditions. A caller
+/// holding a server error passes its SQLSTATE so an unrelated error is not reclassified
+/// because the slot happens to be lost; a caller with no error passes `None`.
+pub(super) fn classify_slot_failure(
+    slot_name: &str,
+    sqlstate: Option<&str>,
+    slot_state: Option<&SlotState>,
+) -> Option<Error> {
+    if sqlstate.is_some_and(|code| code != SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE) {
+        return None;
+    }
+    let state = slot_state.filter(|state| state.is_invalidated())?;
+    let why = match &state.invalidation_reason {
+        Some(reason) => format!("invalidation_reason = {reason}"),
+        None => "wal_status = lost".to_string(),
+    };
+    Some(Error::source_error(
+        SourceErrorKind::SlotInvalidated,
+        format!(
+            "postgres invalidated replication slot '{slot_name}' ({why}): the WAL between \
+             the last confirmed position and the invalidation is gone, and neither a retry \
+             nor a restart can recover it. Drop and recreate the slot, then re-snapshot the \
+             captured tables; a re-snapshot does not replay rows deleted during the gap."
+        ),
+    ))
+}
+
+/// The error for a failed `pg_logical_slot_peek_binary_changes`.
+pub(super) fn map_pgoutput_poll_error(
+    slot_name: &str,
+    sqlstate: Option<&str>,
+    slot_state: Option<&SlotState>,
+    error_message: &str,
+) -> Error {
+    classify_slot_failure(slot_name, sqlstate, slot_state).unwrap_or_else(|| {
+        Error::SourceError(format!(
+            "pg_logical_slot_peek_binary_changes failed for slot '{slot_name}': {error_message}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(wal_status: Option<SlotWalStatus>, reason: Option<&str>) -> SlotState {
+        SlotState {
+            wal_status,
+            safe_wal_size: None,
+            invalidation_reason: reason.map(str::to_string),
+        }
     }
 
-    Error::SourceError(format!(
-        "pg_logical_slot_peek_binary_changes failed for slot '{slot_name}': {error_message}"
-    ))
+    #[test]
+    fn the_classifier_needs_the_slot_state_not_the_message() {
+        let lost = state(Some(SlotWalStatus::Lost), None);
+        let idle = state(Some(SlotWalStatus::Lost), Some("idle_timeout"));
+        let reason_only = state(None, Some("wal_removed"));
+        let reserved = state(Some(SlotWalStatus::Reserved), None);
+        let unreserved = state(Some(SlotWalStatus::Unreserved), None);
+
+        let kind = |error: Option<Error>| error.and_then(|e| e.source_kind());
+        let invalidated = Some(SourceErrorKind::SlotInvalidated);
+
+        assert_eq!(
+            kind(classify_slot_failure("s1", Some("55000"), Some(&lost))),
+            invalidated
+        );
+        assert_eq!(
+            kind(classify_slot_failure("s1", None, Some(&lost))),
+            invalidated
+        );
+        assert_eq!(
+            kind(classify_slot_failure("s1", None, Some(&reason_only))),
+            invalidated
+        );
+
+        let named = classify_slot_failure("s1", None, Some(&idle)).expect("invalidated");
+        assert!(named.to_string().contains("'s1'"), "{named}");
+        assert!(named.to_string().contains("idle_timeout"), "{named}");
+
+        // A healthy or endangered slot is not lost, whatever the error said.
+        assert!(classify_slot_failure("s1", Some("55000"), Some(&reserved)).is_none());
+        assert!(classify_slot_failure("s1", Some("55000"), Some(&unreserved)).is_none());
+        // An unrelated error is not reclassified because the slot happens to be lost.
+        assert!(classify_slot_failure("s1", Some("57P01"), Some(&lost)).is_none());
+
+        // The server's own words, PostgreSQL 16 and 18, without a slot state: not enough.
+        for message in [
+            "55000: can no longer get changes from replication slot \"s1\" (detail: This \
+             slot has been invalidated because it exceeded the maximum reserved size.)",
+            "55000: can no longer access replication slot \"s1\" (detail: This replication \
+             slot has been invalidated due to \"wal_removed\".)",
+        ] {
+            let error = map_pgoutput_poll_error("s1", Some("55000"), None, message);
+            assert_eq!(error.source_kind(), None, "{error}");
+            assert!(error.is_recoverable(), "{error}");
+        }
+        let error = map_pgoutput_poll_error("s1", Some("55000"), Some(&lost), "db error");
+        assert_eq!(error.source_kind(), invalidated);
+    }
 }

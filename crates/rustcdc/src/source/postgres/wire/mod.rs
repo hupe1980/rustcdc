@@ -32,7 +32,10 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub(in crate::source::postgres) use stream::{ReplicationParams, ReplicationStream, WalMessage};
+pub(in crate::source::postgres) use framing::ServerError;
+pub(in crate::source::postgres) use stream::{
+    OpenError, ReplicationParams, ReplicationStream, WalMessage,
+};
 
 /// PostgreSQL's epoch for protocol timestamps: 2000-01-01 00:00:00 UTC, as seconds since
 /// the Unix epoch.

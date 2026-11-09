@@ -2,7 +2,19 @@ use super::*;
 
 impl CdcRuntime {
     /// Start the runtime and initialize source handles.
+    ///
+    /// A start that fails because the source invalidated its replication slot leaves the
+    /// runtime reporting [`StallCause::SourcePositionLost`], so a caller that keeps the
+    /// process up to report it has the verdict to report.
     pub async fn start(&mut self) -> Result<()> {
+        let outcome = self.start_inner().await;
+        if let Err(error) = &outcome {
+            self.note_source_position_lost(error);
+        }
+        outcome
+    }
+
+    async fn start_inner(&mut self) -> Result<()> {
         match self.state {
             RuntimeState::Idle | RuntimeState::Stopped => {}
             RuntimeState::Running => {
@@ -171,6 +183,9 @@ impl CdcRuntime {
         self.last_source_event_ts_ms = None;
         self.last_commit_at_ms = None;
         self.delivery_failure = None;
+        self.source_position_lost = None;
+        self.last_slot_wal_status = None;
+        self.last_slot_safe_wal_size_bytes = None;
         self.total_events_polled = 0;
         self.total_events_committed = 0;
         self.total_events_deduplicated = 0;

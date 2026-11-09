@@ -9,14 +9,16 @@
 //! Nothing is intercepted, re-encoded, or reconstructed, so the decoder cannot disagree
 //! between the two transports.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio_postgres::Client;
 
 use crate::core::Result;
 
 use super::decoder::{PgOutputMessageProvider, PgOutputXLogData, PollOutcome};
-use super::wire::{ReplicationParams, ReplicationStream, WalMessage};
+use super::wire::{OpenError, ReplicationParams, ReplicationStream, WalMessage};
 
 /// Reads the WAL stream over `START_REPLICATION ... LOGICAL`.
 pub(super) struct StreamingPgOutputProvider {
@@ -27,6 +29,9 @@ pub(super) struct StreamingPgOutputProvider {
     /// This is what makes lag reporting free: the server volunteers its write position on
     /// every keepalive, so there is no `pg_current_wal_lsn()` query to run.
     server_wal_end: u64,
+    /// The connection's ordinary SQL client, shared rather than opened anew. The replication
+    /// socket cannot run a catalogue query, and the slot's `wal_status` is only in one.
+    state_client: Arc<Client>,
 }
 
 impl StreamingPgOutputProvider {
@@ -38,7 +43,8 @@ impl StreamingPgOutputProvider {
     pub(super) async fn connect(
         config: &super::PostgresSourceConfig,
         start_lsn: u64,
-    ) -> Result<Self> {
+        state_client: Arc<Client>,
+    ) -> std::result::Result<Self, OpenError> {
         // `resolve`, not `expose_secret`: a deferred secret (provider or callback) must be
         // fetched rather than rejected, because that is how AWS IAM database auth supplies a
         // short-lived token. This runs on every reconnect, so each new replication
@@ -64,6 +70,7 @@ impl StreamingPgOutputProvider {
             stream,
             slot_name: config.replication_slot_name.clone(),
             server_wal_end: start_lsn,
+            state_client,
         })
     }
 
@@ -152,6 +159,10 @@ impl PgOutputMessageProvider for StreamingPgOutputProvider {
             self.server_wal_end
                 .saturating_sub(self.stream.applied_lsn()),
         ))
+    }
+
+    async fn sample_slot_state(&mut self) -> Result<Option<super::parser::SlotState>> {
+        super::query::query_slot_state(&self.state_client, &self.slot_name).await
     }
 
     async fn idle_advance(&mut self) -> Result<u64> {

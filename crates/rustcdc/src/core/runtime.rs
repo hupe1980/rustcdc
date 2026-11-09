@@ -894,6 +894,17 @@ pub enum HealthVerdict {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StallCause {
+    /// The source invalidated the replication slot, discarding the log between the last
+    /// confirmed position and now.
+    ///
+    /// Set when a poll or [`start`](CdcRuntime::start) fails with
+    /// [`SourceErrorKind::SlotInvalidated`](crate::core::SourceErrorKind::SlotInvalidated),
+    /// and never cleared within a run. Checked before every other cause, and before
+    /// [`HealthVerdict::NotRunning`], because it explains all of them: a runtime that cannot
+    /// read its source stops polling and stops delivering. A restart cannot recreate the
+    /// discarded log; recovering is a new slot and a re-snapshot, which does not replay the
+    /// deletes made in the gap.
+    SourcePositionLost,
     /// A position was durably checkpointed but could not be confirmed to the source.
     ///
     /// The source keeps replaying committed events and retains its log — WAL on a
@@ -927,6 +938,7 @@ impl StallCause {
     /// For routing tables and alert-rule checks that must cover each cause. A test with an
     /// exhaustive `match` keeps it complete.
     pub const ALL: &'static [StallCause] = &[
+        Self::SourcePositionLost,
         Self::UnconfirmedSourcePosition,
         Self::DeliveryFailing,
         Self::PollLoopNotTurning,
@@ -936,11 +948,63 @@ impl StallCause {
     /// Short stable label for metrics, dashboards and log fields.
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::SourcePositionLost => "source_position_lost",
             Self::UnconfirmedSourcePosition => "unconfirmed_source_position",
             Self::PollLoopNotTurning => "poll_loop_not_turning",
             Self::ConsumerNotAcknowledging => "consumer_not_acknowledging",
             Self::DeliveryFailing => "delivery_failing",
         }
+    }
+}
+
+/// PostgreSQL's `pg_replication_slots.wal_status`: how safe the slot's retained WAL is.
+///
+/// The progression is `Reserved` → `Extended` → `Unreserved` → `Lost`. `Unreserved` is the
+/// last state in which the slot can still be saved: the WAL it needs is past
+/// `max_slot_wal_keep_size` and is removed at the next checkpoint unless the pipeline
+/// catches up first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SlotWalStatus {
+    /// Within `max_wal_size`.
+    Reserved,
+    /// Past `max_wal_size`, still retained for the slot.
+    Extended,
+    /// Past `max_slot_wal_keep_size`: lost at the next checkpoint unless consumed.
+    Unreserved,
+    /// The WAL the slot needs has been removed. Terminal.
+    Lost,
+}
+
+impl SlotWalStatus {
+    /// Every state, in the order a slot moves through them.
+    pub const ALL: &'static [SlotWalStatus] =
+        &[Self::Reserved, Self::Extended, Self::Unreserved, Self::Lost];
+
+    /// The spelling PostgreSQL uses in `pg_replication_slots.wal_status`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Extended => "extended",
+            Self::Unreserved => "unreserved",
+            Self::Lost => "lost",
+        }
+    }
+
+    /// Parse PostgreSQL's spelling. An unknown value is `None` rather than a guess, so a
+    /// state a future server adds is reported as unknown instead of as a wrong known one.
+    pub fn from_pg(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|status| status.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for SlotWalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1162,6 +1226,19 @@ pub struct RuntimeAdminSnapshot {
     /// `Some(0)` means the slot is fully caught up to the current WAL write position.
     #[serde(default)]
     pub replication_slot_lag_bytes: Option<u64>,
+    /// The replication slot's `wal_status`, from the last sample of the slot.
+    ///
+    /// Kept across a reconnect, and reported [`SlotWalStatus::Lost`] once the source has
+    /// refused the slot as invalidated. `None` for sources without a slot and before the
+    /// first sample.
+    #[serde(default)]
+    pub replication_slot_wal_status: Option<SlotWalStatus>,
+    /// The replication slot's `safe_wal_size` in bytes: how much more WAL can be written
+    /// before the slot is endangered. Negative once the slot is
+    /// [`Unreserved`](SlotWalStatus::Unreserved); `None` when the server does not limit
+    /// slot WAL (`max_slot_wal_keep_size = -1`) or nothing has been sampled.
+    #[serde(default)]
+    pub replication_slot_safe_wal_size_bytes: Option<i64>,
 }
 
 /// Opaque token representing an in-flight batch prefix that may be committed.
@@ -1974,6 +2051,13 @@ pub struct CdcRuntime {
     /// Set while the embedder reports that a batch is failing to deliver. See
     /// [`StallCause::DeliveryFailing`].
     delivery_failure: Option<DeliveryFailure>,
+    /// Why the source refused the replication slot as invalidated, once it has. See
+    /// [`StallCause::SourcePositionLost`].
+    source_position_lost: Option<String>,
+    /// Last sampled slot state, kept across a reconnect: the stream that sampled it is
+    /// dropped exactly when the state matters.
+    last_slot_wal_status: Option<SlotWalStatus>,
+    last_slot_safe_wal_size_bytes: Option<i64>,
     total_events_polled: u64,
     total_events_committed: u64,
     total_events_deduplicated: u64,
@@ -2043,6 +2127,25 @@ impl CdcRuntime {
 
     fn record_runtime_error(&self, context: &str, error: &Error) {
         self.observability().metrics.record_error(error, context);
+    }
+
+    /// Latch [`StallCause::SourcePositionLost`] from an error, if it says the slot is gone.
+    fn note_source_position_lost(&mut self, error: &Error) {
+        if error.source_kind() == Some(crate::core::SourceErrorKind::SlotInvalidated) {
+            self.source_position_lost = Some(error.report().to_string());
+            self.last_slot_wal_status = Some(SlotWalStatus::Lost);
+        }
+    }
+
+    /// Copy the stream's slot sample onto the runtime, which outlives the stream.
+    fn capture_slot_state(&mut self) {
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
+        if let Some(status) = stream.replication_slot_wal_status() {
+            self.last_slot_wal_status = Some(status);
+            self.last_slot_safe_wal_size_bytes = stream.replication_slot_safe_wal_size_bytes();
+        }
     }
 
     fn record_replication_lag_metric(&self) {
@@ -2200,6 +2303,9 @@ impl CdcRuntime {
             last_source_event_ts_ms: None,
             last_commit_at_ms: None,
             delivery_failure: None,
+            source_position_lost: None,
+            last_slot_wal_status: None,
+            last_slot_safe_wal_size_bytes: None,
             total_events_polled: 0,
             total_events_committed: 0,
             total_events_deduplicated: 0,
@@ -2367,8 +2473,10 @@ mod tests {
 
     use super::{
         AckMode, CdcRuntime, ConnectionRetryPolicy, EventBatch, IdempotencyOptions, RuntimeConfig,
-        RuntimeObservability, RuntimeSourceConfig, RuntimeState, TransformErrorPolicy,
+        RuntimeObservability, RuntimeSourceConfig, RuntimeState, SlotWalStatus,
+        TransformErrorPolicy,
     };
+    use crate::core::Error;
 
     #[cfg(feature = "postgres")]
     use super::{PostCommitSourceConfirmPolicy, RuntimeSource};
@@ -5473,7 +5581,8 @@ mod tests {
     #[test]
     fn stall_cause_all_lists_every_variant() {
         let named = |cause: StallCause| match cause {
-            StallCause::UnconfirmedSourcePosition
+            StallCause::SourcePositionLost
+            | StallCause::UnconfirmedSourcePosition
             | StallCause::DeliveryFailing
             | StallCause::PollLoopNotTurning
             | StallCause::ConsumerNotAcknowledging => cause.as_str(),
@@ -5482,7 +5591,7 @@ mod tests {
             StallCause::ALL.iter().map(|c| named(*c)).collect();
         assert_eq!(
             labels.len(),
-            4,
+            5,
             "ALL must hold each variant once: {labels:?}"
         );
     }
@@ -6493,6 +6602,396 @@ mod tests {
         let batch = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.events()[0].op, Operation::SchemaChange);
+    }
+
+    // ─── A lost replication slot ─────────────────────────────────────────────
+
+    /// One step of a scripted stream: a batch, or an error.
+    enum Step {
+        Events(Vec<Event>),
+        Fail(Error),
+    }
+
+    /// A stream that plays its steps, then returns empty batches, reporting a fixed slot
+    /// `wal_status`.
+    struct SlotScriptStream {
+        steps: std::collections::VecDeque<Step>,
+        wal_status: Option<SlotWalStatus>,
+    }
+
+    #[async_trait]
+    impl crate::source::StreamHandle for SlotScriptStream {
+        async fn next_events(&mut self, _timeout_ms: u64) -> crate::core::Result<Vec<Event>> {
+            match self.steps.pop_front() {
+                Some(Step::Events(events)) => Ok(events),
+                Some(Step::Fail(error)) => Err(error),
+                None => Ok(Vec::new()),
+            }
+        }
+
+        async fn save_position(
+            &self,
+            _checkpoint: &mut dyn crate::checkpoint::Checkpoint,
+        ) -> crate::core::Result<()> {
+            Ok(())
+        }
+
+        async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+            Ok(())
+        }
+
+        fn replication_slot_wal_status(&self) -> Option<SlotWalStatus> {
+            self.wal_status
+        }
+
+        fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
+            self.wal_status.map(|_| -4096)
+        }
+    }
+
+    /// A source whose `connect` and `start_stream` results are scripted per call. Once a
+    /// script runs out, `connect` succeeds and `start_stream` yields an empty stream.
+    #[derive(Default)]
+    struct SlotScriptSource {
+        connects: std::sync::Mutex<std::collections::VecDeque<Error>>,
+        starts: std::sync::Mutex<
+            std::collections::VecDeque<std::result::Result<SlotScriptStream, Error>>,
+        >,
+        connect_calls: Arc<std::sync::atomic::AtomicU32>,
+        start_calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl SlotScriptSource {
+        /// The next reconnect's `connect` fails with `error`.
+        fn reconnect_fails(self, error: Error) -> Self {
+            self.connects.lock().unwrap().push_back(error);
+            self
+        }
+
+        fn then_stream(self, steps: Vec<Step>, wal_status: Option<SlotWalStatus>) -> Self {
+            self.starts.lock().unwrap().push_back(Ok(SlotScriptStream {
+                steps: steps.into_iter().collect(),
+                wal_status,
+            }));
+            self
+        }
+
+        fn then_start_fails(self, error: Error) -> Self {
+            self.starts.lock().unwrap().push_back(Err(error));
+            self
+        }
+    }
+
+    #[async_trait]
+    impl crate::source::Source for SlotScriptSource {
+        async fn connect(&self) -> crate::core::Result<()> {
+            let call = self
+                .connect_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The first connect is `start()`'s; the script covers reconnects.
+            if call == 0 {
+                return Ok(());
+            }
+            match self.connects.lock().unwrap().pop_front() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        async fn start_snapshot(
+            &mut self,
+            _tables: &[&str],
+        ) -> crate::core::Result<Box<dyn crate::source::SnapshotHandle>> {
+            unreachable!("no snapshot here")
+        }
+
+        async fn start_stream(
+            &mut self,
+            _resume_from: Option<&dyn crate::core::Offset>,
+        ) -> crate::core::Result<Box<dyn crate::source::StreamHandle>> {
+            self.start_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.starts.lock().unwrap().pop_front() {
+                Some(Ok(stream)) => Ok(Box::new(stream)),
+                Some(Err(error)) => Err(error),
+                None => Ok(Box::new(SlotScriptStream {
+                    steps: Default::default(),
+                    wal_status: None,
+                })),
+            }
+        }
+
+        async fn perform_handoff(
+            &mut self,
+            _snapshot: &mut dyn crate::source::SnapshotHandle,
+            _stream: &mut dyn crate::source::StreamHandle,
+        ) -> crate::core::Result<crate::source::HandoffResult> {
+            unreachable!("no handoff here")
+        }
+
+        fn source_type(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn slot_lost() -> Error {
+        Error::source_error(
+            crate::core::SourceErrorKind::SlotInvalidated,
+            "postgres invalidated replication slot 'cdc' (invalidation_reason = wal_removed)",
+        )
+    }
+
+    fn transient() -> Error {
+        Error::SourceError("simulated TCP reset by peer".into())
+    }
+
+    /// A runtime with fast reconnects and up to `max_retries` attempts.
+    fn slot_runtime(source: SlotScriptSource, max_retries: u32) -> CdcRuntime {
+        let mut config = RuntimeConfig::new(
+            RuntimeSourceConfig::Disabled,
+            InMemoryCheckpoint::default(),
+            InMemorySchemaHistory::default(),
+        )
+        .with_idempotency_disabled();
+        config.options.max_poll_wait_ms = 10;
+        config.options.connection_retry = Some(ConnectionRetryPolicy {
+            max_retries: Some(max_retries),
+            initial_delay_ms: 1,
+            max_delay_ms: 2,
+        });
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.inject_mock_source(Box::new(source));
+        runtime
+    }
+
+    /// Poll until a poll fails, or `limit` polls have passed.
+    async fn poll_until_error(runtime: &mut CdcRuntime, limit: usize) -> Option<Error> {
+        for _ in 0..limit {
+            if let Err(error) = runtime.poll_event_batch().await {
+                return Some(error);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn source_position_lost_outranks_a_stale_poll_loop() {
+        let source = SlotScriptSource::default().then_stream(
+            vec![Step::Fail(slot_lost())],
+            Some(SlotWalStatus::Unreserved),
+        );
+        let mut runtime = slot_runtime(source, 3);
+        runtime.start().await.unwrap();
+
+        let error = poll_until_error(&mut runtime, 3)
+            .await
+            .expect("the poll fails");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated)
+        );
+
+        // A parked process stops polling, so the poll gap grows without bound; the verdict
+        // must still name the slot, which is what routes the page to the database team.
+        let much_later = runtime.last_poll_at_ms.unwrap() + 3_600_000;
+        let verdict = runtime.derive_health(much_later);
+        assert_eq!(
+            verdict.stall_cause(),
+            Some(StallCause::SourcePositionLost),
+            "{verdict:?}"
+        );
+        assert!(!runtime.admin_snapshot().readiness);
+    }
+
+    #[tokio::test]
+    async fn a_start_that_finds_the_slot_invalidated_reports_source_position_lost() {
+        let source = SlotScriptSource::default().then_start_fails(slot_lost());
+        let mut runtime = slot_runtime(source, 3);
+
+        let error = runtime.start().await.expect_err("the start fails");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated)
+        );
+        let snapshot = runtime.admin_snapshot();
+        assert_eq!(
+            snapshot.health.stall_cause(),
+            Some(StallCause::SourcePositionLost),
+            "a runtime that could not start because the slot is lost must say so, not \
+             report not_running: {:?}",
+            snapshot.health
+        );
+        assert_eq!(
+            snapshot.replication_slot_wal_status,
+            Some(SlotWalStatus::Lost)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_recoverable_restart_error_is_returned_with_its_kind() {
+        // The stream drops; the restart finds the slot invalidated. Retrying cannot help,
+        // and ten attempts of exponential backoff would hide the page behind a reconnect
+        // loop. It must come back at once, its kind intact.
+        let source = SlotScriptSource::default()
+            .then_stream(vec![Step::Fail(transient())], None)
+            .then_start_fails(slot_lost());
+        let starts = Arc::clone(&source.start_calls);
+        let mut runtime = slot_runtime(source, 10);
+        runtime.start().await.unwrap();
+
+        let error = poll_until_error(&mut runtime, 3)
+            .await
+            .expect("the restart error surfaces");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated),
+            "{error}"
+        );
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one start and one restart; the restart must not be retried"
+        );
+
+        // The same through a reconnect whose `connect` refuses the slot.
+        let source = SlotScriptSource::default()
+            .then_stream(vec![Step::Fail(transient())], None)
+            .reconnect_fails(slot_lost());
+        let connects = Arc::clone(&source.connect_calls);
+        let mut runtime = slot_runtime(source, 10);
+        runtime.start().await.unwrap();
+        let error = poll_until_error(&mut runtime, 3).await.expect("surfaces");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated),
+            "{error}"
+        );
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Control: a transient restart failure is still retried, and the stream comes back.
+        let source = SlotScriptSource::default()
+            .then_stream(vec![Step::Fail(transient())], None)
+            .then_start_fails(transient())
+            .then_stream(vec![Step::Events(vec![event()])], None);
+        let mut runtime = slot_runtime(source, 10);
+        runtime.start().await.unwrap();
+        let batch = runtime
+            .poll_event_batch()
+            .await
+            .expect("retried to success");
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_secret_failure_on_reconnect_is_retried() {
+        // A secret resolved at connect time — an IAM token minted per connection — can fail
+        // once and succeed on the next attempt. It surfaces as a `ConfigError`, and treating
+        // that as final would turn a token-service blip into an outage.
+        let source = SlotScriptSource::default()
+            .then_stream(vec![Step::Fail(transient())], None)
+            .reconnect_fails(Error::ConfigError(
+                "failed to resolve the postgres password from its provider".into(),
+            ))
+            .then_stream(vec![Step::Events(vec![event()])], None);
+        let mut runtime = slot_runtime(source, 10);
+        runtime.start().await.unwrap();
+
+        let batch = runtime
+            .poll_event_batch()
+            .await
+            .expect("a failed secret resolution must be retried");
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_last_slot_state_survives_a_dropped_stream() {
+        // The stream that sampled `unreserved` is dropped exactly when the warning matters:
+        // while the pipeline reconnects. The runtime keeps the last sample, and reports
+        // `lost` once the source refuses the slot.
+        let source = SlotScriptSource::default()
+            .then_stream(
+                vec![Step::Events(Vec::new()), Step::Fail(transient())],
+                Some(SlotWalStatus::Unreserved),
+            )
+            .then_start_fails(transient())
+            .then_start_fails(transient())
+            .then_start_fails(slot_lost());
+        let mut runtime = slot_runtime(source, 10);
+        runtime.start().await.unwrap();
+
+        let first = runtime.poll_event_batch().await.expect("first poll reads");
+        assert!(first.is_empty());
+        assert_eq!(
+            runtime.admin_snapshot().replication_slot_wal_status,
+            Some(SlotWalStatus::Unreserved)
+        );
+        assert_eq!(
+            runtime
+                .admin_snapshot()
+                .replication_slot_safe_wal_size_bytes,
+            Some(-4096)
+        );
+
+        let error = poll_until_error(&mut runtime, 3).await.expect("surfaces");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated)
+        );
+        let snapshot = runtime.admin_snapshot();
+        assert!(!snapshot.stream_active, "the stream was dropped");
+        assert_eq!(
+            snapshot.replication_slot_wal_status,
+            Some(SlotWalStatus::Lost)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_slot_state_is_rendered_one_hot_with_its_safe_size() {
+        let source = SlotScriptSource::default().then_stream(
+            vec![Step::Events(Vec::new())],
+            Some(SlotWalStatus::Unreserved),
+        );
+        let mut runtime = slot_runtime(source, 3);
+        runtime.start().await.unwrap();
+        let polled = runtime.poll_event_batch().await.unwrap();
+        assert!(polled.is_empty());
+
+        let out = runtime.admin_metrics_prometheus();
+        for status in SlotWalStatus::ALL {
+            let value = u8::from(*status == SlotWalStatus::Unreserved);
+            let line = format!(
+                "rustcdc_replication_slot_wal_status{{source_type=\"unknown\",status=\"{status}\"}} {value}"
+            );
+            assert!(out.contains(&line), "missing `{line}`:\n{out}");
+        }
+        assert!(
+            out.contains(
+                "rustcdc_replication_slot_safe_wal_size_bytes{source_type=\"unknown\"} -4096"
+            ),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_keeps_the_last_sample_while_reconnecting() {
+        // Between the drop and the verdict, the last sampled state is what is reported.
+        let source = SlotScriptSource::default()
+            .then_stream(
+                vec![Step::Fail(transient())],
+                Some(SlotWalStatus::Unreserved),
+            )
+            .then_start_fails(transient())
+            .then_start_fails(transient());
+        let mut runtime = slot_runtime(source, 1);
+        runtime.start().await.unwrap();
+
+        let _ = poll_until_error(&mut runtime, 3).await;
+        let snapshot = runtime.admin_snapshot();
+        assert!(!snapshot.stream_active);
+        assert_eq!(
+            snapshot.replication_slot_wal_status,
+            Some(SlotWalStatus::Unreserved)
+        );
     }
 
     // ─── Reconnect recovery test ─────────────────────────────────────────────

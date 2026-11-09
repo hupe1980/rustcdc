@@ -525,6 +525,7 @@ it is a catch-all, not a no-op.
 | `stream_poll_interval_ms` | `u64` | 50 | Range 1–60 000. |
 | `max_events_per_poll` | `usize` | 1 000 | Range 1–100 000. |
 | `slot_idle_advance_interval_ms` | `u64` | 30 000 | See "Idle slots retain WAL" below. `0` disables. |
+| `slot_state_sample_interval_ms` | `Option<u64>` | unset | Cadence of the slot lag and `wal_status` sample. Unset follows `slot_idle_advance_interval_ms` (15 s when that is `0`). Must be > 0 when set. |
 | `wal_transport` | `WalTransport` | `StreamingReplication` | How the WAL stream is read; see below. |
 | `reselect_unavailable_columns` | `bool` | `false` | Re-read unchanged TOASTed values from the source instead of reporting them absent; see below. |
 | `capture_logical_messages` | `bool` | `false` | Capture `pg_logical_emit_message()` output — the table-free transactional outbox; see below. |
@@ -1489,7 +1490,9 @@ let config = RuntimeConfig::new(...)
 | `rustcdc_runtime_health` | Gauge | Derived health verdict, one series per `verdict` label. **`rustcdc_runtime_health{verdict="stalled"} == 1` is the alert rule** — `state` alone cannot distinguish healthy-idle from stalled. |
 | `rustcdc_runtime_checkpoint_age_ms` | Gauge | Age of last durable checkpoint |
 | `rustcdc_runtime_replication_lag_ms` | Gauge | Estimated source lag in milliseconds |
-| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. Sampled on a timer that does **not** depend on the pipeline being caught up — a sampler tied to the idle-advance path would go stale exactly while the pipeline was behind, which is when the value matters most. The cadence follows `slot_idle_advance_interval_ms`, or 15 s when idle advance is disabled. |
+| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. Sampled on a timer that does **not** depend on the pipeline being caught up — a sampler tied to the idle-advance path would go stale exactly while the pipeline was behind, which is when the value matters most. The cadence follows `slot_idle_advance_interval_ms`, or 15 s when idle advance is disabled, unless `slot_state_sample_interval_ms` is set. |
+| `rustcdc_replication_slot_wal_status` | Gauge | The slot's `wal_status`, one-hot over `status` = `reserved`, `extended`, `unreserved`, `lost`. Page on `unreserved`: the slot is lost at the next checkpoint unless the pipeline catches up. Kept across a reconnect; `lost` once the source refuses the slot. |
+| `rustcdc_replication_slot_safe_wal_size_bytes` | Gauge | The slot's `safe_wal_size`; negative once `unreserved`, absent when `max_slot_wal_keep_size` is unlimited. |
 | `rustcdc_runtime_source_capability` | Gauge | Connector capability flags, one series per `capability` label |
 
 ### OpenTelemetry Exported Metrics (`OTelMetricsCollector`)

@@ -18,6 +18,13 @@ pub enum SourceErrorKind {
     SchemaMismatch,
     /// Replication slot or equivalent source-side tracking object not found.
     SlotNotFound,
+    /// The replication slot exists but the source invalidated it, discarding the log it
+    /// was retaining — PostgreSQL's `max_slot_wal_keep_size` or `idle_replication_slot_timeout`.
+    ///
+    /// The changes between the last confirmed position and the invalidation are gone from
+    /// the source. Neither a retry nor a restart can bring them back; recovering means a new
+    /// slot and a re-snapshot, which an operator has to choose.
+    SlotInvalidated,
     /// Source quota exceeded (e.g. max connections, WAL limits).
     QuotaExceeded,
     /// Error could not be classified into one of the above categories.
@@ -31,8 +38,8 @@ impl SourceErrorKind {
     /// unclassified [`Error::SourceError`]: the overwhelmingly common source failure
     /// is a transient network condition, and treating an unclassified one as terminal
     /// would shut a pipeline down on a blip. Classify explicitly to get the stricter
-    /// behaviour — `AuthFailed`, `SchemaMismatch` and `SlotNotFound` all need an
-    /// operator, and retrying them just delays the page.
+    /// behaviour — `AuthFailed`, `SchemaMismatch`, `SlotNotFound` and `SlotInvalidated`
+    /// all need an operator, and retrying them just delays the page.
     pub fn is_recoverable(self) -> bool {
         matches!(
             self,
@@ -47,6 +54,7 @@ impl SourceErrorKind {
             Self::AuthFailed => "auth_failed",
             Self::SchemaMismatch => "schema_mismatch",
             Self::SlotNotFound => "slot_not_found",
+            Self::SlotInvalidated => "slot_invalidated",
             Self::QuotaExceeded => "quota_exceeded",
             Self::Unknown => "unknown",
         }
@@ -784,7 +792,7 @@ mod tests {
         // succeed; it only delays the operator page.
         use super::SourceErrorKind::*;
 
-        for kind in [AuthFailed, SchemaMismatch, SlotNotFound] {
+        for kind in [AuthFailed, SchemaMismatch, SlotNotFound, SlotInvalidated] {
             let error = Error::source_error(kind, "x");
             assert_eq!(error.kind(), ErrorKind::Terminal, "{kind:?}");
             assert!(!error.is_recoverable(), "{kind:?}");
@@ -793,6 +801,21 @@ mod tests {
             let error = Error::source_error(kind, "x");
             assert_eq!(error.kind(), ErrorKind::Transient, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn an_invalidated_slot_is_its_own_terminal_kind() {
+        // A lost slot is not a missing one: the slot is still there and recreating it is
+        // not the remedy. The label is what alert routing keys on.
+        use super::SourceErrorKind;
+
+        let kind = SourceErrorKind::SlotInvalidated;
+        assert_eq!(kind.as_str(), "slot_invalidated");
+        assert!(!kind.is_recoverable());
+        assert_ne!(kind, SourceErrorKind::SlotNotFound);
+        let error = Error::source_error(kind, "slot 'cdc' was invalidated");
+        assert_eq!(error.source_kind(), Some(kind));
+        assert_eq!(error.kind(), ErrorKind::Terminal);
     }
 
     #[test]

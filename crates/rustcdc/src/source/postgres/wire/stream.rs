@@ -12,8 +12,8 @@ use super::auth::{
     ScramExchange, md5_password_response, parse_sasl_mechanisms, select_sasl_mechanism,
 };
 use super::framing::{
-    BackendMessage, MessageReader, render_error_response, render_tag, request_tls, startup_packet,
-    take_i64, take_u8, write_message, write_untagged,
+    BackendMessage, MessageReader, ServerError, render_error_response, render_tag, request_tls,
+    startup_packet, take_i64, take_u8, write_message, write_untagged,
 };
 use super::now_pg_timestamp;
 
@@ -151,6 +151,45 @@ pub(in crate::source::postgres) struct ReplicationParams<'a> {
     pub(in crate::source::postgres) capture_logical_messages: bool,
 }
 
+/// Why a replication stream could not be opened.
+#[derive(Debug)]
+pub(in crate::source::postgres) enum OpenError {
+    /// The server refused `START_REPLICATION`. Kept as the server's fields, because the
+    /// refusal describes the slot and the caller decides what that means.
+    Refused(ServerError),
+    /// Anything before that: the socket, TLS, authentication, a timeout.
+    Other(Error),
+}
+
+impl From<Error> for OpenError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl OpenError {
+    /// The crate error, for a caller that does not classify the refusal.
+    pub(in crate::source::postgres) fn into_error(self) -> Error {
+        match self {
+            Self::Refused(server) => Error::SourceError(format!(
+                "postgres replication connection rejected: {server}"
+            )),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(server) => {
+                write!(f, "postgres replication connection rejected: {server}")
+            }
+            Self::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 /// A live logical replication stream.
 pub(in crate::source::postgres) struct ReplicationStream {
     socket: Socket,
@@ -182,26 +221,26 @@ impl ReplicationStream {
     /// database.
     pub(in crate::source::postgres) async fn connect(
         params: ReplicationParams<'_>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, OpenError> {
         let connect_timeout = params.connect_timeout;
         let endpoint = format!("{}:{}", params.host, params.port);
 
         tokio::time::timeout(connect_timeout, Self::establish(params))
             .await
             .map_err(|_| {
-                Error::SourceError(format!(
+                OpenError::Other(Error::SourceError(format!(
                     "timed out after {connect_timeout:?} establishing a replication stream \
                      to {endpoint}. The connection was not refused, so the server accepted \
                      it and then stopped responding — check for a firewall dropping the \
                      session mid-handshake, a saturated server, or a proxy pointed at a \
                      dead backend. Raise PostgresSourceConfig::conn_timeout_secs if the \
                      server is merely slow."
-                ))
+                )))
             })?
     }
 
     /// The setup sequence, wrapped by [`Self::connect`]'s timeout.
-    async fn establish(params: ReplicationParams<'_>) -> Result<Self> {
+    async fn establish(params: ReplicationParams<'_>) -> std::result::Result<Self, OpenError> {
         let socket = Self::open_socket(params.host, params.port, params.transport).await?;
 
         let mut stream = Self {
@@ -459,7 +498,7 @@ impl ReplicationStream {
         publication_name: &str,
         start_lsn: u64,
         capture_logical_messages: bool,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), OpenError> {
         // The slot and publication names are server identifiers that reach the server as
         // part of a command string, so they are validated rather than escaped.
         validate_identifier(slot_name, "replication slot name")?;
@@ -490,19 +529,32 @@ impl ReplicationStream {
         write_message(&mut self.socket, frontend_tag::QUERY, &payload).await?;
 
         loop {
-            let message = self.read_backend_message().await?;
+            // Read directly rather than through `read_backend_message`, which would flatten
+            // a refusal into a string: the refusal is about the slot, and its SQLSTATE is
+            // what the caller classifies.
+            let message = self.reader.read_message(&mut self.socket).await?;
             match message.tag {
                 tag::COPY_BOTH_RESPONSE => return Ok(()),
+                tag::ERROR_RESPONSE => {
+                    return Err(OpenError::Refused(ServerError::parse(&message.payload)));
+                }
+                tag::NOTICE_RESPONSE => {
+                    tracing::debug!(
+                        target: "rustcdc::source::postgres",
+                        "postgres notice: {}",
+                        render_error_response(&message.payload),
+                    );
+                }
                 // Some server versions answer with a row set before switching to CopyBoth.
                 tag::ROW_DESCRIPTION | tag::DATA_ROW | tag::COMMAND_COMPLETE => {}
                 other => {
-                    return Err(Error::SourceError(format!(
+                    return Err(OpenError::Other(Error::SourceError(format!(
                         "postgres did not enter CopyBoth mode for slot '{slot_name}'; it \
                          replied with tag {}. The role needs the REPLICATION attribute and \
                          the connection must be direct — a pooler in transaction-pooling \
                          mode cannot carry a replication stream.",
                         render_tag(other)
-                    )));
+                    ))));
                 }
             }
         }

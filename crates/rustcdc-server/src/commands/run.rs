@@ -325,83 +325,113 @@ async fn run_with_runtime_state(
     }
 
     tracing::info!("CDC pipeline starting");
-    runtime.start().await?;
-
-    // The replication-slot lag metric comes from the runtime's own
-    // `RuntimeAdminSnapshot::replication_slot_lag_bytes` (exported as
-    // `rustcdc_replication_slot_lag_bytes`).
-    //
-    // rustcdc samples this on a timer regardless of the caught-up state, so no
-    // side-channel connection is needed. That saves a second connection, a second
-    // credential on the wire every 15 seconds, and the TLS-connector construction — code
-    // that
-    // shipped with a real defect (it connected `NoTls` under `mode = "tls"`).
-
-    // ── Main event loop ───────────────────────────────────────────────────
-    // We use poll_event_batch() instead of event_batches() so we can call
-    // commit_ack / stop / admin snapshot in the same loop body
-    // without a persistent mutable borrow of `runtime`.
-    // Built before the loop so a misconfigured dead-letter target fails at startup
-    // rather than at the moment it is first needed — which is during an incident.
-    let dlq = crate::dlq::DeadLetterQueue::build(&app_config.dlq)
-        .await?
-        .map(tokio::sync::Mutex::new);
-    if let Some(queue) = dlq.as_ref() {
-        tracing::info!(
-            target = queue.lock().await.target_name(),
-            "dead-letter quarantine enabled: permanently undeliverable events will be \
-             recorded and the pipeline will advance past them"
-        );
-    }
-
-    let loop_outcome = execute_event_loop(
-        &mut runtime,
-        sink,
-        transform_pipeline,
-        &admin_state,
-        admin_exit_rx,
-        &checkpoint_age_source,
-        &mut checkpoint_txn_reconciler,
-        sink_metrics,
-        dlq.as_ref(),
-        RuntimeLoopConfig {
-            prepare_parallelism: app_config.runtime.prepare_parallelism,
-            sink_flush_interval_events: app_config.runtime.sink_flush_interval_events,
-            sink_delivery_queue_capacity: app_config.runtime.sink_delivery_queue_capacity,
-            sink_send_timeout_ms: app_config.runtime.sink_send_timeout_ms,
-            sink_flush_timeout_ms: app_config.runtime.sink_flush_timeout_ms,
-            recoverable_error_backoff_initial_ms: app_config
-                .runtime
-                .recoverable_error_backoff_initial_ms,
-            recoverable_error_backoff_max_ms: app_config.runtime.recoverable_error_backoff_max_ms,
-            recoverable_error_backoff_multiplier: app_config
-                .runtime
-                .recoverable_error_backoff_multiplier,
-            recoverable_error_backoff_jitter_ratio: app_config
-                .runtime
-                .recoverable_error_backoff_jitter_ratio,
-            recoverable_error_breaker_consecutive_threshold: u64::from(
-                app_config
-                    .runtime
-                    .recoverable_error_breaker_consecutive_threshold,
-            ),
-            recoverable_error_breaker_max_open_cycles: u64::from(
-                app_config.runtime.recoverable_error_breaker_max_open_cycles,
-            ),
-            recoverable_error_breaker_cooldown_ms: app_config
-                .runtime
-                .recoverable_error_breaker_cooldown_ms,
-            sink_name,
-            requested_delivery_contract,
+    // Installed before `start()` and handed on to the event loop, so a signal that arrives
+    // while the runtime starts — or while it is parked — is not lost.
+    let mut shutdown_signals = crate::runtime::event_loop::ShutdownSignals::install();
+    let parked = {
+        let metrics_accumulator = crate::runtime::metrics::RuntimeLoopMetricsAccumulator::new(
+            &sink_name,
+            &requested_delivery_contract,
             delivery_contract_satisfied,
-            sink_delivery_guarantee,
+            &sink_delivery_guarantee,
             sink_idempotent_delivery_capable,
             sink_transactional_checkpoint_barrier_capable,
-            queue_depth_p95_window_samples: QUEUE_DEPTH_P95_WINDOW_SAMPLES,
-            correctness_dedup_window_size: app_config.runtime.correctness_dedup_window_size,
-        },
-    )
-    .await;
+            QUEUE_DEPTH_P95_WINDOW_SAMPLES,
+            app_config.runtime.correctness_dedup_window_size,
+        );
+        start_or_park(
+            &mut runtime,
+            &admin_state,
+            admin_exit_rx,
+            metrics_accumulator,
+            &mut shutdown_signals,
+        )
+        .await?
+    };
+
+    let loop_outcome = match parked {
+        Some(outcome) => outcome,
+        None => {
+            // The replication-slot lag metric comes from the runtime's own
+            // `RuntimeAdminSnapshot::replication_slot_lag_bytes` (exported as
+            // `rustcdc_replication_slot_lag_bytes`).
+            //
+            // rustcdc samples this on a timer regardless of the caught-up state, so no
+            // side-channel connection is needed. That saves a second connection, a second
+            // credential on the wire every 15 seconds, and the TLS-connector construction — code
+            // that
+            // shipped with a real defect (it connected `NoTls` under `mode = "tls"`).
+
+            // ── Main event loop ───────────────────────────────────────────────────
+            // We use poll_event_batch() instead of event_batches() so we can call
+            // commit_ack / stop / admin snapshot in the same loop body
+            // without a persistent mutable borrow of `runtime`.
+            // Built before the loop so a misconfigured dead-letter target fails at startup
+            // rather than at the moment it is first needed — which is during an incident.
+            let dlq = crate::dlq::DeadLetterQueue::build(&app_config.dlq)
+                .await?
+                .map(tokio::sync::Mutex::new);
+            if let Some(queue) = dlq.as_ref() {
+                tracing::info!(
+                    target = queue.lock().await.target_name(),
+                    "dead-letter quarantine enabled: permanently undeliverable events will be \
+                 recorded and the pipeline will advance past them"
+                );
+            }
+
+            execute_event_loop(
+                &mut runtime,
+                sink,
+                transform_pipeline,
+                &admin_state,
+                admin_exit_rx,
+                &checkpoint_age_source,
+                &mut checkpoint_txn_reconciler,
+                sink_metrics,
+                dlq.as_ref(),
+                RuntimeLoopConfig {
+                    prepare_parallelism: app_config.runtime.prepare_parallelism,
+                    sink_flush_interval_events: app_config.runtime.sink_flush_interval_events,
+                    sink_delivery_queue_capacity: app_config.runtime.sink_delivery_queue_capacity,
+                    sink_send_timeout_ms: app_config.runtime.sink_send_timeout_ms,
+                    sink_flush_timeout_ms: app_config.runtime.sink_flush_timeout_ms,
+                    recoverable_error_backoff_initial_ms: app_config
+                        .runtime
+                        .recoverable_error_backoff_initial_ms,
+                    recoverable_error_backoff_max_ms: app_config
+                        .runtime
+                        .recoverable_error_backoff_max_ms,
+                    recoverable_error_backoff_multiplier: app_config
+                        .runtime
+                        .recoverable_error_backoff_multiplier,
+                    recoverable_error_backoff_jitter_ratio: app_config
+                        .runtime
+                        .recoverable_error_backoff_jitter_ratio,
+                    recoverable_error_breaker_consecutive_threshold: u64::from(
+                        app_config
+                            .runtime
+                            .recoverable_error_breaker_consecutive_threshold,
+                    ),
+                    recoverable_error_breaker_max_open_cycles: u64::from(
+                        app_config.runtime.recoverable_error_breaker_max_open_cycles,
+                    ),
+                    recoverable_error_breaker_cooldown_ms: app_config
+                        .runtime
+                        .recoverable_error_breaker_cooldown_ms,
+                    sink_name,
+                    requested_delivery_contract,
+                    delivery_contract_satisfied,
+                    sink_delivery_guarantee,
+                    sink_idempotent_delivery_capable,
+                    sink_transactional_checkpoint_barrier_capable,
+                    queue_depth_p95_window_samples: QUEUE_DEPTH_P95_WINDOW_SAMPLES,
+                    correctness_dedup_window_size: app_config.runtime.correctness_dedup_window_size,
+                },
+                shutdown_signals,
+            )
+            .await
+        }
+    };
 
     // Reported at shutdown, where the hit counters cover the whole run: a mask rule
     // that never matched means those columns went out unmasked, and nothing else says
@@ -429,6 +459,53 @@ async fn run_with_runtime_state(
     }
 
     shutdown
+}
+
+/// Start the runtime, or park when the source has invalidated the replication slot.
+///
+/// A lost slot found at startup is the same condition as one lost mid-run and gets the same
+/// treatment: the process stays up, reports `stalled/source_position_lost` and exits on a
+/// signal, instead of exiting into a crash loop no restart can end. `Some` is the parked
+/// outcome; `None` means the runtime started and the event loop should run.
+pub(crate) async fn start_or_park(
+    runtime: &mut CdcRuntime,
+    admin_state: &AdminState,
+    admin_exit_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    mut metrics_accumulator: crate::runtime::metrics::RuntimeLoopMetricsAccumulator,
+    shutdown_signals: &mut crate::runtime::event_loop::ShutdownSignals,
+) -> Result<Option<crate::runtime::lifecycle::RuntimeLoopOutcome>, AppError> {
+    // The handlers are installed before `start()`, which replaces the default disposition;
+    // without this arm a start hung on an unreachable database could not be stopped.
+    let started = tokio::select! {
+        biased;
+        _ = shutdown_signals.recv() => {
+            admin_state.record_shutdown_request_os_signal().await;
+            admin_state.set_state(InstanceState::Stopping).await;
+            return Ok(Some(crate::runtime::lifecycle::RuntimeLoopOutcome::Clean(
+                crate::runtime::lifecycle::RuntimeTerminalReasonCode::ShutdownSignal,
+            )));
+        }
+        started = runtime.start() => started,
+    };
+    match started {
+        Ok(()) => Ok(None),
+        Err(error) if crate::runtime::park::is_lost_source_position(&error) => {
+            let recoverable = crate::runtime::recovery::RecoverableErrorState::new(0);
+            Ok(Some(
+                crate::runtime::park::park_on_lost_source_position(
+                    runtime,
+                    admin_state,
+                    &recoverable,
+                    &mut metrics_accumulator,
+                    shutdown_signals,
+                    admin_exit_rx,
+                    &error,
+                )
+                .await,
+            ))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn record_post_recovery_checkpoint_proof(
@@ -987,6 +1064,7 @@ pub(crate) mod tests {
             wal_transport: Default::default(),
             reselect_unavailable_columns: false,
             capture_logical_messages: false,
+            slot_state_sample_interval_ms: None,
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

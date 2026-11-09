@@ -219,7 +219,9 @@ fn rendered_runtime_families() -> BTreeSet<String> {
         "last_commit_at_ms": 3,
         "checkpoint_age_ms": 5,
         "replication_lag_ms": 7,
-        "replication_slot_lag_bytes": 42
+        "replication_slot_lag_bytes": 42,
+        "replication_slot_wal_status": "unreserved",
+        "replication_slot_safe_wal_size_bytes": -1
     }))
     .expect("snapshot deserializes");
 
@@ -333,5 +335,35 @@ fn every_stall_cause_is_routed_and_every_routed_cause_exists() {
     assert!(
         unrouted.is_empty(),
         "stall causes no alert rule routes: {unrouted:?}"
+    );
+}
+
+/// Every `status="…"` an alert selects on `rustcdc_replication_slot_wal_status` is a state
+/// the renderer emits, and the early-warning state is among them. The family exists either
+/// way, so a misspelt value would match nothing and read as coverage.
+#[test]
+fn every_slot_status_an_alert_selects_is_one_the_renderer_emits() {
+    let rules = std::fs::read_to_string(repo_root().join("monitoring/rustcdc_slo_alerts.yml"))
+        .expect("read alert rules");
+    let selected: BTreeSet<String> = rules
+        .match_indices("rustcdc_replication_slot_wal_status{status=\"")
+        .filter_map(|(at, prefix)| {
+            let rest = &rules[at + prefix.len()..];
+            rest.find('"').map(|end| rest[..end].to_string())
+        })
+        .collect();
+    let emitted: BTreeSet<String> = rustcdc::core::SlotWalStatus::ALL
+        .iter()
+        .map(|status| status.as_str().to_string())
+        .collect();
+
+    let unknown: Vec<_> = selected.difference(&emitted).collect();
+    assert!(
+        unknown.is_empty(),
+        "alert rules select slot states the renderer never emits: {unknown:?}"
+    );
+    assert!(
+        selected.contains("unreserved"),
+        "the one state that warns while the slot can still be saved must page"
     );
 }

@@ -160,6 +160,7 @@ was fine.
 
 | `StallCause` | `/livez` | `/readyz` | Why |
 |---|---|---|---|
+| `source_position_lost` | 200 | 503 | PostgreSQL invalidated the replication slot and removed the WAL it held. No restart recreates it; the process parks — alive, not capturing — until an operator re-snapshots (runbook §4) and stops it |
 | `poll_loop_not_turning` | **503** after `LIVEZ_STALL_TIMEOUT` (120 s) | 503 | The process is wedged; a restart is the remedy |
 | `unconfirmed_source_position` | 200 | 503 | A restart replays from the same checkpoint and fails identically, while the source keeps retaining log — crash-looping makes a full `pg_wal` volume arrive *sooner*. Page, do not reboot |
 | `consumer_not_acknowledging` | 200 | 503 | The sink is not draining; restarting thrashes against an already-unhealthy downstream |
@@ -241,13 +242,15 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | Metric | Alert threshold | Description |
 |---|---|---|
 | `rustcdc_runtime_health{verdict="stalled"}` | == 1 | Runtime is running but progress stopped. One-hot gauge: exactly one verdict label is 1. `verdict="idle"` is deliberately not alertable — a quiet database is not an incident, and is a verdict a healthy pipeline reaches whenever its source goes quiet. Logged once at WARN on entry, once at INFO on recovery |
-| `rustcdc_runtime_stall_cause{cause=…}` | present | Which signal stalled: `unconfirmed_source_position` (the database is retaining log), `poll_loop_not_turning` (this process or the source socket), `consumer_not_acknowledging` (the commit path), `delivery_failing` (the sink refuses the held batch). Emitted only while stalled, so presence is the condition — route pages on this rather than fanning one alert out to every team |
+| `rustcdc_runtime_stall_cause{cause=…}` | present | Which signal stalled: `source_position_lost` (the database invalidated the slot), `unconfirmed_source_position` (the database is retaining log), `poll_loop_not_turning` (this process or the source socket), `consumer_not_acknowledging` (the commit path), `delivery_failing` (the sink refuses the held batch). Emitted only while stalled, so presence is the condition — route pages on this rather than fanning one alert out to every team |
 | `rustcdc_runtime_poll_age_ms` | see runbook | Milliseconds since `poll_event_batch` last returned, empty batches included. Stays low on an idle source; growth means the loop itself has stopped turning |
 | `rustcdc_runtime_delivery_age_ms` | **do not alert** | Milliseconds since events last arrived. High on its own is a quiet database. A diagnostic to read beside the poll age, never a condition |
 | `rustcdc_runtime_idempotency_evictions_total` | sustained growth | The dedup window is too small for this deployment's replay distance, so duplicates older than the window stop being suppressed. Raise `runtime.idempotency.capacity` |
 | `rustcdc_runtime_idempotency_unidentifiable_total` | growth on a keyed table | Events with neither transaction metadata nor a resolvable primary key are deliberately **not** deduplicated. Expected for keyless tables; unexpected growth means a key is missing from the row image |
 | `rustcdc_runtime_events_skipped_total` | any increase | Events permanently dropped by `transform_error_policy = "skip"` — the checkpoint advances past them, so **any increase is confirmed data loss** |
 | `rustcdc_replication_slot_lag_bytes` | > 1 GiB sustained | PostgreSQL slot WAL retention; growth risks slot invalidation (`max_slot_wal_keep_size`) or a full WAL volume |
+| `rustcdc_replication_slot_wal_status{status=…}` | `status="unreserved"` == 1 | The slot's `wal_status`, one-hot over `reserved`, `extended`, `unreserved`, `lost`. `unreserved` means the slot is lost at the next checkpoint unless the pipeline catches up — the one alert that fires while the slot can still be saved. `extended` does not page |
+| `rustcdc_replication_slot_safe_wal_size_bytes` | — | The slot's `safe_wal_size`: WAL that can still be written before the slot is endangered; negative once `unreserved`. Absent when `max_slot_wal_keep_size` is unlimited |
 | `rustcdc_sink_kafka_unkeyed_deletes_total` | any increase | A delete arrived with no row key, so no tombstone could be published — on a compacted topic, a key the log will never reclaim. The table has no primary key, and is logged once at WARN. Truncate and schema-change events are excluded |
 | `rustcdc_sink_kafka_tombstones_total` | **do not alert** | Tombstones published. Zero is normal for a pipeline with no deletes — read it beside the counter above, never as a condition |
 | `rustcdc_slo_checkpoint_age_seconds` | > 300 s | Checkpoint has not advanced — sink or source issue |

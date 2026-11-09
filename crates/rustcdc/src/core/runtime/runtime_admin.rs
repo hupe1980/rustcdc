@@ -318,7 +318,8 @@ impl CdcRuntime {
                 // replaying events the runtime has already committed, and the source
                 // is retaining its log (WAL on a PostgreSQL primary) meanwhile.
                 // Reporting ready here is what made this failure silent.
-                && self.pending_confirmation_lsn.is_none(),
+                && self.pending_confirmation_lsn.is_none()
+                && self.source_position_lost.is_none(),
             liveness: self.state != RuntimeState::Stopped,
             capabilities: self.source_capabilities(),
             buffer_depth: self.buffered_events.len()
@@ -358,6 +359,8 @@ impl CdcRuntime {
                 .stream
                 .as_ref()
                 .and_then(|s| s.replication_slot_lag_bytes()),
+            replication_slot_wal_status: self.last_slot_wal_status,
+            replication_slot_safe_wal_size_bytes: self.last_slot_safe_wal_size_bytes,
         }
     }
 
@@ -366,6 +369,16 @@ impl CdcRuntime {
     /// Ordered most-specific first, so the reported reason is the most actionable one
     /// rather than whichever check happens to run first.
     pub(super) fn derive_health(&self, now_ms: u64) -> HealthVerdict {
+        // 0. The source invalidated the slot. First, and before `NotRunning`: it explains
+        //    every other symptom — a parked process stops polling, and a start that found
+        //    the slot lost never reached `Running` — and only this cause names the remedy.
+        if let Some(reason) = &self.source_position_lost {
+            return HealthVerdict::Stalled {
+                cause: StallCause::SourcePositionLost,
+                reason: reason.clone(),
+            };
+        }
+
         if self.state != RuntimeState::Running {
             return HealthVerdict::NotRunning;
         }
@@ -778,6 +791,33 @@ pub fn write_runtime_metrics_prometheus<W: std::io::Write>(
                  # TYPE rustcdc_replication_slot_lag_bytes gauge\n\
                  rustcdc_replication_slot_lag_bytes{{source_type=\"{source_type}\"}} {}",
                 lag_bytes
+            )?;
+        }
+
+        // One-hot over every state, so `status="unreserved"` is a complete alert rule and a
+        // state change is a change of which series is 1 rather than a series appearing.
+        if let Some(current) = admin.replication_slot_wal_status {
+            writeln!(
+                w,
+                "# HELP rustcdc_replication_slot_wal_status PostgreSQL replication slot wal_status (1 for the current state). unreserved means the slot is lost at the next checkpoint unless the pipeline catches up; lost means it already is.\n\
+                 # TYPE rustcdc_replication_slot_wal_status gauge"
+            )?;
+            for status in crate::core::SlotWalStatus::ALL {
+                writeln!(
+                    w,
+                    "rustcdc_replication_slot_wal_status{{source_type=\"{source_type}\",status=\"{}\"}} {}",
+                    status.as_str(),
+                    u8::from(*status == current)
+                )?;
+            }
+        }
+
+        if let Some(safe_bytes) = admin.replication_slot_safe_wal_size_bytes {
+            writeln!(
+                w,
+                "# HELP rustcdc_replication_slot_safe_wal_size_bytes PostgreSQL replication slot safe_wal_size: bytes of WAL that can still be written before the slot is endangered. Negative once the slot is unreserved; absent when max_slot_wal_keep_size is unlimited.\n\
+                 # TYPE rustcdc_replication_slot_safe_wal_size_bytes gauge\n\
+                 rustcdc_replication_slot_safe_wal_size_bytes{{source_type=\"{source_type}\"}} {safe_bytes}"
             )?;
         }
 

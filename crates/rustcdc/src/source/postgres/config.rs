@@ -67,6 +67,7 @@ impl Default for PostgresSourceConfig {
             wal_transport: WalTransport::StreamingReplication,
             reselect_unavailable_columns: false,
             capture_logical_messages: false,
+            slot_state_sample_interval_ms: None,
         }
     }
 }
@@ -173,6 +174,12 @@ impl PostgresSourceConfig {
         if self.publication_name.trim().is_empty() {
             return Err(Error::ConfigError(
                 "postgres publication_name must not be empty".into(),
+            ));
+        }
+        if self.slot_state_sample_interval_ms == Some(0) {
+            // Zero would put a catalogue query on every poll.
+            return Err(Error::ConfigError(
+                "postgres slot_state_sample_interval_ms must be greater than zero when set".into(),
             ));
         }
         if self.conn_timeout_secs == 0 {

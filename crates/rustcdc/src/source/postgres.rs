@@ -134,8 +134,15 @@ pub struct PostgresStreamHandle {
     slot_idle_advance_interval_ms: u64,
     /// Tracks when `idle_advance` was last called to gate the advance interval.
     last_idle_advance_at: Option<std::time::Instant>,
-    /// Tracks when slot lag was last measured, to gate the sampling interval.
+    /// When the slot was last sampled (lag and state), to gate the sampling interval.
+    last_slot_sample_at: Option<std::time::Instant>,
+    /// When slot lag was last *measured*; `None` means not measured on this transport.
     last_slot_lag_at: Option<std::time::Instant>,
+    /// Overrides the sampling cadence. See
+    /// [`PostgresSourceConfig::slot_state_sample_interval_ms`].
+    slot_state_sample_interval_ms: Option<u64>,
+    /// The slot's state at the last sample.
+    last_slot_state: Option<parser::SlotState>,
     /// Most recently observed WAL lag in bytes from the last `idle_advance` call.
     ///
     /// `0` before the first idle advance is executed.
@@ -163,13 +170,13 @@ impl PostgresStreamHandle {
     /// turns off idle advance still needs the lag metric, and gating the measurement on the
     /// advance is what made it stale in the first place.
     fn slot_lag_sample_due(&self) -> bool {
-        let interval_ms = if self.slot_idle_advance_interval_ms > 0 {
-            self.slot_idle_advance_interval_ms
-        } else {
-            DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS
+        let interval_ms = match self.slot_state_sample_interval_ms {
+            Some(interval_ms) => interval_ms,
+            None if self.slot_idle_advance_interval_ms > 0 => self.slot_idle_advance_interval_ms,
+            None => DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS,
         };
         let threshold = std::time::Duration::from_millis(interval_ms);
-        self.last_slot_lag_at
+        self.last_slot_sample_at
             .map(|at| at.elapsed() >= threshold)
             .unwrap_or(true)
     }
@@ -208,13 +215,21 @@ impl PostgresStreamHandle {
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
             slot_idle_advance_interval_ms,
             last_idle_advance_at: None,
+            last_slot_sample_at: None,
             last_slot_lag_at: None,
+            slot_state_sample_interval_ms: None,
+            last_slot_state: None,
             last_slot_lag_bytes: 0,
             table_include_list,
             table_exclude_list,
             reselect_client,
             reselect_column_types: reselect::ColumnTypeCache::new(),
         }
+    }
+
+    fn with_slot_state_sample_interval_ms(mut self, interval_ms: Option<u64>) -> Self {
+        self.slot_state_sample_interval_ms = interval_ms;
+        self
     }
 }
 
@@ -689,6 +704,17 @@ pub struct PostgresSourceConfig {
     /// Default: `false`.
     #[serde(default)]
     pub capture_logical_messages: bool,
+    /// How often, in milliseconds, to sample the replication slot's lag and state
+    /// (`wal_status`, `safe_wal_size`).
+    ///
+    /// The sample is what reports a slot as `unreserved` — lost at the next checkpoint
+    /// unless the pipeline catches up — and what detects a slot the server has invalidated
+    /// when no read fails. One catalogue query per sample, none per event.
+    ///
+    /// Default: unset, which samples every `slot_idle_advance_interval_ms`, or every 15 s
+    /// when idle advance is disabled.
+    #[serde(default)]
+    pub slot_state_sample_interval_ms: Option<u64>,
 }
 
 /// How the connector reads the WAL stream from PostgreSQL.
@@ -1257,11 +1283,26 @@ impl StreamHandle for PostgresStreamHandle {
             // events — so it has to be current precisely when the pipeline is *behind*.
             // Sampling it only from the idle-advance branch meant it refreshed only when
             // the pipeline was caught up, and not at all when idle advance was disabled.
-            if self.slot_lag_sample_due()
-                && let Some(lag_bytes) = self.provider.measure_slot_lag().await?
-            {
-                self.last_slot_lag_bytes = lag_bytes;
-                self.last_slot_lag_at = Some(std::time::Instant::now());
+            //
+            // The slot's state rides the same sample. `unreserved` is the warning that still
+            // leaves time to act; `lost` is raised here as well as from a failed read, so a
+            // pipeline whose reads keep succeeding — or that has reconnects disabled — still
+            // gets the verdict.
+            if self.slot_lag_sample_due() {
+                let now = std::time::Instant::now();
+                self.last_slot_sample_at = Some(now);
+                if let Some(lag_bytes) = self.provider.measure_slot_lag().await? {
+                    self.last_slot_lag_bytes = lag_bytes;
+                    self.last_slot_lag_at = Some(now);
+                }
+                if let Some(state) = self.provider.sample_slot_state().await? {
+                    let lost =
+                        parser::classify_slot_failure(&self.stream.slot_name, None, Some(&state));
+                    self.last_slot_state = Some(state);
+                    if let Some(error) = lost {
+                        return Err(error);
+                    }
+                }
             }
 
             if !had_data && slot_is_caught_up && self.slot_idle_advance_interval_ms > 0 {
@@ -1349,6 +1390,14 @@ impl StreamHandle for PostgresStreamHandle {
         } else {
             Some(self.last_slot_lag_bytes)
         }
+    }
+
+    fn replication_slot_wal_status(&self) -> Option<crate::core::SlotWalStatus> {
+        self.last_slot_state.as_ref()?.wal_status
+    }
+
+    fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
+        self.last_slot_state.as_ref()?.safe_wal_size
     }
 }
 
@@ -1471,7 +1520,6 @@ mod tests {
     use super::decoder::{
         PgOutputMessage, PgOutputXLogData, PgValue, PollOutcome, decode_pgoutput_message,
     };
-    use super::parser::map_pgoutput_poll_error;
     use super::validation::{ValidationBackend, validate_with_backend};
     use super::{
         MAX_EVENTS_PER_POLL, PgOutputMessageProvider, PostgresConnection, PostgresSnapshotHandle,
@@ -1491,12 +1539,20 @@ mod tests {
         create_called: Arc<AtomicBool>,
         /// Records the `failover` argument the connector passed to slot creation.
         create_failover: Arc<AtomicBool>,
+        slot_state: Option<super::parser::SlotState>,
     }
 
     #[async_trait]
     impl ValidationBackend for MockValidationBackend {
         async fn replication_slot_exists(&self, _slot_name: &str) -> crate::core::Result<bool> {
             Ok(self.slot_exists)
+        }
+
+        async fn replication_slot_state(
+            &self,
+            _slot_name: &str,
+        ) -> crate::core::Result<Option<super::parser::SlotState>> {
+            Ok(self.slot_state.clone())
         }
 
         async fn create_replication_slot(
@@ -3027,14 +3083,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pgoutput_poll_error_maps_dead_slot_guidance() {
-        let err = map_pgoutput_poll_error("slot1", "ERROR: required WAL segment has been removed");
-        let msg = err.to_string();
-        assert!(msg.contains("stale or dead"));
-        assert!(msg.contains("slot1"));
-    }
-
     // ─── Existing tests kept ──────────────────────────────────────────────────
 
     #[test]
@@ -3262,6 +3310,138 @@ mod tests {
         assert!(capabilities.handoff);
         assert!(!capabilities.heartbeat);
         assert!(capabilities.ddl_capture);
+    }
+
+    #[tokio::test]
+    async fn validation_refuses_a_slot_the_server_has_invalidated() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            ..Default::default()
+        };
+        let lost = super::parser::SlotState {
+            wal_status: Some(crate::core::SlotWalStatus::Lost),
+            safe_wal_size: None,
+            invalidation_reason: Some("idle_timeout".into()),
+        };
+        let backend = MockValidationBackend {
+            slot_exists: true,
+            publication_exists: true,
+            has_replication_privilege: true,
+            slot_state: Some(lost),
+            ..Default::default()
+        };
+
+        let error = validate_with_backend(&config, &backend)
+            .await
+            .expect_err("an invalidated slot must be refused at startup");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated)
+        );
+        assert!(error.to_string().contains("idle_timeout"), "{error}");
+
+        let reserved = MockValidationBackend {
+            slot_exists: true,
+            publication_exists: true,
+            has_replication_privilege: true,
+            slot_state: Some(super::parser::SlotState {
+                wal_status: Some(crate::core::SlotWalStatus::Reserved),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_with_backend(&config, &reserved)
+            .await
+            .expect("a reserved slot is usable");
+    }
+
+    /// A provider whose catalogue reads report a fixed slot state.
+    struct SlotStateProvider {
+        state: super::parser::SlotState,
+    }
+
+    #[async_trait]
+    impl PgOutputMessageProvider for SlotStateProvider {
+        async fn poll_xlog_data(
+            &mut self,
+            _max: usize,
+            _poll_timeout: std::time::Duration,
+        ) -> crate::core::Result<PollOutcome> {
+            Ok(PollOutcome::Data(Vec::new()))
+        }
+
+        async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+            Ok(())
+        }
+
+        async fn sample_slot_state(
+            &mut self,
+        ) -> crate::core::Result<Option<super::parser::SlotState>> {
+            Ok(Some(self.state.clone()))
+        }
+    }
+
+    fn slot_state_handle(state: super::parser::SlotState) -> PostgresStreamHandle {
+        PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(SlotStateProvider { state }),
+            100,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_sample_raises_slot_invalidated_without_a_reconnect() {
+        // Every read succeeds; only the sample can see the slot is gone. Without it a
+        // pipeline with reconnects disabled would report a poll loop that is not turning.
+        let mut handle = slot_state_handle(super::parser::SlotState {
+            wal_status: Some(crate::core::SlotWalStatus::Lost),
+            ..Default::default()
+        });
+        let error = handle
+            .next_events(10)
+            .await
+            .expect_err("a lost slot must fail the poll");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sample_reports_an_unreserved_slot_and_its_safe_size() {
+        use crate::source::StreamHandle as _;
+        let mut handle = slot_state_handle(super::parser::SlotState {
+            wal_status: Some(crate::core::SlotWalStatus::Unreserved),
+            safe_wal_size: Some(-4096),
+            invalidation_reason: None,
+        });
+        handle
+            .next_events(10)
+            .await
+            .expect("an unreserved slot still reads");
+        assert_eq!(
+            handle.replication_slot_wal_status(),
+            Some(crate::core::SlotWalStatus::Unreserved)
+        );
+        assert_eq!(handle.replication_slot_safe_wal_size_bytes(), Some(-4096));
     }
 
     #[tokio::test]
