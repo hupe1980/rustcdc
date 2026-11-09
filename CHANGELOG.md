@@ -139,6 +139,13 @@ never fired; the streaming transport had none.
 - Every container image the suites pull is pinned — the brokers, and SQL Server, which floated as
   `2022-latest` — and the policy gate fails on a floating tag.
 
+### Fixed: a built-in connector held as `dyn Source` never connected
+
+`PostgresConnection`, `MysqlConnection` and `SqlServerConnection` did not override
+`Source::connect` and `Source::close`, whose defaults do nothing, so a connector registered with
+`register_source` or wrapped in another `Source` failed its first stream with "connection must
+be established". The trait methods now call the connectors' own.
+
 ### Breaking
 
 1. **MSRV raised to 1.97.0** from 1.95.0.

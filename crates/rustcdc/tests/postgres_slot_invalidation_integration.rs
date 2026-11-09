@@ -338,3 +338,51 @@ async fn an_invalidated_slot_is_refused_at_startup() -> rustcdc::Result<()> {
     );
     Ok(())
 }
+
+/// The `START_REPLICATION` refusal is classified on its own path. `connect()` validates
+/// the slot while it is still intact; it is then lost before the stream opens, so only the
+/// refusal path in `start_stream` can name it.
+#[tokio::test]
+async fn a_refused_start_replication_is_classified_as_an_invalidated_slot() -> rustcdc::Result<()> {
+    if !docker_enabled("postgres refused START_REPLICATION test") {
+        return Ok(());
+    }
+    let container = start_postgres("16-alpine", &["-c", "max_slot_wal_keep_size=1MB"]).await?;
+    let (admin, host, port) = admin_client(&container).await?;
+    let slot = "refused_slot";
+    prepare(&admin, slot).await?;
+
+    let mut connection = rustcdc::PostgresConnection::new(PostgresSourceConfig {
+        host,
+        port,
+        user: "postgres".into(),
+        password: "postgres".to_string().into(),
+        database: "cdc".into(),
+        replication_slot_name: slot.into(),
+        publication_name: "slot_pub".into(),
+        transport: rustcdc::TransportConfig::plaintext(),
+        conn_timeout_secs: 30,
+        wal_transport: WalTransport::StreamingReplication,
+        slot_idle_advance_interval_ms: 0,
+        ..PostgresSourceConfig::default()
+    });
+    rustcdc::source::Source::connect(&mut connection).await?;
+
+    burst_wal(&admin).await?;
+    admin
+        .batch_execute("CHECKPOINT")
+        .await
+        .map_err(source_error)?;
+
+    let error = match rustcdc::source::Source::start_stream(&mut connection, None).await {
+        Ok(_) => panic!("a lost slot must refuse START_REPLICATION"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.source_kind(),
+        Some(SourceErrorKind::SlotInvalidated),
+        "{}",
+        error.report()
+    );
+    Ok(())
+}

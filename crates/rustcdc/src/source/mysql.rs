@@ -1437,6 +1437,16 @@ impl MysqlConnection {
 
 #[async_trait]
 impl Source for MysqlConnection {
+    // The trait's defaults are no-ops, so without these a connector held as
+    // `Box<dyn Source>` — registered with `register_source`, or wrapped — never connected.
+    async fn connect(&self) -> Result<()> {
+        MysqlConnection::connect(self).await
+    }
+
+    async fn close(&self) {
+        MysqlConnection::close(self).await
+    }
+
     async fn start_snapshot(&mut self, tables: &[&str]) -> Result<Box<dyn SnapshotHandle>> {
         self.start_snapshot_internal(tables, None).await
     }

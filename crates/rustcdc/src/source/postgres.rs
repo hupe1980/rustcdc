@@ -1051,6 +1051,16 @@ impl Drop for PostgresConnection {
 
 #[async_trait]
 impl Source for PostgresConnection {
+    // The trait's defaults are no-ops, so without these a connector held as
+    // `Box<dyn Source>` — registered with `register_source`, or wrapped — never connected.
+    async fn connect(&self) -> Result<()> {
+        PostgresConnection::connect(self).await
+    }
+
+    async fn close(&self) {
+        PostgresConnection::close(self).await
+    }
+
     async fn start_snapshot(&mut self, tables: &[&str]) -> Result<Box<dyn SnapshotHandle>> {
         Ok(Box::new(self.start_snapshot_internal(tables).await?))
     }
