@@ -141,31 +141,31 @@ would stall the pipeline permanently on one oversized row with no way to make pr
 
 ## Non-PostgreSQL Sources
 
-For MySQL and SQL Server deployments, use the same runtime pattern with source-specific config and operational prerequisites from [config_reference.md](@/docs/config-reference.md) and [runbook.md](@/docs/embedded-operations.md).
+For MySQL and SQL Server deployments, use the same runtime pattern with source-specific config and operational prerequisites from [Library options](@/docs/config-reference.md) and [Embedded pipelines](@/docs/embedded-operations.md).
 
 ### SQL Server: Supported Versions
 
 | SQL Server Version | Status |
 |---|---|
-| 2022 | ✅ CI-tested on every push/PR (`mcr.microsoft.com/mssql/server:2022-latest`) |
-| 2019 | ⚠️ Not CI-tested; protocol-compatible (same `sys.fn_cdc_get_all_changes_*` API). Manual validation recommended before production use. |
-| 2017 | ⚠️ Not CI-tested; CDC tables and change-tracking APIs available but not verified in the CI matrix. |
-| 2016 | ⚠️ Not CI-tested; minimum supported version (major version 13). Startup is allowed; manual validation required. |
-| 2014 and earlier | ❌ Not supported. Rejected at startup with `Error::SourceError` (requires major version ≥ 13). |
+| 2025 | CI-tested (`sqlserver_version_matrix`): connect with CDC enabled, on `2025-CU10-ubuntu-24.04` |
+| 2022 | CI-tested: every SQL Server suite, on `2022-CU27-ubuntu-22.04` |
+| 2019 | CI-tested (`sqlserver_version_matrix`): connect with CDC enabled, on `2019-CU32-ubuntu-20.04` |
+| 2016, 2017 | Accepted at startup (major version ≥ 13); not CI-tested |
+| 2014 and earlier | Rejected at startup with `Error::SourceError` |
+
+The image tags are pinned in `crates/rustcdc/tests/sqlserver_testkit.rs`.
 
 The prerequisite probe in `crates/rustcdc/src/source/sqlserver/query.rs` checks for:
 - `is_cdc_enabled` on the target database.
 - `db_owner`, `sysadmin`, or `db_ddladmin` role membership.
 - Server major version ≥ 13 (SQL Server 2016). Versions below this are rejected at startup with an `Error::SourceError`.
 
-If you require SQL Server 2019 coverage in CI, add the `mcr.microsoft.com/mssql/server:2019-latest` image to the `integration-sqlserver` matrix in `.github/workflows/ci.yml`.
-
 ## Related Documentation
 
-- [getting_started.md](@/docs/embedding.md)
-- [config_reference.md](@/docs/config-reference.md)
-- [runbook.md](@/docs/embedded-operations.md)
-- [troubleshooting.md](@/docs/troubleshooting.md)
+- [Embedding the library](@/docs/embedding.md)
+- [Library options](@/docs/config-reference.md)
+- [Embedded pipelines](@/docs/embedded-operations.md)
+- [Troubleshooting](@/docs/troubleshooting.md)
 
 ---
 

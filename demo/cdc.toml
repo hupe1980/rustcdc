@@ -15,10 +15,8 @@ database              = "demo"
 replication_slot_name = "cdc_demo_slot"
 publication_name      = "cdc_demo_pub"
 
-# Demo-only: let the connector create the slot on first boot (rustcdc ≥ 0.7.0
-# no longer creates slots implicitly — a slot that vanishes mid-life is a
-# data-loss event, and recreating it silently would skip everything in between).
-# In production, provision the slot out of band and leave this at false.
+# Demo-only: create the slot on first boot. In production provision it out of band
+# and leave this at false; a vanished slot is data loss.
 create_replication_slot_if_missing = true
 
 # Periodically advance the slot when the database is idle so PostgreSQL can

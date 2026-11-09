@@ -39,7 +39,8 @@ ignore = [
 
     # RUSTSEC-2026-0440: astral-tokio-tar is unmaintained (2026-11-03). Reached only through
     # testcontainers, a dev-dependency of rustcdc (`cargo tree -i astral-tokio-tar -e all`),
-    # so it is in no published crate and no image. testcontainers 0.28 still depends on it.
+    # so it is in no published crate and no image. testcontainers 0.27 (current) and 0.28 both
+# depend on it.
     # Remove when testcontainers moves off it.
     { id = "RUSTSEC-2026-0440" },
 ]
@@ -85,8 +86,6 @@ deny = [
     { name = "openssl-sys" },
     # Avoid the unsound `atty` crate (GHSA-g98v-hv3f-hcfr).
     { name = "atty" },
-    # Prefer tokio channels; remove crossbeam if it sneaks in.
-    # { name = "crossbeam-channel" },
 ]
 
 # ── Skip justification guide ───────────────────────────────────────────────
@@ -96,8 +95,8 @@ deny = [
 # Remove entries when the upstream diamond is resolved.
 # ──────────────────────────────────────────────────────────────────────────
 skip = [
-    # Duplicates the 0.20 dependency move introduced, each traced with
-    # `cargo tree -i <crate>@<version> --target all -e normal,build` on 2026-11-09:
+    # Root causes (verified 2026-11-09 with
+    # `cargo tree -i <crate>@<version> --target all -e normal,build`):
     #   - zstd / zstd-safe 0.13 vs 0.14: apache-avro 0.21 (pinned by iceberg 0.11) vs krafka
     #       0.29's `zstd` feature. Resolves when iceberg moves to apache-avro 0.22.
     #   - strum / strum_macros 0.27 vs 0.28: apache-avro 0.21 (iceberg) vs jsonschema 0.61
@@ -113,7 +112,7 @@ skip = [
     { name = "strum_macros" },
     { name = "asyncband" },
     { name = "spin" },
-    # RustCrypto generation split: rustcdc 0.8 moved to the 0.11/0.6 generation
+    # RustCrypto generation split: rustcdc is on the 0.11 RustCrypto generation
     # (aes-gcm 0.11, sha2 0.11, hkdf 0.13) while iceberg 0.11 still pins aes-gcm 0.10
     # for its Puffin/KMS encryption. Both are pure-Rust AEAD implementations of the
     # same primitive; neither can move without its parent. Revisit when iceberg-rust
@@ -149,17 +148,19 @@ skip = [
     # use 0.1. Display-width tables only.
     { name = "unicode-width" },
     # Crypto version diamonds.
-    # Root causes (re-verified against the krafka 0.28 / iceberg 0.11 / tiberius 0.13
-    # graph — `cargo tree -i <crate>@<version> --target all -e all`):
+    # Root causes (against the krafka 0.29 / iceberg 0.11 / tiberius 0.13 graph —
+    # `cargo tree -i <crate>@<version> --target all -e all`):
     #   - webpki-roots / const-oid: 0.26 / 0.9 generation still reached through older
     #       transitive crates alongside 1.x / 0.10
     #   - base64: opendal/reqsign are on 0.23; older transitive crates on 0.21/0.22
     #   - sha2 / hmac / md-5 / digest / block-buffer / crypto-common / cpufeatures:
-    #       the RustCrypto 0.10→0.11 generation change; rustcdc 0.8 moved, its
-    #       transitive deps (mysql_common, tiberius) have not
+    #       the RustCrypto 0.10→0.11 generation change; rustcdc is on 0.11, while
+    #       krafka, mysql_common, sqlx, rsa, ed25519-dalek, wasmtime and the Zerobus SDK
+    #       are on 0.10
     #   - rand / rand_chacha / rand_core / getrandom: 0.8 vs 0.9 split across the
     #       database drivers and the newer crates
-    #   - hashbrown: indexmap 1.x vs 2.x diamond
+    #   - hashbrown: dashmap 6 on 0.14, sqlx and petgraph 0.8 on 0.15, wasmtime's gimli
+    #       on 0.16, arrow and opendal on 0.17
     { name = "base64" },
     { name = "block-buffer" },
     { name = "const-oid" },
@@ -183,11 +184,11 @@ skip = [
     #   - quick-xml: opendal-core 0.58 is on 0.41 while another branch of the graph
     #       is already on 0.42
     #   - socket2: older tokio vs newer tokio/hyper version split
-    #   - serde_spanned / toml / toml_datetime / winnow: figment uses toml 0.5.x;
-    #       other crates use toml 0.8.x
-    #   - thiserror / thiserror-impl: macro + runtime split from old vs new anyhow
-    #       transitive chains (safe — no runtime code, pure proc-macro crate)
-    #   - foldhash: hashbrown 0.14 vs 0.15 internal hasher change
+    #   - serde_spanned / toml / toml_datetime / winnow: figment and the server's config
+    #       loader use toml 0.8; wasmtime-internal-cache uses toml 1.x
+    #   - thiserror / thiserror-impl: 1.x through the Zerobus SDK and krafka
+    #       (tokio-socks); everything else is on 2.x
+    #   - foldhash: hashbrown 0.15 uses 0.1, hashbrown 0.17 uses 0.2
     { name = "darling" },
     { name = "darling_core" },
     { name = "darling_macro" },
@@ -209,9 +210,9 @@ skip = [
     { name = "wasm-encoder" },
     { name = "whoami" },
     # miniz_oxide: apache-avro 0.21 depends on 0.8 directly for its deflate codec, while
-    # every other DEFLATE user in the tree — krafka, parquet, mysql_common, schemreg, zip
-    # — reaches 0.9 through flate2 1.1. One pure-Rust implementation of one format at two
-    # minors. Resolves when apache-avro follows flate2.
+    # every other DEFLATE user in the tree — krafka, parquet, iceberg, mysql_common,
+    # schemreg — reaches 0.9 through flate2 1.1. One pure-Rust implementation of one format
+    # at two minors. Resolves when apache-avro follows flate2.
     { name = "miniz_oxide" },
     # syn 2.x vs 3.x: proc-macro ecosystem mid-transition; both versions are
     # compile-time only.
