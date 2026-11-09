@@ -7,8 +7,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-# The binary ships as a container image, not on crates.io. The library at the workspace
-# root is the published artefact.
+# The binary ships as a container image, not on crates.io. The library in `crates/rustcdc`
+# is the published artefact.
 publish = false
 description = "Change-data-capture server powered by rustcdc"
 
@@ -24,18 +24,9 @@ path = "src/main.rs"
 # Features
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# **Connectors are opt-in, and the default is PostgreSQL alone.**
-#
-# A PostgreSQL-only deployment should not link database drivers it never uses: every
-# advisory against one is reported by scanners whether or not the path is reachable, and
-# "unreachable in your configuration" is not an answer any auditor accepts.
-#
-# The published container image builds with `--all-features`, so the shipped artifact
-# carries every connector and loses nothing. Only a source build narrows.
-#
-# A config naming a connector that was not compiled in is rejected at load with a message
-# naming the feature to rebuild with — see `reject_uncompiled_source_driver`. It is never
-# a serde "unknown variant" error, and it never silently loads.
+# Connectors are opt-in (default: postgres), so a build links and gets audited for only the
+# drivers it uses. The image builds `--all-features`. A config naming an uncompiled connector
+# is rejected at load with the feature to rebuild with (`reject_uncompiled_source_driver`).
 [features]
 default = ["postgres"]
 
@@ -94,7 +85,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls = "0.23"
 # PEM parsing comes from rustls-pki-types, not the unmaintained `rustls-pemfile`
 # (RUSTSEC-2025-0134) — `PemObject` is the same implementation that crate's final
-# release wrapped, and it keeps one PEM parser in the tree alongside rustcdc 0.8.
+# release wrapped, and it keeps one PEM parser in the tree alongside the library's.
 rustls-pki-types = { version = "1", features = ["std"] }
 url = "2"
 
@@ -141,38 +132,31 @@ krafka = { version = "0.29.0", default-features = false, features = ["zstd", "ru
 # AWS credential chain. Not optional: `iceberg-catalog-s3tables` pulls it unconditionally
 # and the SQS dead-letter target needs it by name.
 #
-# No `rustls` feature — that name selects `legacy-rustls-ring`, i.e. rustls 0.21, a second
-# TLS stack.
+# No `rustls` feature on this or the other AWS SDK crates: that name selects
+# `legacy-rustls-ring` (rustls 0.21), a second TLS stack the architecture guard rejects.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest"] }
 aws-sdk-glue = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 
-# Snowflake key-pair auth. `jsonwebtoken` was dropped: every one of its crypto backends adds
-# a stack the graph does not already have. `rsa` is needed anyway for the `RSA_PUBLIC_KEY_FP`
-# fingerprint and signs PKCS#1 v1.5 over SHA-256 — which is RS256. See `mint_jwt`.
+# Snowflake key-pair JWT via `rsa` (RS256, see `mint_jwt`); no extra crypto stack. `rsa` is
+# needed anyway for the `RSA_PUBLIC_KEY_FP` fingerprint.
 rsa = { version = "0.9", features = ["sha2", "pkcs5"] }
 base64 = { workspace = true }
 
 # Amazon SQS dead-letter target. `aws-config` is already unconditional, so this costs one
 # thin SDK client rather than the AWS runtime.
-# No `rustls` feature: it maps to `legacy-rustls-ring` (rustls 0.21), a second TLS stack the
-# architecture guard rejects. `default-https-client` is the modern hyper client.
 aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 
 iceberg = "0.11.0"
 iceberg-catalog-rest = "0.11.0"
-# AWS S3 Tables — a managed Iceberg catalog. Same version line as `iceberg` and
-# `iceberg-catalog-rest`: all three share the `Catalog` trait.
-#
-# Worth it for this sink specifically — the Iceberg destination is an append-only change log,
-# and S3 Tables runs the compaction and unreferenced-file removal that otherwise falls to the
-# operator.
+# AWS S3 Tables: a managed catalog that compacts the append-only change log for the operator.
+# Same version line as `iceberg`, because all three crates share the `Catalog` trait.
 iceberg-catalog-s3tables = "0.11.0"
 iceberg-storage-opendal = { version = "0.11.0", features = ["opendal-fs", "opendal-s3", "opendal-gcs", "opendal-azdls"] }
 arrow-array = "58"
 arrow-schema = "58"
 parquet = "58"
 
-# Storage abstraction (E02-S03) — pinned to the same major as iceberg-storage-opendal
+# Storage abstraction, pinned to the same major as iceberg-storage-opendal
 # so the state backends and the Iceberg sink share one opendal in the graph.
 opendal = { version = "0.58", features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "services-redis", "services-postgresql"] }
 # Databricks Zerobus Ingest — protocol, OAuth, back-pressure and stream recovery are all

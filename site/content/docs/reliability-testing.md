@@ -133,20 +133,16 @@ shows the additions describe real behaviour rather than being tightened arbitrar
 
 ### A comparison is only as good as what the fixtures can express
 
-Comparing a field is necessary but not sufficient. Until 0.12.0 the replay engine hardcoded
-`before_is_key_only`, `unavailable_columns` and `before_unavailable_columns` to their empty
-defaults, so **both sides of those comparisons were structurally always equal** — the fields had
-the appearance of coverage and none of the substance, and an unchanged-TOAST regression was still
-invisible.
-
-The fixture payload now carries all three, and `postgres_unchanged_toast_v1` exercises them with
-both cases in one file: a TOASTed column that was *not* modified (absent from `after`, named in
-`unavailable_columns`, key-only before-image) and one that *was* (present in `after`, absent from
-`before`, named in `before_unavailable_columns`). The second is why the two lists are never
+Comparing a field is necessary but not sufficient: a field the replay engine fills with a
+constant is equal on both sides by construction. The fixture payload therefore carries
+`before_is_key_only`, `unavailable_columns` and `before_unavailable_columns`, and
+`postgres_unchanged_toast_v1` covers both cases in one file: a TOASTed column that was *not*
+modified (absent from `after`, named in `unavailable_columns`, key-only before-image) and one
+that *was* (present in `after`, absent from `before`, named in `before_unavailable_columns`). The second is why the two lists are never
 merged — merging them marks a genuinely changed column as unwritable and silently drops the
 update.
 
-Absent fields mean "complete payload", so fixtures written before this are unaffected. A wrong
+Absent fields mean "complete payload", so a fixture without them is read as complete. A wrong
 *shape* is rejected rather than ignored, because a silently-dropped `unavailable_columns` would
 record a golden asserting the opposite of what its author wrote.
 
@@ -380,18 +376,14 @@ both. Re-run it on the hardware you intend to deploy on rather than quoting the 
 bash scripts/run_full_integration_matrix_evidence.sh
 ```
 
-Thirty-eight container suites across PostgreSQL, MySQL, MariaDB and SQL Server, plus the
-reliability and latency gates. It writes `target/integration-full-matrix-evidence.txt`, which
+Thirty-three container suites across PostgreSQL, MySQL, MariaDB and SQL Server, seven
+reliability suites, and the latency gate. It writes `target/integration-full-matrix-evidence.txt`, which
 is the artifact a release quotes.
 
 **A suite that did not run is not a suite that passed.** An image-pull failure — a Docker Hub
 rate-limit, a registry 404, a truncated layer — is CI infrastructure rather than a code
-regression, so it is recorded as `STATUS: SKIP` rather than `FAIL`. Until 0.13.0 a skip was
-also counted as a pass, which meant a registry outage during a release run could skip every
-container suite and still print *"Full integration matrix completed successfully"* and exit 0:
-the evidence artifact then certified a matrix that never ran.
-
-Skips are now listed by name in the report and **fail the run**:
+regression, so it is recorded as `STATUS: SKIP` rather than `FAIL`. Skips are listed by name
+and **fail the run**, so a registry outage cannot produce evidence for a matrix that never ran:
 
 ```text
 Skipped suites (image pull failed — these produced NO evidence):

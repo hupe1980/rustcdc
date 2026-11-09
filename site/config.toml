@@ -15,9 +15,8 @@
 base_url = "https://hupe1980.github.io/rustcdc"
 
 title = "rustcdc"
-description = "Open-source change data capture in Rust. Stream row-level changes from PostgreSQL, MySQL, MariaDB and SQL Server to Kafka, Iceberg, HTTP or files — as a server, or as a crate you embed."
+description = "Open-source change data capture in Rust. Stream row-level changes from PostgreSQL, MySQL, MariaDB and SQL Server to Kafka, Iceberg, Snowflake, Databricks, HTTP or files — as a server, or as a crate you embed."
 
-# UK spelling throughout the prose; this only affects Zola's own slug generation.
 default_language = "en"
 
 compile_sass = true
@@ -27,17 +26,7 @@ compile_sass = true
 # leaves the reader's browser.
 build_search_index = true
 
-# Zola 0.23 made every content file a Tera template, rendered *before* the markdown
-# parser and with no protection for fenced code blocks. On a site that is mostly code
-# samples that is a standing hazard: any Rust `format!` escape, Prometheus annotation,
-# Helm value or Vue snippet containing `{{` fails the build, and the failure reads as a
-# template error in a file that contains no template. Upstream considers this intended
-# (getzola/zola#3263, closed "not going to happen by default").
-#
-# Skipping the pass for all content restores what 0.22 did. Nothing here wants Tera in
-# prose: the one former shortcode had a single call site, and the number it inserted is
-# now checked against the manifest by `crates/rustcdc-server/tests/architecture.rs`, which is a stronger
-# guarantee than an indirection that merely moved where the number was written.
+# Content is not Tera-templated: code samples contain `{{` (getzola/zola#3263).
 skip_content_templating = ["**/*.md"]
 
 # Every `@/…md` link is resolved at build time, so a renamed page fails the build
@@ -88,12 +77,6 @@ author = "hupe1980"
 
 # Left-hand documentation navigation. Declared here rather than derived from the
 # filesystem so the order is editorial — what a reader needs first, not alphabetical.
-#
-# One section, not two. The library and the server are one product at one version, and
-# splitting the documentation by *artefact* made a reader pick a side before they knew
-# which one they wanted — then re-read the same concepts in whichever half they landed in.
-# Pages are grouped by the task instead, and each says at the top which surface it applies
-# to when that is not both.
 
 [[extra.nav]]
 title = "Start"

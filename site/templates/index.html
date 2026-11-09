@@ -34,7 +34,7 @@
             "operatingSystem": "Linux",
             "softwareVersion": {{ config.extra.version | json_encode | safe }},
             "url": {{ (config.base_url ~ "/docs/") | json_encode | safe }},
-            "description": "A configured change-data-capture server and distroless container image: TOML in, Kafka, Iceberg, Snowflake, HTTP or files out."
+            "description": "A configured change-data-capture server and distroless container image: TOML in, Kafka, Iceberg, Snowflake, Databricks, HTTP or files out."
           },
           {
             "@type": "SoftwareSourceCode",
@@ -68,7 +68,7 @@
             "name": "Where can rustcdc deliver change events?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Apache Kafka, Apache Iceberg, any HTTP endpoint, newline-delimited JSON files, or stdout. Events can be encoded as JSON, CloudEvents, Avro or Protobuf, using Confluent, Apicurio or AWS Glue schema registries."
+              "text": "Apache Kafka, Apache Iceberg, Snowflake (Snowpipe Streaming), Databricks (Zerobus Ingest), any HTTP endpoint, newline-delimited JSON files, or stdout. Events can be encoded as JSON, CloudEvents, Avro or Protobuf, using Confluent, Apicurio or AWS Glue schema registries."
             }
           },
           {
@@ -76,7 +76,7 @@
             "name": "Does rustcdc support exactly-once delivery?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "Yes. With effectively_once the batch\u2019s records and its checkpoint are written in a single Kafka transaction, so a crash discards both or keeps both and there is no window in which one survives without the other. It requires a transactional Kafka sink and a Kafka checkpoint topic on the same cluster; any other combination is rejected at startup rather than silently degraded."
+              "text": "Not end to end. With effectively_once a batch\u2019s records and its checkpoint commit together \u2014 in one Kafka transaction, or by a Snowflake channel\u2019s offset token. It requires a transactional Kafka sink with its checkpoint topic on the same cluster, or the Snowflake sink; any other combination is rejected at startup rather than silently degraded."
             }
           },
           {
@@ -111,7 +111,7 @@
     <h1>Change data capture<br><span class="grad">built in Rust</span></h1>
     <p class="lede">
       Stream every <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code> from PostgreSQL,
-      MySQL, MariaDB and SQL Server into Kafka, Iceberg, HTTP or files — with delivery
+      MySQL, MariaDB and SQL Server into Kafka, Iceberg, Snowflake, Databricks, HTTP or files — with delivery
       contracts that say exactly what they guarantee, a sandboxed WASM transform pipeline,
       and a signed audit trail.
     </p>
@@ -153,7 +153,7 @@
         <p class="path-for">You want change data capture <strong>running</strong>.</p>
         <p>
           A configured binary and distroless container image. TOML in; Kafka, Iceberg,
-          Snowflake, HTTP or files out. Admin API, Prometheus, OTLP traces, dead-letter
+          Snowflake, Databricks, HTTP or files out. Admin API, Prometheus, OTLP traces, dead-letter
           queue, signed audit trail.
         </p>
         <div class="hero-run">
@@ -210,6 +210,8 @@
         <ul>
           <li>Apache Kafka <span>idempotent · transactional</span></li>
           <li>Apache Iceberg <span>REST catalog</span></li>
+          <li>Snowflake <span>Snowpipe Streaming</span></li>
+          <li>Databricks <span>Zerobus Ingest</span></li>
           <li>HTTP <span>batched + retry</span></li>
           <li>Files <span>rotating JSONL</span></li>
         </ul>
@@ -228,11 +230,11 @@
 
     <div class="feature-grid">
       <article class="feature">
-        <h3>Exactly-once, end to end</h3>
+        <h3>Records and checkpoint commit together</h3>
         <p>
-          <code>effectively_once</code> writes the checkpoint <em>inside</em> the sink's Kafka
-          transaction, so a batch's data and the position describing it commit together. A crash
-          discards both or keeps both — there is no window where one survives without the other.
+          With <code>effectively_once</code>, a batch's records and its checkpoint commit together
+          — in one Kafka transaction, or by a Snowflake channel's offset token. Any other sink is
+          rejected at startup for that contract rather than silently degraded.
         </p>
         <a href="{{ get_url(path='/docs/concepts/') }}#3-delivery-contracts">Delivery contracts →</a>
       </article>
@@ -278,12 +280,8 @@
       <article class="feature">
         <h3>Observability that resolves</h3>
         <p>
-          Prometheus and OTLP, latency histograms in seconds at microsecond resolution, and a
-          health verdict that tells a quiet database apart from a dead socket — with a stable
-          stall <em>cause</em> to route the page, because an unconfirmed replication slot, a
-          wedged poll loop and a sink that stopped draining go to three different people.
-          <code>/livez</code> restarts the pod for exactly one of them. Shipped alert rules are
-          tested against the metrics that actually exist.
+          Prometheus and OTLP, and a health verdict with a stable stall cause that tells a quiet
+          database from a dead socket. Shipped alert rules are tested against real metric names.
         </p>
         <a href="{{ get_url(path='/docs/runbook/') }}#1-first-response">Health verdict →</a>
       </article>

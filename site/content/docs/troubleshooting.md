@@ -210,7 +210,7 @@ ERROR checkpoint error: failed to read checkpoint: invalid JSON
    -- Should return: 0/11000000 (example)
    
    -- Calculate gap
-   -- If checkpoint LSN differs from the slot's confirmed_flush_lsn, rustcdc now fails closed
+   -- If checkpoint LSN differs from the slot's confirmed_flush_lsn, rustcdc fails closed
    ```
 
 **Resolution:**
