@@ -370,6 +370,7 @@ impl Serialize for RowShape {
     }
 }
 
+#[cfg(any(feature = "avro", feature = "protobuf"))]
 /// Parts for the codecs that rebuild a shape field by field (Avro, Protobuf).
 pub(crate) fn row_shape_from_parts(
     id: String,
