@@ -483,14 +483,30 @@ fn uses_unsafe_keyword(code: &str) -> bool {
 
 #[test]
 fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
-    /// `(file, why)`. One entry. Adding a second needs an argument, in code review, here.
-    const ALLOWED: &[(&str, &str)] = &[(
-        "src/test_env.rs",
-        "the one place the crate mutates process environment, serialised by EnvGuard",
-    )];
+    /// `(file, why)`, relative to the workspace root, for both crates. A new entry needs an
+    /// argument, in code review, here.
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/rustcdc-server/src/test_env.rs",
+            "the one place the server mutates process environment, serialised by EnvGuard",
+        ),
+        (
+            "crates/rustcdc/src/checkpoint/owner_lease.rs",
+            "Windows process-liveness check: the OpenProcess/CloseHandle FFI has no safe wrapper \
+             in the dependency tree",
+        ),
+    ];
 
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the server crate sits two levels below the workspace root")
+        .to_path_buf();
     let mut found: Vec<String> = Vec::new();
-    let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    let mut stack = vec![
+        root.join("crates/rustcdc-server/src"),
+        root.join("crates/rustcdc/src"),
+    ];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -514,7 +530,7 @@ fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
                 continue;
             }
             found.push(
-                path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                path.strip_prefix(&root)
                     .unwrap_or(&path)
                     .display()
                     .to_string(),
@@ -528,9 +544,9 @@ fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "these files use `unsafe` and are not on the allowlist in this test. The library \
-         denies `unsafe_code` and the binary forbids it; if a new site is genuinely \
-         unavoidable, add it here with the argument:\n{unexpected:#?}"
+        "these files use `unsafe` and are not on the allowlist in this test. Both crates deny \
+         `unsafe_code` and the binary forbids it; if a new site is genuinely unavoidable, \
+         add it here with the argument:\n{unexpected:#?}"
     );
 
     for (file, why) in ALLOWED {

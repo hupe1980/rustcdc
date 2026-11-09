@@ -171,11 +171,9 @@ and the second one is invariably the unmaintained one.
 not against `Cargo.toml`. A transitive dependency is exactly as capable of adding a stack as
 a direct one.
 
-**Why it exists.** The SQL Server driver once pinned an older rustls and brought four
-suppressed RUSTSEC advisories with it, and "unreachable in your configuration" is not an answer
-an auditor accepts. The driver now shares the crate's stack, so the guard covers both the default
-build and the `--all-features` build the container image ships
-(`the_all_features_build_has_one_tls_stack`); a planted second `rustls` fails it
+**Why it exists.** "Unreachable in your configuration" is not an answer an auditor accepts, so
+the stack is held to one in every build: the default build and the `--all-features` build the
+image ships (`the_all_features_build_has_one_tls_stack`). A planted second `rustls` fails it
 (`the_tls_stack_check_fires_on_a_second_rustls`).
 
 **Does not catch:** a second TLS *implementation* that is not rustls — `native-tls`, OpenSSL.

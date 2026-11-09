@@ -542,15 +542,20 @@ require_release_job_order() {
   # Build first (proves both architectures compile, pushing only untagged digests), then
   # the irreversible crates.io publish, then the image tagging that makes it consumable,
   # then the announcement. See the ordering note at the top of release.yml.
+  # The binaries are a build too, so they gate the crate like the image does; Homebrew
+  # follows the GitHub release whose assets its formula downloads.
   expected="container-build=verify
-publish-crate=container-build
+binary-build=verify
+publish-crate=[container-build, binary-build]
 container-publish=publish-crate
-github-release=container-publish"
+github-release=container-publish
+homebrew-tap=github-release
+homebrew-install=homebrew-tap"
 
   actual="$(awk '
     /^jobs:$/            { in_jobs = 1; next }
     in_jobs && /^  [a-z][a-z0-9-]*:$/ { job = substr($1, 1, length($1) - 1); next }
-    in_jobs && /^    needs: / && job != "" { print job "=" $2; job = "" }
+    in_jobs && /^    needs: / && job != "" { sub(/^    needs: /, ""); print job "=" $0; job = "" }
   ' "$RELEASE_WORKFLOW")"
 
   if [[ "$actual" != "$expected" ]]; then
@@ -561,7 +566,7 @@ github-release=container-publish"
     printf '  %s\n' "$actual" >&2
     exit 1
   fi
-  echo "Release job order check passed (build -> crates.io -> image tags -> announcement)."
+  echo "Release job order check passed (builds -> crates.io -> image tags -> release -> Homebrew)."
 }
 
 run_workflow_drift_check() {
@@ -658,6 +663,10 @@ run_workflow_drift_check() {
   require_match "^    tags:$" "$RELEASE_WORKFLOW" "release is what a tag triggers"
   require_absent "^      - \"v\\*\"$" "$CI_WORKFLOW" "tag trigger in ci.yml (releases are release.yml's job)"
   require_match "\-\-notes-file release-notes.md" "$RELEASE_WORKFLOW" "release notes come from CHANGELOG.md"
+  # The tap token lives only in the `homebrew` environment, and the job holding it pins
+  # every action by commit.
+  require_match "^    environment: homebrew$" "$RELEASE_WORKFLOW" "Homebrew job runs in the homebrew environment"
+  require_absent "HOMEBREW_APP_PRIVATE_KEY" "$CI_WORKFLOW" "Homebrew secret outside release.yml"
   # Trusted publishing pins the workflow *filename*, which is why the release lives in
   # its own file rather than in ci.yml: a compromised action in the test matrix must not
   # be able to mint a crates.io token.

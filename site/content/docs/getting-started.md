@@ -14,6 +14,17 @@ You need a database you can enable replication on, and either Rust or Docker. Pi
 install path that matches where this will run — a binary for local development, VMs and
 bare metal, or the container image for Kubernetes and CI.
 
+## Install with Homebrew
+
+On macOS (Apple Silicon) and Linux (x86_64, arm64):
+
+```bash
+brew install hupe1980/tap/rustcdc
+rustcdc --version
+```
+
+The formula installs the release binary built with every connector and sink.
+
 ## Install the binary
 
 Requires Rust 1.97.0 or later (`rustup update stable`).
