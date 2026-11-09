@@ -422,9 +422,8 @@ pub(crate) fn build_redis_operator(config: &RedisStateConfig) -> Result<Operator
         builder = builder.password(&resolved);
     }
 
-    Ok(Operator::new(builder)
-        .map_err(|e| AppError::Other(format!("failed to build OpenDAL Redis operator: {e}")))?
-        .finish())
+    Operator::new(builder)
+        .map_err(|e| AppError::Other(format!("failed to build OpenDAL Redis operator: {e}")))
 }
 
 /// Build an OpenDAL [`Operator`] for a PostgreSQL endpoint.
@@ -441,9 +440,8 @@ pub(crate) fn build_postgresql_operator(
         .table(&config.checkpoint_table)
         .root("/");
 
-    Ok(Operator::new(builder)
-        .map_err(|e| AppError::Other(format!("failed to build OpenDAL PostgreSQL operator: {e}")))?
-        .finish())
+    Operator::new(builder)
+        .map_err(|e| AppError::Other(format!("failed to build OpenDAL PostgreSQL operator: {e}")))
 }
 
 #[cfg(test)]
@@ -454,7 +452,6 @@ mod tests {
     fn fs_operator(root: &Path) -> Operator {
         Operator::new(opendal::services::Fs::default().root(&root.to_string_lossy()))
             .expect("fs operator")
-            .finish()
     }
 
     async fn remote_record(op: &Operator) -> RemoteCheckpointRecord {

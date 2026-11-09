@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/rustcdc.svg)](https://crates.io/crates/rustcdc)
 [![docs.rs](https://img.shields.io/docsrs/rustcdc)](https://docs.rs/rustcdc)
 [![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
-[![Rust 1.95.0+](https://img.shields.io/badge/rust-1.95.0%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust 1.97.0+](https://img.shields.io/badge/rust-1.97.0%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
 **Change data capture you embed, not deploy.** PostgreSQL, MySQL, MariaDB, SQL Server and
@@ -459,7 +459,7 @@ zola --root site serve
 
 ## MSRV
 
-Rust 1.95.0+ or newer, matching `rust-version` in `[workspace.package]`. Raising it is a
+Rust 1.97.0+ or newer, matching `rust-version` in `[workspace.package]`. Raising it is a
 minor-version change. CI reads the number out of the manifest rather than restating it, and
 verifies both members on exactly that toolchain — `crates/rustcdc-server/tests/architecture.rs` fails the
 build if this README, the Dockerfile or the documentation site disagrees with it.

@@ -5,6 +5,7 @@
 //! the wrong medium for the artefact you reach for during an incident.
 
 use bytes::Bytes;
+use krafka::Record;
 use krafka::producer::{Acks, Producer};
 
 use super::DeadLetterRecord;
@@ -80,22 +81,24 @@ impl KafkaDlq {
     pub async fn new(config: &KafkaDlqConfig) -> Result<Self, AppError> {
         let auth = config.security.to_auth_config().map_err(AppError::Other)?;
 
-        let producer = Producer::builder()
-            .bootstrap_servers(config.brokers.clone())
-            .client_id(config.client_id.clone())
-            // `acks=all` + idempotent: a dead-letter record that is not durable is the
-            // same as no dead-letter record, and this write happens immediately before
-            // the checkpoint advances past the event it describes.
-            .acks(Acks::All)
-            .idempotent(true)
-            .request_timeout(std::time::Duration::from_millis(config.request_timeout_ms))
-            .connect_timeout(crate::sink::kafka_connect_timeout(
-                std::time::Duration::from_millis(config.request_timeout_ms),
-            ))
-            .auth(auth)
-            .build()
-            .await
-            .map_err(|e| AppError::Other(format!("failed to build dead-letter producer: {e}")))?;
+        let producer = crate::sink::kafka_builder(
+            config.brokers.clone(),
+            config.client_id.clone(),
+            std::time::Duration::from_millis(config.request_timeout_ms),
+            auth,
+        )
+        .connect()
+        .await
+        .map_err(|e| AppError::Other(format!("failed to connect dead-letter producer: {e}")))?
+        .producer()
+        // `acks=all` + idempotent: a dead-letter record that is not durable is the
+        // same as no dead-letter record, and this write happens immediately before
+        // the checkpoint advances past the event it describes.
+        .acks(Acks::All)
+        .idempotent(true)
+        .build()
+        .await
+        .map_err(|e| AppError::Other(format!("failed to build dead-letter producer: {e}")))?;
 
         Ok(Self {
             producer,
@@ -108,21 +111,15 @@ impl KafkaDlq {
 
         // Keyed by table so a compacted or partitioned dead-letter topic keeps one
         // table's failures together and in order — which is how they get triaged.
-        let metadata = self
-            .producer
-            .send_with_headers(
-                &self.topic,
-                Some(record.table.as_bytes()),
-                Some(payload.as_bytes()),
-                dead_letter_headers(record),
-            )
-            .await
-            .map_err(|e| {
-                AppError::Other(format!(
-                    "failed writing dead-letter record to topic '{}': {e}",
-                    self.topic
-                ))
-            })?;
+        let mut kafka_record =
+            Record::new(self.topic.as_str(), payload.into_bytes()).key(record.table.clone());
+        kafka_record.headers = dead_letter_headers(record);
+        let metadata = self.producer.send(kafka_record).await.map_err(|e| {
+            AppError::Other(format!(
+                "failed writing dead-letter record to topic '{}': {e}",
+                self.topic
+            ))
+        })?;
 
         // Same durability bar as the state topic: an unacknowledged write here would let
         // the checkpoint advance past an event whose only remaining record was never

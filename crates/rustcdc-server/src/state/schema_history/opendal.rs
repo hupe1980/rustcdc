@@ -175,9 +175,8 @@ pub(super) fn build_redis_op(config: &RedisStateConfig) -> Result<Operator, AppE
         builder = builder.password(pw.trim());
     }
 
-    Ok(Operator::new(builder)
-        .map_err(|e| AppError::Other(format!("failed to build OpenDAL Redis operator: {e}")))?
-        .finish())
+    Operator::new(builder)
+        .map_err(|e| AppError::Other(format!("failed to build OpenDAL Redis operator: {e}")))
 }
 
 /// Build an OpenDAL [`Operator`] for a PostgreSQL endpoint.
@@ -201,9 +200,8 @@ pub(super) fn build_postgresql_op(config: &PostgresStateConfig) -> Result<Operat
         .table(&config.schema_history_table)
         .root("/");
 
-    Ok(Operator::new(builder)
-        .map_err(|e| AppError::Other(format!("failed to build OpenDAL PostgreSQL operator: {e}")))?
-        .finish())
+    Operator::new(builder)
+        .map_err(|e| AppError::Other(format!("failed to build OpenDAL PostgreSQL operator: {e}")))
 }
 
 #[cfg(test)]
