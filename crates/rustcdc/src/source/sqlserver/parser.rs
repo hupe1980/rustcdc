@@ -432,6 +432,7 @@ pub(super) fn build_cdc_poll_sql(
     start_lsn_hex: &str,
     end_lsn_hex: &str,
     cursor: Option<&SqlServerCdcCursor>,
+    before_lsn_hex: Option<&str>,
 ) -> String {
     let row_projection = build_cdc_select_columns(columns);
 
@@ -439,17 +440,31 @@ pub(super) fn build_cdc_poll_sql(
     // resumed poll starts immediately after the last delivered row.
     let cursor_clause = match cursor {
         Some(c) => format!(
-            " WHERE c.__$start_lsn > CONVERT(binary(10), '{lsn}', 1) \
+            "(c.__$start_lsn > CONVERT(binary(10), '{lsn}', 1) \
               OR (c.__$start_lsn = CONVERT(binary(10), '{lsn}', 1) \
                   AND c.__$seqval > CONVERT(binary(10), '{seq}', 1)) \
               OR (c.__$start_lsn = CONVERT(binary(10), '{lsn}', 1) \
                   AND c.__$seqval = CONVERT(binary(10), '{seq}', 1) \
-                  AND c.__$operation > {op})",
+                  AND c.__$operation > {op}))",
             lsn = c.lsn_hex,
             seq = c.seqval_hex,
             op = c.operation
         ),
         None => String::new(),
+    };
+    // Where a newer capture instance of the same table takes over; see
+    // `SqlServerStreamHandle::successor_floor`.
+    let before_clause = before_lsn_hex
+        .map(|lsn| format!("c.__$start_lsn < CONVERT(binary(10), '{lsn}', 1)"))
+        .unwrap_or_default();
+    let conditions: Vec<&str> = [cursor_clause.as_str(), before_clause.as_str()]
+        .into_iter()
+        .filter(|clause| !clause.is_empty())
+        .collect();
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
     };
 
     format!(
@@ -463,7 +478,7 @@ pub(super) fn build_cdc_poll_sql(
          FROM cdc.fn_cdc_get_all_changes_{capture_instance}(\
              CONVERT(binary(10), '{start_lsn_hex}', 1), \
              CONVERT(binary(10), '{end_lsn_hex}', 1), 'all update old') AS c\
-         {cursor_clause} \
+         {where_clause} \
          ORDER BY c.__$start_lsn, c.__$seqval, c.__$operation"
     )
 }

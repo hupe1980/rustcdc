@@ -186,6 +186,31 @@ jobs:
   # one setting that decides whether the `test-harnesses` release guard fires. Without
   # this job the only lane that would notice a bench that no longer compiles is
   # `release-evidence`, twelve minutes in, behind an apt install and a cargo-deny build.
+  # Every other clippy run is `--all-features`, where the connectors hide each other's
+  # dead code and enum sizes. A MySQL-only build failed `-D warnings` on an item only
+  # PostgreSQL and SQL Server call, and nothing here saw it until a crash worker did.
+  lib-connector-clippy:
+    name: "lib: clippy (${{ matrix.features }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - postgres
+          - mysql
+          - mariadb
+          - sqlserver
+          - snowflake
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo clippy -p rustcdc --all-targets --no-default-features --features ${{ matrix.features }} --locked -- -D warnings
+
   bench-build:
     name: "workspace: bench targets build"
     runs-on: ubuntu-latest
@@ -1023,6 +1048,7 @@ jobs:
       - check
       - quality
       - transport-security
+      - lib-connector-clippy
       - policy-gate
       - docs-site
       - correctness-smoke

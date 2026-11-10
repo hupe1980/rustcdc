@@ -72,8 +72,19 @@ impl SqlServerStreamHandle {
             .map(|meta| (meta.capture_instance.as_str(), meta))
             .collect();
 
+        // A table may have two capture instances; adding or removing one while the other
+        // still captures the table changes its shape, not whether it exists.
+        let covers = |metas: &std::collections::HashMap<&str, &CaptureInstanceMeta>,
+                      meta: &CaptureInstanceMeta| {
+            metas.values().any(|other| {
+                other.capture_instance != meta.capture_instance
+                    && other.schema == meta.schema
+                    && other.table == meta.table
+            })
+        };
+
         for (capture_instance, old_meta) in &current {
-            if !next.contains_key(capture_instance) {
+            if !next.contains_key(capture_instance) && !covers(&next, old_meta) {
                 events.push(self.build_schema_event_for_meta(
                     "DROP_TABLE",
                     old_meta,
@@ -87,6 +98,16 @@ impl SqlServerStreamHandle {
 
         for (capture_instance, new_meta) in &next {
             match current.get(capture_instance) {
+                None if covers(&current, new_meta) => {
+                    events.push(self.build_schema_event_for_meta(
+                        "ALTER_TABLE",
+                        new_meta,
+                        format!(
+                            "ALTER TABLE {}.{} /* capture instance '{}' added */",
+                            new_meta.schema, new_meta.table, new_meta.capture_instance
+                        ),
+                    ));
+                }
                 None => events.push(self.build_schema_event_for_meta(
                     "CREATE_TABLE",
                     new_meta,
@@ -132,7 +153,9 @@ impl SqlServerStreamHandle {
     /// it and silently step over changes this connector had not read yet — the exact data
     /// loss [`super::SqlServerStreamHandle::classify_cdc_window_error`] exists to refuse.
     /// Only genuinely new instances take their floor from the refresh, which is what
-    /// makes adding a table to a running pipeline work.
+    /// makes adding a table to a running pipeline work — and so does a known instance
+    /// whose floor was not established yet: it held no rows, so nothing it could have
+    /// purged was owed to this stream.
     fn retain_known_capture_floors(
         known: &[CaptureInstanceMeta],
         refreshed: &mut [CaptureInstanceMeta],
@@ -141,6 +164,7 @@ impl SqlServerStreamHandle {
             if let Some(existing) = known
                 .iter()
                 .find(|candidate| candidate.capture_instance == meta.capture_instance)
+                && existing.capture_floor != [0u8; 10]
             {
                 meta.capture_floor = existing.capture_floor;
             }
@@ -162,6 +186,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor,
+            created_at: String::new(),
             shape: None,
         }
     }
@@ -190,6 +215,7 @@ mod tests {
                 },
             ],
             capture_floor: [0u8; 10],
+            created_at: String::new(),
             shape: None,
         }
         .with_shape();

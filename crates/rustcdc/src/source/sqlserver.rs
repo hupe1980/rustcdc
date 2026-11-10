@@ -192,6 +192,9 @@ struct CaptureInstanceMeta {
     /// read yet, that *is* data loss, and a stale floor here is what makes it surface
     /// instead of being silently clamped away.
     capture_floor: [u8; 10],
+    /// `cdc.change_tables.create_date` as ISO 8601. A table may have two capture instances;
+    /// when their floors are equal this orders them, and the newer one serves the table.
+    created_at: String,
     /// The shape rows decoded against this instance are captured under, built once from the
     /// fields above by [`Self::with_shape`] so every row shares one `Arc`.
     shape: Option<Arc<crate::RowShape>>,
@@ -543,6 +546,7 @@ fn build_cdc_poll_sql(
     start_lsn_hex: &str,
     end_lsn_hex: &str,
     cursor: Option<&SqlServerCdcCursor>,
+    before_lsn_hex: Option<&str>,
 ) -> String {
     parser::build_cdc_poll_sql(
         capture_instance,
@@ -551,6 +555,7 @@ fn build_cdc_poll_sql(
         start_lsn_hex,
         end_lsn_hex,
         cursor,
+        before_lsn_hex,
     )
 }
 
@@ -643,7 +648,8 @@ async fn load_capture_metas_for_config(
     let rows = client
         .query(
             "SELECT ct.capture_instance, sc.name AS source_schema, tb.name AS source_name, \
-             sys.fn_varbintohexstr(sys.fn_cdc_get_min_lsn(ct.capture_instance)) AS min_lsn_hex \
+             sys.fn_varbintohexstr(sys.fn_cdc_get_min_lsn(ct.capture_instance)) AS min_lsn_hex, \
+             CONVERT(varchar(33), ct.create_date, 126) AS created_at \
              FROM cdc.change_tables ct \
              JOIN sys.tables tb ON ct.source_object_id = tb.object_id \
              JOIN sys.schemas sc ON tb.schema_id = sc.schema_id \
@@ -710,6 +716,7 @@ async fn load_capture_metas_for_config(
             .get::<&str, _>(3)
             .filter(|value| !value.is_empty())
             .map_or(Ok([0u8; 10]), lsn_hex_to_bytes)?;
+        let created_at = row.get::<&str, _>(4).unwrap_or_default().to_string();
 
         metas.push(
             CaptureInstanceMeta {
@@ -719,6 +726,7 @@ async fn load_capture_metas_for_config(
                 primary_key,
                 captured_columns,
                 capture_floor,
+                created_at,
                 shape: None,
             }
             .with_shape(),
@@ -2262,6 +2270,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
             capture_floor: [0u8; 10],
+            created_at: String::new(),
             shape: None,
         };
 
@@ -2373,6 +2382,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
             capture_floor: [0u8; 10],
+            created_at: String::new(),
             shape: None,
         };
 
@@ -2435,6 +2445,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
                 capture_floor: [0u8; 10],
+                created_at: String::new(),
                 shape: None,
             }],
             events_polled: 0,
@@ -2452,6 +2463,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into(), "email".into()],
                 capture_floor: [0u8; 10],
+                created_at: String::new(),
                 shape: None,
             },
             CaptureInstanceMeta {
@@ -2461,6 +2473,7 @@ mod tests {
                 primary_key: vec!["order_id".into()],
                 captured_columns: vec!["order_id".into(), "total".into()],
                 capture_floor: [0u8; 10],
+                created_at: String::new(),
                 shape: None,
             },
         ];
@@ -2513,6 +2526,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
                 capture_floor: [0u8; 10],
+                created_at: String::new(),
                 shape: None,
             }],
             events_polled: 0,
@@ -2588,6 +2602,7 @@ mod tests {
             "0x01",
             "0x02",
             None,
+            None,
         );
 
         assert!(sql.contains("SELECT TOP (128)"));
@@ -2624,6 +2639,7 @@ mod tests {
             "0x01",
             "0x02",
             Some(&cursor),
+            None,
         );
 
         // Strict lexicographic (lsn, seqval, operation) — `operation` must be part of
@@ -2994,6 +3010,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor: [0u8; 10],
+            created_at: String::new(),
             shape: None,
         };
         let changes_a = vec![SqlServerRawChange {
@@ -3012,6 +3029,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor: [0u8; 10],
+            created_at: String::new(),
             shape: None,
         };
         let changes_b = vec![SqlServerRawChange {

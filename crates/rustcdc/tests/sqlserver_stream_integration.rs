@@ -389,3 +389,216 @@ async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh()
     source.close().await;
     Ok(())
 }
+
+/// SQL Server's documented way to change a captured table: add a second capture instance
+/// under a new name, then disable the first. Both capture every change made while both
+/// exist, so each change must come out once, carrying the shape of the instance read.
+#[tokio::test]
+async fn sqlserver_capture_instance_switch_is_exactly_once_and_reaches_the_row_shape()
+-> rustcdc::Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        run_sqlserver_capture_instance_switch().await
+    })
+    .await
+    .map_err(|_| {
+        rustcdc::Error::TimeoutError("sqlserver capture-instance switch exceeded 300s".into())
+    })?
+}
+
+/// Read until every id in `want` has an insert, then keep reading a few more polls so a
+/// duplicate from the other instance has time to arrive.
+async fn collect_inserts(
+    stream: &mut dyn rustcdc::source::StreamHandle,
+    admin: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
+    database: &str,
+    want: &[i64],
+    events: &mut Vec<rustcdc::Event>,
+) -> rustcdc::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut settle_until: Option<std::time::Instant> = None;
+    let scan = format!("USE {database}; EXEC sys.sp_cdc_scan");
+    while std::time::Instant::now() < deadline {
+        if settle_until.is_some_and(|until| std::time::Instant::now() >= until) {
+            return Ok(());
+        }
+        let mut batch = stream.next_events(200).await?;
+        if batch.is_empty() {
+            let _ = sql_exec(admin, &scan).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        events.append(&mut batch);
+        let seen = inserted_ids(events);
+        if settle_until.is_none() && want.iter().all(|id| seen.contains(id)) {
+            settle_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        }
+    }
+    Err(rustcdc::Error::TimeoutError(format!(
+        "inserts {want:?} not all seen; got {:?}",
+        inserted_ids(events)
+    )))
+}
+
+fn inserted_ids(events: &[rustcdc::Event]) -> Vec<i64> {
+    events
+        .iter()
+        .filter(|event| event.op == Operation::Insert)
+        .filter_map(|event| row_id(event.after.as_ref()?))
+        .collect()
+}
+
+/// Values arrive as text; accept a JSON number too.
+fn row_id(after: &serde_json::Value) -> Option<i64> {
+    let id = after.get("id")?;
+    id.as_i64().or_else(|| id.as_str()?.parse().ok())
+}
+
+fn shape_columns(event: &rustcdc::Event) -> Vec<String> {
+    event
+        .shape
+        .as_ref()
+        .and_then(|shape| shape.columns())
+        .map(|columns| columns.iter().map(|column| column.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+async fn run_sqlserver_capture_instance_switch() -> rustcdc::Result<()> {
+    if sqlserver_testkit::skip_docker_test("sqlserver capture-instance switch") {
+        return Ok(());
+    }
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+    let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
+    let mut admin = sqlserver_testkit::connect_admin_with_retry(
+        &host,
+        port,
+        40,
+        std::time::Duration::from_secs(2),
+    )
+    .await?;
+    let db = "rustcdc_ci_switch";
+    sql_exec(&mut admin, &format!("CREATE DATABASE {db}")).await?;
+    sql_exec(
+        &mut admin,
+        &format!(
+            "USE {db}; CREATE TABLE dbo.items (id BIGINT NOT NULL PRIMARY KEY, name NVARCHAR(50) NULL)"
+        ),
+    )
+    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, db).await?;
+    sql_exec_with_retry(
+        &mut admin,
+        &format!(
+            "USE {db}; EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='items', \
+             @role_name=NULL, @supports_net_changes=0, @capture_instance='dbo_items_v1'"
+        ),
+    )
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let mut source = SqlServerConnection::new(sqlserver_testkit::source_config(
+        host.clone(),
+        port,
+        db.into(),
+        30,
+    ));
+    source.connect().await?;
+    let mut stream = source.start_stream(None).await?;
+    let mut events = Vec::new();
+
+    sql_exec(
+        &mut admin,
+        &format!("USE {db}; INSERT INTO dbo.items VALUES (1, 'a')"),
+    )
+    .await?;
+    collect_inserts(stream.as_mut(), &mut admin, db, &[1], &mut events).await?;
+
+    // Both instances capture from here until v1 is disabled.
+    sql_exec_with_retry(
+        &mut admin,
+        &format!("USE {db}; ALTER TABLE dbo.items ADD note NVARCHAR(50) NULL"),
+    )
+    .await?;
+    sql_exec_with_retry(
+        &mut admin,
+        &format!(
+            "USE {db}; EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='items', \
+             @role_name=NULL, @supports_net_changes=0, @capture_instance='dbo_items_v2'"
+        ),
+    )
+    .await?;
+    sql_exec(
+        &mut admin,
+        &format!("USE {db}; INSERT INTO dbo.items VALUES (2, 'b', 'x'); INSERT INTO dbo.items VALUES (3, 'c', 'y')"),
+    )
+    .await?;
+    collect_inserts(stream.as_mut(), &mut admin, db, &[1, 2, 3], &mut events).await?;
+
+    sql_exec_with_retry(
+        &mut admin,
+        &format!(
+            "USE {db}; EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='items', \
+             @capture_instance='dbo_items_v1'"
+        ),
+    )
+    .await?;
+    sql_exec(
+        &mut admin,
+        &format!("USE {db}; INSERT INTO dbo.items VALUES (4, 'd', 'z')"),
+    )
+    .await?;
+    collect_inserts(stream.as_mut(), &mut admin, db, &[1, 2, 3, 4], &mut events).await?;
+
+    let mut ids = inserted_ids(&events);
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [1, 2, 3, 4],
+        "each change exactly once across both instances"
+    );
+
+    let insert = |id: i64| {
+        events
+            .iter()
+            .find(|event| {
+                event.op == Operation::Insert && event.after.as_ref().and_then(row_id) == Some(id)
+            })
+            .expect("insert present")
+    };
+    assert_eq!(shape_columns(insert(1)), ["id", "name"]);
+    for id in [2, 3, 4] {
+        assert_eq!(
+            shape_columns(insert(id)),
+            ["id", "name", "note"],
+            "row {id} was written after v2 started and is read from it"
+        );
+        assert!(
+            insert(id)
+                .after
+                .as_ref()
+                .unwrap()
+                .get("note")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "row {id} carries the new column's value"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.op == Operation::SchemaChange
+                && event
+                    .after
+                    .as_ref()
+                    .and_then(|after| after.get("ddl_type")?.as_str())
+                    == Some("DROP_TABLE")),
+        "dbo.items is still captured; no DROP_TABLE"
+    );
+
+    source.close().await;
+    Ok(())
+}
