@@ -457,7 +457,7 @@ rustcdc snapshot public.invoices --admin-write-token-env RUSTCDC_WRITE_TOKEN
 docker pull ghcr.io/hupe1980/rustcdc-server:latest
 
 # Pin to a specific version
-docker pull ghcr.io/hupe1980/rustcdc-server:0.20.0
+docker pull ghcr.io/hupe1980/rustcdc-server:0.20.1
 ```
 
 Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](../../Dockerfile) for build details.
