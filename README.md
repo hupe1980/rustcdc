@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/rustcdc.svg)](https://crates.io/crates/rustcdc)
 [![docs.rs](https://img.shields.io/docsrs/rustcdc)](https://docs.rs/rustcdc)
 [![CI](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/rustcdc/actions/workflows/ci.yml)
-[![Rust 1.95.0+](https://img.shields.io/badge/rust-1.95.0%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust 1.97.0+](https://img.shields.io/badge/rust-1.97.0%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/rustcdc.svg)](#license)
 
 **Change data capture in Rust.** PostgreSQL, MySQL, MariaDB, SQL Server and Snowflake
@@ -22,7 +22,7 @@ Both are built and tested from this repository, against each other, at one versi
 | | | |
 |---|---|---|
 | **[`rustcdc`](crates/rustcdc/)** | A **library** you link into your own binary. You own the loop, the sink and the process. | [crates.io](https://crates.io/crates/rustcdc) · [guide](https://hupe1980.github.io/rustcdc/docs/) · [README](crates/rustcdc/README.md) |
-| **[`rustcdc-server`](crates/rustcdc-server/)** | A configured **binary and container image**: TOML in, Kafka / Iceberg / Snowflake / HTTP / files out, with an admin API, Prometheus metrics and OTLP traces. | [ghcr.io](https://github.com/hupe1980/rustcdc/pkgs/container/rustcdc-server) · [docs](https://hupe1980.github.io/rustcdc/docs/) · [README](crates/rustcdc-server/README.md) |
+| **[`rustcdc-server`](crates/rustcdc-server/)** | A configured **binary and container image**: TOML in, Kafka / Iceberg / Snowflake / Databricks / HTTP / files out, with an admin API, Prometheus metrics and OTLP traces. | [ghcr.io](https://github.com/hupe1980/rustcdc/pkgs/container/rustcdc-server) · [docs](https://hupe1980.github.io/rustcdc/docs/) · [README](crates/rustcdc-server/README.md) |
 
 If you want change data capture **running**, take the server. If you want it **inside
 something you are building**, take the crate. The server is the crate plus configuration,
@@ -32,9 +32,14 @@ sinks, state backends and an operational surface — not a second implementation
 # The server, against a seeded PostgreSQL, streaming to your terminal
 docker compose -f demo/compose.yml up --build
 
+# The server binary, via Homebrew (macOS Apple Silicon, Linux x86_64 / arm64)
+brew install hupe1980/tap/rustcdc
+
 # The library, in your own project
 cargo add rustcdc --features postgres
 ```
+
+The Homebrew formula installs the release binary built with every connector and sink.
 
 ## Repository layout
 
@@ -44,11 +49,11 @@ cargo add rustcdc --features postgres
 | [`crates/rustcdc-server/`](crates/rustcdc-server/) | The server binary and container image. Not published to crates.io |
 | [`crates/crash-workers/`](crates/crash-workers/) | Binaries the process-crash suites spawn as separate processes; a test cannot `SIGKILL` itself |
 | [`crates/xtask/`](crates/xtask/) | Repository automation. `cargo xtask <task>` is the one entry point |
-| [`site/`](site/) | The documentation site. `/docs/` is the server, `/library/` is the crate |
+| [`site/`](site/) | The documentation site, built with Zola. Server and library guides both live under `/docs/` |
 | [`demo/`](demo/) | A self-contained Compose stack running the server against a seeded database |
 | [`docker/`](docker/) | The library's example stack and its Dockerfile |
 | [`monitoring/`](monitoring/) | Prometheus SLO alert rules, checked against the metrics the server actually emits |
-| [`scripts/`](scripts/) | CI gates, including `ci-policy-gate.sh` |
+| [`scripts/`](scripts/) | The shell gates `cargo xtask` dispatches to and CI runs |
 | [`AGENTS.md`](AGENTS.md) | What a coding agent needs to know before changing this repository: the priorities, the gates to run, and the standing rules |
 
 Every command runs from the repository root. `cargo build` builds both crates;
@@ -72,13 +77,13 @@ Where a guarantee has a limit, the limit is written next to it.
 **Pre-1.0.** The public API may still change; minor versions may contain breaking changes,
 and each one is listed in [CHANGELOG.md](CHANGELOG.md) with the migration it requires.
 
-Validated by 1 204 library and 571 server unit tests, 141 compiled documentation samples,
-41 deterministic-replay golden fixtures and 43 integration suites against real PostgreSQL,
-MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka.
+Validated by library and server unit tests, compiled documentation samples,
+deterministic-replay golden fixtures and container-backed integration suites against real
+PostgreSQL, MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka.
 
 ## Building it
 
-Rust 1.95.0+, and a C toolchain for the server's dependency graph (`cmake`, `clang`,
+Rust 1.97.0+, and a C toolchain for the server's dependency graph (`cmake`, `clang`,
 `perl`, `pkg-config`). Every command runs from the repository root.
 
 ```bash

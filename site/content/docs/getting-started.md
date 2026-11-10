@@ -14,9 +14,20 @@ You need a database you can enable replication on, and either Rust or Docker. Pi
 install path that matches where this will run — a binary for local development, VMs and
 bare metal, or the container image for Kubernetes and CI.
 
+## Install with Homebrew
+
+On macOS (Apple Silicon) and Linux (x86_64, arm64):
+
+```bash
+brew install hupe1980/tap/rustcdc
+rustcdc --version
+```
+
+The formula installs the release binary built with every connector and sink.
+
 ## Install the binary
 
-Requires Rust 1.95.0 or later (`rustup update stable`).
+Requires Rust 1.97.0 or later (`rustup update stable`).
 
 ```bash
 git clone https://github.com/hupe1980/rustcdc
@@ -52,13 +63,9 @@ cargo build --release --locked --all-features
 At least one connector is required; a build with none fails to compile rather than
 producing a binary that rejects every configuration.
 
-This is a security boundary, not packaging taste. `sqlserver` pulls `tiberius`, which
-pins rustls 0.21 — **a second TLS stack**, with its own X.509 verifier and four
-suppressed RUSTSEC advisories that the admin listener and every sink (on rustls 0.23) do
-not carry. A PostgreSQL deployment that never touches SQL Server should not have to rely
-on "that code path is unreachable" being true; leaving the connector out makes the
-question moot. A default build links exactly one rustls and one webpki, and a test
-asserts it.
+A connector you leave out is a driver you do not link, audit or patch. Every build links
+exactly one TLS stack — one `rustls`, one `rustls-webpki` — whichever connectors it has, and a
+test asserts it for the default build and for the all-features build the image ships.
 
 A config naming a connector the binary lacks is rejected at startup with the feature to
 rebuild with — it never loads silently.

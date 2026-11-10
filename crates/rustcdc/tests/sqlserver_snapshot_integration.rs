@@ -80,11 +80,13 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -151,29 +153,57 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
 
     let mut read_count = 0_u64;
     let mut chunk_count = 0_u32;
+    let mut carried_shape: Option<std::sync::Arc<rustcdc::RowShape>> = None;
     loop {
         let chunk = snapshot.next_chunk(128).await?;
         if chunk.is_empty() {
             break;
         }
-        let chunk = chunk
-            .into_iter()
-            .filter(|event| !event.op.is_schema_change())
-            .collect::<Vec<_>>();
 
         chunk_count += 1;
         for event in chunk {
-            assert_eq!(event.op, rustcdc::Operation::Read);
+            assert_eq!(
+                event.op,
+                rustcdc::Operation::Read,
+                "a snapshot emits rows only"
+            );
             assert_eq!(event.table, "users");
             assert_eq!(event.schema.as_deref(), Some("dbo"));
             assert!(event.snapshot.is_some());
             assert!(event.after.is_some());
+            assert!(event.shape.is_some(), "a snapshot row carries its shape");
+            if carried_shape.is_none() {
+                carried_shape = event.shape.clone();
+            }
+            assert_eq!(
+                event.shape, carried_shape,
+                "every snapshot row carries the table's one shape"
+            );
             read_count = read_count.saturating_add(1);
         }
     }
 
     assert!(chunk_count > 1, "snapshot should emit more than one chunk");
     assert_eq!(read_count, expected_count);
+    // dbo.users is (id INT NOT NULL PRIMARY KEY, name NVARCHAR(100) NOT NULL).
+    let shape = carried_shape.as_deref().expect("a shape");
+    let carried: Vec<_> = shape
+        .columns()
+        .expect("a complete shape")
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_str(),
+                column.data_type.as_str(),
+                column.nullable,
+            )
+        })
+        .collect();
+    assert_eq!(
+        carried,
+        [("id", "int", false), ("name", "nvarchar(100)", false)]
+    );
+    assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
 
     let end = snapshot.finish().await?;
     assert!(end.snapshot_end_ts > 0);
@@ -189,11 +219,13 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -353,5 +385,137 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
     assert_eq!(unique_rows, expected_map);
 
     resumed_source.close().await;
+    Ok(())
+}
+
+/// An incremental snapshot's rows carry the shape described before their chunk — a row with
+/// a NULL column too, which `FOR JSON PATH` leaves out of the row.
+#[tokio::test]
+async fn sqlserver_incremental_snapshot_rows_carry_the_shape() -> rustcdc::Result<()> {
+    if sqlserver_testkit::skip_docker_test("sqlserver incremental shape test") {
+        return Ok(());
+    }
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+    let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
+    let mut admin = sqlserver_testkit::connect_admin_with_retry(
+        &host,
+        port,
+        40,
+        std::time::Duration::from_secs(2),
+    )
+    .await?;
+    let database = "rustcdc_incremental_shape";
+    sqlserver_testkit::sql_exec_with_retry(
+        &mut admin,
+        &format!("IF DB_ID('{database}') IS NULL CREATE DATABASE {database}"),
+    )
+    .await?;
+    sqlserver_testkit::enable_cdc(&host, port, database).await?;
+    sqlserver_testkit::sql_exec_with_retry(
+        &mut admin,
+        &format!(
+            "USE {database}; CREATE TABLE dbo.shaped (id INT NOT NULL PRIMARY KEY, \
+             amount DECIMAL(12,4) NOT NULL, note NVARCHAR(10) NULL); \
+             INSERT INTO dbo.shaped VALUES (1, 1.5, N'a'), (2, 2.5, NULL), (3, 3.5, N'c')"
+        ),
+    )
+    .await?;
+    sqlserver_testkit::sql_exec_with_retry(
+        &mut admin,
+        &format!(
+            "USE {database}; EXEC sys.sp_cdc_enable_table @source_schema='dbo', \
+             @source_name='shaped', @role_name=NULL, @supports_net_changes=0"
+        ),
+    )
+    .await?;
+    // The watermark is the capture tables' max LSN, which is NULL until a capture pass has
+    // harvested a change.
+    sqlserver_testkit::sql_exec_with_retry(
+        &mut admin,
+        &format!("USE {database}; UPDATE dbo.shaped SET note = N'a' WHERE id = 1"),
+    )
+    .await?;
+    for _ in 0..60 {
+        let _ = sqlserver_testkit::sql_exec_with_retry(
+            &mut admin,
+            &format!("USE {database}; EXEC sys.sp_cdc_scan"),
+        )
+        .await;
+        let harvested = sql_count(
+            &mut admin,
+            &format!(
+                "USE {database}; SELECT COUNT_BIG(1) WHERE sys.fn_cdc_get_max_lsn() IS NOT NULL"
+            ),
+        )
+        .await?;
+        if harvested == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let mut source = SqlServerConnection::new(sqlserver_testkit::source_config(
+        host.clone(),
+        port,
+        database.into(),
+        30,
+    ));
+    source.connect().await?;
+    let mut handle = source
+        .start_incremental_snapshot(
+            rustcdc::IncrementalSnapshotConfig::new(vec!["dbo.shaped".to_string()])
+                .with_chunk_size(2),
+            None,
+        )
+        .await?;
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        rows.extend(
+            handle
+                .next_events(250)
+                .await?
+                .into_iter()
+                .filter(|event| event.op == rustcdc::Operation::Read),
+        );
+        if rows.len() == 3 {
+            break;
+        }
+    }
+    source.close().await;
+
+    assert_eq!(rows.len(), 3, "every row must be read");
+    for row in &rows {
+        let shape = row
+            .shape
+            .as_ref()
+            .expect("an incremental snapshot row carries its shape");
+        let columns: Vec<_> = shape
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type.as_str(),
+                    column.nullable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                ("id", "int", false),
+                ("amount", "decimal(12,4)", false),
+                ("note", "nvarchar(10)", true)
+            ]
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
     Ok(())
 }

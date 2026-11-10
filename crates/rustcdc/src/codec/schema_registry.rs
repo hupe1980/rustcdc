@@ -1206,7 +1206,7 @@ const CONFLUENT_PROTOBUF_CONTENT_TYPE: &str = "application/vnd.kafka+protobuf";
 /// framing.
 ///
 /// The `before` and `after` fields accept any JSON value (reflecting `Option<serde_json::Value>`).
-pub const EVENT_JSON_SCHEMA: &str = r#"{
+pub const EVENT_JSON_SCHEMA: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "io.rustcdc.Event",
   "title": "Event",
@@ -1307,11 +1307,41 @@ pub const EVENT_JSON_SCHEMA: &str = r#"{
       "description": "Columns absent from `before`. Tracked separately from `unavailable_columns` — the two sets are not the same.",
       "type": "array",
       "items": {"type": "string"}
+    },
+    "shape": {
+      "description": "The table shape this row was captured under: columns with declared types and nullability, the primary key, and a content id. Omitted when the connector cannot vouch for the shape the row was captured under: absent means unknown.",
+      "$ref": "#/$defs/RowShape"
     }
   },
   "required": ["before", "after", "op", "source", "ts", "table", "envelope_version", "before_is_key_only"],
-  "additionalProperties": false
-}"#;
+  "additionalProperties": false,
+  "$defs": {
+    "RowShape": {
+      "description": "Complete when `columns` and `primary_key` are present; compact (only `id`, resolved elsewhere) when both are absent.",
+      "type": "object",
+      "properties": {
+        "id":          {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Lowercase hex SHA-256 of `rustcdc/v2/row-shape` followed by the length-prefixed schema, table, columns and primary key."},
+        "schema":      {"type": "string", "description": "Schema as the source names it."},
+        "table":       {"type": "string", "description": "Table as the source names it; not renamed by a route transform."},
+        "columns":     {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/ShapeColumn"}, "description": "Columns in ordinal order."},
+        "primary_key": {"type": "array", "items": {"type": "string"}, "description": "Primary-key column names in key order; empty for a keyless table."}
+      },
+      "required": ["id", "schema", "table"],
+      "dependentRequired": {"columns": ["primary_key"], "primary_key": ["columns"]},
+      "additionalProperties": false
+    },
+    "ShapeColumn": {
+      "type": "object",
+      "properties": {
+        "name":      {"type": "string", "description": "Column name."},
+        "data_type": {"type": "string", "description": "Declared type in the source's own syntax, modifier included."},
+        "nullable":  {"type": "boolean", "description": "Whether the column accepts NULL, as the source's catalogue declares it."}
+      },
+      "required": ["name", "data_type", "nullable"],
+      "additionalProperties": false
+    }
+  }
+}"##;
 
 // ─── Key JSON Schema ──────────────────────────────────────────────────────────
 
@@ -3922,6 +3952,64 @@ mod event_json_schema_tests {
                 .build();
             validate(&event).unwrap_or_else(|error| panic!("operation {op:?} rejected: {error}"));
         }
+    }
+
+    #[test]
+    fn an_event_carrying_a_complete_or_a_compact_shape_validates() {
+        use crate::core::{RowShape, ShapeColumn};
+        use std::sync::Arc;
+
+        let shape = RowShape::new(
+            "public",
+            "users",
+            vec![ShapeColumn::new("id", "integer", false)],
+            vec!["id".into()],
+        )
+        .unwrap();
+        for shape in [shape.clone(), shape.compact()] {
+            let event = Event::builder("users", Operation::Insert)
+                .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
+                .after(json!({ "id": "1" }))
+                .shape(Arc::new(shape))
+                .ts(1)
+                .build();
+            validate(&event).expect("an event with a shape must validate");
+        }
+    }
+
+    #[test]
+    fn a_shape_with_an_unknown_field_is_rejected() {
+        use crate::core::{RowShape, ShapeColumn};
+        use std::sync::Arc;
+
+        let shape = RowShape::new(
+            "public",
+            "users",
+            vec![ShapeColumn::new("id", "integer", false)],
+            vec!["id".into()],
+        )
+        .unwrap();
+        let mut instance = serde_json::to_value(
+            Event::builder("users", Operation::Insert)
+                .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
+                .after(json!({ "id": "1" }))
+                .shape(Arc::new(shape))
+                .ts(1)
+                .build(),
+        )
+        .expect("serialise");
+        instance["shape"]["columns"][0]["surprise"] = json!(true);
+        let schema: serde_json::Value =
+            serde_json::from_str(EVENT_JSON_SCHEMA).expect("schema parses");
+        let compiled = jsonschema::validator_for(&schema).expect("schema compiles");
+        assert!(compiled.validate(&instance).is_err());
+
+        instance["shape"]["columns"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("surprise");
+        instance["shape"]["extra"] = json!(1);
+        assert!(compiled.validate(&instance).is_err());
     }
 
     #[test]

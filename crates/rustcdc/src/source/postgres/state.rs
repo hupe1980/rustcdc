@@ -48,14 +48,12 @@ pub(super) struct TableSnapshotState {
     ///
     /// Empty only for an offline snapshot, which has no client to read a catalog with.
     pub(super) catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn>,
-    /// Whether this table's schema has already been announced in this run.
+    /// The shape this table's rows carry, derived from `catalog_columns` before its first
+    /// chunk in this run.
     ///
-    /// A snapshot resumes mid-table after a restart, and the announcement is per run
-    /// rather than per snapshot: a consumer that reconnects needs the schema before the
-    /// rows it is about to receive, and it has no way to ask for an event it missed. The
-    /// schema history de-duplicates the repeat, so the cost is one event per table per
-    /// restart and no extra history version.
-    pub(super) schema_announced: bool,
+    /// `None` until then, and for an offline snapshot, which reads no catalog. See
+    /// [`Event::shape`](crate::Event::shape).
+    pub(super) shape: Option<std::sync::Arc<crate::RowShape>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

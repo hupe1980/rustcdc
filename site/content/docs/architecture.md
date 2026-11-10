@@ -64,7 +64,7 @@ Invariant 6 is enforced by `FileCheckpoint`, independently of any connector, and
 the other five are all expressed in terms of the committed-event *count*. A count keeps rising
 while a connector hands the checkpoint a position it cannot have reached, which is strictly
 worse than forgetting progress: the counters say the pipeline is healthy while the recorded
-resume point now sits before data the sink has already accepted. `FileCheckpoint::save`
+resume point sits before data the sink has already accepted. `FileCheckpoint::save`
 therefore compares the connector-native coordinate against the record it is replacing and
 refuses a regression with an error naming both positions.
 
@@ -145,9 +145,8 @@ xid >= xmax  ||  xip.contains(xid)
 
 **Both halves are needed.** `xmax` is `latestCompletedXid + 1`, so an in-flight transaction whose
 xid is the highest assigned — the common case for one mid-commit — sits at or above `xmax` and is
-therefore *absent* from `xip`. An earlier version of this connector tested `xip` alone and so missed
-precisely the transactions the bracket exists to catch; running it against a real server reported
-`Expected 733 in []`, with `pg_current_snapshot()` returning `733:733:`.
+therefore *absent* from `xip`. Testing `xip` alone would miss exactly these:
+`pg_current_snapshot()` reports `733:733:` with 733 in flight.
 
 The fence is read after the low watermark and before the chunk read, so any transaction invisible to
 the chunk's snapshot `S` is also invisible to the earlier fence `S₀` — and by the rule above `S₀`
@@ -280,17 +279,10 @@ rows missing from the snapshot, with no error and no counter to notice it by.
 
 #### A re-snapshot must not look like a replay
 
-A snapshot row's offset identifies the **row**, not a log position — it has none. So re-reading an
-unchanged row produces a byte-identical event, and the runtime's idempotency guard (on by default)
-classified it as a replay and dropped it. An operator who re-requested a table got a success
-response and no rows.
-
-Neither half was wrong alone: the fingerprint excludes wall-clock time so that replays *are*
-recognised, and the offset is row-derived and stable across restarts by design. What was missing is
-that nothing recorded which snapshot **attempt** produced a row.
-
-`IncrementalSnapshotState::generation` now does, and it is part of the offset. It advances on every
-request and across a stop — a stop discards the table list, so a later request would otherwise
+A snapshot row's offset is row-derived, so the offset also carries
+`IncrementalSnapshotState::generation`; a re-requested table is a new generation and is not
+deduplicated as a replay by the idempotency guard. The generation advances on every request and
+across a stop — a stop discards the table list, so a later request would otherwise
 restart at generation 0 and collide with the run it abandoned. A chunk re-read after a
 mid-snapshot reconnect keeps its generation and is still deduplicated, so the guard keeps doing
 what it exists for. The generation is persisted, so the offsets stay stable across a restart.
@@ -330,9 +322,8 @@ Updates.
   upgrade, SCRAM-SHA-256 / MD5 / cleartext authentication, the `CopyBoth` loop, and feedback.
   `tokio-postgres` exposes no `CopyBoth` or replication-mode API, so the protocol is
   unreachable through it; the published crate that does implement it declares `rustls` without
-  `default-features = false`, which would force rustls's `aws-lc-rs` provider across the whole
-  build beside the `ring` backend this crate standardises on — and Cargo unifies features, so a
-  dependent cannot opt out. Roughly 900 lines of stable, well-specified protocol was the cheaper
+  `default-features = false`, which would force `aws-lc-rs` on every PostgreSQL-only build — and
+  Cargo unifies features, so a dependent cannot opt out. Roughly 900 lines of stable, well-specified protocol was the cheaper
   side of that trade.
 - `proto_version '1'` is negotiated, matching what the pgoutput decoder implements. Asking for
   more would make the server send v2 streaming and v3 two-phase messages the decoder

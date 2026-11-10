@@ -37,8 +37,10 @@ pub(crate) mod batch_commit;
 pub(crate) mod event_loop;
 pub(crate) mod lifecycle;
 pub(crate) mod metrics;
+pub(crate) mod park;
 pub(crate) mod reconciliation;
 pub(crate) mod recovery;
+pub mod row_shapes;
 
 /// Crash-injecting end-to-end proof of the delivery contracts.
 ///

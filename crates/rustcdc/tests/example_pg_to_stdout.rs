@@ -173,24 +173,17 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> rustcdc
         })
         .collect();
 
-    // The table's columns are announced before its first row, so the stream carries one
-    // `schema_change` ahead of the ten inserts. The example prints every event it is
-    // handed, which is the behaviour being demonstrated.
-    let (schema_events, row_events): (Vec<_>, Vec<_>) = parsed
-        .iter()
-        .partition(|event| event["op"] == "schema_change");
-
-    assert_eq!(
-        schema_events.len(),
-        1,
-        "expected exactly one schema announcement, got {}\nstdout:\n{}\nstderr:\n{}",
-        schema_events.len(),
-        stdout_text,
-        stderr_text
+    // Rows alone: each carries its table's shape, so no schema event precedes them.
+    assert!(
+        parsed.iter().all(|event| event["op"] != "schema_change"),
+        "no schema event is emitted for a table without DDL\nstdout:\n{stdout_text}"
     );
-    assert_eq!(
-        schema_events[0]["after"]["ddl_type"], "READ_SCHEMA",
-        "the announcement is an observation, not a captured statement"
+    let row_events = &parsed;
+    assert!(
+        row_events
+            .iter()
+            .all(|event| event["shape"]["columns"].is_array()),
+        "every row carries its shape inline\nstdout:\n{stdout_text}"
     );
 
     assert_eq!(

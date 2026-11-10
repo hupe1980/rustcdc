@@ -44,6 +44,11 @@ use rustcdc::sink::SinkAdapter as _;
 const CONTAINER: &str = "rustcdc-integration-kafka";
 const HOST_PORT: u16 = 19092;
 
+// Pinned, not `:latest`: the suite asserts broker semantics, so a broker release must be a
+// reviewed change rather than whatever the registry served on the day the suite ran.
+const REDPANDA_IMAGE: &str = "docker.redpanda.com/redpandadata/redpanda:v26.2.6";
+const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
+
 fn enabled() -> bool {
     std::env::var("RUSTCDC_INTEGRATION").as_deref() == Ok("1")
 }
@@ -112,7 +117,7 @@ fn start_broker(broker: Broker) {
                 CONTAINER,
                 "-p",
                 &ports,
-                "docker.redpanda.com/redpandadata/redpanda:latest",
+                REDPANDA_IMAGE,
                 "redpanda",
                 "start",
                 "--mode",
@@ -159,7 +164,7 @@ fn start_broker(broker: Broker) {
                 "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1",
                 "-e",
                 "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0",
-                "apache/kafka:latest",
+                KAFKA_IMAGE,
             ])
         }
     };
@@ -190,23 +195,23 @@ fn wait_for_broker(broker: Broker) {
     let mut last_error = String::new();
     while Instant::now() < deadline {
         let attempt = runtime.block_on(async {
-            let admin = krafka::admin::AdminClient::builder()
-                .bootstrap_servers(bootstrap())
+            let admin = krafka::Kafka::builder(bootstrap())
                 .client_id("rustcdc-integration-probe")
                 // Both, and in this order of magnitude: krafka refuses a `request_timeout`
                 // below its `connect_timeout`, on the sound ground that every request would
                 // then time out before the connection completed.
                 .connect_timeout(Duration::from_secs(3))
                 .request_timeout(Duration::from_secs(5))
-                .build()
+                .connect()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .admin();
             // `describe_cluster` rather than describing a topic: an unknown topic is an
             // error response, so a topic probe reports "not ready" against a broker that is
             // answering perfectly well. What is being waited on is a controller that has
             // elected itself, which is exactly what this returns.
             admin
-                .describe_cluster()
+                .describe_cluster(krafka::admin::DescribeClusterOptions::default())
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -243,31 +248,33 @@ fn create_topic(topic: &str) {
         .expect("admin runtime");
 
     runtime.block_on(async {
-        let admin = krafka::admin::AdminClient::builder()
-            .bootstrap_servers(bootstrap())
+        let admin = krafka::Kafka::builder(bootstrap())
             .client_id("rustcdc-integration-admin")
             .connect_timeout(Duration::from_secs(3))
             .request_timeout(Duration::from_secs(10))
-            .build()
+            .connect()
             .await
-            .expect("admin client");
+            .expect("admin client")
+            .admin();
 
         let results = admin
             .create_topics(
                 vec![krafka::admin::NewTopic::new(topic, 1, 1).expect("valid topic spec")],
-                Duration::from_secs(20),
-                false,
+                krafka::admin::CreateTopicsOptions::default().timeout(Duration::from_secs(20)),
             )
             .await
             .expect("create_topics");
 
-        for result in results {
+        for (name, result) in results {
             // Already-exists is fine: the suite reuses one broker across tests and a rerun
             // against a surviving container must not fail on the second pass.
-            if let Some(error) = &result.error
-                && !error.to_ascii_lowercase().contains("exists")
-            {
-                panic!("failed to create {topic}: {error}");
+            match result {
+                Ok(())
+                | Err(krafka::KrafkaError::Broker {
+                    code: krafka::error::ErrorCode::TopicAlreadyExists,
+                    ..
+                }) => {}
+                Err(error) => panic!("failed to create {name}: {error}"),
             }
         }
 
@@ -282,7 +289,7 @@ fn create_topic(topic: &str) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let visible = admin
-                .list_topics()
+                .list_topics(krafka::admin::ListTopicsOptions::default())
                 .await
                 .map(|topics| topics.iter().any(|t| t == topic))
                 .unwrap_or(false);
@@ -324,9 +331,11 @@ fn read_back(topic: &str, expected: usize) -> Vec<bytes::Bytes> {
         .expect("consumer runtime");
 
     runtime.block_on(async {
-        let consumer = krafka::consumer::Consumer::builder()
-            .bootstrap_servers(bootstrap())
-            .group_id(format!("rustcdc-readback-{topic}"))
+        let consumer = krafka::Kafka::builder(bootstrap())
+            .connect()
+            .await
+            .expect("kafka should connect")
+            .consumer(format!("rustcdc-readback-{topic}"))
             .auto_offset_reset(krafka::consumer::AutoOffsetReset::Earliest)
             .build()
             .await
@@ -338,7 +347,7 @@ fn read_back(topic: &str, expected: usize) -> Vec<bytes::Bytes> {
         // retry is dead code there and load-bearing here — again, the matrix finding it.
         let subscribe_deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            match consumer.subscribe(&[topic]).await {
+            match consumer.subscribe([topic]).await {
                 Ok(()) => break,
                 Err(error) if Instant::now() < subscribe_deadline => {
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -351,10 +360,16 @@ fn read_back(topic: &str, expected: usize) -> Vec<bytes::Bytes> {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut values = Vec::new();
         while values.len() < expected && Instant::now() < deadline {
-            let records = consumer
-                .poll(Duration::from_millis(500))
-                .await
-                .expect("poll succeeds");
+            // `subscribe` returns before the group is joined, so the coordinator lookup
+            // the comment above describes can surface here instead, as a retriable error.
+            let records = match consumer.poll(Duration::from_millis(500)).await {
+                Ok(records) => records,
+                Err(error) if error.is_retriable() => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(error) => panic!("poll failed: {error}"),
+            };
             for record in records {
                 if let Some(value) = record.value {
                     values.push(value);

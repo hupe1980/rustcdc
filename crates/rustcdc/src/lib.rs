@@ -118,23 +118,24 @@ pub use crate::core::{
     HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
     NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite,
     RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions,
-    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SnapshotMetadata,
-    SourceErrorKind, SourceMetadata, StallCause, StructuredLogger, TransactionBoundaryPolicy,
-    TransactionMetadata, TransformErrorPolicy, TransportConfig, ValidationError,
-    ValidationErrorPolicy, ValidationErrors, fingerprint_event_stable, fingerprint_event_transient,
-    render_error_chain, write_runtime_metrics_prometheus,
+    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SlotWalStatus,
+    SnapshotMetadata, SourceErrorKind, SourceMetadata, StallCause, StructuredLogger,
+    TransactionBoundaryPolicy, TransactionMetadata, TransformErrorPolicy, TransportConfig,
+    ValidationError, ValidationErrorPolicy, ValidationErrors, fingerprint_event_stable,
+    fingerprint_event_transient, render_error_chain, write_runtime_metrics_prometheus,
 };
 #[cfg(feature = "metrics")]
 pub use crate::core::{
     MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord,
 };
+pub use crate::core::{ROW_SHAPE_DIGEST_VERSION, RowShape, ShapeColumn};
 #[cfg(feature = "tls")]
 pub use crate::core::{RustlsClientConfig, rustls_client_config};
 pub use crate::ddl_capture::{
-    CapturedDdl, DDL_TYPE_READ_SCHEMA, DdlDialect, DdlExtractor, DdlOperation, MysqlDdlExtractor,
-    ParsedDdlStatement, PostgresDdlExtractor, SchemaDiff, SchemaDiffOperation,
-    SqlServerDdlExtractor, extract_columns_from_create, extract_primary_keys,
-    extract_qualified_name, extract_qualified_name_with_default, normalize_identifier,
+    CapturedDdl, DdlDialect, DdlExtractor, DdlOperation, MysqlDdlExtractor, ParsedDdlStatement,
+    PostgresDdlExtractor, SchemaDiff, SchemaDiffOperation, SqlServerDdlExtractor,
+    extract_columns_from_create, extract_primary_keys, extract_qualified_name,
+    extract_qualified_name_with_default, normalize_identifier,
 };
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
 pub use crate::source::IncrementalSnapshotConfig;
@@ -171,8 +172,8 @@ pub use crate::source::{SqlServerConnection, SqlServerSourceConfig};
 pub use crate::transform::{
     AsyncTransform, FieldMappingConfig, FieldMappingTransform, FilterField, FilterMode,
     FilterOperator, FilterProjectionConfig, FilterProjectionTransform, FilterRule, MaskHashConfig,
-    MaskHashTransform, MaskRule, RouteConfig, RouteTransform, Transform, TransformPipeline,
-    UnmatchedRule, UnwrapConfig, UnwrapTransform,
+    MaskHashTransform, MaskRule, RouteConfig, RouteTransform, ShapeGuard, Transform,
+    TransformPipeline, UnmatchedRule, UnwrapConfig, UnwrapTransform,
 };
 #[cfg(feature = "outbox")]
 pub use crate::transform::{OutboxResult, OutboxTransform};
@@ -184,8 +185,6 @@ pub use crate::wasm::{
 
 #[cfg(feature = "apicurio")]
 pub use crate::codec::ApicurioRegistryConfig;
-#[cfg(feature = "cloudevents")]
-pub use crate::codec::CloudEventsEncoder;
 #[cfg(feature = "avro")]
 pub use crate::codec::{AVRO_SCHEMA, AvroDecoder, AvroEncoder, avro_value_to_event};
 #[cfg(feature = "schemreg")]
@@ -205,6 +204,8 @@ pub use crate::codec::{
     AsyncCodec, BoxedAsyncCodec, BoxedCodec, Codec, CodecOutput, EncodedOutput, EncoderCodec,
     EventEncoder, JsonCodec, JsonEncoder, JsonPrettyEncoder,
 };
+#[cfg(feature = "cloudevents")]
+pub use crate::codec::{CloudEventsEncoder, row_shape_dataschema};
 #[cfg(feature = "glue")]
 pub use crate::codec::{GlueAvroConfig, GlueAvroDecoder, GlueAvroEncoder};
 #[cfg(feature = "protobuf")]

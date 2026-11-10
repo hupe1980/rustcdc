@@ -665,6 +665,23 @@ pub trait StreamHandle: Send + Sync {
         None
     }
 
+    /// The replication slot's `wal_status` from the most recent sample of the slot.
+    ///
+    /// `None` for connectors without a slot and before the first sample. The runtime keeps
+    /// the last value across a reconnect and reports it as
+    /// `RuntimeAdminSnapshot::replication_slot_wal_status`.
+    fn replication_slot_wal_status(&self) -> Option<crate::core::SlotWalStatus> {
+        None
+    }
+
+    /// The replication slot's `safe_wal_size` in bytes from the most recent sample.
+    ///
+    /// Negative once the slot is past `max_slot_wal_keep_size`; `None` when the server sets
+    /// no limit, for connectors without a slot, and before the first sample.
+    fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
+        None
+    }
+
     /// A checkpoint offset describing this handle's own durable position.
     ///
     /// The runtime normally derives the checkpoint offset from the delivered event.
@@ -842,6 +859,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

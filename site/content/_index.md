@@ -1,6 +1,6 @@
 +++
 title = "Change data capture in Rust"
-description = "Open-source change data capture in Rust. Stream row-level changes from PostgreSQL, MySQL, MariaDB and SQL Server to Kafka, Iceberg, HTTP or files."
+description = "Open-source change data capture in Rust. Stream row-level changes from PostgreSQL, MySQL, MariaDB and SQL Server to Kafka, Iceberg, Snowflake, Databricks, HTTP or files."
 template = "index.html"
 +++
 

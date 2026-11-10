@@ -58,10 +58,8 @@ async fn collect_events_with_deadline(
     let cdc_scan_sql = format!("USE {database}; EXEC sys.sp_cdc_scan");
 
     while std::time::Instant::now() < deadline {
-        // Deliberately unfiltered. Both callers assert with `any(op == …)`, so the
-        // schema announcements that now precede each table's first row cost them
-        // nothing — and `sqlserver_stream_emits_schema_change_for_capture_metadata_refresh`
-        // asserts on exactly those events, so filtering here would make it unpassable.
+        // Deliberately unfiltered: `sqlserver_stream_emits_schema_change_for_capture_metadata_refresh`
+        // asserts on the schema-change events, so filtering here would make it unpassable.
         let mut batch = stream.next_events(200).await?;
         if batch.is_empty() {
             // Force a capture pass so CDC rows become visible promptly in CI/containers.
@@ -111,11 +109,13 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -192,6 +192,35 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
         "expected insert/update/delete in initial stream batch, got {} events",
         events.len()
     );
+    // No DDL ran after the stream started, so only rows arrive, each with the capture
+    // instance's shape: dbo.users is (id INT NOT NULL PRIMARY KEY, name NVARCHAR(100) NOT NULL).
+    assert!(
+        events.iter().all(|event| !event.op.is_schema_change()),
+        "no schema event without DDL"
+    );
+    for event in &events {
+        let shape = event
+            .shape
+            .as_ref()
+            .expect("a stream row carries its shape");
+        let columns: Vec<_> = shape
+            .columns()
+            .expect("an inline shape")
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type.as_str(),
+                    column.nullable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [("id", "int", false), ("name", "nvarchar(100)", false)]
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
 
     let mut checkpoint = InMemoryCheckpoint::default();
     stream.save_position(&mut checkpoint).await?;
@@ -277,11 +306,13 @@ async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh()
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(

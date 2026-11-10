@@ -374,6 +374,41 @@ async fn run_mariadb_stream_capture_insert_update_delete(
         "expected at least 10 delete events, got {deletes}"
     );
 
+    // Each row carries the catalogue's shape, which agrees with its table map: the server
+    // runs with `binlog_row_metadata=FULL`, so the table map names its columns.
+    let declared: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT COLUMN_NAME, CAST(COLUMN_TYPE AS CHAR), IS_NULLABLE \
+         FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = 'cdc' AND TABLE_NAME = 'mariadb_stream_test' \
+         ORDER BY ORDINAL_POSITION",
+    )
+    .fetch_all(&admin_pool)
+    .await
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    for event in &events {
+        let carried: Option<Vec<(String, String, String)>> =
+            event.shape.as_ref().and_then(|shape| {
+                Some(
+                    shape
+                        .columns()?
+                        .iter()
+                        .map(|column| {
+                            (
+                                column.name.clone(),
+                                column.data_type.clone(),
+                                if column.nullable { "YES" } else { "NO" }.to_string(),
+                            )
+                        })
+                        .collect(),
+                )
+            });
+        assert_eq!(
+            carried.as_ref(),
+            Some(&declared),
+            "a MariaDB stream row carries the information_schema shape"
+        );
+    }
+
     connection.close().await;
     Ok(())
 }

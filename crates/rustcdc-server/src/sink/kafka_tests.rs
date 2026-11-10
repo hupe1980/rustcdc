@@ -11,10 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{
-    BarrierState, BarrierStateMachine, KafkaSink, RtError, classify_krafka_error,
-    kafka_connect_timeout,
-};
+use super::{BarrierState, BarrierStateMachine, KafkaSink, RtError, classify_krafka_error};
 use crate::config::schema::{
     KafkaCompression, KafkaSecurityConfig, KafkaSecurityProtocol, KafkaSinkConfig,
 };
@@ -289,9 +286,9 @@ async fn broker_degradation_fails_closed() {
         }
         Err(err) => {
             assert!(
-                err.to_string().contains("failed to build")
-                    && err.to_string().contains("krafka producer"),
-                "expected krafka producer build error, got: {err}"
+                err.to_string()
+                    .contains("failed to connect to Kafka brokers '127.0.0.1:1'"),
+                "expected a krafka connection error, got: {err}"
             );
         }
     }
@@ -535,22 +532,23 @@ async fn live_kafka_consumer_group_commit_survives_rebalance_and_restart() {
         .expect("first-batch flush should succeed");
 
     let group_id = format!("cdc-kafka-commit-e2e-{suffix}");
-    let consumer_a = Consumer::builder()
-        .bootstrap_servers(brokers.clone())
-        .group_id(group_id.clone())
-        .client_id(format!("cdc-kafka-commit-e2e-a-{suffix}"))
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
-        .request_timeout(Duration::from_millis(cfg.ack_timeout_ms))
-        .connect_timeout(kafka_connect_timeout(Duration::from_millis(
-            cfg.ack_timeout_ms,
-        )))
-        .auth(auth.clone())
-        .build()
-        .await
-        .expect("consumer A should build");
+    let consumer_a = crate::sink::kafka_builder(
+        brokers.clone(),
+        format!("cdc-kafka-commit-e2e-a-{suffix}"),
+        Duration::from_millis(cfg.ack_timeout_ms),
+        auth.clone(),
+    )
+    .connect()
+    .await
+    .expect("kafka should connect")
+    .consumer(group_id.clone())
+    .auto_offset_reset(AutoOffsetReset::Earliest)
+    .enable_auto_commit(false)
+    .build()
+    .await
+    .expect("consumer A should build");
     consumer_a
-        .subscribe(&[topic.as_str()])
+        .subscribe([topic.as_str()])
         .await
         .expect("consumer A should subscribe");
 
@@ -564,22 +562,23 @@ async fn live_kafka_consumer_group_commit_survives_rebalance_and_restart() {
         .await
         .expect("consumer A commit should succeed");
 
-    let consumer_b = Consumer::builder()
-        .bootstrap_servers(brokers.clone())
-        .group_id(group_id)
-        .client_id(format!("cdc-kafka-commit-e2e-b-{suffix}"))
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
-        .request_timeout(Duration::from_millis(cfg.ack_timeout_ms))
-        .connect_timeout(kafka_connect_timeout(Duration::from_millis(
-            cfg.ack_timeout_ms,
-        )))
-        .auth(auth)
-        .build()
-        .await
-        .expect("consumer B should build");
+    let consumer_b = crate::sink::kafka_builder(
+        brokers.clone(),
+        format!("cdc-kafka-commit-e2e-b-{suffix}"),
+        Duration::from_millis(cfg.ack_timeout_ms),
+        auth,
+    )
+    .connect()
+    .await
+    .expect("kafka should connect")
+    .consumer(group_id)
+    .auto_offset_reset(AutoOffsetReset::Earliest)
+    .enable_auto_commit(false)
+    .build()
+    .await
+    .expect("consumer B should build");
     consumer_b
-        .subscribe(&[topic.as_str()])
+        .subscribe([topic.as_str()])
         .await
         .expect("consumer B should subscribe");
 
@@ -727,16 +726,22 @@ async fn fake_broker_sink_delivers_all_records_durably() {
 /// Read every record of a single-partition topic back off the fake broker, in log
 /// order, as a `read_uncommitted` consumer sees it.
 async fn drain_partition_values(brokers: &str, topic: &str, expected: usize) -> Vec<String> {
-    let consumer = Consumer::builder()
-        .bootstrap_servers(brokers.to_string())
-        .group_id(format!("{topic}-verify"))
-        .client_id(format!("{topic}-verify"))
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
-        .build()
-        .await
-        .expect("verification consumer");
-    consumer.subscribe(&[topic]).await.expect("subscribe");
+    let consumer = crate::sink::kafka_builder(
+        brokers.to_string(),
+        format!("{topic}-verify"),
+        std::time::Duration::from_secs(30),
+        krafka::auth::AuthConfig::plaintext(),
+    )
+    .connect()
+    .await
+    .expect("kafka should connect")
+    .consumer(format!("{topic}-verify"))
+    .auto_offset_reset(AutoOffsetReset::Earliest)
+    .enable_auto_commit(false)
+    .build()
+    .await
+    .expect("verification consumer");
+    consumer.subscribe([topic]).await.expect("subscribe");
 
     let mut values = Vec::new();
     for _ in 0..40 {
@@ -759,17 +764,23 @@ async fn drain_partition_values(brokers: &str, topic: &str, expected: usize) -> 
 
 /// Read a topic as a `read_committed` consumer does — aborted records excluded.
 async fn read_committed_values(brokers: &str, topic: &str) -> Vec<String> {
-    let consumer = Consumer::builder()
-        .bootstrap_servers(brokers.to_string())
-        .group_id(format!("{topic}-committed"))
-        .client_id(format!("{topic}-committed"))
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .isolation_level(krafka::consumer::IsolationLevel::ReadCommitted)
-        .enable_auto_commit(false)
-        .build()
-        .await
-        .expect("read_committed consumer");
-    consumer.subscribe(&[topic]).await.expect("subscribe");
+    let consumer = crate::sink::kafka_builder(
+        brokers.to_string(),
+        format!("{topic}-committed"),
+        std::time::Duration::from_secs(30),
+        krafka::auth::AuthConfig::plaintext(),
+    )
+    .connect()
+    .await
+    .expect("kafka should connect")
+    .consumer(format!("{topic}-committed"))
+    .auto_offset_reset(AutoOffsetReset::Earliest)
+    .isolation_level(krafka::consumer::IsolationLevel::ReadCommitted)
+    .enable_auto_commit(false)
+    .build()
+    .await
+    .expect("read_committed consumer");
+    consumer.subscribe([topic]).await.expect("subscribe");
 
     let mut values = Vec::new();
     for _ in 0..8 {
@@ -949,11 +960,11 @@ async fn pipelining_outperforms_one_round_trip_per_record() {
 
     broker.clear_requests();
     let serial = run(&broker.bootstrap_servers(), "cdc.fake.perf.serial", 1).await;
-    let serial_produces = broker.request_count(krafka::protocol::ApiKey::Produce);
+    let serial_produces = broker.request_count(krafka::testing::ApiKey::Produce);
 
     broker.clear_requests();
     let pipelined = run(&broker.bootstrap_servers(), "cdc.fake.perf.pipelined", 256).await;
-    let pipelined_produces = broker.request_count(krafka::protocol::ApiKey::Produce);
+    let pipelined_produces = broker.request_count(krafka::testing::ApiKey::Produce);
 
     eprintln!(
         "pipelining: serial {serial:?} / {serial_produces} produce requests \
@@ -1324,6 +1335,7 @@ fn classification_survives_the_round_trip_through_rustcdc() {
     let fatal = classify_krafka_error(
         &krafka::error::KrafkaError::Auth {
             message: "bad credentials".to_string(),
+            source: None,
         },
         "sink delivery failed",
     );
@@ -1335,7 +1347,69 @@ fn classification_survives_the_round_trip_through_rustcdc() {
     );
 }
 
-/// `init_transactions` must fence the previous producer for the same
+/// A barrier no record joined must commit.
+///
+/// The router opens a barrier on every route for every batch, so a route that received
+/// nothing commits an empty one. The fake broker enforces Kafka's rule that a transaction
+/// which added no partition cannot be committed (`INVALID_TXN_STATE` under transaction
+/// version 1), and krafka sends `EndTxn` regardless — so an empty barrier must never reach
+/// the producer at all.
+#[tokio::test]
+async fn an_empty_barrier_commits_without_a_kafka_transaction() {
+    let broker = krafka::testing::FakeBroker::start()
+        .await
+        .expect("fake broker");
+    broker.create_topic("cdc.fake.txn.empty", 1);
+
+    let cfg = transactional_kafka_config(
+        &broker.bootstrap_servers(),
+        "cdc.fake.txn.empty",
+        "cdc-txn-empty",
+    );
+    let mut sink = KafkaSink::new(&cfg).await.expect("transactional sink");
+
+    for _ in 0..2 {
+        sink.begin_checkpoint_barrier()
+            .await
+            .expect("begin barrier");
+        sink.commit_checkpoint_barrier()
+            .await
+            .expect("an empty barrier must commit");
+    }
+    sink.begin_checkpoint_barrier()
+        .await
+        .expect("begin barrier");
+    sink.abort_checkpoint_barrier()
+        .await
+        .expect("an empty barrier must abort");
+
+    // And the next barrier that does carry a record still commits it.
+    sink.begin_checkpoint_barrier()
+        .await
+        .expect("begin barrier");
+    sink.send_encoded(
+        &sample_event(),
+        &cfg.topic,
+        bytes::Bytes::from("key"),
+        bytes::Bytes::from("value"),
+    )
+    .await
+    .expect("send inside transaction");
+    sink.commit_checkpoint_barrier()
+        .await
+        .expect("commit barrier");
+    assert!(
+        broker
+            .last_stable_offset("cdc.fake.txn.empty", 0)
+            .expect("partition exists")
+            > 0,
+        "the record must be committed"
+    );
+
+    sink.close().await.expect("close");
+}
+
+/// `build_transactional` must fence the previous producer for the same
 /// transactional id by bumping the epoch — that is what stops a zombie writer
 /// from committing after this instance took over (KIP-447).
 #[tokio::test]
@@ -1481,11 +1555,16 @@ async fn a_templated_topic_fans_one_sink_across_a_topic_per_table() {
 
     for topic in expected {
         let mut consumer = CompactedTopicConsumer::from_consumer_builder(
-            krafka::consumer::Consumer::builder()
-                .bootstrap_servers(broker.bootstrap_servers())
-                .client_id(format!("fake-template-{topic}"))
-                .connect_timeout(Duration::from_secs(2))
-                .request_timeout(Duration::from_secs(10)),
+            crate::sink::kafka_builder(
+                broker.bootstrap_servers(),
+                format!("fake-template-{topic}"),
+                Duration::from_secs(10),
+                krafka::auth::AuthConfig::plaintext(),
+            )
+            .connect()
+            .await
+            .expect("kafka should connect")
+            .consumer_without_group(),
             topic,
         )
         .await
@@ -1707,14 +1786,19 @@ async fn read_raw(
     broker: &krafka::testing::FakeBroker,
     topic: &str,
 ) -> Vec<krafka::consumer::ConsumerRecord> {
-    let consumer = krafka::consumer::Consumer::builder()
-        .bootstrap_servers(broker.bootstrap_servers())
-        .client_id(format!("raw-{topic}"))
-        .connect_timeout(Duration::from_secs(2))
-        .request_timeout(Duration::from_secs(10))
-        .build()
-        .await
-        .expect("consumer");
+    let consumer = crate::sink::kafka_builder(
+        broker.bootstrap_servers(),
+        format!("raw-{topic}"),
+        Duration::from_secs(10),
+        krafka::auth::AuthConfig::plaintext(),
+    )
+    .connect()
+    .await
+    .expect("kafka should connect")
+    .consumer_without_group()
+    .build()
+    .await
+    .expect("consumer");
     consumer.assign(topic, vec![0]).await.expect("assign");
     consumer
         .seek_to_beginning(topic, 0)
@@ -1743,7 +1827,7 @@ fn header<'a>(
     record
         .headers
         .iter()
-        .find(|(k, _)| k.as_ref() == name.as_bytes())
+        .find(|(k, _)| k == name)
         .and_then(|(_, v)| v.as_ref())
         .map(|v| String::from_utf8_lossy(v))
 }
@@ -1793,6 +1877,47 @@ async fn every_record_carries_its_cdc_provenance_headers() {
         Some("0/16B6A71")
     );
     assert_eq!(header(r, super::HEADER_SOURCE_TS_MS).as_deref(), Some("1"));
+    assert_eq!(
+        header(r, super::HEADER_ROW_SHAPE),
+        None,
+        "a row without a shape carries no shape header"
+    );
+    binding.close().await.expect("binding close");
+}
+
+/// A row with a shape names it in `__rustcdc.row_shape`.
+#[tokio::test]
+async fn kafka_records_carry_the_shape_header() {
+    let broker = krafka::testing::FakeBroker::start()
+        .await
+        .expect("fake broker");
+    broker.create_topic("cdc.fake.shape", 1);
+    let cfg = sample_kafka_config(&broker.bootstrap_servers(), "cdc.fake.shape");
+    let mut binding = crate::sink::build_binding(
+        &crate::config::schema::SinkConfig::Kafka(cfg),
+        &crate::sink::SinkBuildContext::new(usize::MAX),
+    )
+    .await
+    .expect("sink binding");
+
+    let shape = rustcdc::RowShape::new(
+        "public",
+        "users",
+        vec![rustcdc::ShapeColumn::new("id", "integer", false)],
+        vec!["id".into()],
+    )
+    .unwrap();
+    let mut event = sample_event();
+    event.shape = Some(std::sync::Arc::new(shape.clone()));
+    binding.send_event(&event).await.expect("send");
+    use rustcdc::sink::SinkAdapter as _;
+    binding.flush().await.expect("flush");
+
+    let records = read_raw(&broker, "cdc.fake.shape").await;
+    assert_eq!(
+        header(&records[0], super::HEADER_ROW_SHAPE).as_deref(),
+        Some(shape.id())
+    );
     binding.close().await.expect("binding close");
 }
 
@@ -1946,11 +2071,16 @@ async fn scan_topic(broker: &krafka::testing::FakeBroker, topic: &str, key: &[u8
     use krafka::consumer::CompactedTopicConsumer;
 
     let mut consumer = CompactedTopicConsumer::from_consumer_builder(
-        krafka::consumer::Consumer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
-            .client_id(format!("tombstone-scan-{topic}"))
-            .connect_timeout(Duration::from_secs(2))
-            .request_timeout(Duration::from_secs(10)),
+        crate::sink::kafka_builder(
+            broker.bootstrap_servers(),
+            format!("tombstone-scan-{topic}"),
+            Duration::from_secs(10),
+            krafka::auth::AuthConfig::plaintext(),
+        )
+        .connect()
+        .await
+        .expect("kafka should connect")
+        .consumer_without_group(),
         topic,
     )
     .await
@@ -2459,11 +2589,16 @@ async fn fake_broker_message_keys_use_pk_json_with_table_name_fallback() {
     binding.flush().await.expect("flush");
 
     let mut consumer = CompactedTopicConsumer::from_consumer_builder(
-        krafka::consumer::Consumer::builder()
-            .bootstrap_servers(broker.bootstrap_servers())
-            .client_id("fake-key-check".to_string())
-            .connect_timeout(Duration::from_secs(2))
-            .request_timeout(Duration::from_secs(10)),
+        crate::sink::kafka_builder(
+            broker.bootstrap_servers(),
+            "fake-key-check".to_string(),
+            Duration::from_secs(10),
+            krafka::auth::AuthConfig::plaintext(),
+        )
+        .connect()
+        .await
+        .expect("kafka should connect")
+        .consumer_without_group(),
         "cdc.fake.keys",
     )
     .await

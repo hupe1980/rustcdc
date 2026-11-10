@@ -31,11 +31,13 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin =
@@ -148,10 +150,8 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
             continue;
         }
 
-        // Rows only, in the count and in the sample. A table's columns are announced
-        // before its first row; that event carries no writer timestamp, so it would be
-        // tallied as an unstamped event and would inflate the committed count past the
-        // rows actually inserted. Capture latency is a statement about row changes.
+        // Rows only, in the count and in the sample: a schema-change event carries no
+        // writer timestamp, and capture latency is a statement about row changes.
         let rows: Vec<rustcdc::Event> = batch
             .events()
             .iter()

@@ -119,20 +119,23 @@ pub async fn process_batch_events(
     struct EventPrepareResult {
         /// The transformed event and its correctness fingerprint, or `None` when a
         /// transform dropped the event.
-        prepared: Option<(rustcdc::core::Event, CorrectnessSample)>,
+        prepared: Option<(
+            rustcdc::core::Event,
+            CorrectnessSample,
+            Option<std::sync::Arc<rustcdc::RowShape>>,
+        )>,
         transform_latency_us: u64,
         prepare_latency_us: u64,
     }
 
-    // The sample travels *with* the event rather than being collected here.
-    //
-    // The producer used to push every sample into its own vector, and the caller recorded
-    // the lot once the batch was durable — under a comment saying correctness KPIs are
-    // post-durable. They were not: an event the consumer dead-lettered had already had its
-    // sample banked, so `rustcdc_data_events_total` and the duplicate/reorder rates counted
-    // events that were quarantined and never delivered. Carrying the sample and collecting
-    // it on the far side of a successful send makes the comment true.
-    type Delivery = (rustcdc::core::Event, CorrectnessSample);
+    // The sample travels *with* the event and is collected only after a successful send,
+    // so `rustcdc_data_events_total` and the duplicate/reorder rates never count an event
+    // the consumer dead-lettered.
+    type Delivery = (
+        rustcdc::core::Event,
+        CorrectnessSample,
+        Option<std::sync::Arc<rustcdc::RowShape>>,
+    );
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Delivery>(sink_delivery_queue_capacity.max(1));
 
     // `move` + the explicit `drop(tx)` below are load-bearing. The consumer's exit
@@ -150,9 +153,10 @@ pub async fn process_batch_events(
             let transform_started = std::time::Instant::now();
             let transformed = transform_pipeline.apply(event).await?;
             let transform_latency_us = transform_started.elapsed().as_micros() as u64;
-            let prepared = transformed.map(|event| {
+            let prepared = transformed.map(|mut event| {
                 let sample = CorrectnessSample::from_event(&event);
-                (event, sample)
+                let shape = transform_pipeline.row_shapes().prepare(&mut event);
+                (event, sample, shape)
             });
 
             Ok::<EventPrepareResult, AppError>(EventPrepareResult {
@@ -230,16 +234,14 @@ pub async fn process_batch_events(
                 rx.recv().await
             };
 
-            let Some((event, correctness_sample)) = maybe_event else {
+            let Some((event, correctness_sample, shape)) = maybe_event else {
                 break;
             };
 
             let sink_send_started = std::time::Instant::now();
             // `event` is borrowed for the send and still owned here for the dead-letter
-            // path, so neither needs a copy. This used to clone the whole `Event` —
-            // including its `serde_json::Value` payload, so a deep heap walk — for *every*
-            // event, to serve a quarantine branch that fires only for permanently
-            // undeliverable records.
+            // path, so neither needs a copy: a clone would deep-walk the payload for every
+            // event to serve a branch that fires only for undeliverable records.
             match send_event_with_timeout(sink, &event, sink_send_timeout_ms).await {
                 Ok(()) => {}
                 // A *recoverable* failure is the batch's problem, not the event's — the
@@ -289,6 +291,9 @@ pub async fn process_batch_events(
             // Reached only on a successful send, so a quarantined event contributes no
             // correctness sample — it never became part of the stream the KPI describes.
             committed_correctness_samples.push(correctness_sample);
+            if let Some(shape) = &shape {
+                transform_pipeline.row_shapes().delivered(shape);
+            }
 
             let sink_send_latency_us = sink_send_started.elapsed().as_micros() as u64;
             stats.sink_send_ops_total = stats.sink_send_ops_total.saturating_add(1);
@@ -460,10 +465,8 @@ async fn send_event_with_timeout(
     sink_send_timeout_ms: u64,
 ) -> Result<(), AppError> {
     // The size limit is enforced by `SinkBinding` against the *encoded* payload — see
-    // `crate::sink::SinkBinding::max_event_bytes`. It used to be enforced here by
-    // serialising the event to JSON and discarding the result, which cost a measured
-    // 13.9 us per event and, for any non-JSON codec, measured a payload that was never
-    // transmitted.
+    // `crate::sink::SinkBinding::max_event_bytes`, so a non-JSON codec is measured by
+    // the bytes it transmits.
     match tokio::time::timeout(
         std::time::Duration::from_millis(sink_send_timeout_ms),
         sink.send(event),
@@ -473,7 +476,10 @@ async fn send_event_with_timeout(
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(AppError::Runtime(err)),
         Err(_) => Err(AppError::SinkTimeout(format!(
-            "sink send operation timed out after {sink_send_timeout_ms} ms"
+            "sink send for {} ({}) timed out after {sink_send_timeout_ms} ms; the destination \
+             accepted nothing for it in that time",
+            event.qualified_table_name(),
+            event.op
         ))),
     }
 }
@@ -498,6 +504,53 @@ pub(crate) async fn flush_sink_with_timeout(
 
 #[cfg(test)]
 mod tests {
+    /// A send that times out names what it was sending: with a topic template and many
+    /// tables, a bare timeout does not say which table's destination is refusing writes.
+    #[tokio::test]
+    async fn a_send_timeout_names_the_table_and_operation() {
+        // Accepts the connection and never answers: the send neither succeeds nor fails.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let sink = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": format!("http://{addr}/events"),
+            "batch_max_events": 1,
+            "max_retries": 0,
+        }))
+        .expect("http sink config");
+        let binding =
+            crate::sink::build_binding(&sink, &crate::sink::SinkBuildContext::new(1 << 20))
+                .await
+                .expect("http binding");
+        let mut router = crate::pipeline::router::single(binding);
+        let event = rustcdc::core::Event::builder("orders", rustcdc::core::Operation::Update)
+            .after(serde_json::json!({ "id": 1 }))
+            .schema("app")
+            .primary_key(["id"])
+            .build();
+
+        let error = super::send_event_with_timeout(&mut router, &event, 100)
+            .await
+            .expect_err("a destination that never answers must time out");
+        let message = error.to_string();
+        assert!(
+            message.contains("app.orders"),
+            "the table must be named: {message}"
+        );
+        assert!(
+            message.contains("update"),
+            "the operation must be named: {message}"
+        );
+    }
+
     use super::process_batch_events;
     use crate::config::schema::{SinkConfig, StdoutSinkConfig, TransformRuntimeConfig};
     use crate::pipeline::transform::TransformPipeline;
@@ -518,8 +571,7 @@ mod tests {
             .build()
     }
 
-    /// Deadlock regression: the consumer half of the
-    /// prepare/deliver pipeline exits only when the delivery channel closes. If the
+    /// The consumer half of the prepare/deliver pipeline exits only when the delivery channel closes. If the
     /// producer does not drop its sender on completion, `try_join!` waits on a
     /// consumer that waits on `recv()` — forever, for every batch, empty or not.
     #[tokio::test]
@@ -555,5 +607,72 @@ mod tests {
             .expect("batch must succeed");
             assert_eq!(stats.delivery.sink_send_ops_total, batch_len as u64);
         }
+    }
+
+    /// Under `row_shape = "id"` the sink receives only the id, and the delivered shape
+    /// resolves afterwards.
+    #[tokio::test]
+    async fn compact_mode_is_applied_at_delivery_and_the_shape_resolves() {
+        use crate::config::schema::{FileJsonlSinkConfig, RowShapeDelivery};
+        use crate::runtime::row_shapes::{DeliveredShapes, RowShapeDeliveryPlan};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.jsonl");
+        let binding = crate::sink::build_binding(
+            &SinkConfig::FileJsonl(FileJsonlSinkConfig {
+                path: path.clone(),
+                rotate_size_bytes: 0,
+                fsync_every: 1,
+            }),
+            &crate::sink::SinkBuildContext::new(1 << 20),
+        )
+        .await
+        .expect("file binding");
+        let mut router = crate::pipeline::router::single(binding);
+        let delivered = DeliveredShapes::default();
+        let pipeline = TransformPipeline::from_config(TransformRuntimeConfig::default(), vec![])
+            .expect("pipeline")
+            .with_row_shapes(RowShapeDeliveryPlan::new(
+                RowShapeDelivery::Id,
+                delivered.clone(),
+            ));
+        let shape = std::sync::Arc::new(
+            rustcdc::RowShape::new(
+                "public",
+                "users",
+                vec![
+                    rustcdc::ShapeColumn::new("id", "bigint", false),
+                    rustcdc::ShapeColumn::new("name", "text", true),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap(),
+        );
+        let mut event = sample_event(1);
+        event.shape = Some(std::sync::Arc::clone(&shape));
+
+        process_batch_events(
+            &mut router,
+            vec![event],
+            &pipeline,
+            1,
+            1,
+            16,
+            1_000,
+            1_000,
+            None,
+        )
+        .await
+        .expect("batch must succeed");
+
+        let written = std::fs::read_to_string(&path).expect("sink output");
+        let line: serde_json::Value =
+            serde_json::from_str(written.lines().next().expect("one line")).unwrap();
+        assert_eq!(line["shape"]["id"], shape.id());
+        assert!(
+            line["shape"].get("columns").is_none(),
+            "compact mode delivers the id only: {line}"
+        );
+        assert_eq!(delivered.get(shape.id()).as_deref(), Some(shape.as_ref()));
     }
 }

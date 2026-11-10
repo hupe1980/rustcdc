@@ -127,4 +127,49 @@ message Event {
   // genuinely changed as unwritable and silently drop the update.
   // Always empty when before_is_key_only is true.
   repeated string before_unavailable_columns = 14;
+
+  // Reserved: pre-release builds of this envelope wrote `schema_id` here.
+  reserved 15;
+  reserved "schema_id";
+
+  // The table shape this row was captured under: columns with declared types and
+  // nullability, the primary key, and a content id. Column values are JSON text, so the
+  // declared type is what says how to parse them. Absent when the connector cannot vouch
+  // for the shape the row was captured under, and after a transform that changed the
+  // columns' meaning: absent means "unknown".
+  optional RowShape shape = 16;
+}
+
+// ─── RowShape ─────────────────────────────────────────────────────────────────
+//
+// Declared after Event so Event keeps its message-index path ([3]) in a schema registry.
+
+// The shape of a table a row was captured under.
+//
+// Complete when `columns` is non-empty (a complete shape always has at least one column);
+// compact when `columns` and `primary_key` are both empty, in which case only `id` is
+// carried and is resolved elsewhere (the server's `row_shape = "id"` delivery mode).
+message RowShape {
+  // Lowercase hex SHA-256 of "rustcdc/v2/row-shape" followed by the length-prefixed schema,
+  // table, columns (name, data_type, nullable) and primary key. See the schema-evolution
+  // guide for the exact byte layout.
+  string id = 1;
+  // Schema (PostgreSQL schema, MySQL database, SQL Server schema) as the source names it.
+  string schema = 2;
+  // Table as the source names it; not renamed by a route transform.
+  string table = 3;
+  // Columns in ordinal order.
+  repeated ShapeColumn columns = 4;
+  // Primary-key column names in key order. Empty for a keyless table.
+  repeated string primary_key = 5;
+}
+
+// One column of a RowShape.
+message ShapeColumn {
+  // Column name.
+  string name = 1;
+  // Declared type in the source's own syntax, modifier included (numeric(12,4)).
+  string data_type = 2;
+  // Whether the column accepts NULL, as the source's catalogue declares it.
+  bool nullable = 3;
 }

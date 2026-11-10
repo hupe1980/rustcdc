@@ -107,8 +107,9 @@ Two claims are load-bearing, and both are narrower than the words usually imply:
 
 - **`at_least_once`** — a crash can replay the events of one uncheckpointed batch.
   Duplicates are possible; loss is not. Sinks must be idempotent on a key you control.
-- **`effectively_once`** — a batch's records and its checkpoint commit together, in one
-  Kafka transaction. It is *not* end-to-end exactly-once in every configuration, and
+- **`effectively_once`** — a batch's records and its checkpoint commit together: in one
+  Kafka transaction, or by a Snowflake channel's offset token. It is *not* end-to-end
+  exactly-once in every configuration, and
   [the limits are written down](@/docs/concepts.md#3-delivery-contracts) rather than
   glossed over.
 

@@ -294,6 +294,7 @@ impl MysqlSourceConfig {
                         .into(),
                 ));
             }
+            ensure_process_crypto_provider();
             let ssl_opts = self.build_ssl_opts()?;
             builder.ssl_opts(Some(ssl_opts))
         } else {
@@ -380,5 +381,19 @@ impl MysqlSourceConfig {
         pool.disconnect().await.ok();
 
         Ok(read_only == 0)
+    }
+}
+
+/// `mysql_async` builds its TLS client from rustls's process-default provider and takes no
+/// other. rustls installs that default itself when exactly one provider is linked, but a
+/// build with `sqlserver` or `glue` links both `ring` and `aws-lc-rs`, and the first MySQL TLS
+/// connection then panics. Installing `ring` — the provider every other connector uses — only
+/// when nothing is installed is what rustls would have done, and leaves an embedder's earlier
+/// choice in place.
+#[cfg(feature = "tls")]
+fn ensure_process_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Losing a race to another installer is fine: a default exists either way.
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }

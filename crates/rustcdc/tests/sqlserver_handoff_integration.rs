@@ -33,11 +33,13 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(c) => c,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(c) => c,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
 
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -83,7 +85,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
     // Drain snapshot before handoff.
     loop {
         // Drained, not inspected: the handoff is the subject here, so the batch's
-        // contents — rows or the schema announcement that precedes them — do not matter.
+        // contents do not matter.
         let chunk = snapshot.next_chunk(256).await?;
         if chunk.is_empty() {
             break;

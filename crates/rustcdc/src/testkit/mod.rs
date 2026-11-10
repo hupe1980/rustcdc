@@ -329,6 +329,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

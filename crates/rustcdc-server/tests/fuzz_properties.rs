@@ -3,28 +3,22 @@
 //!
 //! # Why these exist, and why they are not only a `fuzz/` crate
 //!
-//! Round 5's adversarial suite (`tests/security_negative.rs`) probes *chosen* inputs: 16
-//! attacks somebody thought of. It found what it was pointed at and, by construction,
-//! nothing else. The residual gap it named was arbitrary input.
-//!
-//! `fuzz/` covers that properly, but `cargo fuzz` needs a nightly toolchain and unbounded
-//! time, so it runs on demand rather than on every commit. A fuzz target CI never executes
-//! protects nothing. These tests close that half: a fixed corpus of adversarial shapes
-//! plus a deterministic PRNG, cheap enough to run on every build.
+//! `tests/security_negative.rs` probes *chosen* inputs; it finds only what it is pointed
+//! at. `fuzz/` covers arbitrary input, but `cargo fuzz` needs nightly and unbounded time,
+//! so it runs on demand. These tests run on every build: a fixed corpus of adversarial
+//! shapes plus a deterministic PRNG.
 //!
 //! # What is actually asserted
 //!
-//! Not "does not panic" — that is the weakest interesting property and the one a fuzzer
-//! finds unaided. The load-bearing assertions are the two guarantees redaction actually
-//! makes, stated separately because they have different scopes:
+//! Not "does not panic" — the weakest property, and one a fuzzer finds unaided. The two
+//! guarantees redaction makes, stated separately because their scopes differ:
 //!
 //! * a value under a **secret-named key** is replaced entirely, at any depth; and
-//! * a **URL carrying userinfo** loses it under *any* key, named sensitive or not.
+//! * a **URL carrying userinfo** loses it under *any* key, named sensitive or not — a URL
+//!   such as `sink.http.url` is neither named like a secret nor enumerated.
 //!
-//! The second is the shape of a real past defect: `sink.http.url` was neither named like a secret nor
-//! enumerated, and `/status` returned `user:pass@` to any read-scoped token. Keeping the
-//! two apart matters — an earlier draft of this suite planted secrets under benign keys
-//! and "failed", which was the test asserting a guarantee the code never offered.
+//! A secret planted under a benign key that is *not* a URL is not redacted; asserting
+//! otherwise would test a guarantee the code does not offer.
 
 use std::fmt::Write as _;
 
@@ -167,9 +161,8 @@ fn no_secret_under_a_secret_named_key_survives_redaction() {
 /// The one **value**-driven rule, checked as a property.
 ///
 /// A URL carrying userinfo must lose it wherever it appears, including under keys nobody
-/// listed as sensitive — that is precisely the past defect, where `sink.http.url` was
-/// neither named like a secret nor enumerated, and `/status` returned `user:pass@` to any
-/// read-scoped token.
+/// listed as sensitive: `sink.http.url` is neither named like a secret nor enumerated, and
+/// `/status` is readable by any read-scoped token.
 #[test]
 fn url_userinfo_is_stripped_under_any_key() {
     for seed in 1..300u64 {

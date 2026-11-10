@@ -378,6 +378,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

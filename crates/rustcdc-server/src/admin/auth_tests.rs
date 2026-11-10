@@ -142,6 +142,7 @@ fn read_auth_requires_matching_bearer_when_token_configured() {
         // not signal ingress, and the ledger is only consulted by the Kafka ingress loop.
         signal_ledger: None,
         workers: super::AdminWorkers::new(),
+        delivered_shapes: Default::default(),
         notification_broadcast: Arc::new(
             tokio::sync::broadcast::channel(super::NOTIFICATION_STREAM_BUFFER).0,
         ),
@@ -280,6 +281,7 @@ fn write_scope_fails_closed_when_only_read_tokens_are_configured() {
         // not signal ingress, and the ledger is only consulted by the Kafka ingress loop.
         signal_ledger: None,
         workers: super::AdminWorkers::new(),
+        delivered_shapes: Default::default(),
         notification_broadcast: Arc::new(
             tokio::sync::broadcast::channel(super::NOTIFICATION_STREAM_BUFFER).0,
         ),
@@ -407,6 +409,7 @@ fn read_scope_fails_closed_when_no_read_tokens_are_configured() {
         // not signal ingress, and the ledger is only consulted by the Kafka ingress loop.
         signal_ledger: None,
         workers: super::AdminWorkers::new(),
+        delivered_shapes: Default::default(),
         notification_broadcast: Arc::new(
             tokio::sync::broadcast::channel(super::NOTIFICATION_STREAM_BUFFER).0,
         ),
@@ -542,6 +545,7 @@ fn token_lifecycle_enforces_expiry_and_revocation() {
         // not signal ingress, and the ledger is only consulted by the Kafka ingress loop.
         signal_ledger: None,
         workers: super::AdminWorkers::new(),
+        delivered_shapes: Default::default(),
         notification_broadcast: Arc::new(
             tokio::sync::broadcast::channel(super::NOTIFICATION_STREAM_BUFFER).0,
         ),
@@ -697,6 +701,7 @@ fn stale_manifest_policy_blocks_authorization() {
         // not signal ingress, and the ledger is only consulted by the Kafka ingress loop.
         signal_ledger: None,
         workers: super::AdminWorkers::new(),
+        delivered_shapes: Default::default(),
         notification_broadcast: Arc::new(
             tokio::sync::broadcast::channel(super::NOTIFICATION_STREAM_BUFFER).0,
         ),
@@ -1003,6 +1008,7 @@ fn readyz_auth_mode_can_allow_loopback_unauthenticated_probes() {
         // not signal ingress, and the ledger is only consulted by the Kafka ingress loop.
         signal_ledger: None,
         workers: super::AdminWorkers::new(),
+        delivered_shapes: Default::default(),
         notification_broadcast: Arc::new(
             tokio::sync::broadcast::channel(super::NOTIFICATION_STREAM_BUFFER).0,
         ),

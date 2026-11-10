@@ -46,13 +46,9 @@ mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "mysql
 mariadb = ["mysql"]
 # Enable SQL Server-specific source implementations.
 #
-# SECURITY: this feature negotiates TLS with a *different, older* stack than the rest of
-# the crate. Everything else here is on rustls 0.23; tiberius 0.12.3 hard-pins
-# tokio-rustls 0.24, so enabling this adds rustls 0.21 / rustls-webpki 0.101.7 —
-# carrying RUSTSEC-2026-0098, -0099 and -0104, plus the unmaintained rustls-pemfile 1.0
-# via rustls-native-certs 0.6. Not deduplicable and not fixable from here: it needs a
-# tiberius release built against rustls 0.23. Per-advisory reachability analysis and
-# mitigations are in site/content/docs/security.md; the suppressions are in deny.toml.
+# tiberius 0.13 is on rustls 0.23, the same stack as the rest of the crate, but it builds
+# its `ClientConfig` with the aws-lc-rs provider unless a process default is installed —
+# so this feature links aws-lc-rs alongside the `ring` the other connectors use.
 sqlserver = ["dep:tiberius", "tls"]
 # Enable TLS-related transport support for source connectors.
 tls = ["dep:rustls", "dep:rustls-native-certs", "dep:tokio-rustls"]
@@ -122,9 +118,9 @@ thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "net", "rt", "signal", "sync", "time", "fs", "io-util"] }
 tracing = "0.1.41"
 regex = "1.11.1"
-wasmparser = { version = "0.255", optional = true }
+wasmparser = { version = "0.261", optional = true }
 # Sets the workspace MSRV; see `[workspace.package].rust-version`.
-wasmtime = { version = "48", optional = true }
+wasmtime = { version = "50.0.1", optional = true }
 aes-gcm = { version = "0.11", optional = true }
 base64 = { workspace = true, optional = true }
 hkdf = { version = "0.13", optional = true }
@@ -139,7 +135,7 @@ tokio-postgres-rustls = { version = "0.14", optional = true }
 zeroize = { version = "1", features = ["alloc"] }
 mysql_async = { version = "0.37", default-features = false, features = ["minimal", "binlog"], optional = true }
 mysql_common = { version = "0.37", default-features = false, features = ["binlog"], optional = true }
-tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "tokio", "rustls"], optional = true }
+tiberius = { version = "0.13.0", default-features = false, features = ["tds73", "tokio", "rustls"], optional = true }
 tokio-util = { version = "0.7.16", features = ["compat"] }
 rustls = { version = "0.23.19", default-features = false, features = ["std", "ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
@@ -148,7 +144,7 @@ prost = { version = "0.14", optional = true }
 prost-reflect = { version = "0.16", optional = true }
 apache-avro = { version = "0.21", optional = true }
 bytes = { workspace = true, optional = true }
-schemreg = { version = "0.6", default-features = false, features = ["confluent", "json"], optional = true }
+schemreg = { version = "0.7.0", default-features = false, features = ["confluent", "json"], optional = true }
 
 [build-dependencies]
 # Pure-Rust protobuf compiler: builds the descriptor set for Confluent Protobuf framing
@@ -161,7 +157,7 @@ criterion = { workspace = true, default-features = true }
 # Validates real events against the published `EVENT_JSON_SCHEMA`. Pinned to the same
 # version `schemreg` validates with, so the test agrees with the encoder rather than with
 # a second implementation's reading of the spec.
-jsonschema = { version = "0.46", default-features = false }
+jsonschema = { version = "0.61", default-features = false }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "json"] }
 tempfile = "3.23.0"
 testcontainers = "0.27"

@@ -160,6 +160,9 @@ pub struct SnapshotTable {
     /// trusted input — see the config field for the trust boundary. The table is aliased
     /// `t` in every backend's chunk read, so a qualified column reference works.
     pub condition: Option<String>,
+    /// The table's shape from [`IncrementalSnapshotBackend::describe_shape`], read again
+    /// before each chunk; `None` from `describe_table`.
+    pub shape: Option<std::sync::Arc<crate::RowShape>>,
 }
 
 /// One row returned by a chunk read.
@@ -202,6 +205,19 @@ pub trait IncrementalSnapshotBackend: Send + Sync {
     /// primary key cannot resume, and a snapshot that cannot resume re-reads the
     /// table from row zero on every restart.
     async fn describe_table(&mut self, table_ref: &str) -> Result<SnapshotTable>;
+
+    /// The table's shape as the catalogue declares it now, in one catalogue query.
+    ///
+    /// Called before each chunk. The driver stamps it on the chunk's rows only when the
+    /// chunk's column names match it; a type change between this read and the chunk's is
+    /// not detected. The default describes nothing, and the rows carry no shape.
+    async fn describe_shape(
+        &mut self,
+        table: &SnapshotTable,
+    ) -> Result<Option<std::sync::Arc<crate::RowShape>>> {
+        let _ = table;
+        Ok(None)
+    }
 
     /// Read the source's current stream position.
     ///
@@ -333,6 +349,35 @@ async fn describe_with_condition<B: IncrementalSnapshotBackend>(
     let mut spec = backend.describe_table(table_ref).await?;
     spec.condition = lookup_condition(conditions, table_ref, &spec);
     Ok(spec)
+}
+
+/// The described shape, when the chunk read exactly its columns.
+///
+/// The chunk's columns are the projection a backend names in [`SnapshotTable::columns`],
+/// or every row's keys when it reads `SELECT *`. The projection, not the row: SQL Server's
+/// `FOR JSON PATH` leaves a NULL column out of the row.
+fn chunk_shape(spec: &SnapshotTable, rows: &[ChunkRow]) -> Option<std::sync::Arc<crate::RowShape>> {
+    let shape = spec.shape.as_ref()?;
+    let described: HashSet<&str> = shape
+        .columns()?
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    let read_the_described_columns = if spec.columns.is_empty() {
+        rows.iter().all(|row| {
+            row.row.as_object().is_some_and(|object| {
+                object.len() == described.len()
+                    && object.keys().all(|key| described.contains(key.as_str()))
+            })
+        })
+    } else {
+        spec.columns.len() == described.len()
+            && spec
+                .columns
+                .iter()
+                .all(|column| described.contains(column.as_str()))
+    };
+    read_the_described_columns.then(|| std::sync::Arc::clone(shape))
 }
 
 // ─── Per-table progress ───────────────────────────────────────────────────────
@@ -862,6 +907,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         fingerprint: &str,
         row: serde_json::Value,
         chunk_index: u32,
+        shape: Option<std::sync::Arc<crate::RowShape>>,
     ) -> Event {
         let table = &self.tables[table_idx].spec;
         let now = crate::source::helpers::now_millis();
@@ -900,6 +946,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape,
             unavailable_columns: Vec::new(),
         }
     }
@@ -939,6 +986,26 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         // executed-GTID set — and evidence captured on the wrong side of the read answers a
         // question about the wrong moment. See `IncrementalSnapshotBackend::event_in_bracket`
         // for the commit-visibility race this closes.
+        // A failed describe costs this chunk its shape, not the chunk: nothing has been read
+        // yet, and a row without a shape is a stated outcome.
+        let described = match self
+            .backend
+            .describe_shape(&self.tables[table_idx].spec)
+            .await
+        {
+            Ok(shape) => shape,
+            Err(error) => {
+                tracing::warn!(
+                    target: "rustcdc::source::incremental_snapshot",
+                    table = %self.tables[table_idx].spec.qualified,
+                    error = %error,
+                    "incremental snapshot: could not describe the table; this chunk's rows \
+                     carry no shape",
+                );
+                None
+            }
+        };
+        self.tables[table_idx].spec.shape = described;
         let low_watermark = self.backend.current_position().await?;
         let rows = {
             let spec = self.tables[table_idx].spec.clone();
@@ -976,12 +1043,18 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         let chunk_index = self.tables[table_idx].chunks_emitted;
         let table_name = self.tables[table_idx].spec.name.clone();
         let pk_columns = self.tables[table_idx].spec.pk_columns.clone();
+        let shape = chunk_shape(&self.tables[table_idx].spec, &rows);
         let chunk_rows: Vec<(String, Event)> = rows
             .into_iter()
             .map(|row| {
                 let fingerprint = fingerprint_from_payload(&table_name, &pk_columns, &row.row);
-                let event =
-                    self.build_snapshot_event(table_idx, &fingerprint, row.row, chunk_index);
+                let event = self.build_snapshot_event(
+                    table_idx,
+                    &fingerprint,
+                    row.row,
+                    chunk_index,
+                    shape.clone(),
+                );
                 (fingerprint, event)
             })
             .collect();
@@ -1455,6 +1528,20 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
     async fn confirm_lsn(&mut self, lsn: u64) -> Result<()> {
         self.inner.confirm_lsn(lsn).await
     }
+
+    // The slot belongs to the inner stream; without these the slot signals vanish for the
+    // whole of an incremental snapshot, which is when a backlog is most likely to build.
+    fn replication_slot_lag_bytes(&self) -> Option<u64> {
+        self.inner.replication_slot_lag_bytes()
+    }
+
+    fn replication_slot_wal_status(&self) -> Option<crate::core::SlotWalStatus> {
+        self.inner.replication_slot_wal_status()
+    }
+
+    fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
+        self.inner.replication_slot_safe_wal_size_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -1479,6 +1566,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -1600,6 +1688,8 @@ mod tests {
         reads: Arc<Mutex<Vec<Option<Vec<serde_json::Value>>>>>,
         /// Transactions reported as still in flight when the chunk is read.
         in_flight: HashSet<u64>,
+        /// What each `describe_shape` call answers, in order; `None` once exhausted.
+        described: Arc<Mutex<VecDeque<Option<Arc<crate::RowShape>>>>>,
     }
 
     #[async_trait]
@@ -1609,6 +1699,7 @@ mod tests {
         async fn describe_table(&mut self, _table_ref: &str) -> Result<SnapshotTable> {
             Ok(SnapshotTable {
                 condition: None,
+                shape: None,
                 schema: "public".into(),
                 name: "users".into(),
                 qualified: "\"public\".\"users\"".into(),
@@ -1616,6 +1707,18 @@ mod tests {
                 pk_types: vec!["bigint".into()],
                 columns: vec!["id".into()],
             })
+        }
+
+        async fn describe_shape(
+            &mut self,
+            _table: &SnapshotTable,
+        ) -> Result<Option<Arc<crate::RowShape>>> {
+            Ok(self
+                .described
+                .lock()
+                .expect("described lock")
+                .pop_front()
+                .flatten())
         }
 
         async fn current_position(&mut self) -> Result<u64> {
@@ -1709,6 +1812,7 @@ mod tests {
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
                 in_flight: HashSet::new(),
+                described: Arc::default(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -1741,6 +1845,7 @@ mod tests {
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
                 in_flight: HashSet::new(),
+                described: Arc::default(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -1782,6 +1887,7 @@ mod tests {
             advance_on_read,
             reads: Arc::clone(&reads),
             in_flight,
+            described: Arc::default(),
         };
         let inner = Box::new(FakeStream {
             batches: batches.into_iter().collect(),
@@ -1812,6 +1918,46 @@ mod tests {
             }
         }
         all
+    }
+
+    /// Each chunk's rows carry the shape described just before that chunk, and only when the
+    /// chunk read exactly the described columns.
+    #[tokio::test]
+    async fn incremental_snapshot_rows_carry_the_described_shape() {
+        let shape = |columns: &[&str]| {
+            Arc::new(
+                crate::RowShape::new(
+                    "public",
+                    "users",
+                    columns
+                        .iter()
+                        .map(|name| crate::ShapeColumn::new(*name, "bigint", false))
+                        .collect(),
+                    vec!["id".to_string()],
+                )
+                .unwrap(),
+            )
+        };
+        let first = shape(&["id"]);
+        // Described before the second chunk: a column the chunk's projection does not read.
+        let widened = shape(&["id", "name"]);
+        let (mut driver, _) =
+            driver_with(vec![json!({"id": 1}), json!({"id": 2})], vec![], 0, 1).await;
+        *driver.backend.described.lock().unwrap() =
+            VecDeque::from([Some(Arc::clone(&first)), Some(widened)]);
+
+        let emitted = drain(&mut driver).await;
+
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(
+            emitted[0].shape.as_deref(),
+            Some(&*first),
+            "the first chunk read the described columns"
+        );
+        assert!(
+            emitted[1].shape.is_none(),
+            "the second chunk's columns are not the shape described before it"
+        );
     }
 
     #[tokio::test]
@@ -2067,6 +2213,7 @@ mod tests {
                 advance_on_read: 0,
                 reads,
                 in_flight: HashSet::new(),
+                described: Arc::default(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2173,6 +2320,7 @@ mod tests {
             pk_types: Vec::new(),
             columns: Vec::new(),
             condition: None,
+            shape: None,
         };
 
         let mut by_short = ahash::AHashMap::new();
@@ -2256,6 +2404,7 @@ mod tests {
                 advance_on_read: 0,
                 reads: Arc::clone(&reads),
                 in_flight: HashSet::new(),
+                described: Arc::default(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2454,6 +2603,7 @@ mod tests {
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
                 in_flight: HashSet::new(),
+                described: Arc::default(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2503,6 +2653,7 @@ mod tests {
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
                 in_flight: HashSet::new(),
+                described: Arc::default(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),
@@ -2531,6 +2682,7 @@ mod tests {
             advance_on_read: 0,
             reads: Arc::clone(&reads),
             in_flight: HashSet::new(),
+            described: Arc::default(),
         };
         let resume = IncrementalSnapshotState {
             paused: false,
@@ -2587,6 +2739,7 @@ mod tests {
             advance_on_read: 0,
             reads: Arc::clone(&reads),
             in_flight: HashSet::new(),
+            described: Arc::default(),
         };
         let resume = IncrementalSnapshotState {
             paused: false,
@@ -2631,6 +2784,7 @@ mod tests {
             async fn describe_table(&mut self, _table_ref: &str) -> Result<SnapshotTable> {
                 Ok(SnapshotTable {
                     condition: None,
+                    shape: None,
                     schema: "public".into(),
                     name: "logs".into(),
                     qualified: "public.logs".into(),
@@ -2706,6 +2860,7 @@ mod tests {
                 advance_on_read: 0,
                 reads: Arc::new(Mutex::new(Vec::new())),
                 in_flight: HashSet::new(),
+                described: Arc::default(),
             },
             Box::new(FakeStream {
                 batches: VecDeque::new(),

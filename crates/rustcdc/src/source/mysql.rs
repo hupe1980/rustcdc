@@ -40,6 +40,7 @@ mod handoff;
 pub mod incremental_snapshot;
 mod parser;
 mod query;
+mod row_shape;
 mod snapshot_chunk;
 mod snapshot_start;
 mod state;
@@ -473,6 +474,7 @@ impl LiveMysqlBinlogProvider {
     fn decode_row_change(
         &self,
         table_map: &TableMapEvent<'_>,
+        table_map_columns: &Arc<row_shape::TableMapColumns>,
         before: Option<BinlogRow>,
         after: Option<BinlogRow>,
     ) -> Result<MysqlRowChange> {
@@ -497,6 +499,7 @@ impl LiveMysqlBinlogProvider {
             after: after
                 .as_ref()
                 .map(|row| mysql_row_to_json_with_labels(row, &labels)),
+            table_map: Arc::clone(table_map_columns),
         })
     }
 
@@ -646,13 +649,17 @@ impl LiveMysqlBinlogProvider {
                     ))
                 })?;
 
+                // Once per rows event: every row in it was written under this one table map.
+                let table_map_columns =
+                    Arc::new(row_shape::TableMapColumns::from_table_map(table_map));
                 for row in rows.rows(table_map) {
                     let (before, after) = row.map_err(|error| {
                         Error::SourceError(format!(
                             "failed decoding mysql rows event row pair: {error}"
                         ))
                     })?;
-                    let change = self.decode_row_change(table_map, before, after)?;
+                    let change =
+                        self.decode_row_change(table_map, &table_map_columns, before, after)?;
                     match &rows {
                         RowsEventData::WriteRowsEventV1(_) | RowsEventData::WriteRowsEvent(_) => {
                             out.push(MysqlBinlogMessage::WriteRows(change));
@@ -806,18 +813,10 @@ pub struct MysqlStreamHandle {
     stream_poll_interval_ms: u64,
     table_include_list: Vec<String>,
     table_exclude_list: Vec<String>,
-    /// Declared column types for every table in the configured database, read from
-    /// `information_schema` once at stream start.
-    ///
-    /// The binlog decode path is synchronous and holds no SQL connection, so this cannot
-    /// be read lazily. See
-    /// [`query_database_column_types`](super::mysql::query::query_database_column_types)
-    /// for why the table map is not a substitute.
-    catalog_columns: crate::source::schema_catalog::CatalogSchemas,
-    /// Primary key per table, in index order, from the same read.
-    catalog_primary_keys: std::collections::HashMap<(String, String), Vec<String>>,
-    /// Tables whose schema this run has already announced.
-    announced_tables: std::collections::HashSet<(String, String)>,
+    /// The catalogue shape per table, seeded from the `information_schema` read at stream
+    /// start and stamped on a row only when it agrees with the row's table map; see
+    /// [`row_shape`].
+    shapes: row_shape::StreamShapes,
 }
 
 impl MysqlStreamHandle {
@@ -846,9 +845,7 @@ impl MysqlStreamHandle {
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
             table_include_list,
             table_exclude_list,
-            catalog_columns,
-            catalog_primary_keys,
-            announced_tables: std::collections::HashSet::new(),
+            shapes: row_shape::StreamShapes::new(&catalog_columns, &catalog_primary_keys),
         }
     }
 }
@@ -1435,6 +1432,16 @@ impl MysqlConnection {
 
 #[async_trait]
 impl Source for MysqlConnection {
+    // The trait's defaults are no-ops, so without these a connector held as
+    // `Box<dyn Source>` — registered with `register_source`, or wrapped — never connected.
+    async fn connect(&self) -> Result<()> {
+        MysqlConnection::connect(self).await
+    }
+
+    async fn close(&self) {
+        MysqlConnection::close(self).await
+    }
+
     async fn start_snapshot(&mut self, tables: &[&str]) -> Result<Box<dyn SnapshotHandle>> {
         self.start_snapshot_internal(tables, None).await
     }
@@ -1484,7 +1491,7 @@ impl Source for MysqlConnection {
             start.gtid.clone(),
         ));
 
-        Ok(Box::new(MysqlStreamHandle::new(
+        let mut handle = MysqlStreamHandle::new(
             self.source_type().to_string(),
             stream,
             Box::new(
@@ -1504,7 +1511,15 @@ impl Source for MysqlConnection {
             self.config.table_exclude_list.clone(),
             catalog_columns,
             catalog_primary_keys,
-        )))
+        );
+        // Re-reads after a DDL statement go through the connector's own connections, so an
+        // `AwsIamToken` stream mints a fresh token per read like every other query.
+        handle
+            .shapes
+            .set_reader(Box::new(row_shape::LiveMysqlCatalogReader {
+                connections: pool,
+            }));
+        Ok(Box::new(handle))
     }
 
     async fn perform_handoff(
@@ -1653,7 +1668,7 @@ impl StreamHandle for MysqlStreamHandle {
                 .poll_events(self.max_events_per_poll, deadline)
                 .await?;
             if !messages.is_empty() {
-                let events = self.process_messages(messages);
+                let events = self.process_messages(messages).await;
                 if !events.is_empty() {
                     tracing::debug!(
                         target: "rustcdc::source::mysql",
@@ -1881,6 +1896,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::row_shape;
     use crate::core::BeforeImage;
     use std::{
         collections::VecDeque,
@@ -2477,12 +2493,28 @@ mod tests {
         before: Option<serde_json::Value>,
         after: Option<serde_json::Value>,
     ) -> MysqlRowChange {
+        row_change_under(
+            table,
+            before,
+            after,
+            row_shape::tests::table_map(&[("id", row_shape::TypeFamily::Integer, false)], &["id"]),
+        )
+    }
+
+    /// A row written under the given table map.
+    fn row_change_under(
+        table: &str,
+        before: Option<serde_json::Value>,
+        after: Option<serde_json::Value>,
+        table_map: Arc<row_shape::TableMapColumns>,
+    ) -> MysqlRowChange {
         MysqlRowChange {
             schema: Some("app".into()),
             table: table.into(),
             primary_key: Some(vec!["id".into()]),
             before,
             after,
+            table_map,
         }
     }
 
@@ -2510,13 +2542,10 @@ mod tests {
         )
     }
 
-    /// A table whose `CREATE TABLE` predates capture is announced before its first row.
-    ///
-    /// MySQL's schema events otherwise come only from DDL parsed out of the binlog, so a
-    /// table created before the pipeline started had none at all — and its rows carry text
-    /// values, which a consumer cannot decode without the types.
+    /// A table's first rows in a run arrive alone: the shape is on each row, and no schema
+    /// event stands in front of them.
     #[tokio::test]
-    async fn a_table_is_announced_before_its_first_row() {
+    async fn no_read_schema_event_is_emitted() {
         use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
 
         let mut catalog = CatalogSchemas::new();
@@ -2547,15 +2576,17 @@ mod tests {
                     tx_id: 7,
                     timestamp_ms: 1,
                 },
-                MysqlBinlogMessage::WriteRows(row_change(
+                MysqlBinlogMessage::WriteRows(row_change_under(
                     "users",
                     None,
                     Some(json!({"id": "1", "amount": "12345.6789"})),
+                    users_table_map(),
                 )),
-                MysqlBinlogMessage::WriteRows(row_change(
+                MysqlBinlogMessage::WriteRows(row_change_under(
                     "users",
                     None,
                     Some(json!({"id": "2", "amount": "1.0000"})),
+                    users_table_map(),
                 )),
                 MysqlBinlogMessage::Xid {
                     tx_id: 7,
@@ -2571,49 +2602,77 @@ mod tests {
 
         let events = handle.next_events(50).await.unwrap();
         assert_eq!(
-            events.len(),
-            3,
-            "one announcement and two rows, got {:?}",
-            events.iter().map(|e| e.table.clone()).collect::<Vec<_>>()
+            events.iter().map(|event| event.op).collect::<Vec<_>>(),
+            [
+                crate::core::Operation::Insert,
+                crate::core::Operation::Insert
+            ],
+            "a row carries its shape; no schema event precedes it"
         );
-
-        let after = events[0].after.as_ref().expect("schema payload");
-        assert_eq!(events[0].op, crate::core::Operation::SchemaChange);
-        assert_eq!(events[0].table, "users__ddl_events");
-        assert_eq!(after["ddl_type"], "READ_SCHEMA");
-        assert_eq!(
-            after["result_schema"]["columns"][1]["data_type"],
-            json!("decimal(12,4)"),
-            "the declared type is MySQL's own spelling, complete with its modifier — the \
-             binlog table map would only give MYSQL_TYPE_NEWDECIMAL"
-        );
-        assert_eq!(
-            after["result_schema"]["columns"][0]["nullable"],
-            json!(false),
-            "nullability is read from information_schema, never derived from the key"
-        );
-        assert_eq!(after["result_schema"]["primary_keys"], json!(["id"]));
-
-        // The second row does not re-announce: one per table per run.
-        assert!(
-            events[1..]
-                .iter()
-                .all(|event| event.op != crate::core::Operation::SchemaChange),
-            "a table is announced once, not before every row"
-        );
+        assert!(events.iter().all(|event| event.shape.is_some()));
     }
 
-    /// A table the catalog read did not cover is a table created after the stream started,
-    /// and it needs no announcement — its `CREATE TABLE` is in the binlog.
+    fn users_table_map() -> Arc<row_shape::TableMapColumns> {
+        row_shape::tests::table_map(
+            &[
+                ("id", row_shape::TypeFamily::Integer, false),
+                ("amount", row_shape::TypeFamily::Decimal, true),
+            ],
+            &["id"],
+        )
+    }
+
+    /// A stream row carries the catalogue's declared types, nullability and key when they
+    /// agree with the row's table map, and no shape when they do not.
     #[tokio::test]
-    async fn a_table_outside_the_catalog_read_is_not_announced() {
+    async fn mysql_rows_carry_the_catalogue_shape() {
+        use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
+
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert(
+            ("app".to_string(), "users".to_string()),
+            vec![
+                CatalogColumn {
+                    name: "id".into(),
+                    data_type: "bigint unsigned".into(),
+                    nullable: false,
+                },
+                CatalogColumn {
+                    name: "amount".into(),
+                    data_type: "decimal(12,4)".into(),
+                    nullable: true,
+                },
+            ],
+        );
+        let keys = std::collections::HashMap::from([(
+            ("app".to_string(), "users".to_string()),
+            vec!["id".to_string()],
+        )]);
         let mut handle = make_stream_handle_with_catalog(
             MockBinlogProvider::new(vec![vec![
                 MysqlBinlogMessage::Begin {
                     tx_id: 7,
                     timestamp_ms: 1,
                 },
-                MysqlBinlogMessage::WriteRows(row_change("users", None, Some(json!({"id": 1})))),
+                MysqlBinlogMessage::WriteRows(row_change_under(
+                    "users",
+                    None,
+                    Some(json!({"id": "1", "amount": "1.0000"})),
+                    users_table_map(),
+                )),
+                // Written under a table map whose `amount` is NOT NULL: not this shape.
+                MysqlBinlogMessage::WriteRows(row_change_under(
+                    "users",
+                    None,
+                    Some(json!({"id": "2", "amount": "2.0000"})),
+                    row_shape::tests::table_map(
+                        &[
+                            ("id", row_shape::TypeFamily::Integer, false),
+                            ("amount", row_shape::TypeFamily::Decimal, false),
+                        ],
+                        &["id"],
+                    ),
+                )),
                 MysqlBinlogMessage::Xid {
                     tx_id: 7,
                     timestamp_ms: 2,
@@ -2622,13 +2681,413 @@ mod tests {
                     gtid: None,
                 },
             ]]),
-            crate::source::schema_catalog::CatalogSchemas::new(),
-            std::collections::HashMap::new(),
+            catalog,
+            keys,
         );
 
         let events = handle.next_events(50).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].op, crate::core::Operation::Insert);
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|event| event.op == crate::core::Operation::Insert)
+            .collect();
+        let shape = rows[0]
+            .shape
+            .as_ref()
+            .expect("the agreeing row carries a shape");
+        let columns: Vec<_> = shape
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type.as_str(),
+                    column.nullable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                ("id", "bigint unsigned", false),
+                ("amount", "decimal(12,4)", true)
+            ]
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+        assert!(
+            rows[1].shape.is_none(),
+            "a disagreeing table map gets no shape"
+        );
+    }
+
+    fn catalogue_of(shapes: &[crate::RowShape]) -> Box<row_shape::tests::FakeCatalogue> {
+        let held = Arc::new(std::sync::Mutex::new(
+            shapes
+                .iter()
+                .map(|shape| {
+                    (
+                        (shape.schema().to_string(), shape.table().to_string()),
+                        shape.clone(),
+                    )
+                })
+                .collect(),
+        ));
+        Box::new(row_shape::tests::FakeCatalogue {
+            shapes: held,
+            reads: Arc::new(std::sync::Mutex::new(0)),
+        })
+    }
+
+    fn id_only() -> crate::RowShape {
+        crate::RowShape::new(
+            "app",
+            "users",
+            vec![crate::ShapeColumn::new("id", "bigint", false)],
+            vec!["id".into()],
+        )
+        .unwrap()
+    }
+
+    fn id_and_note() -> crate::RowShape {
+        crate::RowShape::new(
+            "app",
+            "users",
+            vec![
+                crate::ShapeColumn::new("id", "bigint", false),
+                crate::ShapeColumn::new("note", "text", true),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap()
+    }
+
+    fn id_and_note_map() -> Arc<row_shape::TableMapColumns> {
+        row_shape::tests::table_map(
+            &[
+                ("id", row_shape::TypeFamily::Integer, false),
+                ("note", row_shape::TypeFamily::Blob, true),
+            ],
+            &["id"],
+        )
+    }
+
+    fn insert_tx(tx_id: u64, pos: u32, change: MysqlRowChange) -> Vec<MysqlBinlogMessage> {
+        vec![
+            MysqlBinlogMessage::Begin {
+                tx_id,
+                timestamp_ms: 1,
+            },
+            MysqlBinlogMessage::WriteRows(change),
+            MysqlBinlogMessage::Xid {
+                tx_id,
+                timestamp_ms: 2,
+                binlog_file: "mysql-bin.000001".into(),
+                binlog_pos: pos,
+                gtid: None,
+            },
+        ]
+    }
+
+    fn add_note_ddl(pos: u32) -> MysqlBinlogMessage {
+        MysqlBinlogMessage::Ddl {
+            captured: crate::ddl_capture::parse_ddl_statement(
+                crate::ddl_capture::DdlDialect::Mysql,
+                "ALTER TABLE users ADD COLUMN note text",
+            )
+            .expect("a parseable ALTER")
+            .into_captured(),
+            timestamp_ms: 3,
+            binlog_file: "mysql-bin.000001".into(),
+            binlog_pos: pos,
+        }
+    }
+
+    /// Resumed from before an `ALTER`: the catalogue read at start is already the new shape,
+    /// and the old rows' table maps disagree with it, so they carry none. The `ALTER` then
+    /// triggers a re-read, and the rows after it carry the new shape.
+    #[tokio::test]
+    async fn mysql_rows_resumed_before_an_alter_carry_no_shape() {
+        let mut messages = insert_tx(
+            1,
+            100,
+            row_change_under(
+                "users",
+                None,
+                Some(json!({"id": "1"})),
+                row_shape::tests::table_map(
+                    &[("id", row_shape::TypeFamily::Integer, false)],
+                    &["id"],
+                ),
+            ),
+        );
+        // Unqualified, as an application would write it: the parser files it under a
+        // placeholder schema, and the re-read must still find `app.users`.
+        messages.push(add_note_ddl(200));
+        messages.extend(insert_tx(
+            2,
+            300,
+            row_change_under(
+                "users",
+                None,
+                Some(json!({"id": "2", "note": "x"})),
+                id_and_note_map(),
+            ),
+        ));
+        let mut handle = make_stream_handle_with_catalog(
+            MockBinlogProvider::new(vec![messages]),
+            crate::source::schema_catalog::CatalogSchemas::from([(
+                ("app".to_string(), "users".to_string()),
+                vec![
+                    crate::source::schema_catalog::CatalogColumn {
+                        name: "id".into(),
+                        data_type: "bigint".into(),
+                        nullable: false,
+                    },
+                    crate::source::schema_catalog::CatalogColumn {
+                        name: "note".into(),
+                        data_type: "text".into(),
+                        nullable: true,
+                    },
+                ],
+            )]),
+            std::collections::HashMap::from([(
+                ("app".to_string(), "users".to_string()),
+                vec!["id".to_string()],
+            )]),
+        );
+        let reader = catalogue_of(&[id_and_note()]);
+        handle.shapes.set_reader(reader);
+
+        let events = handle.next_events(50).await.unwrap();
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|event| event.op == crate::core::Operation::Insert)
+            .collect();
+        assert_eq!(rows.len(), 2, "{events:?}");
+        assert!(
+            rows[0].shape.is_none(),
+            "a row from before the ALTER must not carry the catalogue's newer shape"
+        );
+        assert_eq!(rows[1].shape.as_deref(), Some(&id_and_note()));
+    }
+
+    /// An `ALTER … ADD COLUMN` in the binlog: the rows before it carry the old shape, the
+    /// rows after it the re-read one, which includes the new column.
+    #[tokio::test]
+    async fn mysql_rows_after_add_column_carry_it() {
+        let mut messages = insert_tx(
+            1,
+            100,
+            row_change_under(
+                "users",
+                None,
+                Some(json!({"id": "1"})),
+                row_shape::tests::table_map(
+                    &[("id", row_shape::TypeFamily::Integer, false)],
+                    &["id"],
+                ),
+            ),
+        );
+        messages.push(add_note_ddl(200));
+        messages.extend(insert_tx(
+            2,
+            300,
+            row_change_under(
+                "users",
+                None,
+                Some(json!({"id": "2", "note": "x"})),
+                id_and_note_map(),
+            ),
+        ));
+        let mut handle = make_stream_handle_with_catalog(
+            MockBinlogProvider::new(vec![messages]),
+            crate::source::schema_catalog::CatalogSchemas::from([(
+                ("app".to_string(), "users".to_string()),
+                vec![crate::source::schema_catalog::CatalogColumn {
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    nullable: false,
+                }],
+            )]),
+            std::collections::HashMap::from([(
+                ("app".to_string(), "users".to_string()),
+                vec!["id".to_string()],
+            )]),
+        );
+        // The catalogue the stream will find when it re-reads after the ALTER.
+        let reader = catalogue_of(&[id_and_note()]);
+        handle.shapes.set_reader(reader);
+
+        let events = handle.next_events(50).await.unwrap();
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|event| event.op == crate::core::Operation::Insert)
+            .collect();
+        assert_eq!(rows[0].shape.as_deref(), Some(&id_only()));
+        assert_eq!(rows[1].shape.as_deref(), Some(&id_and_note()));
+    }
+
+    /// A change the table map cannot see (`varchar(64)` to `varchar(128)`) still reaches the
+    /// rows after the `ALTER`, because the statement makes the stream re-read the catalogue.
+    #[tokio::test]
+    async fn a_type_change_within_a_family_reaches_the_rows_after_the_alter() {
+        let note = |data_type: &str| {
+            crate::RowShape::new(
+                "app",
+                "users",
+                vec![
+                    crate::ShapeColumn::new("id", "bigint", false),
+                    crate::ShapeColumn::new("note", data_type, true),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap()
+        };
+        let string_map = || {
+            row_shape::tests::table_map(
+                &[
+                    ("id", row_shape::TypeFamily::Integer, false),
+                    ("note", row_shape::TypeFamily::String, true),
+                ],
+                &["id"],
+            )
+        };
+        let mut messages = insert_tx(
+            1,
+            100,
+            row_change_under("users", None, Some(json!({"id": "1"})), string_map()),
+        );
+        messages.push(MysqlBinlogMessage::Ddl {
+            captured: crate::ddl_capture::parse_ddl_statement(
+                crate::ddl_capture::DdlDialect::Mysql,
+                "ALTER TABLE users MODIFY note varchar(128)",
+            )
+            .expect("a parseable ALTER")
+            .into_captured(),
+            timestamp_ms: 3,
+            binlog_file: "mysql-bin.000001".into(),
+            binlog_pos: 200,
+        });
+        messages.extend(insert_tx(
+            2,
+            300,
+            row_change_under("users", None, Some(json!({"id": "2"})), string_map()),
+        ));
+        let mut handle = make_stream_handle_with_catalog(
+            MockBinlogProvider::new(vec![messages]),
+            crate::source::schema_catalog::CatalogSchemas::from([(
+                ("app".to_string(), "users".to_string()),
+                vec![
+                    crate::source::schema_catalog::CatalogColumn {
+                        name: "id".into(),
+                        data_type: "bigint".into(),
+                        nullable: false,
+                    },
+                    crate::source::schema_catalog::CatalogColumn {
+                        name: "note".into(),
+                        data_type: "varchar(64)".into(),
+                        nullable: true,
+                    },
+                ],
+            )]),
+            std::collections::HashMap::from([(
+                ("app".to_string(), "users".to_string()),
+                vec!["id".to_string()],
+            )]),
+        );
+        let reader = catalogue_of(&[note("varchar(128)")]);
+        handle.shapes.set_reader(reader);
+
+        let events = handle.next_events(50).await.unwrap();
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|event| event.op == crate::core::Operation::Insert)
+            .collect();
+        assert_eq!(rows[0].shape.as_deref(), Some(&note("varchar(64)")));
+        assert_eq!(rows[1].shape.as_deref(), Some(&note("varchar(128)")));
+    }
+
+    /// After a DDL statement the catalogue's shape may be stale, and until a re-read succeeds
+    /// (here there is no reader) the rows carry none — never the old one.
+    #[tokio::test]
+    async fn rows_after_an_alter_claim_no_stale_shape() {
+        use crate::ddl_capture::{DdlDialect, parse_ddl_statement};
+        use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
+
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert(
+            ("app".to_string(), "users".to_string()),
+            vec![CatalogColumn {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                nullable: false,
+            }],
+        );
+        let alter = parse_ddl_statement(
+            DdlDialect::Mysql,
+            "ALTER TABLE app.users ADD COLUMN note text",
+        )
+        .expect("a parseable ALTER")
+        .into_captured();
+        let mut handle = make_stream_handle_with_catalog(
+            MockBinlogProvider::new(vec![vec![
+                MysqlBinlogMessage::Begin {
+                    tx_id: 1,
+                    timestamp_ms: 1,
+                },
+                MysqlBinlogMessage::WriteRows(row_change("users", None, Some(json!({"id": "1"})))),
+                MysqlBinlogMessage::Xid {
+                    tx_id: 1,
+                    timestamp_ms: 2,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 100,
+                    gtid: None,
+                },
+                MysqlBinlogMessage::Ddl {
+                    captured: alter,
+                    timestamp_ms: 3,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 200,
+                },
+                MysqlBinlogMessage::Begin {
+                    tx_id: 2,
+                    timestamp_ms: 4,
+                },
+                MysqlBinlogMessage::WriteRows(row_change(
+                    "users",
+                    None,
+                    Some(json!({"id": "2", "note": "x"})),
+                )),
+                MysqlBinlogMessage::Xid {
+                    tx_id: 2,
+                    timestamp_ms: 5,
+                    binlog_file: "mysql-bin.000001".into(),
+                    binlog_pos: 300,
+                    gtid: None,
+                },
+            ]]),
+            catalog,
+            std::collections::HashMap::from([(
+                ("app".to_string(), "users".to_string()),
+                vec!["id".to_string()],
+            )]),
+        );
+
+        let events = handle.next_events(50).await.unwrap();
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|event| event.op == crate::core::Operation::Insert)
+            .collect();
+        assert_eq!(rows.len(), 2, "{events:?}");
+        assert!(
+            rows[0].shape.is_some(),
+            "before the ALTER the row carries its shape"
+        );
+        assert_eq!(
+            rows[1].shape, None,
+            "after an ALTER, with no catalogue re-read possible, the shape is unknown — not the \
+             old one"
+        );
     }
 
     fn make_stream_handle(
@@ -2954,7 +3413,7 @@ mod tests {
                 schema_name: "testdb".into(),
                 bare_table: "users".into(),
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -3216,6 +3675,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

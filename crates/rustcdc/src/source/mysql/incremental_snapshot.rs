@@ -182,6 +182,7 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
         Ok(SnapshotTable {
             // Filled in by the driver from `IncrementalSnapshotConfig::table_conditions`.
             condition: None,
+            shape: None,
             schema,
             name,
             qualified,
@@ -189,6 +190,23 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
             pk_types: Vec::new(),
             columns: Vec::new(),
         })
+    }
+
+    async fn describe_shape(
+        &mut self,
+        table: &SnapshotTable,
+    ) -> Result<Option<std::sync::Arc<crate::RowShape>>> {
+        let mut conn = self.pool.get_conn().await.map_err(|error| {
+            error.context("incremental snapshot: failed to acquire mysql connection")
+        })?;
+        let columns =
+            super::query::query_table_columns(&mut conn, &table.schema, &table.name).await?;
+        Ok(crate::source::schema_catalog::row_shape_from_catalog(
+            &table.schema,
+            &table.name,
+            &columns,
+            &table.pk_columns,
+        ))
     }
 
     /// The server's current binlog coordinate **and** its executed-GTID set.

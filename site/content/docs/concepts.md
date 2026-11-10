@@ -66,7 +66,7 @@ change history.
 | `update` | WAL / binlog | An existing row was updated |
 | `delete` | WAL / binlog | A row was deleted |
 | `read` | snapshot | Row captured during initial snapshot; logically equivalent to `insert` for consumers |
-| `schema_change` | DDL log, or the catalogue | A table's shape. `ddl_type = "READ_SCHEMA"` announces a table's declared columns before its first row on every connector; `CREATE_TABLE`/`ALTER_TABLE`/`DROP_TABLE` report a change. See [Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row) |
+| `schema_change` | DDL log, or capture metadata | Captured DDL: `CREATE_TABLE`/`ALTER_TABLE`/`DROP_TABLE` report a change to a table. Rows do not depend on these events: each carries its own `shape`. See [Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape) |
 | `truncate` | WAL / binlog / DDL trigger | The table was truncated. PostgreSQL (pgoutput) and MySQL/MariaDB (binlog query event) emit it natively; SQL Server requires `capture_truncate_events = true` |
 | `message` | WAL | A logical decoding message the application wrote with `pg_logical_emit_message()` — the table-free transactional outbox. PostgreSQL only, and opt-in via [`capture_logical_messages`](@/docs/config-reference.md#capture-logical-messages). `table` is the synthetic `<prefix>__messages`; `before` is always absent |
 
@@ -92,8 +92,11 @@ and lists their names in `unavailable_columns` (for `after`) and
 > from the write — in SQL terms, `UPDATE … SET <present columns> WHERE <key>`, never an
 > upsert built from the full column list.
 >
-> `REPLICA IDENTITY FULL` does **not** avoid this: replica identity governs the old
-> tuple only, and the after-image omits unmodified TOASTed values under every setting.
+> Under `REPLICA IDENTITY FULL` the hole does not reach you. pgoutput still marks the
+> unmodified column as unchanged in the new tuple, but the old tuple carries its value, and an
+> unmodified column's new value is its old one — so the connector completes `after` from the
+> same WAL record and the column is not listed. Under `DEFAULT` and `USING INDEX` there is no
+> old value to copy, and the column stays listed.
 
 The two lists are tracked per image and are never merged: a TOASTed column that *was*
 modified arrives present in `after` and absent from `before`. Embedders consuming
@@ -456,10 +459,8 @@ After `max_open_cycles` open cycles, the pipeline transitions to `Error` state.
 `/livez` returns 503, triggering a container restart in Kubernetes.
 
 **These parameters govern both halves of the pipeline.** Source poll failures and sink
-delivery failures share one policy and one breaker. That was not always true: sink
-treating such failures as unconditionally terminal would make a few-second broker leader election
-became a process exit and a full replay from the last checkpoint while these settings
-looked like they applied.
+delivery failures share one policy and one breaker, so a few-second broker leader election is a
+retry, not a process exit and a replay from the last checkpoint.
 
 A sink retry re-delivers the **same batch**. Under `at_least_once` that is duplication,
 which the contract permits; under `effectively_once` the aborted transaction discards

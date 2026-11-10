@@ -75,8 +75,9 @@ pub(crate) fn build_tls_root_store(ca_cert_path: Option<&str>) -> Result<rustls:
 /// to `ring`. Using a registered default lets embedders choose `aws-lc-rs` (e.g.
 /// for FIPS) without requiring source-level changes in rustcdc.
 ///
-/// This function must never call `install_default()` — that is process-global
-/// mutation that belongs solely to the embedder / binary entry point.
+/// This function never calls `install_default()`: process-global state belongs to the
+/// embedder. The MySQL connector is the one exception, because its driver reads only the
+/// process default (see `ensure_process_crypto_provider` in `source::mysql::config`).
 fn resolve_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
     rustls::crypto::CryptoProvider::get_default()
         .cloned()

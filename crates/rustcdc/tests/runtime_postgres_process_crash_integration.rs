@@ -459,8 +459,8 @@ async fn run_postgres_process_kill_replay_scenario(
 
     #[cfg(feature = "encryption")]
     if _enable_encryption_transform {
-        // Rows only. A table's schema is announced before its first row and carries no
-        // row payload, so there is nothing for the encryption transform to have masked.
+        // Rows only: a schema-change event carries no row payload, so there is nothing for
+        // the encryption transform to have masked.
         for event in replayed.iter().filter(|event| !event.op.is_schema_change()) {
             let payload = event
                 .after

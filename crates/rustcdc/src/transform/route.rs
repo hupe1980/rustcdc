@@ -261,6 +261,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -489,6 +490,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());

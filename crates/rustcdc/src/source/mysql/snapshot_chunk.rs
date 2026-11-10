@@ -1,11 +1,8 @@
 use crate::core::{
     BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
 };
-use crate::ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA};
 use crate::source::helpers::now_millis;
-use crate::source::schema_catalog::{
-    mark_as_snapshot_event, observed_statement, table_schema_from_catalog,
-};
+use crate::source::schema_catalog::row_shape_from_catalog;
 
 use super::{DEFAULT_SNAPSHOT_CHUNK_SIZE, MysqlSnapshotHandle};
 
@@ -37,51 +34,20 @@ pub(super) async fn next_snapshot_chunk(
             )
         };
 
-        // Announce the table's schema before its first row. MySQL's schema events
-        // otherwise come only from DDL parsed out of the binlog, so a table whose
-        // `CREATE TABLE` predates capture had none at all — and snapshot rows carry text
-        // values like every other event.
-        if !handle.tables[table_index].schema_announced {
-            handle.tables[table_index].schema_announced = true;
-            let catalog = handle.tables[table_index].catalog_columns.clone();
-            if !catalog.is_empty() {
-                let ts = now_millis();
-                let captured = CapturedDdl {
-                    ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
-                    schema: schema_name.clone(),
-                    table: bare_table.clone(),
-                    statement: observed_statement(&schema_name, &bare_table, "information_schema"),
-                    result_schema: Some(table_schema_from_catalog(
-                        &schema_name,
-                        &bare_table,
-                        &catalog,
-                        &primary_key_columns,
-                    )),
-                    schema_diff: None,
-                    ts,
-                };
-                let mut event = captured.to_event(
-                    &handle.source_name,
-                    format!(
-                        "{}:{}",
-                        handle.snapshot.binlog_file, handle.snapshot.binlog_pos
-                    ),
-                    ts,
-                );
-                mark_as_snapshot_event(
-                    &mut event,
-                    &handle.snapshot.snapshot_id,
-                    handle.next_chunk_index,
-                );
-                events.push(event);
-            }
+        // Built from the catalogue read at snapshot start. The snapshot's projection selects
+        // exactly these columns, so the shape names the columns its rows carry.
+        if handle.tables[table_index].shape.is_none() {
+            let table = &handle.tables[table_index];
+            let shape = row_shape_from_catalog(
+                &schema_name,
+                &bare_table,
+                &table.catalog_columns,
+                &primary_key_columns,
+            );
+            handle.tables[table_index].shape = shape;
         }
+        let table_shape = handle.tables[table_index].shape.clone();
 
-        // Computed **after** the announcement, not before: the announcement occupies a
-        // slot in this chunk, and a `remaining` taken ahead of it makes the chunk return
-        // `requested + 1` events. That overflow costs a row — the runtime delivers a
-        // buffer's worth and the extra one is dropped, while the snapshot cursor has
-        // already advanced past it.
         let remaining = requested - events.len();
 
         if live_query {
@@ -128,6 +94,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
+                    shape: table_shape.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }
@@ -168,6 +135,7 @@ pub(super) async fn next_snapshot_chunk(
                     }),
                     transaction: None,
                     envelope_version: EVENT_ENVELOPE_VERSION,
+                    shape: table_shape.clone(),
                     unavailable_columns: Vec::new(),
                 });
             }

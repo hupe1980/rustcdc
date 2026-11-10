@@ -174,6 +174,61 @@ async fn a_valid_read_token_is_accepted() {
     assert_eq!(status, StatusCode::OK, "the control must actually work");
 }
 
+/// `GET /schemas/{id}` resolves a shape the delivery path recorded, 404s an unknown id,
+/// 400s a malformed one, and requires the read token like `/status`.
+#[tokio::test]
+async fn a_delivered_id_resolves_and_an_unknown_one_is_404() {
+    use rustcdc_server::runtime::row_shapes::RowShapeDeliveryPlan;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config_with_manifest(
+        dir.path(),
+        vec![
+            manifest_token("reader", READ_TOKEN, &["read"]),
+            manifest_token("writer", WRITE_TOKEN, &["write"]),
+        ],
+    );
+    let state = AdminState::new(&config).await.expect("admin state");
+    let shape = std::sync::Arc::new(
+        rustcdc::RowShape::new(
+            "public",
+            "users",
+            vec![rustcdc::ShapeColumn::new("id", "integer", false)],
+            vec!["id".into()],
+        )
+        .unwrap(),
+    );
+    let plan = RowShapeDeliveryPlan::new(
+        rustcdc_server::config::schema::RowShapeDelivery::Id,
+        state.delivered_shapes(),
+    );
+    let mut event = rustcdc::Event::builder("users", rustcdc::Operation::Insert)
+        .source(rustcdc::SourceMetadata::new("postgres", "0/1", 1))
+        .after(serde_json::json!({"id": "1"}))
+        .shape(std::sync::Arc::clone(&shape))
+        .ts(1)
+        .build();
+    let full = plan.prepare(&mut event).expect("a complete shape");
+    plan.delivered(&full);
+
+    let bearer = format!("Bearer {READ_TOKEN}");
+    let path = format!("/schemas/{}", shape.id());
+    let (status, body) = probe(state.clone(), get(&path, Some(&bearer))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let resolved: rustcdc::RowShape = serde_json::from_str(&body).expect("a shape");
+    assert_eq!(resolved, *shape);
+
+    let unknown = format!("/schemas/{}", "0".repeat(64));
+    let (status, _) = probe(state.clone(), get(&unknown, Some(&bearer))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = probe(state.clone(), get("/schemas/NOT-AN-ID", Some(&bearer))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = probe(state, get(&path, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn an_unauthenticated_request_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");

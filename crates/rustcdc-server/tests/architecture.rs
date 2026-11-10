@@ -17,9 +17,7 @@ fn read_src(relative: &str) -> String {
 /// Read a file relative to the **workspace root**, not this package.
 ///
 /// The manifest, the Dockerfile, the documentation site, the README and the CI workflows
-/// are repository-level artefacts and live one directory up. They used to sit beside this
-/// crate, when the server was its own repository; the guards below check the same files
-/// in their new home rather than being deleted for being inconvenient.
+/// are repository-level artefacts and live one directory up.
 fn read_repo(relative: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -192,13 +190,8 @@ fn migrations_has_no_v2_or_v3_hop() {
 /// Background work belongs on the ambient tokio runtime, not on detached OS threads
 /// running private ones.
 ///
-/// The admin state used to start four workers with `std::thread::spawn`, each building a
-/// `current_thread` runtime and looping unconditionally. That is four extra OS threads and
-/// four extra timer/IO drivers per process, none of which could be stopped: no handle was
-/// kept and no loop had an exit condition. Shutdown was therefore not orderly — the
-/// signal-action worker went on mutating admin state while the pipeline finalised — and
-/// every test that built an `AdminState` leaked its four threads for the lifetime of the
-/// test binary.
+/// A detached thread with its own runtime keeps a handle nobody holds and a loop nothing
+/// stops, so it outlives shutdown and keeps mutating state while the pipeline finalises.
 ///
 /// The needle is assembled with `concat!` so this assertion does not match its own source.
 #[test]
@@ -483,14 +476,30 @@ fn uses_unsafe_keyword(code: &str) -> bool {
 
 #[test]
 fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
-    /// `(file, why)`. One entry. Adding a second needs an argument, in code review, here.
-    const ALLOWED: &[(&str, &str)] = &[(
-        "src/test_env.rs",
-        "the one place the crate mutates process environment, serialised by EnvGuard",
-    )];
+    /// `(file, why)`, relative to the workspace root, for both crates. A new entry needs an
+    /// argument, in code review, here.
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "crates/rustcdc-server/src/test_env.rs",
+            "the one place the server mutates process environment, serialised by EnvGuard",
+        ),
+        (
+            "crates/rustcdc/src/checkpoint/owner_lease.rs",
+            "Windows process-liveness check: the OpenProcess/CloseHandle FFI has no safe wrapper \
+             in the dependency tree",
+        ),
+    ];
 
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the server crate sits two levels below the workspace root")
+        .to_path_buf();
     let mut found: Vec<String> = Vec::new();
-    let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    let mut stack = vec![
+        root.join("crates/rustcdc-server/src"),
+        root.join("crates/rustcdc/src"),
+    ];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -514,7 +523,7 @@ fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
                 continue;
             }
             found.push(
-                path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                path.strip_prefix(&root)
                     .unwrap_or(&path)
                     .display()
                     .to_string(),
@@ -528,9 +537,9 @@ fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "these files use `unsafe` and are not on the allowlist in this test. The library \
-         denies `unsafe_code` and the binary forbids it; if a new site is genuinely \
-         unavoidable, add it here with the argument:\n{unexpected:#?}"
+        "these files use `unsafe` and are not on the allowlist in this test. Both crates deny \
+         `unsafe_code` and the binary forbids it; if a new site is genuinely unavoidable, \
+         add it here with the argument:\n{unexpected:#?}"
     );
 
     for (file, why) in ALLOWED {
@@ -648,10 +657,6 @@ fn a_secret_named_setting_is_typed_as_a_secret() {
 /// Over-redaction is a real cost. `GET /config` is where someone answers "which variable
 /// holds my token?"; blanking that pushes them to read the config file off the disk, which
 /// is worse for security rather than better.
-///
-/// The treatment used to be arbitrary rather than chosen — `read_token_env` was redacted and
-/// `audit_signing_key_env` was not, the difference being only which substrings happened to
-/// be in the token list.
 #[test]
 fn env_variable_names_and_endpoints_are_not_treated_as_secrets() {
     use rustcdc_server::redaction::is_sensitive_key_name;
@@ -813,9 +818,8 @@ fn workspace_package_key(key: &str) -> String {
 /// against the APIs it calls, and it rots against dependency upgrades without a single
 /// warning. It reads as a feature to anyone browsing the tree and is not one.
 ///
-/// This caught a 399-line `core/column_filter.rs` carrying 13 tests that had never
-/// executed and code that no longer compiled against `sha2` 0.11 — while duplicating
-/// masking the transform pipeline already provides and tests.
+/// An undeclared module's tests never run and its code is never compiled, so it rots
+/// silently while looking like coverage.
 ///
 /// `#[path = "..."]` includes count as declarations: `config/loader_tests.rs` is reached
 /// that way and is genuinely live.
@@ -932,10 +936,7 @@ fn every_statement_of_the_msrv_matches_cargo_toml() {
         }
     }
 
-    // The getting-started page states the number in prose. It used to interpolate a Zola
-    // shortcode instead, which Zola 0.23 removed along with every other shortcode — so the
-    // literal is now the only option. That is not a downgrade: an indirection only moved
-    // where the number was written, whereas this check is what actually prevents drift.
+    // The getting-started page states the MSRV as a literal; this check keeps it in step.
     let getting_started = read_repo("site/content/docs/getting-started.md");
     if !getting_started.contains(&format!("Requires Rust {msrv} or later")) {
         wrong.push(format!(
@@ -1187,12 +1188,9 @@ fn reads_field(src: &str, field: &str) -> bool {
 /// serde from a config file, or clap from the command line. The derive is what makes that
 /// true, so the derive is the filter.
 ///
-/// This used to collect every `pub <name>:` under `src/config/**`, which was blunt in a
-/// way that eventually mattered: `KNOWN_SOURCE_DRIVERS`' `SourceDriverEntry` is a static
-/// lookup table, not a setting, and its `aliases` field was reported as inert because the
-/// only reader is the entry's own `matches()` — good encapsulation, punished. The fix is
-/// not an allowlist entry (that list is for serde and macros, and diluting it is how it
-/// stops meaning anything) but a scanner that knows what it is looking for.
+/// Every `pub <name>:` under `src/config/**` would also catch static lookup tables such as
+/// `SourceDriverEntry`, whose fields only their own methods read; scanning for the derive
+/// keeps the allowlist for serde and macros.
 ///
 /// The six defects this check was built to catch were all serde or clap fields, so nothing
 /// is given up.
@@ -1243,11 +1241,8 @@ fn declared_settings() -> Vec<(String, String)> {
             // Any other *item* resets the pending derive, so `#[derive(Deserialize)] enum`
             // followed by a plain struct does not leak the derive across.
             //
-            // Attributes are **not** items. This used to clear on any non-empty,
-            // non-comment line, which meant a `#[serde(deny_unknown_fields)]` between the
-            // derive and the struct erased the derive — and the whole struct became
-            // invisible to this scanner. Every setting it declared was then exempt from the
-            // inert check by accident, in the guard the project relies on most.
+            // Attributes are not items: a `#[serde(...)]` between the derive and the
+            // struct must not clear it, or the struct escapes the inert check.
             if depth == 0
                 && !trimmed.is_empty()
                 && !trimmed.starts_with("//")
@@ -1330,9 +1325,7 @@ fn every_configuration_setting_is_read_by_something() {
         // This is the one config type this crate owns that mirrors a rustcdc struct
         // field-for-field, so its mapper necessarily lives beside the declaration.
         // `to_runtime_config` is their only reader, like every other field of this
-        // struct — the replication-slot lag side-channel that used to read
-        // `pg.host/port/user/database/conn_timeout_secs` is gone, since rustcdc samples
-        // slot lag itself.
+        // struct.
         ("conn_timeout_secs", "source.rs: to_runtime_config"),
         ("database", "source.rs: to_runtime_config"),
         ("port", "source.rs: to_runtime_config"),
@@ -1363,9 +1356,8 @@ fn every_configuration_setting_is_read_by_something() {
         ("token_endpoint", "sink.rs: OidcTokenProvider builder"),
         // Read by `KafkaTransportConfig::to_krafka_proxy`, which `src/sink/kafka.rs` calls
         // on both producer builders. It is a separate accessor from `to_krafka` because
-        // krafka carries the proxy on the client builder, not on `TransportConfig` — which
-        // is exactly why this setting used to be validated and then dropped, and why this
-        // entry has to name its consumer rather than simply silencing the check.
+        // krafka carries the proxy on the client builder, not on `TransportConfig`, so this
+        // entry names its consumer rather than silencing the check.
         (
             "socks5_proxy",
             "sink.rs: to_krafka_proxy, applied in sink/kafka.rs",
@@ -1499,10 +1491,7 @@ fn every_configuration_setting_is_read_by_something() {
 /// nobody runs is strictly worse than no test: the suite is green, the coverage is zero,
 /// and the absence of failures reads as health.
 ///
-/// This used to assert only that `integration_postgres` was referenced, which is exactly
-/// how the gap it was written to prevent reappeared: a review found three of four shipped
-/// connectors had no end-to-end test at all, while this guard passed. A check that names
-/// one file cannot notice a second file going unrun.
+/// A check that names one file cannot notice a second file going unrun.
 ///
 /// So it enumerates `tests/integration_*.rs` from disk and requires each to appear in the
 /// workflow. Adding a suite and forgetting to wire it up now fails the unit suite.
@@ -1566,26 +1555,54 @@ fn every_integration_suite_is_run_by_ci() {
 // Connectors are opt-in, and a narrow build must stay narrow
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A default build must link exactly one TLS stack.
+/// A default build must link exactly one TLS stack, and no SQL Server driver.
 ///
-/// The point of making connectors cargo features was that a PostgreSQL-only deployment
-/// stopped shipping `tiberius`, and with it rustls 0.21, a second webpki, a second X.509
-/// verifier, and four suppressed RUSTSEC advisories. That property is invisible in the
-/// source: it lives in `Cargo.toml`'s feature graph, and one careless
-/// `rustcdc = { features = ["sqlserver"] }` or a new dependency that happens to pull
-/// tiberius puts it all back with nothing failing.
+/// Connectors are cargo features so that a PostgreSQL-only deployment does not ship a
+/// database driver it never uses. That property is invisible in the source: it lives in
+/// `Cargo.toml`'s feature graph, and one careless `rustcdc = { features = ["sqlserver"] }`
+/// or a new dependency that happens to pull tiberius puts it back with nothing failing.
+/// The same goes for a second rustls major, which brings a second X.509 verifier and its
+/// own advisories.
 ///
 /// So it is asserted against the resolved graph. `cargo tree --edges normal` on the
-/// default feature set must contain no rustls 0.21 and no tiberius.
-///
-/// This is deliberately a *graph* assertion rather than a `deny.toml` one. cargo-deny
-/// reports the three webpki advisories as `advisory-not-detected` on a narrow build,
-/// which is the same signal — but it is a warning, and CI audits `--all-features` where
-/// they legitimately appear, so nothing would fail.
+/// default feature set must contain one rustls version, one rustls-webpki version, and no
+/// tiberius at any version.
 #[test]
 fn the_default_build_has_one_tls_stack() {
+    let tree = normal_dependency_tree(&[]);
+    assert_one_tls_stack(&tree, "a default build");
+
+    let tiberius = crate_versions(&tree, "tiberius");
+    assert!(
+        tiberius.is_empty(),
+        "a default build must not link tiberius ({tiberius:?}). Something re-enabled the \
+         `sqlserver` feature, or a new dependency pulled it in transitively. Run `cargo tree \
+         --edges normal -i tiberius` to find the edge."
+    );
+}
+
+/// The published image is built `--all-features`, every connector included, and it too must
+/// link one TLS stack; a guard that excused that build would let a dependency add a second
+/// stack to exactly the artefact users run.
+#[test]
+fn the_all_features_build_has_one_tls_stack() {
+    let tree = normal_dependency_tree(&["--all-features"]);
+    assert_one_tls_stack(&tree, "an --all-features build (the published image)");
+}
+
+/// The check itself, against a planted second stack: a guard that cannot fire reads as coverage.
+#[test]
+#[should_panic(expected = "must link exactly one rustls")]
+fn the_tls_stack_check_fires_on_a_second_rustls() {
+    let planted = "rustcdc v0.20.0\nrustls v0.23.46\nrustls v0.21.12\nrustls-webpki v0.103.8\n";
+    assert_one_tls_stack(planted, "a planted tree");
+}
+
+fn normal_dependency_tree(extra: &[&str]) -> String {
+    let mut args = vec!["tree", "--edges", "normal", "--prefix", "none"];
+    args.extend_from_slice(extra);
     let output = std::process::Command::new(env!("CARGO"))
-        .args(["tree", "--edges", "normal", "--prefix", "none"])
+        .args(&args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("cargo tree");
@@ -1594,28 +1611,27 @@ fn the_default_build_has_one_tls_stack() {
         "cargo tree failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let tree = String::from_utf8_lossy(&output.stdout);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
 
-    for (crate_name, why) in [
-        (
-            "rustls v0.21",
-            "a second TLS stack, carrying RUSTSEC-2026-0098/-0099/-0104 via rustls-webpki \
-             0.101",
-        ),
-        (
-            "rustls-webpki v0.101",
-            "a second X.509 verifier with three open advisories",
-        ),
-        (
-            "tiberius v0.12",
-            "the SQL Server driver, which is what pins rustls 0.21",
-        ),
-    ] {
-        assert!(
-            !tree.contains(crate_name),
-            "a default build must not link {crate_name} — it is {why}. Something re-enabled \
-             the `sqlserver` feature, or a new dependency pulled it in transitively. Run \
-             `cargo tree --edges normal -i {crate_name}` to find the edge."
+fn crate_versions(tree: &str, name: &str) -> std::collections::BTreeSet<String> {
+    tree.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some(name)).then(|| words.next().unwrap_or("").to_string())
+        })
+        .collect()
+}
+
+fn assert_one_tls_stack(tree: &str, which: &str) {
+    for name in ["rustls", "rustls-webpki"] {
+        let versions = crate_versions(tree, name);
+        assert_eq!(
+            versions.len(),
+            1,
+            "{which} must link exactly one {name}, found {versions:?}. A second one is a \
+             second TLS stack with its own advisories. Run `cargo tree --edges normal -i \
+             {name}` to find the edge."
         );
     }
 }
@@ -1693,7 +1709,7 @@ fn every_source_driver_is_known_to_the_gate() {
 /// endpoints are removed.
 #[test]
 fn every_admin_route_appears_in_the_openapi_document() {
-    let admin = read_src("src/admin/mod.rs");
+    let admin = read_src("src/admin/routes.rs");
 
     // Routes as declared: `.route("/path", ...)`.
     let router_body = admin

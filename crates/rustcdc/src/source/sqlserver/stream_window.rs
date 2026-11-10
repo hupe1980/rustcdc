@@ -526,6 +526,20 @@ fn out_of_retention_error(
     ))
 }
 
+/// A row as the stream builds it, for tests outside this module.
+#[cfg(test)]
+pub(super) fn build_sqlserver_event_for_tests(meta: &CaptureInstanceMeta) -> Event {
+    build_sqlserver_event(
+        meta,
+        "0x00000000000000000001",
+        "0x00000000000000000001",
+        1,
+        Operation::Insert,
+        None,
+        Some(serde_json::json!({"id": "1"})),
+    )
+}
+
 fn build_sqlserver_event(
     meta: &CaptureInstanceMeta,
     start_lsn_hex: &str,
@@ -561,6 +575,8 @@ fn build_sqlserver_event(
             event_index: 0,
         }),
         envelope_version: EVENT_ENVELOPE_VERSION,
+        // Built once per capture instance; a capture-instance change brings a new meta.
+        shape: meta.shape.clone(),
         unavailable_columns: Vec::new(),
     }
 }
@@ -659,6 +675,7 @@ fn build_truncate_event(raw: &SqlServerRawTruncate) -> Event {
         snapshot: None,
         transaction: None,
         envelope_version: EVENT_ENVELOPE_VERSION,
+        shape: None,
         unavailable_columns: Vec::new(),
     }
 }

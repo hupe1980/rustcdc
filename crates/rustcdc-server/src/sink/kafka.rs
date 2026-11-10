@@ -6,14 +6,15 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use krafka::admin::AdminClient;
-use krafka::producer::{Acks, Producer, ProducerRecord, RecordMetadata, TransactionalProducer};
+use krafka::admin::DescribeTopicsOptions;
+use krafka::auth::AuthConfig;
+use krafka::error::ErrorCode;
+use krafka::producer::{Acks, Producer, RecordMetadata, TransactionalProducer};
+use krafka::{CloseOptions, Kafka, KafkaBuilder, KrafkaError, Record};
 use rustcdc::core::Error as RtError;
 use tokio::sync::Mutex;
 
-use crate::config::schema::{
-    KafkaDeliveryMode, KafkaRecordHeaders, KafkaSecurityConfig, KafkaSinkConfig,
-};
+use crate::config::schema::{KafkaDeliveryMode, KafkaRecordHeaders, KafkaSinkConfig};
 use crate::error::AppError;
 use crate::topic::{QualifiedTable, TopicResolveError, TopicResolver, TopicTemplate};
 
@@ -71,10 +72,9 @@ enum SendSlot {
 /// `FuturesUnordered` exists to avoid exactly that sweep; here the sweep *is* the
 /// guarantee, and 128 cheap polls are worth rather less than ordered change data.
 ///
-/// The clean fix belongs upstream: krafka should expose Java's
-/// `send(record) -> Future<RecordMetadata>`, separating enqueue from await so the append
-/// is complete before the call returns. Until it does, the ordered poll sweep below is
-/// what supplies the guarantee.
+/// Every slot holds a krafka `DeliveryHandle`, whose record was appended before the
+/// handle existed, so append order does not depend on this sweep. It decides the order
+/// *results* are reported in, which is what attributes a failure to the right record.
 #[derive(Default)]
 struct SendWindow {
     slots: VecDeque<SendSlot>,
@@ -146,7 +146,7 @@ impl SendWindow {
 ///
 /// For transactional Kafka producers, the barrier lifecycle is:
 /// 1. `NotActive`: Normal state (ready to begin new barrier)
-/// 2. `Active`: Between begin_transaction() and commit/abort
+/// 2. `Active`: Between `begin_checkpoint_barrier` and commit/abort
 /// 3. `Closed`: Sink is closed or producer failed catastrophically
 ///
 /// This enum makes state transitions explicit and prevents confusion from boolean flags.
@@ -154,7 +154,7 @@ impl SendWindow {
 enum BarrierState {
     /// No transaction in progress; ready to begin() a new barrier
     NotActive,
-    /// Transaction active; between begin_transaction() and commit/abort
+    /// Transaction active; between `begin_checkpoint_barrier` and commit/abort
     Active,
     /// Sink is closed or in error state; no further barriers permitted
     Closed,
@@ -163,13 +163,31 @@ enum BarrierState {
 #[derive(Debug)]
 struct BarrierStateMachine {
     state: BarrierState,
+    /// Whether the producer's Kafka transaction has been opened inside this barrier.
+    ///
+    /// Opened on the first record rather than at `begin`, because a barrier can carry no
+    /// records — a route that received nothing in this batch — and Kafka refuses to commit
+    /// a transaction that added no partition (`INVALID_TXN_STATE` under transaction
+    /// version 1). krafka sends `EndTxn` regardless, so an empty barrier is ended here,
+    /// without one. Pinned by `an_empty_barrier_commits_without_a_kafka_transaction`.
+    txn_open: bool,
 }
 
 impl BarrierStateMachine {
     fn new() -> Self {
         Self {
             state: BarrierState::NotActive,
+            txn_open: false,
         }
+    }
+
+    /// Open the producer's transaction for this barrier if no record has yet.
+    fn open_txn(&mut self, producer: &TransactionalProducer) -> Result<(), KrafkaError> {
+        if !self.txn_open {
+            producer.begin()?;
+            self.txn_open = true;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -217,7 +235,7 @@ impl BarrierStateMachine {
 /// A share in the sink's Kafka transaction.
 ///
 /// This is what makes end-to-end exactly-once possible. The source position is not a Kafka
-/// consumer offset, so `send_offsets_to_transaction` does not apply; the only way to make
+/// consumer offset, so `send_offsets` does not apply; the only way to make
 /// the data and the durable position atomic is to write the checkpoint record into the
 /// *same* producer transaction as the data. That requires one producer, shared — which is
 /// what this hands out.
@@ -248,16 +266,21 @@ impl KafkaTransactionHandle {
         // Held across the send so a barrier cannot commit underneath a record that has not
         // reached the accumulator yet — that record would land in the *next* transaction
         // while this one's commit claimed it.
-        let barrier = self.barrier.lock().await;
+        let mut barrier = self.barrier.lock().await;
         let joined = barrier.is_active();
 
-        if !joined {
-            self.producer.begin_transaction().map_err(|e| {
-                AppError::Other(format!("failed to begin kafka state transaction: {e}"))
-            })?;
-        }
+        let began = if joined {
+            barrier.open_txn(&self.producer)
+        } else {
+            self.producer.begin()
+        };
+        began.map_err(|e| {
+            AppError::Other(format!("failed to begin kafka state transaction: {e}"))
+        })?;
 
-        let result = self.producer.send(topic, Some(key), Some(payload)).await;
+        let record =
+            Record::new(topic, Bytes::copy_from_slice(payload)).key(Bytes::copy_from_slice(key));
+        let result = self.producer.send(record).await;
 
         let metadata = match result {
             Ok(metadata) => metadata,
@@ -265,7 +288,7 @@ impl KafkaTransactionHandle {
                 if !joined {
                     // Best-effort: a fenced producer cannot abort either, and the send
                     // error is the one worth surfacing.
-                    if let Err(abort_err) = self.producer.abort_transaction().await {
+                    if let Err(abort_err) = self.producer.abort().await {
                         tracing::warn!(
                             error = %abort_err,
                             "aborting the kafka state transaction failed after a send error"
@@ -277,7 +300,7 @@ impl KafkaTransactionHandle {
         };
 
         if !joined {
-            self.producer.commit_transaction().await.map_err(|e| {
+            self.producer.commit().await.map_err(|e| {
                 AppError::Other(format!("failed to commit the kafka state transaction: {e}"))
             })?;
             enforce_durable_confirmation(&metadata, "state")
@@ -347,6 +370,11 @@ pub const HEADER_SOURCE_OFFSET: &str = "__rustcdc.source.offset";
 /// consumer, and none of those can decode a binary integer. Every other header here is
 /// text for the same reason; making one of them binary would be the surprise.
 pub const HEADER_SOURCE_TS_MS: &str = "__rustcdc.source.ts_ms";
+/// The id of the row's shape (`Event::shape`), omitted when the row carries none.
+///
+/// Lets a consumer of a compact (`row_shape = "id"`) or Avro/Protobuf stream look a shape up
+/// without decoding the value — the role a registry schema-id header plays elsewhere.
+pub const HEADER_ROW_SHAPE: &str = "__rustcdc.row_shape";
 
 /// A source-supplied identifier can be no longer than this in a header value.
 ///
@@ -378,7 +406,7 @@ fn cdc_headers(event: &rustcdc::Event) -> Vec<(String, Option<Bytes>)> {
         ))
     }
 
-    let mut headers = Vec::with_capacity(6);
+    let mut headers = Vec::with_capacity(7);
     headers.push((HEADER_OP.to_string(), identifier(event.op.to_str())));
     if let Some(schema) = event.schema.as_deref().filter(|s| !s.is_empty()) {
         headers.push((HEADER_SOURCE_SCHEMA.to_string(), identifier(schema)));
@@ -396,6 +424,9 @@ fn cdc_headers(event: &rustcdc::Event) -> Vec<(String, Option<Bytes>)> {
         HEADER_SOURCE_TS_MS.to_string(),
         identifier(&event.source.timestamp.to_string()),
     ));
+    if let Some(shape) = event.shape.as_deref() {
+        headers.push((HEADER_ROW_SHAPE.to_string(), identifier(shape.id())));
+    }
     headers
 }
 
@@ -456,22 +487,18 @@ pub struct KafkaSink {
     closed: bool,
     /// Sends handed to krafka whose broker acknowledgement has not been collected yet.
     ///
-    /// Every send used to be awaited to completion before
-    /// the next one was created, so the sink produced exactly one record per broker
-    /// round-trip: measured at 5 700 events/s against an in-process broker, and far worse
-    /// across a real network. Worse, it made `linger_ms` actively harmful — a partially
-    /// filled batch had nothing to wait *for*, so each record paid the full linger by
-    /// itself and the documentation had to tell operators to leave it at zero.
+    /// Awaiting each send before creating the next would cost one broker round-trip per
+    /// record and make `linger_ms` pure delay, since a batch could never fill.
     ///
     /// See [`SendWindow`] for why this is not a `FuturesOrdered`.
     inflight: SendWindow,
     /// Ceiling on `inflight`, from `sink.kafka.max_pipelined_sends`.
     max_pipelined_sends: usize,
-    /// Preflight-check fields: stored at construction for AdminClient use.
+    /// The connection the producer was built from. Preflight's admin client shares its
+    /// pool, so preflight exercises the same transport, TLS and SASL settings the producer
+    /// uses rather than a second, separately configured connection.
+    kafka: Kafka,
     preflight_brokers: String,
-    preflight_client_id: String,
-    preflight_security: KafkaSecurityConfig,
-    preflight_transport: krafka::network::TransportConfig,
     preflight_timeout: Duration,
 }
 
@@ -527,36 +554,43 @@ impl KafkaSink {
             .map_err(RtError::ConfigError)?;
 
         // Carries the SOCKS5 proxy and the per-connection in-flight ceiling too — one
-        // accessor for every transport setting, so no builder below can be given some of
-        // them and silently miss the rest.
-        let transport = config.transport.to_krafka().map_err(RtError::ConfigError)?;
+        // accessor for every transport setting, so no client built from this handle can be
+        // given some of them and silently miss the rest.
+        let kafka = config
+            .transport
+            .apply(kafka_builder(
+                brokers.join(","),
+                config.client_id.clone(),
+                Duration::from_millis(config.ack_timeout_ms),
+                auth,
+            ))
+            .connect()
+            .await
+            .map_err(|e| {
+                RtError::ConfigError(format!(
+                    "failed to connect to Kafka brokers '{}': {e}",
+                    brokers.join(",")
+                ))
+            })?;
+
+        let builder = kafka
+            .producer()
+            .acks(Acks::All)
+            .compression(
+                config
+                    .compression
+                    .to_krafka()
+                    .map_err(RtError::ConfigError)?,
+            )
+            .compression_level(config.compression_level)
+            .batch_size(config.batch_size)
+            .linger(Duration::from_millis(config.linger_ms))
+            .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
+            .delivery_timeout(Self::delivery_timeout(config));
 
         let (producer, delivery_guarantee) = match config.delivery_mode {
             KafkaDeliveryMode::AtLeastOnceIdempotent => {
-                let builder = Producer::builder()
-                    .bootstrap_servers(brokers.join(","))
-                    .client_id(config.client_id.clone())
-                    .acks(Acks::All)
-                    .idempotent(true)
-                    .compression(
-                        config
-                            .compression
-                            .to_krafka()
-                            .map_err(RtError::ConfigError)?,
-                    )
-                    .compression_level(config.compression_level)
-                    .batch_size(config.batch_size)
-                    .linger(Duration::from_millis(config.linger_ms))
-                    .retries(config.retry_max_attempts)
-                    .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
-                    .request_timeout(Duration::from_millis(config.ack_timeout_ms))
-                    .connect_timeout(kafka_connect_timeout(Duration::from_millis(
-                        config.ack_timeout_ms,
-                    )))
-                    .delivery_timeout(Self::delivery_timeout(config))
-                    .transport(transport.clone())
-                    .auth(auth);
-                let producer = builder.build().await.map_err(|e| {
+                let producer = builder.idempotent(true).build().await.map_err(|e| {
                     RtError::ConfigError(format!("failed to build idempotent krafka producer: {e}"))
                 })?;
                 (
@@ -583,43 +617,19 @@ impl KafkaSink {
                     ));
                 }
 
-                let builder = TransactionalProducer::builder()
-                    .bootstrap_servers(brokers.join(","))
-                    .client_id(config.client_id.clone())
-                    .transactional_id(transactional_id)
+                // `delivery_timeout` matters more here than on the idempotent producer: a
+                // stuck batch holds the transaction open and blocks the checkpoint barrier
+                // behind it. `build_transactional` registers the id with the coordinator,
+                // fencing any earlier instance and aborting what it left open.
+                let producer = builder
                     .transaction_timeout(Duration::from_millis(config.transaction_timeout_ms))
-                    .request_timeout(Duration::from_millis(config.ack_timeout_ms))
-                    .connect_timeout(kafka_connect_timeout(Duration::from_millis(
-                        config.ack_timeout_ms,
-                    )))
-                    .compression(
-                        config
-                            .compression
-                            .to_krafka()
-                            .map_err(RtError::ConfigError)?,
-                    )
-                    .compression_level(config.compression_level)
-                    .batch_size(config.batch_size)
-                    .linger(Duration::from_millis(config.linger_ms))
-                    .retries(config.retry_max_attempts)
-                    .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
-                    // Bounds how long a batch may sit in flight. It matters more here
-                    // than on the idempotent producer: a stuck batch holds the
-                    // transaction open and blocks the checkpoint barrier behind it.
-                    .delivery_timeout(Self::delivery_timeout(config))
-                    .transport(transport.clone())
-                    .auth(auth);
-                let producer = builder.build().await.map_err(|e| {
-                    RtError::ConfigError(format!(
-                        "failed to build transactional krafka producer: {e}"
-                    ))
-                })?;
-
-                producer.init_transactions().await.map_err(|e| {
-                    RtError::SourceError(format!(
-                        "failed to initialize transactional producer state: {e}"
-                    ))
-                })?;
+                    .build_transactional(transactional_id)
+                    .await
+                    .map_err(|e| {
+                        RtError::SourceError(format!(
+                            "failed to initialize transactional krafka producer: {e}"
+                        ))
+                    })?;
 
                 (
                     KafkaProducerClient::Transactional(Arc::new(producer)),
@@ -655,10 +665,8 @@ impl KafkaSink {
             closed: false,
             inflight: SendWindow::default(),
             max_pipelined_sends: config.max_pipelined_sends.max(1),
-            preflight_brokers: config.normalized_brokers().join(","),
-            preflight_client_id: format!("{}-preflight", config.client_id),
-            preflight_security: config.security.clone(),
-            preflight_transport: transport,
+            kafka,
+            preflight_brokers: brokers.join(","),
             preflight_timeout: Duration::from_millis(config.ack_timeout_ms.max(5_000)),
         })
     }
@@ -768,15 +776,16 @@ impl KafkaSink {
     ///
     /// Both producer flavours expose the same handle, so the OAUTHBEARER token
     /// counters are available regardless of delivery mode.
-    pub fn connection_metrics(&self) -> krafka::metrics::ConnectionMetricsSnapshot {
+    pub fn connection_metrics(&self) -> krafka::metrics::ConnectionMetrics {
         match &self.producer {
-            KafkaProducerClient::Idempotent(producer) => producer.connection_metrics().snapshot(),
-            KafkaProducerClient::Transactional(producer) => {
-                producer.connection_metrics().snapshot()
-            }
+            KafkaProducerClient::Idempotent(producer) => producer.metrics().connections,
+            KafkaProducerClient::Transactional(producer) => producer.metrics().connections,
         }
     }
 
+    /// krafka retries until this budget is spent — it has no retry count — so this is
+    /// where `retry_max_attempts` takes effect. `linger_ms` is in it because krafka
+    /// rejects a `delivery_timeout` below `linger + request_timeout`.
     fn delivery_timeout(config: &KafkaSinkConfig) -> Duration {
         let retry_budget = config
             .retry_backoff_ms
@@ -784,6 +793,7 @@ impl KafkaSink {
         Duration::from_millis(
             config
                 .ack_timeout_ms
+                .saturating_add(config.linger_ms)
                 .saturating_add(retry_budget)
                 .saturating_add(5_000),
         )
@@ -803,26 +813,7 @@ impl KafkaSink {
     /// it will dead-letter if it ever produces an event, and failing the pipeline for it
     /// would take out every healthy table alongside it.
     pub async fn preflight_check(&mut self) -> Result<(), AppError> {
-        let auth = self
-            .preflight_security
-            .to_auth_config()
-            .map_err(AppError::Other)?;
-
-        let admin = AdminClient::builder()
-            .bootstrap_servers(self.preflight_brokers.clone())
-            .client_id(self.preflight_client_id.clone())
-            .request_timeout(self.preflight_timeout)
-            .connect_timeout(kafka_connect_timeout(self.preflight_timeout))
-            .transport(self.preflight_transport.clone())
-            .auth(auth)
-            .build()
-            .await
-            .map_err(|e| {
-                AppError::Other(format!(
-                    "sink preflight: failed to connect to Kafka brokers '{}': {e}",
-                    self.preflight_brokers
-                ))
-            })?;
+        let admin = self.kafka.admin();
 
         let template = self.topics.template().source().to_string();
         let templated = self.topics.template().is_templated();
@@ -865,18 +856,40 @@ impl KafkaSink {
             }
         };
 
-        let found = admin.describe_topics(&expected).await.map_err(|e| {
-            AppError::Other(format!(
-                "sink preflight: failed to describe Kafka topic(s) {}: {e}",
-                quoted_list(&expected)
-            ))
-        })?;
+        let found = admin
+            .describe_topics(
+                &expected,
+                DescribeTopicsOptions::default().timeout(self.preflight_timeout),
+            )
+            .await
+            .map_err(|e| {
+                AppError::Other(format!(
+                    "sink preflight: failed to describe Kafka topic(s) {}: {e}",
+                    quoted_list(&expected)
+                ))
+            })?;
 
-        let missing: Vec<String> = expected
-            .iter()
-            .filter(|topic| !found.iter().any(|t| t.0 == topic.as_str()))
-            .cloned()
-            .collect();
+        // A missing topic is a per-topic `UnknownTopicOrPartition`. Any other per-topic
+        // failure — an ACL, a timeout — says nothing about existence, so it is reported as
+        // itself rather than as "not found".
+        let mut missing = Vec::new();
+        for topic in &expected {
+            match found.get(topic) {
+                Some(Ok(_)) => {}
+                None
+                | Some(Err(KrafkaError::Broker {
+                    code: ErrorCode::UnknownTopicOrPartition,
+                    ..
+                })) => missing.push(topic.clone()),
+                Some(Err(error)) => {
+                    return Err(AppError::Other(format!(
+                        "sink preflight: failed to describe Kafka topic '{topic}' on brokers \
+                         '{}': {error}",
+                        self.preflight_brokers
+                    )));
+                }
+            }
+        }
 
         if !missing.is_empty() {
             return Err(AppError::Other(if templated {
@@ -923,20 +936,12 @@ impl KafkaSink {
     /// wrapper did a `Bytes::copy_from_slice` of each — a full duplicate of every payload,
     /// per record, discarded immediately after the accumulator took ownership.
     ///
-    /// # The two arms differ, and the difference is the ordering guarantee
+    /// # Ordering
     ///
-    /// **Idempotent:** `enqueue` performs the accumulator append *before it returns*, so
-    /// produce order is call order — settled here, at submission, and not dependent on how
-    /// the returned handles are polled afterwards. This path does not need [`SendWindow`]'s
-    /// poll sweep.
-    ///
-    /// **Transactional:** `TransactionalProducer::enqueue` returns a handle that borrows
-    /// the producer, so it cannot be stored in the same struct that owns the producer
-    /// without a self-reference — and `unsafe_code = "forbid"` rules out the usual
-    /// escapes. This arm therefore still boxes a future that appends when first polled,
-    /// and still depends on the ordered sweep. Raised upstream as F-5; when an owned
-    /// transactional handle exists, this arm collapses into the one above and
-    /// [`SendWindow`] loses its reason to exist.
+    /// Both producers' `enqueue` performs the accumulator append *before it returns* and
+    /// hands back an owned `DeliveryHandle`, so produce order is call order — settled here,
+    /// at submission, and not dependent on how the returned handles are polled afterwards.
+    /// [`SendWindow`]'s ordered sweep is kept as a second line, not as the guarantee.
     ///
     /// Takes its inputs by value rather than through `&self`: an `InFlightSend` is
     /// `Send` but not `Sync`, so holding `&KafkaSink` across the enqueue await would make
@@ -959,21 +964,15 @@ impl KafkaSink {
         // compaction preserves — which is why this is `Option` rather than an empty
         // `Bytes` by convention.
         let mut record = match value {
-            Some(value) => ProducerRecord::new(topic, value).with_key(key),
-            None => ProducerRecord::tombstone(topic, key),
+            Some(value) => Record::new(topic, value).key(key),
+            None => Record::tombstone(topic, key),
         };
         record.headers = headers;
-        match producer {
-            KafkaProducerClient::Idempotent(producer) => {
-                let handle = producer.enqueue(record).await?;
-                Ok(Box::pin(handle))
-            }
-            KafkaProducerClient::Transactional(producer) => {
-                Ok(Box::pin(
-                    async move { producer.enqueue(record).await?.await },
-                ))
-            }
-        }
+        let handle = match producer {
+            KafkaProducerClient::Idempotent(producer) => producer.enqueue(record).await?,
+            KafkaProducerClient::Transactional(producer) => producer.enqueue(record).await?,
+        };
+        Ok(Box::pin(handle))
     }
 
     /// Convert one collected acknowledgement into this layer's error taxonomy.
@@ -1095,26 +1094,8 @@ impl KafkaSink {
     ///
     /// Kafka's per-partition ordering is what CDC consumers depend on, and pipelining is
     /// only sound if records reach krafka's accumulator in submission order. That holds
-    /// here by construction:
-    ///
-    /// 1. Each future is created and polled **once, in submission order**, before the
-    ///    next one exists. That first poll is what carries a record into the accumulator,
-    ///    or — if the accumulator is saturated — what claims its place in the queue.
-    /// 2. Every suspension point on that path is a tokio primitive with documented FIFO
-    ///    fairness: the buffer-memory semaphore in `Accumulator::append_routed_with_guard`,
-    ///    the accumulator's mpsc channel, and the in-flight semaphore on the direct path.
-    ///    Record *i* takes its ticket before record *i + 1* exists, so it is served first
-    ///    however the two are polled afterwards.
-    ///
-    /// That second point is what makes it safe for `inflight` to poll every outstanding
-    /// send concurrently: once the tickets are drawn in order, poll order cannot change
-    /// the outcome. The ordered *first* poll is the entire guarantee, and it is why this
-    /// polls manually instead of pushing an unpolled future onto the queue.
-    ///
-    /// The clean fix belongs upstream — krafka should expose Java's
-    /// `send(record) -> Future<RecordMetadata>`, which separates *enqueue* from *await*
-    /// explicitly instead of leaving both inside one opaque future, which would make this
-    /// invariant structural rather than argued.
+    /// structurally: [`build_send`](Self::build_send) awaits krafka's `enqueue`, which
+    /// returns only once the record is queued, before the next record is submitted.
     async fn enqueue(
         &mut self,
         topic: &str,
@@ -1130,6 +1111,18 @@ impl KafkaSink {
         // outstanding records rather than on records-plus-one.
         while self.inflight.len() >= self.max_pipelined_sends {
             self.await_oldest_send().await?;
+        }
+
+        if let KafkaProducerClient::Transactional(producer) = &self.producer {
+            let mut barrier = self.barrier.lock().await;
+            // Outside a barrier krafka refuses the send itself, which is the error to report.
+            if barrier.is_active() {
+                barrier.open_txn(producer).map_err(|e| {
+                    RtError::SourceError(format!(
+                        "failed to begin transactional checkpoint barrier: {e}"
+                    ))
+                })?;
+            }
         }
 
         // An enqueue failure is the record never reaching the accumulator at all —
@@ -1203,13 +1196,13 @@ impl KafkaSink {
         match &self.producer {
             KafkaProducerClient::Idempotent(producer) => {
                 producer
-                    .close_with_timeout(Duration::from_secs(5))
+                    .close_with(CloseOptions::new().timeout(Duration::from_secs(5)))
                     .await
                     .map_err(|e| RtError::SourceError(format!("Kafka sink close failed: {e}")))?;
             }
             KafkaProducerClient::Transactional(producer) => {
                 producer
-                    .close_with_timeout(Duration::from_secs(5))
+                    .close_with(CloseOptions::new().timeout(Duration::from_secs(5)))
                     .await
                     .map_err(|e| {
                         RtError::SourceError(format!("Kafka transactional sink close failed: {e}"))
@@ -1256,15 +1249,10 @@ impl KafkaSink {
 
         match &self.producer {
             KafkaProducerClient::Idempotent(_) => Ok(()),
-            KafkaProducerClient::Transactional(producer) => {
+            KafkaProducerClient::Transactional(_) => {
                 barrier.ensure_can_begin()?;
-
-                producer.begin_transaction().map_err(|e| {
-                    RtError::SourceError(format!(
-                        "failed to begin transactional checkpoint barrier: {e}"
-                    ))
-                })?;
-                // Transition: NotActive → Active
+                // The Kafka transaction itself opens with the first record; see
+                // `BarrierStateMachine::txn_open`.
                 barrier.mark_active();
                 Ok(())
             }
@@ -1277,7 +1265,7 @@ impl KafkaSink {
         // Load-bearing for `effectively_once`: a pipelined record that has not yet
         // reached the accumulator would otherwise be appended *after* `EndTxn` and land
         // in the following transaction, while the checkpoint this commit unblocks claims
-        // the batch is complete. `commit_transaction` flushes krafka's accumulator, but
+        // the batch is complete. `commit` flushes krafka's accumulator, but
         // it cannot flush a record that has not arrived there yet.
         if self.transactional_checkpoint_barrier_capable() {
             self.drain_inflight().await?;
@@ -1294,11 +1282,14 @@ impl KafkaSink {
             KafkaProducerClient::Transactional(producer) => {
                 barrier.ensure_can_commit()?;
 
-                producer.commit_transaction().await.map_err(|e| {
-                    RtError::SourceError(format!(
-                        "failed to commit transactional checkpoint barrier: {e}"
-                    ))
-                })?;
+                if barrier.txn_open {
+                    producer.commit().await.map_err(|e| {
+                        RtError::SourceError(format!(
+                            "failed to commit transactional checkpoint barrier: {e}"
+                        ))
+                    })?;
+                    barrier.txn_open = false;
+                }
                 // Transition: Active → NotActive
                 barrier.mark_not_active();
                 Ok(())
@@ -1311,7 +1302,7 @@ impl KafkaSink {
         // discarded, so their acknowledgements carry no information and awaiting them
         // would block the abort behind the very broker that is probably why we are
         // aborting. Cancelling the futures does not un-append a record already in the
-        // accumulator — `abort_transaction` is what makes those invisible.
+        // accumulator — `abort` is what makes those invisible.
         self.inflight.abandon();
 
         let mut barrier = self.barrier.lock().await;
@@ -1329,11 +1320,14 @@ impl KafkaSink {
                     return Ok(());
                 }
 
-                producer.abort_transaction().await.map_err(|e| {
-                    RtError::SourceError(format!(
-                        "failed to abort transactional checkpoint barrier: {e}"
-                    ))
-                })?;
+                if barrier.txn_open {
+                    producer.abort().await.map_err(|e| {
+                        RtError::SourceError(format!(
+                            "failed to abort transactional checkpoint barrier: {e}"
+                        ))
+                    })?;
+                    barrier.txn_open = false;
+                }
                 // Transition: Active → NotActive
                 barrier.mark_not_active();
                 Ok(())
@@ -1355,21 +1349,30 @@ pub(crate) fn kafka_connect_timeout(request_timeout: Duration) -> Duration {
     request_timeout.min(Duration::from_secs(10))
 }
 
+/// The connection settings every Kafka client in this server shares.
+///
+/// One function so that no client can be built with a request timeout but not the
+/// matching connect timeout, or without its security settings.
+pub(crate) fn kafka_builder(
+    brokers: impl Into<String>,
+    client_id: impl Into<String>,
+    request_timeout: Duration,
+    security: AuthConfig,
+) -> KafkaBuilder {
+    Kafka::builder(brokers)
+        .client_id(client_id)
+        .request_timeout(request_timeout)
+        .connect_timeout(kafka_connect_timeout(request_timeout))
+        .security(security)
+}
+
 /// Classify a krafka failure into the three responses the pipeline can actually take.
 ///
-/// Every Kafka failure used to become `RtError::SourceError`, which upstream classifies
-/// as `Transient`. That single mapping produced two distinct defects:
-///
-/// * A **poison record** — one the broker will reject identically forever, such as
-///   `MessageTooLarge` or `InvalidRecord` — was retried until the circuit breaker gave
-///   up, then killed the process, then failed again on the same record after restart.
-///   The dead-letter queue added in Round 4 was unreachable from this sink, because its
-///   branch is only taken for a non-recoverable error and this sink never produced one.
-/// * A **fatal misconfiguration** — bad SASL credentials, a revoked topic ACL — was also
-///   retried forever, so `TopicAuthorizationFailed` looked exactly like a broker restart.
-///
-/// The three-way split maps onto [`AppError::is_recoverable`] and
-/// [`AppError::is_dead_letterable`]:
+/// Mapping every failure to one `Transient` error would retry a **poison record** (one
+/// the broker rejects identically forever) until the circuit breaker kills the process,
+/// with the dead-letter queue unreachable, and would make a **fatal misconfiguration**
+/// (a revoked topic ACL) look exactly like a broker restart. The three-way split maps onto
+/// [`AppError::is_recoverable`] and [`AppError::is_dead_letterable`]:
 ///
 /// | Class | Example | Response |
 /// |---|---|---|
@@ -1380,11 +1383,12 @@ pub(crate) fn kafka_connect_timeout(request_timeout: Duration) -> Duration {
 /// The unclassified default is **fatal**, not poison: halting is loud and recoverable by
 /// a human, whereas guessing "poison" silently drains the change stream into the DLQ.
 pub(crate) fn classify_krafka_error(error: &krafka::error::KrafkaError, context: &str) -> AppError {
-    use krafka::error::{ErrorCode, KrafkaError};
-
     let message = format!("Kafka {context}: {error}");
 
-    if error.is_retriable() {
+    // krafka reports an exhausted `delivery_timeout` as its own non-retriable kind,
+    // because krafka itself will not retry it. The batch loop can — it re-sends the whole
+    // batch — and a broker that was slow for one delivery budget is not a reason to halt.
+    if error.is_retriable() || matches!(error, KrafkaError::DeliveryTimeout { .. }) {
         // `TimeoutError` is rustcdc's Transient variant — the batch loop backs off and
         // retries the same events.
         return AppError::SinkTimeout(message);

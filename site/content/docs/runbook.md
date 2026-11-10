@@ -57,9 +57,11 @@ different owners, so it is what an alert should route on:
 
 | `rustcdc_runtime_stall_cause{cause=…}` | What it means | Where to look |
 |---|---|---|
+| `source_position_lost` | PostgreSQL invalidated the replication slot; the process is parked, not capturing | The database — §4, *Slot invalidated* |
 | `unconfirmed_source_position` | A checkpointed position could not be confirmed to the source, which keeps replaying *and* retaining its log | The database. This ends in a full `pg_wal` volume, not a stopped pipeline |
 | `poll_loop_not_turning` | `poll_event_batch` has stopped returning | This process, or the socket to the source |
 | `consumer_not_acknowledging` | Events delivered, never acknowledged, no recent commit | The sink and the commit path — §3 |
+| `delivery_failing` | The sink keeps refusing the batch the pipeline holds; the stall reason carries its last error | The destination — §3 |
 
 The series is absent when healthy, so presence is the condition.
 
@@ -170,8 +172,11 @@ carried over from that transport is the usual source.
 
 Work down this list — it is ordered by how often each is the cause.
 
-0. **Which cause?** `rustcdc_runtime_stall_cause` names it directly, and the three go to
-   three different places. Everything below is the `consumer_not_acknowledging` path.
+0. **Which cause?** `rustcdc_runtime_stall_cause` names it directly, and they go to
+   different places. Everything below is the `consumer_not_acknowledging` and
+   `delivery_failing` path. For `delivery_failing`, read the stall reason first: it quotes the
+   destination's last error, and the WARN line `recoverable sink delivery error` names the
+   table whose send failed. Do not restart — a restart replays the batch into the same refusal.
 1. **Is anything happening upstream?** `verdict="idle"` means no changes to capture, and is
    not a fault. Confirm with a write to a captured table.
 2. **Is the sink accepting?** Check `rustcdc_sink_send_ops_total` for movement and
@@ -245,6 +250,27 @@ FROM pg_replication_slots;
 Set `max_slot_wal_keep_size` on the server so PostgreSQL invalidates a runaway slot
 rather than exhausting the volume. An invalidated slot loses data and needs a
 re-snapshot — bad, but survivable, unlike a full WAL volume.
+
+**`rustcdc_replication_slot_wal_status{status="unreserved"}` is 1** → the slot is past
+`max_slot_wal_keep_size` and is lost at the next checkpoint. Unblock the pipeline now
+(§3, §6), or raise `max_slot_wal_keep_size` to buy time.
+
+### Slot invalidated
+
+**Symptom:** stall cause `source_position_lost`; `/readyz` answers
+`stalled:source_position_lost`, `/livez` stays 200; the log has one ERROR naming the slot
+and the server's `invalidation_reason` (PostgreSQL 17+: `wal_removed`, `idle_timeout`).
+
+PostgreSQL removed the WAL between the last confirmed position and the invalidation. The
+process parks instead of exiting, because a restart replays into the same refusal. It never
+re-snapshots on its own.
+
+1. Drop and recreate the slot: `SELECT pg_drop_replication_slot('cdc_slot');` then
+   `SELECT pg_create_logical_replication_slot('cdc_slot', 'pgoutput');`
+2. Stop the process (SIGTERM), clear the state directory, and start with a snapshot of the
+   captured tables.
+3. **A re-snapshot does not replay rows deleted during the gap.** A mirror keeps them until
+   it is reconciled against the source — truncate and reload it, or diff by key.
 
 
 ## 5. Events are being quarantined

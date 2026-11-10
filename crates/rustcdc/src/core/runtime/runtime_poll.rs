@@ -107,6 +107,9 @@ impl CdcRuntime {
         }
 
         let outcome = self.poll_event_batch_inner().await;
+        if let Err(error) = &outcome {
+            self.note_source_position_lost(error);
+        }
 
         // Every return, including an error. This answers one question — "is the poll loop
         // turning?" — so an idle source returning empty batches must keep it fresh, and a
@@ -231,6 +234,9 @@ impl CdcRuntime {
                             );
                         }
                         if let Err(connect_error) = self.source.connect().await {
+                            if restart_cannot_help(&connect_error) {
+                                break Err(connect_error);
+                            }
                             tracing::warn!(
                                 target: "rustcdc::core::runtime",
                                 attempt = attempt + 1,
@@ -291,6 +297,9 @@ impl CdcRuntime {
                                 );
                             }
                             Err(start_error) => {
+                                if restart_cannot_help(&start_error) {
+                                    break Err(start_error);
+                                }
                                 tracing::warn!(
                                     target: "rustcdc::core::runtime",
                                     attempt = attempt + 1,
@@ -329,10 +338,13 @@ impl CdcRuntime {
                             "poll loop entered with no active stream".into(),
                         )
                     })?;
-                    match stream
+                    let polled = stream
                         .next_events(self.config.options.max_poll_wait_ms)
-                        .await
-                    {
+                        .await;
+                    // Before the match: a recoverable error drops the stream, and the slot
+                    // state it sampled is what an operator needs while it reconnects.
+                    self.capture_slot_state();
+                    match polled {
                         Ok(events) => break Ok(events),
                         Err(error) if error.is_recoverable() => {
                             let exhausted = policy
@@ -376,6 +388,9 @@ impl CdcRuntime {
                                 );
                             }
                             if let Err(connect_error) = self.source.connect().await {
+                                if restart_cannot_help(&connect_error) {
+                                    break Err(connect_error);
+                                }
                                 tracing::warn!(
                                     target: "rustcdc::core::runtime",
                                     attempt = attempt + 1,
@@ -413,6 +428,9 @@ impl CdcRuntime {
                                         );
                                     }
                                     Err(start_error) => {
+                                        if restart_cannot_help(&start_error) {
+                                            break Err(start_error);
+                                        }
                                         tracing::warn!(
                                             target: "rustcdc::core::runtime",
                                             attempt = attempt + 1,
@@ -434,7 +452,8 @@ impl CdcRuntime {
                     }
                 }
             } else {
-                self.stream
+                let polled = self
+                    .stream
                     .as_mut()
                     .ok_or_else(|| {
                         crate::core::Error::SourceError(
@@ -442,7 +461,9 @@ impl CdcRuntime {
                         )
                     })?
                     .next_events(self.config.options.max_poll_wait_ms)
-                    .await
+                    .await;
+                self.capture_slot_state();
+                polled
             };
             let events = result
                 .inspect_err(|error| metrics.record_error(error, "runtime.poll.stream_events"))?;
@@ -1168,12 +1189,14 @@ impl CdcRuntime {
     /// is enqueued for delivery, so a consumer can never observe a schema change the
     /// history does not already contain.
     ///
+    /// Rows record their shape here too, in batch order with the statements; see
+    /// [`record_row_shape`](Self::record_row_shape).
+    ///
     /// # Why a rejected entry does not stop the pipeline
     ///
-    /// A DDL identity is passed that makes recording idempotent under replay — the
-    /// common case after a crash between the record and the checkpoint commit — and, for
-    /// a schema *observation*, idempotent across restarts too
-    /// ([`CapturedDdl::history_identity`]). What remains is a history that genuinely
+    /// The DDL's identity ([`CapturedDdl::history_identity`]) makes recording idempotent under
+    /// replay — the common case after a crash between the record and the checkpoint
+    /// commit. What remains is a history that genuinely
     /// cannot accept the statement: an `ALTER TABLE` diff for a table the store has never
     /// seen, which is what an `InMemorySchemaHistory` looks like after any restart.
     ///
@@ -1187,7 +1210,11 @@ impl CdcRuntime {
     /// A store that is *broken* rather than merely inconsistent — an I/O failure, a
     /// lost owner lease — still propagates.
     pub(crate) async fn record_schema_change_events(&mut self, events: &[Event]) -> Result<()> {
-        for event in events.iter().filter(|event| event.op.is_schema_change()) {
+        for event in events {
+            if !event.op.is_schema_change() {
+                self.record_row_shape(event).await?;
+                continue;
+            }
             let Some(after) = event.after.as_ref() else {
                 continue;
             };
@@ -1200,16 +1227,17 @@ impl CdcRuntime {
             let Some(schema_event) = captured.to_schema_event() else {
                 continue;
             };
+            // The statement moves the history's latest schema; the next row compares
+            // against that rather than against what this cache last saw.
+            self.forget_recorded_shape(&captured.schema, &captured.table);
 
-            // The identity is the offset for a captured statement and a content digest for
-            // an observation, so a restart that re-announces an unchanged table resolves to
-            // the version already stored instead of appending one. See
-            // [`CapturedDdl::history_identity`].
-            let ddl_id = captured.history_identity(&event.source.offset);
             match self
                 .config
                 .schema_history
-                .record_ddl(&ddl_id, schema_event)
+                .record_ddl(
+                    &captured.history_identity(&event.source.offset),
+                    schema_event,
+                )
                 .await
             {
                 Ok(_) => {}
@@ -1302,4 +1330,17 @@ fn estimate_event_bytes(event: &Event) -> usize {
             .map_or(0, |keys| keys.iter().map(String::len).sum::<usize>())
         // Envelope scaffolding: field names, quoting, separators, timestamps.
         + 128
+}
+
+/// Whether a failed reconnect step is one no retry can fix, so the loop returns it now.
+///
+/// Retrying is for conditions that can clear; a slot the source invalidated, missing
+/// credentials or an exhausted budget will not, and retrying them turns a page into a
+/// reconnect loop reported as a poll loop that is not turning. A `ConfigError` stays
+/// retried: a deferred secret that failed to resolve can resolve on the next attempt.
+fn restart_cannot_help(error: &Error) -> bool {
+    error
+        .source_kind()
+        .is_some_and(|kind| !kind.is_recoverable())
+        || matches!(error.root_cause(), Error::Unrecoverable(_))
 }

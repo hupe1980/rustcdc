@@ -2,11 +2,7 @@ use crate::{
     core::{
         BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, SourceMetadata, TransactionMetadata,
     },
-    ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA},
-    source::{
-        schema_catalog::{observed_statement, table_schema_from_catalog},
-        table_is_allowed,
-    },
+    source::table_is_allowed,
 };
 
 use super::{
@@ -44,7 +40,12 @@ impl MysqlStreamHandle {
         }
     }
 
-    fn build_event(&self, op: Operation, change: MysqlRowChange) -> Event {
+    fn build_event(
+        &self,
+        op: Operation,
+        change: MysqlRowChange,
+        shape: Option<std::sync::Arc<crate::RowShape>>,
+    ) -> Event {
         Event {
             // A row-based binlog event carries the whole prior row or none of it — MySQL
             // has no key-only pre-image, so there is no third case to distinguish here.
@@ -61,8 +62,21 @@ impl MysqlStreamHandle {
             snapshot: None,
             transaction: self.tx_meta(),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape,
             unavailable_columns: Vec::new(),
         }
+    }
+
+    /// The shape a row was captured under: the catalogue's, when it agrees with the row's
+    /// own table map; see [`row_shape`](super::row_shape).
+    async fn row_shape(
+        &mut self,
+        change: &MysqlRowChange,
+    ) -> Option<std::sync::Arc<crate::RowShape>> {
+        let schema = change.schema.as_deref()?;
+        self.shapes
+            .shape_for(schema, &change.table, &change.table_map)
+            .await
     }
 
     fn commit_current_transaction(
@@ -99,63 +113,11 @@ impl MysqlStreamHandle {
         std::mem::take(&mut self.partial_tx_events)
     }
 
-    /// Announce a table's schema the first time this run sees a row for it.
-    ///
-    /// MySQL's schema-change events come from DDL statements parsed out of the binlog, so
-    /// a table whose `CREATE TABLE` ran before capture started had no schema event at all —
-    /// and its rows carry text values. This closes that, from the catalog read at stream
-    /// start rather than from the table map; see
-    /// [`query_database_column_types`](super::query::query_database_column_types).
-    ///
-    /// Returns `None` for a table the catalog has nothing for, which is a table created
-    /// after the stream started. That case needs nothing: its `CREATE TABLE` is in the
-    /// binlog and arrives as its own schema-change event.
-    fn announce_table_if_new(&mut self, schema: Option<&str>, table: &str) -> Option<Event> {
-        let database = schema?.to_string();
-        let key = (database.clone(), table.to_string());
-        if self.announced_tables.contains(&key) {
-            return None;
-        }
-        let columns = self.catalog_columns.get(&key)?.clone();
-        self.announced_tables.insert(key.clone());
-
-        let primary_keys = self
-            .catalog_primary_keys
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        let ts_ms = if self.current_commit_ts == 0 {
-            crate::source::helpers::now_millis()
-        } else {
-            self.current_commit_ts
-        };
-        let captured = CapturedDdl {
-            ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
-            schema: database.clone(),
-            table: table.to_string(),
-            statement: observed_statement(&database, table, "information_schema"),
-            result_schema: Some(table_schema_from_catalog(
-                &database,
-                table,
-                &columns,
-                &primary_keys,
-            )),
-            schema_diff: None,
-            ts: ts_ms,
-        };
-        let offset = format_mysql_source_offset(
-            &self.stream.binlog_file,
-            self.stream.binlog_pos,
-            &self.stream.gtid,
-        );
-        let mut event = captured.to_event(&self.source_name, offset, ts_ms);
-        if self.current_tx_id.is_some() {
-            event.transaction = self.tx_meta();
-        }
-        Some(event)
-    }
-
-    pub(super) fn process_messages(&mut self, messages: Vec<MysqlBinlogMessage>) -> Vec<Event> {
+    pub(super) async fn process_messages(
+        &mut self,
+        messages: Vec<MysqlBinlogMessage>,
+    ) -> Vec<Event> {
+        self.shapes.start_batch();
         let mut committed = Vec::new();
         for message in messages {
             match message {
@@ -174,15 +136,12 @@ impl MysqlStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
-                        // Before the row, never after: a consumer that receives the row
-                        // first has already had to decide how to decode its text values.
-                        if let Some(schema_event) =
-                            self.announce_table_if_new(change.schema.as_deref(), &change.table)
-                        {
-                            self.partial_tx_events.push(schema_event);
-                        }
-                        self.partial_tx_events
-                            .push(self.build_event(Operation::Insert, change));
+                        let shape = self.row_shape(&change).await;
+                        self.partial_tx_events.push(self.build_event(
+                            Operation::Insert,
+                            change,
+                            shape,
+                        ));
                     }
                 }
                 MysqlBinlogMessage::UpdateRows(change) => {
@@ -192,15 +151,12 @@ impl MysqlStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
-                        // Before the row, never after: a consumer that receives the row
-                        // first has already had to decide how to decode its text values.
-                        if let Some(schema_event) =
-                            self.announce_table_if_new(change.schema.as_deref(), &change.table)
-                        {
-                            self.partial_tx_events.push(schema_event);
-                        }
-                        self.partial_tx_events
-                            .push(self.build_event(Operation::Update, change));
+                        let shape = self.row_shape(&change).await;
+                        self.partial_tx_events.push(self.build_event(
+                            Operation::Update,
+                            change,
+                            shape,
+                        ));
                     }
                 }
                 MysqlBinlogMessage::DeleteRows(change) => {
@@ -210,15 +166,12 @@ impl MysqlStreamHandle {
                         &self.table_include_list,
                         &self.table_exclude_list,
                     ) {
-                        // Before the row, never after: a consumer that receives the row
-                        // first has already had to decide how to decode its text values.
-                        if let Some(schema_event) =
-                            self.announce_table_if_new(change.schema.as_deref(), &change.table)
-                        {
-                            self.partial_tx_events.push(schema_event);
-                        }
-                        self.partial_tx_events
-                            .push(self.build_event(Operation::Delete, change));
+                        let shape = self.row_shape(&change).await;
+                        self.partial_tx_events.push(self.build_event(
+                            Operation::Delete,
+                            change,
+                            shape,
+                        ));
                     }
                 }
                 MysqlBinlogMessage::Xid {
@@ -272,6 +225,9 @@ impl MysqlStreamHandle {
 
                     self.stream.binlog_file = binlog_file;
                     self.stream.binlog_pos = binlog_pos;
+                    // Whatever the catalogue said about this table may be stale from here on,
+                    // filtered or not: it is re-read before a later row may carry it.
+                    self.shapes.invalidate(&captured.schema, &captured.table);
                     // The position advances whether or not the statement is emitted — a
                     // filtered DDL still moved the binlog on, and a checkpoint that
                     // pretended otherwise would replay it.
@@ -291,7 +247,8 @@ impl MysqlStreamHandle {
                             self.stream.binlog_pos,
                             &self.stream.gtid,
                         );
-                        committed.push(captured.to_event(&self.source_name, offset, timestamp_ms));
+                        let event = captured.to_event(&self.source_name, offset, timestamp_ms);
+                        committed.push(event);
                         self.events_polled = self.events_polled.saturating_add(1);
                     }
                 }
@@ -339,6 +296,7 @@ impl MysqlStreamHandle {
                             snapshot: None,
                             transaction: None,
                             envelope_version: EVENT_ENVELOPE_VERSION,
+                            shape: None,
                             unavailable_columns: Vec::new(),
                         });
                         self.events_polled = self.events_polled.saturating_add(1);

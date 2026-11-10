@@ -38,9 +38,8 @@ async fn collect(
     let scan_sql = format!("USE {database}; EXEC sys.sp_cdc_scan");
     let mut collected = Vec::new();
     while std::time::Instant::now() < deadline {
-        // Rows only, and `want` counts rows. Every table is announced before its first
-        // row, so counting all events would satisfy `want == 1` with the announcement and
-        // return before the insert this test is about ever arrived.
+        // Rows only, and `want` counts rows: a schema-change event must not satisfy it
+        // before the insert this test is about arrives.
         collected.extend(
             stream
                 .next_events(500)
@@ -63,11 +62,13 @@ async fn sqlserver_decodes_non_trivial_types_without_loss() -> rustcdc::Result<(
     if sqlserver_testkit::skip_docker_test("sqlserver type-fidelity test") {
         return Ok(());
     }
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(container) => container,
-        Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
-        Err(error) => return Err(error),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(container) => container,
+            Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
     let database = "rustcdc_types";
     let mut admin = sqlserver_testkit::connect_admin_with_retry(
@@ -301,11 +302,13 @@ async fn sqlserver_null_is_distinguishable_from_an_undecodable_value() -> rustcd
     if sqlserver_testkit::skip_docker_test("sqlserver null-fidelity test") {
         return Ok(());
     }
-    let container = match sqlserver_testkit::start_sqlserver_container("2022-latest").await {
-        Ok(container) => container,
-        Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
-        Err(error) => return Err(error),
-    };
+    let container =
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
+        {
+            Ok(container) => container,
+            Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
     let (host, port) = sqlserver_testkit::host_and_port(&container).await?;
     let database = "rustcdc_nulls";
     let mut admin = sqlserver_testkit::connect_admin_with_retry(

@@ -231,10 +231,12 @@ fn as_i64(value: Option<&Value>) -> Option<i64> {
 Parsing text requires knowing what to parse it as, and the row does not say — `"9"` could be
 a `bigint` or a `text` holding a digit.
 
-Every connector announces a table's column types before that table's first row, in the
-snapshot and the stream, as a `SchemaChange` event with `ddl_type = "READ_SCHEMA"`.
-`data_type` is the source's own syntax, modifier intact: `numeric(12,4)`, not `numeric`. See
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Every row carries its table's shape in `Event::shape` (a `RowShape`): the
+columns in ordinal order with `data_type` and `nullable`, the primary key, and a content `id`.
+`data_type` is the source's own syntax, modifier intact: `numeric(12,4)`, not `numeric`.
+`None` means unknown — see
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape) for the paths that
+carry none.
 
 #### Why text rather than typed JSON
 
@@ -382,10 +384,11 @@ out-of-band would race concurrent writes and return a value from a different poi
 > and the event, which is precisely what a fresh read does not. Outside that window the
 > paragraph above stands, so a sink must still handle `RowWrite::Merge`.
 
-> ⚠️ **`REPLICA IDENTITY FULL` does not avoid this.** Replica identity governs the *old*
-> tuple only. The after-image still omits unmodified TOASTed values under every replica
-> identity setting. `FULL` gives you a `BeforeImage::Full` (see `before` below); it does not
-> make `after` complete.
+> **Under `REPLICA IDENTITY FULL` this list is empty for an unmodified column.** The old tuple
+> carries the value, and an unmodified column's new value is its old one, so the connector
+> completes `after` from it — same WAL record, no extra read — and `row_write()` is a
+> `Replace`. A column missing from the old tuple too stays listed, so a sink must still handle
+> `RowWrite::Merge`.
 
 This is also why the failure mode is so late-breaking: it only begins once rows cross the
 TOAST threshold, typically long after the pipeline was validated against small test rows.
@@ -428,7 +431,7 @@ and silently drop the update — so they are never merged.
 
 It hangs off `Full` alone, which is where it was ever meaningful: a key-only image omits its
 non-key columns *by design*, not because of TOAST, and the two kinds of absence must not be
-conflated. Under the previous representation that was a validation rule; now it is unrepresentable.
+conflated. The type makes that unrepresentable.
 
 Only relevant if you consume the before-image (computing diffs, building compensating writes). A
 column listed here had *some* prior value; the source could not report it. Do not read its absence
@@ -438,9 +441,7 @@ as "was NULL".
 and CloudEvents each emit `before`, `before_is_key_only` and `before_unavailable_columns`, and the
 decoders read them back through one shared constructor, so a consumer's contract does not depend
 on which output format it reads — and a self-contradictory envelope is refused identically
-whichever codec carried it. Until 0.12.0 the CloudEvents encoder omitted
-`before_unavailable_columns`, which left its consumers unable to tell a TOASTed before-image column
-from a genuine `NULL` while consumers of the same stream in another format could.
+whichever codec carried it.
 
 ## Delivery And Acknowledgement Semantics
 
@@ -1040,9 +1041,8 @@ value — silently.
 - **PostgreSQL** overrides it with the engine's own visibility rule. A snapshot is
   `(xmin, xmax, xip)`, and a transaction is invisible exactly when `xid >= xmax || xip.contains(xid)`.
   Both halves matter: `xmax` is `latestCompletedXid + 1`, so a lone in-flight transaction sits *at*
-  `xmax` and never appears in `xip`. An earlier version tested `xip` alone and therefore missed
-  precisely the transactions it was added to catch — `pg_current_snapshot()` on a single-writer
-  database reports `733:733:` with 733 in flight.
+  `xmax` and never appears in `xip`: `pg_current_snapshot()` on a single-writer database reports
+  `733:733:` with 733 in flight.
 - **MySQL** overrides it with executed-GTID **set difference**, because `Executed_Gtid_Set` is
   updated after the engine commit while the binlog coordinate advances before it. A GTID set is
   only *partially* ordered, so no `>` comparison could express this. Requires `gtid_mode = ON`;
@@ -1076,9 +1076,11 @@ match &snapshot.health {
         // `reason` is prose for a human and includes live measurements.
         eprintln!("cdc stalled ({cause}): {reason}");
         match cause {
+            StallCause::SourcePositionLost => { /* the database invalidated the slot */ }
             StallCause::UnconfirmedSourcePosition => { /* the database is retaining log */ }
             StallCause::PollLoopNotTurning => { /* the process, or the source socket */ }
             StallCause::ConsumerNotAcknowledging => { /* your commit_ack loop */ }
+            StallCause::DeliveryFailing => { /* the destination you deliver to */ }
             _ => {}
         }
     }
@@ -1125,13 +1127,22 @@ metadata nor a resolvable primary key — see [Idempotency guard safety](#idempo
 gate on it without matching every variant. The enum is `#[non_exhaustive]` — match with a
 wildcard arm.
 
-`Stalled` carries one of three `StallCause`s, checked in this order:
+`Stalled` carries one of five `StallCause`s, checked in this order:
 
 | `StallCause` | Condition | Whose problem |
 |---|---|---|
+| `SourcePositionLost` | A poll or `start()` failed with `SourceErrorKind::SlotInvalidated`. Checked before `NotRunning` too, and never cleared within a run | The database — the slot's WAL is gone; recreate the slot and re-snapshot |
 | `UnconfirmedSourcePosition` | A position was durably checkpointed but the source refused to confirm it | The database — it keeps retaining log (WAL on a PostgreSQL primary) |
+| `DeliveryFailing` | You reported delivery failures with `record_delivery_failure`, the first longer ago than the stall threshold, and nothing has committed since | The destination — it is refusing the batch you are holding |
 | `PollLoopNotTurning` | `poll_event_batch` has not returned within `max_poll_wait_ms × 6` (floor 30s) | The process, or a socket wedged inside the source |
 | `ConsumerNotAcknowledging` | Events delivered but not committed, with a stale last commit | Your loop — it stopped calling `commit_ack` |
+
+**Report a failing delivery, or it is misreported.** A loop that holds a batch and retries it
+stops polling and stops committing, which is exactly what `PollLoopNotTurning` and
+`ConsumerNotAcknowledging` describe. Call `runtime.record_delivery_failure(&error)` on each
+failed attempt: the verdict then names the destination, carries its last error in `reason`,
+and stays `Healthy`/`Idle` for failures younger than the threshold. The next successful
+`commit_ack` clears it.
 
 **`PollLoopNotTurning` is not source idleness.** A quiet source returns an empty batch on
 schedule, and every returned poll — empty or not — keeps the signal fresh. The verdict goes
@@ -1404,18 +1415,13 @@ ways to hit it are all ordinary-looking config: an `include_columns` list that o
 PK, a `FieldMappingTransform` rename, or `MaskRule::Encrypt` on a key column (a fresh nonce
 per call gives every event for the same row a different key).
 
-**Declaring the events keyless is allowed.** The guard distinguishes two things that used
-to be one condition: an event whose `primary_key` still names columns the payload no longer
-carries (an accident — rejected), and one whose `primary_key` a stage set to `None` (a
-deliberate, visible choice — permitted). Before 0.13.0 the error message recommended
-clearing `Event::primary_key`, and doing so tripped the very guard that recommended it.
+**Declaring the events keyless is allowed.** The guard distinguishes an event whose
+`primary_key` still names columns the payload no longer carries (an accident — rejected) from one
+whose `primary_key` a stage set to `None` (a deliberate, visible choice — permitted).
 
-**A keyless table does not trip it.** The batch-path guard is evaluated per *table*: a
-table whose events resolved a key before the stage and do not after it. Until 0.13.0 it
-asked the much weaker question "did any event in this batch have a key, and does any event
-now lack one" — two different events — so a batch mixing a keyed table with a keyless one
-(no primary key, or `REPLICA IDENTITY NOTHING`) failed on **every** poll, permanently, for
-any pipeline with a transform configured.
+**A keyless table does not trip it.** The batch-path guard is evaluated per *table*: a table whose
+events resolved a key before the stage and do not after it. A batch mixing a keyed table with a
+keyless one (no primary key, or `REPLICA IDENTITY NOTHING`) passes.
 
 ### A transform that rewrites columns must keep `unavailable_columns` in step
 
@@ -1720,14 +1726,7 @@ so an incompatible auto-registration fails with a clear message rather than an o
 
 ### `auto_register = false` means no writes at all
 
-The setting is enforced by the encoders themselves, not only by an explicit preflight call.
-`ConfluentAvroEncoder` always resolved both subjects itself, so it honoured the setting.
-The JSON Schema and Protobuf encoders delegate subject resolution to `schemreg`, whose
-resolution path through its 0.4 release *was* `register_schema` with no lookup-only mode —
-so the setting was **silently ignored** by both, and an operator who set it got schemas
-registered anyway plus none of the schema-identity checking it exists to buy.
-
-Since schemreg 0.5 there is a lookup-only mode, and rustcdc uses it: with
+The setting is enforced by the encoders themselves, not only by an explicit preflight call: with
 `auto_register = false` all three encoders resolve through
 `SchemaResolution::LookupOnly`, which reads the id without writing. **A read-only
 producer principal — `Subject:Read` and nothing more — is a supported

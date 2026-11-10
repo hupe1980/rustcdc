@@ -1263,6 +1263,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -1404,6 +1405,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -1432,6 +1434,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
 

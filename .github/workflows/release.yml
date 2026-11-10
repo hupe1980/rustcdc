@@ -15,7 +15,8 @@ name: release
 #
 # ── Ordering ─────────────────────────────────────────────────────────────────
 #
-#   verify → container-build → publish-crate → container-publish → github-release
+#   verify → container-build + binary-build → publish-crate → container-publish
+#          → github-release → homebrew-tap → homebrew-install
 #
 # Two facts set this order, and the first is the one people get wrong:
 #
@@ -28,8 +29,9 @@ name: release
 #     the code cannot be deleted." `cargo yank` does not delete it either — it stops new
 #     dependency resolution, and the number stays burned forever.
 #
-# So the build runs first as a gate: by the time anything irreversible happens, both
-# architectures are proven to compile. Then the crate is published, and only then is the
+# So the builds run first as a gate — the image for both architectures and the binary for
+# each Homebrew platform: by the time anything irreversible happens, all of them are
+# proven to compile. Then the crate is published, and only then is the
 # image tagged.
 #
 # The library goes out before the image because the image *contains* it — `rustcdc-server`
@@ -337,15 +339,71 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # ── Binaries for Homebrew — a build, so it gates the crate like the image does ──
+  #
+  # Static musl on Linux (no glibc floor on the host), native on Apple Silicon. Archives
+  # only: they are attached to the GitHub release, which is what the formula downloads.
+  binary-build:
+    name: "release: build binary (${{ matrix.artifact }})"
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact: rustcdc-linux-x86_64
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            artifact: rustcdc-linux-aarch64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: rustcdc-darwin-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - name: Install Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = Linux ]; then build=zigbuild; else build=build; fi
+          cargo "$build" -p rustcdc-server --release --bin rustcdc --all-features --locked \
+            --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/rustcdc" "dist/${{ matrix.artifact }}"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz
+
   # ── crates.io — the one irreversible step ───────────────────────────────────
   #
-  # After `container-build`, so a version number is never spent on a commit whose image
-  # does not compile on both architectures; before `container-publish`, so the library
+  # After both builds, so a version number is never spent on a commit whose image or
+  # binaries do not compile; before `container-publish`, so the library
   # an image contains is on crates.io before that image is tagged. See the ordering note
   # at the top of this file.
   publish-crate:
     name: "release: publish rustcdc to crates.io"
-    needs: container-build
+    needs: [container-build, binary-build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # An environment, so the publish can be put behind a required reviewer and a tag
@@ -472,6 +530,18 @@ jobs:
       # `--notes-file`, never `--notes "$(...)"`. Release notes are arbitrary Markdown —
       # backticks, `$`, quotes — and interpolating them into a shell command is both a
       # quoting bug waiting to happen and a script-injection surface.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rustcdc-*
+          path: artifacts
+          merge-multiple: true
+      # Plain file names, so `sha256sum -c checksums.txt` works next to the downloads.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum rustcdc-*.tar.gz > checksums.txt
+          cat checksums.txt
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -480,4 +550,72 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file release-notes.md \
-            --verify-tag
+            --verify-tag \
+            artifacts/rustcdc-*.tar.gz artifacts/checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: artifacts/checksums.txt
+
+  # ── Homebrew: Formula/rustcdc.rb in hupe1980/homebrew-tap ──────────────────
+  #
+  # Full releases only — a pre-release tag (`v1.2.3-rc.1`) is not offered to `brew`.
+  # Runs in the `homebrew` environment, which holds HOMEBREW_APP_ID and
+  # HOMEBREW_APP_PRIVATE_KEY: a GitHub App installed on the tap alone, with contents:
+  # write. Actions are pinned by commit because this job holds that token.
+  homebrew-tap:
+    name: "release: Homebrew tap"
+    needs: github-release
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    runs-on: ubuntu-24.04
+    environment: homebrew
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: checksums
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: hupe1980
+          repositories: homebrew-tap
+          permission-contents: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hupe1980/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+          persist-credentials: true
+      - name: Update the formula
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p tap/Formula
+          packaging/homebrew/formula.sh "$version" checksums.txt > tap/Formula/rustcdc.rb
+          cd tap
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "rustcdc release"
+            git config user.email "rustcdc-release@users.noreply.github.com"
+            git add Formula/rustcdc.rb
+            git commit -m "rustcdc $version"
+            git push
+          fi
+
+  # The published formula installs, passes its own test, and reports this version.
+  homebrew-install:
+    name: "release: Homebrew install"
+    needs: homebrew-tap
+    runs-on: macos-15
+    steps:
+      - run: |
+          set -euo pipefail
+          brew install hupe1980/tap/rustcdc
+          brew test rustcdc
+          case "$(rustcdc --version)" in
+            "rustcdc ${GITHUB_REF_NAME#v} "*) ;;
+            *) echo "::error::installed rustcdc reports '$(rustcdc --version)'"; exit 1 ;;
+          esac

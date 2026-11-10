@@ -1,9 +1,11 @@
+use super::pg_error::PgError;
 use async_trait::async_trait;
 use tokio_postgres::Client;
 
 use crate::core::{Error, Result};
 
 use super::PostgresSourceConfig;
+use super::parser::{SlotState, classify_slot_failure};
 
 pub(super) async fn validate_connected_postgres_client(
     config: &PostgresSourceConfig,
@@ -53,6 +55,18 @@ pub(super) async fn validate_with_backend(
                     config.replication_slot_name
                 ))
             })?;
+    } else {
+        // A slot that exists is not necessarily usable: one the server invalidated keeps its
+        // row in `pg_replication_slots` and fails every read. Refusing it here names the
+        // condition at startup instead of on the first poll.
+        let state = backend
+            .replication_slot_state(&config.replication_slot_name)
+            .await?;
+        if let Some(error) =
+            classify_slot_failure(&config.replication_slot_name, None, state.as_ref())
+        {
+            return Err(error);
+        }
     }
 
     if !backend.publication_exists(&config.publication_name).await? {
@@ -74,6 +88,10 @@ pub(super) async fn validate_with_backend(
 #[async_trait]
 pub(super) trait ValidationBackend: Send + Sync {
     async fn replication_slot_exists(&self, slot_name: &str) -> Result<bool>;
+    /// The slot's state, or `None` when it cannot be read.
+    async fn replication_slot_state(&self, _slot_name: &str) -> Result<Option<SlotState>> {
+        Ok(None)
+    }
     async fn create_replication_slot(&self, slot_name: &str, failover: bool) -> Result<()>;
     async fn publication_exists(&self, publication_name: &str) -> Result<bool>;
     async fn has_replication_privilege(&self) -> Result<bool>;
@@ -93,10 +111,15 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[&slot_name],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!("failed to inspect replication slots: {error}"))
             })?;
         Ok(row.is_some())
+    }
+
+    async fn replication_slot_state(&self, slot_name: &str) -> Result<Option<SlotState>> {
+        super::query::query_slot_state(self.client, slot_name).await
     }
 
     async fn create_replication_slot(&self, slot_name: &str, failover: bool) -> Result<()> {
@@ -115,6 +138,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                     &[&slot_name],
                 )
                 .await
+                .map_err(PgError::from)
                 .map_err(|error| {
                     Error::SourceError(format!(
                         "failed creating failover-enabled replication slot '{slot_name}': \
@@ -132,7 +156,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[&slot_name],
             )
             .await
-            .map_err(|error| Error::SourceError(format!("failed to create replication slot: {error}")))?;
+            .map_err(PgError::from).map_err(|error| Error::SourceError(format!("failed to create replication slot: {error}")))?;
         Ok(())
     }
 
@@ -144,6 +168,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[&publication_name],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!("failed to inspect publications: {error}"))
             })?;
@@ -158,6 +183,7 @@ impl ValidationBackend for LiveValidationBackend<'_> {
                 &[],
             )
             .await
+            .map_err(PgError::from)
             .map_err(|error| {
                 Error::SourceError(format!("failed to inspect role privileges: {error}"))
             })?;

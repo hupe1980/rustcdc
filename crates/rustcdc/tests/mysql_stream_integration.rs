@@ -158,10 +158,13 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
                 break;
             }
         }
-        let events = events
-            .into_iter()
-            .filter(|event| !event.op.is_schema_change())
-            .collect::<Vec<_>>();
+        // The table was created before the stream started; no schema event stands in
+        // front of its rows.
+        assert!(
+            events.iter().all(|event| !event.op.is_schema_change()),
+            "no schema event without DDL: {:?}",
+            events.iter().map(|event| event.op).collect::<Vec<_>>()
+        );
         stream_events.extend(events);
         if stream_events.len() >= 80 {
             break;
@@ -209,8 +212,84 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
         insert_count, update_count, delete_count, stream_count
     );
 
+    // Every stream row carries the catalogue's shape, which its binlog table map agreed with.
+    let declared = declared_columns(&admin_pool, "stream_test").await?;
+    for event in &stream_events {
+        assert_eq!(
+            carried_columns(event),
+            Some(declared.clone()),
+            "a stream row carries the information_schema shape"
+        );
+    }
+
+    // After an ALTER in the binlog, the rows carry the new column.
+    sqlx::query("ALTER TABLE stream_test ADD COLUMN note TEXT")
+        .execute(&admin_pool)
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    sqlx::query("INSERT INTO stream_test (value, note) VALUES ('after-alter', 'n')")
+        .execute(&admin_pool)
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let mut after_alter = None;
+    for _ in 0..50 {
+        let events = stream_handle.next_events(500).await?;
+        if let Some(row) = events
+            .into_iter()
+            .find(|event| event.op == rustcdc::core::Operation::Insert)
+        {
+            after_alter = Some(row);
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    let row = after_alter.expect("the insert after the ALTER is captured");
+    let declared = declared_columns(&admin_pool, "stream_test").await?;
+    assert_eq!(
+        declared.last().map(|column| column.0.as_str()),
+        Some("note")
+    );
+    assert_eq!(
+        carried_columns(&row),
+        Some(declared),
+        "a row after the ALTER carries the re-read shape, new column included"
+    );
+
     connection.close().await;
     Ok(())
+}
+
+/// `(name, COLUMN_TYPE, IS_NULLABLE)` in ordinal order, as `information_schema` declares them.
+async fn declared_columns(
+    pool: &sqlx::MySqlPool,
+    table: &str,
+) -> rustcdc::Result<Vec<(String, String, String)>> {
+    sqlx::query_as(
+        "SELECT COLUMN_NAME, CAST(COLUMN_TYPE AS CHAR), IS_NULLABLE \
+         FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = 'cdc' AND TABLE_NAME = ? \
+         ORDER BY ORDINAL_POSITION",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
+}
+
+fn carried_columns(event: &rustcdc::Event) -> Option<Vec<(String, String, String)>> {
+    let columns = event.shape.as_ref()?.columns()?;
+    Some(
+        columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    if column.nullable { "YES" } else { "NO" }.to_string(),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Test stream resume from checkpoint

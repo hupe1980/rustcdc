@@ -71,6 +71,8 @@ impl AsyncTransform for WasmTransform {
         match guard.transform(event).await? {
             TransformResult::Ok(transformed) => {
                 *event = *transformed;
+                // A module can rewrite any value under any name; no name comparison sees it.
+                event.shape = None;
                 Ok(true)
             }
             TransformResult::Filtered => Ok(false),
@@ -98,6 +100,7 @@ impl AsyncTransform for WasmTransform {
             match guard.transform(&event).await? {
                 TransformResult::Ok(transformed) => {
                     event = *transformed;
+                    event.shape = None;
                     kept.push(event);
                 }
                 TransformResult::Filtered => {}
@@ -105,5 +108,100 @@ impl AsyncTransform for WasmTransform {
         }
         *events = kept;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::core::{Operation, RowShape, ShapeColumn, SourceMetadata};
+
+    /// Returns the event JSON it was given, byte for byte: column names unchanged, so only
+    /// the adapter's own removal can drop the shape.
+    const PASS_THROUGH_WAT: &str = r#"
+        (module
+          (memory (export "memory") 2 2)
+          (global $heap (mut i32) (i32.const 8))
+          (func (export "alloc") (param $size i32) (result i32)
+            (local $ptr i32)
+            global.get $heap
+            local.tee $ptr
+            local.get $size
+            i32.add
+            global.set $heap
+            local.get $ptr)
+          (func (export "dealloc") (param i32) (param i32))
+          (func (export "rustcdc_abi_version") (result i32) i32.const 2)
+          (func (export "transform") (param $ptr i32) (param $len i32) (result i64)
+            i32.const 65536
+            local.get $ptr
+            local.get $len
+            memory.copy
+            i32.const 65536
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            local.get $len
+            i64.extend_i32_u
+            i64.or))
+    "#;
+
+    async fn pass_through() -> (tempfile::TempDir, WasmTransform) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pass_through.wasm");
+        std::fs::write(&path, wat::parse_str(PASS_THROUGH_WAT).unwrap()).unwrap();
+        let transform = WasmTransform::new(WasmConfig {
+            module_path: path,
+            ..WasmConfig::default()
+        })
+        .await
+        .unwrap();
+        (dir, transform)
+    }
+
+    fn shaped(offset: &str) -> Event {
+        let shape = RowShape::new(
+            "app",
+            "items",
+            vec![ShapeColumn::new("id", "bigint", false)],
+            vec!["id".into()],
+        )
+        .unwrap();
+        Event::builder("items", Operation::Insert)
+            .schema("app")
+            .after(json!({"id": 1}))
+            .primary_key(["id"])
+            .source(SourceMetadata::new("test", offset, 1))
+            .shape(Arc::new(shape))
+            .build()
+    }
+
+    #[tokio::test]
+    async fn a_module_s_output_carries_no_shape() {
+        let (_dir, transform) = pass_through().await;
+        let mut event = shaped("1");
+        assert!(transform.apply(&mut event).await.unwrap());
+        assert_eq!(
+            event.after,
+            Some(json!({"id": 1})),
+            "the module passed the row through"
+        );
+        assert!(
+            event.shape.is_none(),
+            "a module's output is not the table's row"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_s_batch_output_carries_no_shape() {
+        let (_dir, transform) = pass_through().await;
+        let mut events = vec![shaped("1"), shaped("2")];
+        transform.apply_batch(&mut events).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.shape.is_none()));
     }
 }

@@ -19,12 +19,12 @@ pub(super) struct TableSnapshotState {
     pub(super) column_names: Vec<String>,
     /// The table's declared columns, read alongside the names at snapshot start.
     ///
-    /// The projection wants names; the schema event announced before the first row wants
-    /// types. One read serves both, so the two cannot disagree about which columns the
-    /// table has.
+    /// The projection wants names; the rows' shape wants types. One read serves both, so the
+    /// two cannot disagree about which columns the table has.
     pub(super) catalog_columns: Vec<crate::source::schema_catalog::CatalogColumn>,
-    /// Whether this table's schema has been announced in this run.
-    pub(super) schema_announced: bool,
+    /// The shape the snapshot's rows carry, built from `catalog_columns` before the table's
+    /// first chunk. `None` when the catalogue read nothing.
+    pub(super) shape: Option<std::sync::Arc<crate::RowShape>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -80,22 +80,23 @@ async fn signal_action_emits_non_admin_notification_kafka_events_when_configured
 
     assert_eq!(response.status(), StatusCode::OK);
 
-    let consumer = Consumer::builder()
-        .bootstrap_servers(brokers)
-        .group_id(format!("cdc-admin-notifications-{suffix}"))
-        .client_id(format!("cdc-admin-notifications-consumer-{suffix}"))
-        .auto_offset_reset(AutoOffsetReset::Earliest)
-        .enable_auto_commit(false)
-        .request_timeout(Duration::from_millis(1_000))
-        .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-            1_000,
-        )))
-        .auth(kafka_auth_from_env())
-        .build()
-        .await
-        .expect("consumer should build");
+    let consumer = crate::sink::kafka_builder(
+        brokers,
+        format!("cdc-admin-notifications-consumer-{suffix}"),
+        Duration::from_millis(1_000),
+        kafka_auth_from_env(),
+    )
+    .connect()
+    .await
+    .expect("kafka should connect")
+    .consumer(format!("cdc-admin-notifications-{suffix}"))
+    .auto_offset_reset(AutoOffsetReset::Earliest)
+    .enable_auto_commit(false)
+    .build()
+    .await
+    .expect("consumer should build");
     consumer
-        .subscribe(&[topic.as_str()])
+        .subscribe([topic.as_str()])
         .await
         .expect("consumer should subscribe");
 
@@ -159,18 +160,20 @@ async fn signal_ingress_kafka_processes_execute_snapshot_actions() {
 
     let admin = AdminState::new(&cfg).await.expect("admin state");
 
-    let producer = krafka::producer::Producer::builder()
-        .bootstrap_servers(brokers)
-        .client_id(format!("cdc-admin-signal-ingress-producer-{suffix}"))
-        .acks(krafka::producer::Acks::All)
-        .request_timeout(Duration::from_millis(1_000))
-        .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-            1_000,
-        )))
-        .auth(kafka_auth_from_env())
-        .build()
-        .await
-        .expect("signal ingress producer should build");
+    let producer = crate::sink::kafka_builder(
+        brokers,
+        format!("cdc-admin-signal-ingress-producer-{suffix}"),
+        Duration::from_millis(1_000),
+        kafka_auth_from_env(),
+    )
+    .connect()
+    .await
+    .expect("kafka should connect")
+    .producer()
+    .acks(krafka::producer::Acks::All)
+    .build()
+    .await
+    .expect("signal ingress producer should build");
 
     let signal_id = format!("sig-ingress-kafka-{suffix}");
     let correlation_id = format!("corr-ingress-kafka-{suffix}");
@@ -183,12 +186,12 @@ async fn signal_ingress_kafka_processes_execute_snapshot_actions() {
         "additional_data": {"ingress": "kafka"},
     });
 
-    let record = krafka::producer::ProducerRecord::new(
+    let record = krafka::Record::new(
         topic,
         serde_json::to_vec(&payload).expect("serialize kafka ingress payload"),
     );
     let _metadata = producer
-        .send_record(record)
+        .send(record)
         .await
         .expect("signal ingress payload send should succeed");
     producer

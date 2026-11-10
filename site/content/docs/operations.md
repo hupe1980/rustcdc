@@ -160,9 +160,11 @@ was fine.
 
 | `StallCause` | `/livez` | `/readyz` | Why |
 |---|---|---|---|
+| `source_position_lost` | 200 | 503 | PostgreSQL invalidated the replication slot and removed the WAL it held. No restart recreates it; the process parks — alive, not capturing — until an operator re-snapshots (runbook §4) and stops it |
 | `poll_loop_not_turning` | **503** after `LIVEZ_STALL_TIMEOUT` (120 s) | 503 | The process is wedged; a restart is the remedy |
 | `unconfirmed_source_position` | 200 | 503 | A restart replays from the same checkpoint and fails identically, while the source keeps retaining log — crash-looping makes a full `pg_wal` volume arrive *sooner*. Page, do not reboot |
 | `consumer_not_acknowledging` | 200 | 503 | The sink is not draining; restarting thrashes against an already-unhealthy downstream |
+| `delivery_failing` | 200 | 503 | The sink refuses the held batch — a missing topic, a revoked ACL. A restart creates neither, and replays the batch |
 
 Readiness excludes no cause because it costs nothing — it takes the pod out of rotation
 and stops a rollout rather than destroying in-flight work, and a stalled replica that
@@ -219,10 +221,8 @@ token.
 
 The document is **generated from the same crate as the handlers**, and
 `tests/architecture.rs` fails the build if the router serves a path the document omits, or
-documents one the router no longer serves. A hand-written spec file would drift a commit
-later with nothing to catch it, and a specification nobody verifies is one that lies in the
-direction that costs most — a consumer generates a client, it is missing an endpoint or
-calls one that 404s, and the mismatch surfaces in their codebase rather than ours.
+documents one the router does not serve, so a generated client is never missing an
+endpoint or calling one that 404s.
 
 ### `rustcdc status`
 
@@ -240,13 +240,15 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | Metric | Alert threshold | Description |
 |---|---|---|
 | `rustcdc_runtime_health{verdict="stalled"}` | == 1 | Runtime is running but progress stopped. One-hot gauge: exactly one verdict label is 1. `verdict="idle"` is deliberately not alertable — a quiet database is not an incident, and is a verdict a healthy pipeline reaches whenever its source goes quiet. Logged once at WARN on entry, once at INFO on recovery |
-| `rustcdc_runtime_stall_cause{cause=…}` | present | Which signal stalled: `unconfirmed_source_position` (the database is retaining log), `poll_loop_not_turning` (this process or the source socket), `consumer_not_acknowledging` (the sink). Emitted only while stalled, so presence is the condition — route pages on this rather than fanning one alert out to every team |
+| `rustcdc_runtime_stall_cause{cause=…}` | present | Which signal stalled: `source_position_lost` (the database invalidated the slot), `unconfirmed_source_position` (the database is retaining log), `poll_loop_not_turning` (this process or the source socket), `consumer_not_acknowledging` (the commit path), `delivery_failing` (the sink refuses the held batch). Emitted only while stalled, so presence is the condition — route pages on this rather than fanning one alert out to every team |
 | `rustcdc_runtime_poll_age_ms` | see runbook | Milliseconds since `poll_event_batch` last returned, empty batches included. Stays low on an idle source; growth means the loop itself has stopped turning |
 | `rustcdc_runtime_delivery_age_ms` | **do not alert** | Milliseconds since events last arrived. High on its own is a quiet database. A diagnostic to read beside the poll age, never a condition |
 | `rustcdc_runtime_idempotency_evictions_total` | sustained growth | The dedup window is too small for this deployment's replay distance, so duplicates older than the window stop being suppressed. Raise `runtime.idempotency.capacity` |
 | `rustcdc_runtime_idempotency_unidentifiable_total` | growth on a keyed table | Events with neither transaction metadata nor a resolvable primary key are deliberately **not** deduplicated. Expected for keyless tables; unexpected growth means a key is missing from the row image |
 | `rustcdc_runtime_events_skipped_total` | any increase | Events permanently dropped by `transform_error_policy = "skip"` — the checkpoint advances past them, so **any increase is confirmed data loss** |
 | `rustcdc_replication_slot_lag_bytes` | > 1 GiB sustained | PostgreSQL slot WAL retention; growth risks slot invalidation (`max_slot_wal_keep_size`) or a full WAL volume |
+| `rustcdc_replication_slot_wal_status{status=…}` | `status="unreserved"` == 1 | The slot's `wal_status`, one-hot over `reserved`, `extended`, `unreserved`, `lost`. `unreserved` means the slot is lost at the next checkpoint unless the pipeline catches up — the one alert that fires while the slot can still be saved. `extended` does not page |
+| `rustcdc_replication_slot_safe_wal_size_bytes` | — | The slot's `safe_wal_size`: WAL that can still be written before the slot is endangered; negative once `unreserved`. Absent when `max_slot_wal_keep_size` is unlimited |
 | `rustcdc_sink_kafka_unkeyed_deletes_total` | any increase | A delete arrived with no row key, so no tombstone could be published — on a compacted topic, a key the log will never reclaim. The table has no primary key, and is logged once at WARN. Truncate and schema-change events are excluded |
 | `rustcdc_sink_kafka_tombstones_total` | **do not alert** | Tombstones published. Zero is normal for a pipeline with no deletes — read it beside the counter above, never as a condition |
 | `rustcdc_slo_checkpoint_age_seconds` | > 300 s | Checkpoint has not advanced — sink or source issue |
@@ -333,8 +335,8 @@ Schema history
 
 ### Checkpoint integrity
 
-Checkpoint files carry a `content_checksum` (SHA-256 over the other fields,
-rustcdc ≥ 0.7.0) that is verified on every load, and must be owner-only
+Checkpoint files carry a `content_checksum` (SHA-256 over the other fields)
+that is verified on every load, and must be owner-only
 (`chmod 600`). This closes a silent-corruption path: a flipped bit in an LSN
 does not fail to parse — it resumes capture from a *wrong* position, skipping
 events with no error raised anywhere.
@@ -512,8 +514,8 @@ manages its own container, so a local run and CI are the same command against th
 fixture:
 
 ```bash
-RUSTCDC_INTEGRATION=1 cargo test --all-features --test integration_postgres -- --test-threads=1
-RUSTCDC_INTEGRATION=1 cargo test --all-features --test integration_mysql    -- --test-threads=1
+RUSTCDC_INTEGRATION=1 cargo test -p rustcdc-server --all-features --test integration_postgres -- --test-threads=1
+RUSTCDC_INTEGRATION=1 cargo test -p rustcdc-server --all-features --test integration_mysql    -- --test-threads=1
 ```
 
 `--test-threads=1` is required: each suite binds a fixed host port and a fixed container
@@ -530,7 +532,7 @@ What it covers:
 | Test | Property |
 |---|---|
 | `insert_update_and_delete_are_captured_in_order` | Commit order and full before-images, across **both** `wal_transport` values |
-| `the_resume_position_does_not_lose_events` | Rows committed while the pipeline is down are captured after a restart, in order, with a bounded replay window |
+| `the_resume_position_does_not_lose_events` | Rows committed while the pipeline is down are captured after a restart, in order, and none is replayed |
 | `a_tls_transport_refuses_a_server_without_tls` | `mode = "tls"` fails against `ssl = off` rather than silently downgrading |
 | `a_replica_identity_full_table_reports_only_its_real_primary_key` | The key is the table's key, not every column — the Kafka message key is derived from it |
 | `an_on_demand_snapshot_backfills_rows_the_stream_could_never_deliver` | `execute_snapshot` reaches a live runtime and produces rows |
@@ -551,23 +553,12 @@ And for MySQL:
 > primary-key flags travel with them. MySQL 8 defaults the latter to `MINIMAL` and MariaDB
 > to `NO_LOG`, under which events carry positional placeholders (`@0`, `@1`, …) and no
 > primary key — so the connector refuses to start rather than emit that. The error names
-> the setting and the fix. This fixture was written with only the first setting and hit it
-> on its first run.
+> the setting and the fix.
 
-The resume tests assert **no gaps and no replay**, both exactly.
-
-They did not always. This suite found a real defect on its first run: a *clean* shutdown
-redelivered the last transaction on every restart, deterministically. The tests were
-written to assert "no gaps exactly, duplicates within a bound" — which was the honest
-assertion while the defect stood, since at-least-once is the contract and asserting "no
-duplicates" would have been asserting exactly-once.
-
-The diagnosis we reported upstream was wrong, and the correction is worth recording:
-we said `START_REPLICATION` was inclusive and suggested resuming at `lsn + 1`. PostgreSQL
-logical decoding filters at *transaction* granularity, and a change's own LSN always
-precedes its transaction's commit record, so either position replays the whole transaction.
-rustcdc 0.11 fixed it properly with `StreamHandle::resume_offset_for`, and the bound was
-tightened to zero.
+The resume tests assert **no gaps and no replay**, both exactly. PostgreSQL logical
+decoding filters at *transaction* granularity, so resuming from a change's own LSN would
+replay its whole transaction; `StreamHandle::resume_offset_for` gives the position after
+the commit record instead. After a crash the contract is at-least-once.
 
 If a run is interrupted, clean up with
 `docker rm -f rustcdc-integration-postgres rustcdc-integration-mysql`.
@@ -755,14 +746,13 @@ slips past one is usually caught by another:
 | **Key names** | Any key containing `password`, `secret`, `token`, `credential`, `api_key`, `authorization`, `private_key`, `key_file` — at any depth. Separators are normalised, so `x-api-key` and `client.secret` match the same tokens as `api_key` |
 | **URL values** | Any string that parses as `scheme://…`, under *any* key: userinfo is replaced, and query parameters whose **name** looks secret (`?api_key=`, `?token=`) have their values replaced |
 
-The URL rule is value-driven on purpose. `sink.http.url` was named like nothing sensitive
-and was on no list, so a webhook URL carrying its credential came back verbatim. The
-loader now also rejects userinfo in that field outright, which leaves the query string as
-the only way a credential can reach it — hence the second half of the rule.
+The URL rule is value-driven on purpose: a field such as `sink.http.url` is named like
+nothing sensitive and is on no list. The loader also rejects userinfo in that field
+outright, which leaves the query string as the only way a credential can reach it — hence
+the second half of the rule.
 
 A property test in `tests/fuzz_properties.rs` generates key and parameter names rather
-than listing them, which is what found the hyphenated spelling the enumerated tests all
-missed.
+than listing them, so a spelling no enumerated test thought of is still covered.
 
 ### Control-plane panic guard
 

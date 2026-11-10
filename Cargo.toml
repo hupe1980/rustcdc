@@ -4,17 +4,18 @@
 #
 #   crates/rustcdc         the library, published to crates.io
 #   crates/rustcdc-server  the server binary and container image
-#   crates/xtask           crash-worker binaries the integration suites spawn
+#   crates/crash-workers   binaries the process-crash suites spawn
+#   crates/xtask           the `cargo xtask` task runner
 #
 [workspace]
 # A virtual manifest: the root defines the workspace and owns nothing itself. Every crate
 # lives under `crates/`, so `cargo package` collects one crate's directory and nothing else
 # — a package at the root would collect the whole repository.
 members = ["crates/*"]
-# `cargo build` builds the product: library *and* server binary. `xtask` is a member but
-# not a default one — it holds the crash-worker binaries the integration suites spawn, and
-# building them is the suites' job. CI addresses packages explicitly with `-p`, because a
-# bare `--features …` is ambiguous across members.
+# `cargo build` builds the product: library *and* server binary. `crash-workers` and `xtask`
+# are members but not default ones: the suites build the workers, `cargo xtask` builds the
+# runner. CI addresses packages explicitly with `-p`, because a bare `--features …` is
+# ambiguous across members.
 default-members = ["crates/rustcdc", "crates/rustcdc-server"]
 # The libFuzzer targets need a nightly toolchain and `cargo fuzz`. Excluding them keeps
 # `cargo build` on stable from depending on either; `crates/rustcdc-server/tests/fuzz_properties.rs`
@@ -26,17 +27,18 @@ resolver = "2"
 # and are tested only against each other, so a split version line would encode a
 # compatibility question that does not exist.
 [workspace.package]
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
-# `wasmtime` sets this floor; the AWS SDK is the next constraint at 1.94.1. Declaring the
-# lower number would hand anyone a resolver error instead of a documented requirement.
+# `wasmtime` 50 sets this floor; krafka 0.29 and iceberg 0.11 are the next constraint at
+# 1.95. Declaring a lower number would hand anyone a resolver error instead of a documented
+# requirement.
 # It covers the server with every feature, which is what the MSRV job checks: `wasm` is
 # optional, but a floor that only held for the default build is not the one the image needs.
-rust-version = "1.95.0"
+rust-version = "1.97.0"
 authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/rustcdc"
-homepage = "https://github.com/hupe1980/rustcdc"
+homepage = "https://hupe1980.github.io/rustcdc"
 
 # Dependencies shared by more than one crate, declared once.
 #
@@ -48,7 +50,7 @@ homepage = "https://github.com/hupe1980/rustcdc"
 # two copies of the same crate. A member narrows what it takes with
 # `default-features = false` and adds the features it needs; it cannot pick its own version.
 [workspace.dependencies]
-rustcdc = { path = "crates/rustcdc", version = "0.19.0", default-features = false }
+rustcdc = { path = "crates/rustcdc", version = "0.20.0", default-features = false }
 
 base64 = "0.23"
 bytes = "1"
@@ -70,10 +72,10 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     # Set by `crates/rustcdc/build.rs` when the documentation site is present.
     "cfg(rustcdc_markdown_doctests)",
 ] }
-# `deny`, not `forbid`: the Windows PID-liveness probe in `checkpoint::owner_lease` needs
-# one tightly-scoped `unsafe` block for the Win32 `OpenProcess`/`GetExitCodeProcess` FFI,
-# and the server's `test_env` needs `std::env::set_var`, which Rust 2024 makes unsafe.
-# `forbid` cannot be locally overridden, which would leave the library uncompilable for
-# `*-pc-windows-*` targets. Every exception carries an explicit `#[allow(unsafe_code)]`
-# with a safety comment, and `crates/rustcdc-server/tests/architecture.rs` holds the allowlist.
+# `deny`, not `forbid`, because `forbid` cannot be locally overridden and two sites need
+# `unsafe`: the library's Windows PID-liveness probe (`checkpoint/owner_lease.rs`, Win32
+# FFI) and the server's `test_env.rs` (`std::env::set_var`, unsafe in Rust 2024). Each
+# carries `#[allow(unsafe_code)]` with a safety comment; the server binary still forbids it.
+# `unsafe_code_appears_only_where_the_allowlist_says_it_may` in
+# `crates/rustcdc-server/tests/architecture.rs` holds both crates to those two files.
 unsafe_code = "deny"

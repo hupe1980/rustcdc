@@ -14,7 +14,7 @@ SQL Server differ only in the source config and the server prerequisites — see
 
 ## Prerequisites
 
-- Rust 1.95 or newer
+- Rust 1.97 or newer
 - A PostgreSQL 10+ server you can configure, with `wal_level = logical`
 - A role with the **`REPLICATION`** attribute, and a **direct** connection to the server — the
   default WAL transport runs `START_REPLICATION` and a pooler in transaction-pooling mode cannot
@@ -33,7 +33,7 @@ docker run --rm -d --name rustcdc-pg -p 5432:5432 \
 
 The `postgres` superuser already has `REPLICATION`. Note this container has TLS off, so the
 walkthrough below sets `TransportConfig::plaintext()` explicitly — a TLS transport against a
-server without TLS now fails rather than silently downgrading.
+server without TLS fails rather than downgrading.
 
 ## 1. Add the dependency
 
@@ -85,7 +85,7 @@ let source = PostgresSourceConfig {
     replication_slot_name: "rustcdc_slot".into(),
     publication_name: "rustcdc_publication".into(),
     // The throwaway container above has TLS off. Against a real server, drop this line and
-    // keep the default TLS transport — which now means `sslmode=require`, so a server with
+    // keep the default TLS transport — which means `sslmode=require`, so a server with
     // `ssl = off` fails the connection rather than quietly sending everything in the clear.
     transport: rustcdc::TransportConfig::plaintext(),
     ..PostgresSourceConfig::default()

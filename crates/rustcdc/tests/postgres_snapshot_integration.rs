@@ -518,12 +518,10 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         }
     }
 
-    // Five chunks of 1000 **events**, one of which is the table's schema announcement —
-    // so the first session reads 4 999 rows, not 5 000. The number is an artefact of chunk
-    // composition; what the test is about is that the checkpoint lands mid-snapshot and the
-    // resume neither duplicates nor skips. Those are asserted below, against the total.
-    assert!(
-        (4_999..=5_000).contains(&total_first_read),
+    // Five chunks of 1000 rows. What the test is about is that the checkpoint lands
+    // mid-snapshot and the resume neither duplicates nor skips; those are asserted below.
+    assert_eq!(
+        total_first_read, 5_000,
         "expected the first session to stop mid-snapshot, read {total_first_read}"
     );
 
@@ -762,12 +760,11 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         }
     }
 
-    // Four chunks of 1000 **events**, one of which is the schema announcement — so phase 1
-    // reads 3 999 rows. The exact number is chunk composition, not the property under test:
-    // what matters is that the checkpoint lands mid-snapshot, which the assertions after
-    // the resume then exercise against a mutated table.
-    assert!(
-        (3_999..=4_000).contains(&phase1_ids.len()),
+    // Four chunks of 1000 rows: the checkpoint lands mid-snapshot, which the assertions
+    // after the resume then exercise against a mutated table.
+    assert_eq!(
+        phase1_ids.len(),
+        4_000,
         "expected phase1 to stop mid-snapshot, read {}",
         phase1_ids.len()
     );
@@ -1764,4 +1761,430 @@ fn snapshot_row_id(event: &rustcdc::Event, table: &str) -> Option<i64> {
         .get("id")?
         .as_i64()
         .or_else(|| event.after.as_ref()?.get("id")?.as_str()?.parse().ok())
+}
+
+/// A PostgreSQL container with logical replication, and an admin client on it.
+async fn start_snapshot_postgres() -> rustcdc::Result<(
+    testcontainers::ContainerAsync<GenericImage>,
+    String,
+    u16,
+    tokio_postgres::Client,
+)> {
+    // The tag CI pre-pulls; nothing these tests pin is specific to a newer release.
+    let container = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec!["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let admin = connect_admin(&host, port).await?;
+    Ok((container, host, port, admin))
+}
+
+async fn connect_admin(host: &str, port: u16) -> rustcdc::Result<tokio_postgres::Client> {
+    let dsn = format!(
+        "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
+    );
+    let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(client)
+}
+
+fn snapshot_source_config(host: &str, port: u16, slot: &str) -> PostgresSourceConfig {
+    PostgresSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "postgres".to_string(),
+        password: "postgres".to_string().into(),
+        database: "cdc".to_string(),
+        replication_slot_name: slot.to_string(),
+        publication_name: format!("{slot}_pub"),
+        create_replication_slot_if_missing: true,
+        conn_timeout_secs: 30,
+        transport: rustcdc::TransportConfig::plaintext(),
+        ..PostgresSourceConfig::default()
+    }
+}
+
+/// PostgreSQL caps a function call at 100 arguments. A row payload built as one
+/// `json_build_object(k, v, …)` call takes two per column, so a table of 51 columns could not
+/// be snapshotted at all. Sixty columns, with a NULL and an empty string kept apart.
+#[tokio::test]
+async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres wide-table snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+
+    let columns = (1..60).map(|i| format!("c{i} text")).collect::<Vec<_>>();
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE public.wide (id bigint PRIMARY KEY, {});
+             INSERT INTO public.wide (id, c1, c2) VALUES (1, 'x', '');
+             CREATE PUBLICATION wide_slot_pub FOR TABLE public.wide;",
+            columns.join(", ")
+        ))
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut connection = PostgresConnection::new(snapshot_source_config(&host, port, "wide_slot"));
+    connection.connect().await?;
+    let mut handle = connection.start_snapshot(&["public.wide"]).await?;
+    let mut rows = Vec::new();
+    loop {
+        let chunk = handle.next_chunk(100).await?;
+        if chunk.is_empty() {
+            break;
+        }
+        rows.extend(chunk);
+    }
+    handle.finish().await?;
+    connection.close().await;
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "the one row must be read, and nothing else: {rows:?}"
+    );
+    let shape = rows[0]
+        .shape
+        .as_ref()
+        .expect("a snapshot row carries its shape");
+    let columns = shape.columns().expect("an inline shape");
+    assert_eq!(columns.len(), 60);
+    assert_eq!(
+        (
+            columns[0].name.as_str(),
+            columns[0].data_type.as_str(),
+            columns[0].nullable
+        ),
+        ("id", "bigint", false)
+    );
+    assert!(
+        columns[1..]
+            .iter()
+            .enumerate()
+            .all(|(i, column)| column.name == format!("c{}", i + 1)
+                && column.data_type == "text"
+                && column.nullable),
+        "each column as the table declares it: {columns:?}"
+    );
+    assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    let after = rows[0]
+        .after
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .expect("after image");
+    assert_eq!(
+        after.len(),
+        60,
+        "every column must be in the row: {after:?}"
+    );
+    assert_eq!(after["c1"], "x");
+    assert_eq!(after["c2"], "", "an empty string is not NULL");
+    assert!(after["c59"].is_null(), "a NULL column stays JSON null");
+    Ok(())
+}
+
+/// A failed snapshot statement aborts the `REPEATABLE READ` transaction, and a retry on the
+/// same transaction fails with `25P02` forever. A failure part-way through a chunk must also
+/// not drop the rows already read into it: their table's cursor has moved past them.
+///
+/// Two tables in one chunk, read by a role that loses `SELECT` on the second after the
+/// snapshot starts — permission is checked against the current catalog, not the snapshot's —
+/// so the fetch fails after the first table's rows are in the chunk. The server's SQLSTATE must
+/// be in the error, the snapshot must recover once the grant is restored, and every row of both
+/// tables must arrive exactly once.
+#[tokio::test]
+async fn postgres_snapshot_recovers_from_a_failed_chunk_without_losing_rows() -> rustcdc::Result<()>
+{
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres failed-chunk snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+    let pg = |error: tokio_postgres::Error| rustcdc::Error::SourceError(format!("{error:?}"));
+    admin
+        .batch_execute(
+            "CREATE TABLE public.first_t (id bigint PRIMARY KEY, v text);
+             CREATE TABLE public.second_t (id bigint PRIMARY KEY, v text);
+             INSERT INTO public.first_t SELECT g, 'a' FROM generate_series(1, 5) g;
+             INSERT INTO public.second_t SELECT g, 'b' FROM generate_series(1, 5) g;
+             CREATE PUBLICATION retry_slot_pub FOR TABLE public.first_t, public.second_t;
+             CREATE ROLE cdc LOGIN REPLICATION PASSWORD 'cdc';
+             GRANT SELECT ON public.first_t, public.second_t TO cdc;",
+        )
+        .await
+        .map_err(pg)?;
+
+    let config = PostgresSourceConfig {
+        user: "cdc".to_string(),
+        password: "cdc".to_string().into(),
+        ..snapshot_source_config(&host, port, "retry_slot")
+    };
+    let mut connection = PostgresConnection::new(config);
+    connection.connect().await?;
+    let mut handle = connection
+        .start_snapshot(&["public.first_t", "public.second_t"])
+        .await?;
+    admin
+        .batch_execute("REVOKE SELECT ON public.second_t FROM cdc")
+        .await
+        .map_err(pg)?;
+
+    // Drive it the way the runtime does: a failed chunk is retried. The grant comes back
+    // after two failures, and a row is inserted after the first recovered chunk — a snapshot
+    // reading in a reopened `REPEATABLE READ` transaction must not see it, because a change
+    // after the snapshot's start belongs to the stream.
+    let mut first_ids = Vec::new();
+    let mut second_ids = Vec::new();
+    let mut errors = Vec::new();
+    let mut chunk_size = 100;
+    let mut inserted_after_recovery = false;
+    loop {
+        match handle.next_chunk(chunk_size).await {
+            Ok(chunk) if chunk.is_empty() => break,
+            Ok(chunk) => {
+                for event in &chunk {
+                    if let Some(id) = snapshot_row_id(event, "first_t") {
+                        first_ids.push(id);
+                    }
+                    if let Some(id) = snapshot_row_id(event, "second_t") {
+                        second_ids.push(id);
+                    }
+                }
+                if errors.len() >= 2 && !inserted_after_recovery {
+                    inserted_after_recovery = true;
+                    admin
+                        .batch_execute("INSERT INTO public.second_t VALUES (6, 'late')")
+                        .await
+                        .map_err(pg)?;
+                }
+            }
+            Err(error) => {
+                errors.push(error.to_string());
+                assert!(
+                    errors.len() <= 4,
+                    "the snapshot never recovered: {errors:#?}"
+                );
+                if errors.len() == 2 {
+                    admin
+                        .batch_execute("GRANT SELECT ON public.second_t TO cdc")
+                        .await
+                        .map_err(pg)?;
+                    chunk_size = 2;
+                }
+            }
+        }
+    }
+    handle.finish().await?;
+    connection.close().await;
+
+    assert_eq!(
+        errors.len(),
+        2,
+        "two failed chunks, then recovery: {errors:#?}"
+    );
+    assert!(
+        errors.iter().all(|message| message.contains("42501")),
+        "the server's SQLSTATE must reach the error, not `db error`: {errors:#?}"
+    );
+    assert!(
+        errors.iter().all(|message| !message.contains("25P02")),
+        "a retry must run in a fresh transaction, not the aborted one: {errors:#?}"
+    );
+    first_ids.sort_unstable();
+    second_ids.sort_unstable();
+    assert_eq!(
+        first_ids,
+        vec![1, 2, 3, 4, 5],
+        "rows read before the failure were lost"
+    );
+    assert_eq!(
+        second_ids,
+        vec![1, 2, 3, 4, 5],
+        "after recovery the snapshot reads in a fresh REPEATABLE READ transaction, not in autocommit; a row inserted after it opened belongs to the stream"
+    );
+    Ok(())
+}
+
+/// The incremental snapshot builds its rows with the same projection, so it had the same
+/// 100-argument limit. Sixty columns, read through the incremental snapshot driver.
+#[tokio::test]
+async fn postgres_incremental_snapshot_reads_a_table_wider_than_fifty_columns()
+-> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping postgres wide incremental snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)"
+        );
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+    let columns = (1..60).map(|i| format!("c{i} text")).collect::<Vec<_>>();
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE public.wide_inc (id bigint PRIMARY KEY, {});
+             INSERT INTO public.wide_inc (id, c1, c59) VALUES (1, 'x', 'last'), (2, '', NULL);
+             CREATE PUBLICATION wide_inc_slot_pub FOR TABLE public.wide_inc;",
+            columns.join(", ")
+        ))
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut connection =
+        PostgresConnection::new(snapshot_source_config(&host, port, "wide_inc_slot"));
+    connection.connect().await?;
+    let mut handle = connection
+        .start_incremental_snapshot(
+            IncrementalSnapshotConfig::new(vec!["public.wide_inc".to_string()]).with_chunk_size(10),
+            None,
+        )
+        .await?;
+
+    let mut rows = std::collections::BTreeMap::new();
+    for _ in 0..100 {
+        for event in handle.next_events(250).await? {
+            if let Some(id) = snapshot_row_id(&event, "wide_inc") {
+                rows.insert(id, event.after.clone().expect("a read carries a row"));
+            }
+        }
+        if rows.len() == 2 {
+            break;
+        }
+    }
+    connection.close().await;
+
+    assert_eq!(rows.len(), 2, "both rows must be read: {rows:?}");
+    let first = rows[&1].as_object().expect("an object");
+    assert_eq!(
+        first.len(),
+        60,
+        "every column must be in the row: {first:?}"
+    );
+    assert_eq!(first["c59"], "last");
+    let second = rows[&2].as_object().expect("an object");
+    assert_eq!(second["c1"], "", "an empty string is not NULL");
+    assert!(second["c59"].is_null(), "a NULL column stays JSON null");
+    Ok(())
+}
+
+/// An incremental snapshot's rows carry the shape described before their chunk, matching
+/// the catalogue.
+#[tokio::test]
+async fn postgres_incremental_snapshot_rows_carry_the_shape() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres incremental shape test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, admin) = start_snapshot_postgres().await?;
+    admin
+        .batch_execute(
+            "CREATE TABLE public.shaped_inc (
+               id bigint PRIMARY KEY,
+               amount numeric(12,4) NOT NULL,
+               note varchar(10)
+             );
+             INSERT INTO public.shaped_inc VALUES (1, 1.5, 'a'), (2, 2.5, NULL), (3, 3.5, 'c');
+             CREATE PUBLICATION shaped_inc_slot_pub FOR TABLE public.shaped_inc;",
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+
+    let mut connection =
+        PostgresConnection::new(snapshot_source_config(&host, port, "shaped_inc_slot"));
+    connection.connect().await?;
+    let mut handle = connection
+        .start_incremental_snapshot(
+            IncrementalSnapshotConfig::new(vec!["public.shaped_inc".to_string()])
+                .with_chunk_size(2),
+            None,
+        )
+        .await?;
+
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        for event in handle.next_events(250).await? {
+            if snapshot_row_id(&event, "shaped_inc").is_some() {
+                rows.push(event);
+            }
+        }
+        if rows.len() == 3 {
+            break;
+        }
+    }
+    connection.close().await;
+
+    assert_eq!(rows.len(), 3, "every row must be read");
+    for row in &rows {
+        let shape = row
+            .shape
+            .as_ref()
+            .expect("an incremental snapshot row carries its shape");
+        let columns: Vec<_> = shape
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.data_type.as_str(),
+                    column.nullable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                ("id", "bigint", false),
+                ("amount", "numeric(12,4)", false),
+                ("note", "character varying(10)", true)
+            ]
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
+    Ok(())
+}
+
+/// A server-side failure at connect carries the server's SQLSTATE, not only `db error`.
+#[tokio::test]
+async fn postgres_connect_errors_carry_the_servers_sqlstate() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres connect-error test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let (_container, host, port, _admin) = start_snapshot_postgres().await?;
+    let config = PostgresSourceConfig {
+        password: "wrong".to_string().into(),
+        ..snapshot_source_config(&host, port, "bad_auth_slot")
+    };
+    let connection = PostgresConnection::new(config);
+    let error = connection
+        .connect()
+        .await
+        .expect_err("a wrong password must be refused");
+    assert!(
+        error.to_string().contains("28P01"),
+        "the server's SQLSTATE for a failed password must reach the error: {error}"
+    );
+    Ok(())
 }

@@ -9,6 +9,7 @@ mod logging;
 mod observability;
 #[cfg(feature = "metrics")]
 mod otel;
+mod row_shape;
 mod runtime;
 mod runtime_offsets;
 mod runtime_utils;
@@ -32,13 +33,16 @@ pub use logging::StructuredLogger;
 pub use observability::{EventTracer, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector};
 #[cfg(feature = "metrics")]
 pub use otel::{MetricsReport, OTelConfig, OTelEventTracer, OTelMetricsCollector, SpanRecord};
+#[cfg(any(feature = "avro", feature = "protobuf"))]
+pub(crate) use row_shape::row_shape_from_parts;
+pub use row_shape::{ROW_SHAPE_DIGEST_VERSION, RowShape, ShapeColumn};
 pub use runtime::write_runtime_metrics_prometheus;
 pub use runtime::{
     AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch,
     HEALTH_MIN_CONFIGURABLE_STALL_MS, HealthVerdict, IdempotencyOptions,
     PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl,
-    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, StallCause,
-    TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
+    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SlotWalStatus,
+    StallCause, TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
 #[cfg(feature = "tls")]

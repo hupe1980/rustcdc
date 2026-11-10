@@ -29,7 +29,7 @@ replica with a unique `server_id`.
 | `UPDATE` | yes | `before` + `after` when `binlog_row_image = FULL` |
 | `DELETE` | yes | `before` when `binlog_row_image = FULL`; otherwise primary key only |
 | DDL changes | yes | Schema history is maintained for correct event decoding after column additions/renames |
-| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
+| Column types | yes | Every row carries its table's declared columns in `shape` — see [Declared column types](#declared-column-types) |
 | `TRUNCATE` | yes | Parsed from the `TRUNCATE TABLE` query event in the binlog and emitted as a `truncate` operation (respects the table include/exclude lists) |
 
 ### Minimum requirements
@@ -67,17 +67,18 @@ the schema history so subsequent events can be decoded correctly.
 
 ### Declared column types
 
-Column values are text, so a consumer needs the types to decode them. Every table's columns
-are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
-event with `ddl_type = "READ_SCHEMA"` — see
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Column values are text, so a consumer needs the types to decode them. Every row carries its
+table's `shape` — declared types, nullability and key. A stream row carries the
+`information_schema` shape only when it agrees with the row's binlog table map (column count,
+names, type family, nullability, primary key); a DDL statement for the table triggers a
+re-read, and until a table map agrees the rows carry none. A change within one type family
+(`varchar(64)` to `varchar(128)`) is not visible in the table map. See
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape).
 
-Types come from `information_schema.COLUMNS`, read once at stream start for the configured
-database. `COLUMN_TYPE` is MySQL's own spelling and is already complete — `decimal(12,4)`,
-`int unsigned`, `enum('a','b')` — and `IS_NULLABLE` is the real nullability.
-
-A table created *after* the stream starts is not in that read and needs nothing: its
-`CREATE TABLE` arrives in the binlog as its own schema event.
+Types come from `information_schema.COLUMNS`, read at stream start for the configured
+database and again for a table after DDL names it, on resume, and at the first row of a table
+the start read did not cover. `COLUMN_TYPE` is MySQL's own spelling and is already complete —
+`decimal(12,4)`, `int unsigned`, `enum('a','b')` — and `IS_NULLABLE` is the real nullability.
 
 ### GTID mode
 
@@ -350,6 +351,12 @@ mode = "plaintext"    # plaintext | tls
 # allow_invalid_certificates = false                   # local testing only
 # allow_invalid_hostnames    = false                   # local testing only
 ```
+
+**Embedding the library with TLS.** The MySQL driver takes its rustls crypto provider from the
+process default. If none is installed at the first TLS connection, the connector installs
+`ring`. To use `aws-lc-rs` (for FIPS, say), install it before connecting:
+`rustls::crypto::aws_lc_rs::default_provider().install_default()`. The server binary installs
+`aws-lc-rs` at startup.
 
 ### Field details
 

@@ -67,7 +67,7 @@ fi
 # pre-pull failures do not block unrelated CI lanes.  The sqlserver tests
 # themselves emit a "SKIP:" sentinel when the image cannot be pulled.
 if [[ "${1:-}" == "--sqlserver-soft" ]]; then
-  image="mcr.microsoft.com/mssql/server:${2:-2022-latest}"
+  image="mcr.microsoft.com/mssql/server:${2:-2022-CU27-ubuntu-22.04}"
   if pull_with_retry "$image"; then
     echo "prepared ${image}"
   else

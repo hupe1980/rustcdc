@@ -343,6 +343,9 @@ jobs:
           # if PostgreSQL had sent the value all along.
           - postgres_reselect_integration
           - postgres_wal_transport_parity_integration
+          # A slot PostgreSQL invalidates mid-run (max_slot_wal_keep_size) on 16 and 18, both
+          # transports, and one refused at startup (18's idle_replication_slot_timeout).
+          - postgres_slot_invalidation_integration
           - postgres_incremental_snapshot_reconnect_integration
           # The two transaction-id scales in the snapshot watermark bracket must agree.
           # pg_snapshot_xip yields epoch-extended xid8; pgoutput's BEGIN carries a bare
@@ -393,6 +396,9 @@ jobs:
           tags="16-alpine"
           if [[ "${{ matrix.suite }}" == "postgres_version_matrix" ]]; then
             tags="12-alpine 14-alpine 15-alpine 16-alpine"
+          fi
+          if [[ "${{ matrix.suite }}" == "postgres_slot_invalidation_integration" ]]; then
+            tags="16-alpine 18-alpine"
           fi
           bash scripts/ci-pull-relational-images.sh ${tags}
       - name: cargo test -p rustcdc --test ${{ matrix.suite }}
@@ -610,7 +616,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
-        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-CU27-ubuntu-22.04
       - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features sqlserver
@@ -637,7 +643,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
-        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-latest
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-CU27-ubuntu-22.04
       - name: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
         run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 

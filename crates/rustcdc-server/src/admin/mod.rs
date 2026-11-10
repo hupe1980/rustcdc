@@ -1,9 +1,12 @@
 mod auth;
+mod health;
 mod notify;
 mod openapi;
 mod probes;
 mod prometheus;
 mod rate_limit;
+mod routes;
+pub use routes::router;
 mod signal_ledger;
 mod signals;
 mod tls;
@@ -18,19 +21,19 @@ use auth::{
 };
 
 use axum::{
-    Json, Router,
+    Json,
     extract::{ConnectInfo, State},
     http::StatusCode,
     http::{HeaderMap, HeaderValue, header::RETRY_AFTER},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
 use ed25519_dalek::{Signer, SigningKey};
 use futures::FutureExt as _;
-use krafka::consumer::{AutoOffsetReset, Consumer, ConsumerRecord};
-use krafka::producer::{Acks, Producer, ProducerRecord};
+use krafka::Record;
+use krafka::consumer::{AutoOffsetReset, ConsumerRecord};
+use krafka::producer::{Acks, Producer};
 use notify::*;
 use prometheus::*;
 use rate_limit::{AbuseLimitScope, AdminAbuseGuard, RATE_LIMIT_STALE_CLIENT_TTL};
@@ -69,14 +72,10 @@ pub enum InstanceState {
     Error,
 }
 
-/// Histogram bucket upper bounds (ms) for admin API latency.
-/// Mirrors `LATENCY_HISTOGRAM_BUCKETS_US` in `commands/run_metrics.rs`.
 /// Admin API latency bounds in **microseconds**, exported as seconds.
 ///
-/// A `/readyz` handler returns in tens of microseconds. Against the previous
-/// millisecond bounds every request landed in `le="1"` and the histogram could not
-/// distinguish a healthy probe from one 100x slower — the same defect as the pipeline
-/// latency histograms.
+/// A `/readyz` handler returns in tens of microseconds; millisecond bounds would put every
+/// request in the first bucket and hide a probe 100x slower.
 const ADMIN_API_LATENCY_HISTOGRAM_BUCKETS_US: [u64; 10] = [
     100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -578,6 +577,8 @@ pub struct AdminState {
     /// forwards that as an explicit `lagged` SSE event, so a slow client learns it has a
     /// gap instead of silently receiving an incomplete sequence.
     notification_broadcast: Arc<tokio::sync::broadcast::Sender<ControlNotification>>,
+    /// The shapes `GET /schemas/{id}` resolves; filled by the delivery path.
+    delivered_shapes: crate::runtime::row_shapes::DeliveredShapes,
 }
 
 /// How many notifications a slow `/notifications/stream` subscriber may fall behind
@@ -597,23 +598,11 @@ const ADMIN_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Lifecycle handle for the admin background workers.
 ///
-/// Each of the four workers used to be a `std::thread::spawn` running a private
-/// `current_thread` tokio runtime in an unconditional `loop`. That cost four OS threads
-/// and four independent timer and I/O drivers per process, and — because nothing held a
-/// handle and no loop had an exit condition — none of them could be stopped. They ran
-/// until the process died.
-///
-/// Two consequences beyond the waste. Shutdown was not orderly: the signal-action worker
-/// could still be mutating `AdminStateData` while the pipeline was finalising, so the
-/// counters reported at exit raced the workers producing them. And every test that
-/// constructed an `AdminState` leaked four OS threads and four runtimes for the lifetime
-/// of the test binary, which is why the suite's thread count grew with the number of
-/// admin tests rather than with its concurrency.
-///
-/// They are now ordinary `tokio::spawn` tasks on the ambient runtime, each selecting on a
+/// The workers are `tokio::spawn` tasks on the ambient runtime, each selecting on a
 /// shutdown watch, with their handles retained so [`AdminState::shutdown_workers`] can
-/// stop them deterministically. In tests they need no shutdown at all: dropping the test
-/// runtime cancels them.
+/// stop them before the pipeline finalises. Otherwise the signal-action worker could
+/// still be mutating `AdminStateData` while the exit counters are reported. In tests,
+/// dropping the runtime cancels them.
 #[derive(Clone)]
 struct AdminWorkers {
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
@@ -780,6 +769,7 @@ impl AdminState {
             signal_terminal_budget: Duration::from_secs(SIGNAL_TERMINAL_TIMEOUT_SECONDS as u64),
             signal_ledger,
             workers: AdminWorkers::new(),
+            delivered_shapes: Default::default(),
             notification_broadcast: Arc::new(
                 tokio::sync::broadcast::channel(NOTIFICATION_STREAM_BUFFER).0,
             ),
@@ -949,13 +939,9 @@ impl AdminState {
 
         // **Start at the end of the file, not the beginning.**
         //
-        // This offset is process-local — nothing persists it — so starting at 0 meant
-        // every restart re-read the whole file and **re-executed every signal in it**.
-        // While `execute_snapshot` was a no-op that only produced duplicate audit
-        // entries; now it snapshots, and rustcdc rewinds an already-complete table and
-        // reads it again, so a restart re-scanned every table ever requested through this
-        // channel. A file that accumulates signals over months turns each restart into a
-        // full re-read of all of them.
+        // This offset is process-local — nothing persists it — so starting at 0 would
+        // re-execute every signal in the file on each restart, and an `execute_snapshot`
+        // re-run rewinds an already-complete table and reads it again.
         //
         // The file is a live channel, not a durable queue: a signal appended while the
         // server is down is not processed. That is the safe direction — the operator gets
@@ -1092,36 +1078,33 @@ impl AdminState {
                         }
                     };
 
-                    let consumer = match Consumer::builder()
-                        .bootstrap_servers(config.normalized_brokers().join(","))
-                        .group_id(config.group_id.clone())
-                        .client_id(config.client_id.clone())
-                        // **A signal is a command, not state.** `Earliest` meant that a
-                        // group with no committed offset — a first start, a renamed
-                        // `group_id`, or a group whose offsets aged out of
-                        // `offsets.retention.minutes` — replayed the entire signal topic
-                        // and **re-executed every `execute_snapshot` in its history**.
-                        // rustcdc rewinds an already-complete table and reads it again, so
-                        // that is a full re-scan of every table ever requested, plus the
-                        // duplicate `read` events downstream.
-                        //
-                        // The in-memory idempotency guard does not cover it: replayed
-                        // signal ids are deduplicated against `audit_recent_entries`, which
-                        // holds 512 entries and starts empty on every boot.
-                        //
-                        // `Latest` keeps the useful case — a committed offset still wins,
-                        // so signals sent during a brief restart are processed — and drops
-                        // only commands issued to a consumer that had never run.
+                    // **A signal is a command, not state.** `Earliest` meant that a group with
+                    // no committed offset — a first start, a renamed `group_id`, or a group
+                    // whose offsets aged out of `offsets.retention.minutes` — replayed the
+                    // entire signal topic and **re-executed every `execute_snapshot` in its
+                    // history**: a full re-scan of every table ever requested, plus the
+                    // duplicate `read` events downstream.
+                    //
+                    // The in-memory idempotency guard (`audit_recent_entries`: 512 entries,
+                    // empty on every boot) does not cover it. `Latest` keeps the useful case —
+                    // a committed offset still wins, so signals sent during a brief restart
+                    // are processed — and drops only commands to a consumer that never ran.
+                    let consumer = async {
+                        crate::sink::kafka_builder(
+                            config.normalized_brokers().join(","),
+                            config.client_id.clone(),
+                            Duration::from_millis(1_000),
+                            auth,
+                        )
+                        .connect()
+                        .await?
+                        .consumer(config.group_id.clone())
                         .auto_offset_reset(AutoOffsetReset::Latest)
                         .enable_auto_commit(false)
-                        .request_timeout(Duration::from_millis(1_000))
-                        .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-                            1_000,
-                        )))
-                        .auth(auth)
                         .build()
                         .await
-                    {
+                    };
+                    let consumer = match consumer.await {
                         Ok(consumer) => consumer,
                         Err(error) => {
                             tracing::warn!(
@@ -1135,7 +1118,7 @@ impl AdminState {
                         }
                     };
 
-                    if let Err(error) = consumer.subscribe(&[config.topic.as_str()]).await {
+                    if let Err(error) = consumer.subscribe([config.topic.as_str()]).await {
                         tracing::warn!(
                             target: "rustcdc_audit",
                             action = "signal_ingress_kafka_subscribe_failed",
@@ -1383,20 +1366,11 @@ impl AdminState {
     async fn ingest_kafka_signal_batch(&self, records: Vec<ConsumerRecord>) -> KafkaIngestOutcome {
         // **Commit after the action is decided, never before it starts.**
         //
-        // This loop used to call `commit()` unconditionally once every
-        // record had been *queued*. An async action — every
-        // `execute_snapshot` — had not run at that point, so a crash
-        // between the commit and the worker draining the queue lost the
-        // command permanently: a `STARTED` entry in a 512-entry in-memory
-        // ring that the restart then emptied, and no terminal state. The
-        // channel documented as the durable one was at-most-once.
-        //
-        // The reason it was written that way is that the opposite trade is
-        // also bad: redelivering an `execute_snapshot` re-runs it, and
-        // rustcdc rewinds an already-complete table and reads it again.
-        // `ProcessedSignalLedger` removes the dilemma — a record whose
-        // action reached a terminal state is durably marked, so redelivery
-        // is a skip rather than a re-execution.
+        // Committing once a record is merely *queued* makes the channel at-most-once:
+        // a crash before an async action (every `execute_snapshot`) runs loses the
+        // command. Redelivery is safe instead because `ProcessedSignalLedger` durably
+        // marks a record whose action reached a terminal state, so a redelivered one is
+        // skipped rather than re-executed.
         let mut ingested_records = 0_u64;
         let mut commit_batch = true;
         for record in records {
@@ -2630,13 +2604,8 @@ impl AdminState {
             .await;
         }
 
-        // Do the work the signal names, then report what happened.
-        //
-        // This block used to be absent: every queued action went straight to its terminal
-        // audit entry, so `execute_snapshot` recorded `COMPLETED` and emitted a
-        // notification saying so **without snapshotting anything**. The API reported
-        // success for an operation that did not exist, which is worse than not offering it
-        // — an operator watching the notification stream had no way to tell.
+        // Do the work the signal names, then report what happened: the terminal audit
+        // entry and notification must reflect the outcome, never just the queueing.
         let outcome = self.run_signal_action(&action).await;
 
         let (lifecycle_action, result, state, detail) = match outcome {
@@ -2847,11 +2816,9 @@ fn append_audit_entry(
     // message payloads.
     //
     // Through `crate::text`, because this string embeds the caller's `message` and
-    // `additional_data` verbatim and `serde_json` does not escape non-ASCII: the previous
-    // `detail[..AUDIT_DETAIL_MAX_BYTES]` panicked whenever the budget landed inside a
-    // multi-byte character. From the HTTP handler that failed one request; from the
-    // signal-action worker it killed the task, and every asynchronous signal afterwards
-    // was silently never processed.
+    // `additional_data` verbatim and `serde_json` does not escape non-ASCII: a byte slice
+    // panics when the budget lands inside a multi-byte character, and a panic in the
+    // signal-action worker would stop every later asynchronous signal.
     let detail = crate::text::truncate_utf8(detail, AUDIT_DETAIL_MAX_BYTES, " [truncated]");
     let detail: &str = &detail;
     data.audit_entries_total = data.audit_entries_total.saturating_add(1);
@@ -2917,12 +2884,9 @@ fn append_audit_entry(
 
 /// Resolve the Ed25519 key used to sign audit-trail exports.
 ///
-/// `admin.audit_signing_key_env` names the variable; it used to be ignored entirely
-/// while this function read a hardcoded `CDC_AUDIT_SIGNING_KEY_HEX`. An operator who
-/// configured the documented key got **unsigned audit records and no error** — the
-/// setting was accepted, serialised into `/status`, and never consulted. Unsigned
-/// audit trails are exactly what an audit trail exists to rule out, so every way this
-/// can end up without a key now says so at `warn`.
+/// `admin.audit_signing_key_env` names the variable. Unsigned audit records are exactly
+/// what an audit trail exists to rule out, so every way this can end up without a key
+/// says so at `warn`.
 fn load_audit_signing_key(cfg: &crate::config::schema::AdminConfig) -> Option<SigningKey> {
     let env_name = cfg.audit_signing_key_env.as_deref()?;
     let Ok(hex) = std::env::var(env_name) else {
@@ -3039,10 +3003,7 @@ fn slo_reasons(data: &AdminStateData) -> Vec<String> {
     }
 
     if let Some(latency_us) = data.last_admin_api_latency_us {
-        // 250 ms, now expressed in the unit the field actually carries. The threshold
-        // was `latency > 250` against a value that used to be milliseconds; leaving it
-        // after the switch to microseconds would have fired on every request over
-        // 250 us — i.e. permanently.
+        // 250 ms, in the microseconds the field carries.
         if latency_us > 250_000 {
             let latency_ms = latency_us as f64 / 1_000.0;
             reasons.push(format!(
@@ -3410,11 +3371,8 @@ async fn metrics(
 /// connection reset with **no status and no body**, and nothing is written to the log —
 /// so the failure looks like a network problem and is diagnosed as one.
 ///
-/// This is not hypothetical here. The audit-trail detail was truncated with a byte slice,
-/// which panicked whenever the budget landed inside a multi-byte character, and any
-/// write-scope token could reach it. That specific defect is fixed (`crate::text`), and
-/// the next one of its kind should surface as a `500` with a stack trace in the log rather
-/// than as an unexplained reset.
+/// A handler panic should surface as a `500` with a stack trace in the log, not as an
+/// unexplained reset.
 ///
 /// The panic payload is deliberately **not** returned to the caller: a panic message can
 /// carry file paths and fragments of internal state, and the admin API is reachable by any
@@ -3509,26 +3467,6 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "<non-string panic payload>".to_string()
     }
-}
-
-pub fn router(state: AdminState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/livez", get(livez))
-        .route("/readyz", get(readyz))
-        .route("/status", get(status_authed))
-        .route("/config", get(config_authed))
-        .route("/metrics", get(metrics))
-        .route("/signals", post(signal_action))
-        .route("/notifications", get(notifications_authed))
-        .route(
-            "/notifications/cloudevents",
-            get(notifications_cloudevents_authed),
-        )
-        .route("/notifications/stream", get(notifications_stream_authed))
-        .route("/openapi.json", get(openapi_document))
-        .with_state(state)
-        .layer(panic_guard())
 }
 
 /// Spawn the admin HTTP server as a background tokio task.

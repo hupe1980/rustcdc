@@ -24,6 +24,7 @@
 //! reselected value is byte-identical to what pgoutput would have sent. A plain `::text` cast
 //! would not be: PostgreSQL renders `bool` as `true` where pgoutput emits `t`.
 
+use super::pg_error::PgError;
 use std::collections::HashMap;
 
 use tokio_postgres::Client;
@@ -180,12 +181,16 @@ async fn reselect_one(
         .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
-    let rows = client.query(&sql, &params).await.map_err(|error| {
-        Error::SourceError(format!(
-            "reselect query failed for '{schema}.{}': {error}",
-            event.table
-        ))
-    })?;
+    let rows = client
+        .query(&sql, &params)
+        .await
+        .map_err(PgError::from)
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "reselect query failed for '{schema}.{}': {error}",
+                event.table
+            ))
+        })?;
 
     // The row has been deleted since the event was written. Leaving the holes is the only
     // answer that is not a guess.
@@ -249,6 +254,7 @@ async fn query_column_types(
             &[&schema, &table],
         )
         .await
+        .map_err(PgError::from)
         .map_err(|error| {
             Error::SourceError(format!(
                 "reselect: failed reading column types for '{schema}.{table}': {error}"

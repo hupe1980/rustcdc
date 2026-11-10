@@ -1,6 +1,6 @@
 use rustcdc::outbox::OutboxTransform;
 use rustcdc::schema_history::{ColumnDef, TableSchema};
-use rustcdc::transform::UnmatchedRule;
+use rustcdc::transform::{ShapeGuard, UnmatchedRule};
 use rustcdc::wasm::{TransformResult, WasmConfig as RustcdcWasmConfig, WasmRuntime};
 use rustcdc::{
     BeforeImage, CapturedDdl, Error, Event, FieldMappingConfig, FieldMappingTransform,
@@ -20,6 +20,8 @@ use crate::topic::QualifiedTable;
 pub struct TransformPipeline {
     rules: Vec<CompiledRule>,
     runtime: TransformRuntime,
+    /// Applied after the rules, so a narrowed shape is known for what it is.
+    row_shapes: crate::runtime::row_shapes::RowShapeDeliveryPlan,
 }
 
 /// A transform rule with its actions built once, at startup.
@@ -353,7 +355,22 @@ impl TransformPipeline {
         Ok(Self {
             rules: compile_rules(rules)?,
             runtime,
+            row_shapes: crate::runtime::row_shapes::RowShapeDeliveryPlan::default(),
         })
+    }
+
+    /// Deliver row shapes per `runtime.row_shape`, recording them for `GET /schemas/{id}`.
+    #[must_use]
+    pub fn with_row_shapes(
+        mut self,
+        plan: crate::runtime::row_shapes::RowShapeDeliveryPlan,
+    ) -> Self {
+        self.row_shapes = plan;
+        self
+    }
+
+    pub fn row_shapes(&self) -> &crate::runtime::row_shapes::RowShapeDeliveryPlan {
+        &self.row_shapes
     }
 
     /// Every configured rule that has never matched, across every stage.
@@ -458,20 +475,23 @@ impl TransformPipeline {
     }
 
     pub async fn apply(&self, event: Event) -> Result<Option<Event>> {
+        // The shape the row claimed on the way in. A rule — or a WASM module, which may
+        // rewrite the payload wholesale — that changes the columns invalidates the claim.
+        let shape = ShapeGuard::capture(&event);
         let native_rules_active = !self.rules.is_empty();
         let transformed = apply_rules(event, &self.rules)?;
         let Some(event) = transformed else {
             return Ok(None);
         };
 
-        match &self.runtime {
+        let transformed = match &self.runtime {
             TransformRuntime::Native => {
                 if native_rules_active {
-                    Ok(Some(finalize_transformed(event)?))
+                    Some(finalize_transformed(event)?)
                 } else {
                     // Pass-through: the source already validated its own envelope;
                     // re-validating every event here would only add hot-path cost.
-                    Ok(Some(event))
+                    Some(event)
                 }
             }
             TransformRuntime::Wasm(pool) => {
@@ -482,12 +502,22 @@ impl TransformPipeline {
                 let mut guard = pool.acquire().await;
                 match guard.transform(&event).await? {
                     TransformResult::Ok(transformed) => {
-                        Ok(Some(finalize_transformed(*transformed)?))
+                        let mut transformed = finalize_transformed(*transformed)?;
+                        // A module can rewrite any value under any name, which no comparison
+                        // of column names can see; and whatever shape it returns is its own
+                        // claim, not one a connector made.
+                        transformed.shape = None;
+                        Some(transformed)
                     }
-                    TransformResult::Filtered => Ok(None),
+                    TransformResult::Filtered => None,
                 }
             }
-        }
+        };
+
+        Ok(transformed.map(|mut event| {
+            shape.release(&mut event);
+            event
+        }))
     }
 }
 
@@ -571,12 +601,12 @@ fn apply_rules(event: Event, rules: &[CompiledRule]) -> Result<Option<Event>> {
 /// The known tables whose schema events the configured rules let through, under the name
 /// they reach the router with.
 ///
-/// Startup needs this to know which schema-event topics a sink will be asked for. The probe
-/// is a real `READ_SCHEMA` announcement published through [`CapturedDdl::to_event`], the
-/// same call every connector makes, so a rule that reads the payload (`unwrap` or `flatten`
-/// on `result_schema`, a strict field mapping) sees the fields it sees at runtime. The
-/// one-column `result_schema` stands in for the catalogue read. A rule that still errors on
-/// it counts as dropping the event.
+/// Startup needs this to know which schema-event topics a sink will be asked for: a
+/// connector writes one when it captures DDL for the table. The probe is an `ALTER_TABLE`
+/// event published through [`CapturedDdl::to_event`], the same call every connector makes,
+/// so a rule that reads the payload (`unwrap` or `flatten` on `result_schema`, a strict field
+/// mapping) sees the fields it sees at runtime. The one-column `result_schema` stands in for
+/// the table's. A rule that still errors on it counts as dropping the event.
 ///
 /// Returns nothing when the transform runtime is WASM. The module runs after these rules,
 /// cannot be run here, and may drop or rename schema events, so a topic predicted without it
@@ -595,7 +625,7 @@ pub(crate) fn schema_event_tables(
     tables
         .iter()
         .filter_map(|table| {
-            let mut event = read_schema_probe(table);
+            let mut event = schema_change_probe(table);
             // `to_event` always sets a schema. Keep the configured table's own, so an
             // unqualified entry renders the way its data topic does.
             event.schema = table.schema.clone();
@@ -610,14 +640,14 @@ pub(crate) fn schema_event_tables(
         .collect()
 }
 
-/// The schema announcement a connector publishes before `table`'s first row.
-fn read_schema_probe(table: &QualifiedTable) -> Event {
+/// The schema-change event a connector publishes when it captures DDL for `table`.
+fn schema_change_probe(table: &QualifiedTable) -> Event {
     let schema = table.schema.clone().unwrap_or_default();
     CapturedDdl {
-        ddl_type: rustcdc::DDL_TYPE_READ_SCHEMA.to_string(),
+        ddl_type: "ALTER_TABLE".to_string(),
         schema: schema.clone(),
         table: table.table.clone(),
-        statement: format!("/* schema of {} probed at startup */", table.display()),
+        statement: format!("ALTER TABLE {} /* probed at startup */", table.display()),
         result_schema: Some(TableSchema {
             schema,
             table: table.table.clone(),
@@ -668,9 +698,19 @@ fn matches_optional_value(value: Option<&str>, allowed: &[String]) -> bool {
 
 fn apply_action(event: Event, action: &TransformActionConfig) -> Result<Option<Event>> {
     match action {
-        TransformActionConfig::Unwrap { field } => unwrap_after_field(event, field).map(Some),
+        // Both put a nested value's fields where the table's columns were; whatever names
+        // result, the table's shape no longer describes them.
+        TransformActionConfig::Unwrap { field } => {
+            unwrap_after_field(event, field).map(|mut event| {
+                event.shape = None;
+                Some(event)
+            })
+        }
         TransformActionConfig::Flatten { field, prefix } => {
-            flatten_after_field(event, field, prefix.as_deref()).map(Some)
+            flatten_after_field(event, field, prefix.as_deref()).map(|mut event| {
+                event.shape = None;
+                Some(event)
+            })
         }
         TransformActionConfig::Filter {
             include_tables,
@@ -1178,6 +1218,7 @@ mod tests {
         let pipeline = TransformPipeline {
             rules: compile_rules(rules).expect("compile"),
             runtime: TransformRuntime::Native,
+            row_shapes: Default::default(),
         };
         super::apply_rules(sample_event(), &pipeline.rules).expect("apply");
 
@@ -1408,13 +1449,7 @@ mod tests {
         path
     }
 
-    #[tokio::test]
-    async fn wasm_runtime_can_pass_through_event_json() {
-        let dir = wasm_fixture_dir();
-        let module_path = write_wasm_module(
-            &dir,
-            "passthrough.wasm",
-            r#"
+    const PASS_THROUGH_WAT: &str = r#"
             (module
               (memory (export "memory") 2 2)
               (global $heap (mut i32) (i32.const 8))
@@ -1441,8 +1476,12 @@ mod tests {
                 local.get $len
                 i64.extend_i32_u
                 i64.or))
-            "#,
-        );
+            "#;
+
+    #[tokio::test]
+    async fn wasm_runtime_can_pass_through_event_json() {
+        let dir = wasm_fixture_dir();
+        let module_path = write_wasm_module(&dir, "passthrough.wasm", PASS_THROUGH_WAT);
 
         let runtime_cfg = TransformRuntimeConfig {
             mode: TransformRuntimeMode::Wasm,
@@ -1464,6 +1503,98 @@ mod tests {
 
         assert_eq!(transformed.table, event.table);
         assert_eq!(transformed.after, event.after);
+    }
+
+    /// A row whose shape describes `id` and `inner`. Unwrapping or flattening `inner` below
+    /// leaves the same two names, so the chain's name comparison keeps the shape; only the
+    /// action's own removal drops it.
+    fn shaped_nested_event() -> Event {
+        let shape = rustcdc::RowShape::new(
+            "public",
+            "users",
+            vec![
+                rustcdc::ShapeColumn::new("id", "bigint", false),
+                rustcdc::ShapeColumn::new("inner", "jsonb", true),
+            ],
+            vec!["id".into()],
+        )
+        .expect("shape");
+        Event::builder("users", Operation::Insert)
+            .after(json!({"id": 1, "inner": {"id": 7, "inner": 5}}))
+            .source(SourceMetadata::new("postgres", "0/1", 1))
+            .ts(1)
+            .schema("public")
+            .primary_key(["id"])
+            .shape(std::sync::Arc::new(shape))
+            .build()
+    }
+
+    async fn apply_one_action(action: TransformActionConfig, event: Event) -> Event {
+        let rules = vec![TransformRuleConfig {
+            name: "reshape".to_string(),
+            when: TransformWhenConfig::default(),
+            actions: vec![action],
+        }];
+        TransformPipeline::from_config(TransformRuntimeConfig::default(), rules)
+            .expect("pipeline")
+            .apply(event)
+            .await
+            .expect("apply")
+            .expect("kept")
+    }
+
+    #[tokio::test]
+    async fn an_unwrapped_row_carries_no_shape() {
+        let event = apply_one_action(
+            TransformActionConfig::Unwrap {
+                field: "inner".to_string(),
+            },
+            shaped_nested_event(),
+        )
+        .await;
+        assert_eq!(event.after, Some(json!({"id": 7, "inner": 5})));
+        assert!(event.shape.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_flattened_row_carries_no_shape() {
+        let event = apply_one_action(
+            TransformActionConfig::Flatten {
+                field: "inner".to_string(),
+                prefix: None,
+            },
+            shaped_nested_event(),
+        )
+        .await;
+        assert_eq!(event.after, Some(json!({"id": 7, "inner": 5})));
+        assert!(event.shape.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_wasm_module_s_output_carries_no_shape() {
+        let dir = wasm_fixture_dir();
+        let module_path = write_wasm_module(&dir, "passthrough.wasm", PASS_THROUGH_WAT);
+        let runtime_cfg = TransformRuntimeConfig {
+            mode: TransformRuntimeMode::Wasm,
+            wasm: WasmTransformConfig {
+                module_path: Some(module_path),
+                max_memory_bytes: 128 * 1024,
+                max_event_bytes: 64 * 1024,
+                ..WasmTransformConfig::default()
+            },
+        };
+        let pipeline = TransformPipeline::from_config(runtime_cfg, Vec::new()).expect("pipeline");
+        let event = shaped_nested_event();
+        let transformed = pipeline
+            .apply(event.clone())
+            .await
+            .expect("apply")
+            .expect("kept");
+        assert_eq!(
+            transformed.after, event.after,
+            "the module passed the row through"
+        );
+        assert!(transformed.shape.is_none());
     }
 
     #[tokio::test]

@@ -280,6 +280,26 @@ impl CdcRuntime {
         self.config.source.capabilities()
     }
 
+    /// Report that delivering the batch from the last poll failed and will be retried.
+    ///
+    /// For an embedder that holds a batch and retries it rather than polling again — which
+    /// is what keeps a failed batch from being skipped. Without this the runtime sees a poll
+    /// loop that stopped and a consumer that stopped acknowledging, and reports one of those,
+    /// which routes the page to the wrong place. Cleared by the next successful
+    /// [`commit_ack`](CdcRuntime::commit_ack).
+    pub fn record_delivery_failure(&mut self, error: &dyn std::fmt::Display) {
+        let now_ms = now_millis();
+        let failure = self
+            .delivery_failure
+            .get_or_insert_with(|| super::DeliveryFailure {
+                since_ms: now_ms,
+                attempts: 0,
+                last_error: String::new(),
+            });
+        failure.attempts = failure.attempts.saturating_add(1);
+        failure.last_error = error.to_string();
+    }
+
     /// Return an embeddable admin snapshot for runtime health and capabilities introspection.
     pub fn admin_snapshot(&self) -> RuntimeAdminSnapshot {
         let now_ms = now_millis();
@@ -298,7 +318,8 @@ impl CdcRuntime {
                 // replaying events the runtime has already committed, and the source
                 // is retaining its log (WAL on a PostgreSQL primary) meanwhile.
                 // Reporting ready here is what made this failure silent.
-                && self.pending_confirmation_lsn.is_none(),
+                && self.pending_confirmation_lsn.is_none()
+                && self.source_position_lost.is_none(),
             liveness: self.state != RuntimeState::Stopped,
             capabilities: self.source_capabilities(),
             buffer_depth: self.buffered_events.len()
@@ -338,6 +359,8 @@ impl CdcRuntime {
                 .stream
                 .as_ref()
                 .and_then(|s| s.replication_slot_lag_bytes()),
+            replication_slot_wal_status: self.last_slot_wal_status,
+            replication_slot_safe_wal_size_bytes: self.last_slot_safe_wal_size_bytes,
         }
     }
 
@@ -346,6 +369,16 @@ impl CdcRuntime {
     /// Ordered most-specific first, so the reported reason is the most actionable one
     /// rather than whichever check happens to run first.
     pub(super) fn derive_health(&self, now_ms: u64) -> HealthVerdict {
+        // 0. The source invalidated the slot. First, and before `NotRunning`: it explains
+        //    every other symptom — a parked process stops polling, and a start that found
+        //    the slot lost never reached `Running` — and only this cause names the remedy.
+        if let Some(reason) = &self.source_position_lost {
+            return HealthVerdict::Stalled {
+                cause: StallCause::SourcePositionLost,
+                reason: reason.clone(),
+            };
+        }
+
         if self.state != RuntimeState::Running {
             return HealthVerdict::NotRunning;
         }
@@ -364,7 +397,7 @@ impl CdcRuntime {
             };
         }
 
-        // 2. The poll loop itself is not turning. Compared against the configured wait
+        // 3. The poll loop itself is not turning. Compared against the configured wait
         //    plus a generous multiple, so a slow-but-working poll is not flagged.
         //
         //    `last_poll_at_ms` is stamped by `poll_event_batch` on **every** return, so
@@ -392,6 +425,29 @@ impl CdcRuntime {
                     .saturating_mul(HEALTH_POLL_STALL_MULTIPLIER)
                     .max(HEALTH_MIN_POLL_STALL_MS)
             });
+        // 2. The embedder says delivery is failing. Past the threshold that is the stall;
+        //    before it, the poll and acknowledgement gaps below are explained by the retry
+        //    and must not be reported as the other two causes.
+        if let Some(failure) = &self.delivery_failure {
+            let failing_for = now_ms.saturating_sub(failure.since_ms);
+            if failing_for > stall_threshold_ms {
+                return HealthVerdict::Stalled {
+                    cause: StallCause::DeliveryFailing,
+                    reason: format!(
+                        "delivery of the current batch has failed {} time(s) over {failing_for}ms \
+                         (threshold {stall_threshold_ms}ms); last error: {}",
+                        failure.attempts, failure.last_error
+                    ),
+                };
+            }
+            return match self.last_delivery_at_ms {
+                Some(at) if now_ms.saturating_sub(at) <= stall_threshold_ms => {
+                    HealthVerdict::Healthy
+                }
+                _ => HealthVerdict::Idle,
+            };
+        }
+
         if let Some(reference) = self.last_poll_at_ms.or(self.started_at_ms) {
             let since_poll = now_ms.saturating_sub(reference);
             if since_poll > stall_threshold_ms {
@@ -412,7 +468,7 @@ impl CdcRuntime {
             }
         }
 
-        // 3. Events delivered but not committed, with no recent commit. This is a
+        // 4. Events delivered but not committed, with no recent commit. This is a
         //    *consumer* stall — the source is fine and the caller has stopped
         //    acknowledging — which looks identical to source idleness in the counters.
         let uncommitted = self
@@ -439,7 +495,7 @@ impl CdcRuntime {
             }
         }
 
-        // 4. Polling on schedule with nothing outstanding. Whether that is `Healthy` or
+        // 5. Polling on schedule with nothing outstanding. Whether that is `Healthy` or
         //    `Idle` turns on whether events have *arrived* recently.
         //
         //    Measured against `last_delivery_at_ms` — the local clock at the last
@@ -735,6 +791,33 @@ pub fn write_runtime_metrics_prometheus<W: std::io::Write>(
                  # TYPE rustcdc_replication_slot_lag_bytes gauge\n\
                  rustcdc_replication_slot_lag_bytes{{source_type=\"{source_type}\"}} {}",
                 lag_bytes
+            )?;
+        }
+
+        // One-hot over every state, so `status="unreserved"` is a complete alert rule and a
+        // state change is a change of which series is 1 rather than a series appearing.
+        if let Some(current) = admin.replication_slot_wal_status {
+            writeln!(
+                w,
+                "# HELP rustcdc_replication_slot_wal_status PostgreSQL replication slot wal_status (1 for the current state). unreserved means the slot is lost at the next checkpoint unless the pipeline catches up; lost means it already is.\n\
+                 # TYPE rustcdc_replication_slot_wal_status gauge"
+            )?;
+            for status in crate::core::SlotWalStatus::ALL {
+                writeln!(
+                    w,
+                    "rustcdc_replication_slot_wal_status{{source_type=\"{source_type}\",status=\"{}\"}} {}",
+                    status.as_str(),
+                    u8::from(*status == current)
+                )?;
+            }
+        }
+
+        if let Some(safe_bytes) = admin.replication_slot_safe_wal_size_bytes {
+            writeln!(
+                w,
+                "# HELP rustcdc_replication_slot_safe_wal_size_bytes PostgreSQL replication slot safe_wal_size: bytes of WAL that can still be written before the slot is endangered. Negative once the slot is unreserved; absent when max_slot_wal_keep_size is unlimited.\n\
+                 # TYPE rustcdc_replication_slot_safe_wal_size_bytes gauge\n\
+                 rustcdc_replication_slot_safe_wal_size_bytes{{source_type=\"{source_type}\"}} {safe_bytes}"
             )?;
         }
 

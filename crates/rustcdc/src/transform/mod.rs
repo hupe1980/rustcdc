@@ -10,6 +10,7 @@ pub mod mask_hash;
 #[cfg(feature = "outbox")]
 pub mod outbox;
 pub mod route;
+mod shape_guard;
 pub mod unwrap;
 
 pub use field_mapping::{FieldMappingConfig, FieldMappingTransform};
@@ -21,6 +22,7 @@ pub use mask_hash::{MaskHashConfig, MaskHashTransform, MaskRule};
 #[cfg(feature = "outbox")]
 pub use outbox::{OutboxResult, OutboxTransform};
 pub use route::{RouteConfig, RouteTransform};
+pub use shape_guard::ShapeGuard;
 pub use unwrap::{UnwrapConfig, UnwrapTransform};
 
 // ─── Rule coverage ────────────────────────────────────────────────────────────
@@ -351,6 +353,7 @@ impl TransformPipeline {
         if self.transforms.is_empty() || events.is_empty() {
             return Ok(());
         }
+        let shapes = shape_guard::BatchShapeGuard::capture(events);
 
         for stage in &self.transforms {
             // Which *tables* arrived at this stage with a resolvable message key.
@@ -396,6 +399,9 @@ impl TransformPipeline {
             }
         }
 
+        if let Some(shapes) = shapes {
+            shapes.release(events);
+        }
         Ok(())
     }
 
@@ -415,6 +421,7 @@ impl TransformPipeline {
         // Only meaningful for data-change events; READ/SCHEMA_CHANGE/TRUNCATE carry no
         // row identity to preserve.
         let key_before = event.op.is_data_change() && event.has_resolvable_key();
+        let shape = ShapeGuard::capture(&event);
 
         for transform in &self.transforms {
             // Wrap with context rather than re-wrapping as `TransformError`.
@@ -465,6 +472,9 @@ impl TransformPipeline {
                 )));
             }
         }
+
+        shape.release(&mut event);
+
         Ok(Some(event))
     }
 }
@@ -537,6 +547,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

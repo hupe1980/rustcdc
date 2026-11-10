@@ -233,6 +233,99 @@ pub struct ProtoEvent {
     /// differ, and merging them marks genuinely-changed columns as unwritable.
     #[prost(string, repeated, tag = "14")]
     pub before_unavailable_columns: Vec<String>,
+    /// The table shape this row was captured under — see `Event::shape`. Tag 15 is reserved.
+    #[prost(message, optional, tag = "16")]
+    pub shape: Option<ProtoRowShape>,
+}
+
+/// Protobuf representation of [`crate::core::RowShape`].
+///
+/// Mirrors `message RowShape` in `proto/event.proto`. Compact when `columns` is empty.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoRowShape {
+    /// Content id.
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// Schema name.
+    #[prost(string, tag = "2")]
+    pub schema: String,
+    /// Table name.
+    #[prost(string, tag = "3")]
+    pub table: String,
+    /// Columns in ordinal order; empty for a compact shape.
+    #[prost(message, repeated, tag = "4")]
+    pub columns: Vec<ProtoShapeColumn>,
+    /// Primary-key column names in key order.
+    #[prost(string, repeated, tag = "5")]
+    pub primary_key: Vec<String>,
+}
+
+/// Protobuf representation of [`crate::core::ShapeColumn`].
+///
+/// Mirrors `message ShapeColumn` in `proto/event.proto`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoShapeColumn {
+    /// Column name.
+    #[prost(string, tag = "1")]
+    pub name: String,
+    /// Declared type in the source's own syntax.
+    #[prost(string, tag = "2")]
+    pub data_type: String,
+    /// Whether the column accepts `NULL`.
+    #[prost(bool, tag = "3")]
+    pub nullable: bool,
+}
+
+impl ProtoRowShape {
+    fn from_shape(shape: &crate::core::RowShape) -> Self {
+        Self {
+            id: shape.id().to_string(),
+            schema: shape.schema().to_string(),
+            table: shape.table().to_string(),
+            columns: shape
+                .columns()
+                .unwrap_or_default()
+                .iter()
+                .map(|column| ProtoShapeColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+                .collect(),
+            primary_key: shape.primary_key().unwrap_or_default().to_vec(),
+        }
+    }
+
+    fn into_shape(self) -> Result<crate::core::RowShape> {
+        // Protobuf cannot tell an absent repeated field from an empty one; a complete shape
+        // always has a column, so no columns means compact.
+        let (columns, primary_key) = if self.columns.is_empty() {
+            if !self.primary_key.is_empty() {
+                return Err(Error::SerializationError(
+                    "protobuf row shape lists a primary key but no columns".into(),
+                ));
+            }
+            (None, None)
+        } else {
+            (
+                Some(
+                    self.columns
+                        .into_iter()
+                        .map(|column| {
+                            crate::core::ShapeColumn::new(
+                                column.name,
+                                column.data_type,
+                                column.nullable,
+                            )
+                        })
+                        .collect(),
+                ),
+                Some(self.primary_key),
+            )
+        };
+        crate::core::row_shape_from_parts(self.id, self.schema, self.table, columns, primary_key)
+            .map_err(|error| Error::SerializationError(format!("protobuf row shape: {error}")))
+    }
 }
 
 /// Protobuf representation of a CDC event's primary key.
@@ -317,6 +410,7 @@ impl ProtoEvent {
                     event_index: t.event_index,
                 }),
             envelope_version: event.envelope_version as u32,
+            shape: event.shape.as_deref().map(ProtoRowShape::from_shape),
             before_is_key_only: event.before.is_key_only(),
             unavailable_columns: event.unavailable_columns.clone(),
             before_unavailable_columns: event.before.unavailable_columns().to_vec(),
@@ -407,6 +501,11 @@ impl ProtoEvent {
                 event_index: t.event_index,
             }),
             envelope_version: self.envelope_version as u16,
+            shape: self
+                .shape
+                .map(ProtoRowShape::into_shape)
+                .transpose()?
+                .map(std::sync::Arc::new),
             unavailable_columns: self.unavailable_columns,
         })
     }
@@ -445,6 +544,7 @@ mod tests {
                 event_index: 1,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -466,6 +566,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

@@ -525,6 +525,7 @@ it is a catch-all, not a no-op.
 | `stream_poll_interval_ms` | `u64` | 50 | Range 1–60 000. |
 | `max_events_per_poll` | `usize` | 1 000 | Range 1–100 000. |
 | `slot_idle_advance_interval_ms` | `u64` | 30 000 | See "Idle slots retain WAL" below. `0` disables. |
+| `slot_state_sample_interval_ms` | `Option<u64>` | unset | Cadence of the slot lag and `wal_status` sample. Unset follows `slot_idle_advance_interval_ms` (15 s when that is `0`). Must be > 0 when set. |
 | `wal_transport` | `WalTransport` | `StreamingReplication` | How the WAL stream is read; see below. |
 | `reselect_unavailable_columns` | `bool` | `false` | Re-read unchanged TOASTed values from the source instead of reporting them absent; see below. |
 | `capture_logical_messages` | `bool` | `false` | Capture `pg_logical_emit_message()` output — the table-free transactional outbox; see below. |
@@ -651,7 +652,7 @@ needs `SqlPeek`.
 > **TLS means TLS.** `sslmode=require` is set on both connections whenever the transport is TLS.
 > `tokio-postgres` defaults to `prefer`, which silently falls back to plaintext against a server
 > with `ssl = off` — a config that says TLS and delivers cleartext, visible only in a packet
-> capture. A server that refuses TLS now fails the connection instead.
+> capture. A server that refuses TLS fails the connection.
 
 ### Large transactions spill on the server
 
@@ -914,11 +915,11 @@ values against real databases.
 > Read with `value.as_str()` and parse — integers and floats arrive **quoted**, to keep the
 > full source precision that a JSON number would round.
 
-> **You do not have to know the types in advance.** Each table's column types are announced
-> on the stream before that table's first row, as a `SchemaChange` event with
-> `ddl_type = "READ_SCHEMA"` and a full `result_schema` — `data_type` in the source's own
-> syntax, modifier included, and `nullable` read from the catalogue. See
-> [Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+> **You do not have to know the types in advance.** Every row carries its table's shape in
+> `Event::shape` — each column's `data_type` in the source's own syntax, modifier included,
+> and `nullable` read from the catalogue. See
+> [Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape) for the paths
+> that carry none.
 
 ### Binary column encoding, per connector
 
@@ -964,10 +965,8 @@ for column names and key flags. Without it the values fall back to the raw ordin
 ### SQL Server
 
 `DECIMAL`, `NUMERIC`, `MONEY`, `DATETIME2`, `DATETIMEOFFSET`, `TIME`, `UNIQUEIDENTIFIER`,
-`VARBINARY` and `XML` all decode to their exact values. This is called out explicitly because
-an earlier version of the connector returned `null` for five of them — indistinguishable from a
-genuine SQL NULL, delivered as an authentic value, with no error anywhere. The fidelity suite
-now asserts non-null on every `NOT NULL` column precisely to catch a regression of that shape.
+`VARBINARY` and `XML` all decode to their exact values; the fidelity suite asserts non-null on
+every `NOT NULL` column, so a value decoded as `null` fails it.
 
 ## MySQL Source Configuration
 
@@ -1073,11 +1072,9 @@ sharing a `server_id` cause the server to evict one, and the eviction surfaces o
 generic disconnect. A deliberately invalid default forces the decision to be made once,
 explicitly.
 
-**Why the handoff drain has a time budget.** The previous implementation capped overlap
-draining at a hard-coded eight polls. On a high-traffic table with large batches that cap was
-exhausted before the overlap was drained, and the connector silently delivered duplicate rows.
-The budget is wall-clock instead, and exhausting it emits a `WARN` naming the residual count
-rather than passing the duplicates off as normal.
+**Why the handoff drain has a time budget.** A poll-count cap can be exhausted by large batches
+before the overlap is drained. The budget is wall-clock, and exhausting it emits a `WARN` naming
+the residual count.
 
 
 ### MySQL GTID String Format
@@ -1489,7 +1486,9 @@ let config = RuntimeConfig::new(...)
 | `rustcdc_runtime_health` | Gauge | Derived health verdict, one series per `verdict` label. **`rustcdc_runtime_health{verdict="stalled"} == 1` is the alert rule** — `state` alone cannot distinguish healthy-idle from stalled. |
 | `rustcdc_runtime_checkpoint_age_ms` | Gauge | Age of last durable checkpoint |
 | `rustcdc_runtime_replication_lag_ms` | Gauge | Estimated source lag in milliseconds |
-| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. Sampled on a timer that does **not** depend on the pipeline being caught up — a sampler tied to the idle-advance path would go stale exactly while the pipeline was behind, which is when the value matters most. The cadence follows `slot_idle_advance_interval_ms`, or 15 s when idle advance is disabled. |
+| `rustcdc_replication_slot_lag_bytes` | Gauge | PostgreSQL replication slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). **The single most operationally critical PostgreSQL signal**: a monotonically growing value means the slot is pinning WAL on the primary until the disk fills. Page on sustained growth. Sampled on a timer that does **not** depend on the pipeline being caught up — a sampler tied to the idle-advance path would go stale exactly while the pipeline was behind, which is when the value matters most. The cadence follows `slot_idle_advance_interval_ms`, or 15 s when idle advance is disabled, unless `slot_state_sample_interval_ms` is set. |
+| `rustcdc_replication_slot_wal_status` | Gauge | The slot's `wal_status`, one-hot over `status` = `reserved`, `extended`, `unreserved`, `lost`. Page on `unreserved`: the slot is lost at the next checkpoint unless the pipeline catches up. Kept across a reconnect; `lost` once the source refuses the slot. |
+| `rustcdc_replication_slot_safe_wal_size_bytes` | Gauge | The slot's `safe_wal_size`; negative once `unreserved`, absent when `max_slot_wal_keep_size` is unlimited. |
 | `rustcdc_runtime_source_capability` | Gauge | Connector capability flags, one series per `capability` label |
 
 ### OpenTelemetry Exported Metrics (`OTelMetricsCollector`)

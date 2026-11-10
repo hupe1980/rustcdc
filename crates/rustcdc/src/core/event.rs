@@ -715,6 +715,18 @@ pub struct Event {
     /// rather than merely discouraged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_columns: Vec<String>,
+    /// The table shape this row was captured under: columns with declared types and
+    /// nullability, the primary key, and a content id.
+    ///
+    /// Column values are text, so the declared type is what says how to parse them. Carried
+    /// in the row rather than in a separate event because nothing orders two events across
+    /// Kafka topics or keys: a row decodes on its own.
+    ///
+    /// `None` where the connector cannot vouch for the shape the row was captured under — see
+    /// the schema-evolution guide for the paths that carry none — and after a transform that
+    /// changed the columns' meaning. Absent means unknown, never "no columns". Behind an
+    /// [`Arc`](std::sync::Arc) so the rows of one table share one shape.
+    pub shape: Option<std::sync::Arc<crate::core::RowShape>>,
 }
 
 /// Flat wire form of [`Event`].
@@ -748,6 +760,8 @@ struct EventWire {
     unavailable_columns: Vec<String>,
     #[serde(default)]
     before_unavailable_columns: Vec<String>,
+    #[serde(default)]
+    shape: Option<crate::core::RowShape>,
 }
 
 impl TryFrom<EventWire> for Event {
@@ -773,6 +787,7 @@ impl TryFrom<EventWire> for Event {
             transaction: wire.transaction,
             envelope_version: wire.envelope_version,
             unavailable_columns: wire.unavailable_columns,
+            shape: wire.shape.map(std::sync::Arc::new),
         })
     }
 }
@@ -780,10 +795,12 @@ impl TryFrom<EventWire> for Event {
 impl Serialize for Event {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let before_unavailable_columns = self.before.unavailable_columns();
-        // Twelve always-present fields, plus the two lists that are omitted when empty.
+        // Twelve always-present fields, plus the two lists that are omitted when empty and the
+        // shape that is omitted when unknown.
         let len = 12
             + usize::from(!self.unavailable_columns.is_empty())
-            + usize::from(!before_unavailable_columns.is_empty());
+            + usize::from(!before_unavailable_columns.is_empty())
+            + usize::from(self.shape.is_some());
 
         let mut state = serializer.serialize_struct("Event", len)?;
         state.serialize_field("before", &self.before.row())?;
@@ -807,6 +824,10 @@ impl Serialize for Event {
             state.skip_field("before_unavailable_columns")?;
         } else {
             state.serialize_field("before_unavailable_columns", before_unavailable_columns)?;
+        }
+        match &self.shape {
+            Some(shape) => state.serialize_field("shape", shape.as_ref())?,
+            None => state.skip_field("shape")?,
         }
         state.end()
     }
@@ -909,6 +930,7 @@ impl Default for Event {
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
             unavailable_columns: Vec::new(),
+            shape: None,
         }
     }
 }
@@ -1453,6 +1475,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -2244,6 +2267,13 @@ impl EventBuilder {
         S: Into<String>,
     {
         self.event.unavailable_columns = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The table shape this row was captured under. See [`Event::shape`].
+    #[must_use]
+    pub fn shape(mut self, shape: std::sync::Arc<crate::core::RowShape>) -> Self {
+        self.event.shape = Some(shape);
         self
     }
 

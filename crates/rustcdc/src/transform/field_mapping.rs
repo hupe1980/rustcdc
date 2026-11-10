@@ -119,15 +119,18 @@ impl FieldMappingTransform {
         })
     }
 
-    fn apply_payload(&self, payload: Option<&mut Value>) -> Result<()> {
+    /// Apply the rules to one payload; returns whether a copy, rename or literal rewrote a
+    /// column (a removal alone does not count — the shape guard narrows for it).
+    fn apply_payload(&self, payload: Option<&mut Value>) -> Result<bool> {
         // Do NOT create a synthetic payload for None values.
         // Insert.before, Delete.after, and all Truncate payloads are intentionally
         // None per the canonical event envelope contract.  Creating an object here
         // would produce phantom payloads that fail event.validate() downstream.
         // set_literal rules are only applied to payloads that already exist.
         let Some(value) = payload else {
-            return Ok(());
+            return Ok(false);
         };
+        let mut rewrote = !self.set_rules.is_empty();
 
         if !value.is_object() {
             return Err(Error::TransformError(
@@ -137,7 +140,10 @@ impl FieldMappingTransform {
 
         for rule in &self.copy_rules {
             match get_path(value, &rule.from).cloned() {
-                Some(source) => set_path(value, &rule.to, source)?,
+                Some(source) => {
+                    set_path(value, &rule.to, source)?;
+                    rewrote = true;
+                }
                 None if self.config.strict => {
                     return Err(Error::TransformError(format!(
                         "field_mapping copy source path missing: {}",
@@ -150,7 +156,10 @@ impl FieldMappingTransform {
 
         for rule in &self.rename_rules {
             match remove_path(value, &rule.from) {
-                Some(source) => set_path(value, &rule.to, source)?,
+                Some(source) => {
+                    set_path(value, &rule.to, source)?;
+                    rewrote = true;
+                }
                 None if self.config.strict => {
                     return Err(Error::TransformError(format!(
                         "field_mapping rename source path missing: {}",
@@ -180,7 +189,7 @@ impl FieldMappingTransform {
             }
         }
 
-        Ok(())
+        Ok(rewrote)
     }
 
     /// Keep an unavailable-column list in step with the column names this stage rewrote.
@@ -243,8 +252,13 @@ impl FieldMappingTransform {
 
 impl Transform for FieldMappingTransform {
     fn apply(&self, event: &mut Event) -> Result<bool> {
-        self.apply_payload(event.before.row_mut())?;
-        self.apply_payload(event.after.as_mut())?;
+        let rewrote_before = self.apply_payload(event.before.row_mut())?;
+        let rewrote_after = self.apply_payload(event.after.as_mut())?;
+        // A renamed, copied or overwritten column no longer carries what the shape declares
+        // under that name — even where the column names happen to match a narrowing.
+        if rewrote_before || rewrote_after {
+            event.shape = None;
+        }
         if let Some(columns) = event.before.unavailable_columns_mut() {
             self.remap_unavailable(columns);
         }
@@ -380,6 +394,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -519,6 +534,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());
@@ -554,6 +570,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());

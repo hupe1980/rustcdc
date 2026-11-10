@@ -38,24 +38,12 @@ Replace these placeholders with your environment equivalents:
 
 If your deployment does not provide these wrappers, see [Deployment](@/docs/deployment.md) first and wire health/metrics/service controls before applying this runbook verbatim.
 
-> **The `rustcdc` crate ships no binary.** It has no `[[bin]]` target; `systemctl stop rustcdc`
-> and `curl localhost:9090/metrics` below refer to **your** wrapper, not to anything this crate
-> installs.
->
-> If you would rather not build that wrapper, [`rustcdc-server`](@/docs/_index.md) is it —
-> the same runtime with a supervised process, an admin API, Prometheus and OTLP, graceful
-> drain on `SIGTERM` and a container image. This runbook is for embedders who want the
-> runtime inside their own process. In particular:
->
-> - **Nothing flushes on SIGTERM unless you implement it.** Graceful drain is
->   `CdcRuntime::drain_and_stop()` — which returns the drained events and commits them, so **you
->   must consume the returned `Vec<Event>`**; dropping it is unrecoverable data loss. Use
->   `stop()` (refuses while events are uncommitted) or `force_stop()` (discards explicitly, returns
->   them for replay) if you do not intend to process them.
-> - **No HTTP server is provided.** The crate exposes `admin_snapshot_json()` and a Prometheus text
->   *renderer*; binding a port is the embedder's job.
-> - **Restart does not drain automatically.** Any "will drain pending events before restart"
->   behaviour is a property of your supervisor.
+> **The `rustcdc` crate ships no binary.** `systemctl stop rustcdc` and
+> `curl localhost:9090/metrics` below refer to **your** wrapper; [`rustcdc-server`](@/docs/_index.md)
+> is a ready-made one. Nothing flushes on SIGTERM unless you implement it:
+> `CdcRuntime::drain_and_stop()` commits and returns the drained events, so **you must consume
+> the returned `Vec<Event>`** — dropping it is data loss. No HTTP server is provided either:
+> the crate renders `admin_snapshot_json()` and Prometheus text; binding a port is yours.
 
 ---
 
@@ -472,7 +460,7 @@ Drop them with `sys.sp_cdc_disable_table` if needed.
 
 ### SQL Server Connection and Poll Tuning
 
-`SqlServerSourceConfig` now exposes explicit concurrency/throughput controls:
+`SqlServerSourceConfig` exposes explicit concurrency/throughput controls:
 
 - `prereq_pool_size`
 - `stream_poll_interval_ms`
@@ -628,16 +616,23 @@ streaming from a quiet database and one hung on a dead socket both report `state
 | `NotRunning` | The runtime has not been started, or has stopped. | No — but check it was intentional |
 
 `HealthVerdict::is_alertable()` returns `true` for exactly `Stalled`, so an embedder's health
-endpoint can gate on it directly. The verdict is derived from three independent signals, checked
+endpoint can gate on it directly. The verdict is derived from these signals, checked
 in this order. Each carries a stable `StallCause` to route on, and a `reason` naming the
 condition, the measurements and the remedy:
 
+0. **`SourcePositionLost`** — a poll or `start()` failed with
+   `SourceErrorKind::SlotInvalidated`: PostgreSQL invalidated the replication slot. Checked
+   first, and before `NotRunning`, because it explains every other symptom. Never cleared
+   within a run; the remedy is a new slot and a re-snapshot, not a restart.
 1. **`UnconfirmedSourcePosition`** — a checkpoint committed but the source-side confirmation
    (`confirmed_flush_lsn` and equivalents) failed repeatedly. Retention keeps growing at the
    source even though the consumer is making progress.
-2. **`PollLoopNotTurning`** — `now - last_poll_at_ms` exceeds `max_poll_wait_ms × 6` (floor
+2. **`DeliveryFailing`** — the embedder reported, through `record_delivery_failure`, that the
+   batch it holds keeps failing, for longer than the stall threshold. It is checked before the
+   next two because a held batch produces both of their symptoms.
+3. **`PollLoopNotTurning`** — `now - last_poll_at_ms` exceeds `max_poll_wait_ms × 6` (floor
    30s). Either a poll is blocked inside the source or nothing is calling `poll_event_batch`.
-3. **`ConsumerNotAcknowledging`** — events were polled but not committed, and
+4. **`ConsumerNotAcknowledging`** — events were polled but not committed, and
    `last_commit_at_ms` is stale. The embedder has stopped calling `commit_ack`; this is *not*
    a source problem.
 
@@ -654,13 +649,8 @@ which moves only when events actually arrive:
 | low | high | `Idle` — the database is quiet | **No.** Never page on this |
 | high | any | `Stalled { PollLoopNotTurning }` | **Yes** |
 
-This distinction is the entire reason the verdict exists, and it is worth stating what goes
-wrong without it. Until 0.15.0 the poll timestamp was recorded only on the path that
-*delivered* events, so on an idle source it froze at the last event while the loop kept
-turning perfectly. Thirty seconds of quiet then reported
-`Stalled { reason: "…the poll loop is blocked, not idle" }` — the alertable verdict, asserting
-the exact opposite of what was happening, on the most common benign state a pipeline has. If
-you are running an older build, that is what you are seeing, and the pipeline is fine.
+This distinction is the reason the verdict exists: a quiet database is the most common
+benign state a pipeline has, and it must never page.
 
 ### Comparing verdicts in your own code
 
@@ -686,14 +676,23 @@ an incident. It is a diagnostic to read beside the poll age, not a condition.
 Route on the cause rather than fanning one page out to everyone:
 
 ```promql
+# The database invalidated the replication slot — re-snapshot, do not restart.
+rustcdc_runtime_stall_cause{cause="source_position_lost"} == 1
+
 # The database is retaining log — a disk-fill risk on the source, not on this process.
 rustcdc_runtime_stall_cause{cause="unconfirmed_source_position"} == 1
+
+# The slot is lost at the next checkpoint unless the pipeline catches up.
+rustcdc_replication_slot_wal_status{status="unreserved"} == 1
 
 # The poll loop is not turning — this process, or the socket to the source.
 rustcdc_runtime_stall_cause{cause="poll_loop_not_turning"} == 1
 
 # Nothing is acknowledging — the embedder's commit path.
 rustcdc_runtime_stall_cause{cause="consumer_not_acknowledging"} == 1
+
+# The destination keeps refusing the held batch.
+rustcdc_runtime_stall_cause{cause="delivery_failing"} == 1
 ```
 
 The series is emitted only while stalled, so its presence is the condition; there is nothing

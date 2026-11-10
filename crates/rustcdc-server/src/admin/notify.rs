@@ -23,33 +23,43 @@ impl KafkaNotificationPublisher {
                 "invalid admin.notification_kafka compression configuration: {err}"
             ))
         })?;
-        let producer = Producer::builder()
-            .bootstrap_servers(config.normalized_brokers().join(","))
-            .client_id(config.client_id.clone())
-            .acks(Acks::All)
-            .idempotent(true)
-            .compression(compression)
-            .retries(config.retry_max_attempts)
-            .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
-            .request_timeout(Duration::from_millis(config.ack_timeout_ms))
-            .connect_timeout(crate::sink::kafka_connect_timeout(Duration::from_millis(
-                config.ack_timeout_ms,
-            )))
-            .delivery_timeout(Duration::from_millis(
-                config.ack_timeout_ms.saturating_add(
-                    config
-                        .retry_backoff_ms
-                        .saturating_mul(config.retry_max_attempts as u64),
-                ),
+        let request_timeout = Duration::from_millis(config.ack_timeout_ms);
+        let producer = crate::sink::kafka_builder(
+            config.normalized_brokers().join(","),
+            config.client_id.clone(),
+            request_timeout,
+            auth,
+        )
+        .connect()
+        .await
+        .map_err(|err| {
+            AppError::Other(format!(
+                "failed to connect the admin.notification_kafka producer: {err}"
             ))
-            .auth(auth)
-            .build()
-            .await
-            .map_err(|err| {
-                AppError::Other(format!(
-                    "failed to build admin.notification_kafka producer: {err}"
-                ))
-            })?;
+        })?
+        .producer()
+        .acks(Acks::All)
+        .idempotent(true)
+        .compression(compression)
+        // One notification at a time, flushed after each: there is nothing to batch, so a
+        // linger would only delay it.
+        .linger(Duration::ZERO)
+        .retry_backoff(Duration::from_millis(config.retry_backoff_ms))
+        // krafka retries until this budget is spent; it has no retry count.
+        .delivery_timeout(
+            request_timeout.saturating_add(Duration::from_millis(
+                config
+                    .retry_backoff_ms
+                    .saturating_mul(config.retry_max_attempts as u64),
+            )),
+        )
+        .build()
+        .await
+        .map_err(|err| {
+            AppError::Other(format!(
+                "failed to build admin.notification_kafka producer: {err}"
+            ))
+        })?;
 
         Ok(Self {
             topic: config.topic.clone(),
@@ -68,9 +78,9 @@ impl KafkaNotificationPublisher {
             .as_bytes()
             .to_vec();
 
-        let record = ProducerRecord::new(self.topic.clone(), payload).with_key(key);
+        let record = Record::new(self.topic.clone(), payload).key(key);
         let producer = self.producer.lock().await;
-        let metadata = producer.send_record(record).await.map_err(|err| {
+        let metadata = producer.send(record).await.map_err(|err| {
             AppError::Other(format!(
                 "failed to emit notification event to admin.notification_kafka topic {}: {err}",
                 self.topic

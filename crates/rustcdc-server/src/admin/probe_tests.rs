@@ -108,13 +108,18 @@ pub(super) async fn livez_fails_when_the_poll_loop_has_been_wedged_long_enough()
     assert_eq!(body, "poll-loop-stalled");
 }
 
-/// Restarting is the wrong remedy for two of the three stall causes.
+/// Restarting is the wrong remedy for every stall cause but a wedged poll loop.
+///
+/// `SourcePositionLost` is the clearest: the source discarded the WAL the slot was holding,
+/// and no restart recreates it — each one would replay into the same refusal.
 ///
 /// `UnconfirmedSourcePosition` is the important one: a restart replays from the same
 /// checkpoint and fails identically, while the source keeps retaining log. A crash-loop
 /// there makes a full `pg_wal` volume arrive *sooner*, so the probe must stay green and
 /// let the page do its job. `ConsumerNotAcknowledging` means the sink is not draining;
-/// restarting thrashes against a downstream that is already unhealthy.
+/// restarting thrashes against a downstream that is already unhealthy. `DeliveryFailing` is
+/// a destination refusing writes — a missing topic, a revoked ACL — which no restart creates
+/// or grants, and each restart replays the batch from the checkpoint.
 ///
 /// Branching on a stable `StallCause` is what makes this expressible at all — the reason
 /// string could only have been matched as prose.
@@ -123,8 +128,10 @@ pub(super) async fn livez_stays_green_for_stalls_a_restart_cannot_fix() {
     let admin = probe_admin().await;
 
     for cause in [
+        StallCause::SourcePositionLost,
         StallCause::UnconfirmedSourcePosition,
         StallCause::ConsumerNotAcknowledging,
+        StallCause::DeliveryFailing,
     ] {
         set_health(&admin, stalled(cause)).await;
         backdate_stall(&admin, LIVEZ_STALL_TIMEOUT * 10).await;
@@ -188,11 +195,7 @@ pub(super) async fn the_stall_clock_restarts_when_the_cause_changes() {
 pub(super) async fn readyz_reports_a_stall_and_names_its_cause() {
     let admin = probe_admin().await;
 
-    for cause in [
-        StallCause::PollLoopNotTurning,
-        StallCause::UnconfirmedSourcePosition,
-        StallCause::ConsumerNotAcknowledging,
-    ] {
+    for cause in StallCause::ALL.iter().copied() {
         set_health(&admin, stalled(cause)).await;
         let (status, body) = readyz_body(&admin).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{cause}");

@@ -296,12 +296,14 @@ impl MaskHashTransform {
         }
     }
 
-    fn apply_payload(&self, payload: Option<&mut Value>, table: &str) -> Result<()> {
+    /// Mask one payload; returns whether any value was rewritten.
+    fn apply_payload(&self, payload: Option<&mut Value>, table: &str) -> Result<bool> {
+        let mut masked = false;
         if let Some(value) = payload {
             let mut path_buf = String::new();
-            self.walk_value(value, &mut path_buf, table)?;
+            self.walk_value(value, &mut path_buf, table, &mut masked)?;
         }
-        Ok(())
+        Ok(masked)
     }
 
     /// Resolve the rule for a JSON path, honouring a trailing-segment `*` wildcard.
@@ -325,7 +327,13 @@ impl MaskHashTransform {
             .map(|(matched, rule)| (rule, matched.as_str()))
     }
 
-    fn walk_value(&self, value: &mut Value, path: &mut String, table: &str) -> Result<()> {
+    fn walk_value(
+        &self,
+        value: &mut Value,
+        path: &mut String,
+        table: &str,
+        masked: &mut bool,
+    ) -> Result<()> {
         // A rule targeting a container applies to the container as a whole.
         //
         // Previously only the scalar arm consulted `mask_rules`, so a rule on an
@@ -346,6 +354,7 @@ impl MaskHashTransform {
             && !matches!(rule, MaskRule::Passthrough)
         {
             *value = apply_rule(value, rule, &field_aad(table, path))?;
+            *masked = true;
             self.record_rule_hit(path.as_str());
             return Ok(());
         }
@@ -358,7 +367,7 @@ impl MaskHashTransform {
                         path.push('.');
                     }
                     path.push_str(key);
-                    self.walk_value(child, path, table)?;
+                    self.walk_value(child, path, table, masked)?;
                     path.truncate(prev);
                 }
             }
@@ -370,7 +379,7 @@ impl MaskHashTransform {
                         path.push('.');
                     }
                     let _ = write!(path, "{index}");
-                    self.walk_value(child, path, table)?;
+                    self.walk_value(child, path, table, masked)?;
                     path.truncate(prev);
                 }
             }
@@ -380,6 +389,7 @@ impl MaskHashTransform {
                     let rule = matched.map_or(&self.config.default_rule, |(rule, _)| rule);
                     if !matches!(rule, MaskRule::Passthrough) {
                         *value = apply_rule(value, rule, &field_aad(table, path))?;
+                        *masked = true;
                         if let Some((_, rule_path)) = matched {
                             // Record against the *configured* path, not the field path,
                             // so one `emails.*` rule counts every element it covered.
@@ -416,8 +426,13 @@ impl Transform for MaskHashTransform {
     fn apply(&self, event: &mut Event) -> Result<bool> {
         // Bind ciphertexts to the table they came from — see `field_aad`.
         let table = event.qualified_table_name();
-        self.apply_payload(event.before.row_mut(), &table)?;
-        self.apply_payload(event.after.as_mut(), &table)?;
+        let masked_before = self.apply_payload(event.before.row_mut(), &table)?;
+        let masked_after = self.apply_payload(event.after.as_mut(), &table)?;
+        // A masked or hashed value no longer has its column's declared type — a hashed
+        // `bigint` is a hex string — so the shape would tell a consumer to parse it wrongly.
+        if masked_before || masked_after {
+            event.shape = None;
+        }
         Ok(true)
     }
 
@@ -744,6 +759,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

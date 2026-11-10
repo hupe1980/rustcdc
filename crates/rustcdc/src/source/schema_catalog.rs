@@ -14,13 +14,13 @@
 //! `"12345.6789"`. The published guidance is "read with `value.as_str()` and parse", and
 //! parsing requires knowing what to parse it as.
 //!
-//! So every connector announces a table's schema **before that table's first row**, in both
-//! the snapshot and the stream, and the declared type is read from the catalogue rather
-//! than inferred from the replication protocol. What the protocols carry is not enough:
+//! So every row carries its table's shape ([`Event::shape`](crate::Event::shape)), in both
+//! the snapshot and the stream, and the declared type is read from the server rather than
+//! inferred from the replication protocol. What the protocols carry is not enough:
 //!
 //! | Source | What the log gives | What it costs |
 //! |---|---|---|
-//! | PostgreSQL | a type OID and a type modifier | pgoutput carries no nullability at all, and an OID alone loses `numeric(12,4)` to `numeric` |
+//! | PostgreSQL | a type OID and a type modifier | pgoutput carries no nullability or key; `format_type` of the OID and modifier names the type |
 //! | MySQL | a protocol type code plus a metadata block | `MYSQL_TYPE_NEWDECIMAL`, not `decimal(12,4)`; reconstructing the spelling would produce a *second* spelling beside the one the DDL parser already emits |
 //! | SQL Server | `cdc.captured_columns.column_type` | the base type name only — that table carries no precision, scale or length |
 //!
@@ -31,6 +31,7 @@
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 use std::collections::HashMap;
 
+#[cfg(any(feature = "postgres", feature = "sqlserver"))]
 use crate::schema_history::{ColumnDef, TableSchema};
 
 /// One column as the source's catalogue declares it.
@@ -106,6 +107,9 @@ pub(crate) type CatalogSchemas = HashMap<(String, String), Vec<CatalogColumn>>;
 /// key flag: under PostgreSQL's `REPLICA IDENTITY FULL` pgoutput flags *every* column as
 /// part of the replica identity, and treating that as the key published a table whose
 /// every column was a non-nullable primary key.
+///
+/// MySQL builds its shape from the binlog table map instead, so it has no caller there.
+#[cfg(any(feature = "postgres", feature = "sqlserver"))]
 pub(crate) fn table_schema_from_catalog(
     schema: &str,
     table: &str,
@@ -135,41 +139,30 @@ pub(crate) fn table_schema_from_catalog(
     }
 }
 
-/// The statement text carried by an observation event.
+/// The [`RowShape`](crate::RowShape) catalogue columns describe, shared by every row of the
+/// table through one `Arc`.
 ///
-/// Not SQL that was run — nothing ran. It is a comment naming the source of the
-/// description, so a reader of a dead-letter payload or an audit trail can tell an
-/// observation from a captured statement without consulting `ddl_type`.
-pub(crate) fn observed_statement(schema: &str, table: &str, source: &str) -> String {
-    format!("/* schema of {schema}.{table} observed from {source} */")
+/// `None` for no columns — an offline snapshot reads no catalogue and must not describe
+/// columns it did not read.
+pub(crate) fn row_shape_from_catalog(
+    schema: &str,
+    table: &str,
+    columns: &[CatalogColumn],
+    primary_keys: &[String],
+) -> Option<std::sync::Arc<crate::RowShape>> {
+    crate::RowShape::new(
+        schema,
+        table,
+        columns
+            .iter()
+            .map(|column| crate::ShapeColumn::new(&column.name, &column.data_type, column.nullable))
+            .collect(),
+        primary_keys.to_vec(),
+    )
+    .map(std::sync::Arc::new)
 }
 
-/// Attach the snapshot metadata a snapshot-path schema event must carry.
-///
-/// A schema event built from [`CapturedDdl`](crate::ddl_capture::CapturedDdl) has
-/// `snapshot: None`, and the runtime reads that as "this is a stream event": it then parses
-/// the event's offset as a *stream* position to build a checkpoint from. A snapshot has no
-/// such position — its progress is persisted by
-/// [`SnapshotHandle::checkpoint`](crate::source::SnapshotHandle) — so the parse fails and
-/// takes the poll with it, or worse, writes a stream checkpoint over a snapshot one.
-///
-/// Marking the event as part of the snapshot is what routes it the same way as the rows it
-/// precedes. Every connector's snapshot path must call this; the alternative, hand-crafting
-/// an offset each connector's parser happens to accept, is three chances to get it wrong.
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlserver"))]
-pub(crate) fn mark_as_snapshot_event(
-    event: &mut crate::core::Event,
-    snapshot_id: &str,
-    chunk_index: u32,
-) {
-    event.snapshot = Some(crate::core::SnapshotMetadata {
-        snapshot_id: snapshot_id.to_string(),
-        chunk_index,
-        is_last_chunk: false,
-    });
-}
-
-#[cfg(test)]
+#[cfg(all(test, any(feature = "postgres", feature = "sqlserver")))]
 mod tests {
     use super::*;
 
@@ -210,40 +203,6 @@ mod tests {
         let columns = vec![column("amount", "numeric(12,4)", true)];
         let schema = table_schema_from_catalog("public", "orders", &columns, &[]);
         assert_eq!(schema.columns[0].data_type, "numeric(12,4)");
-    }
-
-    /// A snapshot-path schema event must be marked as a snapshot event.
-    ///
-    /// Without it the runtime parses the event's offset as a stream position. That is not
-    /// hypothetical: a MySQL snapshot announcement carrying `mysql-bin.000003:205202:schema`
-    /// failed `parse_mysql_stream_offset` and took a crash-recovery suite down, and the SQL
-    /// Server equivalent wrote a `sqlserver` checkpoint where a `sqlserver_snapshot` one
-    /// belonged.
-    #[test]
-    fn a_snapshot_schema_event_is_marked_as_one() {
-        use crate::ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA};
-
-        let captured = CapturedDdl {
-            ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
-            schema: "public".into(),
-            table: "orders".into(),
-            statement: observed_statement("public", "orders", "a catalogue"),
-            result_schema: None,
-            schema_diff: None,
-            ts: 1,
-        };
-        let mut event = captured.to_event("postgres", "0/00000064".into(), 1);
-        assert!(
-            event.snapshot.is_none(),
-            "the builder does not set it; the snapshot path must"
-        );
-
-        mark_as_snapshot_event(&mut event, "snap-1", 7);
-
-        let snapshot = event.snapshot.expect("marked");
-        assert_eq!(snapshot.snapshot_id, "snap-1");
-        assert_eq!(snapshot.chunk_index, 7);
-        assert!(!snapshot.is_last_chunk);
     }
 
     #[test]

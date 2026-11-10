@@ -5,6 +5,140 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.20.0
+
+Every row now carries its table's shape. Fixes for the PostgreSQL snapshot (one of them a
+data-loss path), a health verdict for a failing destination and for a lost replication slot,
+current dependencies with one TLS stack in every build, and Homebrew. **Breaking**: see below.
+
+### Added: every row carries its table's shape (#27)
+
+Column values are text, so a consumer needs the declared types to parse them. 0.18 announced them
+in a separate event, which can reach a consumer after the rows it describes. Every row event now
+carries `shape` — schema, table, columns (name, declared type, nullability) and primary key — and
+its `id`, a digest of exactly those fields. A row decodes on its own: no second event, no topic
+ordering, no registry. The `READ_SCHEMA` announcement events are gone; the runtime records each new
+shape in schema history from the rows. Builds on #28 by vu2jpr.
+
+- **Current, within stated limits.** PostgreSQL takes declared types from the `RELATION` message
+  (`format_type(oid, typmod)`), so rows after `ALTER COLUMN … TYPE` carry the new type — 0.18 and
+  0.19 announced the type read at stream start. MySQL and MariaDB stamp the catalogue's shape only
+  when it agrees with the row's binlog table map (names, type family, nullability, key) and re-read
+  it after DDL and on resume; until it agrees, rows carry no shape. *Limits:* PostgreSQL
+  nullability and key are the catalogue's at its last read; a MySQL/MariaDB change within one type
+  family (`varchar(64)` to `varchar(128)`) is invisible to the table map; an incremental chunk
+  does not see a type change between its describe and its read. See
+  [schema evolution](site/content/docs/schema-evolution.md#every-row-carries-its-shape).
+- **Everywhere it is known:** snapshot, incremental snapshot and stream rows on PostgreSQL, MySQL,
+  MariaDB and SQL Server. No shape: the Snowflake source, truncate events, an offline snapshot.
+- **Transforms keep it honest.** A projection narrows the shape; a rename, mask, unwrap, outbox or
+  WASM stage removes it.
+- **Compact mode:** `runtime.row_shape = "id"` delivers the id alone, resolvable at
+  `GET /schemas/{id}` for every shape the server has delivered since it started. Kafka records
+  carry the id in the `__rustcdc.row_shape` header; CloudEvents set
+  `dataschema = urn:rustcdc:row-shape:<id>`. JSON, Avro and Protobuf carry the shape.
+
+### Fixed: a PostgreSQL snapshot lost rows when a read failed part-way through a chunk
+
+A chunk can span tables. When the read for the second table failed after the first table's last
+rows were in the chunk, the chunk was discarded with the error after that table's progress had
+moved past them — rows never delivered and never read again. They are now delivered, and the
+failure surfaces on the next read.
+
+### Fixed: PostgreSQL snapshots (#24, #25, #26)
+
+- **Retry after a failed read (#26).** A failed statement aborted the snapshot's
+  `REPEATABLE READ` transaction and every retry failed with `25P02`. The next read now opens a
+  fresh one, keeping the original watermark: the snapshot continues from a new read point, and
+  changes in between arrive through the stream.
+- **More than 50 columns (#24).** The row was built with one `json_build_object` call, two
+  arguments per column, and PostgreSQL caps a call at 100. It is `json_object(text[], text[])`
+  now, on the initial snapshot, the incremental snapshot and `reselect_unavailable_columns`.
+- **The server's error (#25).** Every PostgreSQL client error carries the SQLSTATE and message,
+  and the detail and hint when sent — `42501: permission denied for table orders`, not `db error`.
+
+### Changed: unmodified TOAST under `REPLICA IDENTITY FULL` is completed (#22)
+
+An unmodified column's new value is its old value, and under `FULL` the old tuple carries it, so
+`after` is completed from the same WAL record instead of listing the column as unavailable.
+
+### Added: health verdicts that route to the right owner (#21)
+
+- **`delivery_failing`.** A sink that kept refusing a batch read as `idle`, and the runtime's own
+  verdict for a held batch was `poll_loop_not_turning` — which `/livez` restarts on, replaying into
+  the same refusal. `StallCause::DeliveryFailing` names it with the destination's last error;
+  embedders report failures with `CdcRuntime::record_delivery_failure`. SIGTERM interrupts a sink
+  retry backoff, and a send timeout names its table.
+- **`source_position_lost`.** A slot PostgreSQL invalidates (`max_slot_wal_keep_size`, 18's
+  `idle_replication_slot_timeout`) is `SourceErrorKind::SlotInvalidated`, decided by SQLSTATE and
+  the slot's row in `pg_replication_slots`, never by message text. The server parks — alive,
+  `/livez` 200, `/readyz` 503 — and never re-snapshots on its own: a re-snapshot cannot replay rows
+  deleted in the gap. `rustcdc_replication_slot_wal_status` and
+  `rustcdc_replication_slot_safe_wal_size_bytes` warn while the slot is still `unreserved`.
+- Both causes keep `/livez` green and have alert rules; a test holds the rules to every cause.
+- A reconnect returns a non-recoverable source error at once instead of spending its retry budget.
+
+### Fixed
+
+- **Empty Kafka transactions.** A route that received no record in a batch still committed an
+  empty transaction, which the broker refuses. The transaction now opens on its first record.
+- **A built-in connector held as `dyn Source` never connected.** `Source::connect` and
+  `Source::close` default to no-ops and the three built-in connectors did not override them.
+- **MySQL TLS panicked in a build linking two rustls providers** (`mysql` with `glue` or
+  `sqlserver`): the driver reads only the process default, which rustls cannot pick between
+  `ring` and `aws-lc-rs`. The connector installs `ring` when no default is installed; an
+  embedder that wants `aws-lc-rs` installs it before connecting.
+
+### Changed: dependencies and packaging
+
+`iceberg` **0.11**, `opendal` **0.58**, `krafka` **0.29**, `schemreg` **0.7**, `wasmtime` **50**,
+`tiberius` **0.13**, `axum-server` **0.9**; `zip` removed. **MSRV 1.97.0**, set by `wasmtime` 50.
+
+- **One TLS stack in every build.** `tiberius` 0.13 is on `rustls` 0.23, removing the second stack
+  `sqlserver` linked and its four advisories. Six suppressions left `deny.toml`; three remain, none
+  on an untrusted-TLS path. SQL Server 2025 joins 2019 and 2022 in the tested matrix.
+- **No suite pulls a `latest` image.** The brokers and SQL Server (which floated as `2022-latest`)
+  are pinned, and the policy gate fails on a `latest` tag.
+- **Homebrew:** `brew install hupe1980/tap/rustcdc` (macOS Apple Silicon, Linux x86_64 and arm64,
+  static musl). Each release attaches the binaries and `checksums.txt`.
+
+### Breaking
+
+1. **MSRV 1.97.0.**
+2. **`READ_SCHEMA` events are gone**, with `DDL_TYPE_READ_SCHEMA` and
+   `CapturedDdl::is_observation`. PostgreSQL emits a schema event only when a relation changes.
+   `CapturedDdl::history_identity` is now always position-derived; it was content-derived for
+   observations.
+3. **`Event` gained `shape`** in every envelope: `EVENT_JSON_SCHEMA` (closed by
+   `additionalProperties: false`, so a pinned copy rejects it), Avro, and Protobuf (field 16;
+   `ProtoEvent` gained `pub shape`, so its struct literals stop compiling).
+4. **`SnapshotTable` gained `shape`**, and `PostgresSourceConfig` gained
+   `slot_state_sample_interval_ms`: struct literals without `..Default::default()` stop compiling.
+5. **Under `REPLICA IDENTITY FULL`, an unchanged-TOAST update is a full-row write:**
+   `row_write()` returns `Replace` where it returned `Merge`.
+6. **New stall causes.** A held, failing batch is `delivery_failing` and a lost slot is
+   `source_position_lost`; both were `poll_loop_not_turning`, and the server parks on a lost slot
+   instead of exiting.
+
+### Migrating
+
+- Read column types from each row's `shape`. A consumer that waited for `READ_SCHEMA` can stop;
+  DDL still arrives as `op = "schema_change"` on `<table>__ddl_events`, and a templated Kafka sink
+  still needs those topics.
+- Take the new JSON Schema if you validate against a pinned copy.
+- Under `FULL`, a consumer that merged `before` into `after` for TOAST columns can stop.
+- Route `rustcdc_runtime_stall_cause{cause="delivery_failing"}` to the destination's owner and
+  `source_position_lost` and `rustcdc_replication_slot_wal_status{status="unreserved"}` to the
+  database team; the shipped alert rules do.
+
+### Evidence
+
+`1 262` library and `592` server unit tests and the doctests, green, with `clippy -D warnings`,
+`cargo deny` and the policy gate. Container suites: PostgreSQL 16 (snapshot, incremental snapshot,
+stream, handoff, type fidelity, reselect, restart, process crash), connection on 12, 14 and 15,
+slot invalidation on 18; MySQL, MariaDB, SQL Server 2019/2022/2025 and the server's Kafka and
+PostgreSQL suites. Every new test was run against its defect planted back and failed.
+
 ## 0.19.0
 
 A fix for the release before it. 0.18.0 announces every table before its first row; on a Kafka

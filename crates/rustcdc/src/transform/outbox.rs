@@ -120,6 +120,8 @@ impl Transform for OutboxTransform {
                 // partition / ordering key (e.g., Kafka partition key for per-aggregate
                 // ordering guarantees).
                 event.primary_key = Some(vec![aggregate_id]);
+                // The payload is the application's document, not the outbox table's row.
+                event.shape = None;
                 Ok(true)
             }
         }
@@ -157,6 +159,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -247,6 +250,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unwrapped_outbox_event_carries_no_shape() {
+        let transform = OutboxTransform::new("outbox");
+        let mut e = event(
+            "outbox",
+            json!({"aggregate_id": "o1", "event_type": "order.placed", "payload": {"id": 1}}),
+        );
+        e.shape = Some(std::sync::Arc::new(
+            crate::core::RowShape::new(
+                "public",
+                "outbox",
+                vec![
+                    crate::core::ShapeColumn::new("aggregate_id", "text", false),
+                    crate::core::ShapeColumn::new("event_type", "text", false),
+                    crate::core::ShapeColumn::new("payload", "jsonb", false),
+                ],
+                vec!["aggregate_id".into()],
+            )
+            .unwrap(),
+        ));
+        transform.apply(&mut e).unwrap();
+        assert!(
+            e.shape.is_none(),
+            "the payload is the application's document, not the outbox table's row"
+        );
+    }
+
     // ── Operation guard: Delete / Update / Truncate on outbox table ──────────
 
     #[tokio::test]
@@ -271,6 +301,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         // Must not error — cleanup rows must be passed through (or filtered upstream).
@@ -300,6 +331,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         assert!(
@@ -336,6 +368,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
         assert!(transform.apply(&mut e).unwrap());

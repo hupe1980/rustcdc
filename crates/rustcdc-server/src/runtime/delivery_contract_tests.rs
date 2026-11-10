@@ -77,11 +77,31 @@ struct ScriptedStream {
     total: u64,
     next_seq: u64,
     batch_size: usize,
+    /// Fail every read as a source whose replication slot was invalidated.
+    slot_lost: bool,
+}
+
+/// Where a scripted source reports its replication slot as invalidated, if anywhere.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LostSlot {
+    Never,
+    OnPoll,
+    OnStart,
+}
+
+fn slot_invalidated() -> rustcdc::core::Error {
+    rustcdc::core::Error::source_error(
+        rustcdc::core::SourceErrorKind::SlotInvalidated,
+        "postgres invalidated replication slot 'cdc' (invalidation_reason = wal_removed)",
+    )
 }
 
 #[async_trait]
 impl StreamHandle for ScriptedStream {
     async fn next_events(&mut self, _timeout_ms: u64) -> rustcdc::core::Result<Vec<Event>> {
+        if self.slot_lost {
+            return Err(slot_invalidated());
+        }
         let mut events = Vec::new();
         while events.len() < self.batch_size && self.next_seq < self.total {
             self.next_seq += 1;
@@ -136,6 +156,7 @@ struct ScriptedSource {
     batch_size: usize,
     /// Where `start_stream` was asked to resume from, recorded for assertion.
     resumed_from: Arc<Mutex<Option<u64>>>,
+    lost_slot: LostSlot,
 }
 
 #[async_trait]
@@ -151,12 +172,16 @@ impl Source for ScriptedSource {
         &mut self,
         resume_from: Option<&dyn Offset>,
     ) -> rustcdc::core::Result<Box<dyn StreamHandle>> {
+        if self.lost_slot == LostSlot::OnStart {
+            return Err(slot_invalidated());
+        }
         let next_seq = resume_sequence(resume_from);
         *self.resumed_from.lock().expect("resume lock") = Some(next_seq);
         Ok(Box::new(ScriptedStream {
             total: self.total,
             next_seq,
             batch_size: self.batch_size,
+            slot_lost: self.lost_slot == LostSlot::OnPoll,
         }))
     }
 
@@ -219,13 +244,32 @@ impl Pipeline {
         total: u64,
         batch_size: usize,
     ) -> Self {
-        let mut pipeline = Self::start_with_max_event_bytes(
+        Self::start_with_unreachable_sink_and_threshold(
+            state_dir,
+            output_path,
+            total,
+            batch_size,
+            None,
+        )
+        .await
+    }
+
+    async fn start_with_unreachable_sink_and_threshold(
+        state_dir: &Path,
+        output_path: &Path,
+        total: u64,
+        batch_size: usize,
+        health_stall_threshold_ms: Option<u64>,
+    ) -> Self {
+        let mut pipeline = Self::start_with_options(
             state_dir,
             output_path,
             total,
             batch_size,
             &[],
             1 << 20,
+            health_stall_threshold_ms,
+            LostSlot::Never,
         )
         .await;
 
@@ -262,6 +306,36 @@ impl Pipeline {
         faults: &[CheckpointFault],
         max_event_bytes: usize,
     ) -> Self {
+        Self::start_with_options(
+            state_dir,
+            output_path,
+            total,
+            batch_size,
+            faults,
+            max_event_bytes,
+            None,
+            LostSlot::Never,
+        )
+        .await
+    }
+
+    /// A pipeline whose source reports its replication slot invalidated. Under
+    /// [`LostSlot::OnStart`] the runtime is left unstarted, for the caller to start.
+    async fn start_with_lost_slot(state_dir: &Path, output_path: &Path, lost: LostSlot) -> Self {
+        Self::start_with_options(state_dir, output_path, 3, 3, &[], 1 << 20, None, lost).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_options(
+        state_dir: &Path,
+        output_path: &Path,
+        total: u64,
+        batch_size: usize,
+        faults: &[CheckpointFault],
+        max_event_bytes: usize,
+        health_stall_threshold_ms: Option<u64>,
+        lost_slot: LostSlot,
+    ) -> Self {
         let mut app_config = config_for(state_dir, output_path);
         app_config.runtime.max_event_bytes = max_event_bytes;
         app_config.runtime.sink_flush_interval_events = 1;
@@ -283,18 +357,25 @@ impl Pipeline {
         }
 
         let resumed_from = Arc::new(Mutex::new(None));
-        let runtime_config = RuntimeConfig::new(
+        let mut runtime_config = RuntimeConfig::new(
             RuntimeSourceConfig::disabled(),
             checkpoint,
             state.schema_history,
         );
+        if let Some(threshold_ms) = health_stall_threshold_ms {
+            runtime_config.options.max_poll_wait_ms = 10;
+            runtime_config.options.health_stall_threshold_ms = Some(threshold_ms);
+        }
         let mut runtime = CdcRuntime::new(runtime_config).expect("runtime");
         runtime.register_source(Box::new(ScriptedSource {
             total,
             batch_size,
             resumed_from: Arc::clone(&resumed_from),
+            lost_slot,
         }));
-        runtime.start().await.expect("runtime start");
+        if lost_slot != LostSlot::OnStart {
+            runtime.start().await.expect("runtime start");
+        }
 
         let recovery_policy = RecoveryPolicyConfig {
             initial_backoff_ms: 1,
@@ -361,6 +442,7 @@ impl Pipeline {
                 &mut self.recoverable,
                 &mut self.metrics,
                 &self.sink_metrics,
+                None,
                 None,
                 batch,
             )
@@ -481,6 +563,7 @@ async fn a_transient_sink_failure_is_retried_under_the_recovery_policy_then_esca
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
         None,
+        None,
         batch,
     )
     .await;
@@ -499,6 +582,126 @@ async fn a_transient_sink_failure_is_retried_under_the_recovery_policy_then_esca
     assert!(
         started.elapsed() >= std::time::Duration::from_millis(1),
         "the retries must actually back off rather than spin"
+    );
+}
+
+/// **While a batch is retried, the published verdict says delivery is failing.**
+///
+/// The verdict was latched only after a committed batch, so a sink that refused writes for
+/// five minutes was reported `idle` for five minutes. And once the runtime's own verdict
+/// was consulted, a held batch looked like a poll loop that stopped turning — the cause
+/// `/livez` restarts on, which cannot fix a destination that refuses writes.
+///
+/// A 1 s stall threshold and 200 ms backoffs: the retries outlast the threshold, and the
+/// last publish before escalation must name the delivery.
+#[tokio::test]
+async fn a_failing_delivery_is_published_as_its_own_stall_while_the_batch_is_retried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline =
+        Pipeline::start_with_unreachable_sink_and_threshold(dir.path(), &output, 3, 3, Some(1_000))
+            .await;
+    pipeline.recovery_policy.initial_backoff_ms = 200;
+    pipeline.recovery_policy.max_backoff_ms = 200;
+    pipeline.recovery_policy.breaker_consecutive_threshold = 8;
+    pipeline.recoverable = RecoverableErrorState::new(200);
+
+    let batch = pipeline.runtime.poll_event_batch().await.expect("poll");
+    let outcome = handle_polled_batch(
+        &mut pipeline.runtime,
+        &mut pipeline.router,
+        &pipeline.transform_pipeline,
+        &pipeline.admin_state,
+        &pipeline.checkpoint_age_source,
+        &mut pipeline.reconciler,
+        &pipeline.loop_config,
+        &pipeline.recovery_policy,
+        &mut pipeline.recoverable,
+        &mut pipeline.metrics,
+        &pipeline.sink_metrics,
+        None,
+        None,
+        batch,
+    )
+    .await;
+    assert!(
+        outcome.is_some(),
+        "the unreachable sink must eventually escalate"
+    );
+
+    let health = pipeline.admin_state.health_snapshot_for_tests().await;
+    assert_eq!(
+        health,
+        (
+            Some("stalled".to_string()),
+            Some("delivery_failing".to_string())
+        ),
+        "the verdict published during the retries must name the failing delivery"
+    );
+    assert_eq!(
+        pipeline.admin_state.batches_processed_for_tests().await,
+        0,
+        "publishing health during a retry must not count a batch that never delivered"
+    );
+}
+
+/// **A shutdown request is honoured during a retry backoff.**
+///
+/// The event loop's signal arm cannot run while a batch is held, so SIGTERM during a
+/// backoff was ignored until the batch delivered or escalated — an orchestrator then
+/// SIGKILLs. The batch stays uncommitted and redelivers from the checkpoint.
+#[tokio::test]
+async fn a_shutdown_request_interrupts_a_retry_backoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline = Pipeline::start_with_unreachable_sink(dir.path(), &output, 3, 3).await;
+    // A minute between attempts: without the signal the test would hang here.
+    pipeline.recovery_policy.initial_backoff_ms = 60_000;
+    pipeline.recovery_policy.max_backoff_ms = 60_000;
+    pipeline.recoverable = RecoverableErrorState::new(60_000);
+
+    let (trigger, mut signals) = super::event_loop::ShutdownSignals::for_tests();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = trigger.send(());
+    });
+
+    let started = std::time::Instant::now();
+    let batch = pipeline.runtime.poll_event_batch().await.expect("poll");
+    let outcome = handle_polled_batch(
+        &mut pipeline.runtime,
+        &mut pipeline.router,
+        &pipeline.transform_pipeline,
+        &pipeline.admin_state,
+        &pipeline.checkpoint_age_source,
+        &mut pipeline.reconciler,
+        &pipeline.loop_config,
+        &pipeline.recovery_policy,
+        &mut pipeline.recoverable,
+        &mut pipeline.metrics,
+        &pipeline.sink_metrics,
+        None,
+        Some(&mut signals),
+        batch,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Some(crate::runtime::lifecycle::RuntimeLoopOutcome::Clean(
+                crate::runtime::lifecycle::RuntimeTerminalReasonCode::ShutdownSignal
+            ))
+        ),
+        "a shutdown during the backoff must stop cleanly"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the backoff must not run to completion first"
+    );
+    assert!(
+        pipeline.runtime.stop().await.is_err(),
+        "the held batch stays uncommitted, so it redelivers from the checkpoint"
     );
 }
 
@@ -531,6 +734,7 @@ async fn an_oversized_event_fails_immediately_without_retrying() {
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
+        None,
         None,
         batch,
     )
@@ -592,6 +796,7 @@ async fn a_poison_event_is_quarantined_and_the_batch_completes() {
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
         Some(&dlq),
+        None,
         batch,
     )
     .await;
@@ -648,6 +853,7 @@ async fn without_a_dead_letter_target_a_poison_event_still_halts() {
         &mut pipeline.recoverable,
         &mut pipeline.metrics,
         &pipeline.sink_metrics,
+        None,
         None,
         batch,
     )
@@ -824,5 +1030,160 @@ async fn the_at_least_once_crash_window_replays_the_uncheckpointed_batch() {
          duplicates stop appearing here, something has changed the checkpoint ordering \
          for a non-transactional sink — that is a behaviour change to investigate, not \
          an improvement to accept silently."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A lost replication slot
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wait until the published verdict names the lost slot, then return the `/metrics` body.
+async fn await_parked_verdict(admin_state: &AdminState) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let health = admin_state.health_snapshot_for_tests().await;
+        if health
+            == (
+                Some("stalled".to_string()),
+                Some("source_position_lost".to_string()),
+            )
+        {
+            return admin_state.metrics_exposition().await;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the verdict was never published as stalled/source_position_lost: {health:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Drive `parked` to completion while `observe` runs, and report whether `parked` returned
+/// only after `observe` released it.
+async fn returns_only_when_released<F, O>(
+    parked: F,
+    observe: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> O,
+) -> (F::Output, bool)
+where
+    F: std::future::Future,
+    O: std::future::Future<Output = ()>,
+{
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watched = {
+        let released = Arc::clone(&released);
+        async move {
+            let outcome = parked.await;
+            let was_released = released.load(std::sync::atomic::Ordering::SeqCst);
+            (outcome, was_released)
+        }
+    };
+    let (result, ()) = tokio::join!(watched, observe(released));
+    result
+}
+
+/// **A slot the source invalidated mid-run parks the process instead of ending it.**
+///
+/// Exiting hands the orchestrator a restart that replays into the same refusal, and a
+/// restart cannot recreate the discarded WAL. The loop must publish the verdict — on the
+/// `/metrics` body an alert reads, not only on the latch — stay up, and stop cleanly when
+/// asked.
+#[tokio::test]
+async fn the_server_parks_rather_than_exits_on_a_lost_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline = Pipeline::start_with_lost_slot(dir.path(), &output, LostSlot::OnPoll).await;
+    let (trigger, signals) = super::event_loop::ShutdownSignals::for_tests();
+    let admin_state = pipeline.admin_state.clone();
+    let mut admin_exit_rx = None;
+
+    let parked = super::event_loop::execute_event_loop(
+        &mut pipeline.runtime,
+        &mut pipeline.router,
+        &pipeline.transform_pipeline,
+        &pipeline.admin_state,
+        &mut admin_exit_rx,
+        &pipeline.checkpoint_age_source,
+        &mut pipeline.reconciler,
+        &pipeline.sink_metrics,
+        None,
+        loop_config_for(&config_for(dir.path(), &output)),
+        signals,
+    );
+    let (outcome, released) = returns_only_when_released(parked, |released| async move {
+        let metrics = await_parked_verdict(&admin_state).await;
+        assert!(
+            metrics.contains("cause=\"source_position_lost\"} 1"),
+            "the /metrics body must carry the cause an alert routes on:\n{metrics}"
+        );
+        // Long enough for an exit, or a retry loop, to have happened.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = trigger.send(());
+    })
+    .await;
+
+    assert!(released, "the loop returned before it was told to stop");
+    assert!(
+        matches!(
+            outcome,
+            crate::runtime::lifecycle::RuntimeLoopOutcome::Clean(
+                crate::runtime::lifecycle::RuntimeTerminalReasonCode::ShutdownSignal
+            )
+        ),
+        "a parked process must stop cleanly on a signal"
+    );
+}
+
+/// **A slot found invalidated at startup parks exactly as one lost mid-run does.**
+#[tokio::test]
+async fn a_lost_slot_at_startup_parks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out.jsonl");
+    let mut pipeline = Pipeline::start_with_lost_slot(dir.path(), &output, LostSlot::OnStart).await;
+    pipeline
+        .admin_state
+        .set_state(crate::admin::InstanceState::Running)
+        .await;
+    let (trigger, mut signals) = super::event_loop::ShutdownSignals::for_tests();
+    let admin_state = pipeline.admin_state.clone();
+    let mut admin_exit_rx = None;
+    let metrics = RuntimeLoopMetricsAccumulator::new(
+        "file_jsonl",
+        DeliveryContract::AtLeastOnce.as_label(),
+        true,
+        "at_least_once",
+        false,
+        false,
+        16,
+        1024,
+    );
+
+    let parked = crate::commands::run::start_or_park(
+        &mut pipeline.runtime,
+        &pipeline.admin_state,
+        &mut admin_exit_rx,
+        metrics,
+        &mut signals,
+    );
+    let (outcome, released) = returns_only_when_released(parked, |released| async move {
+        await_parked_verdict(&admin_state).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = trigger.send(());
+    })
+    .await;
+
+    assert!(
+        released,
+        "start_or_park returned before it was told to stop"
+    );
+    assert!(
+        matches!(
+            outcome,
+            Ok(Some(crate::runtime::lifecycle::RuntimeLoopOutcome::Clean(
+                crate::runtime::lifecycle::RuntimeTerminalReasonCode::ShutdownSignal
+            )))
+        ),
+        "a lost slot at startup must park and then stop cleanly, not fail the start"
     );
 }

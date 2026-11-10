@@ -1,5 +1,6 @@
 //! PostgreSQL source configuration, connection lifecycle, and validation helpers.
 
+use pg_error::PgError;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -22,7 +23,9 @@ mod decoder;
 mod handoff;
 pub mod incremental_snapshot;
 mod parser;
+mod pg_error;
 mod query;
+mod relation_catalog;
 mod reselect;
 mod snapshot_chunk;
 mod snapshot_finalize;
@@ -78,21 +81,25 @@ pub struct PostgresStreamHandle {
     stream: PostgresStream,
     provider: Box<dyn PgOutputMessageProvider>,
     relation_map: HashMap<u32, PgRelation>,
+    /// Per relation, the shape its rows carry, rebuilt on each changed `RELATION` message;
+    /// see [`Event::shape`](crate::Event::shape).
+    relation_shapes: HashMap<u32, std::sync::Arc<crate::RowShape>>,
+    /// Resolves what a `RELATION` message does not carry. `None` only in unit tests, which
+    /// then describe types from the wire OID alone.
+    relation_catalog: Option<Box<dyn relation_catalog::RelationCatalog>>,
+    /// `format_type(oid, typmod)` per pair already resolved, so a type is asked for once.
+    type_names: HashMap<(u32, i32), String>,
     /// Real primary key of each published table, by `(schema, table)`, read from the catalog
-    /// once at stream start.
+    /// at stream start and again for a table whose `RELATION` changes.
     ///
     /// Needed because pgoutput's per-column key flag means "part of the replica identity", and
     /// under `REPLICA IDENTITY FULL` PostgreSQL sets it on every column. See
     /// [`query_publication_primary_keys`](super::postgres::query::query_publication_primary_keys)
     /// for what reading the flag as a primary key breaks.
     catalog_primary_keys: HashMap<(String, String), Vec<String>>,
-    /// Declared column types and nullability of every published table, read from the
-    /// catalog once at stream start.
-    ///
-    /// pgoutput carries a type OID, a type modifier it never used to read, and no
-    /// nullability at all — so the schema a RELATION message can describe on its own is
-    /// incomplete in three ways. See
-    /// [`query_publication_column_types`](super::postgres::query::query_publication_column_types).
+    /// Columns of every published table, read from the catalog at stream start and again for
+    /// a table whose `RELATION` changes. Only their nullability is used: pgoutput carries
+    /// none, while the declared type comes from the `RELATION` itself.
     catalog_columns: crate::source::schema_catalog::CatalogSchemas,
     /// Relations already warned about for an unusable REPLICA IDENTITY.
     ///
@@ -129,8 +136,15 @@ pub struct PostgresStreamHandle {
     slot_idle_advance_interval_ms: u64,
     /// Tracks when `idle_advance` was last called to gate the advance interval.
     last_idle_advance_at: Option<std::time::Instant>,
-    /// Tracks when slot lag was last measured, to gate the sampling interval.
+    /// When the slot was last sampled (lag and state), to gate the sampling interval.
+    last_slot_sample_at: Option<std::time::Instant>,
+    /// When slot lag was last *measured*; `None` means not measured on this transport.
     last_slot_lag_at: Option<std::time::Instant>,
+    /// Overrides the sampling cadence. See
+    /// [`PostgresSourceConfig::slot_state_sample_interval_ms`].
+    slot_state_sample_interval_ms: Option<u64>,
+    /// The slot's state at the last sample.
+    last_slot_state: Option<parser::SlotState>,
     /// Most recently observed WAL lag in bytes from the last `idle_advance` call.
     ///
     /// `0` before the first idle advance is executed.
@@ -158,13 +172,13 @@ impl PostgresStreamHandle {
     /// turns off idle advance still needs the lag metric, and gating the measurement on the
     /// advance is what made it stale in the first place.
     fn slot_lag_sample_due(&self) -> bool {
-        let interval_ms = if self.slot_idle_advance_interval_ms > 0 {
-            self.slot_idle_advance_interval_ms
-        } else {
-            DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS
+        let interval_ms = match self.slot_state_sample_interval_ms {
+            Some(interval_ms) => interval_ms,
+            None if self.slot_idle_advance_interval_ms > 0 => self.slot_idle_advance_interval_ms,
+            None => DEFAULT_SLOT_LAG_SAMPLE_INTERVAL_MS,
         };
         let threshold = std::time::Duration::from_millis(interval_ms);
-        self.last_slot_lag_at
+        self.last_slot_sample_at
             .map(|at| at.elapsed() >= threshold)
             .unwrap_or(true)
     }
@@ -188,6 +202,9 @@ impl PostgresStreamHandle {
             stream,
             provider,
             relation_map: HashMap::new(),
+            relation_shapes: HashMap::new(),
+            relation_catalog: None,
+            type_names: HashMap::new(),
             catalog_primary_keys,
             catalog_columns,
             warned_replica_identity: std::collections::HashSet::new(),
@@ -202,13 +219,29 @@ impl PostgresStreamHandle {
             stream_poll_interval_ms: stream_poll_interval_ms.max(1),
             slot_idle_advance_interval_ms,
             last_idle_advance_at: None,
+            last_slot_sample_at: None,
             last_slot_lag_at: None,
+            slot_state_sample_interval_ms: None,
+            last_slot_state: None,
             last_slot_lag_bytes: 0,
             table_include_list,
             table_exclude_list,
             reselect_client,
             reselect_column_types: reselect::ColumnTypeCache::new(),
         }
+    }
+
+    fn with_slot_state_sample_interval_ms(mut self, interval_ms: Option<u64>) -> Self {
+        self.slot_state_sample_interval_ms = interval_ms;
+        self
+    }
+
+    fn with_relation_catalog(
+        mut self,
+        catalog: Box<dyn relation_catalog::RelationCatalog>,
+    ) -> Self {
+        self.relation_catalog = Some(catalog);
+        self
     }
 }
 
@@ -482,7 +515,7 @@ impl PostgresSnapshotHandle {
             client
                 .query(&query, &params)
                 .await
-                .map_err(|error| {
+                .map_err(PgError::from).map_err(|error| {
                     Error::SourceError(format!(
                         "failed fetching snapshot rows for table '{schema}.{table_name}' after cursor {last_pk_cursor}: {error}"
                     ))
@@ -494,11 +527,15 @@ impl PostgresSnapshotHandle {
                  ORDER BY {order_expr} \
                  LIMIT $1"
             );
-            client.query(&query, &[&limit]).await.map_err(|error| {
-                Error::SourceError(format!(
-                    "failed fetching snapshot rows for table '{schema}.{table_name}': {error}"
-                ))
-            })?
+            client
+                .query(&query, &[&limit])
+                .await
+                .map_err(PgError::from)
+                .map_err(|error| {
+                    Error::SourceError(format!(
+                        "failed fetching snapshot rows for table '{schema}.{table_name}': {error}"
+                    ))
+                })?
         };
 
         let mut decoded = Vec::with_capacity(rows.len());
@@ -679,6 +716,17 @@ pub struct PostgresSourceConfig {
     /// Default: `false`.
     #[serde(default)]
     pub capture_logical_messages: bool,
+    /// How often, in milliseconds, to sample the replication slot's lag and state
+    /// (`wal_status`, `safe_wal_size`).
+    ///
+    /// The sample is what reports a slot as `unreserved` — lost at the next checkpoint
+    /// unless the pipeline catches up — and what detects a slot the server has invalidated
+    /// when no read fails. One catalogue query per sample, none per event.
+    ///
+    /// Default: unset, which samples every `slot_idle_advance_interval_ms`, or every 15 s
+    /// when idle advance is disabled.
+    #[serde(default)]
+    pub slot_state_sample_interval_ms: Option<u64>,
 }
 
 /// How the connector reads the WAL stream from PostgreSQL.
@@ -802,7 +850,7 @@ impl PostgresConnection {
                     .map_err(|error| {
                         Error::SourceError(format!(
                             "postgres plaintext connection failed: {}",
-                            crate::core::render_error_chain(&error)
+                            PgError::from(error)
                         ))
                     })?;
                 let connection_task = tokio::spawn(run_connection_task(connection));
@@ -871,7 +919,7 @@ impl PostgresConnection {
                         .map_err(|error| {
                             Error::SourceError(format!(
                                 "postgres tls connection failed: {}",
-                                crate::core::render_error_chain(&error)
+                                PgError::from(error)
                             ))
                         })?;
 
@@ -892,15 +940,13 @@ impl PostgresConnection {
                 use tokio_postgres_rustls::MakeRustlsConnect;
                 let tls_connector = MakeRustlsConnect::new((*rustls_cfg.0).clone());
                 let connect_config = self.config.build_connect_config()?;
-                let (client, connection) =
-                    connect_config
-                        .connect(tls_connector)
-                        .await
-                        .map_err(|error| {
-                            Error::SourceError(format!(
-                                "postgres rustls connection failed: {error}"
-                            ))
-                        })?;
+                let (client, connection) = connect_config
+                    .connect(tls_connector)
+                    .await
+                    .map_err(PgError::from)
+                    .map_err(|error| {
+                        Error::SourceError(format!("postgres rustls connection failed: {error}"))
+                    })?;
                 let connection_task = tokio::spawn(run_connection_task(connection));
                 self.validate_connected_client(&client).await?;
                 let client = Arc::new(client);
@@ -993,7 +1039,7 @@ impl PostgresConnection {
             let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
             loop {
                 interval.tick().await;
-                if let Err(error) = client.simple_query("SELECT 1").await {
+                if let Err(error) = client.simple_query("SELECT 1").await.map_err(PgError::from) {
                     logger.connection_error(&format!("heartbeat query failed: {error}"));
                     break;
                 }
@@ -1017,6 +1063,16 @@ impl Drop for PostgresConnection {
 
 #[async_trait]
 impl Source for PostgresConnection {
+    // The trait's defaults are no-ops, so without these a connector held as
+    // `Box<dyn Source>` — registered with `register_source`, or wrapped — never connected.
+    async fn connect(&self) -> Result<()> {
+        PostgresConnection::connect(self).await
+    }
+
+    async fn close(&self) {
+        PostgresConnection::close(self).await
+    }
+
     async fn start_snapshot(&mut self, tables: &[&str]) -> Result<Box<dyn SnapshotHandle>> {
         Ok(Box::new(self.start_snapshot_internal(tables).await?))
     }
@@ -1249,11 +1305,26 @@ impl StreamHandle for PostgresStreamHandle {
             // events — so it has to be current precisely when the pipeline is *behind*.
             // Sampling it only from the idle-advance branch meant it refreshed only when
             // the pipeline was caught up, and not at all when idle advance was disabled.
-            if self.slot_lag_sample_due()
-                && let Some(lag_bytes) = self.provider.measure_slot_lag().await?
-            {
-                self.last_slot_lag_bytes = lag_bytes;
-                self.last_slot_lag_at = Some(std::time::Instant::now());
+            //
+            // The slot's state rides the same sample. `unreserved` is the warning that still
+            // leaves time to act; `lost` is raised here as well as from a failed read, so a
+            // pipeline whose reads keep succeeding — or that has reconnects disabled — still
+            // gets the verdict.
+            if self.slot_lag_sample_due() {
+                let now = std::time::Instant::now();
+                self.last_slot_sample_at = Some(now);
+                if let Some(lag_bytes) = self.provider.measure_slot_lag().await? {
+                    self.last_slot_lag_bytes = lag_bytes;
+                    self.last_slot_lag_at = Some(now);
+                }
+                if let Some(state) = self.provider.sample_slot_state().await? {
+                    let lost =
+                        parser::classify_slot_failure(&self.stream.slot_name, None, Some(&state));
+                    self.last_slot_state = Some(state);
+                    if let Some(error) = lost {
+                        return Err(error);
+                    }
+                }
             }
 
             if !had_data && slot_is_caught_up && self.slot_idle_advance_interval_ms > 0 {
@@ -1341,6 +1412,14 @@ impl StreamHandle for PostgresStreamHandle {
         } else {
             Some(self.last_slot_lag_bytes)
         }
+    }
+
+    fn replication_slot_wal_status(&self) -> Option<crate::core::SlotWalStatus> {
+        self.last_slot_state.as_ref()?.wal_status
+    }
+
+    fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
+        self.last_slot_state.as_ref()?.safe_wal_size
     }
 }
 
@@ -1456,13 +1535,13 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::checkpoint::{Checkpoint, InMemoryCheckpoint, PostgresOffset};
+    use crate::core::{BeforeImage, Event, RowWrite};
     use crate::source::{SnapshotHandle, Source, StreamHandle};
 
     use super::PostgresSourceConfig;
     use super::decoder::{
         PgOutputMessage, PgOutputXLogData, PgValue, PollOutcome, decode_pgoutput_message,
     };
-    use super::parser::map_pgoutput_poll_error;
     use super::validation::{ValidationBackend, validate_with_backend};
     use super::{
         MAX_EVENTS_PER_POLL, PgOutputMessageProvider, PostgresConnection, PostgresSnapshotHandle,
@@ -1482,12 +1561,20 @@ mod tests {
         create_called: Arc<AtomicBool>,
         /// Records the `failover` argument the connector passed to slot creation.
         create_failover: Arc<AtomicBool>,
+        slot_state: Option<super::parser::SlotState>,
     }
 
     #[async_trait]
     impl ValidationBackend for MockValidationBackend {
         async fn replication_slot_exists(&self, _slot_name: &str) -> crate::core::Result<bool> {
             Ok(self.slot_exists)
+        }
+
+        async fn replication_slot_state(
+            &self,
+            _slot_name: &str,
+        ) -> crate::core::Result<Option<super::parser::SlotState>> {
+            Ok(self.slot_state.clone())
         }
 
         async fn create_replication_slot(
@@ -1894,6 +1981,22 @@ mod tests {
         buf
     }
 
+    /// An UPDATE under `REPLICA IDENTITY FULL` (`'O'` old tuple) where either tuple can
+    /// carry the `'u'` unchanged-TOAST placeholder.
+    fn build_full_update_with_toast(
+        oid: u32,
+        old: &[Option<Option<&str>>],
+        new: &[Option<Option<&str>>],
+    ) -> Vec<u8> {
+        let mut buf = vec![b'U'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.push(b'O');
+        append_tuple_data_with_toast(&mut buf, old);
+        buf.push(b'N');
+        append_tuple_data_with_toast(&mut buf, new);
+        buf
+    }
+
     fn build_insert(oid: u32, values: &[Option<&str>]) -> Vec<u8> {
         let mut buf = vec![b'I'];
         buf.extend_from_slice(&oid.to_be_bytes());
@@ -1926,13 +2029,7 @@ mod tests {
         PgOutputXLogData { lsn, data }
     }
 
-    /// Row events only, with schema announcements filtered out.
-    ///
-    /// Every connector announces a table's schema before that table's first row, so a
-    /// test about row decoding would otherwise assert on an event it is not testing. The
-    /// announcement itself is pinned by its own tests — see
-    /// `a_table_is_announced_before_its_first_row` — which is where a regression in it
-    /// should fail, rather than in fourteen tests about inserts and updates.
+    /// Row events only, with the schema-change events a changed `RELATION` emits filtered out.
     fn rows_only(events: Vec<crate::core::Event>) -> Vec<crate::core::Event> {
         events
             .into_iter()
@@ -2208,36 +2305,23 @@ mod tests {
                 make_stream_handle_with_catalog(0, batch(), catalog(&["id"]), catalog_columns);
             let events = handle.next_events(50).await.unwrap();
 
-            let schema = events
-                .iter()
-                .find(|event| event.op == crate::core::Operation::SchemaChange)
-                .and_then(|event| event.after.clone())
-                .and_then(|after| after.get("result_schema").cloned())
-                .expect("the first sighting of a relation publishes its schema");
-
-            let column = |name: &str| -> serde_json::Value {
-                schema["columns"]
-                    .as_array()
-                    .expect("columns array")
+            let shape = events[0].shape.clone().expect("the row carries its shape");
+            let nullable = |name: &str| {
+                shape
+                    .columns()
+                    .unwrap()
                     .iter()
-                    .find(|column| column["name"] == name)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("column '{name}' missing from {schema}"))
+                    .find(|column| column.name == name)
+                    .unwrap_or_else(|| panic!("column '{name}' missing from {shape:?}"))
+                    .nullable
             };
 
-            assert_eq!(column("id")["nullable"], serde_json::json!(false));
-            assert_eq!(
-                column("small")["nullable"],
-                serde_json::json!(false),
+            assert!(!nullable("id"));
+            assert!(
+                !nullable("small"),
                 "a NOT NULL non-key column must not be published as nullable"
             );
-            assert_eq!(column("big")["nullable"], serde_json::json!(true));
-            assert_eq!(
-                column("small")["data_type"],
-                serde_json::json!("numeric(12,4)"),
-                "the declared type keeps its modifier; the wire type OID alone would say \
-                 'numeric'"
-            );
+            assert!(nullable("big"));
         }
     }
 
@@ -2577,6 +2661,405 @@ mod tests {
         assert_eq!(tx1.event_index, 1);
     }
 
+    /// Answers what a `RELATION` message leaves open from fixed maps, as the server would.
+    #[derive(Default)]
+    struct FakeRelationCatalog {
+        types: std::collections::HashMap<(u32, i32), String>,
+        tables: std::collections::HashMap<
+            (String, String),
+            (
+                Vec<crate::source::schema_catalog::CatalogColumn>,
+                Vec<String>,
+            ),
+        >,
+    }
+
+    #[async_trait]
+    impl super::relation_catalog::RelationCatalog for FakeRelationCatalog {
+        async fn type_names(&self, types: &[(u32, i32)]) -> crate::core::Result<Vec<String>> {
+            Ok(types
+                .iter()
+                .map(|pair| self.types.get(pair).cloned().expect("type in the fake"))
+                .collect())
+        }
+
+        async fn columns_and_key(
+            &self,
+            schema: &str,
+            table: &str,
+        ) -> crate::core::Result<(
+            Vec<crate::source::schema_catalog::CatalogColumn>,
+            Vec<String>,
+        )> {
+            Ok(self
+                .tables
+                .get(&(schema.to_string(), table.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    const INT8: u32 = 20;
+    const NUMERIC: u32 = 1700;
+    const TEXT: u32 = 25;
+    /// `atttypmod` of `numeric(p,s)`: `((p << 16) | s) + VARHDRSZ`.
+    const fn numeric_typmod(precision: i32, scale: i32) -> i32 {
+        ((precision << 16) | scale) + 4
+    }
+
+    /// A `RELATION` message whose columns carry their own type OID and modifier.
+    fn build_typed_relation(
+        oid: u32,
+        name: &str,
+        replica_identity: u8,
+        cols: &[(&str, bool, u32, i32)],
+    ) -> Vec<u8> {
+        let mut buf = vec![b'R'];
+        buf.extend_from_slice(&oid.to_be_bytes());
+        buf.extend_from_slice(b"public\0");
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.push(replica_identity);
+        buf.extend_from_slice(&(cols.len() as u16).to_be_bytes());
+        for (col, is_key, type_oid, typmod) in cols {
+            buf.push(u8::from(*is_key));
+            buf.extend_from_slice(col.as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&type_oid.to_be_bytes());
+            buf.extend_from_slice(&typmod.to_be_bytes());
+        }
+        buf
+    }
+
+    fn catalog_column(
+        name: &str,
+        data_type: &str,
+        nullable: bool,
+    ) -> crate::source::schema_catalog::CatalogColumn {
+        crate::source::schema_catalog::CatalogColumn {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable,
+        }
+    }
+
+    fn shape_columns(event: &crate::core::Event) -> Vec<(String, String, bool)> {
+        event
+            .shape
+            .as_ref()
+            .expect("the row carries a shape")
+            .columns()
+            .unwrap()
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect()
+    }
+
+    fn owned(columns: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
+        columns
+            .iter()
+            .map(|(name, data_type, nullable)| {
+                ((*name).to_string(), (*data_type).to_string(), *nullable)
+            })
+            .collect()
+    }
+
+    fn items_types() -> std::collections::HashMap<(u32, i32), String> {
+        std::collections::HashMap::from([
+            ((INT8, -1), "bigint".to_string()),
+            ((TEXT, -1), "text".to_string()),
+            (
+                (NUMERIC, numeric_typmod(12, 4)),
+                "numeric(12,4)".to_string(),
+            ),
+            (
+                (NUMERIC, numeric_typmod(14, 4)),
+                "numeric(14,4)".to_string(),
+            ),
+        ])
+    }
+
+    /// A stream row carries the declared types of its `RELATION`, the catalogue's
+    /// nullability and the key.
+    #[tokio::test]
+    async fn postgres_rows_carry_the_catalogue_shape() {
+        const OID: u32 = 7;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_typed_relation(
+                    OID,
+                    "items",
+                    b'd',
+                    &[
+                        ("id", true, INT8, -1),
+                        ("amount", false, NUMERIC, numeric_typmod(12, 4)),
+                    ],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 10)),
+            xlog(150, build_insert(OID, &[Some("1"), Some("2.5000")])),
+            xlog(200, build_commit(200, 250, 0)),
+        ]]);
+        let catalog_columns = crate::source::schema_catalog::CatalogSchemas::from([(
+            ("public".to_string(), "items".to_string()),
+            vec![
+                catalog_column("id", "bigint", false),
+                catalog_column("amount", "numeric(12,4)", false),
+            ],
+        )]);
+        let mut handle = make_stream_handle_with_catalog(
+            0,
+            provider,
+            std::collections::HashMap::new(),
+            catalog_columns,
+        )
+        .with_relation_catalog(Box::new(FakeRelationCatalog {
+            types: items_types(),
+            ..FakeRelationCatalog::default()
+        }));
+
+        let events = handle.next_events(50).await.unwrap();
+
+        let shape = events[0].shape.as_ref().expect("the row carries a shape");
+        assert_eq!((shape.schema(), shape.table()), ("public", "items"));
+        assert_eq!(
+            shape_columns(&events[0]),
+            owned(&[("id", "bigint", false), ("amount", "numeric(12,4)", false)])
+        );
+        assert_eq!(shape.primary_key().unwrap(), ["id".to_string()]);
+    }
+
+    /// The first rows of a table in a run arrive alone; the shape is on each of them.
+    #[tokio::test]
+    async fn no_read_schema_event_is_emitted() {
+        const OID: u32 = 7;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(OID, "public", "items", &[("id", true), ("name", false)]),
+            ),
+            xlog(100, build_begin(200, 0, 10)),
+            xlog(150, build_insert(OID, &[Some("1"), Some("a")])),
+            xlog(200, build_commit(200, 250, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let events = handle.next_events(50).await.unwrap();
+
+        assert_eq!(
+            events.iter().map(|event| event.op).collect::<Vec<_>>(),
+            [crate::core::Operation::Insert],
+            "a RELATION seen for the first time emits no schema event"
+        );
+        assert!(events[0].shape.is_some());
+    }
+
+    /// After `ALTER COLUMN … TYPE` the rows carry the new type, taken from the `RELATION`
+    /// message — not the catalogue read at stream start, which still says the old one.
+    #[tokio::test]
+    async fn a_type_change_reaches_the_row_shape_from_the_relation() {
+        const OID: u32 = 9;
+        let relation = |typmod: i32| {
+            build_typed_relation(
+                OID,
+                "items",
+                b'd',
+                &[("id", true, INT8, -1), ("amount", false, NUMERIC, typmod)],
+            )
+        };
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(100, relation(numeric_typmod(12, 4))),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(150, build_insert(OID, &[Some("1"), Some("2.5000")])),
+                xlog(200, build_commit(200, 250, 0)),
+            ],
+            vec![
+                xlog(250, build_begin(300, 0, 11)),
+                xlog(260, relation(numeric_typmod(14, 4))),
+                xlog(280, build_insert(OID, &[Some("2"), Some("3.5000")])),
+                xlog(300, build_commit(300, 350, 0)),
+            ],
+        ]);
+        let catalog_columns = crate::source::schema_catalog::CatalogSchemas::from([(
+            ("public".to_string(), "items".to_string()),
+            vec![
+                catalog_column("id", "bigint", false),
+                catalog_column("amount", "numeric(12,4)", true),
+            ],
+        )]);
+        let mut handle = make_stream_handle_with_catalog(
+            0,
+            provider,
+            std::collections::HashMap::new(),
+            catalog_columns.clone(),
+        )
+        .with_relation_catalog(Box::new(FakeRelationCatalog {
+            types: items_types(),
+            tables: std::collections::HashMap::from([(
+                ("public".to_string(), "items".to_string()),
+                (
+                    catalog_columns[&("public".to_string(), "items".to_string())].clone(),
+                    vec!["id".to_string()],
+                ),
+            )]),
+        }));
+
+        let before = rows_only(handle.next_events(50).await.unwrap());
+        let after = handle.next_events(50).await.unwrap();
+
+        assert_eq!(shape_columns(&before[0])[1].1, "numeric(12,4)");
+        let row = after
+            .iter()
+            .find(|event| event.op == crate::core::Operation::Insert)
+            .expect("the row after the ALTER");
+        assert_eq!(
+            shape_columns(row)[1].1,
+            "numeric(14,4)",
+            "the type comes from the RELATION's modifier, not the stream-start catalogue"
+        );
+        let alter = after
+            .iter()
+            .find(|event| event.op.is_schema_change())
+            .expect("the changed RELATION is reported");
+        assert_eq!(
+            alter.after.as_ref().unwrap()["result_schema"]["columns"][1]["data_type"],
+            "numeric(14,4)"
+        );
+    }
+
+    /// pgoutput carries neither the primary key nor nullability, so a changed `RELATION`
+    /// re-reads both from the catalogue.
+    #[tokio::test]
+    async fn a_relation_change_rereads_the_key_and_nullability() {
+        const OID: u32 = 10;
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(
+                    100,
+                    build_typed_relation(
+                        OID,
+                        "items",
+                        b'f',
+                        &[("id", true, INT8, -1), ("code", true, TEXT, -1)],
+                    ),
+                ),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(150, build_insert(OID, &[Some("1"), Some("a")])),
+                xlog(200, build_commit(200, 250, 0)),
+            ],
+            vec![
+                xlog(250, build_begin(300, 0, 11)),
+                xlog(
+                    260,
+                    build_typed_relation(
+                        OID,
+                        "items",
+                        b'f',
+                        &[
+                            ("id", true, INT8, -1),
+                            ("code", true, TEXT, -1),
+                            ("region", true, TEXT, -1),
+                        ],
+                    ),
+                ),
+                xlog(280, build_insert(OID, &[Some("2"), Some("b"), Some("eu")])),
+                xlog(300, build_commit(300, 350, 0)),
+            ],
+        ]);
+        let key = ("public".to_string(), "items".to_string());
+        let mut handle = make_stream_handle_with_catalog(
+            0,
+            provider,
+            std::collections::HashMap::from([(key.clone(), vec!["id".to_string()])]),
+            crate::source::schema_catalog::CatalogSchemas::from([(
+                key.clone(),
+                vec![
+                    catalog_column("id", "bigint", false),
+                    catalog_column("code", "text", true),
+                ],
+            )]),
+        )
+        .with_relation_catalog(Box::new(FakeRelationCatalog {
+            types: items_types(),
+            tables: std::collections::HashMap::from([(
+                key,
+                (
+                    vec![
+                        catalog_column("id", "bigint", false),
+                        catalog_column("code", "text", false),
+                        catalog_column("region", "text", false),
+                    ],
+                    vec!["id".to_string(), "region".to_string()],
+                ),
+            )]),
+        }));
+
+        let before = rows_only(handle.next_events(50).await.unwrap());
+        let after = rows_only(handle.next_events(50).await.unwrap());
+
+        assert_eq!(before[0].primary_key, Some(vec!["id".to_string()]));
+        let shape = after[0].shape.as_ref().unwrap();
+        assert_eq!(
+            after[0].primary_key,
+            Some(vec!["id".to_string(), "region".to_string()]),
+            "the key the catalogue holds after the change"
+        );
+        assert_eq!(
+            shape.primary_key().unwrap(),
+            ["id".to_string(), "region".to_string()]
+        );
+        assert_eq!(
+            shape_columns(&after[0]),
+            owned(&[
+                ("id", "bigint", false),
+                ("code", "text", false),
+                ("region", "text", false)
+            ])
+        );
+    }
+
+    /// A shape change must reach the rows, or a consumer parses them with the old one.
+    #[tokio::test]
+    async fn a_relation_that_gains_a_column_gets_a_new_shape() {
+        const OID: u32 = 8;
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(100, build_relation(OID, "public", "items", &[("id", true)])),
+                xlog(100, build_begin(200, 0, 10)),
+                xlog(150, build_insert(OID, &[Some("1")])),
+                xlog(200, build_commit(200, 250, 0)),
+            ],
+            vec![
+                xlog(
+                    250,
+                    build_relation(OID, "public", "items", &[("id", true), ("name", false)]),
+                ),
+                xlog(250, build_begin(300, 0, 11)),
+                xlog(280, build_insert(OID, &[Some("2"), Some("b")])),
+                xlog(300, build_commit(300, 350, 0)),
+            ],
+        ]);
+        let mut handle = make_stream_handle(0, provider);
+
+        let before = rows_only(handle.next_events(50).await.unwrap());
+        let after = rows_only(handle.next_events(50).await.unwrap());
+
+        assert!(before[0].shape.is_some());
+        assert_ne!(
+            before[0].shape, after[0].shape,
+            "a row captured under the widened table must not claim the old shape"
+        );
+        assert_eq!(after[0].shape.as_ref().unwrap().columns().unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn stream_confirm_lsn_delegates_to_provider() {
         let provider = MockPgOutputProvider::new(vec![]);
@@ -2687,6 +3170,126 @@ mod tests {
         assert!(!events[0].unavailable_columns.contains(&"title".to_string()));
     }
 
+    /// Decode one FULL-identity UPDATE of `docs(id, title, body)` and return the event.
+    async fn decode_full_update(
+        old: &[Option<Option<&str>>],
+        new: &[Option<Option<&str>>],
+    ) -> Event {
+        const OID: u32 = 32;
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(
+                    OID,
+                    "public",
+                    "docs",
+                    &[("id", true), ("title", false), ("body", false)],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(150, build_full_update_with_toast(OID, old, new)),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let mut events = rows_only(handle.next_events(100).await.unwrap());
+        assert_eq!(events.len(), 1);
+        events.remove(0)
+    }
+
+    #[tokio::test]
+    async fn under_full_identity_an_unchanged_toast_column_is_filled_from_the_old_tuple() {
+        // `body` was not modified, so its new value is its old one, and FULL logged it.
+        let event = decode_full_update(
+            &[
+                Some(Some("1")),
+                Some(Some("old")),
+                Some(Some("the document")),
+            ],
+            &[Some(Some("1")), Some(Some("new")), Some(None)],
+        )
+        .await;
+        let after = event.after.as_ref().unwrap();
+        assert_eq!(after.get("body").unwrap(), "the document");
+        assert_eq!(after.get("title").unwrap(), "new");
+        assert!(
+            event.unavailable_columns.is_empty(),
+            "a filled column is not unavailable: {:?}",
+            event.unavailable_columns
+        );
+        assert!(matches!(event.row_write(), RowWrite::Replace { .. }));
+        event.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn under_full_identity_a_column_missing_from_both_images_stays_reported() {
+        let event = decode_full_update(
+            &[Some(Some("1")), Some(Some("old")), Some(None)],
+            &[Some(Some("1")), Some(Some("new")), Some(None)],
+        )
+        .await;
+        assert!(event.after.as_ref().unwrap().get("body").is_none());
+        assert_eq!(event.unavailable_columns, vec!["body".to_string()]);
+        event.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn under_full_identity_a_modified_toast_column_keeps_its_new_value() {
+        // Present in the new tuple, a hole in the old: the change must win, and the
+        // before-image's own hole must not leak into `unavailable_columns`.
+        let event = decode_full_update(
+            &[Some(Some("1")), Some(Some("old")), Some(None)],
+            &[Some(Some("1")), Some(Some("old")), Some(Some("rewritten"))],
+        )
+        .await;
+        assert_eq!(
+            event.after.as_ref().unwrap().get("body").unwrap(),
+            "rewritten"
+        );
+        assert!(event.unavailable_columns.is_empty());
+        match &event.before {
+            BeforeImage::Full {
+                unavailable_columns,
+                ..
+            } => {
+                assert_eq!(unavailable_columns, &vec!["body".to_string()]);
+            }
+            other => panic!("expected a full pre-image, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_only_pre_image_never_fills_a_hole() {
+        // `K`: DEFAULT identity, key changed. The key tuple's absent columns mean "not
+        // logged", not "unchanged", so `body` stays reported even though `K` is present.
+        const OID: u32 = 33;
+        let mut update = vec![b'U'];
+        update.extend_from_slice(&OID.to_be_bytes());
+        update.push(b'K');
+        append_tuple_data_with_toast(&mut update, &[Some(Some("1")), None, None]);
+        update.push(b'N');
+        append_tuple_data_with_toast(&mut update, &[Some(Some("2")), Some(Some("t")), Some(None)]);
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(
+                100,
+                build_relation(
+                    OID,
+                    "public",
+                    "docs",
+                    &[("id", true), ("title", false), ("body", false)],
+                ),
+            ),
+            xlog(100, build_begin(200, 0, 20)),
+            xlog(150, update),
+            xlog(200, build_commit(200, 300, 0)),
+        ]]);
+        let mut handle = make_stream_handle(0, provider);
+        let events = rows_only(handle.next_events(100).await.unwrap());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].before, BeforeImage::KeyOnly { .. }));
+        assert_eq!(events[0].unavailable_columns, vec!["body".to_string()]);
+        assert!(events[0].after.as_ref().unwrap().get("body").is_none());
+    }
+
     #[tokio::test]
     async fn stream_row_with_unknown_relation_fails_loud() {
         // pgoutput guarantees RELATION precedes any row referencing it. A row for an
@@ -2715,7 +3318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_announces_a_relation_then_reports_its_change() {
+    async fn stream_reports_a_relation_change() {
         const OID: u32 = 21;
         let provider = MockPgOutputProvider::new(vec![vec![
             xlog(
@@ -2735,33 +3338,10 @@ mod tests {
         let mut handle = make_stream_handle(0, provider);
 
         let events = handle.next_events(100).await.unwrap();
-        // Two: the first sighting is announced, then the added column is a change.
-        //
-        // The first RELATION used to emit nothing at all — `unwrap_or(false)` — which is
-        // precisely the moment a consumer needs the schema, because pgoutput sends
-        // RELATION before a table's first row. A table that never underwent DDL therefore
-        // had no type information anywhere in the stream, and column values are text.
-        assert_eq!(events.len(), 2);
+        // One: the first sighting describes the rows that follow it and emits nothing.
+        assert_eq!(events.len(), 1);
 
-        let observed = &events[0];
-        assert_eq!(observed.op, crate::core::Operation::SchemaChange);
-        assert_eq!(observed.source.offset, "0/00000064");
-        assert_eq!(observed.table, "users__ddl_events");
-        let after = observed.after.as_ref().expect("schema event payload");
-        assert_eq!(
-            after["ddl_type"], "READ_SCHEMA",
-            "a first sighting is an observation, not a change: reusing ALTER_TABLE would              tell every consumer that every table was altered on every restart"
-        );
-        assert_eq!(
-            after["result_schema"]["columns"]
-                .as_array()
-                .expect("columns")
-                .len(),
-            2,
-            "the observation carries the table's full column list"
-        );
-
-        let changed = &events[1];
+        let changed = &events[0];
         assert_eq!(changed.op, crate::core::Operation::SchemaChange);
         assert_eq!(changed.source.offset, "0/00000190");
         assert_eq!(changed.schema.as_deref(), Some("public"));
@@ -2771,6 +3351,14 @@ mod tests {
         assert_eq!(after["ddl_type"], "ALTER_TABLE");
         assert_eq!(after["schema"], "public");
         assert_eq!(after["table"], "users");
+        assert_eq!(
+            after["result_schema"]["columns"]
+                .as_array()
+                .expect("columns")
+                .len(),
+            3,
+            "the change carries the table's full column list"
+        );
     }
 
     #[tokio::test]
@@ -2809,14 +3397,6 @@ mod tests {
                 .map(|t| t.event_index),
             Some(9_999)
         );
-    }
-
-    #[test]
-    fn pgoutput_poll_error_maps_dead_slot_guidance() {
-        let err = map_pgoutput_poll_error("slot1", "ERROR: required WAL segment has been removed");
-        let msg = err.to_string();
-        assert!(msg.contains("stale or dead"));
-        assert!(msg.contains("slot1"));
     }
 
     // ─── Existing tests kept ──────────────────────────────────────────────────
@@ -3049,6 +3629,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_refuses_a_slot_the_server_has_invalidated() {
+        let config = PostgresSourceConfig {
+            host: "localhost".into(),
+            user: "cdc".into(),
+            password: "secret".into(),
+            database: "app".into(),
+            replication_slot_name: "slot".into(),
+            publication_name: "pub".into(),
+            ..Default::default()
+        };
+        let lost = super::parser::SlotState {
+            wal_status: Some(crate::core::SlotWalStatus::Lost),
+            safe_wal_size: None,
+            invalidation_reason: Some("idle_timeout".into()),
+        };
+        let backend = MockValidationBackend {
+            slot_exists: true,
+            publication_exists: true,
+            has_replication_privilege: true,
+            slot_state: Some(lost),
+            ..Default::default()
+        };
+
+        let error = validate_with_backend(&config, &backend)
+            .await
+            .expect_err("an invalidated slot must be refused at startup");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated)
+        );
+        assert!(error.to_string().contains("idle_timeout"), "{error}");
+
+        let reserved = MockValidationBackend {
+            slot_exists: true,
+            publication_exists: true,
+            has_replication_privilege: true,
+            slot_state: Some(super::parser::SlotState {
+                wal_status: Some(crate::core::SlotWalStatus::Reserved),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_with_backend(&config, &reserved)
+            .await
+            .expect("a reserved slot is usable");
+    }
+
+    /// A provider whose catalogue reads report a fixed slot state.
+    struct SlotStateProvider {
+        state: super::parser::SlotState,
+    }
+
+    #[async_trait]
+    impl PgOutputMessageProvider for SlotStateProvider {
+        async fn poll_xlog_data(
+            &mut self,
+            _max: usize,
+            _poll_timeout: std::time::Duration,
+        ) -> crate::core::Result<PollOutcome> {
+            Ok(PollOutcome::Data(Vec::new()))
+        }
+
+        async fn confirm_lsn(&mut self, _lsn: u64) -> crate::core::Result<()> {
+            Ok(())
+        }
+
+        async fn sample_slot_state(
+            &mut self,
+        ) -> crate::core::Result<Option<super::parser::SlotState>> {
+            Ok(Some(self.state.clone()))
+        }
+    }
+
+    fn slot_state_handle(state: super::parser::SlotState) -> PostgresStreamHandle {
+        PostgresStreamHandle::new(
+            "postgres".into(),
+            PostgresStream {
+                slot_name: "slot".into(),
+                publication_name: "pub".into(),
+                lsn_position: 0,
+                replication_status: StreamState::Streaming,
+            },
+            Box::new(SlotStateProvider { state }),
+            100,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            crate::source::schema_catalog::CatalogSchemas::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_sample_raises_slot_invalidated_without_a_reconnect() {
+        // Every read succeeds; only the sample can see the slot is gone. Without it a
+        // pipeline with reconnects disabled would report a poll loop that is not turning.
+        let mut handle = slot_state_handle(super::parser::SlotState {
+            wal_status: Some(crate::core::SlotWalStatus::Lost),
+            ..Default::default()
+        });
+        let error = handle
+            .next_events(10)
+            .await
+            .expect_err("a lost slot must fail the poll");
+        assert_eq!(
+            error.source_kind(),
+            Some(crate::core::SourceErrorKind::SlotInvalidated)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sample_reports_an_unreserved_slot_and_its_safe_size() {
+        use crate::source::StreamHandle as _;
+        let mut handle = slot_state_handle(super::parser::SlotState {
+            wal_status: Some(crate::core::SlotWalStatus::Unreserved),
+            safe_wal_size: Some(-4096),
+            invalidation_reason: None,
+        });
+        handle
+            .next_events(10)
+            .await
+            .expect("an unreserved slot still reads");
+        assert_eq!(
+            handle.replication_slot_wal_status(),
+            Some(crate::core::SlotWalStatus::Unreserved)
+        );
+        assert_eq!(handle.replication_slot_safe_wal_size_bytes(), Some(-4096));
+    }
+
+    #[tokio::test]
     async fn validation_creates_replication_slot_when_explicitly_opted_in() {
         let config = PostgresSourceConfig {
             host: "localhost".into(),
@@ -3264,7 +3976,7 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -3313,7 +4025,7 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -3366,7 +4078,7 @@ mod tests {
                 primary_key_columns: vec!["id".into()],
                 primary_key_types: vec!["bigint".into()],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -3435,7 +4147,7 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -3482,7 +4194,7 @@ mod tests {
                 primary_key_columns: vec![],
                 primary_key_types: vec![],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -3534,7 +4246,7 @@ mod tests {
                 primary_key_columns: vec!["id".into()],
                 primary_key_types: vec!["bigint".into()],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -3709,37 +4421,11 @@ mod tests {
         );
 
         let events = handle.next_events(5).await.unwrap();
-        // Two for the allowed table — its first sighting is announced, and its added
-        // column is a change — and none at all for the excluded one.
         let tables: Vec<String> = events.iter().map(|event| event.table.clone()).collect();
         assert_eq!(
             tables,
-            vec![
-                "allowed_table__ddl_events".to_string(),
-                "allowed_table__ddl_events".to_string()
-            ],
+            vec!["allowed_table__ddl_events".to_string()],
             "only the allowlisted table may publish a schema, got {tables:?}"
-        );
-        // A schema-change event is published under a synthetic `<table>__ddl_events`
-        // name, which is exactly why the filter has to be applied at the source: no
-        // downstream matcher on the real table name can ever see it.
-        let ddl_types: Vec<String> = events
-            .iter()
-            .filter_map(|event| {
-                event
-                    .after
-                    .as_ref()?
-                    .get("ddl_type")?
-                    .as_str()
-                    .map(str::to_string)
-            })
-            .collect();
-        assert_eq!(
-            ddl_types,
-            vec!["READ_SCHEMA".to_string(), "ALTER_TABLE".to_string()],
-            "the first sighting is an observation and the added column is a change; \
-             collapsing the two would tell a consumer every table was altered on every \
-             restart"
         );
         assert!(
             !format!("{events:?}").contains("ssn"),
@@ -3810,7 +4496,7 @@ mod tests {
                     _ => "other",
                 })
                 .collect();
-            assert_eq!(positions, vec!["schema", "insert", "message"]);
+            assert_eq!(positions, vec!["insert", "message"]);
         }
 
         /// A non-transactional message is released immediately, not held for a commit.
@@ -3908,18 +4594,22 @@ mod tests {
         #[tokio::test]
         async fn a_schema_event_outside_a_transaction_carries_the_stream_position() {
             const OID: u32 = 31;
-            // A RELATION with no surrounding BEGIN, framed at wal_start 0 as pgoutput sends it.
-            let provider = MockPgOutputProvider::new(vec![vec![xlog(
-                0,
-                build_relation(OID, "public", "orders", &[("id", true)]),
-            )]]);
+            // A changed RELATION with no surrounding BEGIN, framed at wal_start 0 as pgoutput
+            // sends it.
+            let provider = MockPgOutputProvider::new(vec![vec![
+                xlog(0, build_relation(OID, "public", "orders", &[("id", true)])),
+                xlog(
+                    0,
+                    build_relation(OID, "public", "orders", &[("id", true), ("note", false)]),
+                ),
+            ]]);
             let mut handle = make_stream_handle(0x4000, provider);
 
             let events = handle.next_events(50).await.unwrap();
             let schema = events
                 .iter()
                 .find(|event| event.op == crate::core::Operation::SchemaChange)
-                .expect("the first sighting is announced");
+                .expect("the change is reported");
 
             assert!(
                 schema.transaction.is_none(),

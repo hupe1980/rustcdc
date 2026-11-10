@@ -308,8 +308,8 @@ fn default_snowflake_batch_max_delay_ms() -> u64 {
 }
 fn default_snowflake_commit_timeout_ms() -> u64 {
     // Deliberately below `runtime.sink_flush_timeout_ms` (60 000) with room for the append
-    // and a status poll. The two used to be equal, so the runtime's timeout raced the
-    // sink's own and usually won — cancelling a durability wait mid-flight.
+    // and a status poll; an equal value would race the runtime's timeout against the
+    // sink's own and cancel a durability wait mid-flight.
     45_000
 }
 fn default_snowflake_commit_poll_ms() -> u64 {
@@ -753,13 +753,9 @@ pub struct HttpSigningConfig {
 }
 
 impl HttpSinkConfig {
-    /// Every rule that was previously inline in the loader, and applied only to the
-    /// default `[sink]`.
-    ///
-    /// A named `[[sinks]]` HTTP entry and a fan-out HTTP child skipped all of it — the URL
-    /// policy included, so `verify_tls = false` or a plaintext `http://` endpoint was
-    /// rejected in one position and accepted in another. Same defect the Kafka and Iceberg
-    /// sinks had; found while adding signing, because signing would have inherited it.
+    /// Every HTTP sink rule, applied wherever the sink appears: the default `[sink]`, a
+    /// named `[[sinks]]` entry and a fan-out child alike, so the URL policy cannot reject
+    /// an endpoint in one position and accept it in another.
     pub fn validate(&self) -> Result<(), String> {
         if self.url.trim().is_empty() {
             return Err("sink.http.url must not be empty".to_string());
@@ -1421,21 +1417,21 @@ pub enum KafkaDeliveryMode {
 }
 
 impl KafkaCompression {
-    pub fn to_krafka(self) -> Result<krafka::protocol::Compression, String> {
+    pub fn to_krafka(self) -> Result<krafka::Compression, String> {
         let codec = match self {
-            Self::None => krafka::protocol::Compression::None,
-            Self::Gzip => krafka::protocol::Compression::Gzip,
-            Self::Snappy => krafka::protocol::Compression::Snappy,
-            Self::Lz4 => krafka::protocol::Compression::Lz4,
-            Self::Zstd => krafka::protocol::Compression::Zstd,
+            Self::None => krafka::Compression::None,
+            Self::Gzip => krafka::Compression::Gzip,
+            Self::Snappy => krafka::Compression::Snappy,
+            Self::Lz4 => krafka::Compression::Lz4,
+            Self::Zstd => krafka::Compression::Zstd,
         };
 
         if codec.is_available() {
             Ok(codec)
         } else {
-            let feature = codec.required_feature().unwrap_or("compression");
+            // Only zstd can be missing: krafka encodes it behind its `zstd` feature.
             Err(format!(
-                "krafka compression codec {self:?} is unavailable in this build; enable the `{feature}` feature"
+                "krafka compression codec {self:?} is unavailable in this build; enable krafka's `zstd` feature"
             ))
         }
     }
@@ -1630,37 +1626,28 @@ pub struct KafkaTransportConfig {
     /// rather than failing. Worst-case per-connection memory is roughly this times the
     /// largest response.
     ///
-    /// **It moved here from `sink.kafka.max_in_flight`, and its cap is gone.** It used to
-    /// be rejected above 5, on the standard reasoning that Kafka's idempotent producer
-    /// preserves ordering only up to `max.in.flight.requests.per.connection = 5` (KIP-679)
-    /// and that a retried batch could otherwise land after one produced later. That rule
-    /// protects against several batches for the *same partition* being on the wire at
-    /// once, which krafka's record accumulator does not do: `partition_inflight` holds one
-    /// slot per partition and `dispatch_unblocked_partitions` only flushes partitions
-    /// whose slot is idle, so batches for a partition reach the wire in seal order and
-    /// sequence order cannot diverge from wire order — which is why krafka carries no
-    /// `max_in_flight` producer knob of its own.
-    ///
-    /// What remains is a per-*connection* pipelining depth, which is a transport concern —
-    /// hence the move. Raising it lets more partitions have requests in flight over the
-    /// same connection; it does not let one partition get ahead of itself.
+    /// It is not capped at 5. KIP-679's `max.in.flight.requests.per.connection <= 5` rule
+    /// guards against several batches for the *same partition* on the wire at once, which
+    /// krafka's accumulator never sends: `partition_inflight` holds one slot per partition,
+    /// so batches for a partition reach the wire in seal order. Raising this lets more
+    /// partitions share a connection; it does not let one partition get ahead of itself.
     #[serde(default = "default_kafka_max_in_flight")]
     pub max_in_flight: usize,
 }
 
 impl KafkaTransportConfig {
-    /// Map every transport setting — including the proxy — onto krafka's `TransportConfig`.
+    /// Apply every transport setting — including the proxy — to a krafka connection.
     ///
     /// **Including the proxy** — one storage location, no precedence rule, and no second
-    /// accessor to forget to call. When `socks5_proxy` lived on a separate accessor it was
-    /// validated for `host:port` shape and then silently discarded, which in the topology
-    /// the setting exists for (brokers behind a bastion that also resolves their
-    /// hostnames) looked like a broker outage, and everywhere else sent traffic by the
-    /// route the operator had configured it not to take.
-    pub fn to_krafka(&self) -> Result<krafka::network::TransportConfig, String> {
-        let mut builder = krafka::network::TransportConfig::builder();
+    /// accessor to forget to call. A proxy setting that is validated and then not applied
+    /// looks like a broker outage in the topology it exists for (brokers behind a bastion
+    /// that also resolves their hostnames), and everywhere else sends traffic by the route
+    /// the operator configured it not to take.
+    ///
+    /// krafka validates the values when the connection is opened, naming the setting.
+    pub fn apply(&self, mut builder: krafka::KafkaBuilder) -> krafka::KafkaBuilder {
         if let Some(proxy) = &self.socks5_proxy {
-            builder = builder.proxy(krafka::network::ProxyConfig::new(proxy.clone()));
+            builder = builder.proxy(krafka::ProxyConfig::new(proxy.clone()));
         }
         if self.max_in_flight > 0 {
             builder = builder.max_in_flight_requests(self.max_in_flight);
@@ -1680,8 +1667,6 @@ impl KafkaTransportConfig {
                 .tls_reload_interval(Some(Duration::from_millis(self.tls_reload_interval_ms)));
         }
         builder
-            .build()
-            .map_err(|e| format!("sink.kafka.transport is invalid: {e}"))
     }
 
     pub fn validate(&self, protocol: KafkaSecurityProtocol) -> Result<(), String> {
@@ -1719,11 +1704,9 @@ pub struct KafkaSinkConfig {
     /// topic = "cdc.${schema}.${table}"
     /// ```
     ///
-    /// That is the layout Debezium produces from `topic.prefix`, and it collapses what
-    /// used to need one `[[sinks]]` block and one `[[pipeline.routes]]` entry per table
-    /// — plus one producer per table — into a single sink. A new table starts flowing
-    /// without a config change, because there is no per-table configuration left to
-    /// change.
+    /// That is the layout Debezium produces from `topic.prefix`, from one sink and one
+    /// producer rather than a `[[sinks]]` block and a route per table. A new table starts
+    /// flowing without a config change.
     ///
     /// The template is parsed and checked at startup: an unknown placeholder, an
     /// unterminated `${`, or a literal segment carrying characters Kafka forbids is a
@@ -1781,12 +1764,6 @@ pub struct KafkaSinkConfig {
     /// records are in flight at once, so a batch fills from concurrent sends and the
     /// linger is amortised across all of them.
     ///
-    /// The sink used to await each record's acknowledgement before creating the
-    /// next send, so a batch could never accumulate and every record paid the full linger
-    /// alone — capping throughput at roughly `1000 / linger_ms` events per second. This
-    /// field's documentation used to say so, and told operators to leave it at zero. That
-    /// advice no longer applies.
-    ///
     /// The default remains `0` because it is the lowest-latency setting and CDC consumers
     /// are usually latency-sensitive; raise it if you have measured that your workload
     /// prefers throughput.
@@ -1796,8 +1773,7 @@ pub struct KafkaSinkConfig {
     /// Records accepted for delivery before the sink waits for an acknowledgement
     /// (default: 128).
     ///
-    /// This is the pipelining window. `1` restores the older behaviour of one broker
-    /// round-trip per record. Records still reach the broker in submission order — see
+    /// This is the pipelining window; `1` means one broker round-trip per record. Records still reach the broker in submission order — see
     /// `KafkaSink::send_encoded` for why that survives pipelining — so per-partition
     /// ordering is unaffected.
     ///
@@ -2180,8 +2156,7 @@ impl KafkaSecurityConfig {
             KafkaSaslMechanism::Plain => AuthConfig::sasl_plain(
                 username(sasl.mechanism)?,
                 credential("password", sasl.password.as_ref())?,
-            )
-            .map_err(|e| format!("sink.kafka.security.sasl: {e}"))?,
+            ),
             KafkaSaslMechanism::ScramSha256 => AuthConfig::sasl_scram_sha256(
                 username(sasl.mechanism)?,
                 credential("password", sasl.password.as_ref())?,
@@ -2451,10 +2426,8 @@ pub(crate) const KAFKA_MAX_PIPELINED_SENDS_LIMIT: usize = 100_000;
 /// Matches krafka's own default and the Kafka Java client's
 /// `max.in.flight.requests.per.connection`.
 ///
-/// This was 5 while the setting lived on the sink and was capped there for idempotent
-/// ordering. It is a per-connection pipelining depth now — see
-/// `KafkaTransportConfig::max_in_flight` for why the cap went away — so the default
-/// follows the upstream one rather than an ordering rule it no longer implements.
+/// A per-connection pipelining depth, not an idempotent-ordering cap; see
+/// `KafkaTransportConfig::max_in_flight`.
 fn default_kafka_max_in_flight() -> usize {
     10
 }

@@ -45,7 +45,7 @@ async fn run_sqlserver_connection_lifecycle(image_tag: &str) -> rustcdc::Result<
 }
 
 macro_rules! sqlserver_connection_test {
-    ($name:ident, $image_tag:literal, $label:literal) => {
+    ($name:ident, $image_tag:expr, $label:literal) => {
         #[tokio::test]
         async fn $name() -> rustcdc::Result<()> {
             if skip_sqlserver_version_matrix_case($label) {
@@ -76,14 +76,20 @@ async fn connect_with_retry(connection: &SqlServerConnection) -> rustcdc::Result
 
 sqlserver_connection_test!(
     sqlserver_connection_2019,
-    "2019-latest",
+    sqlserver_testkit::SQLSERVER_2019,
     "sqlserver 2019 connection integration test"
 );
 
 sqlserver_connection_test!(
     sqlserver_connection_2022,
-    "2022-latest",
+    sqlserver_testkit::SQLSERVER_2022,
     "sqlserver 2022 connection integration test"
+);
+
+sqlserver_connection_test!(
+    sqlserver_connection_2025,
+    sqlserver_testkit::SQLSERVER_2025,
+    "sqlserver 2025 connection integration test"
 );
 
 /// Verify CDC connector capabilities are consistent across SQL Server versions
@@ -94,11 +100,12 @@ async fn sqlserver_cdc_capabilities_are_consistent() -> rustcdc::Result<()> {
     }
 
     let database = "rustcdc_connection";
-    let (config, _container) = match sqlserver_base_config("2022-latest", database).await {
-        Ok(r) => r,
-        Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let (config, _container) =
+        match sqlserver_base_config(sqlserver_testkit::SQLSERVER_2022, database).await {
+            Ok(r) => r,
+            Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
     let connection = SqlServerConnection::new(config);
     connect_with_retry(&connection).await?;

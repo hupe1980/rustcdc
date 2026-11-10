@@ -1,11 +1,8 @@
 use crate::core::{
     BeforeImage, EVENT_ENVELOPE_VERSION, Event, Operation, Result, SnapshotMetadata, SourceMetadata,
 };
-use crate::ddl_capture::{CapturedDdl, DDL_TYPE_READ_SCHEMA};
 use crate::source::helpers::now_millis;
-use crate::source::schema_catalog::{
-    mark_as_snapshot_event, observed_statement, table_schema_from_catalog,
-};
+use crate::source::schema_catalog::row_shape_from_catalog;
 
 use super::{SqlServerSnapshotHandle, lsn_bytes_to_hex};
 
@@ -38,43 +35,15 @@ pub(super) async fn next_sqlserver_snapshot_chunk(
             continue;
         }
 
-        // Announce the table's schema before its first row. SQL Server change rows carry
-        // text values, and until this the snapshot path emitted no schema event at all.
-        if !handle.tables[table_index].schema_announced {
-            handle.tables[table_index].schema_announced = true;
-            let catalog = handle.tables[table_index].catalog_columns.clone();
-            if !catalog.is_empty() {
-                let ts = now_millis();
-                let captured = CapturedDdl {
-                    ddl_type: DDL_TYPE_READ_SCHEMA.to_string(),
-                    schema: schema_name.clone(),
-                    table: table_name_only.clone(),
-                    statement: observed_statement(
-                        &schema_name,
-                        &table_name_only,
-                        "INFORMATION_SCHEMA.COLUMNS",
-                    ),
-                    result_schema: Some(table_schema_from_catalog(
-                        &schema_name,
-                        &table_name_only,
-                        &catalog,
-                        &primary_key_columns,
-                    )),
-                    schema_diff: None,
-                    ts,
-                };
-                let mut event = captured.to_event(
-                    "sqlserver",
-                    lsn_bytes_to_hex(&handle.snapshot.lsn_start),
-                    ts,
-                );
-                mark_as_snapshot_event(
-                    &mut event,
-                    &handle.snapshot.snapshot_id,
-                    handle.next_chunk_index,
-                );
-                events.push(event);
-            }
+        if handle.tables[table_index].shape.is_none() {
+            let state = &handle.tables[table_index];
+            let shape = row_shape_from_catalog(
+                &schema_name,
+                &table_name_only,
+                &state.catalog_columns,
+                &primary_key_columns,
+            );
+            handle.tables[table_index].shape = shape;
         }
 
         let remaining = requested - events.len();
@@ -127,6 +96,7 @@ pub(super) async fn next_sqlserver_snapshot_chunk(
                 }),
                 transaction: None,
                 envelope_version: EVENT_ENVELOPE_VERSION,
+                shape: handle.tables[table_index].shape.clone(),
                 unavailable_columns: Vec::new(),
             });
         }

@@ -1,33 +1,12 @@
 //! Repository automation: `cargo xtask <task>`.
 //!
-//! # Why this exists
+//! One discoverable entry point for the gates: `cargo xtask` with no arguments lists them.
+//! Most tasks dispatch to a shell script under `scripts/`, which is good at text munging
+//! over the tree. A check whose correctness depends on a shell-tool dialect lives here
+//! instead, compiled and unit-tested: BSD and GNU awk disagree, and a dialect error under
+//! `|| true` reports a pass having checked nothing. [`cargo_profile`] is one.
 //!
-//! The gates were five shell scripts under `scripts/`, discoverable only by reading CI.
-//! A contributor had to know that `ci-policy-gate.sh` is the one that must pass before a
-//! pull request, that `ci-benchmark-gate.sh` needs a baseline first, and that two of them
-//! are orchestration nobody runs by hand. `cargo xtask` with no arguments answers that.
-//!
-//! The workflows still invoke the scripts directly. Routing them through here would add a
-//! `cargo build` to jobs that call `pull-images` eight times, and buy nothing: this is a
-//! discoverability and portability layer for people, not an indirection for CI.
-//!
-//! # Why it is a dispatcher rather than a rewrite
-//!
-//! The scripts are ~2 000 lines of text munging over the repository: `sed` ranges across
-//! Rust source, `rg` with PCRE2, `jq` over Avro schemas, `diff` of generated sets. That
-//! is what shell is genuinely good at, and rewriting it wholesale would trade a working
-//! tool for a large diff and a regression risk.
-//!
-//! What shell is *not* good at is being portable, and that is not hypothetical here: the
-//! Cargo-profile check used gawk's three-argument `match()`, which is a syntax error on
-//! BSD awk. On macOS the program aborted, `|| true` swallowed it, and the check printed
-//! "passed" having examined nothing — silently vacuous for every developer on a Mac,
-//! including through a change that added the exact profile it was meant to reject.
-//!
-//! So checks whose correctness depends on shell-tool dialects move here, where they are
-//! compiled and unit-tested. [`cargo_profile`] is the first, and it carries the test that
-//! the shell version could not have. The rest stay in `scripts/` and are invoked from
-//! here until there is a reason to move them.
+//! CI invokes the scripts directly, so its jobs do not pay for building this crate.
 
 use std::process::{Command, ExitCode};
 
@@ -126,9 +105,8 @@ const BENCH_HATCH: &str = "--cfg rustcdc_optimised_test_harnesses";
 
 /// Benchmarks, with the release guard opened and the package scoping cargo needs.
 ///
-/// This exists so the hatch has exactly one spelling. It previously lived only in a
-/// comment in the root `Cargo.toml`, every caller was expected to retype it, and the
-/// release-evidence CI job did not — which is how an unbuildable benchmark reached main.
+/// The hatch has exactly one spelling, here; a caller retyping it can get it wrong and
+/// build a benchmark that does not compile anywhere else.
 fn bench(args: &[String]) -> Result<(), String> {
     let root = workspace_root()?;
 

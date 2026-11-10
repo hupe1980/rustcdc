@@ -252,55 +252,74 @@ pub(super) fn startup_packet(user: &str, database: &str, application_name: &str)
     body
 }
 
-/// Render an `ErrorResponse` / `NoticeResponse` payload as a diagnostic string.
+/// An `ErrorResponse` / `NoticeResponse`, field by field.
 ///
-/// The payload is a sequence of `field-code + NUL-terminated value`, ending with a zero
-/// code byte. Severity, SQLSTATE and the primary message are the fields worth surfacing;
-/// including the SQLSTATE matters because callers key recoverability off it.
+/// Kept structured so a caller can act on the SQLSTATE as a value; rendering it to a
+/// string is the last step, for a human.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::source::postgres) struct ServerError {
+    pub(in crate::source::postgres) severity: Option<String>,
+    pub(in crate::source::postgres) code: Option<String>,
+    pub(in crate::source::postgres) message: Option<String>,
+    pub(in crate::source::postgres) detail: Option<String>,
+    pub(in crate::source::postgres) hint: Option<String>,
+}
+
+impl ServerError {
+    /// Parse the payload: a sequence of `field-code + NUL-terminated value`, ending with a
+    /// zero code byte.
+    pub(in crate::source::postgres) fn parse(payload: &[u8]) -> Self {
+        let mut parsed = Self::default();
+        let mut rest = payload;
+        while let Some((&field, tail)) = rest.split_first() {
+            if field == 0 {
+                break;
+            }
+            let end = tail
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(tail.len());
+            let value = String::from_utf8_lossy(&tail[..end]).into_owned();
+            rest = tail.get(end + 1..).unwrap_or(&[]);
+            match field {
+                b'S' => parsed.severity = Some(value),
+                b'C' => parsed.code = Some(value),
+                b'M' => parsed.message = Some(value),
+                b'D' => parsed.detail = Some(value),
+                b'H' => parsed.hint = Some(value),
+                _ => {}
+            }
+        }
+        parsed
+    }
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(severity) = &self.severity {
+            write!(f, "{severity}: ")?;
+        }
+        f.write_str(
+            self.message
+                .as_deref()
+                .unwrap_or("unspecified postgres error"),
+        )?;
+        if let Some(code) = &self.code {
+            write!(f, " (SQLSTATE {code})")?;
+        }
+        if let Some(detail) = &self.detail {
+            write!(f, " detail: {detail}")?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(f, " hint: {hint}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Render an `ErrorResponse` / `NoticeResponse` payload as a diagnostic string.
 pub(super) fn render_error_response(payload: &[u8]) -> String {
-    let mut severity = None;
-    let mut code = None;
-    let mut message = None;
-    let mut detail = None;
-    let mut hint = None;
-
-    let mut rest = payload;
-    while let Some((&field, tail)) = rest.split_first() {
-        if field == 0 {
-            break;
-        }
-        let end = tail
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(tail.len());
-        let value = String::from_utf8_lossy(&tail[..end]).into_owned();
-        rest = tail.get(end + 1..).unwrap_or(&[]);
-        match field {
-            b'S' => severity = Some(value),
-            b'C' => code = Some(value),
-            b'M' => message = Some(value),
-            b'D' => detail = Some(value),
-            b'H' => hint = Some(value),
-            _ => {}
-        }
-    }
-
-    let mut rendered = String::new();
-    if let Some(severity) = severity {
-        rendered.push_str(&severity);
-        rendered.push_str(": ");
-    }
-    rendered.push_str(message.as_deref().unwrap_or("unspecified postgres error"));
-    if let Some(code) = code {
-        rendered.push_str(&format!(" (SQLSTATE {code})"));
-    }
-    if let Some(detail) = detail {
-        rendered.push_str(&format!(" detail: {detail}"));
-    }
-    if let Some(hint) = hint {
-        rendered.push_str(&format!(" hint: {hint}"));
-    }
-    rendered
+    ServerError::parse(payload).to_string()
 }
 
 /// Render a message tag for diagnostics, printable or not.
@@ -569,6 +588,35 @@ mod tests {
         assert!(rendered.contains("55006"), "SQLSTATE drives recoverability");
         assert!(rendered.contains("is active"));
         assert!(rendered.contains("wait for the other session"));
+    }
+
+    #[test]
+    fn an_error_response_keeps_its_sqlstate_and_detail_as_fields() {
+        let mut payload = Vec::new();
+        for (field, value) in [
+            (b'S', "ERROR"),
+            (b'C', "55000"),
+            (b'M', "can no longer access replication slot \"s1\""),
+            (
+                b'D',
+                "This replication slot has been invalidated due to \"wal_removed\".",
+            ),
+        ] {
+            payload.push(field);
+            payload.extend_from_slice(value.as_bytes());
+            payload.push(0);
+        }
+        payload.push(0);
+
+        let parsed = ServerError::parse(&payload);
+        assert_eq!(parsed.code.as_deref(), Some("55000"));
+        assert!(
+            parsed
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("wal_removed"))
+        );
+        assert_eq!(parsed.to_string(), render_error_response(&payload));
     }
 
     #[test]

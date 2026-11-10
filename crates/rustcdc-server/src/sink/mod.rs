@@ -12,7 +12,7 @@ use rustcdc::sink::BoxedSink;
 pub use http::HttpSink;
 pub use iceberg::IcebergSink;
 pub(crate) use kafka::enforce_durable_confirmation;
-pub(crate) use kafka::kafka_connect_timeout;
+pub(crate) use kafka::kafka_builder;
 pub use kafka::{KafkaSink, KafkaTransactionHandle};
 pub use rustcdc::sink::{FanOutSinkAdapter as FanOutSink, FileJsonlSink, StdoutSink};
 pub use snowflake::SnowflakeSink;

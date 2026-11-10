@@ -343,6 +343,7 @@ impl ReplaySession {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -367,6 +368,7 @@ impl ReplaySession {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: payload.unavailable_columns,
         })
     }

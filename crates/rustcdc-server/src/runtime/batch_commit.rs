@@ -24,6 +24,7 @@ pub(crate) async fn handle_polled_batch(
     metrics_accumulator: &mut RuntimeLoopMetricsAccumulator,
     sink_metrics: &crate::sink::SinkMetricsRegistry,
     dlq: Option<&tokio::sync::Mutex<crate::dlq::DeadLetterQueue>>,
+    mut shutdown: Option<&mut super::event_loop::ShutdownSignals>,
     batch: rustcdc::core::EventBatch,
 ) -> Option<RuntimeLoopOutcome> {
     tracing::trace!(batch_len = batch.len(), "handle_polled_batch: enter");
@@ -102,7 +103,14 @@ pub(crate) async fn handle_polled_batch(
                     ));
                 }
 
-                match recoverable
+                // The batch is held, so nothing polls and nothing commits until it goes
+                // through. Tell the runtime why, and publish what it now says: the verdict
+                // otherwise stays at the last committed batch's for the whole outage.
+                runtime.record_delivery_failure(&err);
+                publish_health_during_retry(runtime, admin_state, recoverable, metrics_accumulator)
+                    .await;
+
+                let wait_ms = match recoverable
                     .on_recoverable_error(recovery_policy, super::recovery::jitter_seed())
                 {
                     RecoveryAction::Retry {
@@ -116,7 +124,7 @@ pub(crate) async fn handle_polled_batch(
                             backoff_ms,
                             "recoverable sink delivery error; backing off before retrying the batch"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms
                     }
                     RecoveryAction::BreakerCooldown {
                         consecutive,
@@ -130,7 +138,7 @@ pub(crate) async fn handle_polled_batch(
                             cooldown_ms,
                             "sink delivery circuit-breaker opened; cooling down before retrying the batch"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(cooldown_ms)).await;
+                        cooldown_ms
                     }
                     RecoveryAction::Escalate { message } => {
                         return Some(RuntimeLoopOutcome::error(
@@ -138,6 +146,33 @@ pub(crate) async fn handle_polled_batch(
                             crate::error::AppError::Other(format!("{message}: {err}")),
                         ));
                     }
+                };
+
+                // The wait is where a shutdown request lands: the event loop's own signal
+                // arm cannot run while this batch is held. Stopping here leaves the batch
+                // uncommitted, so it is redelivered from the checkpoint on the next start —
+                // the same outcome as a crash, without the forced stop.
+                let wait = tokio::time::sleep(std::time::Duration::from_millis(wait_ms));
+                match shutdown.as_deref_mut() {
+                    Some(signals) => {
+                        tokio::select! {
+                            () = wait => {}
+                            () = signals.recv() => {
+                                tracing::info!(
+                                    "shutdown signal received while retrying a batch - stopping \
+                                     pipeline; the batch redelivers from the checkpoint"
+                                );
+                                admin_state.record_shutdown_request_os_signal().await;
+                                admin_state
+                                    .set_state(crate::admin::InstanceState::Stopping)
+                                    .await;
+                                return Some(RuntimeLoopOutcome::Clean(
+                                    RuntimeTerminalReasonCode::ShutdownSignal,
+                                ));
+                            }
+                        }
+                    }
+                    None => wait.await,
                 }
             }
         }
@@ -152,7 +187,7 @@ pub(crate) async fn handle_polled_batch(
     //
     // `commit_ack` writes the durable position through the checkpoint store. With a Kafka
     // state backend sharing the sink's producer, that write lands **inside the open
-    // transaction**, so the single `commit_transaction` below makes the batch's data and
+    // transaction**, so the single `commit` below makes the batch's data and
     // the position that describes it durable together. There is no window between them:
     // a crash before the commit discards both and the batch replays cleanly; a crash after
     // it keeps both and the batch is not replayed.
@@ -372,4 +407,17 @@ async fn record_batch_metrics_and_admin(
     admin_state
         .record_batch(event_count, runtime_metrics, checkpoint_age_seconds)
         .await;
+}
+
+pub(super) async fn publish_health_during_retry(
+    runtime: &CdcRuntime,
+    admin_state: &AdminState,
+    recoverable: &RecoverableErrorState,
+    metrics_accumulator: &mut RuntimeLoopMetricsAccumulator,
+) {
+    let admin_snapshot = runtime.admin_snapshot();
+    metrics_accumulator.observe_health_transition(&admin_snapshot);
+    let runtime_metrics =
+        metrics_accumulator.build_runtime_metrics_snapshot(admin_snapshot, recoverable.snapshot());
+    admin_state.record_runtime_health(runtime_metrics).await;
 }

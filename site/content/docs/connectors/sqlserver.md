@@ -25,7 +25,7 @@ rows into the rustcdc event envelope.
 | `UPDATE` | yes | Full `before` + `after` |
 | `DELETE` | yes | Full `before` |
 | DDL changes | partial | Column additions captured; column drops may require re-enabling CDC on the table |
-| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
+| Column types | yes | Every row carries its table's declared columns in `shape` — see [Declared column types](#declared-column-types) |
 | `TRUNCATE` | opt-in | SQL Server CDC alone cannot log TRUNCATE. With `capture_truncate_events = true` the connector installs a database-level DDL trigger + shadow table and emits a `truncate` event positioned after all DML at the captured LSN |
 
 ### Minimum requirements
@@ -57,10 +57,11 @@ captured change, with columns:
 
 ### Declared column types
 
-Column values are text, so a consumer needs the types to decode them. Every table's columns
-are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
-event with `ddl_type = "READ_SCHEMA"` — see
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Column values are text, so a consumer needs the types to decode them. Every row carries its
+table's `shape` — declared types, nullability and key. Stream rows take it from the capture
+instance they were read through, so a new capture instance brings a new shape; snapshot rows
+take it from the catalogue read at snapshot start. See
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape).
 
 Types come from `sys.columns`, reached through the capture instance, so lengths, precision
 and scale survive: `decimal(12,4)`, `nvarchar(255)`, `datetime2(3)`. An alias type or UDT
@@ -386,6 +387,19 @@ EXEC sys.sp_cdc_change_job
     @job_type = N'cleanup',
     @retention = 14400;   -- 14400 minutes = 10 days (default: 4320 = 3 days)
 ```
+
+### CDC disabled and re-enabled under the same capture instance
+
+**Symptom:** after `sp_cdc_disable_table` and `sp_cdc_enable_table` for a captured table, the
+connector stops with the same "no longer retained" error as above.
+
+**Cause:** changes made while CDC was off were never captured, and the new instance's history
+starts after the checkpoint. Continuing would hide that gap, so the connector stops.
+
+**Resolution:** to change a captured table's columns, add a second capture instance with a new
+`@capture_instance` name, let the connector pick it up, then disable the old one — SQL Server's
+documented way to evolve a captured table without a gap. If CDC was already disabled and
+re-enabled, re-snapshot as above.
 
 ### SQL Server Agent not running
 

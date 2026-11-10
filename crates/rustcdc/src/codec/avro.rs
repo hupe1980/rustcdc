@@ -171,6 +171,11 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
         None => AvroValue::Union(0, Box::new(AvroValue::Null)),
     };
 
+    let shape_val = match event.shape.as_deref() {
+        Some(shape) => AvroValue::Union(1, Box::new(row_shape_to_avro(shape))),
+        None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+    };
+
     let primary_key = AvroValue::Array(
         event
             .primary_key
@@ -251,7 +256,53 @@ fn event_to_avro_value(event: &Event) -> Result<AvroValue> {
                     .collect(),
             ),
         ),
+        ("shape".into(), shape_val),
     ]))
+}
+
+fn row_shape_to_avro(shape: &crate::core::RowShape) -> AvroValue {
+    let columns = match shape.columns() {
+        Some(columns) => AvroValue::Union(
+            1,
+            Box::new(AvroValue::Array(
+                columns
+                    .iter()
+                    .map(|column| {
+                        AvroValue::Record(vec![
+                            ("name".into(), AvroValue::String(column.name.clone())),
+                            (
+                                "data_type".into(),
+                                AvroValue::String(column.data_type.clone()),
+                            ),
+                            ("nullable".into(), AvroValue::Boolean(column.nullable)),
+                        ])
+                    })
+                    .collect(),
+            )),
+        ),
+        None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+    };
+    let primary_key = match shape.primary_key() {
+        Some(keys) => AvroValue::Union(
+            1,
+            Box::new(AvroValue::Array(
+                keys.iter()
+                    .map(|key| AvroValue::String(key.clone()))
+                    .collect(),
+            )),
+        ),
+        None => AvroValue::Union(0, Box::new(AvroValue::Null)),
+    };
+    AvroValue::Record(vec![
+        ("id".into(), AvroValue::String(shape.id().to_string())),
+        (
+            "schema".into(),
+            AvroValue::String(shape.schema().to_string()),
+        ),
+        ("table".into(), AvroValue::String(shape.table().to_string())),
+        ("columns".into(), columns),
+        ("primary_key".into(), primary_key),
+    ])
 }
 
 #[cfg(test)]
@@ -284,6 +335,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -309,6 +361,7 @@ mod tests {
             }),
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -603,6 +656,71 @@ pub fn avro_value_to_event(value: &AvroValue) -> Result<Event> {
         }
     }
 
+    fn row_shape_from_avro(fields: &[(String, AvroValue)]) -> Result<crate::core::RowShape> {
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value)
+        };
+        let text = |name: &str| -> Result<String> {
+            field(name)
+                .map(|value| string_field(value, &format!("shape.{name}")))
+                .unwrap_or_else(|| {
+                    Err(Error::SerializationError(format!(
+                        "avro → Event: shape has no '{name}'"
+                    )))
+                })
+        };
+        let columns = match field("columns").and_then(unwrap_union) {
+            Some(AvroValue::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|item| {
+                        let column = record_fields(item).ok_or_else(|| {
+                            Error::SerializationError(
+                                "avro → Event: a shape column must be a record".into(),
+                            )
+                        })?;
+                        let get = |name: &str| {
+                            column
+                                .iter()
+                                .find(|(key, _)| key == name)
+                                .map(|(_, value)| value)
+                        };
+                        Ok(crate::core::ShapeColumn::new(
+                            get("name")
+                                .map(|value| string_field(value, "shape.columns.name"))
+                                .transpose()?
+                                .unwrap_or_default(),
+                            get("data_type")
+                                .map(|value| string_field(value, "shape.columns.data_type"))
+                                .transpose()?
+                                .unwrap_or_default(),
+                            matches!(
+                                get("nullable").and_then(unwrap_union),
+                                Some(AvroValue::Boolean(true))
+                            ),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            _ => None,
+        };
+        let primary_key = match field("primary_key").and_then(unwrap_union) {
+            Some(AvroValue::Array(_)) => Some(string_array(field("primary_key"))),
+            _ => None,
+        };
+        crate::core::row_shape_from_parts(
+            text("id")?,
+            text("schema")?,
+            text("table")?,
+            columns,
+            primary_key,
+        )
+        .map_err(|error| Error::SerializationError(format!("avro → Event: {error}")))
+    }
+
     let op = match string_field(required("op")?, "op")?.as_str() {
         "INSERT" => Operation::Insert,
         "UPDATE" => Operation::Update,
@@ -695,6 +813,10 @@ pub fn avro_value_to_event(value: &AvroValue) -> Result<Event> {
         .ts(long_field(required("ts")?, "ts")? as u64)
         .primary_key(string_array(get("primary_key")))
         .unavailable_columns(string_array(get("unavailable_columns")));
+
+    if let Some(shape_fields) = get("shape").and_then(record_fields) {
+        builder = builder.shape(std::sync::Arc::new(row_shape_from_avro(shape_fields)?));
+    }
 
     // Reassembled through the one shared constructor so Avro cannot accept an envelope
     // JSON and Protobuf reject.

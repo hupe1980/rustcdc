@@ -19,6 +19,7 @@
 //! | `time` | RFC 3339 timestamp from `event.ts` (ms since epoch) |
 //! | `datacontenttype` | `"application/json"` |
 //! | `subject` | `"{schema}.{table}"` or `"{table}"` |
+//! | `dataschema` | `"urn:rustcdc:row-shape:{id}"` when the row carries a shape (omitted otherwise) |
 //!
 //! # CDC extension attributes
 //!
@@ -42,7 +43,10 @@
 //!   "after":  { "id": 1, "name": "alice-v2" },
 //!   "primary_key": ["id"],
 //!   "snapshot":    null,
-//!   "transaction": { "tx_id": 42, "total_events": 1, "event_index": 0 }
+//!   "transaction": { "tx_id": 42, "total_events": 1, "event_index": 0 },
+//!   "shape": { "id": "…", "schema": "public", "table": "users",
+//!              "columns": [{ "name": "id", "data_type": "integer", "nullable": false }],
+//!              "primary_key": ["id"] }
 //! }
 //! ```
 
@@ -193,6 +197,10 @@ impl EventEncoder for CloudEventsEncoder {
                 data.insert(field.into(), json!(columns));
             }
         }
+        // The shape travels with the row so `data` decodes on its own.
+        if let Some(shape) = event.shape.as_deref() {
+            data.insert("shape".into(), serde_json::to_value(shape)?);
+        }
         // Carry the envelope version so consumers can detect a version bump.
         data.insert("envelope_version".into(), json!(event.envelope_version));
 
@@ -205,6 +213,11 @@ impl EventEncoder for CloudEventsEncoder {
         ce.insert("time".into(), json!(time));
         ce.insert("datacontenttype".into(), json!("application/json"));
         ce.insert("subject".into(), json!(subject));
+        // CloudEvents' own field for "the schema `data` adheres to"; it changes exactly when
+        // the shape does, which is what the spec asks of it.
+        if let Some(shape) = event.shape.as_deref() {
+            ce.insert("dataschema".into(), json!(row_shape_dataschema(shape.id())));
+        }
 
         // CDC extension attributes (spec: lowercase alphanumeric, max 20 chars).
         ce.insert("cdcop".into(), json!(event.op.to_str()));
@@ -227,6 +240,12 @@ impl EventEncoder for CloudEventsEncoder {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// The CloudEvents `dataschema` URI naming a row shape.
+#[must_use]
+pub fn row_shape_dataschema(shape_id: &str) -> String {
+    format!("urn:rustcdc:row-shape:{shape_id}")
+}
 
 /// Format Unix epoch milliseconds as an RFC 3339 / ISO 8601 UTC timestamp.
 ///
@@ -354,6 +373,38 @@ mod tests {
         );
     }
 
+    /// `dataschema` names the row's shape, and `data` carries the shape itself.
+    #[test]
+    fn cloudevents_names_the_shape_in_dataschema() {
+        use crate::core::{RowShape, ShapeColumn};
+
+        let shape = RowShape::new(
+            "public",
+            "users",
+            vec![ShapeColumn::new("id", "integer", false)],
+            vec!["id".into()],
+        )
+        .unwrap();
+        let mut event = insert_event();
+        event.shape = Some(std::sync::Arc::new(shape.clone()));
+        let encoded = CloudEventsEncoder::default().encode(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded.bytes).unwrap();
+        assert_eq!(
+            value["dataschema"],
+            format!("urn:rustcdc:row-shape:{}", shape.id())
+        );
+        assert_eq!(
+            value["data"]["shape"],
+            serde_json::to_value(&shape).unwrap()
+        );
+
+        let encoded = CloudEventsEncoder::default()
+            .encode(&insert_event())
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded.bytes).unwrap();
+        assert!(value.get("dataschema").is_none(), "no shape, no dataschema");
+    }
+
     fn insert_event() -> Event {
         Event {
             before: BeforeImage::Unavailable,
@@ -375,6 +426,7 @@ mod tests {
                 event_index: 0,
             }),
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }

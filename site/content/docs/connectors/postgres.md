@@ -27,7 +27,7 @@ additional installation required).
 | `UPDATE` | yes | `after` always; `before` requires `REPLICA IDENTITY FULL` or `USING INDEX` |
 | `DELETE` | yes | `before` requires `REPLICA IDENTITY FULL` or `USING INDEX`; otherwise primary key only |
 | `TRUNCATE` | yes | PostgreSQL ≥ 11; `pgoutput` only |
-| Column types | yes | Every table's declared columns are announced before its first row — see [Declared column types](#declared-column-types) |
+| Column types | yes | Every row carries its table's declared columns in `shape` — see [Declared column types](#declared-column-types) |
 | Logical decoding messages | opt-in | `pg_logical_emit_message()` output — the table-free transactional outbox. Set [`capture_logical_messages`](@/docs/config-reference.md#capture-logical-messages) |
 | DDL statements | no | Logical decoding does not expose the statement text. A column added or retyped is reported as a schema event derived from the `RELATION` metadata, not as the `ALTER TABLE` that caused it |
 
@@ -159,21 +159,21 @@ slot. PostgreSQL will replay all uncommitted WAL segments from that LSN forward.
 
 ### Declared column types
 
-Column values are text, so a consumer needs the types to decode them. Every table's columns
-are announced before its first row, in the snapshot and the stream, as a `SchemaChange`
-event with `ddl_type = "READ_SCHEMA"` — see
-[Schema Evolution](@/docs/schema-evolution.md#every-table-is-announced-before-its-first-row).
+Column values are text, so a consumer needs the types to decode them. Every row, in the
+snapshot and the stream, carries its table's columns in `shape` — see
+[Schema Evolution](@/docs/schema-evolution.md#every-row-carries-its-shape).
 
-Types come from `pg_catalog.format_type()`, read once at stream start over the publication:
-`numeric(12,4)` keeps its modifier, and enums, domains and extension types report their own
-names. Nullability comes from `pg_attribute.attnotnull`.
+Types are `pg_catalog.format_type()`: `numeric(12,4)` keeps its modifier, and enums, domains
+and extension types report their own names. A stream row's types come from the type OID and
+modifier of its `RELATION` message, resolved once per distinct pair on the connector's SQL
+connection, so a row written before an `ALTER COLUMN … TYPE` carries the type it was written
+under. Nullability comes from `pg_attribute.attnotnull` and the key from the primary-key
+index, read at stream start and again when a table's `RELATION` changes.
 
 No extra privilege — `pg_catalog` is readable by every role.
 
-**Limit.** A table added to the publication *after* the stream started is not in that read,
-so its columns report the pgoutput type OID: no modifier, and `unknown` for a type outside
-the built-in set. Its first DDL carries the full declaration, and a restart re-reads the
-catalogue.
+**Limit.** pgoutput carries neither nullability nor the key, so a stream row's are the
+catalogue's at the last read, not necessarily at the row's position.
 
 ### Logical decoding messages — the table-free outbox
 
@@ -218,10 +218,14 @@ ALTER TABLE public.orders REPLICA IDENTITY FULL;
 ### Unchanged TOAST columns (partial after-images)
 
 PostgreSQL stores large values (roughly > 8 KB: `text`, `bytea`, `jsonb`) out of
-line ("TOAST"). When an `UPDATE` does not modify such a value, PostgreSQL omits it
-from the WAL record entirely — **under every `REPLICA IDENTITY` setting**. Replica
-identity governs the *old* tuple only; it does not and cannot make the after-image
-complete.
+line ("TOAST"). When an `UPDATE` does not modify such a value, pgoutput sends it as
+*unchanged* in the new tuple rather than sending the value — under every `REPLICA IDENTITY`
+setting.
+
+**Under `REPLICA IDENTITY FULL` the connector completes the row.** The old tuple carries the
+column's value, and an unmodified column's new value is its old one, so `after` is filled from
+the same WAL record and the column is not reported. A column the old tuple *also* lacks stays
+reported. Under `DEFAULT` and `USING INDEX` there is no old value to use:
 
 The connector surfaces this precisely instead of papering over it: affected column
 names are listed in the event's `unavailable_columns` (holes in `after`) and
@@ -488,6 +492,36 @@ Alert when `retained_wal` exceeds a threshold (e.g., 10 GiB).
    and the pipeline must re-snapshot. Alert well before the cap using the
    `rustcdc_replication_slot_lag_bytes` gauge (see
    `RUSTCDCReplicationSlotLagHigh` in the shipped alert rules).
+
+### An invalidated slot
+
+Two server settings invalidate a slot while the pipeline depends on it:
+
+| Setting | Invalidates when | `invalidation_reason` (17+) |
+|---|---|---|
+| `max_slot_wal_keep_size` (13+) | the slot retains more WAL than the cap, at the next checkpoint | `wal_removed` |
+| `idle_replication_slot_timeout` (18+) | the slot has been inactive longer than the timeout, at the next checkpoint | `idle_timeout` |
+
+The connector samples the slot's `wal_status` and `safe_wal_size` with its lag
+(every `slot_idle_advance_interval_ms`, 15 s when idle advance is off, or
+`slot_state_sample_interval_ms`). `unreserved` is exported and alerted
+(`RUSTCDCReplicationSlotUnreserved`) while the slot can still be saved.
+
+Once the slot is invalidated, the next poll, reconnect or startup fails with
+`SourceErrorKind::SlotInvalidated`, decided from SQLSTATE `55000` and the slot's
+row in `pg_replication_slots`, and the runtime reports
+`StallCause::SourcePositionLost`. The server parks rather than restarting; see the
+runbook. The sample raises the same error when it reads `lost`, which is what
+names the condition when connection retries are disabled — without it the
+verdict would be `poll_loop_not_turning`.
+
+Limits:
+
+- Under `sql_peek` the slot is active only during each peek, so
+  `idle_replication_slot_timeout` can invalidate it between peeks when the timeout
+  is shorter than the poll interval plus any backoff. The same classifier names it.
+- The sample is one catalogue query on the connection's SQL client, per sample, on
+  both transports.
 3. **Drop idle slots** if a pipeline is permanently retired:
    ```sql
    SELECT pg_drop_replication_slot('cdc_slot');
@@ -537,6 +571,7 @@ replication_slot_name = "cdc_slot"      # name of the replication slot
 create_replication_slot_if_missing = false   # true only for first-time provisioning / ephemeral envs
 failover_slot                      = false   # PostgreSQL 17+: create failover-enabled slots
 slot_idle_advance_interval_ms      = 30000   # idle slot advance; 0 disables (not recommended)
+# slot_state_sample_interval_ms    = 15000   # slot lag/wal_status sample; defaults to the idle-advance cadence
 
 # WAL transport
 wal_transport = "streaming_replication"   # streaming_replication | sql_peek
@@ -570,6 +605,7 @@ mode = "plaintext"    # plaintext | tls
 | `create_replication_slot_if_missing` | `false` | Allow the connector to create a missing slot. Keep `false` in production: a vanished slot is a data-loss event, and recreating it silently resumes from "now" and skips everything in between |
 | `failover_slot` | `false` | PostgreSQL 17+: create the slot with `failover = true` so it is synchronized to standbys and capture survives promotion. Only applies when the connector creates the slot; requires cluster-side sync configuration |
 | `slot_idle_advance_interval_ms` | `30000` | Advance the slot when no committed events arrive so PostgreSQL can recycle WAL. `0` disables (not recommended for long-lived streams) |
+| `slot_state_sample_interval_ms` | unset | How often to sample the slot's lag and `wal_status`. Unset follows `slot_idle_advance_interval_ms`, or 15 s when that is `0`. Must be greater than zero when set |
 | `wal_transport` | `"streaming_replication"` | How the WAL stream is read. `"sql_peek"` is the fallback for a role without `REPLICATION` or a connection that must route through a pooler — see [WAL transport](#wal-transport-how-the-stream-is-read) for the cost |
 | `conn_timeout_secs` | `30` | Connection timeout in seconds |
 | `stream_poll_interval_ms` | `50` | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
@@ -587,7 +623,9 @@ metrics:
 | Metric | Type | Description |
 |---|---|---|
 | `rustcdc_runtime_health{verdict=…}` | gauge (one-hot) | Derived health verdict: `healthy` \| `idle` \| `stalled` \| `not_running`. Exactly one series is 1. Alert on `verdict="stalled"` — `idle` is deliberately not alertable (a quiet database is not an incident) |
-| `rustcdc_runtime_stall_cause{cause=…}` | gauge | Present only while stalled: `unconfirmed_source_position` \| `poll_loop_not_turning` \| `consumer_not_acknowledging`. Route the page on this |
+| `rustcdc_runtime_stall_cause{cause=…}` | gauge | Present only while stalled: `source_position_lost` \| `unconfirmed_source_position` \| `delivery_failing` \| `poll_loop_not_turning` \| `consumer_not_acknowledging`. Route the page on this |
+| `rustcdc_replication_slot_wal_status{status=…}` | gauge | The slot's `wal_status`, one-hot. Page on `unreserved` |
+| `rustcdc_replication_slot_safe_wal_size_bytes` | gauge | The slot's `safe_wal_size`; negative once `unreserved` |
 | `rustcdc_runtime_poll_age_ms` | gauge | Milliseconds since the last poll returned, empty batches included — the poll loop's own liveness |
 | `rustcdc_runtime_delivery_age_ms` | gauge | Milliseconds since events last arrived. High on its own just means the source is quiet — do not alert on it |
 | `rustcdc_replication_slot_lag_bytes` | gauge | Slot WAL lag (`pg_current_wal_lsn - confirmed_flush_lsn`). Unbounded growth risks slot invalidation |

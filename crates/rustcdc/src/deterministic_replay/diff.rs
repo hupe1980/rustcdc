@@ -94,7 +94,7 @@ impl EventDiff {
 /// **Compared** — every field whose value is a deterministic function of the replayed input:
 /// `op`, `table`, `schema`, `source.source_name`, `source.offset`, `before`, `after`,
 /// `before_is_key_only`, `unavailable_columns`, `before_unavailable_columns`, `primary_key`,
-/// `envelope_version`, `transaction`, and the deterministic half of `snapshot`.
+/// `envelope_version`, `shape`, `transaction`, and the deterministic half of `snapshot`.
 ///
 /// **Not compared**, each for a reason rather than by omission:
 ///
@@ -246,6 +246,27 @@ pub fn semantic_diff(old: &Event, new: &Event) -> Vec<EventDiff> {
                 .with_path(field),
             );
         }
+    }
+
+    // The shape a row was captured under. A replay that stopped stamping it, or stamped a
+    // different one, changes how every consumer parses the row's text values. Compared whole,
+    // not by id: a decoded shape whose columns disagree with its id is a defect too.
+    if old.shape != new.shape {
+        let id = |shape: &Option<std::sync::Arc<crate::core::RowShape>>| {
+            shape.as_deref().map(|shape| shape.id().to_string())
+        };
+        diffs.push(
+            EventDiff::new(
+                DiffLevel::Semantic,
+                format!(
+                    "shape changed from {:?} to {:?}",
+                    id(&old.shape),
+                    id(&new.shape)
+                ),
+                vec![],
+            )
+            .with_path("shape"),
+        );
     }
 
     // The resume coordinate. A checkpoint is only as good as this string, and getting it
@@ -423,6 +444,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -452,6 +474,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: crate::core::EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -519,6 +542,18 @@ mod field_coverage_tests {
             (
                 "unavailable_columns",
                 Box::new(|event: &mut Event| event.unavailable_columns = vec!["body".into()]),
+            ),
+            (
+                "shape",
+                Box::new(|event: &mut Event| {
+                    event.shape = crate::core::RowShape::new(
+                        "public",
+                        "orders",
+                        vec![crate::core::ShapeColumn::new("id", "bigint", false)],
+                        vec!["id".into()],
+                    )
+                    .map(std::sync::Arc::new);
+                }),
             ),
             (
                 "before_unavailable_columns",

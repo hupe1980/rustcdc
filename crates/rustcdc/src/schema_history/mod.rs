@@ -570,12 +570,18 @@ impl SchemaHistory for FileSchemaHistory {
     async fn record_ddl(&mut self, ddl_id: &str, ddl: DDLEvent) -> Result<u32> {
         let mut store = self.schemas.write().await;
         let entries_before = store.values().map(Vec::len).sum::<usize>();
+        let previous = store.clone();
         let version = record_ddl_in_store(&mut store, ddl_id, ddl, current_time())?;
         // A recognised replay changed nothing, so there is nothing to make durable —
         // and rewriting the whole file plus two `fsync`s per redelivered DDL is not a
         // cost worth paying for a no-op.
-        if store.values().map(Vec::len).sum::<usize>() != entries_before {
-            self.persist_store(&store).await?;
+        if store.values().map(Vec::len).sum::<usize>() != entries_before
+            && let Err(error) = self.persist_store(&store).await
+        {
+            // Memory must not hold a version the file lacks: a retry would find it by its
+            // identity, report it recorded, and never write it.
+            *store = previous;
+            return Err(error);
         }
         Ok(version)
     }
@@ -870,6 +876,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         }
     }
@@ -1240,6 +1247,54 @@ mod tests {
         assert_eq!(
             latest.columns.iter().filter(|c| c.name == "email").count(),
             1
+        );
+    }
+
+    /// A record whose persist fails must not stay in memory: the retry would find it by its
+    /// identity, answer "already recorded" and never write it.
+    #[tokio::test]
+    async fn a_failed_persist_leaves_no_version_in_memory() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("schema-history.json");
+        let lease_path = tmp.path().join("schema-history.json.owner");
+
+        let mut history = FileSchemaHistory::new(&path).await.unwrap();
+        history
+            .record_ddl("0/100", DDLEvent::CreateTable(schema()))
+            .await
+            .unwrap();
+        let mut altered = schema();
+        altered.columns.push(ColumnDef {
+            name: "email".into(),
+            data_type: "text".into(),
+            nullable: true,
+            constraints: Vec::new(),
+        });
+
+        // Losing the lease is a persist failure the store can recover from once it returns.
+        let token = std::fs::read_to_string(&lease_path).unwrap();
+        std::fs::write(&lease_path, "someone-else").unwrap();
+        history
+            .record_ddl("0/200", DDLEvent::AlterTable(altered.clone()))
+            .await
+            .expect_err("the persist must fail without the lease");
+        std::fs::write(&lease_path, token).unwrap();
+
+        let version = history
+            .record_ddl("0/200", DDLEvent::AlterTable(altered))
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+        drop(history);
+        let reloaded = FileSchemaHistory::new(&path).await.unwrap();
+        let latest = reloaded
+            .latest_schema("public.users")
+            .await
+            .unwrap()
+            .expect("schema persisted");
+        assert_eq!(
+            latest.version, 2,
+            "the retried record must reach the file, not be answered from memory"
         );
     }
 

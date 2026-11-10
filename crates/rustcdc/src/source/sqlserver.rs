@@ -1,23 +1,12 @@
 //! SQL Server source configuration and connection lifecycle.
 //!
-//! # TLS: this connector uses a different stack than the rest of the crate
+//! # TLS
 //!
-//! Every other connector and sink in rustcdc negotiates TLS with `rustls 0.23`.
-//! `tiberius 0.12.3` hard-pins `tokio-rustls 0.24`, so enabling the `sqlserver` feature
-//! links a **second, older** copy — `rustls 0.21` / `rustls-webpki 0.101.7` — and that is
-//! the stack this connector actually speaks TLS with. It carries RUSTSEC-2026-0098,
-//! -0099 and -0104, plus the unmaintained `rustls-pemfile 1.0` via
-//! `rustls-native-certs 0.6`.
-//!
-//! It is not deduplicable and not fixable from rustcdc: the advisories are resolved only
-//! in `rustls-webpki >= 0.103.12`, which needs `rustls 0.23`, which is not
-//! semver-reachable from tiberius' pin. Two of the three are unreachable on rustcdc's code
-//! paths (no CRL is ever parsed; no URI name is ever asserted) and the third additionally
-//! requires a trusted CA to have misissued a certificate.
-//!
-//! The per-advisory reachability analysis, the mitigations, and the `cargo deny`
-//! suppressions live in `site/content/docs/security.md` and `deny.toml`. Deployments that
-//! cannot accept the exposure should leave the feature disabled — it is not a default.
+//! tiberius builds its own TLS client on `rustls 0.23` — the same stack as the rest of
+//! the crate — but not through `core::transport_tls`: it cannot consume a pre-built
+//! `rustls::ClientConfig`, and it selects the aws-lc-rs crypto provider unless a process
+//! default is installed. `SqlServerSourceConfig::to_tiberius_config` maps the transport
+//! settings it can express and rejects the ones it cannot.
 
 use std::{sync::Arc, time::Duration};
 
@@ -203,9 +192,23 @@ struct CaptureInstanceMeta {
     /// read yet, that *is* data loss, and a stale floor here is what makes it surface
     /// instead of being silently clamped away.
     capture_floor: [u8; 10],
+    /// The shape rows decoded against this instance are captured under, built once from the
+    /// fields above by [`Self::with_shape`] so every row shares one `Arc`.
+    shape: Option<Arc<crate::RowShape>>,
 }
 
 impl CaptureInstanceMeta {
+    /// Fill [`Self::shape`] from the captured columns and primary key.
+    fn with_shape(mut self) -> Self {
+        self.shape = crate::source::schema_catalog::row_shape_from_catalog(
+            &self.schema,
+            &self.table,
+            &self.captured_columns,
+            &self.primary_key,
+        );
+        self
+    }
+
     /// The captured column names, in source-table order.
     ///
     /// The poll projection and the row decoder want names; the schema event wants types.
@@ -357,14 +360,6 @@ pub struct SqlServerStreamHandle {
     /// of the events that have been delivered, so a crash mid-buffer causes at most one
     /// window of duplicate delivery (handled by the idempotency guard).
     window_buffer: Vec<Event>,
-    /// Whether the tables known at stream start have been announced yet.
-    ///
-    /// `metas` is seeded by `start_sqlserver_stream`, so the first metadata refresh sees
-    /// every instance as already-known and emits nothing — the same first-sight gap
-    /// PostgreSQL had, reached by a different route. A table whose capture instance
-    /// predates the pipeline therefore had no schema event anywhere in the stream, and
-    /// SQL Server rows carry text values like every other connector's.
-    schemas_announced: bool,
 }
 
 /// Snapshot handle that reads captured tables in keyset-paginated chunks.
@@ -716,14 +711,18 @@ async fn load_capture_metas_for_config(
             .filter(|value| !value.is_empty())
             .map_or(Ok([0u8; 10]), lsn_hex_to_bytes)?;
 
-        metas.push(CaptureInstanceMeta {
-            capture_instance: capture_instance.to_string(),
-            schema,
-            table,
-            primary_key,
-            captured_columns,
-            capture_floor,
-        });
+        metas.push(
+            CaptureInstanceMeta {
+                capture_instance: capture_instance.to_string(),
+                schema,
+                table,
+                primary_key,
+                captured_columns,
+                capture_floor,
+                shape: None,
+            }
+            .with_shape(),
+        );
     }
 
     if require_non_empty_metas && metas.is_empty() {
@@ -905,11 +904,7 @@ impl StreamHandle for SqlServerStreamHandle {
         }
 
         // ── Priority 2: flush schema-change events ──────────────────────────────
-        //
-        // The first poll announces every table the stream started with, before any row of
-        // any of them. After that the refresh reports only genuine changes.
-        let mut schema_events = self.announce_known_schemas();
-        schema_events.extend(self.refresh_metas_and_collect_schema_events().await?);
+        let mut schema_events = self.refresh_metas_and_collect_schema_events().await?;
         if !schema_events.is_empty() {
             self.events_polled = self
                 .events_polled
@@ -1327,9 +1322,8 @@ impl SqlServerConnection {
 
         for entry in tables {
             let (schema, table) = parse_schema_table(entry)?;
-            let catalog_columns = self
-                .load_table_columns(client, schema.as_str(), table.as_str())
-                .await?;
+            let catalog_columns =
+                load_table_catalog_columns(client, schema.as_str(), table.as_str()).await?;
             let column_names: Vec<String> = catalog_columns
                 .iter()
                 .map(|column| column.name.clone())
@@ -1368,7 +1362,7 @@ impl SqlServerConnection {
                 primary_key_columns,
                 column_names,
                 catalog_columns,
-                schema_announced: false,
+                shape: None,
             });
         }
 
@@ -1450,99 +1444,6 @@ impl SqlServerConnection {
         )
         .await?;
         Ok(Box::new(handle))
-    }
-
-    /// Read a snapshot table's columns with their declared types and nullability.
-    ///
-    /// The projection selected `COLUMN_NAME` alone, which is all the snapshot query needed
-    /// — and left the snapshot with nothing to describe the table with. Snapshot rows
-    /// carry text values, so a consumer joining at the initial load had no types at all.
-    ///
-    /// `DATA_TYPE` plus the three length columns rather than a single field, because
-    /// `INFORMATION_SCHEMA.COLUMNS` has no assembled type string the way MySQL's does.
-    /// `-1` is not used here: a `(max)` column reports `NULL` for
-    /// `CHARACTER_MAXIMUM_LENGTH`, which is why the field is read as an `Option`.
-    async fn load_table_columns(
-        &self,
-        client: &mut SqlClient,
-        schema: &str,
-        table: &str,
-    ) -> Result<Vec<CatalogColumn>> {
-        let rows = client
-            .query(
-                "SELECT COLUMN_NAME, COALESCE(DOMAIN_NAME, DATA_TYPE), \
-                        CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, DATETIME_PRECISION, \
-                        NUMERIC_SCALE, IS_NULLABLE \
-                 FROM INFORMATION_SCHEMA.COLUMNS \
-                 WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 \
-                 ORDER BY ORDINAL_POSITION",
-                &[&schema, &table],
-            )
-            .await
-            .map_err(|error| {
-                Error::SourceError(format!(
-                    "sqlserver snapshot columns query failed for '{schema}.{table}': {error}"
-                ))
-            })?
-            .into_first_result()
-            .await
-            .map_err(|error| {
-                Error::SourceError(format!(
-                    "sqlserver snapshot columns decode failed for '{schema}.{table}': {error}"
-                ))
-            })?;
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let name = row.get::<&str, _>(0)?.to_string();
-                // `COALESCE(DOMAIN_NAME, DATA_TYPE)`: for an alias type `DATA_TYPE` is the
-                // *base* system type while `DOMAIN_NAME` is the alias. The stream path
-                // reads `sys.types` on `user_type_id`, which reports the alias — so
-                // without the coalesce the snapshot and the stream would spell one column
-                // two ways, which is the disagreement this whole change exists to remove.
-                let base = row.get::<&str, _>(1).unwrap_or(CatalogColumn::UNKNOWN_TYPE);
-                // `INFORMATION_SCHEMA` reports character length **in characters**, and
-                // `-1` for the large-value `(max)` forms; `sys.columns` reports **bytes**,
-                // and `-1` for the same forms. `format_sqlserver_type` speaks the
-                // `sys.columns` convention, so the Unicode types are doubled here — but
-                // the `-1` sentinel is a sentinel, not a length, and doubling it would
-                // make it one.
-                let max_length = match row.get::<i32, _>(2) {
-                    // Not a character or binary type: no length applies.
-                    None => -1,
-                    Some(-1) => -1,
-                    Some(len) => {
-                        let bytes =
-                            if matches!(base.to_ascii_lowercase().as_str(), "nchar" | "nvarchar") {
-                                len.saturating_mul(2)
-                            } else {
-                                len
-                            };
-                        i16::try_from(bytes).unwrap_or(-1)
-                    }
-                };
-                let precision = row
-                    .get::<u8, _>(3)
-                    .or_else(|| row.get::<i16, _>(4).and_then(|v| u8::try_from(v).ok()))
-                    .unwrap_or(0);
-                // `DATETIME_PRECISION` is the fractional-seconds scale for the temporal
-                // types; `NUMERIC_SCALE` is the scale for the exact numerics.
-                let scale = row
-                    .get::<i32, _>(5)
-                    .and_then(|v| u8::try_from(v).ok())
-                    .or_else(|| row.get::<i16, _>(4).and_then(|v| u8::try_from(v).ok()))
-                    .unwrap_or(0);
-                Some(CatalogColumn {
-                    name,
-                    data_type: format_sqlserver_type(base, max_length, precision, scale),
-                    nullable: row
-                        .get::<&str, _>(6)
-                        .map(|value| value.eq_ignore_ascii_case("YES"))
-                        .unwrap_or(true),
-                })
-            })
-            .collect())
     }
 
     async fn load_table_primary_key_columns(
@@ -1643,6 +1544,16 @@ impl Drop for SqlServerConnection {
 
 #[async_trait]
 impl Source for SqlServerConnection {
+    // The trait's defaults are no-ops, so without these a connector held as
+    // `Box<dyn Source>` — registered with `register_source`, or wrapped — never connected.
+    async fn connect(&self) -> Result<()> {
+        SqlServerConnection::connect(self).await
+    }
+
+    async fn close(&self) {
+        SqlServerConnection::close(self).await
+    }
+
     async fn start_snapshot(&mut self, tables: &[&str]) -> Result<Box<dyn SnapshotHandle>> {
         self.start_snapshot_internal(tables, None).await
     }
@@ -1767,6 +1678,98 @@ impl Source for SqlServerConnection {
     }
 }
 
+/// Read a snapshot table's columns with their declared types and nullability.
+///
+/// The projection selected `COLUMN_NAME` alone, which is all the snapshot query needed
+/// — and left the snapshot with nothing to describe the table with. Snapshot rows
+/// carry text values, so a consumer joining at the initial load had no types at all.
+///
+/// `DATA_TYPE` plus the three length columns rather than a single field, because
+/// `INFORMATION_SCHEMA.COLUMNS` has no assembled type string the way MySQL's does.
+/// `-1` is not used here: a `(max)` column reports `NULL` for
+/// `CHARACTER_MAXIMUM_LENGTH`, which is why the field is read as an `Option`.
+pub(super) async fn load_table_catalog_columns(
+    client: &mut SqlClient,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<CatalogColumn>> {
+    let rows = client
+        .query(
+            "SELECT COLUMN_NAME, COALESCE(DOMAIN_NAME, DATA_TYPE), \
+                    CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, DATETIME_PRECISION, \
+                    NUMERIC_SCALE, IS_NULLABLE \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 \
+             ORDER BY ORDINAL_POSITION",
+            &[&schema, &table],
+        )
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "sqlserver snapshot columns query failed for '{schema}.{table}': {error}"
+            ))
+        })?
+        .into_first_result()
+        .await
+        .map_err(|error| {
+            Error::SourceError(format!(
+                "sqlserver snapshot columns decode failed for '{schema}.{table}': {error}"
+            ))
+        })?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let name = row.get::<&str, _>(0)?.to_string();
+            // `COALESCE(DOMAIN_NAME, DATA_TYPE)`: for an alias type `DATA_TYPE` is the
+            // *base* system type while `DOMAIN_NAME` is the alias. The stream path
+            // reads `sys.types` on `user_type_id`, which reports the alias — so
+            // without the coalesce the snapshot and the stream would spell one column
+            // two ways, which is the disagreement this whole change exists to remove.
+            let base = row.get::<&str, _>(1).unwrap_or(CatalogColumn::UNKNOWN_TYPE);
+            // `INFORMATION_SCHEMA` reports character length **in characters**, and
+            // `-1` for the large-value `(max)` forms; `sys.columns` reports **bytes**,
+            // and `-1` for the same forms. `format_sqlserver_type` speaks the
+            // `sys.columns` convention, so the Unicode types are doubled here — but
+            // the `-1` sentinel is a sentinel, not a length, and doubling it would
+            // make it one.
+            let max_length = match row.get::<i32, _>(2) {
+                // Not a character or binary type: no length applies.
+                None => -1,
+                Some(-1) => -1,
+                Some(len) => {
+                    let bytes =
+                        if matches!(base.to_ascii_lowercase().as_str(), "nchar" | "nvarchar") {
+                            len.saturating_mul(2)
+                        } else {
+                            len
+                        };
+                    i16::try_from(bytes).unwrap_or(-1)
+                }
+            };
+            let precision = row
+                .get::<u8, _>(3)
+                .or_else(|| row.get::<i16, _>(4).and_then(|v| u8::try_from(v).ok()))
+                .unwrap_or(0);
+            // `DATETIME_PRECISION` is the fractional-seconds scale for the temporal
+            // types; `NUMERIC_SCALE` is the scale for the exact numerics.
+            let scale = row
+                .get::<i32, _>(5)
+                .and_then(|v| u8::try_from(v).ok())
+                .or_else(|| row.get::<i16, _>(4).and_then(|v| u8::try_from(v).ok()))
+                .unwrap_or(0);
+            Some(CatalogColumn {
+                name,
+                data_type: format_sqlserver_type(base, max_length, precision, scale),
+                nullable: row
+                    .get::<&str, _>(6)
+                    .map(|value| value.eq_ignore_ascii_case("YES"))
+                    .unwrap_or(true),
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1826,36 +1829,6 @@ mod tests {
             "nvarchar(50)",
             "the spelling is normalised to lower case so one type has one spelling"
         );
-    }
-
-    /// A stream handle carrying the given capture-instance metadata and nothing else.
-    ///
-    /// Used by the schema-announcement tests, which exercise the metadata path only —
-    /// there is no window, no cursor and no broker.
-    pub(super) fn stream_handle_for_schema_tests(
-        metas: Vec<CaptureInstanceMeta>,
-    ) -> SqlServerStreamHandle {
-        SqlServerStreamHandle {
-            config: config(),
-            stream: SqlServerStream {
-                lsn_start: [0; 10],
-                lsn_end: [0xff; 10],
-                change_tables: metas
-                    .iter()
-                    .map(|meta| meta.capture_instance.clone())
-                    .collect(),
-                poll_interval_ms: 5000,
-                cursor: None,
-                pending_cursor: None,
-            },
-            metas,
-            events_polled: 0,
-            requeued_events: Vec::new(),
-            max_events_per_poll: MAX_EVENTS_PER_POLL,
-            pending_update_befores: AHashMap::new(),
-            window_buffer: Vec::new(),
-            schemas_announced: false,
-        }
     }
 
     use crate::core::BeforeImage;
@@ -2212,7 +2185,6 @@ mod tests {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
-            schemas_announced: false,
         }
     }
 
@@ -2281,7 +2253,6 @@ mod tests {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
-            schemas_announced: false,
         };
 
         let meta = CaptureInstanceMeta {
@@ -2291,6 +2262,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
 
         // A realistic CDC window: INSERT, UPDATE (op=3 before-image then op=4 after-image), DELETE.
@@ -2392,7 +2364,6 @@ mod tests {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
-            schemas_announced: false,
         };
 
         let meta = CaptureInstanceMeta {
@@ -2402,6 +2373,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into(), "name".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
 
         // Poll 1: only the op=3 before-image (OLD values) arrives.
@@ -2463,13 +2435,13 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             }],
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
-            schemas_announced: false,
         };
 
         let refreshed = vec![
@@ -2480,6 +2452,7 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into(), "email".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             },
             CaptureInstanceMeta {
                 capture_instance: "sales_orders".into(),
@@ -2488,6 +2461,7 @@ mod tests {
                 primary_key: vec!["order_id".into()],
                 captured_columns: vec!["order_id".into(), "total".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             },
         ];
 
@@ -2539,13 +2513,13 @@ mod tests {
                 primary_key: vec!["id".into()],
                 captured_columns: vec!["id".into(), "name".into()],
                 capture_floor: [0u8; 10],
+                shape: None,
             }],
             events_polled: 0,
             requeued_events: Vec::new(),
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
-            schemas_announced: false,
         };
 
         let events = handle.compute_schema_events_for_meta_refresh(&[]);
@@ -2724,7 +2698,7 @@ mod tests {
             primary_key_columns: vec!["id".into()],
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
-            schema_announced: false,
+            shape: None,
         };
 
         let mut handle = SqlServerSnapshotHandle::new(snapshot, vec![table_state], None, false);
@@ -2756,7 +2730,7 @@ mod tests {
                 primary_key_columns: vec!["id".into()],
                 column_names: vec!["id".into(), "name".into()],
                 catalog_columns: Vec::new(),
-                schema_announced: false,
+                shape: None,
             }],
             None,
             false,
@@ -2794,7 +2768,7 @@ mod tests {
             primary_key_columns: vec!["id".into()],
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
-            schema_announced: false,
+            shape: None,
         };
 
         let fetcher = Arc::new(MockSnapshotRowFetcher::with_table_pages(
@@ -2866,7 +2840,7 @@ mod tests {
             primary_key_columns: vec!["id".into()],
             column_names: vec!["id".into(), "name".into()],
             catalog_columns: Vec::new(),
-            schema_announced: false,
+            shape: None,
         };
 
         let first_fetcher = Arc::new(MockSnapshotRowFetcher::with_table_pages(
@@ -2973,6 +2947,7 @@ mod tests {
             snapshot: None,
             transaction: None,
             envelope_version: EVENT_ENVELOPE_VERSION,
+            shape: None,
             unavailable_columns: Vec::new(),
         };
 
@@ -3019,6 +2994,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
         let changes_a = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000000A0003".into(), // later LSN
@@ -3036,6 +3012,7 @@ mod tests {
             primary_key: vec!["id".into()],
             captured_columns: vec!["id".into()],
             capture_floor: [0u8; 10],
+            shape: None,
         };
         let changes_b = vec![SqlServerRawChange {
             start_lsn_hex: "0x000000230000000A0001".into(), // earlier LSN
@@ -3063,7 +3040,6 @@ mod tests {
             max_events_per_poll: MAX_EVENTS_PER_POLL,
             pending_update_befores: AHashMap::new(),
             window_buffer: Vec::new(),
-            schemas_announced: false,
         };
 
         // Collect all changes (as next_events does) and flatten with meta.

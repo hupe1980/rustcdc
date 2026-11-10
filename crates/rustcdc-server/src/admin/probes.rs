@@ -56,6 +56,9 @@ pub(super) async fn healthz(State(_admin): State<AdminState>, _headers: HeaderMa
 ///   replays from the same checkpoint and fails the same way, and meanwhile the
 ///   source keeps retaining log — a crash-loop here makes a full `pg_wal`
 ///   volume arrive *sooner*.  It is a page, not a reboot.
+/// - `SourcePositionLost` must **not** restart the process either.  The source
+///   discarded the WAL the slot held; a restart replays into the same refusal.  The
+///   process parks and pages instead.
 /// - `ConsumerNotAcknowledging` means the sink is not draining.  Restarting
 ///   thrashes against a downstream that is already unhealthy; `/readyz` reports
 ///   it instead.
