@@ -204,6 +204,16 @@ impl SqlServerStreamHandle {
             self.stream.lsn_start
         };
 
+        let before = self.successor_floor(meta);
+        if let Some(before) = before
+            && compare_lsn(&before, &window_start).is_le()
+        {
+            // A newer instance of this table serves the whole window.
+            return Ok(Vec::new());
+        }
+        let before_hex = before.map(|lsn| lsn_bytes_to_hex(&lsn));
+        let floor_established = meta.capture_floor != [0u8; 10];
+
         let mut client = query::connect_client(&self.config).await?;
         let start_lsn_hex = lsn_bytes_to_hex(&window_start);
         let end_lsn_hex = lsn_bytes_to_hex(&self.stream.lsn_end);
@@ -215,6 +225,7 @@ impl SqlServerStreamHandle {
             &start_lsn_hex,
             &end_lsn_hex,
             self.stream.cursor.as_ref(),
+            before_hex.as_deref(),
         );
 
         let query_result = match client.query(&sql, &[]).await {
@@ -225,6 +236,7 @@ impl SqlServerStreamHandle {
                     return self
                         .classify_cdc_window_error(
                             capture_instance,
+                            floor_established,
                             &start_lsn_hex,
                             &end_lsn_hex,
                             &text,
@@ -245,6 +257,7 @@ impl SqlServerStreamHandle {
                     return self
                         .classify_cdc_window_error(
                             capture_instance,
+                            floor_established,
                             &start_lsn_hex,
                             &end_lsn_hex,
                             &text,
@@ -318,6 +331,19 @@ impl SqlServerStreamHandle {
         Ok(out)
     }
 
+    /// The LSN at which a newer capture instance of the same table takes over from `meta`.
+    ///
+    /// SQL Server lets a table have two capture instances, and adding a second under a new
+    /// name, then disabling the first, is its documented way to change a captured table.
+    /// While both exist both record every change, so `meta` serves only what precedes the
+    /// next instance's floor and that instance serves the rest: each change once, carrying
+    /// the shape of the instance current when it was written. Instances order by floor,
+    /// then creation, so one whose floor is not established yet (zero) ranks first and
+    /// takes nothing over.
+    pub(super) fn successor_floor(&self, meta: &CaptureInstanceMeta) -> Option<[u8; 10]> {
+        successor_floor(&self.metas, meta)
+    }
+
     /// Decide whether a SQL Server error 313 means data loss or "not yet captured".
     ///
     /// `cdc.fn_cdc_get_all_changes_*` raises 313 whenever the requested LSN range is
@@ -336,12 +362,15 @@ impl SqlServerStreamHandle {
     async fn classify_cdc_window_error(
         &self,
         capture_instance: &str,
+        floor_established: bool,
         start_lsn_hex: &str,
         end_lsn_hex: &str,
         server_message: &str,
     ) -> Result<Vec<SqlServerRawChange>> {
         let mut client = query::connect_client(&self.config).await?;
-        let min_lsn_hex: String = match client
+        // `Err` when the query fails, `Ok(None)` when SQL Server has no low endpoint for
+        // the instance yet: the two mean opposite things here.
+        let min_lsn_hex: std::result::Result<Option<String>, ()> = match client
             .query(
                 "SELECT sys.fn_varbintohexstr(sys.fn_cdc_get_min_lsn(@P1))",
                 &[&capture_instance],
@@ -349,51 +378,42 @@ impl SqlServerStreamHandle {
             .await
         {
             Ok(result) => match result.into_first_result().await {
-                Ok(rows) => rows
+                Ok(rows) => Ok(rows
                     .into_iter()
                     .next()
                     .and_then(|row| row.get::<&str, _>(0).map(ToOwned::to_owned))
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
+                    .filter(|value| !value.is_empty())),
+                Err(_) => Err(()),
             },
-            Err(_) => String::new(),
+            Err(_) => Err(()),
+        };
+        let min = min_lsn_hex
+            .as_ref()
+            .map(|hex| hex.as_deref().map(lsn_hex_to_bytes));
+        let min = match min {
+            Ok(Some(Ok(bytes))) => Ok(Some(bytes)),
+            Ok(None) => Ok(None),
+            Ok(Some(Err(_))) | Err(()) => Err(()),
         };
 
-        // If min_lsn is unreadable we cannot prove the data is still there, and the
-        // safe assumption for a correctness-first connector is that it is not.
-        let (Ok(start), Ok(min)) = (
-            lsn_hex_to_bytes(start_lsn_hex),
-            lsn_hex_to_bytes(&min_lsn_hex),
-        ) else {
-            return Err(out_of_retention_error(
+        match window_error_verdict(lsn_hex_to_bytes(start_lsn_hex).ok(), min, floor_established) {
+            WindowErrorVerdict::Purged => Err(out_of_retention_error(
                 capture_instance,
                 start_lsn_hex,
                 end_lsn_hex,
                 server_message,
-            ));
-        };
-
-        if compare_lsn(&start, &min).is_lt() {
-            // Genuinely purged: our position predates the oldest retained change.
-            return Err(out_of_retention_error(
-                capture_instance,
-                start_lsn_hex,
-                end_lsn_hex,
-                server_message,
-            ));
+            )),
+            verdict => {
+                tracing::debug!(
+                    target: "rustcdc::source::sqlserver",
+                    capture_instance,
+                    start_lsn = %start_lsn_hex,
+                    ?verdict,
+                    "sqlserver CDC window error is not a purge; treating as empty and retrying",
+                );
+                Ok(Vec::new())
+            }
         }
-
-        // Ahead of what has been captured so far. Return no rows and let the window
-        // logic retry; the window is never advanced past unread data, so this is safe.
-        tracing::debug!(
-            target: "rustcdc::source::sqlserver",
-            capture_instance,
-            start_lsn = %start_lsn_hex,
-            min_lsn = %min_lsn_hex,
-            "sqlserver CDC window is ahead of captured data (capture job has not reached \
-             it yet); treating as empty and retrying",
-        );
-        Ok(Vec::new())
     }
 
     pub(super) fn map_changes_to_events(
@@ -494,6 +514,60 @@ impl SqlServerStreamHandle {
         }
 
         Ok(out)
+    }
+}
+
+/// See [`SqlServerStreamHandle::successor_floor`].
+fn successor_floor(metas: &[CaptureInstanceMeta], meta: &CaptureInstanceMeta) -> Option<[u8; 10]> {
+    let rank = |m: &CaptureInstanceMeta| (m.capture_floor, m.created_at.clone());
+    metas
+        .iter()
+        .filter(|other| {
+            other.capture_instance != meta.capture_instance
+                && other.schema == meta.schema
+                && other.table == meta.table
+                && rank(other) > rank(meta)
+        })
+        .map(|other| other.capture_floor)
+        .min()
+}
+
+/// What a SQL Server error 313 on a capture instance's window means.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowErrorVerdict {
+    /// The window starts below the instance's oldest retained change: cleanup purged rows
+    /// this connector had not read.
+    Purged,
+    /// The instance had no floor at the last refresh, so it held no rows; its floor has
+    /// been established since, and the next refresh adopts it.
+    FloorJustEstablished,
+    /// The window is ahead of what the capture job has harvested.
+    NotYetCaptured,
+}
+
+/// `start` is the window's start; `min` is `Err` when `fn_cdc_get_min_lsn` could not be
+/// read and `Ok(None)` when the instance has no low endpoint yet. An unreadable answer is
+/// a purge: a correctness-first connector does not assume the data is still there.
+fn window_error_verdict(
+    start: Option<[u8; 10]>,
+    min: std::result::Result<Option<[u8; 10]>, ()>,
+    floor_established: bool,
+) -> WindowErrorVerdict {
+    let Some(start) = start else {
+        return WindowErrorVerdict::Purged;
+    };
+    match min {
+        Err(()) => WindowErrorVerdict::Purged,
+        Ok(None) if floor_established => WindowErrorVerdict::Purged,
+        Ok(None) => WindowErrorVerdict::FloorJustEstablished,
+        Ok(Some(min)) if compare_lsn(&start, &min).is_lt() => {
+            if floor_established {
+                WindowErrorVerdict::Purged
+            } else {
+                WindowErrorVerdict::FloorJustEstablished
+            }
+        }
+        Ok(Some(_)) => WindowErrorVerdict::NotYetCaptured,
     }
 }
 
@@ -776,5 +850,119 @@ mod window_advance_tests {
             (1, 7),
             "and opens from 1 when the maximum arrives"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_error_verdict_tests {
+    use super::{WindowErrorVerdict, window_error_verdict};
+
+    fn lsn(tail: u8) -> [u8; 10] {
+        let mut bytes = [0u8; 10];
+        bytes[9] = tail;
+        bytes
+    }
+
+    #[test]
+    fn below_an_established_floor_is_a_purge() {
+        assert_eq!(
+            window_error_verdict(Some(lsn(5)), Ok(Some(lsn(9))), true),
+            WindowErrorVerdict::Purged
+        );
+    }
+
+    /// An instance added to a running stream: its floor was not established at the last
+    /// refresh, so it held no rows, and a window below the floor SQL Server reports now
+    /// lost nothing.
+    #[test]
+    fn below_a_floor_established_since_the_last_refresh_is_not_a_purge() {
+        assert_eq!(
+            window_error_verdict(Some(lsn(5)), Ok(Some(lsn(9))), false),
+            WindowErrorVerdict::FloorJustEstablished
+        );
+        assert_eq!(
+            window_error_verdict(Some(lsn(5)), Ok(None), false),
+            WindowErrorVerdict::FloorJustEstablished
+        );
+    }
+
+    #[test]
+    fn ahead_of_the_harvest_is_transient() {
+        assert_eq!(
+            window_error_verdict(Some(lsn(9)), Ok(Some(lsn(5))), true),
+            WindowErrorVerdict::NotYetCaptured
+        );
+    }
+
+    #[test]
+    fn an_unreadable_answer_is_a_purge() {
+        for established in [true, false] {
+            assert_eq!(
+                window_error_verdict(Some(lsn(5)), Err(()), established),
+                WindowErrorVerdict::Purged
+            );
+            assert_eq!(
+                window_error_verdict(None, Ok(Some(lsn(5))), established),
+                WindowErrorVerdict::Purged
+            );
+        }
+        assert_eq!(
+            window_error_verdict(Some(lsn(5)), Ok(None), true),
+            WindowErrorVerdict::Purged,
+            "an established instance with no low endpoint has lost its history"
+        );
+    }
+}
+
+#[cfg(test)]
+mod successor_floor_tests {
+    use super::{CaptureInstanceMeta, successor_floor};
+
+    fn meta(name: &str, table: &str, floor: u8, created_at: &str) -> CaptureInstanceMeta {
+        let mut capture_floor = [0u8; 10];
+        capture_floor[9] = floor;
+        CaptureInstanceMeta {
+            capture_instance: name.into(),
+            schema: "dbo".into(),
+            table: table.into(),
+            primary_key: vec!["id".into()],
+            captured_columns: Vec::new(),
+            capture_floor,
+            created_at: created_at.into(),
+            shape: None,
+        }
+    }
+
+    #[test]
+    fn the_newer_instance_of_a_table_bounds_the_older() {
+        let v1 = meta("dbo_items_v1", "items", 0x10, "2026-01-01T00:00:00");
+        let v2 = meta("dbo_items_v2", "items", 0x40, "2026-01-02T00:00:00");
+        let other = meta("dbo_orders", "orders", 0x20, "2026-01-01T12:00:00");
+        let metas = [v1.clone(), v2.clone(), other.clone()];
+        assert_eq!(successor_floor(&metas, &v1).map(|f| f[9]), Some(0x40));
+        assert_eq!(successor_floor(&metas, &v2), None);
+        assert_eq!(
+            successor_floor(&metas, &other),
+            None,
+            "another table never bounds"
+        );
+    }
+
+    /// Two instances enabled before the capture job ran share a floor; without an order
+    /// both would serve every change.
+    #[test]
+    fn equal_floors_go_to_the_newer_instance() {
+        let v1 = meta("dbo_items_v1", "items", 0x10, "2026-01-01T00:00:00");
+        let v2 = meta("dbo_items_v2", "items", 0x10, "2026-01-01T00:00:01");
+        let metas = [v1.clone(), v2.clone()];
+        assert_eq!(successor_floor(&metas, &v1).map(|f| f[9]), Some(0x10));
+        assert_eq!(successor_floor(&metas, &v2), None);
+    }
+
+    #[test]
+    fn a_successor_without_a_floor_takes_nothing_over() {
+        let v1 = meta("dbo_items_v1", "items", 0x10, "2026-01-01T00:00:00");
+        let v2 = meta("dbo_items_v2", "items", 0x00, "2026-01-02T00:00:00");
+        assert_eq!(successor_floor(&[v1.clone(), v2], &v1), None);
     }
 }

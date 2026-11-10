@@ -5,6 +5,35 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.20.1
+
+A fix for SQL Server's documented way to change a captured table.
+
+### Fixed: a second SQL Server capture instance duplicated or stopped the stream
+
+SQL Server changes a captured table through a second capture instance under a new name; both
+record every change until the first is disabled. The connector polled both as separate tables,
+so every change in that period arrived twice, the second time with the other instance's shape.
+Disabling the old instance also emitted `DROP_TABLE` for a table that still existed. And when
+the new instance's first LSN was not yet established at discovery, the connector kept a zero
+floor for it, queried below its real start, and stopped with a false "no longer retained"
+error.
+
+The older instance now serves a table up to the newer one's first LSN and the newer one from
+there: each change once, with the shape of the instance current when it was written. The table
+gets `ALTER_TABLE` instead of `DROP_TABLE` and `CREATE_TABLE`. A floor that was not established
+is adopted once SQL Server reports it, and an error 313 below a floor established since the last
+refresh is not read as a purge. See
+[Changing a captured table](site/content/docs/connectors/sqlserver.md#changing-a-captured-table).
+
+### Evidence
+
+`sqlserver_capture_instance_switch_is_exactly_once_and_reaches_the_row_shape` runs the procedure
+on SQL Server 2022. It fails with the successor bound removed (ids `1, 2, 2, 3, 3, 4`), with
+zero floors kept (rows read from the old instance), and with `DROP_TABLE` restored. The
+error-313 verdict and the successor order, including equal floors, have unit tests that fail
+against their planted defects. CI now runs clippy for each connector alone.
+
 ## 0.20.0
 
 Every row now carries its table's shape. Fixes for the PostgreSQL snapshot (one of them a

@@ -70,6 +70,21 @@ why it is not the source.
 
 No extra privilege beyond the `db_datareader` the connector already needs.
 
+### Changing a captured table
+
+A capture instance records the columns it was created with, so a new column needs a new
+instance. SQL Server allows two per table; the procedure is:
+
+1. `ALTER TABLE` the source table.
+2. `sp_cdc_enable_table` with a new `@capture_instance` name.
+3. Once the connector has picked it up, `sp_cdc_disable_table` the old instance.
+
+While both exist, both record every change. The connector reads the older instance up to the
+newer one's first LSN and the newer from there, so each change arrives once, carrying the shape
+of the instance current when it was written. The table gets an `ALTER_TABLE` schema event, not
+a `DROP_TABLE` and `CREATE_TABLE`. Instances with the same first LSN go to the one created
+later.
+
 **Limit.** A captured column whose source column has been dropped reports
 `data_type = "unknown"` rather than being omitted — omitting it would describe a table the
 change rows do not match.
@@ -396,9 +411,8 @@ connector stops with the same "no longer retained" error as above.
 **Cause:** changes made while CDC was off were never captured, and the new instance's history
 starts after the checkpoint. Continuing would hide that gap, so the connector stops.
 
-**Resolution:** to change a captured table's columns, add a second capture instance with a new
-`@capture_instance` name, let the connector pick it up, then disable the old one — SQL Server's
-documented way to evolve a captured table without a gap. If CDC was already disabled and
+**Resolution:** change a captured table with a second capture instance instead — see
+[Changing a captured table](#changing-a-captured-table). If CDC was already disabled and
 re-enabled, re-snapshot as above.
 
 ### SQL Server Agent not running
