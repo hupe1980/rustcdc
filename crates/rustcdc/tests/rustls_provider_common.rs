@@ -1,3 +1,4 @@
+#![cfg(feature = "tls")]
 //! Installs a process-default rustls crypto provider for tests that need one.
 //!
 //! # Why a test needs this when the library does not

@@ -672,6 +672,11 @@ impl ConnectionRetryPolicy {
 /// embedder that matches on it exhaustively. Add a `_` arm.
 #[derive(Clone)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "built once per runtime and moved a handful of times; boxing would change \
+              every variant's public payload type for no measurable gain"
+)]
 pub enum RuntimeSourceConfig {
     #[cfg(feature = "postgres")]
     /// PostgreSQL logical replication via pgoutput.
