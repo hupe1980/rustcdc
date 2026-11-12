@@ -113,8 +113,12 @@ pub(super) async fn livez(State(admin): State<AdminState>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "source-degraded-timeout").into_response();
     }
 
-    // Compared against the stable `StallCause` label, never the reason prose.
-    if stall_cause.as_deref() == Some(StallCause::PollLoopNotTurning.as_str())
+    // Decided by the cause's own `restart_helps`, the routing `/status` reports too; read
+    // from the stable label, never the reason prose.
+    if stall_cause
+        .as_deref()
+        .and_then(stall_cause_from_label)
+        .is_some_and(|cause| cause.restart_helps())
         && stalled_for.is_some_and(|elapsed| elapsed > LIVEZ_STALL_TIMEOUT)
     {
         return (StatusCode::SERVICE_UNAVAILABLE, "poll-loop-stalled").into_response();

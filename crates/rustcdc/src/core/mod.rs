@@ -42,7 +42,7 @@ pub use runtime::{
     HEALTH_MIN_CONFIGURABLE_STALL_MS, HealthVerdict, IdempotencyOptions,
     PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl,
     RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SlotWalStatus,
-    StallCause, TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
+    StallCause, StallOwner, TransactionBoundaryPolicy, TransformErrorPolicy, ValidationErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
 #[cfg(feature = "tls")]

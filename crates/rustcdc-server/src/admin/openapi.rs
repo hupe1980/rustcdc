@@ -357,6 +357,23 @@ pub(crate) fn document(version: &str) -> Value {
                                         "type": "object",
                                         "properties": {
                                             "state": { "type": "string" },
+                                            "health": {
+                                                "type": "object",
+                                                "description": "Whether the pipeline is working, and when not, who can fix it.",
+                                                "properties": {
+                                                    "verdict": { "type": ["string", "null"] },
+                                                    "stall_cause": {
+                                                        "type": ["string", "null"],
+                                                        "enum": ["source_position_lost", "unconfirmed_source_position", "delivery_failing", "poll_loop_not_turning", "consumer_not_acknowledging", null]
+                                                    },
+                                                    "stalled_for_seconds": { "type": ["number", "null"] },
+                                                    "owner": {
+                                                        "type": ["string", "null"],
+                                                        "enum": ["source", "destination", "rustcdc", null]
+                                                    },
+                                                    "restart_helps": { "type": ["boolean", "null"] }
+                                                }
+                                            },
                                             "incremental_snapshot": {
                                                 "$ref": "#/components/schemas/IncrementalSnapshotProgress"
                                             }
@@ -604,6 +621,37 @@ mod tests {
             DOCUMENTED_PATHS.len(),
             "DOCUMENTED_PATHS and the document's paths must agree"
         );
+    }
+
+    /// The documented causes and owners are the library's: a cause added there without one
+    /// here would reach a generated client as an unknown value.
+    #[test]
+    fn the_documented_health_values_are_the_librarys() {
+        let doc = document(TEST_VERSION);
+        let health = &doc["paths"]["/status"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["health"]["properties"];
+        let documented = |field: &str| -> Vec<String> {
+            health[field]["enum"]
+                .as_array()
+                .expect("an enum")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        };
+        let causes: Vec<_> = rustcdc::core::StallCause::ALL
+            .iter()
+            .map(|cause| cause.as_str().to_string())
+            .collect();
+        let mut owners: Vec<_> = rustcdc::core::StallCause::ALL
+            .iter()
+            .map(|cause| cause.owner().as_str().to_string())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        let mut documented_owners = documented("owner");
+        documented_owners.sort();
+        assert_eq!(documented("stall_cause"), causes);
+        assert_eq!(documented_owners, owners);
     }
 
     /// Every `$ref` must resolve. A dangling one breaks generators at the worst moment.

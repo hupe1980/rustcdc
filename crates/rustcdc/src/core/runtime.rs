@@ -960,6 +960,51 @@ impl StallCause {
             Self::DeliveryFailing => "delivery_failing",
         }
     }
+
+    /// Whose problem it is: where a page about this stall should go.
+    pub fn owner(&self) -> StallOwner {
+        match self {
+            Self::SourcePositionLost | Self::UnconfirmedSourcePosition => StallOwner::Source,
+            Self::DeliveryFailing | Self::ConsumerNotAcknowledging => StallOwner::Destination,
+            Self::PollLoopNotTurning => StallOwner::Rustcdc,
+        }
+    }
+
+    /// Whether restarting the process can clear it. Only a poll loop that stopped turning:
+    /// a restart recreates no lost log, confirms no position and fixes no destination.
+    pub fn restart_helps(&self) -> bool {
+        match self {
+            Self::PollLoopNotTurning => true,
+            Self::SourcePositionLost
+            | Self::UnconfirmedSourcePosition
+            | Self::DeliveryFailing
+            | Self::ConsumerNotAcknowledging => false,
+        }
+    }
+}
+
+/// Who can fix a [`StallCause`]: the routing target, as a stable value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StallOwner {
+    /// The source database and whoever runs it.
+    Source,
+    /// The destination the events are delivered to, or the code acknowledging them.
+    Destination,
+    /// This process.
+    Rustcdc,
+}
+
+impl StallOwner {
+    /// Short stable label, as `/status` and alert routing use it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Destination => "destination",
+            Self::Rustcdc => "rustcdc",
+        }
+    }
 }
 
 /// PostgreSQL's `pg_replication_slots.wal_status`: how safe the slot's retained WAL is.
@@ -5603,6 +5648,32 @@ mod tests {
             labels.len(),
             5,
             "ALL must hold each variant once: {labels:?}"
+        );
+    }
+
+    /// Each cause routes to one owner, and only a poll loop that stopped turning is helped by a
+    /// restart — the answer `/livez` acts on and the operator console words.
+    #[test]
+    fn every_stall_cause_names_its_owner_and_whether_a_restart_helps() {
+        let routing: Vec<_> = StallCause::ALL
+            .iter()
+            .map(|cause| {
+                (
+                    cause.as_str(),
+                    cause.owner().as_str(),
+                    cause.restart_helps(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            routing,
+            [
+                ("source_position_lost", "source", false),
+                ("unconfirmed_source_position", "source", false),
+                ("delivery_failing", "destination", false),
+                ("poll_loop_not_turning", "rustcdc", true),
+                ("consumer_not_acknowledging", "destination", false),
+            ]
         );
     }
 

@@ -119,7 +119,7 @@ pub use crate::core::{
     NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite,
     RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions,
     RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SlotWalStatus,
-    SnapshotMetadata, SourceErrorKind, SourceMetadata, StallCause, StructuredLogger,
+    SnapshotMetadata, SourceErrorKind, SourceMetadata, StallCause, StallOwner, StructuredLogger,
     TransactionBoundaryPolicy, TransactionMetadata, TransformErrorPolicy, TransportConfig,
     ValidationError, ValidationErrorPolicy, ValidationErrors, fingerprint_event_stable,
     fingerprint_event_transient, render_error_chain, write_runtime_metrics_prometheus,
