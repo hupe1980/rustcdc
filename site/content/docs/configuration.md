@@ -1174,7 +1174,13 @@ durability_profile = "production"     # production | development
 # protocol = "tls"                     # plaintext | tls
 ```
 
-Seed the topic once before first start: `rustcdc init-state --config-file cdc.toml`.
+Create the topic before first start with `cleanup.policy=compact` and an explicit
+`min.insync.replicas`, then seed it once: `rustcdc init-state --config-file cdc.toml`. rustcdc
+does not create it, and refuses one whose configuration it cannot verify.
+
+> **Not on Redpanda.** The backend reads `min.insync.replicas` back from the broker to verify
+> durability, and Redpanda does not report it, so this backend, and with it `effectively_once`
+> with a Kafka sink, does not start against Redpanda. Apache Kafka is tested.
 
 ### PostgreSQL
 

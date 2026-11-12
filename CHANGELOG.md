@@ -7,6 +7,46 @@ what breaks and what to do about it.
 
 ## Unreleased
 
+### Added: `cargo xtask pipeline-bench`, and the pipeline is five times faster
+
+`cargo xtask pipeline-bench` measures rows per second and latency from a real PostgreSQL, through
+the release binary built as the image builds it, to a real Apache Kafka, under both delivery
+contracts, plus when one large transaction's rows reach the topic relative to its commit. It
+fails when any row never arrives. It is a local command; [Performance](site/content/docs/performance.md)
+publishes the measured card.
+
+Its first run found the PostgreSQL stream sleeping `stream_poll_interval_ms` after every poll that
+returned rows of a transaction still open, a sleep meant only for a slot with nothing to read.
+Every transaction larger than one poll paid it once per poll. The source now reads on.
+
+- Default settings, same machine: **4 300 → 23 800 rows/s**; the first row of a 100 000-row
+  `UPDATE` reaches the topic **0.8 s** after its commit instead of 21.9 s.
+- `runtime_throughput` (formerly `benches/throughput.rs`) joins the benchmark gate. Joining it
+  was not enough: the gate counts only its critical groups, and a planted 300 µs per commit
+  (+735 %) passed. `runtime_end_to_end/in_memory_checkpoint` is now critical
+  (`file_checkpoint` is fsync-bound, with more run-to-run spread than the threshold), and the gate
+  fails when a gated bench has no critical benchmark.
+- The `kafka_topic` state backend does not start against Redpanda, which does not report
+  `min.insync.replicas`; [Configuration](site/content/docs/configuration.md) says so.
+- *Evidence*: `a_transaction_spanning_polls_is_read_without_the_idle_sleep` takes the full
+  interval without the fix; the gate fails 3 of 3 runs on the planted slowdown and passes
+  unplanted; the pipeline bench fails on a planted missing row.
+
+### Fixed: `effectively_once` with one Kafka sink halted on its first batch
+
+Since 0.15.0, a configuration with a single transactional Kafka sink and no `[[routes]]` never
+opened a Kafka transaction: the table router reported a checkpoint barrier only when it had at least
+one route, and a one-sink configuration has none, only a default. The first record then reached a
+producer with no open transaction, krafka refused it, and the pipeline stopped with
+`illegal state: cannot send in transaction state Ready`. Nothing was published and the checkpoint
+did not move, so no data was lost or duplicated, but the contract could not run in its documented
+shape. The router now counts its default sink.
+
+- *Evidence*: `a_router_with_only_a_default_sink_carries_its_barrier` fails without the fix, and so
+  does the new `cargo xtask pipeline-bench`, which runs the release binary under `effectively_once`
+  against Apache Kafka. Each layer had been tested alone (the sink's barrier against a fake broker,
+  the delivery contracts through file and HTTP sinks), never composed.
+
 ### Added: an operator console at `/ui`
 
 `rustcdc run` serves a console on the admin listener — on by default, `[admin.ui] enabled = false`

@@ -62,6 +62,11 @@ const TASKS: &[Task] = &[
         run: |_| npm(&["run", "dev"]),
     },
     Task {
+        name: "pipeline-bench",
+        about: "Rows/s and latency, PostgreSQL → rustcdc → Redpanda, both contracts (Docker, ~10 min).",
+        run: pipeline_bench,
+    },
+    Task {
         name: "pull-images",
         about: "Pre-pull the database images the integration matrix uses.",
         run: |args| script("ci-pull-relational-images.sh", args),
@@ -154,6 +159,65 @@ fn bench(args: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("cargo bench exited with {status}"))
+    }
+}
+
+/// The pipeline bench, measuring the binary the image ships rather than the one cargo
+/// builds for integration tests: that one carries `test-harnesses`, and the release
+/// settings below are the Dockerfile's. Its own target directory keeps those settings from
+/// invalidating the ordinary release cache.
+fn pipeline_bench(args: &[String]) -> Result<(), String> {
+    let root = workspace_root()?;
+    let target = root.join("target").join("pipeline-bench");
+    run(Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "rustcdc-server",
+            "--release",
+            "--bin",
+            "rustcdc",
+            "--all-features",
+            "--locked",
+        ])
+        .arg("--target-dir")
+        .arg(&target)
+        .env("CARGO_PROFILE_RELEASE_LTO", "thin")
+        .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1")
+        .current_dir(&root))?;
+
+    let rustflags = match std::env::var("RUSTFLAGS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {BENCH_HATCH}"),
+        _ => BENCH_HATCH.to_string(),
+    };
+    run(Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "rustcdc-server",
+            "--release",
+            "--all-features",
+            "--test",
+            "pipeline_bench",
+        ])
+        .args(["--", "--ignored", "--nocapture"])
+        .args(args)
+        .env("RUSTFLAGS", rustflags)
+        .env(
+            "PIPELINE_BENCH_BINARY",
+            target.join("release").join("rustcdc"),
+        )
+        .current_dir(&root))
+}
+
+fn run(command: &mut Command) -> Result<(), String> {
+    let status = command
+        .status()
+        .map_err(|error| format!("could not run cargo: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo exited with {status}"))
     }
 }
 

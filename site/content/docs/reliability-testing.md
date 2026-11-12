@@ -343,14 +343,14 @@ separate Docker-backed latency harness described under [Coverage Areas](#coverag
 
 ### End-to-end runtime throughput
 
-One benchmark is not a microbenchmark. `cargo xtask bench -p rustcdc --bench throughput` drives the **whole
+One benchmark is not a microbenchmark. `cargo xtask bench -p rustcdc --bench runtime_throughput` drives the **whole
 runtime** — source poll, idempotency guard, transform pipeline, sink, ack token, commit
 barrier, durable checkpoint write — over a synthetic source, and reports events per second.
 
 Database I/O is excluded deliberately. The figure is what the library costs *on top of*
 whatever the server and the sink cost; a connector-inclusive number measured against a
-container on a laptop would be a property of the laptop. This closes what previous audits
-recorded as the last open evidence condition: *no end-to-end throughput measurement*.
+container on a laptop would be a property of the laptop. The pipeline with a real database and
+a real broker is measured separately, on your machine: see [Performance](@/docs/performance.md).
 
 Representative run — Apple M-series, Darwin, APFS on SSD, `--release`, one Tokio worker:
 

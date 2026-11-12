@@ -455,8 +455,7 @@ run_cargo_scope_check() {
 run_bench_invocation_check() {
   # Benchmarks build in the release profile, where the guard in `fault_injection` rejects
   # `test-harnesses` — and `rustcdc-server` dev-depends on `rustcdc` with that feature, so
-  # cargo's feature unification turns it on for any unscoped build. Two bench targets are
-  # also named `throughput`, one per crate, so `--bench throughput` is ambiguous.
+  # cargo's feature unification turns it on for any unscoped build.
   # `cargo xtask bench` carries the hatch and the `-p`.
   #
   # Allowed to say `cargo bench`: the xtask that wraps it, the gate that scopes it, the

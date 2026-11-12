@@ -11,7 +11,7 @@
 //!
 //! That gap was the last open evidence condition on a 1.0 release. This closes it with a
 //! number that is reproducible on any machine with
-//! `cargo xtask bench -p rustcdc --bench throughput`.
+//! `cargo xtask bench -p rustcdc --bench runtime_throughput`.
 //!
 //! # What the number does and does not include
 //!
