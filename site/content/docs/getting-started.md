@@ -202,7 +202,7 @@ docker run --rm \
 # compose.yml
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: changeme
       POSTGRES_DB: mydb

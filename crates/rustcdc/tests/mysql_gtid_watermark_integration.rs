@@ -31,6 +31,9 @@
 
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{MysqlConnection, MysqlSourceConfig, Operation, source::Source};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -48,7 +51,7 @@ fn source_error(error: impl std::fmt::Display) -> rustcdc::Error {
 
 /// Read `Executed_Gtid_Set` the way the connector's watermark does.
 async fn executed_gtid_set(pool: &sqlx::MySqlPool) -> rustcdc::Result<String> {
-    let row: (String, u64, String, String, String) = sqlx::query_as("SHOW MASTER STATUS")
+    let row: (String, u64, String, String, String) = sqlx::query_as("SHOW BINARY LOG STATUS")
         .fetch_one(pool)
         .await
         .map_err(source_error)?;
@@ -94,7 +97,7 @@ async fn an_events_gtid_falls_inside_the_executed_set_difference() -> rustcdc::R
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")

@@ -22,6 +22,9 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use std::collections::BTreeSet;
 
 use rustcdc::{
@@ -50,7 +53,7 @@ async fn an_incremental_snapshot_survives_a_reconnect_and_still_completes() -> r
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -246,7 +249,7 @@ async fn a_table_requested_at_runtime_is_backfilled_without_a_restart() -> rustc
     const SLOT_ONDEMAND: &str = "incremental_ondemand_slot";
     const LATE_ROWS: i64 = 120;
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

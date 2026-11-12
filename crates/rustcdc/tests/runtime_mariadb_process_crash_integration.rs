@@ -1,5 +1,8 @@
 #![cfg(feature = "mariadb")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -76,7 +79,7 @@ async fn runtime_mariadb_process_kill_resumes_snapshot_after_committed_batch() -
         return Ok(());
     }
 
-    let container = GenericImage::new("mariadb", "10.11")
+    let container = GenericImage::new("mariadb", matrix::full(matrix::Engine::Mariadb))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_cmd(vec![
@@ -256,7 +259,7 @@ async fn run_mariadb_process_kill_replay_scenario(
         return Ok(());
     }
 
-    let container = GenericImage::new("mariadb", "10.11")
+    let container = GenericImage::new("mariadb", matrix::full(matrix::Engine::Mariadb))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_cmd(vec![

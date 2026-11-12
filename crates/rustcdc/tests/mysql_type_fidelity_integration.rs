@@ -19,6 +19,9 @@
 //! `null`, truncates precision or drops the sign would pass a presence check and fail
 //! these.
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     MysqlConnection, MysqlSourceConfig, TransportConfig, core::Operation, source::Source,
 };
@@ -43,7 +46,7 @@ fn skip() -> bool {
 
 async fn start_mysql() -> rustcdc::Result<(ContainerAsync<GenericImage>, String, u16)> {
     install_rustls_provider();
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")

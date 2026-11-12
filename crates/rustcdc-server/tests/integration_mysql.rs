@@ -37,6 +37,9 @@
 //! immediately — and `tests/architecture.rs` asserts that CI still runs it, so this suite
 //! cannot quietly stop running.
 
+#[path = "../../rustcdc/tests/support/matrix.rs"]
+mod matrix;
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -117,14 +120,14 @@ fn start_mysql() {
         &format!("MYSQL_DATABASE={DATABASE}"),
         "-p",
         &format!("{HOST_PORT}:3306"),
-        "mysql:8.0",
+        &format!("mysql:{}", matrix::full(matrix::Engine::Mysql)),
         "--log-bin=binlog",
         "--binlog-format=ROW",
         "--binlog-row-image=FULL",
         // **Two different settings, and both are required.**
         //
         // `binlog_row_image` decides which *columns* are logged; `binlog_row_metadata`
-        // decides whether column names and primary-key flags travel with them. MySQL 8
+        // decides whether column names and primary-key flags travel with them. MySQL
         // defaults the latter to MINIMAL (MariaDB to NO_LOG), under which streamed events
         // carry positional placeholders (`@0`, `@1`, …) instead of column names and no
         // primary key at all — which in turn disables snapshot/stream duplicate

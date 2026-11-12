@@ -7,6 +7,9 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use std::{
     process::{Child, Command, Stdio},
     time::Duration,
@@ -26,7 +29,7 @@ async fn example_pg_to_stdout_streams_events_and_shuts_down_cleanly() -> rustcdc
     }
 
     // ── 1. Start Postgres container ─────────────────────────────────────────
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

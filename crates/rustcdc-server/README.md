@@ -44,12 +44,14 @@ than leaving for you to discover:
 
 **Sources**
 
+Versions: [Supported versions](https://hupe1980.github.io/rustcdc/docs/supported-versions/).
+
 | Connector | End-to-end tested in CI | Against |
 |---|---|---|
 | PostgreSQL | ✅ | A real server, both WAL transports, resume, TLS enforcement, on-demand snapshots, row filters |
 | MySQL | ✅ | A real server, GTID and file+position, resume, primary-key shape |
-| MariaDB | ✅ library suites | MariaDB 10.5 / 10.6 / 10.11: connection, end-to-end capture and process-crash replay. No server-binary suite |
-| SQL Server | ✅ library suites | 2022 for capture, snapshot, handoff, type fidelity and process-crash replay; lifecycle on 2019 / 2022 / 2025. No server-binary suite |
+| MariaDB | ✅ library suites | Connection, end-to-end capture and process-crash replay. No server-binary suite |
+| SQL Server | ✅ library suites | Capture, snapshot, handoff, type fidelity and process-crash replay. No server-binary suite |
 
 **Sinks**
 

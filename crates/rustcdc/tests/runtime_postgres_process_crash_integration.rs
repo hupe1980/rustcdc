@@ -1,5 +1,8 @@
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -43,7 +46,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch()
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -256,7 +259,7 @@ async fn run_postgres_process_kill_replay_scenario(
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

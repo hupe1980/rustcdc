@@ -61,8 +61,7 @@ async fn a_change_after_a_long_idle_period_is_still_captured() -> rustcdc::Resul
     }
 
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(container) => container,
             Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
             Err(error) => return Err(error),

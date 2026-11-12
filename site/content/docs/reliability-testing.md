@@ -34,8 +34,8 @@ configuration where it goes wrong:
 
 | Suite | Configuration it needs | What it asserts |
 |---|---|---|
-| `mysql_binlog_compression_integration` | MySQL 8.0, `binlog_transaction_compression = ON`, file+position (not GTID) | Every event carries a resumable binlog position, and a stream resumed from one captured inside a compressed transaction receives what follows it |
-| `sqlserver_window_truncation_integration` | SQL Server 2022, **two** capture instances, `max_events_per_poll = 5` | No row is lost when an LSN window truncates at different positions per capture instance |
+| `mysql_binlog_compression_integration` | MySQL, `binlog_transaction_compression = ON`, file+position (not GTID) | Every event carries a resumable binlog position, and a stream resumed from one captured inside a compressed transaction receives what follows it |
+| `sqlserver_window_truncation_integration` | SQL Server, **two** capture instances, `max_events_per_poll = 5` | No row is lost when an LSN window truncates at different positions per capture instance |
 | `postgres_snapshot_integration` (`…resumes_at_the_chunk_boundary_after_a_restart`) | PostgreSQL, incremental snapshot | A restart resumes at a chunk boundary rather than skipping or restarting the table |
 
 Alongside them, `source::postgres::wire::tests` drives the replication client against an

@@ -1,5 +1,8 @@
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::TransportConfig;
 use rustcdc::{MysqlConnection, MysqlSourceConfig, source::Source};
 use testcontainers::{
@@ -47,7 +50,7 @@ async fn mysql_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -301,7 +304,7 @@ async fn mysql_stream_resume_from_checkpoint() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -431,7 +434,7 @@ async fn mysql_stream_binlog_rotation() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")

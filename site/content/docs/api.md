@@ -1888,26 +1888,24 @@ consumer written against Debezium's key subject works unchanged.
 
 ## MariaDB Support
 
-rustcdc supports **MariaDB 10.5, 10.6, and 10.11** via the MySQL protocol stack. The
+rustcdc supports MariaDB's long-term releases ([Supported versions](@/docs/supported-versions.md))
+via the MySQL protocol stack. The
 `mysql_async` library handles the MariaDB binlog wire protocol transparently.
 rustcdc also provides a first-class `MariaDbSourceConfig` wrapper for explicit
 runtime source typing (`mariadb`) and separate checkpoint namespace handling.
 
 ### Capability Matrix
 
-| Capability                 | PostgreSQL | MySQL 8+ | MariaDB 10.5/10.6/10.11 | SQL Server |
-|----------------------------|:----------:|:--------:|:-----------------:|:----------:|
-| Full-table snapshot        | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| Resumable snapshot (keyset)| ✅        | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| CDC streaming              | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| GTID-based position        | —          | ✅        | ✅ (connector support) | —          |
-| Binlog position fallback   | —          | ✅        | ✅ (connector support) | —          |
-| TLS connections            | ✅          | ✅        | ✅ (connector support) | ✅          |
-| Transaction boundaries     | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| Schema change events       | ✅          | ✅        | ✅ | ✅          |
-
-MariaDB 10.11 currently has explicit process-crash and replay evidence coverage,
-while 10.5/10.6 are validated across the core connection and end-to-end lanes.
+| Capability                 | PostgreSQL | MySQL | MariaDB | SQL Server |
+|----------------------------|:----------:|:-----:|:-------:|:----------:|
+| Full-table snapshot        | ✅ | ✅ | ✅ | ✅ |
+| Resumable snapshot (keyset)| ✅ | ✅ | ✅ | ✅ |
+| CDC streaming              | ✅ | ✅ | ✅ | ✅ |
+| GTID-based position        | —  | ✅ | ✅ | —  |
+| Binlog position fallback   | —  | ✅ | ✅ | —  |
+| TLS connections            | ✅ | ✅ | ✅ | ✅ |
+| Transaction boundaries     | ✅ | ✅ | ✅ | ✅ |
+| Schema change events       | ✅ | ✅ | ✅ | ✅ |
 
 **Note on schema change events**: Runtime connectors emit canonical `Operation::SchemaChange` events for supported DDL capture paths. Use `rustcdc::ddl_capture` and `rustcdc::schema_history` together when building schema-aware downstream consumers.
 
@@ -1932,16 +1930,14 @@ let config = MysqlSourceConfig {
 
 ### Known Limitations
 
-- MariaDB 10.3 and earlier are **not tested** and may work with basic binlog
-  events but are unsupported.
+- Releases outside MariaDB's support window are not tested and not supported.
 - MariaDB Galera Cluster is not tested; CDC from a Galera node may exhibit
   unexpected behaviour due to write-set replication semantics.
 - `ROW_FORMAT=COMPRESSED` tables require `binlog_row_image = FULL` on the
   server; partial images are not supported.
 
-MariaDB integration evidence includes dedicated end-to-end suites for snapshot
-resume, stream CDC, and snapshot-to-stream handoff on MariaDB 10.5 and 10.6 in
-`tests/mariadb_e2e_integration.rs`, plus connection lifecycle coverage in
-`tests/mariadb_connection_integration.rs`, and process-crash replay coverage on
-MariaDB 10.11 in `tests/runtime_mariadb_process_crash_integration.rs`.
+MariaDB integration evidence: snapshot resume, stream CDC and snapshot-to-stream handoff on
+every tested release (`tests/mariadb_e2e_integration.rs`), connection lifecycle
+(`tests/mariadb_connection_integration.rs`), and process-crash replay on the newest
+(`tests/runtime_mariadb_process_crash_integration.rs`).
 

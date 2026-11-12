@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pull Docker images used by connector CI lanes with retry.
+# Pull the database images the connector CI lanes need, with retry, from mirrors rather than
+# rate-limited Docker Hub. The tags come from the matrix every suite reads, so this list cannot
+# drift from what the tests start.
 # Usage:
-#   bash scripts/ci-pull-relational-images.sh 16-alpine
-#   bash scripts/ci-pull-relational-images.sh 12-alpine 14-alpine 15-alpine 16-alpine
-#   bash scripts/ci-pull-relational-images.sh --relational-smoke
+#   bash scripts/ci-pull-relational-images.sh postgres full     # the full-suite tag
+#   bash scripts/ci-pull-relational-images.sh postgres tested   # every tested tag
+#   bash scripts/ci-pull-relational-images.sh --relational-smoke  # every tested MySQL and MariaDB tag
+#   bash scripts/ci-pull-relational-images.sh --sqlserver-soft [full|tested]
+MATRIX="crates/rustcdc/tests/support/matrix.txt"
 
-# Non-postgres, non-sqlserver smoke images.
-# Postgres tags are passed explicitly as positional args.
-# SQL Server is handled separately via --sqlserver-soft (soft failure on MCR downtime).
-# Must match the versions the test matrices actually instantiate — see
-# `run_relational_image_drift_check` in scripts/ci-policy-gate.sh, which fails the build if
-# they diverge. They had: this list warmed mysql:8.1 and mariadb:10.11, which no test uses,
-# while mysql:8.4 and mariadb:10.5, which the matrices do use, were pulled from Docker Hub at
-# run time — the rate-limited path this script exists to avoid.
-NON_POSTGRES_RELATIONAL_SMOKE_IMAGES=(
-  "mysql:8.0"
-  "mysql:8.4"
-  "mariadb:10.5"
-  "mariadb:10.6"
-)
+# matrix_tags <engine> full|tested
+matrix_tags() {
+  awk -v engine="$1" -v which="$2" '
+    $1 == engine {
+      if (which == "full") { print $2 } else { for (i = 3; i <= NF; i++) print $i }
+      found = 1
+    }
+    END { if (!found) exit 1 }
+  ' "$MATRIX" || { echo "no ${1} line in ${MATRIX}" >&2; exit 2; }
+}
 
 pull_with_retry() {
   local image="$1"
@@ -46,12 +46,15 @@ pull_with_retry() {
 }
 
 if [[ "$#" -eq 0 ]]; then
-  echo "usage: $0 <tag> [<tag> ...] | --relational-smoke" >&2
+  echo "usage: $0 postgres full|tested | --relational-smoke | --sqlserver-soft [full|tested]" >&2
   exit 2
 fi
 
 if [[ "${1:-}" == "--relational-smoke" ]]; then
-  for image in "${NON_POSTGRES_RELATIONAL_SMOKE_IMAGES[@]}"; do
+  images=()
+  for tag in $(matrix_tags mysql tested); do images+=("mysql:${tag}"); done
+  for tag in $(matrix_tags mariadb tested); do images+=("mariadb:${tag}"); done
+  for image in "${images[@]}"; do
     # Pull from the ECR public mirror (no Docker Hub rate-limits / auth required)
     # and re-tag to the bare name so testcontainers finds it in the local cache.
     ecr_image="public.ecr.aws/docker/library/${image}"
@@ -67,16 +70,23 @@ fi
 # pre-pull failures do not block unrelated CI lanes.  The sqlserver tests
 # themselves emit a "SKIP:" sentinel when the image cannot be pulled.
 if [[ "${1:-}" == "--sqlserver-soft" ]]; then
-  image="mcr.microsoft.com/mssql/server:${2:-2022-CU27-ubuntu-22.04}"
-  if pull_with_retry "$image"; then
-    echo "prepared ${image}"
-  else
-    echo "WARNING: could not pull ${image} — sqlserver tests will be skipped" >&2
-  fi
+  for tag in $(matrix_tags sqlserver "${2:-full}"); do
+    image="mcr.microsoft.com/mssql/server:${tag}"
+    if pull_with_retry "$image"; then
+      echo "prepared ${image}"
+    else
+      echo "WARNING: could not pull ${image} — sqlserver tests will be skipped" >&2
+    fi
+  done
   exit 0
 fi
 
-for tag in "$@"; do
+if [[ "${1:-}" != "postgres" || ( "${2:-}" != "full" && "${2:-}" != "tested" ) ]]; then
+  echo "usage: $0 postgres full|tested | --relational-smoke | --sqlserver-soft [full|tested]" >&2
+  exit 2
+fi
+
+for tag in $(matrix_tags postgres "$2"); do
   image="public.ecr.aws/docker/library/postgres:${tag}"
   pull_with_retry "$image"
   docker tag "$image" "postgres:${tag}"

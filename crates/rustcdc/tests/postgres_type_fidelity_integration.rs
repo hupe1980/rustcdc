@@ -17,6 +17,9 @@
 //! overwhelmingly common production configuration — which every other integration test
 //! avoids by forcing `FULL`.
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     BeforeImage, PostgresConnection, PostgresSourceConfig, RowWrite, core::Operation,
     source::Source,
@@ -36,7 +39,7 @@ fn skip() -> bool {
 }
 
 async fn start_postgres() -> rustcdc::Result<(ContainerAsync<GenericImage>, String, u16)> {
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

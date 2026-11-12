@@ -16,6 +16,9 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     IncrementalSnapshotConfig, Operation, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
     checkpoint::FileCheckpoint, schema_history::InMemorySchemaHistory,
@@ -48,7 +51,7 @@ async fn snapshot_and_stream_agree_on_the_json_type_of_every_column() -> rustcdc
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

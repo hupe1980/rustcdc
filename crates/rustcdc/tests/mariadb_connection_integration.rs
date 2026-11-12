@@ -1,5 +1,8 @@
 #![cfg(feature = "mariadb")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::TransportConfig;
 use rustcdc::{MariaDbConnection, MariaDbSourceConfig, MysqlSourceConfig};
 use testcontainers::{
@@ -142,18 +145,6 @@ async fn run_mariadb_connection_lifecycle(version: &str, server_id: u32) -> rust
     Ok(())
 }
 
-macro_rules! mariadb_connection_test {
-    ($name:ident, $version:literal, $server_id:expr, $label:literal) => {
-        #[tokio::test]
-        async fn $name() -> rustcdc::Result<()> {
-            if skip_mariadb_connection_case($label) {
-                return Ok(());
-            }
-            run_mariadb_connection_lifecycle($version, $server_id).await
-        }
-    };
-}
-
 async fn connect_with_retry(connection: &MariaDbConnection) -> rustcdc::Result<()> {
     install_rustls_provider();
     let deadline = std::time::Instant::now() + CONNECT_RETRY_BUDGET;
@@ -175,20 +166,6 @@ async fn connect_with_retry(connection: &MariaDbConnection) -> rustcdc::Result<(
     }))
 }
 
-mariadb_connection_test!(
-    mariadb_connection_10_5,
-    "10.5",
-    100,
-    "mariadb 10.5 connection integration test"
-);
-
-mariadb_connection_test!(
-    mariadb_connection_10_6,
-    "10.6",
-    101,
-    "mariadb 10.6 connection integration test"
-);
-
 /// Test MariaDB GTID mode support
 #[tokio::test]
 async fn mariadb_gtid_mode_support() -> rustcdc::Result<()> {
@@ -197,7 +174,7 @@ async fn mariadb_gtid_mode_support() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let target = mariadb_base_config("10.6", 102).await?;
+    let target = mariadb_base_config(matrix::full(matrix::Engine::Mariadb), 102).await?;
 
     let connection = MariaDbConnection::new(target.config.into_inner());
     connect_with_retry(&connection).await?;
@@ -205,5 +182,18 @@ async fn mariadb_gtid_mode_support() -> rustcdc::Result<()> {
     // MariaDB supports both traditional and GTID binlog mode
     assert!(connection.is_connected().await);
     connection.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mariadb_connection_every_tested_version() -> rustcdc::Result<()> {
+    if skip_mariadb_connection_case("mariadb connection integration test") {
+        return Ok(());
+    }
+    for (server_id, tag) in (100..).zip(matrix::tested(matrix::Engine::Mariadb)) {
+        run_mariadb_connection_lifecycle(tag, server_id)
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(format!("mariadb {tag}: {error}")))?;
+    }
     Ok(())
 }

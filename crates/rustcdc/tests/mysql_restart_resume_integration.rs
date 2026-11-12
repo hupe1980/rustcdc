@@ -10,6 +10,9 @@
 //! the docs before it was measured. This measures it.
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::source::Source;
 use rustcdc::{MysqlConnection, MysqlSourceConfig, TransportConfig, checkpoint::MysqlOffset};
 use testcontainers::{
@@ -125,11 +128,18 @@ async fn replayed_after_clean_restart(image: &str, tag: &str) -> rustcdc::Result
     let resume = stream
         .resume_offset_for(&delivered[0])
         .unwrap_or_else(|| delivered[0].source.offset.clone());
-    let (file, pos) = resume
+    // `file:pos`, then `#gtid=<set>` when GTIDs are on (MySQL 9.x defaults them on); a GTID set
+    // contains colons of its own.
+    let coordinate = resume
+        .split_once("#gtid=")
+        .map_or(resume.as_str(), |(c, _)| c);
+    let (file, pos) = coordinate
         .split_once(':')
-        .map(|(f, rest)| {
-            let pos = rest.split(':').next().unwrap_or(rest);
-            (f.to_string(), pos.parse::<u32>().unwrap_or_default())
+        .map(|(f, pos)| {
+            let pos = pos
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("mysql offset position in {resume:?}"));
+            (f.to_string(), pos)
         })
         .expect("mysql offset is file:pos");
     println!("session 1 resume coordinate: {file}:{pos}");
@@ -171,7 +181,8 @@ async fn mysql_restart_delivers_nothing_new() -> rustcdc::Result<()> {
         eprintln!("skipping mysql restart resume test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
     }
-    let replayed = replayed_after_clean_restart("mysql", "8.0").await?;
+    let replayed =
+        replayed_after_clean_restart("mysql", matrix::full(matrix::Engine::Mysql)).await?;
     assert_eq!(
         replayed, 0,
         "a clean restart with no new writes must deliver nothing; the binlog coordinate \
@@ -187,7 +198,8 @@ async fn mariadb_restart_delivers_nothing_new() -> rustcdc::Result<()> {
         eprintln!("skipping mariadb restart resume test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
     }
-    let replayed = replayed_after_clean_restart("mariadb", "10.6").await?;
+    let replayed =
+        replayed_after_clean_restart("mariadb", matrix::full(matrix::Engine::Mariadb)).await?;
     assert_eq!(
         replayed, 0,
         "a clean restart with no new writes must deliver nothing on MariaDB either"

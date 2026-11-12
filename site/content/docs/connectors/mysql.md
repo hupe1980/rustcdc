@@ -10,8 +10,9 @@ It acts as a **replica** — connecting to the server using the MySQL replicatio
 protocol — so it captures changes in real time with no polling, triggers, or
 schema modifications required.
 
-Both MySQL (5.7+) and MariaDB (10.3+) are supported. The configuration is
-identical except for `type = "mysql"` vs `type = "mariadb"`.
+MySQL and MariaDB are both supported — the tested releases are on
+[Supported versions](@/docs/supported-versions.md). The configuration is identical except for
+`type = "mysql"` vs `type = "mariadb"`.
 
 
 ## 1. Overview
@@ -275,8 +276,8 @@ Aurora requires a cluster-level parameter group change, not an instance-level on
 
 ### Cloud SQL for MySQL (GCP)
 
-Enable binary logging in the Cloud SQL instance settings. GTID is available on
-Cloud SQL MySQL 5.7+. Grant standard replication privileges as shown above.
+Enable binary logging in the Cloud SQL instance settings; GTID is available there. Grant
+standard replication privileges as shown above.
 
 
 ## 6. Supported topologies

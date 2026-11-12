@@ -2,7 +2,7 @@
 # =============================================================================
 # seed.sh — continuously generates INSERT / UPDATE / DELETE events
 #
-# Runs inside the postgres:16 container (has psql available).
+# Runs inside the postgres:18 container (has psql available).
 # PGPASSWORD is injected via the compose environment.
 # =============================================================================
 set -euo pipefail

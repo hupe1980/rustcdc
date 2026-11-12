@@ -1,5 +1,8 @@
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::TransportConfig;
 use rustcdc::{PostgresConnection, PostgresSourceConfig, source::Source};
 use testcontainers::{
@@ -16,53 +19,6 @@ fn skip_postgres_version_matrix_case() -> bool {
 
     eprintln!("skipping postgres version matrix test (set CDC_RS_RUN_DOCKER_TESTS=1)");
     true
-}
-
-/// Returns `true` when the error message indicates that the container image
-/// could not be pulled from the registry (rate-limit, access denial, network
-/// partition, or retired tag).
-fn is_image_pull_failure(err: &rustcdc::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("failed to pull")
-        || msg.contains("pull access denied")
-        || msg.contains("does not exist or may require")
-        || msg.contains("status code 404")
-        || msg.contains("request is blocked")
-        || msg.contains("toomanyrequests")
-}
-
-macro_rules! postgres_version_test {
-    ($name:ident, $image_tag:literal, $slot_name:literal, $publication_name:literal, $table_name:literal, $label:literal) => {
-        #[tokio::test]
-        async fn $name() -> rustcdc::Result<()> {
-            if skip_postgres_version_matrix_case() {
-                return Ok(());
-            }
-
-            match run_postgres_version_connection_test(
-                $image_tag,
-                $slot_name,
-                $publication_name,
-                $table_name,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(ref e) if is_image_pull_failure(e) => {
-                    eprintln!(
-                        "skipping postgres version matrix test for {}: image pull failed — \
-                         Docker Hub may be unavailable or the tag may be retired.",
-                        $image_tag
-                    );
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            }
-
-            println!($label);
-            Ok(())
-        }
-    };
 }
 
 async fn run_postgres_version_connection_test(
@@ -158,38 +114,24 @@ async fn run_postgres_version_connection_test(
     Ok(())
 }
 
-postgres_version_test!(
-    postgres_version_12_connection,
-    "12-alpine",
-    "pg12_test_slot",
-    "pg12_test_pub",
-    "pg12_test_table",
-    "✓ PostgreSQL 12 compatibility verified"
-);
-
-postgres_version_test!(
-    postgres_version_14_connection,
-    "14-alpine",
-    "pg14_test_slot",
-    "pg14_test_pub",
-    "pg14_test_table",
-    "✓ PostgreSQL 14 compatibility verified"
-);
-
-postgres_version_test!(
-    postgres_version_15_connection,
-    "15-alpine",
-    "pg15_test_slot",
-    "pg15_test_pub",
-    "pg15_test_table",
-    "✓ PostgreSQL 15 compatibility verified"
-);
-
-postgres_version_test!(
-    postgres_version_16_connection,
-    "16-alpine",
-    "pg16_test_slot",
-    "pg16_test_pub",
-    "pg16_test_table",
-    "✓ PostgreSQL 16 compatibility verified"
-);
+/// Connect, replicate and close on every tested PostgreSQL version. A tag that no longer pulls
+/// fails: a retired image is the drift this matrix exists to catch.
+#[tokio::test]
+async fn postgres_connection_every_tested_version() -> rustcdc::Result<()> {
+    if skip_postgres_version_matrix_case() {
+        return Ok(());
+    }
+    for tag in matrix::tested(matrix::Engine::Postgres) {
+        let id = tag.split('-').next().unwrap_or(tag).replace('.', "_");
+        run_postgres_version_connection_test(
+            tag,
+            &format!("pg{id}_test_slot"),
+            &format!("pg{id}_test_pub"),
+            &format!("pg{id}_test_table"),
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(format!("postgres {tag}: {error}")))?;
+        println!("✓ PostgreSQL {tag} compatibility verified");
+    }
+    Ok(())
+}

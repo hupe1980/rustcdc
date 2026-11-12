@@ -1,5 +1,8 @@
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     AckMode, CdcRuntime, PostgresSourceConfig, RuntimeConfig, RuntimeSourceConfig,
     checkpoint::{Checkpoint, FileCheckpoint, PostgresOffset},
@@ -18,7 +21,7 @@ async fn runtime_postgres_stream_resume_from_checkpoint() -> rustcdc::Result<()>
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

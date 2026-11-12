@@ -1,5 +1,8 @@
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::TransportConfig;
 use rustcdc::{MysqlConnection, MysqlSourceConfig, source::Source};
 use std::collections::HashSet;
@@ -57,7 +60,7 @@ async fn mysql_snapshot_stream_handoff_full_cycle() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")

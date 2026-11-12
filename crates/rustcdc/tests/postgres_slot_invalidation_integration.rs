@@ -9,6 +9,9 @@
 //! `idle_replication_slot_timeout` while nothing ran is refused at startup the same way.
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -251,7 +254,8 @@ async fn a_slot_invalidated_mid_run_is_named(
     );
     let report = error.report().to_string();
     assert!(report.contains(slot), "{report}");
-    if tag.starts_with("18") {
+    if major(tag) >= 17 {
+        // `invalidation_reason` exists from PostgreSQL 17.
         assert!(report.contains("wal_removed"), "{report}");
     }
     if transport == WalTransport::SqlPeek {
@@ -284,7 +288,11 @@ async fn a_slot_invalidated_mid_run_is_named_on_both_transports() -> rustcdc::Re
     if !docker_enabled("postgres slot invalidation test") {
         return Ok(());
     }
-    for tag in ["16-alpine", "18-alpine"] {
+    // The oldest and newest tested releases: either side of PostgreSQL 17's `invalidation_reason`.
+    let tested = matrix::tested(matrix::Engine::Postgres);
+    let mut ends = vec![tested[0], *tested.last().unwrap()];
+    ends.dedup();
+    for tag in ends {
         for transport in [WalTransport::SqlPeek, WalTransport::StreamingReplication] {
             a_slot_invalidated_mid_run_is_named(tag, transport).await?;
         }
@@ -298,7 +306,12 @@ async fn an_invalidated_slot_is_refused_at_startup() -> rustcdc::Result<()> {
         return Ok(());
     }
     // Seconds on PostgreSQL 18; the invalidation happens at the next checkpoint.
-    let container = start_postgres("18-alpine", &["-c", "idle_replication_slot_timeout=1"]).await?;
+    let tag = matrix::full(matrix::Engine::Postgres);
+    assert!(
+        major(tag) >= 18,
+        "idle_replication_slot_timeout needs PostgreSQL 18+; the full suites run on {tag}"
+    );
+    let container = start_postgres(tag, &["-c", "idle_replication_slot_timeout=1"]).await?;
     let (admin, host, port) = admin_client(&container).await?;
     let slot = "idle_slot";
     prepare(&admin, slot).await?;
@@ -347,7 +360,11 @@ async fn a_refused_start_replication_is_classified_as_an_invalidated_slot() -> r
     if !docker_enabled("postgres refused START_REPLICATION test") {
         return Ok(());
     }
-    let container = start_postgres("16-alpine", &["-c", "max_slot_wal_keep_size=1MB"]).await?;
+    let container = start_postgres(
+        matrix::full(matrix::Engine::Postgres),
+        &["-c", "max_slot_wal_keep_size=1MB"],
+    )
+    .await?;
     let (admin, host, port) = admin_client(&container).await?;
     let slot = "refused_slot";
     prepare(&admin, slot).await?;
@@ -385,4 +402,12 @@ async fn a_refused_start_replication_is_classified_as_an_invalidated_slot() -> r
         error.report()
     );
     Ok(())
+}
+
+/// `18-alpine` → 18.
+fn major(tag: &str) -> u32 {
+    tag.split(['-', '.'])
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or_else(|| panic!("no major version in PostgreSQL tag {tag}"))
 }

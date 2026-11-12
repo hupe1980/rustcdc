@@ -13,7 +13,7 @@
 #
 # Services
 # ─────────
-#   postgres  — PostgreSQL 16 with wal_level=logical
+#   postgres  — PostgreSQL 18 with wal_level=logical
 #   rustcdc   — the CDC pipeline; creates its own state dirs on first start
 #   seeder    — generates ongoing changes every 2 s
 #
@@ -34,7 +34,7 @@ services:
 
   # ── PostgreSQL source ───────────────────────────────────────────────────────
   postgres:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_DB:       demo
       POSTGRES_USER:     postgres
@@ -51,7 +51,8 @@ services:
     volumes:
       # init.sql runs once on first container start (skipped if pg-data exists).
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      - pg-data:/var/lib/postgresql/data
+      # PostgreSQL 18 images keep their data under /var/lib/postgresql/<major>/docker.
+      - pg-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
       interval: 5s
@@ -101,7 +102,7 @@ services:
 
   # ── Seeder: generates continuous INSERT / UPDATE / DELETE events ────────────
   seeder:
-    image: postgres:16
+    image: postgres:18
     depends_on:
       postgres:
         condition: service_healthy

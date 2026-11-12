@@ -5,6 +5,35 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## Unreleased
+
+### Changed: the tested database matrix follows the vendor support windows
+
+Container suites now run against every vendor-supported release, with the full suites on the
+newest: PostgreSQL 15, 16, 17, **18**; MySQL 8.4, **9.7** (LTS); MariaDB 10.11, 11.4, 11.8,
+**12.3** (LTS); SQL Server 2017, 2019, 2022, **2025**. Previously PostgreSQL 12 and 14, MySQL 8.0
+and MariaDB 10.5 and 10.6 — all past vendor EOL — were tested, and PostgreSQL 17, MySQL 9.7,
+MariaDB 11.x/12.3 and SQL Server 2017 were not. No connector change was needed.
+
+- **One place names the versions**: `crates/rustcdc/tests/support/matrix.txt`, read by every
+  suite, the CI pre-pull and the workflows. `RUSTCDC_TEST_POSTGRES=17-alpine` (and the same per
+  engine) runs any suite against another release without an edit.
+- **`cargo xtask support-window`** compares the matrix with the vendor windows and names what to
+  add, drop or promote; it fails closed when it cannot check.
+- **[Supported versions](site/content/docs/supported-versions.md)** is the one published page for
+  versions; the others link to it. The policy gate holds it, and the examples, to the matrix.
+- The examples and the demo run PostgreSQL 18; the demo's volume moves to `/var/lib/postgresql`,
+  where the 18 image keeps its data.
+
+### Evidence
+
+Every relational container suite and the server's PostgreSQL, MySQL and Kafka suites ran on the
+new matrix. `support_window` unit tests fail against each rule planted out (add, drop, promote,
+LTS filter, empty answer, SQL Server label); the policy gate fails on a planted version literal in
+a suite and in the workflow, a release missing from the page, and an old PostgreSQL in an example
+and in the demo. The PostgreSQL version-matrix suite no longer passes when an image cannot be
+pulled.
+
 ## 0.20.1
 
 A fix for SQL Server's documented way to change a captured table.

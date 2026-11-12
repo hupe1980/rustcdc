@@ -79,8 +79,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let sqlserver =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),

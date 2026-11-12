@@ -11,6 +11,7 @@
 use std::process::{Command, ExitCode};
 
 mod cargo_profile;
+mod support_window;
 
 /// A task, its one-line description, and how to run it.
 struct Task {
@@ -44,6 +45,11 @@ const TASKS: &[Task] = &[
         name: "bench",
         about: "Build (--no-run) or run the workspace benchmarks. Extra args go to cargo.",
         run: bench,
+    },
+    Task {
+        name: "support-window",
+        about: "Is the tested database matrix still the one the vendors support? (network)",
+        run: support_window::run,
     },
     Task {
         name: "pull-images",

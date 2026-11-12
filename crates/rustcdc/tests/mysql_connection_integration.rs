@@ -1,5 +1,8 @@
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::TransportConfig;
 use rustcdc::{MysqlConnection, MysqlSourceConfig, source::Source};
 use testcontainers::{
@@ -26,141 +29,75 @@ async fn connect_with_retry(connection: &MysqlConnection) -> rustcdc::Result<()>
     }))
 }
 
-/// Test MySQL 8.0 connection lifecycle
+/// Connect to, check and close every tested MySQL version. Installs no TLS provider on purpose:
+/// the connector must work without one.
 #[tokio::test]
-async fn mysql_connection_8_0() -> rustcdc::Result<()> {
+async fn mysql_connection_every_tested_version() -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping mysql connection integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
-        .with_exposed_port(3306.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
-        .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
-        .with_env_var("MYSQL_DATABASE", "cdc")
-        // rustcdc requires FULL row metadata and row images. MySQL 8 defaults
-        // binlog_row_metadata to MINIMAL, under which the binlog carries no column
-        // names and no primary-key flags — events would be emitted with positional
-        // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
-        // the test server must be configured the way a production server must be.
-        .with_cmd(vec![
-            "--log-bin=mysql-bin",
-            "--binlog-format=ROW",
-            "--binlog-row-metadata=FULL",
-            "--binlog-row-image=FULL",
-            "--server-id=1",
-        ])
-        .start()
-        .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    for (server_id, tag) in (100..).zip(matrix::tested(matrix::Engine::Mysql)) {
+        let container = GenericImage::new("mysql", tag)
+            .with_exposed_port(3306.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
+            .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
+            .with_env_var("MYSQL_DATABASE", "cdc")
+            // rustcdc requires FULL row metadata and row images. MySQL defaults
+            // binlog_row_metadata to MINIMAL, under which the binlog carries no column
+            // names and no primary-key flags — events would be emitted with positional
+            // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
+            // the test server must be configured the way a production server must be.
+            .with_cmd(vec![
+                "--log-bin=mysql-bin",
+                "--binlog-format=ROW",
+                "--binlog-row-metadata=FULL",
+                "--binlog-row-image=FULL",
+                "--server-id=1",
+            ])
+            .start()
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let host = container
-        .get_host()
-        .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-    let port = container
-        .get_host_port_ipv4(3306.tcp())
-        .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        let host = container
+            .get_host()
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+        let port = container
+            .get_host_port_ipv4(3306.tcp())
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
-    let config = MysqlSourceConfig {
-        host: host.to_string(),
-        port,
-        user: "root".to_string(),
-        password: "rootpass".to_string().into(),
-        database: "cdc".to_string(),
-        server_id: 100,
-        gtid_mode_enabled: false,
-        binlog_format_check: true,
-        transport: TransportConfig::tls_insecure_skip_verify(),
-        conn_timeout_secs: 30,
-        stream_poll_interval_ms: 50,
-        max_events_per_poll: 1_000,
-        ..Default::default()
-    };
+        let config = MysqlSourceConfig {
+            host: host.to_string(),
+            port,
+            user: "root".to_string(),
+            password: "rootpass".to_string().into(),
+            database: "cdc".to_string(),
+            server_id,
+            gtid_mode_enabled: false,
+            binlog_format_check: true,
+            transport: TransportConfig::tls_insecure_skip_verify(),
+            conn_timeout_secs: 30,
+            stream_poll_interval_ms: 50,
+            max_events_per_poll: 1_000,
+            ..Default::default()
+        };
 
-    // Test connection
-    let connection = MysqlConnection::new(config);
-    connect_with_retry(&connection).await?;
-    assert_eq!(connection.source_type(), "mysql");
+        // Test connection
+        let connection = MysqlConnection::new(config);
+        connect_with_retry(&connection).await?;
+        assert_eq!(connection.source_type(), "mysql");
 
-    // Verify connection is alive
-    assert!(connection.is_connected().await);
+        // Verify connection is alive
+        assert!(connection.is_connected().await);
 
-    // Test clean close
-    connection.close().await;
+        // Test clean close
+        connection.close().await;
 
-    println!("✓ MySQL 8.0 connection test passed");
-    Ok(())
-}
-
-/// Test MySQL 8.1 connection lifecycle
-#[tokio::test]
-async fn mysql_connection_8_1() -> rustcdc::Result<()> {
-    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping mysql connection integration test (set CDC_RS_RUN_DOCKER_TESTS=1)");
-        return Ok(());
+        println!("✓ MySQL {tag} connection test passed");
     }
-
-    let container = GenericImage::new("mysql", "8.1")
-        .with_exposed_port(3306.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
-        .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
-        .with_env_var("MYSQL_DATABASE", "cdc")
-        // rustcdc requires FULL row metadata and row images. MySQL 8 defaults
-        // binlog_row_metadata to MINIMAL, under which the binlog carries no column
-        // names and no primary-key flags — events would be emitted with positional
-        // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
-        // the test server must be configured the way a production server must be.
-        .with_cmd(vec![
-            "--log-bin=mysql-bin",
-            "--binlog-format=ROW",
-            "--binlog-row-metadata=FULL",
-            "--binlog-row-image=FULL",
-            "--server-id=1",
-        ])
-        .start()
-        .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-
-    let host = container
-        .get_host()
-        .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-    let port = container
-        .get_host_port_ipv4(3306.tcp())
-        .await
-        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
-
-    let config = MysqlSourceConfig {
-        host: host.to_string(),
-        port,
-        user: "root".to_string(),
-        password: "rootpass".to_string().into(),
-        database: "cdc".to_string(),
-        server_id: 101,
-        gtid_mode_enabled: false,
-        binlog_format_check: true,
-        transport: TransportConfig::tls_insecure_skip_verify(),
-        conn_timeout_secs: 30,
-        stream_poll_interval_ms: 50,
-        max_events_per_poll: 1_000,
-        ..Default::default()
-    };
-
-    // Test connection with GTID validation
-    let connection = MysqlConnection::new(config);
-    connect_with_retry(&connection).await?;
-    assert_eq!(connection.source_type(), "mysql");
-
-    // Verify connection is alive
-    assert!(connection.is_connected().await);
-
-    // Test clean close
-    connection.close().await;
-
-    println!("✓ MySQL 8.1 connection test passed");
     Ok(())
 }
 

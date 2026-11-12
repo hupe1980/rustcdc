@@ -27,6 +27,9 @@
 //! immediately — and `tests/architecture.rs` asserts that CI still sets it, so the suite
 //! cannot quietly stop running.
 
+#[path = "../../rustcdc/tests/support/matrix.rs"]
+mod matrix;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -110,7 +113,7 @@ fn start_postgres() {
         "POSTGRES_DB=cdc",
         "-p",
         &format!("{HOST_PORT}:5432"),
-        "postgres:16",
+        &format!("postgres:{}", matrix::full(matrix::Engine::Postgres)),
         "-c",
         "wal_level=logical",
         "-c",

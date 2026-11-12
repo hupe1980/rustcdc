@@ -1,0 +1,12 @@
+# The database and broker versions the container suites run against — the only place they are
+# named. One line per engine: the tag the full suites run on, then every tag the version-matrix
+# suites run on. `cargo xtask support-window` says when this falls behind the vendors.
+# Override one engine for a local run: RUSTCDC_TEST_POSTGRES=17-alpine cargo test ...
+#
+# engine    full suites             every tested tag
+postgres    18-alpine               15-alpine 16-alpine 17-alpine 18-alpine
+mysql       9.7                     8.4 9.7
+mariadb     12.3                    10.11 11.4 11.8 12.3
+sqlserver   2025-CU10-ubuntu-24.04  2017-CU31-ubuntu-18.04 2019-CU32-ubuntu-20.04 2022-CU27-ubuntu-22.04 2025-CU10-ubuntu-24.04
+kafka       4.4.0                   4.4.0
+redpanda    v26.2.6                 v26.2.6

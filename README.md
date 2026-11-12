@@ -79,7 +79,8 @@ and each one is listed in [CHANGELOG.md](CHANGELOG.md) with the migration it req
 
 Validated by library and server unit tests, compiled documentation samples,
 deterministic-replay golden fixtures and container-backed integration suites against real
-PostgreSQL, MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka.
+PostgreSQL, MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka — every release
+inside its vendor's support window ([Supported versions](https://hupe1980.github.io/rustcdc/docs/supported-versions/)).
 
 ## Building it
 

@@ -11,6 +11,9 @@
 
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use std::collections::BTreeSet;
 
 use rustcdc::{
@@ -32,7 +35,7 @@ async fn a_snapshot_row_filter_bounds_the_chunk_reads_but_not_the_stream() -> ru
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

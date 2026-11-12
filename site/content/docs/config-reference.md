@@ -1010,7 +1010,7 @@ position of the payload event**, exactly as MySQL specifies for `START REPLICA â
 `sql_replica_skip_counter`. Several rows therefore share one `source.offset`, which is
 already true of any multi-row transaction.
 
-Evidence: `tests/mysql_binlog_compression_integration.rs` runs against MySQL 8.0 with
+Evidence: `tests/mysql_binlog_compression_integration.rs` runs against the newest tested MySQL with
 compression enabled and asserts both that every event carries a resumable position and that a
 stream restarted from a position captured inside a compressed transaction picks up the changes
 that follow it.

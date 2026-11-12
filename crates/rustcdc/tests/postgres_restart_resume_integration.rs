@@ -17,6 +17,9 @@
 //! was unbounded rather than a single duplicate.
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::source::Source;
 use rustcdc::{PostgresConnection, PostgresSourceConfig, WalTransport, checkpoint::PostgresOffset};
 use testcontainers::{
@@ -26,7 +29,7 @@ use testcontainers::{
 };
 
 async fn run(transport: WalTransport, slot: &str) -> rustcdc::Result<usize> {
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
