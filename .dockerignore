@@ -3,6 +3,8 @@ target/
 crates/rustcdc-server/fuzz/target/
 crates/rustcdc-server/fuzz/corpus/
 crates/rustcdc-server/fuzz/artifacts/
+crates/rustcdc-server/ui/node_modules/
+crates/rustcdc-server/ui/dist/
 
 # ── version control ──────────────────────────────────────────────────────────
 .git/

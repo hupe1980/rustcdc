@@ -28,7 +28,11 @@ path = "src/main.rs"
 # drivers it uses. The image builds `--all-features`. A config naming an uncompiled connector
 # is rejected at load with the feature to rebuild with (`reject_uncompiled_source_driver`).
 [features]
-default = ["postgres"]
+default = ["postgres", "ui"]
+
+# The operator console at `/ui`, embedded from `ui/dist` (`cargo xtask console` builds it).
+# Without a built bundle the route serves a page saying how to build it.
+ui = []
 
 # PostgreSQL logical replication. The default, and the only connector most deployments
 # need. Adds no TLS stack of its own beyond rustls 0.23, which is already present.

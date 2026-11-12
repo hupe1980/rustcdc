@@ -186,6 +186,41 @@ jobs:
   # one setting that decides whether the `test-harnesses` release guard fires. Without
   # this job the only lane that would notice a bench that no longer compiles is
   # `release-evidence`, twelve minutes in, behind an apt install and a cargo-deny build.
+  # The operator console: the only job that installs Node. Every other job builds the server
+  # without the bundle and serves the page saying how to build it.
+  console:
+    name: "server: console"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/rustcdc-server/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/rustcdc-server/ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check -- --fail-on-warnings
+      - run: npm test
+      - run: npm run build
+      - name: bundle budget (150 KB of JavaScript and CSS)
+        run: |
+          size=$(cat dist/*.js dist/*.css | wc -c)
+          echo "console bundle: ${size} bytes"
+          test "$size" -le 153600
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - name: the server embeds and serves it
+        env:
+          RUSTCDC_REQUIRE_CONSOLE: "1"
+          CDC_TEST_SOURCE_PASSWORD: unused
+        run: cargo test -p rustcdc-server --test console_tests --locked
+
   # Every other clippy run is `--all-features`, where the connectors hide each other's
   # dead code and enum sizes. A MySQL-only build failed `-D warnings` on an item only
   # PostgreSQL and SQL Server call, and nothing here saw it until a crash worker did.
@@ -1046,6 +1081,7 @@ jobs:
       - quality
       - transport-security
       - lib-connector-clippy
+      - console
       - policy-gate
       - docs-site
       - correctness-smoke

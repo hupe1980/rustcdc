@@ -52,6 +52,16 @@ const TASKS: &[Task] = &[
         run: support_window::run,
     },
     Task {
+        name: "console",
+        about: "Build the operator console into crates/rustcdc-server/ui/dist (needs Node 24).",
+        run: |_| npm(&["ci", "--no-audit", "--no-fund"]).and_then(|()| npm(&["run", "build"])),
+    },
+    Task {
+        name: "console-dev",
+        about: "Serve the console with live reload against `rustcdc run` (RUSTCDC_URL, default :8080).",
+        run: |_| npm(&["run", "dev"]),
+    },
+    Task {
         name: "pull-images",
         about: "Pre-pull the database images the integration matrix uses.",
         run: |args| script("ci-pull-relational-images.sh", args),
@@ -186,5 +196,21 @@ fn script(name: &str, args: &[String]) -> Result<(), String> {
                 .code()
                 .map_or_else(|| "a signal".to_owned(), |c| c.to_string())
         ))
+    }
+}
+
+/// Run `npm` in the console's directory. Node is needed only here; every other task and every
+/// `cargo build` works without it.
+fn npm(args: &[&str]) -> Result<(), String> {
+    let dir = workspace_root()?.join("crates/rustcdc-server/ui");
+    let status = Command::new("npm")
+        .args(args)
+        .current_dir(&dir)
+        .status()
+        .map_err(|error| format!("could not run npm (install Node 24): {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("npm {} failed with {status}", args.join(" ")))
     }
 }

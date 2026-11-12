@@ -61,6 +61,7 @@ These pages cover both. Where something applies to only one, the page says so at
 | [Getting started](@/docs/getting-started.md) | Run the server against a database in about ten minutes |
 | [Embedding the library](@/docs/embedding.md) | Build a pipeline inside your own Rust binary |
 | [Supported versions](@/docs/supported-versions.md) | Which database releases every release is tested against |
+| [Console](@/docs/console.md) | Health, snapshots and activity in the browser, at `/ui` |
 | [Core concepts](@/docs/concepts.md) | The event model, delivery contracts, lifecycle |
 | [Architecture](@/docs/architecture.md) | Capture, the commit barrier and checkpointing — how they fit |
 

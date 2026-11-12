@@ -87,6 +87,7 @@ async fn run_pipeline(
             &app_config.admin.bind,
             app_config.admin.timeout_ms,
             app_config.admin.tls.as_ref(),
+            app_config.admin.ui.enabled,
             admin_state.clone(),
         )
         .await?;

@@ -1713,7 +1713,7 @@ fn every_admin_route_appears_in_the_openapi_document() {
 
     // Routes as declared: `.route("/path", ...)`.
     let router_body = admin
-        .split_once("pub fn router(state: AdminState) -> Router {")
+        .split_once("pub fn router(state: AdminState, console: bool) -> Router {")
         .expect("the admin router must exist")
         .1
         .split_once("\n}")

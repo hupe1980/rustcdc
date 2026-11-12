@@ -10,6 +10,8 @@ pub use routes::router;
 mod signal_ledger;
 mod signals;
 mod tls;
+#[cfg(feature = "ui")]
+mod ui;
 
 // The probe handlers live in `probes` but are referenced unqualified by `router()`
 // and by the test modules, which is how they were written when they sat in this file.
@@ -3491,6 +3493,7 @@ pub async fn serve(
     bind_addr: &str,
     timeout_ms: u64,
     tls: Option<&AdminTlsConfig>,
+    console: bool,
     state: AdminState,
 ) -> Result<tokio::task::JoinHandle<()>, AppError> {
     let addr: std::net::SocketAddr = bind_addr
@@ -3499,7 +3502,7 @@ pub async fn serve(
 
     state.spawn_manifest_refresh_worker();
 
-    let app = router(state).layer(TimeoutLayer::with_status_code(
+    let app = router(state, console).layer(TimeoutLayer::with_status_code(
         StatusCode::REQUEST_TIMEOUT,
         Duration::from_millis(timeout_ms),
     ));

@@ -7,6 +7,33 @@ what breaks and what to do about it.
 
 ## Unreleased
 
+### Added: an operator console at `/ui`
+
+`rustcdc run` serves a console on the admin listener — on by default, `[admin.ui] enabled = false`
+turns it off. **Health** says in one sentence whether the pipeline is working and, when it is not,
+who can fix it (the source, the destination or rustcdc), what to do and whether a restart helps,
+with the stalled hop lit on a source → rustcdc → destination strip and the browser tab as a status
+light. **Snapshots** starts, pauses, resumes and stops incremental snapshots and follows each signal
+to its real outcome. **Activity** is the live notification stream and audit trail; **Shapes** looks
+up a row shape by id. Every action shows its `curl`. It is a client of the admin API with the
+existing tokens, kept in the tab's session storage, under its own CSP. See
+[Console](site/content/docs/console.md).
+
+- **`/status` says who can fix a stall**: `health.owner` (`source`, `destination`, `rustcdc`) and
+  `health.restart_helps`, from `StallCause::owner()` and `StallCause::restart_helps()` in the library,
+  which `/livez` now decides through too. The OpenAPI document describes `health`.
+- **Every signal from the console**: the four snapshot controls, with an optional SQL row filter per
+  table, and markers (`log_marker`) from Activity. Each carries its own `signal_id`, so a retry
+  cannot run it twice, and each is followed to what happened — a snapshot is "complete" when its
+  tables are read, not when the request was queued.
+- **Admin API responses carry `Content-Security-Policy: default-src 'none'`.**
+- **The OpenAPI `Notification` schema describes what `/notifications` sends** (`action_type`,
+  `state`, `at`, `detail`, inside `{ notifications: [...] }`); it described fields the server never
+  sent. A test now holds the schema to the serialised struct.
+- `cargo xtask console` builds it (Node 24), `cargo xtask console-dev` serves it with live reload.
+  A server built without the bundle serves a page saying how to build it; release builds and the
+  image refuse to build without it.
+
 ### Changed: the tested database matrix follows the vendor support windows
 
 Container suites now run against every vendor-supported release, with the full suites on the
