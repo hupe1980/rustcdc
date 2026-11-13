@@ -20,16 +20,16 @@ arrives**.
 ## Measured
 
 ```text
-rustcdc pipeline bench · 2026-11-12 · Apple M4 Pro, 14 cores · Darwin 25.6.0
+rustcdc pipeline bench · 2026-11-13 · Apple M4 Pro, 14 cores · Darwin 25.6.0 · rustcdc 0.21.0
 PostgreSQL 18.6 → rustcdc (release) → Apache Kafka 4.4.0 · 200 000 rows, 1 000 per transaction
 
                       rows/s       p50       p95       p99   write → broker
-at_least_once         23 811   4440 ms   7553 ms   7816 ms
-effectively_once      24 369   4267 ms   7292 ms   7580 ms
+at_least_once         23 484   4470 ms   7606 ms   7874 ms
+effectively_once      23 075   4369 ms   7800 ms   8086 ms
 
 One transaction of 100 000 updates, committed 0.3 s after it began
-  first row at the broker  +0.8 s after the commit   (protocol v1 sends nothing before it)
-  last row at the broker   +3.6 s after the commit
+  first row at the broker  +0.9 s after the commit   (protocol v1 sends nothing before it)
+  last row at the broker   +3.8 s after the commit
 
 Latency: PostgreSQL's write time to the consumer's arrival, clocks aligned within 17.3 ms.
 Reproduce: cargo xtask pipeline-bench  (default settings)
@@ -57,6 +57,7 @@ transaction reaches the topic as one burst after it.
 - **One table, one partition, one connector.** Wide rows, many tables, MySQL, SQL Server or a sink
   other than Kafka are not measured here.
 - **Not tuned.** Every setting is the default unless the card says otherwise.
+- **Runs differ by a few percent.** Compare runs from the same machine, not single numbers.
 
 ## Trying a setting
 

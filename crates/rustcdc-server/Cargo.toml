@@ -131,7 +131,7 @@ tokio-postgres = "0.7"
 # One crypto backend for the process (aws-lc-rs, matching main.rs), and `zstd` because
 # krafka encodes zstd only behind that feature — without it a documented `compression =
 # "zstd"` fails validation at startup. Gzip, Snappy and LZ4 are always compiled in.
-krafka = { version = "0.29.0", default-features = false, features = ["zstd", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots"] }
+krafka = { version = "0.31.1", default-features = false, features = ["zstd", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots"] }
 
 # AWS credential chain. Not optional: `iceberg-catalog-s3tables` pulls it unconditionally
 # and the SQS dead-letter target needs it by name.
@@ -203,4 +203,4 @@ wat = "1"
 tokio-stream = { version = "0.1", features = ["net"] }
 # test-broker: krafka's in-process fake Kafka broker — real protocol round-trips
 # in unit tests without Docker.
-krafka = { version = "0.29.0", default-features = false, features = ["zstd", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "test-broker"] }
+krafka = { version = "0.31.1", default-features = false, features = ["zstd", "rustls-aws-lc-rs", "oauth-oidc", "native-tls-roots", "test-broker"] }

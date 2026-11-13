@@ -74,6 +74,11 @@ all past vendor end of life, are no longer tested. No connector change was neede
 - [Supported versions](site/content/docs/supported-versions.md) is the one page for versions. The
   policy gate holds it, and the examples, to the matrix.
 
+### Changed: krafka 0.29 → 0.31.1
+
+Consumer-group fixes and a faster producer for small records. End to end, `cargo xtask pipeline-bench`
+measures no difference: the producer is not where the pipeline spends its time.
+
 ### Upgrading
 
 - **The console is on by default** on the admin listener. It can do what the admin API's tokens

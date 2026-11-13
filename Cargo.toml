@@ -29,7 +29,7 @@ resolver = "2"
 [workspace.package]
 version = "0.21.0"
 edition = "2024"
-# `wasmtime` 50 sets this floor; krafka 0.29 and iceberg 0.11 are the next constraint at
+# `wasmtime` 50 sets this floor; krafka 0.31 and iceberg 0.11 are the next constraint at
 # 1.95. Declaring a lower number would hand anyone a resolver error instead of a documented
 # requirement.
 # It covers the server with every feature, which is what the MSRV job checks: `wasm` is
