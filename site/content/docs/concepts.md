@@ -472,6 +472,7 @@ Two classes of failure are deliberately **not** retried:
   behind it.
 * **Configuration errors.** Deterministic by nature.
 
-One gap worth knowing: an error surfacing from a sink **flush** rather than a send is
-currently treated as terminal even when it is transient. The router collapses per-sink
-flush errors into a single string, which loses the classification. Sends are unaffected.
+A failure from a sink **flush** is classified the same way as one from a send. When
+several routed sinks fail one flush, the router reports them together under the most
+severe kind among them: a transient broker error is retried, and one terminal failure
+makes the whole flush terminal.
