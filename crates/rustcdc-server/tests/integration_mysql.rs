@@ -124,16 +124,8 @@ fn start_mysql() {
         "--log-bin=binlog",
         "--binlog-format=ROW",
         "--binlog-row-image=FULL",
-        // **Two different settings, and both are required.**
-        //
-        // `binlog_row_image` decides which *columns* are logged; `binlog_row_metadata`
-        // decides whether column names and primary-key flags travel with them. MySQL
-        // defaults the latter to MINIMAL (MariaDB to NO_LOG), under which streamed events
-        // carry positional placeholders (`@0`, `@1`, …) instead of column names and no
-        // primary key at all — which in turn disables snapshot/stream duplicate
-        // suppression. The connector refuses to start rather than emit that, with an error
-        // that names the setting and the fix; this fixture was written against
-        // `binlog_row_image` alone and hit it on the first run.
+        // Required alongside `binlog_row_image`: it carries column names and primary-key
+        // flags, without which the connector refuses to start.
         "--binlog-row-metadata=FULL",
         "--server-id=1",
         "--gtid-mode=ON",

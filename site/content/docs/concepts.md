@@ -253,9 +253,8 @@ produced by the same producer.
 
 Any other state backend is a second durability domain. The batch and the position would
 commit separately, and a crash between the two would replay the batch — the window this
-contract exists to avoid. That combination is rejected rather than accepted with the residual window
-documented as a caveat; it is now a configuration error, because a guarantee an operator
-has to read a paragraph to qualify is not a guarantee.
+contract exists to avoid. That combination is a configuration error rather than a caveat, because a guarantee an
+operator has to read a paragraph to qualify is not a guarantee.
 
 > [!NOTE]
 > One consequence worth planning for: the checkpoint topic must be a compacted topic on
@@ -272,7 +271,7 @@ has to read a paragraph to qualify is not a guarantee.
   records, and no producer-side guarantee can prevent that.
 - **The reconciliation marker still runs.** It is written before delivery and cleared after
   the commit, and a marker surviving a restart tells you the crash landed mid-batch. It is
-  now purely diagnostic — the transaction, not the marker, is what protects the data.
+  purely diagnostic — the transaction, not the marker, is what protects the data.
 
 
 ## 4. Transform pipeline

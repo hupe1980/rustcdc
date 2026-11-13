@@ -7,6 +7,14 @@
 ARG RUST_VERSION=1.97.0
 ARG DEBIAN_CODENAME=bookworm
 
+# The console is static files; Node is needed only to build them.
+FROM node:24-bookworm-slim AS console
+WORKDIR /ui
+COPY crates/rustcdc-server/ui/package.json crates/rustcdc-server/ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY crates/rustcdc-server/ui/ ./
+RUN npm run build
+
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_CODENAME} AS builder
 
 # aws-lc-sys requires cmake, clang, and perl at compile time.
@@ -25,7 +33,8 @@ WORKDIR /build
 # layer cache already does the job. The production image in the repository root uses
 # cargo-chef, which does handle workspaces.
 COPY . .
-RUN cargo build -p rustcdc-server --bin rustcdc --all-features
+COPY --from=console /ui/dist/ crates/rustcdc-server/ui/dist/
+RUN RUSTCDC_REQUIRE_CONSOLE=1 cargo build -p rustcdc-server --bin rustcdc --all-features
 
 # Self-signed TLS cert for the admin API (demo only — the server refuses a
 # non-loopback admin bind without TLS, and the demo port-maps admin to the host).

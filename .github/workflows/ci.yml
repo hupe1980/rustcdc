@@ -222,8 +222,8 @@ jobs:
         run: cargo test -p rustcdc-server --test console_tests --locked
 
   # Every other clippy run is `--all-features`, where the connectors hide each other's
-  # dead code and enum sizes. A MySQL-only build failed `-D warnings` on an item only
-  # PostgreSQL and SQL Server call, and nothing here saw it until a crash worker did.
+  # dead code and enum sizes: an item only PostgreSQL calls is dead in a MySQL-only build,
+  # and the crash workers build one connector at a time.
   lib-connector-clippy:
     name: "lib: clippy (${{ matrix.features }})"
     runs-on: ubuntu-latest

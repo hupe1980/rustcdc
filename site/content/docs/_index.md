@@ -98,6 +98,7 @@ These pages cover both. Where something applies to only one, the page says so at
 |---|---|
 | [Deployment](@/docs/deployment.md) | Kubernetes, health wiring, resource shape |
 | [Operations](@/docs/operations.md) | CLI, probes, metrics, replay |
+| [Performance](@/docs/performance.md) | Measured rows/s and latency, PostgreSQL → Kafka, and how to reproduce it |
 | [Incident runbook](@/docs/runbook.md) | Symptom → diagnosis → resolution, for the server |
 | [Embedded pipelines](@/docs/embedded-operations.md) | Alert thresholds and recovery when you own the process |
 | [Troubleshooting](@/docs/troubleshooting.md) | Organised by symptom |

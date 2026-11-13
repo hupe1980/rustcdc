@@ -571,8 +571,8 @@ mod tests {
         assert_eq!(actions(&pg, Must::EverySupported, POSTGRES), ["add 17"]);
     }
 
-    /// The matrix before this check existed: two out-of-support releases, two missing, the full
-    /// suites on an old one. Its final release is "today", so 14 counts as out.
+    /// A stale matrix: two out-of-support releases, two missing, the full suites on an old
+    /// one. Its final release is "today", so 14 counts as out.
     #[test]
     fn the_matrix_this_check_was_written_for_fails_with_every_action() {
         let pg = line(

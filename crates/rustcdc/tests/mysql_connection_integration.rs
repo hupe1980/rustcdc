@@ -44,11 +44,8 @@ async fn mysql_connection_every_tested_version() -> rustcdc::Result<()> {
             .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
             .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
             .with_env_var("MYSQL_DATABASE", "cdc")
-            // rustcdc requires FULL row metadata and row images. MySQL defaults
-            // binlog_row_metadata to MINIMAL, under which the binlog carries no column
-            // names and no primary-key flags — events would be emitted with positional
-            // placeholder keys ("@0", "@1") and no key at all. connect() rejects that, so
-            // the test server must be configured the way a production server must be.
+            // MySQL defaults binlog_row_metadata to MINIMAL, which carries no column names or
+            // primary-key flags; connect() rejects it, as it would a production server.
             .with_cmd(vec![
                 "--log-bin=mysql-bin",
                 "--binlog-format=ROW",
@@ -85,15 +82,12 @@ async fn mysql_connection_every_tested_version() -> rustcdc::Result<()> {
             ..Default::default()
         };
 
-        // Test connection
         let connection = MysqlConnection::new(config);
         connect_with_retry(&connection).await?;
         assert_eq!(connection.source_type(), "mysql");
 
-        // Verify connection is alive
         assert!(connection.is_connected().await);
 
-        // Test clean close
         connection.close().await;
 
         println!("✓ MySQL {tag} connection test passed");

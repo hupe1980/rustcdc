@@ -2528,9 +2528,8 @@ mod tests {
     }
 
     /// The idle sleep is for a slot with nothing to read. A transaction larger than one poll
-    /// returns rows that cannot be released before COMMIT; sleeping after that poll cost a
-    /// full interval per poll while a backlog waited, which capped a default pipeline at a
-    /// few thousand rows per second.
+    /// returns rows that cannot be released before COMMIT; sleeping after that poll would cost a
+    /// full interval per poll while a backlog waits.
     #[tokio::test]
     async fn a_transaction_spanning_polls_is_read_without_the_idle_sleep() {
         const OID: u32 = 999;

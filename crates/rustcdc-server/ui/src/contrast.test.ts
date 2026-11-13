@@ -1,4 +1,4 @@
-// SC-003, the half a DOM without layout cannot check: every text colour the console uses, on every
+// Contrast, which a DOM without layout cannot check: every text colour the console uses, on every
 // surface it sits on, in light and dark, read from tokens.css itself — so a token edit that drops
 // below WCAG AA fails here rather than in someone's eyes.
 import { describe, expect, it } from "vitest";

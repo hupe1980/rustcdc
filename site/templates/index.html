@@ -278,12 +278,43 @@
       </article>
 
       <article class="feature">
+        <h3>A console that names the owner</h3>
+        <p>
+          The server serves an operator console at <code>/ui</code>. When the pipeline stalls,
+          it says who can fix it — the source, the destination or rustcdc — and whether a
+          restart would help. It also starts, pauses and stops incremental snapshots. It is a
+          client of the admin API and holds no privilege of its own.
+        </p>
+        <a href="{{ get_url(path='/docs/console/') }}">Console →</a>
+      </article>
+
+      <article class="feature">
         <h3>Observability that resolves</h3>
         <p>
           Prometheus and OTLP, and a health verdict with a stable stall cause that tells a quiet
           database from a dead socket. Shipped alert rules are tested against real metric names.
         </p>
         <a href="{{ get_url(path='/docs/runbook/') }}#1-first-response">Health verdict →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Throughput you can reproduce</h3>
+        <p>
+          About 24 000 rows/s from PostgreSQL through the release binary to Kafka, under either
+          delivery contract, with default settings on one laptop. One table and one partition;
+          <code>cargo xtask pipeline-bench</code> measures it on your machine.
+        </p>
+        <a href="{{ get_url(path='/docs/performance/') }}">Performance →</a>
+      </article>
+
+      <article class="feature">
+        <h3>Tested on every supported release</h3>
+        <p>
+          Container suites run against each PostgreSQL, MySQL LTS, MariaDB LTS and SQL Server
+          release inside its vendor's support window; the full suites run on the newest.
+          <code>cargo xtask support-window</code> names what to add or drop when the vendors move.
+        </p>
+        <a href="{{ get_url(path='/docs/supported-versions/') }}">Supported versions →</a>
       </article>
 
       <article class="feature">

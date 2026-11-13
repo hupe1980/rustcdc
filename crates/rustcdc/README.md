@@ -375,7 +375,7 @@ the transform and codec paths, not a throughput claim. One is not:
 cargo xtask bench -p rustcdc --bench runtime_throughput
 ```
 
-`throughput` drives the **whole runtime** — poll, idempotency guard, transforms, sink, ack
+`runtime_throughput` drives the **whole runtime** — poll, idempotency guard, transforms, sink, ack
 token, commit barrier, durable checkpoint — over a synthetic source, and reports events per
 second. Database I/O is excluded on purpose: the number is what the library costs on top of
 whatever your server and sink cost, and a figure measured against a container on a laptop

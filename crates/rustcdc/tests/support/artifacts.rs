@@ -1,9 +1,8 @@
 //! Where cargo puts the binaries a test runs and the files it writes, in every build layout.
 //!
-//! Cargo 1.100 moved test executables under `<target>/<profile>/build/<pkg>/<hash>/out/`, so the
-//! profile directory can no longer be found by walking up from `current_exe()`. `CARGO_TARGET_TMPDIR`
-//! is set for every integration test and is `<target>/tmp` in both layouts; final binaries and
-//! examples stay in `<target>/<profile>/`.
+//! From Cargo 1.100, test executables live under `<target>/<profile>/build/<pkg>/<hash>/out/`, so
+//! walking up from `current_exe()` does not find the profile directory. `CARGO_TARGET_TMPDIR` is
+//! `<target>/tmp` in both layouts; final binaries and examples are in `<target>/<profile>/`.
 #![allow(dead_code)]
 
 use std::path::PathBuf;

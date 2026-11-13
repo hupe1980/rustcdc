@@ -5,101 +5,103 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
-## Unreleased
+## 0.21.0
 
-### Added: `cargo xtask pipeline-bench`, and the pipeline is five times faster
-
-`cargo xtask pipeline-bench` measures rows per second and latency from a real PostgreSQL, through
-the release binary built as the image builds it, to a real Apache Kafka, under both delivery
-contracts, plus when one large transaction's rows reach the topic relative to its commit. It
-fails when any row never arrives. It is a local command; [Performance](site/content/docs/performance.md)
-publishes the measured card.
-
-Its first run found the PostgreSQL stream sleeping `stream_poll_interval_ms` after every poll that
-returned rows of a transaction still open, a sleep meant only for a slot with nothing to read.
-Every transaction larger than one poll paid it once per poll. The source now reads on.
-
-- Default settings, same machine: **4 300 → 23 800 rows/s**; the first row of a 100 000-row
-  `UPDATE` reaches the topic **0.8 s** after its commit instead of 21.9 s.
-- `runtime_throughput` (formerly `benches/throughput.rs`) joins the benchmark gate. Joining it
-  was not enough: the gate counts only its critical groups, and a planted 300 µs per commit
-  (+735 %) passed. `runtime_end_to_end/in_memory_checkpoint` is now critical
-  (`file_checkpoint` is fsync-bound, with more run-to-run spread than the threshold), and the gate
-  fails when a gated bench has no critical benchmark.
-- The `kafka_topic` state backend does not start against Redpanda, which does not report
-  `min.insync.replicas`; [Configuration](site/content/docs/configuration.md) says so.
-- *Evidence*: `a_transaction_spanning_polls_is_read_without_the_idle_sleep` takes the full
-  interval without the fix; the gate fails 3 of 3 runs on the planted slowdown and passes
-  unplanted; the pipeline bench fails on a planted missing row.
-
-### Fixed: `effectively_once` with one Kafka sink halted on its first batch
-
-Since 0.15.0, a configuration with a single transactional Kafka sink and no `[[routes]]` never
-opened a Kafka transaction: the table router reported a checkpoint barrier only when it had at least
-one route, and a one-sink configuration has none, only a default. The first record then reached a
-producer with no open transaction, krafka refused it, and the pipeline stopped with
-`illegal state: cannot send in transaction state Ready`. Nothing was published and the checkpoint
-did not move, so no data was lost or duplicated, but the contract could not run in its documented
-shape. The router now counts its default sink.
-
-- *Evidence*: `a_router_with_only_a_default_sink_carries_its_barrier` fails without the fix, and so
-  does the new `cargo xtask pipeline-bench`, which runs the release binary under `effectively_once`
-  against Apache Kafka. Each layer had been tested alone (the sink's barrier against a fake broker,
-  the delivery contracts through file and HTTP sinks), never composed.
+An operator console, a pipeline five times faster on large transactions, `effectively_once` working
+with a single Kafka sink, and a test matrix that follows the vendor support windows. No breaking
+API changes; see *Upgrading* for the three things that behave differently.
 
 ### Added: an operator console at `/ui`
 
-`rustcdc run` serves a console on the admin listener — on by default, `[admin.ui] enabled = false`
-turns it off. **Health** says in one sentence whether the pipeline is working and, when it is not,
-who can fix it (the source, the destination or rustcdc), what to do and whether a restart helps,
-with the stalled hop lit on a source → rustcdc → destination strip and the browser tab as a status
-light. **Snapshots** starts, pauses, resumes and stops incremental snapshots and follows each signal
-to its real outcome. **Activity** is the live notification stream and audit trail; **Shapes** looks
-up a row shape by id. Every action shows its `curl`. It is a client of the admin API with the
-existing tokens, kept in the tab's session storage, under its own CSP. See
-[Console](site/content/docs/console.md).
+`rustcdc run` serves a console on the admin listener. **Health** says in one sentence whether the
+pipeline is working and, when it is not, who can fix it (the source, the destination or rustcdc),
+what to do and whether a restart helps; the browser tab is the status light. **Snapshots** starts,
+pauses, resumes and stops incremental snapshots, with an optional SQL row filter per table, and
+follows each signal to its real outcome. **Activity** is the live notification stream and audit
+trail; **Shapes** looks up a row shape by id. Every action shows its `curl` and carries its own
+`signal_id`, so a retry cannot run it twice. It is a client of the admin API with the existing
+tokens, kept in the tab's session storage. See [Console](site/content/docs/console.md).
 
 - **`/status` says who can fix a stall**: `health.owner` (`source`, `destination`, `rustcdc`) and
-  `health.restart_helps`, from `StallCause::owner()` and `StallCause::restart_helps()` in the library,
-  which `/livez` now decides through too. The OpenAPI document describes `health`.
-- **Every signal from the console**: the four snapshot controls, with an optional SQL row filter per
-  table, and markers (`log_marker`) from Activity. Each carries its own `signal_id`, so a retry
-  cannot run it twice, and each is followed to what happened — a snapshot is "complete" when its
-  tables are read, not when the request was queued.
-- **Admin API responses carry `Content-Security-Policy: default-src 'none'`.**
-- **The OpenAPI `Notification` schema describes what `/notifications` sends** (`action_type`,
-  `state`, `at`, `detail`, inside `{ notifications: [...] }`); it described fields the server never
-  sent. A test now holds the schema to the serialised struct.
-- `cargo xtask console` builds it (Node 24), `cargo xtask console-dev` serves it with live reload.
-  A server built without the bundle serves a page saying how to build it; release builds and the
-  image refuse to build without it.
+  `health.restart_helps`, from `StallCause::owner()` and `StallCause::restart_helps()` in the
+  library, which `/livez` decides through too.
+- **Admin API responses carry `Content-Security-Policy: default-src 'none'`**; the console has its
+  own.
+- **The OpenAPI document describes `health`, and its `Notification` schema matches what
+  `/notifications` sends.** It described fields the server never sent.
+- `cargo xtask console` builds the bundle (Node 24), `cargo xtask console-dev` serves it with live
+  reload. Release builds and the image refuse to build without it.
+
+### Fixed: `effectively_once` with one Kafka sink halted on its first batch
+
+Since 0.15.0, a single transactional Kafka sink with no `[[routes]]` never opened a Kafka
+transaction: the table router reported a checkpoint barrier only when it had a route, and a
+one-sink configuration has only a default. The pipeline stopped on its first record with
+`illegal state: cannot send in transaction state Ready`. Nothing was published and the checkpoint
+did not move, so nothing was lost or duplicated. The router now counts its default sink.
+
+### Changed: the PostgreSQL stream reads on through an open transaction
+
+The stream slept `stream_poll_interval_ms` after every poll that returned rows of a transaction
+not yet committed, a sleep meant only for an idle slot. Every transaction larger than one poll
+paid it once per poll. On the same machine with default settings, the pipeline goes from
+**4 300 to 23 800 rows/s**, and the first row of a 100 000-row `UPDATE` reaches Kafka **0.8 s**
+after its commit instead of 21.9 s.
+
+### Added: `cargo xtask pipeline-bench`
+
+Measures rows per second and latency from a real PostgreSQL, through the release binary built as
+the image builds it, to a real Apache Kafka, under both delivery contracts, and when one large
+transaction's rows arrive relative to its commit. It fails when any row never arrives.
+[Performance](site/content/docs/performance.md) publishes the card.
+
+- `benches/throughput.rs` is now `runtime_throughput` and joins the 5 % benchmark gate, with
+  `runtime_end_to_end/in_memory_checkpoint` as a critical benchmark. The gate fails when a gated
+  bench has no critical benchmark, which is how a planted +735 % slowdown had passed it.
 
 ### Changed: the tested database matrix follows the vendor support windows
 
-Container suites now run against every vendor-supported release, with the full suites on the
-newest: PostgreSQL 15, 16, 17, **18**; MySQL 8.4, **9.7** (LTS); MariaDB 10.11, 11.4, 11.8,
-**12.3** (LTS); SQL Server 2017, 2019, 2022, **2025**. Previously PostgreSQL 12 and 14, MySQL 8.0
-and MariaDB 10.5 and 10.6 — all past vendor EOL — were tested, and PostgreSQL 17, MySQL 9.7,
-MariaDB 11.x/12.3 and SQL Server 2017 were not. No connector change was needed.
+Container suites run against every vendor-supported release, the full suites on the newest:
+PostgreSQL 15, 16, 17, **18**; MySQL 8.4, **9.7** (LTS); MariaDB 10.11, 11.4, 11.8, **12.3** (LTS);
+SQL Server 2017, 2019, 2022, **2025**. PostgreSQL 12 and 14, MySQL 8.0 and MariaDB 10.5 and 10.6,
+all past vendor end of life, are no longer tested. No connector change was needed.
 
-- **One place names the versions**: `crates/rustcdc/tests/support/matrix.txt`, read by every
-  suite, the CI pre-pull and the workflows. `RUSTCDC_TEST_POSTGRES=17-alpine` (and the same per
-  engine) runs any suite against another release without an edit.
-- **`cargo xtask support-window`** compares the matrix with the vendor windows and names what to
-  add, drop or promote; it fails closed when it cannot check.
-- **[Supported versions](site/content/docs/supported-versions.md)** is the one published page for
-  versions; the others link to it. The policy gate holds it, and the examples, to the matrix.
-- The examples and the demo run PostgreSQL 18; the demo's volume moves to `/var/lib/postgresql`,
-  where the 18 image keeps its data.
+- `crates/rustcdc/tests/support/matrix.txt` names the versions for every suite, the CI pre-pull
+  and the workflows. `RUSTCDC_TEST_POSTGRES=17-alpine` (and the same per engine) runs a suite
+  against another release.
+- `cargo xtask support-window` compares the matrix with the vendor windows and names what to add,
+  drop or promote; it fails closed when it cannot check.
+- [Supported versions](site/content/docs/supported-versions.md) is the one page for versions. The
+  policy gate holds it, and the examples, to the matrix.
+
+### Upgrading
+
+- **The console is on by default** on the admin listener. It can do what the admin API's tokens
+  allow and nothing more; `[admin.ui] enabled = false` turns it off.
+- **The demo runs PostgreSQL 18**, whose image keeps its data in `/var/lib/postgresql`; the demo's
+  volume moves there. Recreate an existing demo volume.
+- **`effectively_once` with a `kafka_topic` state backend does not start on Redpanda**, which does
+  not report `min.insync.replicas`. It never could; [Configuration](site/content/docs/configuration.md)
+  now says so.
 
 ### Evidence
 
+Library 1 273 and server 594 unit tests. Each fix has a test that fails without it:
+`a_router_with_only_a_default_sink_carries_its_barrier`, and
+`a_transaction_spanning_polls_is_read_without_the_idle_sleep`, which takes the full poll interval
+without the fix. `cargo xtask pipeline-bench` runs the release binary under `effectively_once`
+against Apache Kafka and fails on the router defect and on a planted missing row; the router defect
+shipped because the sink's barrier and the delivery contracts were each tested alone, never
+composed. The benchmark gate fails 3 of 3 runs on a planted slowdown and passes without it.
+
+The console's tests run axe on every place and sheet, check contrast from the tokens, click
+budgets, keyboard reachability, idempotent retry and honest completion; Rust tests hold its
+wording, runbook anchors and the OpenAPI schema to the library. Each was planted.
+
 Every relational container suite and the server's PostgreSQL, MySQL and Kafka suites ran on the
-new matrix. `support_window` unit tests fail against each rule planted out (add, drop, promote,
-LTS filter, empty answer, SQL Server label); the policy gate fails on a planted version literal in
-a suite and in the workflow, a release missing from the page, and an old PostgreSQL in an example
-and in the demo. The PostgreSQL version-matrix suite no longer passes when an image cannot be
-pulled.
+new matrix. `support_window` unit tests fail against each rule planted out; the policy gate fails
+on a planted version literal in a suite and in the workflow, a release missing from the page, and
+an old PostgreSQL in an example and in the demo.
 
 ## 0.20.1
 

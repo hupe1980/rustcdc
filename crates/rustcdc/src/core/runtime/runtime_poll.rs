@@ -1058,9 +1058,7 @@ impl CdcRuntime {
             self.observability()
                 .metrics
                 .record_event_processed(event.op, latency_ms);
-            // FR-3: Structured per-event trace including tx_id and WAL offset.
-            // At tracing::trace level so production deployments are not flooded;
-            // operators can enable it per-target for deep debugging.
+            // Trace level so production is not flooded; enable it per-target to debug.
             tracing::trace!(
                 target: "rustcdc::core::runtime",
                 table = %event.table,

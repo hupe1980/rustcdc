@@ -27,7 +27,7 @@ resolver = "2"
 # and are tested only against each other, so a split version line would encode a
 # compatibility question that does not exist.
 [workspace.package]
-version = "0.20.1"
+version = "0.21.0"
 edition = "2024"
 # `wasmtime` 50 sets this floor; krafka 0.29 and iceberg 0.11 are the next constraint at
 # 1.95. Declaring a lower number would hand anyone a resolver error instead of a documented
@@ -50,7 +50,7 @@ homepage = "https://hupe1980.github.io/rustcdc"
 # two copies of the same crate. A member narrows what it takes with
 # `default-features = false` and adds the features it needs; it cannot pick its own version.
 [workspace.dependencies]
-rustcdc = { path = "crates/rustcdc", version = "0.20.1", default-features = false }
+rustcdc = { path = "crates/rustcdc", version = "0.21.0", default-features = false }
 
 base64 = "0.23"
 bytes = "1"

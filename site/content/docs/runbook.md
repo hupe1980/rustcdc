@@ -468,13 +468,10 @@ Confirm success: `rustcdc_slo_checkpoint_age_seconds` returns to baseline and
 Roll the image tag back and restart. Safe **as long as the state format did not
 change** — checkpoints are forward-compatible within a format version, not backward.
 
-The asymmetry is deliberate and worth understanding: a new build reading old state fills in
-absent fields with documented defaults, and CI proves it does. An *old* build reading new
-state has no such rule — it sees fields it was never taught, and depending on the struct it
-either ignores them (losing whatever they recorded) or refuses the file. A concrete example
-from 0.12: snapshot state gained `stopped`. Roll back to a build that predates it and a
-backfill an operator deliberately stopped starts again from row zero on the next restart,
-because the field carrying that decision is one the old build cannot see.
+A new build reading old state fills absent fields with documented defaults, and CI proves
+it does. An *old* build reading new state sees fields it was never taught and either ignores
+them, losing what they recorded, or refuses the file. For example, an old build that cannot
+see snapshot state's `stopped` field restarts a deliberately stopped backfill from row zero.
 
 If the release notes flagged a state-format change, rolling back requires the state as
 it was *before* the upgrade:

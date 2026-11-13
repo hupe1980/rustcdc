@@ -263,7 +263,7 @@ mode = "plaintext"
    ```
 4. In `cdc.toml`, use the RDS endpoint as `source.host`.
 
-> GTID is available on RDS MySQL 5.7.23+ and 8.0. Enable it via the parameter
+> Enable GTID on RDS MySQL via the parameter
 > group (`gtid_mode = ON`, `enforce_gtid_consistency = ON`).
 
 ### Amazon Aurora MySQL

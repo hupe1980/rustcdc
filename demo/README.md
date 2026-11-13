@@ -42,7 +42,7 @@ Updates carry a **full `before` image** because `init.sql` sets
 `REPLICA IDENTITY FULL` on the demo tables. Events with partial payloads
 (PostgreSQL unchanged-TOAST) would additionally list the missing columns in
 `unavailable_columns` / `before_unavailable_columns` — see
-[Core concepts](https://hupe1980.github.io/rustcdc-server/docs/concepts/#partial-row-images-unchanged-toast).
+[Core concepts](https://hupe1980.github.io/rustcdc/docs/concepts/#partial-row-images-unchanged-toast).
 
 ## Inspect the admin API
 
@@ -100,9 +100,9 @@ docker compose down -v
 | Goal | How |
 |---|---|
 | Stream to Kafka | Replace `[sink]` in `cdc.toml` with `type = "kafka"` and add a [Redpanda](https://hub.docker.com/r/redpandadata/redpanda) service to `compose.yml` |
-| Encode as Avro / Protobuf against a registry | Add `[sink.codec]` with `type = "avro_confluent"` and a `[registries.<name>]` block — see [the configuration reference](https://hupe1980.github.io/rustcdc-server/docs/configuration/#codecs-sink-codec) |
-| Tune or extend the masking rules | The `redact_customer_pii` rule in `cdc.toml`; all rule types are in [the configuration reference](https://hupe1980.github.io/rustcdc-server/docs/configuration/#mask-redact-hash-or-encrypt-fields) |
-| Add a WASM transform | See [the WASM transforms guide](https://hupe1980.github.io/rustcdc-server/docs/transforms/) |
-| Use MySQL instead of PostgreSQL | See [the MySQL connector guide](https://hupe1980.github.io/rustcdc-server/docs/connectors/mysql/) |
-| Deploy to Kubernetes | See [the operations guide](https://hupe1980.github.io/rustcdc-server/docs/operations/#11-kubernetes-deployment) |
-| All configuration options | See [the configuration reference](https://hupe1980.github.io/rustcdc-server/docs/configuration/) |
+| Encode as Avro / Protobuf against a registry | Add `[sink.codec]` with `type = "avro_confluent"` and a `[registries.<name>]` block — see [the configuration reference](https://hupe1980.github.io/rustcdc/docs/configuration/#codecs-sink-codec) |
+| Tune or extend the masking rules | The `redact_customer_pii` rule in `cdc.toml`; all rule types are in [the configuration reference](https://hupe1980.github.io/rustcdc/docs/configuration/#mask-redact-hash-or-encrypt-fields) |
+| Add a WASM transform | See [the WASM transforms guide](https://hupe1980.github.io/rustcdc/docs/transforms/) |
+| Use MySQL instead of PostgreSQL | See [the MySQL connector guide](https://hupe1980.github.io/rustcdc/docs/connectors/mysql/) |
+| Deploy to Kubernetes | See [the operations guide](https://hupe1980.github.io/rustcdc/docs/operations/#11-kubernetes-deployment) |
+| All configuration options | See [the configuration reference](https://hupe1980.github.io/rustcdc/docs/configuration/) |

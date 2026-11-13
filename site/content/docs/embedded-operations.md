@@ -4,9 +4,7 @@ description = "Alert thresholds, disaster recovery, secret rotation and per-conn
 weight = 100
 +++
 
-**Audience:** Platform operators and SREs managing rustcdc in production  
-**Version:** Current  
-**Last Updated:** May 25, 2026
+**Audience:** Platform operators and SREs managing rustcdc in production
 
 ---
 
@@ -1072,15 +1070,8 @@ the stream position, which is the worse trade.
 
 ---
 
-## Contacts and Escalation
+## Escalation
 
-| Role | Contact | Escalation |
-|------|---------|-----------|
-| On-Call SRE | Page via PagerDuty | Escalate to Platform Lead if unresolved in 30 min |
-| Database Admin | Slack #dba-oncall | Create incident ticket if source DB issue confirmed |
-| CDC Maintainer | GitHub Issues or #rustcdc Slack | Create critical incident if data loss risk detected |
-
----
-
-**Last Updated:** May 25, 2026  
-**Version:** Current Runbook
+A defect in rustcdc itself, above all any risk of data loss, goes to
+[GitHub issues](https://github.com/hupe1980/rustcdc/issues) with the `/status` output and the
+log around the first error.

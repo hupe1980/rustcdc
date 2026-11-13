@@ -1,5 +1,5 @@
 // The real App, mounted in happy-dom with the admin API stubbed: axe on every place and sheet, the
-// click budgets of SC-001, and that everything a pointer can do a keyboard can reach. Contrast needs
+// click budgets, and that everything a pointer can do a keyboard can reach. Contrast needs
 // layout, which happy-dom has not got; contrast.test.ts checks it from the tokens instead.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushSync, mount, unmount } from "svelte";
@@ -140,7 +140,7 @@ describe("accessibility (axe, every place and sheet)", () => {
   });
 });
 
-describe("click budgets (SC-001)", () => {
+describe("click budgets", () => {
   it("the verdict, its owner and the remedy need no click", async () => {
     health = { verdict: "stalled", stall_cause: "delivery_failing", stalled_for_seconds: 90, owner: "destination", restart_helps: false };
     await start(true);

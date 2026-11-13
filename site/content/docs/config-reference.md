@@ -4,7 +4,6 @@ description = "Every rustcdc runtime and connector option, with the failure each
 weight = 40
 +++
 
-**Version:** v0.1+  
 **Audience:** Platform engineers and application developers embedding rustcdc
 
 ---
@@ -146,7 +145,7 @@ Prefer the associated constructors when selecting a source in embedder code:
 
 ## Runtime Consumption Model
 
-The preferred embedder surface is now batch-oriented rather than count-oriented.
+The embedder surface is batch-oriented.
 
 `poll_event_batch()` returns an `EventBatch` containing the delivered events plus an `AckMode`. Re-polling before acknowledgement redelivers the same in-flight batch, which keeps retry behavior loss-safe.
 
@@ -195,7 +194,7 @@ while let Some(batch) = batches.next().await {
 # }
 ```
 
-`poll_event_batch()` + `commit_ack(batch.ack_mode())` is now the canonical runtime acknowledgement API.
+`poll_event_batch()` + `commit_ack(batch.ack_mode())` is the canonical runtime acknowledgement API.
 
 ## On-demand snapshots
 
@@ -389,7 +388,7 @@ transaction boundaries — are treated as their own boundary and are never trimm
 
 ## Connector Capabilities
 
-Runtime source selection now exposes explicit connector capabilities through `ConnectorCapabilities`.
+Runtime source selection exposes explicit connector capabilities through `ConnectorCapabilities`.
 
 ```rust
 use rustcdc::{ConnectorCapabilities, RuntimeSourceConfig};
@@ -417,7 +416,7 @@ For configured PostgreSQL/MySQL/MariaDB/SQL Server sources, the runtime advertis
 `snapshot=true`, `handoff=true`, `ddl_capture=true`, `heartbeat=true`, and
 `schema_introspection=true`.
 
-The runtime now also provides an embeddable admin/introspection surface that includes
+The runtime also provides an embeddable admin/introspection surface that includes
 capabilities, readiness/liveness, buffer depth, and delivery counters.
 
 ```rust
@@ -456,8 +455,8 @@ key, so a pattern that selects an event also routes it.
 > identifier rules are defined in terms of.
 >
 > The consequence worth knowing: on a case-sensitive MySQL (`lower_case_table_names = 0`), two
-> tables differing only in case cannot be told apart by a pattern. That was already true of the
-> include and exclude lists; it is now also true of routing.
+> tables differing only in case cannot be told apart by a pattern — in the include and exclude
+> lists or in routing.
 
 | Pattern | Matches |
 |---|---|
@@ -683,7 +682,7 @@ mismatch is loud instead of a silent misreading of transaction boundaries.
 
 ### Secret Loading Patterns
 
-Connector passwords are now modeled as `SecretString`, not raw `String` values.
+Connector passwords are `SecretString`, not `String`.
 
 ```rust
 use rustcdc::{SecretProvider, SecretString};
@@ -1039,8 +1038,7 @@ transactions, rather than letting the server fail with a generic *"could not fin
 file"* that says nothing about how much was lost.
 
 Set `binlog_expire_logs_seconds` so retention comfortably exceeds your maximum expected
-connector downtime. (Note `expire_logs_days` was **removed** in MySQL 8.4 — using it now
-raises an error at startup.)
+connector downtime. MySQL 8.4 and later reject `expire_logs_days` at startup.
 
 > The subset direction matters and is easy to invert. The correct test is "everything the
 > server purged, I already consumed". The intuitive inverse — "my position is a subset of
@@ -1066,8 +1064,8 @@ raises an error at startup.)
 | `max_events_per_poll` | `usize` | 1 000 | Range 1–100 000. |
 | `handoff_overlap_drain_budget_ms` | `u64` | `stream_poll_interval_ms * 8` | Wall-clock budget for draining overlap events during snapshot-to-stream handoff. `0` disables the budget (unlimited drain). |
 
-**Why `server_id` has no auto-generated default.** Auto-generation was removed because
-PID-hash collisions caused silent event loss in multi-instance deployments: two readers
+**Why `server_id` has no auto-generated default.** A generated id can collide across
+instances, and a collision loses events silently: two readers
 sharing a `server_id` cause the server to evict one, and the eviction surfaces only as a
 generic disconnect. A deliberately invalid default forces the decision to be made once,
 explicitly.
@@ -1611,7 +1609,7 @@ let transport = TransportConfig::tls_insecure_skip_verify();
 let transport = TransportConfig::plaintext();
 ```
 
-Connector config helpers now provide explicit transport selection APIs:
+Connector config helpers provide explicit transport selection APIs:
 
 ```rust,ignore
 // Requires the mysql, postgres and sqlserver features together.
@@ -1632,7 +1630,3 @@ let mysql_tls = mysql_cfg.with_tls_transport();
 - [ ] Dashboard: Event processing rate (events/sec)
 - [ ] Dashboard: Checkpoint commit latency distribution
 
----
-
-**Last Updated:** May 25, 2026  
-**Version:** Configuration Reference v0.1+

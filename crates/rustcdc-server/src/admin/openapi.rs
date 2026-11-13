@@ -668,9 +668,8 @@ mod tests {
         assert_eq!(documented_owners, owners);
     }
 
-    /// The documented notification is the serialised one: the schema once described fields
-    /// (`action`, `result`, `timestamp`) the server never sent, and a client built from it read
-    /// nothing.
+    /// The documented notification is the serialised one: a field the schema names but the
+    /// server never sends is one a generated client reads as absent.
     #[test]
     fn the_documented_notification_is_what_the_server_sends() {
         let doc = document(TEST_VERSION);

@@ -25,8 +25,8 @@ for months, not years, and are not tested.
 - **PostgreSQL** before 15, **MySQL** 8.0 and **MariaDB** before 10.11 are out of vendor support.
   rustcdc does not refuse them, and does not test them.
 - **SQL Server** 2016 is accepted at startup and not tested; 2014 and earlier are refused.
-- **PostgreSQL 19** joins when it is released: the window check fails until it is tested, and it
-  becomes the full-suite version.
+- **A newer major** than the table lists is untested. When a vendor releases one, the window
+  check fails until it is added, and the newest tested release runs the full suites.
 
 ## How this stays current
 
