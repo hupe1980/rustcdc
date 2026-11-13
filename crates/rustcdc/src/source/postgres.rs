@@ -742,7 +742,7 @@ pub struct PostgresSourceConfig {
     #[serde(default = "PostgresSourceConfig::default_stream_in_progress_transactions")]
     pub stream_in_progress_transactions: bool,
     /// Bytes of streamed, not yet committed transactions held in memory. A transaction that
-    /// would cross it moves to an anonymous file in `stream_spill_directory`.
+    /// would cross it moves to a temporary file in `stream_spill_directory`.
     ///
     /// Default: 64 MiB, PostgreSQL's default `logical_decoding_work_mem`.
     #[serde(default = "PostgresSourceConfig::default_stream_buffer_memory_bytes")]

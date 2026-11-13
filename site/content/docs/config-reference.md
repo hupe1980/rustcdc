@@ -661,7 +661,7 @@ needs `SqlPeek`.
 On PostgreSQL 14+ under `StreamingReplication`, the connector negotiates pgoutput
 **`proto_version '2'`** with `streaming 'on'`: a transaction past the server's
 `logical_decoding_work_mem` (default **64 MB**) is streamed while it runs and held by the
-connector — in memory up to `stream_buffer_memory_bytes`, then in an anonymous file under
+connector — in memory up to `stream_buffer_memory_bytes`, then in a temporary file under
 `stream_spill_directory` — until it commits. Rows are released only at the commit and dropped on
 abort, so a sink receives the same events either way. Details:
 [Large transactions](@/docs/connectors/postgres.md#large-transactions).

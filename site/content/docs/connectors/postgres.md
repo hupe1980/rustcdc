@@ -179,8 +179,8 @@ the checkpoint never moves for a transaction that has not committed.
 
 **Where it is held.** In memory up to `stream_buffer_memory_bytes` (64 MiB) across open
 transactions; a transaction that would cross that moves to a file in `stream_spill_directory`
-(the system temporary directory by default). Spill files are anonymous — deleted on creation
-— so a crash leaves nothing behind, and the slot streams the transaction again after a
+(the system temporary directory by default). The operating system deletes a spill file
+when it is closed, so a crash leaves nothing behind, and the slot streams the transaction again after a
 restart. The directory is checked writable when the stream opens; under a read-only root
 filesystem, mount an `emptyDir` and point `stream_spill_directory` at it. A full disk stops the
 pipeline with the I/O error; nothing is dropped.

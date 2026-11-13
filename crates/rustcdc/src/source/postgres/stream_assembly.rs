@@ -396,7 +396,7 @@ impl Default for Store {
     }
 }
 
-/// Move held bytes to an anonymous file: unlinked at creation, so any exit reclaims it.
+/// Move held bytes to a temporary file the OS deletes when it closes, on any exit.
 fn spill(directory: &std::path::Path, held: &[u8]) -> std::io::Result<Store> {
     let mut writer = BufWriter::new(tempfile::tempfile_in(directory)?);
     writer.write_all(held)?;
@@ -759,15 +759,18 @@ mod tests {
         let totals = assembler.totals();
         assert_eq!((totals.open, totals.memory_bytes), (1, 0));
         assert!(totals.spilled_bytes > 0);
-        assert_eq!(
-            std::fs::read_dir(directory.path()).unwrap().count(),
-            0,
-            "a spill file is anonymous: nothing to clean up after a crash"
-        );
+        // Unix unlinks the file at creation; Windows deletes it when its handle closes.
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 
         let out = assembler.feed(vec![stream_commit(TOP)]).unwrap();
         let expected: Vec<String> = (0..20).map(|i| format!("row {i}")).collect();
         assert_eq!(committed_values(out), vec![(TOP, expected)]);
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "a released spill file leaves nothing to clean up"
+        );
     }
 
     #[test]

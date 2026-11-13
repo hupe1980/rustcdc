@@ -17,7 +17,7 @@ snapshots work again; CI runs `effectively_once` end to end. **Breaking** for co
 On PostgreSQL 14+ the connector negotiates pgoutput v2 with `streaming 'on'`. A transaction past
 `logical_decoding_work_mem` is sent while it runs instead of being spilled to the **primary's**
 disk until its commit. rustcdc holds it — in memory up to `stream_buffer_memory_bytes`, then in
-an anonymous spill file — and releases it at the commit, so a sink receives exactly what it
+a spill file the OS deletes on close — and releases it at the commit, so a sink receives exactly what it
 received before. A rollback drops it; `ROLLBACK TO SAVEPOINT` drops that savepoint's rows. Debezium,
 Materialize, PeerDB, Supabase etl and Sequin all negotiate v1.
 
