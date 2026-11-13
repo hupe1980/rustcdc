@@ -39,8 +39,8 @@ it requires.
 
 Core connector and runtime paths are validated by unit tests, documentation samples compiled
 as doctests, deterministic-replay golden fixtures and container-backed integration suites
-against real PostgreSQL 12/14/15/16, MySQL 8.0/8.4, MariaDB 10.5/10.6/10.11, SQL Server
-2019/2022/2025 and Apicurio Registry 3.0.6.
+against every vendor-supported PostgreSQL, MySQL LTS, MariaDB LTS and SQL Server release —
+see [Supported versions](https://hupe1980.github.io/rustcdc/docs/supported-versions/) — and Apicurio Registry 3.0.6.
 
 The Snowflake source is the one connector with **no container-backed evidence** — Snowflake
 has no self-hostable implementation. Its semantics are unit-tested through a scripted
@@ -372,10 +372,10 @@ Most benchmarks are in-process microbenchmarks with no connector I/O — a regre
 the transform and codec paths, not a throughput claim. One is not:
 
 ```bash
-cargo xtask bench -p rustcdc --bench throughput
+cargo xtask bench -p rustcdc --bench runtime_throughput
 ```
 
-`throughput` drives the **whole runtime** — poll, idempotency guard, transforms, sink, ack
+`runtime_throughput` drives the **whole runtime** — poll, idempotency guard, transforms, sink, ack
 token, commit barrier, durable checkpoint — over a synthetic source, and reports events per
 second. Database I/O is excluded on purpose: the number is what the library costs on top of
 whatever your server and sink cost, and a figure measured against a container on a laptop

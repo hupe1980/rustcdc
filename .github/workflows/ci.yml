@@ -186,9 +186,44 @@ jobs:
   # one setting that decides whether the `test-harnesses` release guard fires. Without
   # this job the only lane that would notice a bench that no longer compiles is
   # `release-evidence`, twelve minutes in, behind an apt install and a cargo-deny build.
+  # The operator console: the only job that installs Node. Every other job builds the server
+  # without the bundle and serves the page saying how to build it.
+  console:
+    name: "server: console"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/rustcdc-server/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/rustcdc-server/ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check -- --fail-on-warnings
+      - run: npm test
+      - run: npm run build
+      - name: bundle budget (150 KB of JavaScript and CSS)
+        run: |
+          size=$(cat dist/*.js dist/*.css | wc -c)
+          echo "console bundle: ${size} bytes"
+          test "$size" -le 153600
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - name: the server embeds and serves it
+        env:
+          RUSTCDC_REQUIRE_CONSOLE: "1"
+          CDC_TEST_SOURCE_PASSWORD: unused
+        run: cargo test -p rustcdc-server --test console_tests --locked
+
   # Every other clippy run is `--all-features`, where the connectors hide each other's
-  # dead code and enum sizes. A MySQL-only build failed `-D warnings` on an item only
-  # PostgreSQL and SQL Server call, and nothing here saw it until a crash worker did.
+  # dead code and enum sizes: an item only PostgreSQL calls is dead in a MySQL-only build,
+  # and the crash workers build one connector at a time.
   lib-connector-clippy:
     name: "lib: clippy (${{ matrix.features }})"
     runs-on: ubuntu-latest
@@ -287,7 +322,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres image (public ecr mirror)
-        run: bash scripts/ci-pull-relational-images.sh 16-alpine
+        run: bash scripts/ci-pull-relational-images.sh postgres full
       - name: pre-pull mysql/mariadb images
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: contract compatibility smoke
@@ -345,7 +380,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres image (public ecr mirror)
-        run: bash scripts/ci-pull-relational-images.sh 16-alpine
+        run: bash scripts/ci-pull-relational-images.sh postgres full
       - name: connector-backed latency evidence gate (p95/p99)
         run: bash scripts/ci-latency-gate.sh
 
@@ -418,14 +453,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
         run: |
-          tags="16-alpine"
-          if [[ "${{ matrix.suite }}" == "postgres_version_matrix" ]]; then
-            tags="12-alpine 14-alpine 15-alpine 16-alpine"
-          fi
-          if [[ "${{ matrix.suite }}" == "postgres_slot_invalidation_integration" ]]; then
-            tags="16-alpine 18-alpine"
-          fi
-          bash scripts/ci-pull-relational-images.sh ${tags}
+          which=full
+          case "${{ matrix.suite }}" in
+            postgres_version_matrix|postgres_slot_invalidation_integration) which=tested ;;
+          esac
+          bash scripts/ci-pull-relational-images.sh postgres "$which"
       - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration' && matrix.suite != 'example_pg_to_stdout'
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres
@@ -455,7 +487,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull postgres images (public ecr mirror)
-        run: bash scripts/ci-pull-relational-images.sh 16-alpine
+        run: bash scripts/ci-pull-relational-images.sh postgres full
       - name: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
         run: cargo test -p rustcdc --test runtime_postgres_process_crash_integration --features postgres,encryption --bins
 
@@ -641,7 +673,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
-        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-CU27-ubuntu-22.04
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft full
       - name: cargo test -p rustcdc --test ${{ matrix.suite }}
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features sqlserver
@@ -668,7 +700,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: pre-pull SQL Server image (soft — MCR downtime or retired tag skips tests, not CI)
-        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft 2022-CU27-ubuntu-22.04
+        run: bash scripts/ci-pull-relational-images.sh --sqlserver-soft full
       - name: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
         run: cargo test -p rustcdc --test runtime_sqlserver_process_crash_integration --features sqlserver,encryption --bins
 
@@ -699,7 +731,6 @@ jobs:
       BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
       BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
       CRITERION_BASELINE: ci-baseline
-      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_perf/quality_gates cdc_perf/quality_gates cdc_perf/wasm_transform"
       LATENCY_GATE_DEFAULT_P95_MS: "500"
       LATENCY_GATE_DEFAULT_P99_MS: "1000"
     steps:
@@ -787,7 +818,7 @@ jobs:
       - name: pre-pull relational images (MySQL, MariaDB)
         run: bash scripts/ci-pull-relational-images.sh --relational-smoke
       - name: pre-pull postgres images used by the version matrix
-        run: bash scripts/ci-pull-relational-images.sh 12-alpine 14-alpine 15-alpine 16-alpine
+        run: bash scripts/ci-pull-relational-images.sh postgres tested
 
       - name: full integration matrix evidence
         run: bash scripts/run_full_integration_matrix_evidence.sh
@@ -1049,6 +1080,7 @@ jobs:
       - quality
       - transport-security
       - lib-connector-clippy
+      - console
       - policy-gate
       - docs-site
       - correctness-smoke

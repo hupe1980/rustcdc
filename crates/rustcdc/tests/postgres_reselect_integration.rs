@@ -12,6 +12,9 @@
 //! inline value is *in* the WAL, so there would be no hole to fill and the test would pass
 //! vacuously.
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{Operation, PostgresConnection, PostgresSourceConfig, source::Source};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -34,7 +37,7 @@ async fn unchanged_toasted_values_are_absent_by_default_and_reselected_when_aske
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -208,7 +211,7 @@ async fn a_row_deleted_before_the_reselect_leaves_the_columns_absent() -> rustcd
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -344,7 +347,7 @@ async fn reselect_fills_more_than_fifty_holes_in_one_event() -> rustcdc::Result<
         eprintln!("skipping postgres wide reselect test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
     }
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

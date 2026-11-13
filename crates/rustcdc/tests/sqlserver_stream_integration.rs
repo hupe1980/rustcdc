@@ -110,8 +110,7 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
     }
 
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),
@@ -307,8 +306,7 @@ async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh()
     }
 
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),
@@ -466,8 +464,7 @@ async fn run_sqlserver_capture_instance_switch() -> rustcdc::Result<()> {
         return Ok(());
     }
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),

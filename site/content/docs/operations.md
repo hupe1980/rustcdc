@@ -129,6 +129,8 @@ curl -H "Authorization: Bearer $RUSTCDC_READ_TOKEN" http://localhost:8080/metric
 curl http://localhost:8080/openapi.json
 ```
 
+The same answers are in the browser at `/ui` — see [Console](@/docs/console.md).
+
 > [!NOTE]
 > **Every runtime metric carries a `source_type` label** — `postgres`, `mysql`,
 > `sqlserver` and so on. PromQL label matchers select a subset, so existing rules such as
@@ -1049,7 +1051,7 @@ spec:
 > For production, prefer `kafka_topic` or `postgres` state backends over
 > `local_fs` so the state survives pod rescheduling without a PVC.
 >
-> **Whichever you choose, `strategy: Recreate` above is mandatory.** *Every* backend now
+> **Whichever you choose, `strategy: Recreate` above is mandatory.** *Every* backend
 > holds an owner lease that refuses a second concurrent writer, and a rolling update would
 > make the new pod fail its lease acquisition and crash-loop until the old pod exits —
 > which, with `maxUnavailable: 0`, it never does.

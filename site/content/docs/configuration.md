@@ -1174,7 +1174,13 @@ durability_profile = "production"     # production | development
 # protocol = "tls"                     # plaintext | tls
 ```
 
-Seed the topic once before first start: `rustcdc init-state --config-file cdc.toml`.
+Create the topic before first start with `cleanup.policy=compact` and an explicit
+`min.insync.replicas`, then seed it once: `rustcdc init-state --config-file cdc.toml`. rustcdc
+does not create it, and refuses one whose configuration it cannot verify.
+
+> **Not on Redpanda.** The backend reads `min.insync.replicas` back from the broker to verify
+> durability, and Redpanda does not report it, so this backend, and with it `effectively_once`
+> with a Kafka sink, does not start against Redpanda. Apache Kafka is tested.
 
 ### PostgreSQL
 
@@ -1794,6 +1800,11 @@ write_token_env = "RUSTCDC_WRITE_TOKEN"   # env var containing the write token
 # Write-capable signaling requires a durable notification channel
 notification_log_file = "/var/lib/rustcdc/admin-notifications.jsonl"
 
+# The operator console at /ui (default: on). It grants nothing: every request it
+# makes needs the tokens above, like any other client's.
+[admin.ui]
+enabled = true
+
 # TLS
 [admin.tls]
 cert_file           = "/etc/rustcdc/tls/server.pem"
@@ -1865,6 +1876,7 @@ cheap to refuse. A `429` therefore does not imply your credentials are wrong.
 | `GET` | `/notifications` | read | Recent CloudEvents notification log |
 | `GET` | `/notifications/stream` | read | Server-sent events stream (long-lived) |
 | `GET` | `/schemas/{id}` | read | A row shape this process delivered since it started; 404 when unknown, 400 for an id that is not 64 lowercase hex |
+| `GET` | `/ui` | none (its requests need the tokens) | The [operator console](@/docs/console.md); `admin.ui.enabled = false` removes it |
 
 #### `/config`
 

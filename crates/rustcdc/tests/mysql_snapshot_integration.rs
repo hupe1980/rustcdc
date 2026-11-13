@@ -1,5 +1,8 @@
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     MysqlConnection, MysqlSourceConfig, TransportConfig,
     checkpoint::{Checkpoint, FileCheckpoint},
@@ -88,7 +91,7 @@ async fn mysql_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -283,7 +286,7 @@ async fn mysql_snapshot_resumption_from_checkpoint() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -457,7 +460,7 @@ async fn mysql_snapshot_empty_table() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -551,7 +554,7 @@ async fn mysql_incremental_snapshot_rows_carry_the_shape() -> rustcdc::Result<()
         eprintln!("skipping mysql incremental shape test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
     }
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")

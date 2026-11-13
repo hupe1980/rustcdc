@@ -253,6 +253,7 @@ pub(super) async fn status_reports_the_verdict_and_its_cause() {
         "a non-stalled verdict has no cause: {health:#}",
     );
     assert!(health["stalled_for_seconds"].is_null());
+    assert!(health["owner"].is_null() && health["restart_helps"].is_null());
 
     set_health(&admin, stalled(StallCause::ConsumerNotAcknowledging)).await;
     let health = {
@@ -264,6 +265,11 @@ pub(super) async fn status_reports_the_verdict_and_its_cause() {
         health["stall_cause"], "consumer_not_acknowledging",
         "the stable discriminant, not the prose — it is what routes a page",
     );
+    assert_eq!(
+        health["owner"], "destination",
+        "who can fix it, from the library's routing"
+    );
+    assert_eq!(health["restart_helps"], false);
     assert!(
         health["stalled_for_seconds"]
             .as_f64()

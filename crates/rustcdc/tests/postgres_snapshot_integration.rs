@@ -1,5 +1,8 @@
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     PostgresConnection, PostgresSourceConfig,
     checkpoint::{Checkpoint, FileCheckpoint},
@@ -21,7 +24,7 @@ async fn postgres_snapshot_large_table_chunked() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -226,7 +229,7 @@ async fn postgres_incremental_snapshot_reads_all_seed_rows_once() -> rustcdc::Re
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -393,7 +396,7 @@ async fn postgres_snapshot_checkpoint_resume_continues_without_duplicates() -> r
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -640,7 +643,7 @@ async fn postgres_snapshot_checkpoint_resume_under_mutation_window() -> rustcdc:
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -902,7 +905,7 @@ async fn postgres_snapshot_checkpoint_resume_across_table_boundary() -> rustcdc:
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -1178,7 +1181,7 @@ async fn postgres_snapshot_empty_table() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -1291,7 +1294,7 @@ async fn postgres_snapshot_concurrent_write_pressure_correctness() -> rustcdc::R
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -1517,7 +1520,7 @@ async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_res
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -1771,7 +1774,7 @@ async fn start_snapshot_postgres() -> rustcdc::Result<(
     tokio_postgres::Client,
 )> {
     // The tag CI pre-pulls; nothing these tests pin is specific to a newer release.
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

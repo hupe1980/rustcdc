@@ -390,6 +390,25 @@ pub struct AdminConfig {
     /// Proxy IPs trusted to provide client IP forwarding headers.
     #[serde(default)]
     pub trusted_proxy_ips: Vec<String>,
+
+    /// The operator console at `/ui`.
+    #[serde(default)]
+    pub ui: AdminUiConfig,
+}
+
+/// The operator console: the admin API's own client, served at `/ui`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AdminUiConfig {
+    /// Serve it (default: true). It grants nothing: every request it makes is authorised by
+    /// the admin tokens like any other client's.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+}
+
+impl Default for AdminUiConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 impl Default for AdminConfig {
@@ -421,6 +440,7 @@ impl Default for AdminConfig {
             notification_kafka: None,
             tls: None,
             trusted_proxy_ips: Vec::new(),
+            ui: AdminUiConfig::default(),
         }
     }
 }

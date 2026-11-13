@@ -202,7 +202,7 @@ docker run --rm \
 # compose.yml
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: changeme
       POSTGRES_DB: mydb
@@ -254,6 +254,9 @@ export RUSTCDC_ADMIN_READ_TOKEN="my-dev-read-token"   # matches [admin] read_tok
 curl -H "Authorization: Bearer $RUSTCDC_ADMIN_READ_TOKEN" http://localhost:8080/status
 curl -H "Authorization: Bearer $RUSTCDC_ADMIN_READ_TOKEN" http://localhost:8080/metrics
 ```
+
+Or open `http://localhost:8080/ui` for the [console](@/docs/console.md). The image and the
+Homebrew binary include it; a build from source needs `cargo xtask console` first.
 
 
 ## Add a transform (optional)
@@ -340,5 +343,7 @@ Before going to production, work through these items:
 | [SQL Server connector](@/docs/connectors/sqlserver.md) | `sp_cdc_enable_db`, permissions, polling interval |
 | [Core concepts](@/docs/concepts.md) | Event model, pipeline lifecycle, delivery contracts, circuit breaker |
 | [Configuration reference](@/docs/configuration.md) | Every TOML field with defaults and examples |
+| [Console](@/docs/console.md) | Health, snapshots and activity in the browser |
 | [Operations guide](@/docs/operations.md) | Replay, migrate-state, graceful shutdown, performance tuning |
+| [Performance](@/docs/performance.md) | Measured throughput and latency, and how to reproduce it |
 | [Writing WASM transforms](@/docs/transforms.md) | Write custom transforms in Rust, AssemblyScript, or any WASM language |

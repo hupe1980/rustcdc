@@ -8,8 +8,10 @@ raw_out="target/benchmark-ci-gate.txt"
 retry_out="target/benchmark-ci-gate-retry.txt"
 regression_threshold="${BENCHMARK_MAX_REGRESSION_PERCENT:-5}"
 strict_mode="${BENCHMARK_STRICT:-1}"
-gated_benches_raw="${BENCHMARK_GATED_BENCHES:-quality_perf cdc_perf}"
-critical_group_prefixes_raw="${BENCHMARK_CRITICAL_GROUP_PREFIXES:-quality_perf/quality_gates cdc_perf/quality_gates cdc_perf/wasm_transform}"
+gated_benches_raw="${BENCHMARK_GATED_BENCHES:-quality_perf cdc_perf runtime_throughput}"
+# Only these groups can fail the gate. `runtime_end_to_end/file_checkpoint` is left out on
+# purpose: it is fsync-bound, and its unplanted run-to-run spread exceeds the threshold.
+critical_group_prefixes_raw="${BENCHMARK_CRITICAL_GROUP_PREFIXES:-quality_perf/quality_gates cdc_perf/quality_gates cdc_perf/wasm_transform throughput/runtime_end_to_end/in_memory_checkpoint}"
 allow_non_strict="${ALLOW_BENCHMARK_NON_STRICT:-0}"
 bench_sample_size="${BENCHMARK_SAMPLE_SIZE:-30}"
 bench_measurement_secs="${BENCHMARK_MEASUREMENT_SECS:-8}"
@@ -302,8 +304,7 @@ record_baseline_fallback_bench() {
 # selects every default workspace member, and cargo unifies features across that whole
 # set. `rustcdc-server` dev-depends on `rustcdc` with `test-harnesses`, so an unscoped
 # bench build turned that feature on for `rustcdc` and tripped the release guard in
-# `fault_injection`. Two bench targets are also named `throughput`, one per crate, so a
-# bare `--bench throughput` is ambiguous. Naming the package fixes both.
+# `fault_injection`. Naming the package fixes it, and an ambiguous name is refused below.
 bench_targets_table=""
 
 load_bench_targets() {
@@ -688,6 +689,17 @@ for bench in "${gated_benches[@]}"; do
   #
   # The report says plainly that no regression check was performed, so this weakens the
   # evidence without quietly weakening it.
+  # Confirmation counts critical-group benchmarks only, so a gated bench with none of them
+  # can never fail the gate, however far it regresses.
+  if ! awk -v prefixes="$critical_group_prefixes_raw" '
+      BEGIN { n = split(prefixes, p, " ") }
+      { for (i = 1; i <= n; i++) if (index($0, p[i] "/") == 1) found = 1 }
+      END { exit !found }' "$bench_raw_out"; then
+    echo "Benchmark gate misconfigured: ${bench} is gated, but none of its benchmarks is in a"
+    echo "critical group (${critical_group_prefixes_raw}), so no regression in it could fail the gate."
+    exit 1
+  fi
+
   if baseline_was_bootstrapped "$bench"; then
     echo "Not enforcing regressions for ${bench}: its baseline was bootstrapped from this"
     echo "same commit, so the comparison is run-to-run variance, not a regression."

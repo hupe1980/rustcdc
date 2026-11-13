@@ -4,9 +4,7 @@ description = "Alert thresholds, disaster recovery, secret rotation and per-conn
 weight = 100
 +++
 
-**Audience:** Platform operators and SREs managing rustcdc in production  
-**Version:** Current  
-**Last Updated:** May 25, 2026
+**Audience:** Platform operators and SREs managing rustcdc in production
 
 ---
 
@@ -67,7 +65,7 @@ If your deployment does not provide these wrappers, see [Deployment](@/docs/depl
 ### Replication Slot Setup
 
 **Prerequisites:**
-- PostgreSQL 10+ (recommended 16+)
+- A supported PostgreSQL ([Supported versions](@/docs/supported-versions.md))
 - Logical replication enabled: `wal_level = logical` in postgresql.conf
 - Sufficient WAL retention (at least 1GB, preferably 10GB+)
 
@@ -228,7 +226,7 @@ fi
 ### Binlog Configuration
 
 **Prerequisites:**
-- MySQL 8.0+ (MariaDB 10.5+)
+- A supported MySQL or MariaDB ([Supported versions](@/docs/supported-versions.md))
 - Binlog enabled: `log_bin = ON` in my.cnf
 - GTID enabled (recommended): `gtid_mode = ON`
 - Binlog retention: `binlog_expire_logs_auto_purge = 0` (manual management recommended)
@@ -323,7 +321,7 @@ SHOW MASTER STATUS\G
 ### CDC Setup on SQL Server
 
 **Prerequisites:**
-- SQL Server 2016+ (2019 recommended)
+- A supported SQL Server ([Supported versions](@/docs/supported-versions.md))
 - SQL Server Agent running
 - Database recovery model: FULL (not SIMPLE)
 
@@ -1072,15 +1070,8 @@ the stream position, which is the worse trade.
 
 ---
 
-## Contacts and Escalation
+## Escalation
 
-| Role | Contact | Escalation |
-|------|---------|-----------|
-| On-Call SRE | Page via PagerDuty | Escalate to Platform Lead if unresolved in 30 min |
-| Database Admin | Slack #dba-oncall | Create incident ticket if source DB issue confirmed |
-| CDC Maintainer | GitHub Issues or #rustcdc Slack | Create critical incident if data loss risk detected |
-
----
-
-**Last Updated:** May 25, 2026  
-**Version:** Current Runbook
+A defect in rustcdc itself, above all any risk of data loss, goes to
+[GitHub issues](https://github.com/hupe1980/rustcdc/issues) with the `/status` output and the
+log around the first error.

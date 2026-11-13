@@ -133,7 +133,7 @@ async fn probe(state: AdminState, mut request: Request<Body>) -> (StatusCode, St
             .expect("peer addr"),
     ));
 
-    let response = rustcdc_server::admin::router(state)
+    let response = rustcdc_server::admin::router(state, false)
         .oneshot(request)
         .await
         .expect("router responds");
@@ -811,7 +811,7 @@ async fn one_peer_exhausting_its_budget_does_not_affect_another() {
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(noisy));
-        let _ = rustcdc_server::admin::router(state.clone())
+        let _ = rustcdc_server::admin::router(state.clone(), false)
             .oneshot(request)
             .await
             .expect("router responds");
@@ -821,7 +821,7 @@ async fn one_peer_exhausting_its_budget_does_not_affect_another() {
     request
         .extensions_mut()
         .insert(axum::extract::ConnectInfo(quiet));
-    let response = rustcdc_server::admin::router(state)
+    let response = rustcdc_server::admin::router(state, false)
         .oneshot(request)
         .await
         .expect("router responds");

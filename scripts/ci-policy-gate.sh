@@ -455,8 +455,7 @@ run_cargo_scope_check() {
 run_bench_invocation_check() {
   # Benchmarks build in the release profile, where the guard in `fault_injection` rejects
   # `test-harnesses` — and `rustcdc-server` dev-depends on `rustcdc` with that feature, so
-  # cargo's feature unification turns it on for any unscoped build. Two bench targets are
-  # also named `throughput`, one per crate, so `--bench throughput` is ambiguous.
+  # cargo's feature unification turns it on for any unscoped build.
   # `cargo xtask bench` carries the hatch and the `-p`.
   #
   # Allowed to say `cargo bench`: the xtask that wraps it, the gate that scopes it, the
@@ -740,37 +739,61 @@ mints a short-lived token instead" >&2
   echo "Workflow drift guard passed."
 }
 
-# The pre-pull list must cover every version the test matrices instantiate.
+# Database and broker versions are named in one place, crates/rustcdc/tests/support/matrix.txt.
 #
-# The pre-pull exists to fetch images from a mirror rather than from rate-limited Docker Hub.
-# When it drifts from the matrices it fails silently in the worst direction: the warmed
-# images go unused and the images the tests actually need are fetched at run time, from
-# exactly the registry the script was written to avoid.
+# Every suite, the CI pre-pull and the workflows read it, so moving the matrix is one edit and
+# nothing can lag behind it. The published supported-versions page and the examples are written
+# by hand, so this holds them to it: a page that lists versions the suites no longer run is the
+# drift `cargo xtask support-window` exists to catch, one step removed.
 run_relational_image_drift_check() {
-  local pull_script="scripts/ci-pull-relational-images.sh"
-  local missing=()
-
-  local mysql_versions mariadb_versions
-  mysql_versions="$(grep -oE '"[0-9]+\.[0-9]+"' crates/rustcdc/tests/mysql_version_matrix.rs | tr -d '"' | sort -u)"
-  mariadb_versions="$(grep -oE '"1[0-9]\.[0-9]+"' crates/rustcdc/tests/mariadb_e2e_integration.rs | tr -d '"' | sort -u)"
-
-  local version
-  for version in $mysql_versions; do
-    grep -q "\"mysql:${version}\"" "$pull_script" || missing+=("mysql:${version}")
-  done
-  for version in $mariadb_versions; do
-    grep -q "\"mariadb:${version}\"" "$pull_script" || missing+=("mariadb:${version}")
-  done
-
-  if (( ${#missing[@]} > 0 )); then
-    echo "FAIL: test matrices instantiate images the pre-pull list does not warm:" >&2
-    printf '  - %s\n' "${missing[@]}" >&2
-    echo "Add them to NON_POSTGRES_RELATIONAL_SMOKE_IMAGES in ${pull_script}, or drop the" >&2
-    echo "version from the matrix. Leaving them out sends those pulls to Docker Hub." >&2
+  local matrix="crates/rustcdc/tests/support/matrix.txt"
+  local page="site/content/docs/supported-versions.md"
+  local hits
+  hits="$(git grep -nE 'GenericImage::new\("(postgres|mysql|mariadb)", *"|"(postgres|mysql|mariadb):[0-9]|mssql/server:20[0-9]{2}|redpanda:v[0-9]|apache/kafka:[0-9]|"[0-9]+-alpine"|ci-pull-relational-images\.sh +[0-9]|--sqlserver-soft +20' \
+    -- crates/*/tests scripts .github ':!scripts/ci-policy-gate.sh' || true)"
+  if [[ -n "$hits" ]]; then
+    echo "FAIL: a database or broker version is named outside ${matrix}:" >&2
+    echo "$hits" >&2
+    echo "Read it from the matrix instead (tests: support/matrix.rs; scripts: ci-pull-relational-images.sh)." >&2
     exit 1
   fi
 
-  echo "Relational image drift check passed (pre-pull covers every matrix version)."
+  local missing=()
+  local engine full tags label row tag version
+  while read -r engine full tags; do
+    case "$engine" in
+      postgres) label="PostgreSQL" ;;
+      mysql) label="MySQL" ;;
+      mariadb) label="MariaDB" ;;
+      sqlserver) label="SQL Server" ;;
+      kafka) label="Apache Kafka" ;;
+      redpanda) label="Redpanda" ;;
+      *) echo "FAIL: unknown engine '${engine}' in ${matrix}" >&2; exit 1 ;;
+    esac
+    row="$(grep -E "^\| ${label} \|" "$page" || true)"
+    for tag in $full $tags; do
+      version="${tag%-alpine}"; version="${version#v}"
+      [[ "$engine" == "sqlserver" ]] && version="${tag:0:4}"
+      grep -qE "(^|[^0-9.])${version//./\\.}([^0-9.]|$)" <<<"$row" || missing+=("${label} ${version}")
+    done
+    if [[ "$engine" == "postgres" ]]; then
+      local major="${full%%-*}" example
+      for example in docker/compose.example.yml demo/compose.yml demo/seed.sh site/content/docs/getting-started.md site/content/docs/embedding.md; do
+        if grep -oE 'postgres:[0-9]+' "$example" | grep -vqx "postgres:${major}"; then
+          missing+=("${example}: an example names a PostgreSQL other than ${major}")
+        fi
+      done
+    fi
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$matrix")
+
+  if (( ${#missing[@]} > 0 )); then
+    echo "FAIL: the published versions disagree with ${matrix}:" >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    echo "Update the table in ${page} (and the examples) to match." >&2
+    exit 1
+  fi
+
+  echo "Database version check passed (one matrix; the published page and the examples agree)."
 }
 
 # Every integration suite under crates/rustcdc/tests/ must actually be run by something.
@@ -1074,6 +1097,20 @@ run_rust_version_pin_check() {
   echo "Rust version pin check passed ($checked pin(s) match rust-version $msrv)."
 }
 
+run_bench_critical_list_check() {
+  # The critical benchmark groups are listed once, in scripts/ci-benchmark-gate.sh. A second
+  # list in a workflow drifts: a bench added to the script's list stays ungated in CI.
+  local hits
+  hits="$(git grep -n 'BENCHMARK_CRITICAL_GROUP_PREFIXES' -- .github || true)"
+  if [[ -n "$hits" ]]; then
+    echo "bench critical-list check failed: set the critical groups in scripts/ci-benchmark-gate.sh, not in a workflow:" >&2
+    echo "$hits" >&2
+    exit 1
+  fi
+
+  echo "Bench critical-list check passed."
+}
+
 run_config_docs_coverage_check
 run_reexport_coverage_check
 run_schema_contract_check
@@ -1082,6 +1119,7 @@ run_async_trait_policy_check
 run_cargo_profile_safety_check
 run_job_naming_check
 run_bench_invocation_check
+run_bench_critical_list_check
 run_cargo_scope_check
 run_release_evidence_contract_check
 run_workflow_path_check

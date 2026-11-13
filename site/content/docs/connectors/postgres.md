@@ -13,7 +13,7 @@ or additional plugins.
 
 ## 1. Overview
 
-PostgreSQL's **logical decoding** feature (introduced in PostgreSQL 9.4) streams
+PostgreSQL's **logical decoding** streams
 committed transactions from the write-ahead log (WAL) in a structured format.
 rustcdc attaches to a **replication slot** and reads events via the built-in
 `pgoutput` logical decoding plugin (available in every PostgreSQL ≥ 10 with no
@@ -140,10 +140,10 @@ wal_transport = "streaming_replication"   # or "sql_peek"
 > `streaming_replication` a walsender holds the slot for the life of the stream, and
 > PostgreSQL refuses `pg_replication_slot_advance` or `pg_drop_replication_slot` on an
 > active slot. Stop the pipeline first; an operator script that runs alongside a live
-> one fails with *"replication slot is active for PID N"*. This did not apply under
-> `sql_peek`, where nothing held the slot persistently.
+> one fails with *"replication slot is active for PID N"*. Under `sql_peek` nothing holds
+> the slot between polls.
 
-> **TLS is now enforced, not preferred.** A connector configured with
+> **TLS is enforced, not preferred.** A connector configured with
 > `transport.mode = "tls"` against a server with `ssl = off` fails to connect instead
 > of silently falling back to an unencrypted connection. Either enable TLS on the
 > server or set `mode = "plaintext"` explicitly.

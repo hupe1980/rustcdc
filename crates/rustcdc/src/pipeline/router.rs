@@ -393,7 +393,8 @@ impl<S: SinkAdapter> SinkAdapter for TableRouter<S> {
     }
 
     fn transactional_checkpoint_barrier_capable(&self) -> bool {
-        !self.routes.is_empty()
+        // The default is a sink like any route: a one-sink configuration has no routes.
+        (!self.routes.is_empty() || self.default.is_some())
             && self
                 .routes
                 .iter()
@@ -556,6 +557,53 @@ mod tests {
             shape: None,
             unavailable_columns: Vec::new(),
         }
+    }
+
+    // ─── checkpoint barrier ────────────────────────────────────────────────────
+
+    /// A sink that takes part in the checkpoint barrier and counts the barriers it saw.
+    struct BarrierSink {
+        begun: usize,
+    }
+
+    impl SinkAdapter for BarrierSink {
+        async fn send(&mut self, _event: &Event) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "barrier"
+        }
+        fn transactional_checkpoint_barrier_capable(&self) -> bool {
+            true
+        }
+        async fn begin_checkpoint_barrier(&mut self) -> Result<()> {
+            self.begun += 1;
+            Ok(())
+        }
+    }
+
+    /// A configuration with one sink and no routing builds exactly this router. If it
+    /// reports no barrier, `effectively_once` sends every record outside a transaction.
+    #[tokio::test]
+    async fn a_router_with_only_a_default_sink_carries_its_barrier() {
+        let mut router: TableRouter<BarrierSink> = TableRouter::builder("single")
+            .default(BarrierSink { begun: 0 })
+            .build_unchecked();
+        assert!(router.transactional_checkpoint_barrier_capable());
+        router.begin_checkpoint_barrier().await.expect("begin");
+        assert_eq!(router.default.as_ref().map(|d| d.begun), Some(1));
+    }
+
+    #[test]
+    fn a_router_with_no_sink_at_all_has_no_barrier() {
+        let router: TableRouter<BarrierSink> = TableRouter::builder("empty").build_unchecked();
+        assert!(!router.transactional_checkpoint_barrier_capable());
     }
 
     // ─── glob helpers ──────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@
 use std::process::{Command, ExitCode};
 
 mod cargo_profile;
+mod support_window;
 
 /// A task, its one-line description, and how to run it.
 struct Task {
@@ -44,6 +45,26 @@ const TASKS: &[Task] = &[
         name: "bench",
         about: "Build (--no-run) or run the workspace benchmarks. Extra args go to cargo.",
         run: bench,
+    },
+    Task {
+        name: "support-window",
+        about: "Is the tested database matrix still the one the vendors support? (network)",
+        run: support_window::run,
+    },
+    Task {
+        name: "console",
+        about: "Build the operator console into crates/rustcdc-server/ui/dist (needs Node 24).",
+        run: |_| npm(&["ci", "--no-audit", "--no-fund"]).and_then(|()| npm(&["run", "build"])),
+    },
+    Task {
+        name: "console-dev",
+        about: "Serve the console with live reload against `rustcdc run` (RUSTCDC_URL, default :8080).",
+        run: |_| npm(&["run", "dev"]),
+    },
+    Task {
+        name: "pipeline-bench",
+        about: "Rows/s and latency, PostgreSQL → rustcdc → Redpanda, both contracts (Docker, ~10 min).",
+        run: pipeline_bench,
     },
     Task {
         name: "pull-images",
@@ -141,6 +162,65 @@ fn bench(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The pipeline bench, measuring the binary the image ships rather than the one cargo
+/// builds for integration tests: that one carries `test-harnesses`, and the release
+/// settings below are the Dockerfile's. Its own target directory keeps those settings from
+/// invalidating the ordinary release cache.
+fn pipeline_bench(args: &[String]) -> Result<(), String> {
+    let root = workspace_root()?;
+    let target = root.join("target").join("pipeline-bench");
+    run(Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "rustcdc-server",
+            "--release",
+            "--bin",
+            "rustcdc",
+            "--all-features",
+            "--locked",
+        ])
+        .arg("--target-dir")
+        .arg(&target)
+        .env("CARGO_PROFILE_RELEASE_LTO", "thin")
+        .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1")
+        .current_dir(&root))?;
+
+    let rustflags = match std::env::var("RUSTFLAGS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {BENCH_HATCH}"),
+        _ => BENCH_HATCH.to_string(),
+    };
+    run(Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "rustcdc-server",
+            "--release",
+            "--all-features",
+            "--test",
+            "pipeline_bench",
+        ])
+        .args(["--", "--ignored", "--nocapture"])
+        .args(args)
+        .env("RUSTFLAGS", rustflags)
+        .env(
+            "PIPELINE_BENCH_BINARY",
+            target.join("release").join("rustcdc"),
+        )
+        .current_dir(&root))
+}
+
+fn run(command: &mut Command) -> Result<(), String> {
+    let status = command
+        .status()
+        .map_err(|error| format!("could not run cargo: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo exited with {status}"))
+    }
+}
+
 /// The repository root, whatever directory `cargo xtask` was invoked from.
 fn workspace_root() -> Result<std::path::PathBuf, String> {
     Ok(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -180,5 +260,21 @@ fn script(name: &str, args: &[String]) -> Result<(), String> {
                 .code()
                 .map_or_else(|| "a signal".to_owned(), |c| c.to_string())
         ))
+    }
+}
+
+/// Run `npm` in the console's directory. Node is needed only here; every other task and every
+/// `cargo build` works without it.
+fn npm(args: &[&str]) -> Result<(), String> {
+    let dir = workspace_root()?.join("crates/rustcdc-server/ui");
+    let status = Command::new("npm")
+        .args(args)
+        .current_dir(&dir)
+        .status()
+        .map_err(|error| format!("could not run npm (install Node 24): {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("npm {} failed with {status}", args.join(" ")))
     }
 }

@@ -10,6 +10,8 @@ pub use routes::router;
 mod signal_ledger;
 mod signals;
 mod tls;
+#[cfg(feature = "ui")]
+mod ui;
 
 // The probe handlers live in `probes` but are referenced unqualified by `router()`
 // and by the test modules, which is how they were written when they sat in this file.
@@ -3102,11 +3104,26 @@ fn slo_reasons(data: &AdminStateData) -> Vec<String> {
 /// page and what `/readyz` reports. `stalled_for_seconds` is how long *this* condition
 /// has held, which is what decides whether `/livez` is about to restart the pod.
 pub(crate) fn health_json(data: &AdminStateData) -> serde_json::Value {
+    let cause = data
+        .health_stall_cause
+        .as_deref()
+        .and_then(stall_cause_from_label);
     serde_json::json!({
         "verdict": data.health_verdict,
         "stall_cause": data.health_stall_cause,
         "stalled_for_seconds": data.stalled_for().map(|elapsed| elapsed.as_secs_f64()),
+        // Who can fix it and whether a restart would: the routing `/livez` acts on.
+        "owner": cause.map(|cause| cause.owner().as_str()),
+        "restart_helps": cause.map(|cause| cause.restart_helps()),
     })
+}
+
+/// The cause a latched label names. The admin state keeps the stable label, not the enum.
+pub(crate) fn stall_cause_from_label(label: &str) -> Option<StallCause> {
+    StallCause::ALL
+        .iter()
+        .copied()
+        .find(|cause| cause.as_str() == label)
 }
 
 pub(crate) fn slo_json(data: &AdminStateData) -> serde_json::Value {
@@ -3476,6 +3493,7 @@ pub async fn serve(
     bind_addr: &str,
     timeout_ms: u64,
     tls: Option<&AdminTlsConfig>,
+    console: bool,
     state: AdminState,
 ) -> Result<tokio::task::JoinHandle<()>, AppError> {
     let addr: std::net::SocketAddr = bind_addr
@@ -3484,7 +3502,7 @@ pub async fn serve(
 
     state.spawn_manifest_refresh_worker();
 
-    let app = router(state).layer(TimeoutLayer::with_status_code(
+    let app = router(state, console).layer(TimeoutLayer::with_status_code(
         StatusCode::REQUEST_TIMEOUT,
         Duration::from_millis(timeout_ms),
     ));

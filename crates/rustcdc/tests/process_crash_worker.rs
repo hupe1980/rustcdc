@@ -1,3 +1,6 @@
+#[path = "support/artifacts.rs"]
+mod artifacts;
+
 use std::{
     collections::HashMap,
     path::Path,
@@ -75,19 +78,16 @@ pub fn resolve_crash_worker_bin(bin: &str, feature: &str) -> rustcdc::Result<Pat
         }
     }
 
-    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
-    if let Some(debug_dir) = test_exe.parent().and_then(|deps| deps.parent()) {
-        let candidate = debug_dir.join(bin);
-        if candidate.exists() {
-            cache_set(bin, &candidate)?;
-            return Ok(candidate);
-        }
+    let candidate = artifacts::profile_dir().join(bin);
+    if candidate.exists() {
+        cache_set(bin, &candidate)?;
+        return Ok(candidate);
+    }
 
-        build_crash_worker(bin, feature)?;
-        if candidate.exists() {
-            cache_set(bin, &candidate)?;
-            return Ok(candidate);
-        }
+    build_crash_worker(bin, feature)?;
+    if candidate.exists() {
+        cache_set(bin, &candidate)?;
+        return Ok(candidate);
     }
 
     Err(rustcdc::Error::StateError(format!(

@@ -1,5 +1,8 @@
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -75,7 +78,7 @@ async fn runtime_mysql_process_kill_resumes_snapshot_after_committed_batch() -> 
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -287,7 +290,7 @@ async fn run_mysql_process_kill_replay_scenario(
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -336,7 +339,7 @@ async fn run_mysql_process_kill_replay_scenario(
     .await
     .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
 
-    let status: sqlx::mysql::MySqlRow = sqlx::query("SHOW MASTER STATUS")
+    let status: sqlx::mysql::MySqlRow = sqlx::query("SHOW BINARY LOG STATUS")
         .fetch_one(&admin_pool)
         .await
         .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;

@@ -4,7 +4,6 @@ description = "Diagnose and resolve rustcdc capture stalls, replication lag, che
 weight = 110
 +++
 
-**Version:** v0.1+  
 **Audience:** Operators and developers debugging rustcdc issues
 
 ---
@@ -858,6 +857,4 @@ curl -v http://localhost:8080/health
 
 ---
 
-**Last Updated:** May 25, 2026  
-**Version:** Troubleshooting Guide v0.1+  
 **Contributing:** Found a new troubleshooting scenario? File an issue on GitHub!

@@ -1,5 +1,8 @@
 #![cfg(feature = "postgres")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{PostgresConnection, PostgresSourceConfig, source::Source};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -16,7 +19,7 @@ async fn postgres_stream_capture_insert_update_delete() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -271,7 +274,7 @@ async fn postgres_stream_resume_from_lsn() -> rustcdc::Result<()> {
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -410,7 +413,7 @@ async fn start_logical_postgres() -> rustcdc::Result<(
     u16,
     tokio_postgres::Client,
 )> {
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -706,7 +709,7 @@ async fn postgres_stream_captures_logical_decoding_messages() -> rustcdc::Result
         return Ok(());
     }
 
-    let container = GenericImage::new("postgres", "16-alpine")
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",

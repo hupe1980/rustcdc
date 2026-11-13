@@ -1358,6 +1358,13 @@ impl StreamHandle for PostgresStreamHandle {
                 return Ok(Vec::new());
             }
 
+            // Rows with no events are a transaction still open across polls: read on. The
+            // streaming transport blocks on its socket and a peek returns whole
+            // transactions, so this cannot spin.
+            if had_data {
+                continue;
+            }
+
             let remaining = timeout.saturating_sub(started.elapsed());
             tokio::time::sleep(Duration::from_millis(
                 self.stream_poll_interval_ms
@@ -2518,6 +2525,37 @@ mod tests {
         assert_eq!(events[0].primary_key, Some(vec!["id".to_string()]));
         // LSN position updated to the end LSN from COMMIT
         assert_eq!(handle.stream.lsn_position, 1100);
+    }
+
+    /// The idle sleep is for a slot with nothing to read. A transaction larger than one poll
+    /// returns rows that cannot be released before COMMIT; sleeping after that poll would cost a
+    /// full interval per poll while a backlog waits.
+    #[tokio::test]
+    async fn a_transaction_spanning_polls_is_read_without_the_idle_sleep() {
+        const OID: u32 = 999;
+        let provider = MockPgOutputProvider::new(vec![
+            vec![
+                xlog(800, build_relation(OID, "public", "users", &[("id", true)])),
+                xlog(800, build_begin(1000, 0, 1)),
+                xlog(900, build_insert(OID, &[Some("1")])),
+            ],
+            vec![
+                xlog(950, build_insert(OID, &[Some("2")])),
+                xlog(1000, build_commit(950, 1100, 0)),
+            ],
+        ]);
+        let mut handle = make_stream_handle(0, provider);
+        handle.stream_poll_interval_ms = 2_000;
+
+        let started = std::time::Instant::now();
+        let events = rows_only(handle.next_events(10_000).await.unwrap());
+
+        assert_eq!(events.len(), 2, "both rows of the transaction");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_000),
+            "a poll that returned rows was followed by the idle sleep ({:?})",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

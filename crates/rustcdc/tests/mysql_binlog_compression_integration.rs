@@ -22,6 +22,9 @@
 
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     MysqlConnection, MysqlSourceConfig, TransportConfig, checkpoint::MysqlOffset, source::Source,
 };
@@ -116,7 +119,7 @@ async fn compressed_transactions_keep_a_resumable_binlog_position() -> rustcdc::
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.0")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")

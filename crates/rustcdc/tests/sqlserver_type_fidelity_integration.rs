@@ -63,8 +63,7 @@ async fn sqlserver_decodes_non_trivial_types_without_loss() -> rustcdc::Result<(
         return Ok(());
     }
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(container) => container,
             Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
             Err(error) => return Err(error),
@@ -303,8 +302,7 @@ async fn sqlserver_null_is_distinguishable_from_an_undecodable_value() -> rustcd
         return Ok(());
     }
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(container) => container,
             Err(ref error) if sqlserver_testkit::is_skip_error(error) => return Ok(()),
             Err(error) => return Err(error),

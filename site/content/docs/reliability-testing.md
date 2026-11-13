@@ -34,8 +34,8 @@ configuration where it goes wrong:
 
 | Suite | Configuration it needs | What it asserts |
 |---|---|---|
-| `mysql_binlog_compression_integration` | MySQL 8.0, `binlog_transaction_compression = ON`, file+position (not GTID) | Every event carries a resumable binlog position, and a stream resumed from one captured inside a compressed transaction receives what follows it |
-| `sqlserver_window_truncation_integration` | SQL Server 2022, **two** capture instances, `max_events_per_poll = 5` | No row is lost when an LSN window truncates at different positions per capture instance |
+| `mysql_binlog_compression_integration` | MySQL, `binlog_transaction_compression = ON`, file+position (not GTID) | Every event carries a resumable binlog position, and a stream resumed from one captured inside a compressed transaction receives what follows it |
+| `sqlserver_window_truncation_integration` | SQL Server, **two** capture instances, `max_events_per_poll = 5` | No row is lost when an LSN window truncates at different positions per capture instance |
 | `postgres_snapshot_integration` (`…resumes_at_the_chunk_boundary_after_a_restart`) | PostgreSQL, incremental snapshot | A restart resumes at a chunk boundary rather than skipping or restarting the table |
 
 Alongside them, `source::postgres::wire::tests` drives the replication client against an
@@ -343,14 +343,14 @@ separate Docker-backed latency harness described under [Coverage Areas](#coverag
 
 ### End-to-end runtime throughput
 
-One benchmark is not a microbenchmark. `cargo xtask bench -p rustcdc --bench throughput` drives the **whole
+One benchmark is not a microbenchmark. `cargo xtask bench -p rustcdc --bench runtime_throughput` drives the **whole
 runtime** — source poll, idempotency guard, transform pipeline, sink, ack token, commit
 barrier, durable checkpoint write — over a synthetic source, and reports events per second.
 
 Database I/O is excluded deliberately. The figure is what the library costs *on top of*
 whatever the server and the sink cost; a connector-inclusive number measured against a
-container on a laptop would be a property of the laptop. This closes what previous audits
-recorded as the last open evidence condition: *no end-to-end throughput measurement*.
+container on a laptop would be a property of the laptop. The pipeline with a real database and
+a real broker is measured separately, on your machine: see [Performance](@/docs/performance.md).
 
 Representative run — Apple M-series, Darwin, APFS on SSD, `--release`, one Tokio worker:
 

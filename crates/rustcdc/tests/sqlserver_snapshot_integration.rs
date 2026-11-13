@@ -81,8 +81,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
     }
 
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),
@@ -220,8 +219,7 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
     }
 
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),
@@ -396,8 +394,7 @@ async fn sqlserver_incremental_snapshot_rows_carry_the_shape() -> rustcdc::Resul
         return Ok(());
     }
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),

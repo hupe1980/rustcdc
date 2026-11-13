@@ -28,7 +28,7 @@ pub fn skip_docker_test(case_label: &str) -> bool {
 /// (MCR downtime, rate-limit, retired tag) rather than failing the suite:
 ///
 /// ```rust,ignore
-/// let container = sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await;
+/// let container = sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await;
 /// let container = match container {
 ///     Ok(c) => c,
 ///     Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
@@ -52,16 +52,21 @@ fn is_image_pull_failure(err: &rustcdc::Error) -> bool {
         || msg.contains("toomanyrequests")
 }
 
-/// SQL Server 2019, pinned to a cumulative update. A floating `2019-latest` tag tested a
-/// different server on each pull, so a failure could be neither reproduced nor attributed.
+#[path = "support/matrix.rs"]
+mod matrix;
+
+/// The SQL Server tag the full suites run on, pinned to a cumulative update in
+/// `support/matrix.txt`: a floating `-latest` tag tests a different server on each pull.
 #[allow(dead_code)]
-pub const SQLSERVER_2019: &str = "2019-CU32-ubuntu-20.04";
-/// SQL Server 2022, pinned to a cumulative update. The tag every single-version suite uses.
+pub fn full_tag() -> &'static str {
+    matrix::full(matrix::Engine::SqlServer)
+}
+
+/// Every SQL Server tag the version-matrix suite runs on.
 #[allow(dead_code)]
-pub const SQLSERVER_2022: &str = "2022-CU27-ubuntu-22.04";
-/// SQL Server 2025, pinned to a cumulative update.
-#[allow(dead_code)]
-pub const SQLSERVER_2025: &str = "2025-CU10-ubuntu-24.04";
+pub fn tested_tags() -> Vec<&'static str> {
+    matrix::tested(matrix::Engine::SqlServer)
+}
 
 pub async fn start_sqlserver_container(
     image_tag: &str,

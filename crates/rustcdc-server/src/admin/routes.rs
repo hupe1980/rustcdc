@@ -13,8 +13,10 @@ use super::auth::{rate_limited_response, unauthorized_response};
 use super::rate_limit::AbuseLimitScope;
 use super::*;
 
-pub fn router(state: AdminState) -> Router {
-    Router::new()
+/// The admin API, and — when `console` is on and the `ui` feature compiled it in — the console
+/// at `/ui`. API responses carry `default-src 'none'`: they are data, never a page to render.
+pub fn router(state: AdminState, console: bool) -> Router {
+    let api = Router::new()
         .route("/healthz", get(healthz))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -31,7 +33,31 @@ pub fn router(state: AdminState) -> Router {
         .route("/schemas/{id}", get(row_shape_authed))
         .route("/openapi.json", get(openapi_document))
         .with_state(state)
-        .layer(panic_guard())
+        .layer(axum::middleware::map_response(api_content_security_policy))
+        .layer(panic_guard());
+    with_console(api, console)
+}
+
+async fn api_content_security_policy(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    response
+}
+
+#[cfg(feature = "ui")]
+fn with_console(api: Router, console: bool) -> Router {
+    if console {
+        api.merge(super::ui::routes())
+    } else {
+        api
+    }
+}
+
+#[cfg(not(feature = "ui"))]
+fn with_console(api: Router, _console: bool) -> Router {
+    api
 }
 
 impl AdminState {

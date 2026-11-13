@@ -33,7 +33,7 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 | 🌊 **Non-blocking backfill** | DBLog watermark incremental snapshots interleave with the live stream and resume mid-chunk after a restart; tables can be added to a running pipeline |
 | 🧩 **Transforms and codecs** | Masking (redact / HMAC / AES-GCM), field mapping, outbox, routing, sandboxed WASM; JSON, CloudEvents, Avro and Protobuf, with Confluent, Apicurio or AWS Glue registry framing |
 | ☠️ **Dead-letter queue** | Opt-in. A poison record is quarantined to a file, a Kafka topic or Amazon SQS with its source offset and cause; an environmental failure (a revoked ACL) halts instead of draining the stream into the DLQ |
-| 🔭 **Operable** | Prometheus and OTLP, a health verdict that tells a quiet database from a dead socket, a signed audit trail, and a distroless multi-arch image with SLSA provenance and SBOM |
+| 🔭 **Operable** | An operator [console](https://hupe1980.github.io/rustcdc/docs/console/) at `/ui`, Prometheus and OTLP, a health verdict that tells a quiet database from a dead socket and names who can fix a stall, a signed audit trail, and a distroless multi-arch image with SLSA provenance and SBOM |
 
 ---
 
@@ -44,12 +44,14 @@ than leaving for you to discover:
 
 **Sources**
 
+Versions: [Supported versions](https://hupe1980.github.io/rustcdc/docs/supported-versions/).
+
 | Connector | End-to-end tested in CI | Against |
 |---|---|---|
 | PostgreSQL | ✅ | A real server, both WAL transports, resume, TLS enforcement, on-demand snapshots, row filters |
 | MySQL | ✅ | A real server, GTID and file+position, resume, primary-key shape |
-| MariaDB | ✅ library suites | MariaDB 10.5 / 10.6 / 10.11: connection, end-to-end capture and process-crash replay. No server-binary suite |
-| SQL Server | ✅ library suites | 2022 for capture, snapshot, handoff, type fidelity and process-crash replay; lifecycle on 2019 / 2022 / 2025. No server-binary suite |
+| MariaDB | ✅ library suites | Connection, end-to-end capture and process-crash replay. No server-binary suite |
+| SQL Server | ✅ library suites | Capture, snapshot, handoff, type fidelity and process-crash replay. No server-binary suite |
 
 **Sinks**
 
@@ -80,9 +82,12 @@ neither.
 | Guide | Description |
 |---|---|
 | [🚀 Getting started](https://hupe1980.github.io/rustcdc/docs/getting-started/) | Up and running in 10 minutes |
+| [🗄️ Supported versions](https://hupe1980.github.io/rustcdc/docs/supported-versions/) | The database releases every release is tested against |
 | [💡 Core concepts](https://hupe1980.github.io/rustcdc/docs/concepts/) | Event model, delivery contracts, circuit breaker |
 | [⚙️ Configuration reference](https://hupe1980.github.io/rustcdc/docs/configuration/) | Every TOML field, with examples |
+| [🖥️ Console](https://hupe1980.github.io/rustcdc/docs/console/) | Health, snapshots and activity in the browser |
 | [🛠️ Operations guide](https://hupe1980.github.io/rustcdc/docs/operations/) | CLI, health checks, replay, K8s deployment |
+| [📈 Performance](https://hupe1980.github.io/rustcdc/docs/performance/) | Measured rows/s and latency, PostgreSQL → Kafka, and how to reproduce it |
 | [🚨 Runbook](https://hupe1980.github.io/rustcdc/docs/runbook/) | Incident procedures, disaster recovery, upgrade and rollback |
 | [🧩 WASM transforms](https://hupe1980.github.io/rustcdc/docs/transforms/) | Rust + AssemblyScript walkthroughs |
 | [🔌 PostgreSQL connector](https://hupe1980.github.io/rustcdc/docs/connectors/postgres/) | WAL, replication slots, cloud databases |
@@ -457,7 +462,7 @@ rustcdc snapshot public.invoices --admin-write-token-env RUSTCDC_WRITE_TOKEN
 docker pull ghcr.io/hupe1980/rustcdc-server:latest
 
 # Pin to a specific version
-docker pull ghcr.io/hupe1980/rustcdc-server:0.20.1
+docker pull ghcr.io/hupe1980/rustcdc-server:0.21.0
 ```
 
 Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](../../Dockerfile) for build details.

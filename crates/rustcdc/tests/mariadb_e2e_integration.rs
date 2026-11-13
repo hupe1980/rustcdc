@@ -1,5 +1,8 @@
 #![cfg(feature = "mariadb")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::{
     MariaDbConnection, MariaDbSourceConfig, MysqlSourceConfig, TransportConfig,
     checkpoint::{Checkpoint, FileCheckpoint},
@@ -68,18 +71,6 @@ fn skip_mariadb_e2e_case(case_label: &str) -> bool {
 
     eprintln!("skipping {case_label} (set CDC_RS_RUN_DOCKER_TESTS=1)",);
     true
-}
-
-macro_rules! mariadb_e2e_test {
-    ($name:ident, $version:literal, $server_id:expr, $runner:ident, $label:literal) => {
-        #[tokio::test]
-        async fn $name() -> rustcdc::Result<()> {
-            if skip_mariadb_e2e_case($label) {
-                return Ok(());
-            }
-            $runner($version, $server_id).await
-        }
-    };
 }
 
 async fn run_mariadb_snapshot_resume_from_checkpoint(
@@ -595,45 +586,40 @@ async fn run_mariadb_snapshot_stream_handoff_full_cycle(
     Ok(())
 }
 
-mariadb_e2e_test!(
-    mariadb_10_5_snapshot_resume_from_checkpoint,
-    "10.5",
+/// Each runner against every tested MariaDB version, with server ids unique per run.
+macro_rules! every_tested_mariadb {
+    ($name:ident, $runner:ident, $base_server_id:expr, $label:literal) => {
+        #[tokio::test]
+        async fn $name() -> rustcdc::Result<()> {
+            if skip_mariadb_e2e_case($label) {
+                return Ok(());
+            }
+            for (server_id, tag) in ($base_server_id..).zip(matrix::tested(matrix::Engine::Mariadb))
+            {
+                $runner(tag, server_id).await.map_err(|error| {
+                    rustcdc::Error::SourceError(format!("mariadb {tag}: {error}"))
+                })?;
+            }
+            Ok(())
+        }
+    };
+}
+
+every_tested_mariadb!(
+    mariadb_snapshot_resume_from_checkpoint,
+    run_mariadb_snapshot_resume_from_checkpoint,
     510,
-    run_mariadb_snapshot_resume_from_checkpoint,
-    "mariadb 10.5 snapshot resume test"
+    "mariadb snapshot resume test"
 );
-mariadb_e2e_test!(
-    mariadb_10_5_stream_capture_insert_update_delete,
-    "10.5",
-    511,
+every_tested_mariadb!(
+    mariadb_stream_capture_insert_update_delete,
     run_mariadb_stream_capture_insert_update_delete,
-    "mariadb 10.5 stream CDC test"
+    530,
+    "mariadb stream CDC test"
 );
-mariadb_e2e_test!(
-    mariadb_10_5_snapshot_stream_handoff_full_cycle,
-    "10.5",
-    512,
+every_tested_mariadb!(
+    mariadb_snapshot_stream_handoff_full_cycle,
     run_mariadb_snapshot_stream_handoff_full_cycle,
-    "mariadb 10.5 handoff test"
-);
-mariadb_e2e_test!(
-    mariadb_10_6_snapshot_resume_from_checkpoint,
-    "10.6",
-    610,
-    run_mariadb_snapshot_resume_from_checkpoint,
-    "mariadb 10.6 snapshot resume test"
-);
-mariadb_e2e_test!(
-    mariadb_10_6_stream_capture_insert_update_delete,
-    "10.6",
-    611,
-    run_mariadb_stream_capture_insert_update_delete,
-    "mariadb 10.6 stream CDC test"
-);
-mariadb_e2e_test!(
-    mariadb_10_6_snapshot_stream_handoff_full_cycle,
-    "10.6",
-    612,
-    run_mariadb_snapshot_stream_handoff_full_cycle,
-    "mariadb 10.6 handoff test"
+    550,
+    "mariadb handoff test"
 );

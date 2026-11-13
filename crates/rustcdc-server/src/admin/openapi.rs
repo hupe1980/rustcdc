@@ -219,14 +219,20 @@ pub(crate) fn document(version: &str) -> Value {
                 },
                 "Notification": {
                     "type": "object",
-                    "required": ["action", "result", "timestamp"],
+                    "description": "One step of a signal. `/notifications/stream` carries the same fields as a CloudEvent's `data`, with `at` as the envelope's `time`.",
+                    "required": ["id", "action_type", "state", "at"],
                     "properties": {
-                        "action": { "type": "string" },
-                        "result": { "type": "string" },
+                        "id": { "type": "integer" },
+                        "action_type": { "type": "string" },
                         "state": { "type": "string" },
                         "signal_id": { "type": "string" },
                         "correlation_id": { "type": "string" },
-                        "timestamp": { "type": "string", "format": "date-time" }
+                        "at": { "type": "string", "format": "date-time" },
+                        "traceparent": { "type": ["string", "null"] },
+                        "detail": {
+                            "type": "object",
+                            "description": "The signal as submitted, with `message` and `additional_data.error` when present."
+                        }
                     }
                 },
                 "IncrementalSnapshotProgress": {
@@ -357,6 +363,23 @@ pub(crate) fn document(version: &str) -> Value {
                                         "type": "object",
                                         "properties": {
                                             "state": { "type": "string" },
+                                            "health": {
+                                                "type": "object",
+                                                "description": "Whether the pipeline is working, and when not, who can fix it.",
+                                                "properties": {
+                                                    "verdict": { "type": ["string", "null"] },
+                                                    "stall_cause": {
+                                                        "type": ["string", "null"],
+                                                        "enum": ["source_position_lost", "unconfirmed_source_position", "delivery_failing", "poll_loop_not_turning", "consumer_not_acknowledging", null]
+                                                    },
+                                                    "stalled_for_seconds": { "type": ["number", "null"] },
+                                                    "owner": {
+                                                        "type": ["string", "null"],
+                                                        "enum": ["source", "destination", "rustcdc", null]
+                                                    },
+                                                    "restart_helps": { "type": ["boolean", "null"] }
+                                                }
+                                            },
                                             "incremental_snapshot": {
                                                 "$ref": "#/components/schemas/IncrementalSnapshotProgress"
                                             }
@@ -449,12 +472,20 @@ pub(crate) fn document(version: &str) -> Value {
                     "security": [{ "readToken": [] }],
                     "responses": {
                         "200": {
-                            "description": "A bounded, in-memory ring of recent notifications.",
+                            "description": "A bounded, in-memory ring of recent notifications, oldest first.",
                             "content": {
                                 "application/json": {
                                     "schema": {
-                                        "type": "array",
-                                        "items": { "$ref": "#/components/schemas/Notification" }
+                                        "type": "object",
+                                        "required": ["notifications"],
+                                        "properties": {
+                                            "api_version": { "type": "string" },
+                                            "notifications_total": { "type": "integer" },
+                                            "notifications": {
+                                                "type": "array",
+                                                "items": { "$ref": "#/components/schemas/Notification" }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -604,6 +635,77 @@ mod tests {
             DOCUMENTED_PATHS.len(),
             "DOCUMENTED_PATHS and the document's paths must agree"
         );
+    }
+
+    /// The documented causes and owners are the library's: a cause added there without one
+    /// here would reach a generated client as an unknown value.
+    #[test]
+    fn the_documented_health_values_are_the_librarys() {
+        let doc = document(TEST_VERSION);
+        let health = &doc["paths"]["/status"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["properties"]["health"]["properties"];
+        let documented = |field: &str| -> Vec<String> {
+            health[field]["enum"]
+                .as_array()
+                .expect("an enum")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        };
+        let causes: Vec<_> = rustcdc::core::StallCause::ALL
+            .iter()
+            .map(|cause| cause.as_str().to_string())
+            .collect();
+        let mut owners: Vec<_> = rustcdc::core::StallCause::ALL
+            .iter()
+            .map(|cause| cause.owner().as_str().to_string())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        let mut documented_owners = documented("owner");
+        documented_owners.sort();
+        assert_eq!(documented("stall_cause"), causes);
+        assert_eq!(documented_owners, owners);
+    }
+
+    /// The documented notification is the serialised one: a field the schema names but the
+    /// server never sends is one a generated client reads as absent.
+    #[test]
+    fn the_documented_notification_is_what_the_server_sends() {
+        let doc = document(TEST_VERSION);
+        let schema = &doc["components"]["schemas"]["Notification"];
+        let documented: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let sent = serde_json::to_value(super::super::signals::ControlNotification {
+            id: 1,
+            at: chrono::Utc::now(),
+            signal_id: "s".into(),
+            correlation_id: "c".into(),
+            action_type: "log_marker".into(),
+            state: "COMPLETED".into(),
+            traceparent: None,
+            detail: serde_json::json!({ "message": "m" }),
+        })
+        .unwrap();
+        let sent: Vec<&str> = sent
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in &sent {
+            assert!(documented.contains(key), "{key} is sent but not documented");
+        }
+        for key in schema["required"].as_array().unwrap() {
+            assert!(
+                sent.contains(&key.as_str().unwrap()),
+                "{key} is required but not sent"
+            );
+        }
     }
 
     /// Every `$ref` must resolve. A dangling one breaks generators at the worst moment.

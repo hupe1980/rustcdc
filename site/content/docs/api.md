@@ -141,7 +141,7 @@ Source configuration in library code is explicit and typed; environment parsing
 belongs in host applications or examples that map `CDC_RS_*` variables into
 connector config values.
 
-The runtime also exposes connector capability metadata via `source_capabilities()` and validates incompatible settings (for example, snapshot tables for a source that does not support snapshots). Capability metadata includes `snapshot_checkpoint_resume`, which is `true` for PostgreSQL, MySQL, and SQL Server. Snapshot checkpoints now resume through connector-native cursor state and keep stream bootstrap aligned with the saved snapshot watermark.
+The runtime also exposes connector capability metadata via `source_capabilities()` and validates incompatible settings (for example, snapshot tables for a source that does not support snapshots). Capability metadata includes `snapshot_checkpoint_resume`, which is `true` for PostgreSQL, MySQL, and SQL Server. Snapshot checkpoints resume through connector-native cursor state and keep stream bootstrap aligned with the saved snapshot watermark.
 
 ## Event Model
 
@@ -250,13 +250,9 @@ type's own output function — the same function PostgreSQL's `pgoutput` calls, 
 `boolean` is `"t"` and not `"true"`. A snapshot and the live stream therefore agree character
 for character, not merely on the JSON type.
 
-**It must not differ by path.** A row backfilled by a PostgreSQL
-snapshot arrived as `{"id": 1}` while the same row updated a moment later arrived as
-`{"id": "1"}`, because the chunk read went through `row_to_json` and the stream did not. A
-sink reaching for `as_i64()` read one and silently saw `None` for the other. MySQL emitted
-JSON numbers from both paths, and SQL Server's `FOR JSON PATH` payload was parsed through
-`f64` — which is why its type-fidelity assertions had to be written as prefix matches rather
-than equalities. All three are now the same rule, and
+**It must not differ by path.** A row backfilled by a snapshot and the same row read from the
+stream carry the same value representation — otherwise a sink reaching for `as_i64()` reads one
+and silently sees `None` for the other. All connectors follow the same rule, and
 `tests/postgres_value_representation_integration.rs` asserts it end to end.
 
 Structured columns are the one carve-out: a `json`/`jsonb` column keeps its object or array
@@ -581,9 +577,9 @@ Important semantics:
 - `force_stop()` is intended for emergency drain where replay is acceptable; emits a `WARN` log with `shutdown_mode = "forced"`
 - `drain_and_stop()` polls until the source is exhausted then stops cleanly
 - process termination without `stop()` can replay the in-flight batch on restart (at-least-once)
-- source confirmation failures after durable checkpoint commit now fail fast by default (`PostCommitSourceConfirmPolicy::FailFast`)
+- source confirmation failures after durable checkpoint commit fail fast by default (`PostCommitSourceConfirmPolicy::FailFast`)
 
-To preserve pre-existing availability-biased behavior, opt into continue mode explicitly:
+To favour availability instead, opt into continue mode explicitly:
 
 ```rust
 use rustcdc::PostCommitSourceConfirmPolicy;
@@ -603,7 +599,7 @@ let config = config.with_post_commit_source_confirm_policy(
 
 ### Sink-Side Idempotency Guard
 
-For at-least-once replay tolerance, rustcdc now provides a built-in
+For at-least-once replay tolerance, rustcdc provides a built-in
 `EventIdempotencyGuard` helper for consumer loops.
 
 ```rust
@@ -1428,7 +1424,7 @@ keyless one (no primary key, or `REPLICA IDENTITY NOTHING`) passes.
 [`unavailable_columns`](#unavailable-columns-vec-string) names top-level columns the *source*
 could not supply, and a sink reads it as "leave this column alone". A stage that renames or
 removes a column, or gives an unavailable one a value, changes what that list means. The two
-column-manipulating transforms this crate ships now maintain it:
+column-manipulating transforms this crate ships maintain it:
 
 | Stage does | Effect on the list |
 |---|---|
@@ -1637,7 +1633,7 @@ says "decode me with schema X" while carrying bytes written under schema Y.
 mismatch does not fail to decode. It silently yields shifted fields and plausible-looking
 wrong values, arbitrarily far downstream.
 
-`ConfluentAvroEncoder::new` now verifies the registered schema is the one it will write
+`ConfluentAvroEncoder::new` verifies the registered schema is the one it will write
 with, comparing Avro **parsing canonical form** — so a registry copy differing only in
 whitespace, docs, or JSON field ordering is accepted, while a structural difference is a
 hard error naming the remedy.
@@ -1888,26 +1884,24 @@ consumer written against Debezium's key subject works unchanged.
 
 ## MariaDB Support
 
-rustcdc supports **MariaDB 10.5, 10.6, and 10.11** via the MySQL protocol stack. The
+rustcdc supports MariaDB's long-term releases ([Supported versions](@/docs/supported-versions.md))
+via the MySQL protocol stack. The
 `mysql_async` library handles the MariaDB binlog wire protocol transparently.
 rustcdc also provides a first-class `MariaDbSourceConfig` wrapper for explicit
 runtime source typing (`mariadb`) and separate checkpoint namespace handling.
 
 ### Capability Matrix
 
-| Capability                 | PostgreSQL | MySQL 8+ | MariaDB 10.5/10.6/10.11 | SQL Server |
-|----------------------------|:----------:|:--------:|:-----------------:|:----------:|
-| Full-table snapshot        | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| Resumable snapshot (keyset)| ✅        | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| CDC streaming              | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| GTID-based position        | —          | ✅        | ✅ (connector support) | —          |
-| Binlog position fallback   | —          | ✅        | ✅ (connector support) | —          |
-| TLS connections            | ✅          | ✅        | ✅ (connector support) | ✅          |
-| Transaction boundaries     | ✅          | ✅        | ✅ (validated on 10.5 and 10.6) | ✅          |
-| Schema change events       | ✅          | ✅        | ✅ | ✅          |
-
-MariaDB 10.11 currently has explicit process-crash and replay evidence coverage,
-while 10.5/10.6 are validated across the core connection and end-to-end lanes.
+| Capability                 | PostgreSQL | MySQL | MariaDB | SQL Server |
+|----------------------------|:----------:|:-----:|:-------:|:----------:|
+| Full-table snapshot        | ✅ | ✅ | ✅ | ✅ |
+| Resumable snapshot (keyset)| ✅ | ✅ | ✅ | ✅ |
+| CDC streaming              | ✅ | ✅ | ✅ | ✅ |
+| GTID-based position        | —  | ✅ | ✅ | —  |
+| Binlog position fallback   | —  | ✅ | ✅ | —  |
+| TLS connections            | ✅ | ✅ | ✅ | ✅ |
+| Transaction boundaries     | ✅ | ✅ | ✅ | ✅ |
+| Schema change events       | ✅ | ✅ | ✅ | ✅ |
 
 **Note on schema change events**: Runtime connectors emit canonical `Operation::SchemaChange` events for supported DDL capture paths. Use `rustcdc::ddl_capture` and `rustcdc::schema_history` together when building schema-aware downstream consumers.
 
@@ -1932,16 +1926,14 @@ let config = MysqlSourceConfig {
 
 ### Known Limitations
 
-- MariaDB 10.3 and earlier are **not tested** and may work with basic binlog
-  events but are unsupported.
+- Releases outside MariaDB's support window are not tested and not supported.
 - MariaDB Galera Cluster is not tested; CDC from a Galera node may exhibit
   unexpected behaviour due to write-set replication semantics.
 - `ROW_FORMAT=COMPRESSED` tables require `binlog_row_image = FULL` on the
   server; partial images are not supported.
 
-MariaDB integration evidence includes dedicated end-to-end suites for snapshot
-resume, stream CDC, and snapshot-to-stream handoff on MariaDB 10.5 and 10.6 in
-`tests/mariadb_e2e_integration.rs`, plus connection lifecycle coverage in
-`tests/mariadb_connection_integration.rs`, and process-crash replay coverage on
-MariaDB 10.11 in `tests/runtime_mariadb_process_crash_integration.rs`.
+MariaDB integration evidence: snapshot resume, stream CDC and snapshot-to-stream handoff on
+every tested release (`tests/mariadb_e2e_integration.rs`), connection lifecycle
+(`tests/mariadb_connection_integration.rs`), and process-crash replay on the newest
+(`tests/runtime_mariadb_process_crash_integration.rs`).
 

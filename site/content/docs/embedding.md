@@ -15,7 +15,7 @@ SQL Server differ only in the source config and the server prerequisites — see
 ## Prerequisites
 
 - Rust 1.97 or newer
-- A PostgreSQL 10+ server you can configure, with `wal_level = logical`
+- A [supported](@/docs/supported-versions.md) PostgreSQL server you can configure, with `wal_level = logical`
 - A role with the **`REPLICATION`** attribute, and a **direct** connection to the server — the
   default WAL transport runs `START_REPLICATION` and a pooler in transaction-pooling mode cannot
   carry it. `ALTER ROLE <user> REPLICATION;` grants it (`rds_replication` on RDS). If your
@@ -28,7 +28,7 @@ A throwaway server for this walkthrough:
 ```bash
 docker run --rm -d --name rustcdc-pg -p 5432:5432 \
   -e POSTGRES_PASSWORD=postgres \
-  postgres:16 -c wal_level=logical
+  postgres:18 -c wal_level=logical
 ```
 
 The `postgres` superuser already has `REPLICATION`. Note this container has TLS off, so the

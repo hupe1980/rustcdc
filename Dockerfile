@@ -48,6 +48,16 @@ WORKDIR /build
 # `[[bench]]` the cook stage then cannot reconstruct ("can't find `pipeline` bench").
 # Enumerating the tree was already fragile with one member; with three it is a
 # standing trap, and `.dockerignore` keeps the context small.
+# ── The operator console ──────────────────────────────────────────────────────
+# Built once on the build machine's own platform: it is static files, the same for every
+# target, and the only stage that needs Node.
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS console
+WORKDIR /ui
+COPY crates/rustcdc-server/ui/package.json crates/rustcdc-server/ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY crates/rustcdc-server/ui/ ./
+RUN npm run build
+
 FROM chef AS planner
 
 COPY . .
@@ -83,6 +93,7 @@ RUN cargo chef cook \
 # ── Build the application binary ──────────────────────────────────────────────
 # Only invalidated when source code outside of Cargo.toml / Cargo.lock changes.
 COPY . .
+COPY --from=console /ui/dist/ crates/rustcdc-server/ui/dist/
 
 # Release profile tuning (additive to Cargo.toml defaults).
 #   strip=debuginfo  — remove DWARF from the binary (-20 % typical)
@@ -94,7 +105,8 @@ ENV CARGO_PROFILE_RELEASE_STRIP=debuginfo \
 
 # `-p rustcdc-server`: the workspace root package is the library, and `--bin rustcdc`
 # alone would leave cargo resolving the binary across every default member.
-RUN cargo build \
+# The image ships the console: a missing bundle fails the build rather than the page.
+RUN RUSTCDC_REQUIRE_CONSOLE=1 cargo build \
         -p rustcdc-server \
         --release \
         --bin rustcdc \

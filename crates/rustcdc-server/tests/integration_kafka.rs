@@ -34,6 +34,9 @@
 //! build_router` and `state::build` — never through a hand-built producer. A test that
 //! constructs its own client tests the client, not the wiring where the defects live.
 
+#[path = "../../rustcdc/tests/support/matrix.rs"]
+mod matrix;
+
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -46,8 +49,6 @@ const HOST_PORT: u16 = 19092;
 
 // Pinned, not `:latest`: the suite asserts broker semantics, so a broker release must be a
 // reviewed change rather than whatever the registry served on the day the suite ran.
-const REDPANDA_IMAGE: &str = "docker.redpanda.com/redpandadata/redpanda:v26.2.6";
-const KAFKA_IMAGE: &str = "apache/kafka:4.4.0";
 
 fn enabled() -> bool {
     std::env::var("RUSTCDC_INTEGRATION").as_deref() == Ok("1")
@@ -117,7 +118,10 @@ fn start_broker(broker: Broker) {
                 CONTAINER,
                 "-p",
                 &ports,
-                REDPANDA_IMAGE,
+                &format!(
+                    "docker.redpanda.com/redpandadata/redpanda:{}",
+                    matrix::full(matrix::Engine::Redpanda)
+                ),
                 "redpanda",
                 "start",
                 "--mode",
@@ -164,7 +168,7 @@ fn start_broker(broker: Broker) {
                 "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1",
                 "-e",
                 "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0",
-                KAFKA_IMAGE,
+                &format!("apache/kafka:{}", matrix::full(matrix::Engine::Kafka)),
             ])
         }
     };

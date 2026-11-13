@@ -376,8 +376,17 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build the console
+        working-directory: crates/rustcdc-server/ui
+        run: npm ci --no-audit --no-fund && npm run build
       - name: Build
         shell: bash
+        env:
+          # A release ships the console; a missing bundle fails here, not on the page.
+          RUSTCDC_REQUIRE_CONSOLE: "1"
         run: |
           set -euo pipefail
           if [ "${{ runner.os }}" = Linux ]; then build=zigbuild; else build=build; fi

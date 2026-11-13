@@ -34,9 +34,11 @@
 
 #![allow(dead_code)] // Each connector suite uses a subset of this harness.
 
+#[path = "support/artifacts.rs"]
+mod artifacts;
+
 use std::{
     fs,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering::SeqCst},
@@ -302,19 +304,8 @@ pub fn assert_sample_is_meaningful(summary: &LatencySummary, min_samples: u64) {
 /// where nothing looked, and the gate failed with "missing latency artifact" about files
 /// that had just been written.
 ///
-/// `current_exe()` is `<target>/<profile>/deps/<test>-<hash>`, so three levels up is the
-/// target directory itself — correct for any profile and any `CARGO_TARGET_DIR`.
 fn workspace_target_dir() -> rustcdc::Result<std::path::PathBuf> {
-    let exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
-    exe.parent()
-        .and_then(|deps| deps.parent())
-        .and_then(|profile| profile.parent())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            rustcdc::Error::StateError(
-                "cannot locate the target directory from the test executable".into(),
-            )
-        })
+    Ok(artifacts::target_dir())
 }
 
 #[cfg(test)]

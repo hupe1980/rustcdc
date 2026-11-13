@@ -1,5 +1,8 @@
 #![cfg(feature = "mysql")]
 
+#[path = "support/matrix.rs"]
+mod matrix;
+
 use rustcdc::TransportConfig;
 use rustcdc::{MysqlConnection, MysqlSourceConfig, source::Source};
 use testcontainers::{
@@ -92,39 +95,13 @@ async fn run_mysql_connection_lifecycle(version: &str, server_id: u32) -> rustcd
     Ok(())
 }
 
-macro_rules! mysql_connection_test {
-    ($name:ident, $version:literal, $server_id:literal, $label:literal) => {
-        #[tokio::test]
-        async fn $name() -> rustcdc::Result<()> {
-            if skip_mysql_version_matrix_case($label) {
-                return Ok(());
-            }
-            run_mysql_connection_lifecycle($version, $server_id).await
-        }
-    };
-}
-
-mysql_connection_test!(
-    mysql_connection_8_0_matrix,
-    "8.0",
-    301,
-    "mysql 8.0 version matrix connection test"
-);
-
-mysql_connection_test!(
-    mysql_connection_8_4_matrix,
-    "8.4",
-    302,
-    "mysql 8.4 version matrix connection test"
-);
-
 #[tokio::test]
 async fn mysql_capabilities_are_consistent_in_matrix_profile() -> rustcdc::Result<()> {
     if skip_mysql_version_matrix_case("mysql capability matrix test") {
         return Ok(());
     }
 
-    let container = GenericImage::new("mysql", "8.4")
+    let container = GenericImage::new("mysql", matrix::full(matrix::Engine::Mysql))
         .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
@@ -182,5 +159,18 @@ async fn mysql_capabilities_are_consistent_in_matrix_profile() -> rustcdc::Resul
     assert!(caps.schema_introspection);
 
     connection.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mysql_connection_every_tested_version_matrix() -> rustcdc::Result<()> {
+    if skip_mysql_version_matrix_case("mysql version matrix connection test") {
+        return Ok(());
+    }
+    for (server_id, tag) in (301..).zip(matrix::tested(matrix::Engine::Mysql)) {
+        run_mysql_connection_lifecycle(tag, server_id)
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(format!("mysql {tag}: {error}")))?;
+    }
     Ok(())
 }

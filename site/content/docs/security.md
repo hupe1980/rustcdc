@@ -42,8 +42,7 @@ called out here rather than left to be discovered:
   comparison is constant-time.
 - **The server nonce is checked to extend the client nonce**, which is what makes a
   replayed or substituted server-first message fail. The client nonce is 24 bytes from
-  rustls's CSPRNG — no separate RNG dependency was added, so there is one secure random
-  source to audit rather than two.
+  rustls's CSPRNG, so there is one secure random source to audit rather than two.
 - **`SCRAM-SHA-256-PLUS` (TLS channel binding) is not implemented.** The residual risk is a
   downgrade: an attacker positioned to intercept could advertise only `SCRAM-SHA-256`. That
   position already requires a certificate chaining to a trusted root for the right hostname,

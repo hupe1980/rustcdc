@@ -32,8 +32,7 @@ async fn sqlserver_connector_latency_evidence_stream_commit_percentiles() -> rus
     }
 
     let container =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),

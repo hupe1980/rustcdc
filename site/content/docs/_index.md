@@ -60,6 +60,8 @@ These pages cover both. Where something applies to only one, the page says so at
 |---|---|
 | [Getting started](@/docs/getting-started.md) | Run the server against a database in about ten minutes |
 | [Embedding the library](@/docs/embedding.md) | Build a pipeline inside your own Rust binary |
+| [Supported versions](@/docs/supported-versions.md) | Which database releases every release is tested against |
+| [Console](@/docs/console.md) | Health, snapshots and activity in the browser, at `/ui` |
 | [Core concepts](@/docs/concepts.md) | The event model, delivery contracts, lifecycle |
 | [Architecture](@/docs/architecture.md) | Capture, the commit barrier and checkpointing — how they fit |
 
@@ -96,6 +98,7 @@ These pages cover both. Where something applies to only one, the page says so at
 |---|---|
 | [Deployment](@/docs/deployment.md) | Kubernetes, health wiring, resource shape |
 | [Operations](@/docs/operations.md) | CLI, probes, metrics, replay |
+| [Performance](@/docs/performance.md) | Measured rows/s and latency, PostgreSQL → Kafka, and how to reproduce it |
 | [Incident runbook](@/docs/runbook.md) | Symptom → diagnosis → resolution, for the server |
 | [Embedded pipelines](@/docs/embedded-operations.md) | Alert thresholds and recovery when you own the process |
 | [Troubleshooting](@/docs/troubleshooting.md) | Organised by symptom |

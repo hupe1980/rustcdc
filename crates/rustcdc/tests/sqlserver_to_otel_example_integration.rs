@@ -1,5 +1,8 @@
 #![cfg(feature = "sqlserver")]
 
+#[path = "support/artifacts.rs"]
+mod artifacts;
+
 use std::{
     io,
     process::{Command, Stdio},
@@ -79,8 +82,7 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
 
     let sqlserver =
-        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::SQLSERVER_2022).await
-        {
+        match sqlserver_testkit::start_sqlserver_container(sqlserver_testkit::full_tag()).await {
             Ok(c) => c,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),
@@ -309,18 +311,8 @@ async fn sqlserver_to_otel_example_runs_and_emits_logs_and_traces() -> rustcdc::
 /// not exist. The failure surfaces as a bare `No such file or directory` from `spawn`,
 /// naming nothing.
 ///
-/// `current_exe()` is `<target>/<profile>/deps/<test>-<hash>`, so two levels up is the
-/// profile directory whatever the profile is and wherever `CARGO_TARGET_DIR` points.
 fn example_binary(name: &str) -> rustcdc::Result<std::path::PathBuf> {
-    let test_exe = std::env::current_exe().map_err(rustcdc::Error::IoError)?;
-    let profile_dir = test_exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .ok_or_else(|| {
-            rustcdc::Error::StateError("cannot locate the target profile directory".into())
-        })?;
-
-    let candidate = profile_dir.join("examples").join(name);
+    let candidate = artifacts::profile_dir().join("examples").join(name);
     if !candidate.exists() {
         return Err(rustcdc::Error::StateError(format!(
             "example binary not found at {}; `cargo build --example {name}` must run first",

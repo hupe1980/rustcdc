@@ -176,7 +176,7 @@ harness = false
 # End-to-end runtime throughput. Deliberately free of `required-features`: the whole point
 # is a number for the default build, and gating it behind a connector would mean the one
 # benchmark an operator quotes is the one most builds cannot run.
-name = "throughput"
+name = "runtime_throughput"
 harness = false
 
 [[bench]]

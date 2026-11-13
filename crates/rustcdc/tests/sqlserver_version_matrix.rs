@@ -44,19 +44,6 @@ async fn run_sqlserver_connection_lifecycle(image_tag: &str) -> rustcdc::Result<
     Ok(())
 }
 
-macro_rules! sqlserver_connection_test {
-    ($name:ident, $image_tag:expr, $label:literal) => {
-        #[tokio::test]
-        async fn $name() -> rustcdc::Result<()> {
-            if skip_sqlserver_version_matrix_case($label) {
-                return Ok(());
-            }
-
-            run_sqlserver_connection_lifecycle($image_tag).await
-        }
-    };
-}
-
 async fn connect_with_retry(connection: &SqlServerConnection) -> rustcdc::Result<()> {
     let mut last_error = None;
     for _ in 0..60 {
@@ -74,24 +61,6 @@ async fn connect_with_retry(connection: &SqlServerConnection) -> rustcdc::Result
     }))
 }
 
-sqlserver_connection_test!(
-    sqlserver_connection_2019,
-    sqlserver_testkit::SQLSERVER_2019,
-    "sqlserver 2019 connection integration test"
-);
-
-sqlserver_connection_test!(
-    sqlserver_connection_2022,
-    sqlserver_testkit::SQLSERVER_2022,
-    "sqlserver 2022 connection integration test"
-);
-
-sqlserver_connection_test!(
-    sqlserver_connection_2025,
-    sqlserver_testkit::SQLSERVER_2025,
-    "sqlserver 2025 connection integration test"
-);
-
 /// Verify CDC connector capabilities are consistent across SQL Server versions
 #[tokio::test]
 async fn sqlserver_cdc_capabilities_are_consistent() -> rustcdc::Result<()> {
@@ -101,7 +70,7 @@ async fn sqlserver_cdc_capabilities_are_consistent() -> rustcdc::Result<()> {
 
     let database = "rustcdc_connection";
     let (config, _container) =
-        match sqlserver_base_config(sqlserver_testkit::SQLSERVER_2022, database).await {
+        match sqlserver_base_config(sqlserver_testkit::full_tag(), database).await {
             Ok(r) => r,
             Err(ref e) if sqlserver_testkit::is_skip_error(e) => return Ok(()),
             Err(e) => return Err(e),
@@ -130,5 +99,18 @@ async fn sqlserver_cdc_capabilities_are_consistent() -> rustcdc::Result<()> {
     );
 
     connection.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlserver_connection_every_tested_version() -> rustcdc::Result<()> {
+    if skip_sqlserver_version_matrix_case("sqlserver connection integration test") {
+        return Ok(());
+    }
+    for tag in sqlserver_testkit::tested_tags() {
+        run_sqlserver_connection_lifecycle(tag)
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(format!("sqlserver {tag}: {error}")))?;
+    }
     Ok(())
 }

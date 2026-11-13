@@ -1884,7 +1884,7 @@ checksum = "6f34b169b8cbbaed2b4995205f1d02d7eac4b2771df5479255fe5483e1334a39"
 
 [[package]]
 name = "crash-workers"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "rustcdc",
  "tokio",
@@ -3940,9 +3940,9 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.29.0"
+version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19061a83b10619985cf9ba76a93fb4d842fdbc7c7963b849a5a29b383ed7a6b0"
+checksum = "9e2a0d607735a0297596b3207377a754d48a366f76711b440179326c641b511d"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -3957,6 +3957,7 @@ dependencies = [
  "parking_lot",
  "pbkdf2",
  "rand 0.9.5",
+ "regex-lite",
  "rustls",
  "rustls-native-certs",
  "ruzstd",
@@ -6311,7 +6312,7 @@ dependencies = [
 
 [[package]]
 name = "rustcdc"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "ahash",
@@ -6364,7 +6365,7 @@ dependencies = [
 
 [[package]]
 name = "rustcdc-server"
-version = "0.20.1"
+version = "0.21.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -9402,7 +9403,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.20.1"
+version = "0.21.0"
 
 [[package]]
 name = "xxhash-rust"

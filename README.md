@@ -22,7 +22,7 @@ Both are built and tested from this repository, against each other, at one versi
 | | | |
 |---|---|---|
 | **[`rustcdc`](crates/rustcdc/)** | A **library** you link into your own binary. You own the loop, the sink and the process. | [crates.io](https://crates.io/crates/rustcdc) · [guide](https://hupe1980.github.io/rustcdc/docs/) · [README](crates/rustcdc/README.md) |
-| **[`rustcdc-server`](crates/rustcdc-server/)** | A configured **binary and container image**: TOML in, Kafka / Iceberg / Snowflake / Databricks / HTTP / files out, with an admin API, Prometheus metrics and OTLP traces. | [ghcr.io](https://github.com/hupe1980/rustcdc/pkgs/container/rustcdc-server) · [docs](https://hupe1980.github.io/rustcdc/docs/) · [README](crates/rustcdc-server/README.md) |
+| **[`rustcdc-server`](crates/rustcdc-server/)** | A configured **binary and container image**: TOML in, Kafka / Iceberg / Snowflake / Databricks / HTTP / files out, with an operator [console](https://hupe1980.github.io/rustcdc/docs/console/), an admin API, Prometheus metrics and OTLP traces. | [ghcr.io](https://github.com/hupe1980/rustcdc/pkgs/container/rustcdc-server) · [docs](https://hupe1980.github.io/rustcdc/docs/) · [README](crates/rustcdc-server/README.md) |
 
 If you want change data capture **running**, take the server. If you want it **inside
 something you are building**, take the crate. The server is the crate plus configuration,
@@ -30,6 +30,7 @@ sinks, state backends and an operational surface — not a second implementation
 
 ```bash
 # The server, against a seeded PostgreSQL, streaming to your terminal
+# (the console is at https://localhost:8080/ui)
 docker compose -f demo/compose.yml up --build
 
 # The server binary, via Homebrew (macOS Apple Silicon, Linux x86_64 / arm64)
@@ -79,7 +80,8 @@ and each one is listed in [CHANGELOG.md](CHANGELOG.md) with the migration it req
 
 Validated by library and server unit tests, compiled documentation samples,
 deterministic-replay golden fixtures and container-backed integration suites against real
-PostgreSQL, MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka.
+PostgreSQL, MySQL, MariaDB, SQL Server, Apicurio, Redpanda and Apache Kafka — every release
+inside its vendor's support window ([Supported versions](https://hupe1980.github.io/rustcdc/docs/supported-versions/)).
 
 ## Building it
 
