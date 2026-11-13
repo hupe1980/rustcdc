@@ -1392,10 +1392,9 @@ impl AckToken {
     ///
     /// # There is no remainder token
     ///
-    /// This used to return `(accepted, Option<remainder>)`, and the remainder was a
-    /// loaded gun: acknowledging it claimed events the caller had, by construction,
-    /// just declined to process, and the checkpoint advanced past them. Both callers
-    /// in this repository discarded it.
+    /// A remainder token would be a loaded gun: acknowledging it claims events the caller
+    /// has, by construction, just declined to process, and the checkpoint advances past
+    /// them.
     ///
     /// The uncommitted tail is **redelivered** by the next
     /// [`CdcRuntime::poll_event_batch`] with a fresh token, which is the only way to
@@ -1510,10 +1509,9 @@ pub struct EventBatch {
     /// Index of the first event in this batch within `events`.
     ///
     /// A redelivered batch is the *uncommitted suffix* of an in-flight delivery. Taking
-    /// that suffix used to deep-clone the whole slice on every re-poll; sharing the
-    /// `Arc` and carrying an offset makes redelivery allocation-free. The repository's
-    /// own `benches/cdc_perf.rs` benchmarked exactly this trade-off and showed the
-    /// shared-view variant faster — the result was simply never applied to production.
+    /// that suffix by cloning would deep-copy the slice on every re-poll; sharing the
+    /// `Arc` and carrying an offset makes redelivery allocation-free. `benches/cdc_perf.rs`
+    /// benchmarks this trade-off.
     offset: usize,
     ack_token: Option<AckToken>,
 }
@@ -1743,11 +1741,11 @@ pub enum TransformErrorPolicy {
 
 /// What the runtime does with an event that fails envelope validation at ingress.
 ///
-/// Validation runs *before* a sink ever sees the event, so a permanently invalid event was
-/// previously unreachable by the dead-letter handler: the poll returned `Err` and the
-/// pipeline stopped. Because the source's durable position cannot advance past an event
-/// that was never accepted, a restart replayed the same record and stopped again — an
-/// unrecoverable loop whose only exits were data loss or disabling validation entirely.
+/// Validation runs *before* a sink ever sees the event, so without a policy a permanently
+/// invalid event never reaches the dead-letter handler: the poll returns `Err` and the
+/// pipeline stops. The source's durable position cannot advance past an event that was
+/// never accepted, so a restart replays the same record and stops again — an
+/// unrecoverable loop whose only exits are data loss or disabling validation entirely.
 ///
 /// [`Quarantine`](ValidationErrorPolicy::Quarantine) closes that: the offending event is
 /// routed to the dead-letter handler and the pipeline advances past it.
@@ -4726,13 +4724,13 @@ mod tests {
 
     /// A `confirm_lsn` failure must never become a *silent* stall.
     ///
-    /// Previously: the source kept replaying already-committed events, the idempotency
-    /// guard suppressed all of them (they were fingerprinted on the first pass), and
-    /// every poll returned `EventBatch::empty()` while liveness and readiness both
-    /// reported healthy — an unbounded no-progress loop that accumulated WAL on the
-    /// PostgreSQL primary with no error, no metric, and no log above `debug`.
+    /// Otherwise the source keeps replaying already-committed events, the idempotency
+    /// guard suppresses all of them (they were fingerprinted on the first pass), and
+    /// every poll returns `EventBatch::empty()` while liveness and readiness both report
+    /// healthy — an unbounded no-progress loop that accumulates WAL on the PostgreSQL
+    /// primary with no error, no metric, and no log above `debug`.
     ///
-    /// Now the runtime retains the unconfirmed LSN, retries it before dedup runs on
+    /// So the runtime retains the unconfirmed LSN, retries it before dedup runs on
     /// each poll, reports `readiness: false` while it is outstanding, and escalates to
     /// a hard `Unrecoverable` error once the no-progress loop is demonstrated.
     #[cfg(feature = "postgres")]
@@ -4820,12 +4818,9 @@ mod tests {
 
     /// Connector-emitted schema-change events must land in the durable schema history.
     ///
-    /// Previously `record_ddl` had exactly one caller (`capture_ddl_statement`), which
-    /// itself had no non-test callers — so the schema history was never populated in
-    /// any production path, while `start()` nonetheless refused to run without a
-    /// retention policy for it. The connectors synthesize `Operation::SchemaChange`
-    /// events directly, so the runtime now records them where every connector's events
-    /// converge.
+    /// The connectors synthesize `Operation::SchemaChange` events directly rather than
+    /// calling `capture_ddl_statement`, so the runtime records them where every
+    /// connector's events converge — otherwise no production path populates the history.
     #[tokio::test]
     async fn connector_schema_change_events_populate_the_schema_history() {
         use crate::core::Operation;
@@ -4958,10 +4953,9 @@ mod tests {
 
     /// Backpressure must be its own `ErrorKind`, not `Terminal`.
     ///
-    /// It previously surfaced as `StateError` → `ErrorKind::Terminal`, documented as
-    /// "a permanent problem that retrying will not resolve" — so an embedder following
-    /// the crate's own retry guidance would shut the pipeline down on routine flow
-    /// control.
+    /// `Terminal` is documented as "a permanent problem that retrying will not resolve",
+    /// so an embedder following the crate's own retry guidance would shut the pipeline
+    /// down on routine flow control.
     #[tokio::test]
     async fn buffer_full_reports_backpressure_not_terminal() {
         let checkpoint = InMemoryCheckpoint::default();
@@ -5145,11 +5139,10 @@ mod tests {
     /// documentation's promise actually had to be taken on faith.
     #[tokio::test]
     async fn a_custom_sources_resume_position_reaches_the_checkpoint() {
-        // `build_checkpoint_offset` used to read `event.source.offset` directly on the
-        // generic path, so a custom connector implementing `resume_offset_for` — the one
-        // hook that exists for a log filtering at transaction granularity — had its
-        // correct answer discarded. It then took the guaranteed duplicate-per-restart the
-        // PostgreSQL connector was fixed for, with no way to tell from the outside.
+        // `build_checkpoint_offset` must consult `resume_offset_for` on the generic path,
+        // not read `event.source.offset` directly: that hook is how a log filtering at
+        // transaction granularity avoids a guaranteed duplicate per restart, and
+        // discarding its answer is invisible from the outside.
         struct CustomResumeStream;
 
         #[async_trait::async_trait]
@@ -5492,9 +5485,9 @@ mod tests {
             "a disabled source has nothing to hand over"
         );
 
-        // The poll happened, so the poll timestamp must have moved. This is the defect:
-        // it was written only on the path that delivered events, so an idle source left
-        // it frozen at the last event while the loop kept turning.
+        // The poll happened, so the poll timestamp must have moved — written only on the
+        // path that delivers events, an idle source would leave it frozen at the last
+        // event while the loop kept turning.
         let polled_at = runtime.last_poll_at_ms.expect("polls have happened");
         assert!(
             polled_at > long_ago,
@@ -6337,9 +6330,8 @@ mod tests {
 
     /// A masking rule that never fires must reach the metrics endpoint, not just a log.
     ///
-    /// A rule with zero hits means a column is shipping in clear text. Before this, the
-    /// only way to see it was to call an accessor at shutdown — something an operator has
-    /// to go looking for rather than something that pages them.
+    /// A rule with zero hits means a column is shipping in clear text, which must page an
+    /// operator rather than wait for them to call an accessor at shutdown.
     #[tokio::test]
     async fn unmatched_transform_rules_reach_the_admin_surface() {
         use crate::transform::{MaskHashConfig, MaskHashTransform, MaskRule};

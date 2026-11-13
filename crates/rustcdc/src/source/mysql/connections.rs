@@ -35,7 +35,7 @@ use super::MysqlSourceConfig;
 
 /// A source of MySQL connections: pooled, or freshly authenticated per connection.
 ///
-/// Cloneable and cheap to clone, so it drops into the places a `Pool` used to live.
+/// Cloneable and cheap to clone, like a `Pool`.
 #[derive(Clone)]
 pub(super) struct MysqlConnections {
     inner: Arc<Mode>,

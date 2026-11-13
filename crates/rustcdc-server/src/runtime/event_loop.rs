@@ -182,15 +182,11 @@ pub(crate) async fn wait_for_admin_exit(rx: &mut Option<tokio::sync::watch::Rece
 ///
 /// # Why this is a struct and not an `async fn`
 ///
-/// It used to be `async fn shutdown_signal()`, awaited fresh inside the event loop's
-/// `select!` — which called `signal::unix::signal(..)` on **every iteration**. A tokio
-/// `Signal` is a receiver, not a query: a signal delivered while no receiver is registered
-/// is dropped, and every loop iteration dropped the previous registration and built a new
-/// one. SIGTERM was therefore only honoured if it arrived in the window where the select
-/// happened to be parked — so `kill` on a busy pipeline did nothing, systemd and Kubernetes
-/// hit their grace period and sent SIGKILL, the checkpoint was never flushed and the owner
-/// lease was never released, leaving the successor to wait out the full lease TTL before it
-/// could start.
+/// A tokio `Signal` is a receiver, not a query: a signal delivered while no receiver is
+/// registered is dropped. An `async fn` awaited fresh in the event loop's `select!` would
+/// re-register on every iteration, so SIGTERM on a busy pipeline would mostly be lost —
+/// the orchestrator sends SIGKILL after its grace period, the checkpoint is never flushed,
+/// and the successor waits out the full owner-lease TTL.
 ///
 /// Installed once and polled by reference, the registration outlives every iteration and
 /// there is no window. [`Self::recv`] is cancel-safe, which is what lets it sit in a

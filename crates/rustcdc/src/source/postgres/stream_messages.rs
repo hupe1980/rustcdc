@@ -127,16 +127,9 @@ impl PostgresStreamHandle {
         let mut map = serde_json::Map::new();
         let mut unavailable = Vec::new();
         for (i, value) in values.iter().enumerate() {
-            // A tuple with more columns than the cached RELATION means our schema view
-            // is stale — the table gained a column and we missed (or have not yet
-            // processed) the new RELATION message.
-            //
-            // This used to fall back to the literal name `"?"`. Because the row is
-            // assembled into a `serde_json::Map`, *every* overflow column collapsed
-            // onto that one key and overwrote the previous one — silent, unlogged data
-            // destruction. Failing is the only safe response: the alternative is
-            // emitting a row that claims to be complete while having quietly discarded
-            // columns.
+            // More columns than the cached RELATION means our schema view is stale. Fail:
+            // any placeholder name would collapse the extra columns onto one JSON key and
+            // emit a row that looks complete while it has lost values.
             let Some(column) = relation.columns.get(i) else {
                 return Err(Error::SourceError(format!(
                     "postgres tuple for relation '{}.{}' (oid {}) has {} values but the \
@@ -840,9 +833,8 @@ impl PostgresStreamHandle {
                         // RELATION's OID and modifier, which resolves enums and domains by
                         // name.
                         //
-                        // `M` is no longer here: it is decoded when
-                        // `capture_logical_messages` is set, and the server does not send
-                        // it otherwise.
+                        // `M` is not here: it is decoded when `capture_logical_messages` is
+                        // set, and the server does not send it otherwise.
                         other => {
                             if self.warned_unknown_messages.insert(other) {
                                 tracing::warn!(

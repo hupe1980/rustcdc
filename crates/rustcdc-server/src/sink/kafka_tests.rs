@@ -814,8 +814,8 @@ async fn pipelined_sends_reach_the_partition_in_submission_order() {
 
     let mut cfg = sample_kafka_config(&broker.bootstrap_servers(), topic);
     cfg.max_pipelined_sends = 256;
-    // A non-zero linger is the case that used to be unusable: it forces records to
-    // coalesce in the accumulator, which is exactly where a reordering would happen.
+    // A non-zero linger forces records to coalesce in the accumulator, which is exactly
+    // where a reordering would happen.
     cfg.linger_ms = 5;
     let mut sink = KafkaSink::new(&cfg).await.expect("kafka sink");
 
@@ -1254,11 +1254,9 @@ async fn aborting_before_the_window_drains_publishes_nothing() {
 
 // ── Sink error classification ────────────────────────────────────────────
 
-/// Every Kafka failure used to map to `SourceError`, which classifies as Transient.
-/// A record the broker rejects permanently was therefore retried until the circuit
-/// breaker killed the process — and then failed identically after the restart, on the
-/// same record, forever. The dead-letter queue could not help, because its branch
-/// only runs for a non-recoverable error and this sink never produced one.
+/// A record the broker rejects permanently must not classify as Transient: it would be
+/// retried until the circuit breaker killed the process, then fail identically after the
+/// restart, forever. The dead-letter queue only runs for a non-recoverable error.
 #[test]
 fn a_poison_record_is_quarantinable_not_retriable() {
     let error = krafka::error::KrafkaError::Broker {
@@ -1452,17 +1450,9 @@ async fn fake_broker_reinit_fences_the_previous_producer_epoch() {
 
 /// `linger_ms` must default to 0.
 ///
-/// **This comment used to describe the opposite of what the code does.** It said the
-/// sink awaited each record's broker confirmation before returning from
-/// `send_encoded`, so a batch could never accumulate and every record paid the full
-/// linger alone — capping throughput at `1000 / linger_ms` events per second. That
-/// was true before `send_encoded` began pipelining into [`SendWindow`], and
-/// `KafkaSinkConfig::linger_ms` has said so ever since; this comment did not, and a
-/// design proposal built a durability argument on it.
-///
-/// What is actually true: `send_encoded` returns once the record is in the
-/// accumulator, and acknowledgements are collected by the window or by `flush`. The
-/// default is still 0 because CDC consumers are latency-sensitive, not because
+/// `send_encoded` does not await each record's broker confirmation: it returns once the
+/// record is in the accumulator, and acknowledgements are collected by [`SendWindow`] or
+/// by `flush`. The default is 0 because CDC consumers are latency-sensitive, not because
 /// linger is charged per record. The assertion below measures exactly that.
 #[tokio::test]
 async fn linger_is_not_charged_per_record_at_the_default() {

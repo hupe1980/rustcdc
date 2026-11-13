@@ -3100,9 +3100,8 @@ fn slo_reasons(data: &AdminStateData) -> Vec<String> {
 ///
 /// Deliberately not inside the `slo` object: a verdict is not a service-level indicator,
 /// it is the headline answer, and §1 of the runbook opens by telling an operator to curl
-/// this endpoint. Until it was added, the verdict was reachable only by scraping
-/// `/metrics` and grepping a one-hot gauge — for the single field that says whether the
-/// pipeline is working.
+/// this endpoint rather than scrape `/metrics` and grep a one-hot gauge for the single
+/// field that says whether the pipeline is working.
 ///
 /// `stall_cause` is the stable discriminant rather than the prose: it is what routes a
 /// page and what `/readyz` reports. `stalled_for_seconds` is how long *this* condition
@@ -3456,8 +3455,7 @@ async fn openapi_document(
     // It stays **unauthenticated** — it describes the shape of the API rather than any of
     // this instance's state, carries no configuration, and requiring a credential to
     // discover how to authenticate is a loop. But unauthenticated and unmetered are
-    // different things, and this was briefly both: it was the only route that was neither
-    // authorised nor limited while serving ~10 KB of freshly-built JSON, which is a cheap
+    // different things: unlimited, ~10 KB of freshly-built JSON per request is a cheap
     // asymmetric-cost request against a process that is also running the pipeline.
     //
     // Shares the `Status` scope rather than adding a fourth limiter: the budget an operator

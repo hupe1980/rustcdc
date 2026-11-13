@@ -94,11 +94,8 @@ impl Default for MaskHashConfig {
     /// Creates a configuration that **leaves all fields unchanged** unless
     /// they are explicitly listed in `mask_rules`.
     ///
-    /// # Behaviour change
-    /// Earlier versions defaulted `default_rule` to `MaskRule::UnsaltedSha256`, which
-    /// silently hashed every field not mentioned in `mask_rules`.  This has
-    /// been changed to `MaskRule::Passthrough` to eliminate unexpected data
-    /// loss.  Use [`MaskHashConfig::hash_all`] to restore the old behaviour.
+    /// `default_rule` is `MaskRule::Passthrough`: silently hashing every unlisted field
+    /// would be unexpected data loss. Use [`MaskHashConfig::hash_all`] to hash them.
     fn default() -> Self {
         Self {
             mask_rules: HashMap::new(),
@@ -336,18 +333,16 @@ impl MaskHashTransform {
     ) -> Result<()> {
         // A rule targeting a container applies to the container as a whole.
         //
-        // Previously only the scalar arm consulted `mask_rules`, so a rule on an
-        // object- or array-valued field was accepted at construction and then did
-        // nothing. That is a silent PII leak in exactly the case operators most expect
-        // to be covered: a `jsonb` column such as `profile` holding `{"ssn": ...,
-        // "dob": ...}` masked with a rule on `"profile"` passed straight through.
+        // Otherwise a rule on an object- or array-valued field is accepted at
+        // construction and then does nothing — a silent PII leak in exactly the case
+        // operators most expect to be covered: a `jsonb` column such as `profile` holding
+        // `{"ssn": ..., "dob": ...}` masked with a rule on `"profile"`.
         //
-        // Arrays were worse: elements address as `emails.0`, `emails.1`, … so covering
-        // a variable-length array required enumerating indices the operator cannot know
-        // in advance, and a row with three emails leaked the third.
+        // Array elements address as `emails.0`, `emails.1`, … so per-element rules would
+        // require enumerating indices the operator cannot know in advance.
         //
         // Checking here first means a container rule masks the whole subtree; without a
-        // container rule the walk descends as before, so per-leaf rules still work.
+        // container rule the walk descends, so per-leaf rules still work.
         if !path.is_empty()
             && matches!(value, Value::Object(_) | Value::Array(_))
             && let Some(rule) = self.config.mask_rules.get(path.as_str())
@@ -687,10 +682,9 @@ mod tests {
 
     /// A rule on an object- or array-valued field must actually apply.
     ///
-    /// Previously only the scalar arm consulted `mask_rules`, so such a rule was
-    /// accepted at construction and then silently did nothing — a PII leak in exactly
-    /// the case operators most expect to be covered (a `jsonb` column of PII masked by
-    /// naming the column).
+    /// Otherwise such a rule is accepted at construction and then silently does nothing —
+    /// a PII leak in exactly the case operators most expect to be covered (a `jsonb`
+    /// column of PII masked by naming the column).
     #[tokio::test]
     async fn mask_rule_on_a_container_field_is_applied() {
         let mut config = MaskHashConfig::default();

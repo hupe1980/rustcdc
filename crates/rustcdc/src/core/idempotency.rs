@@ -188,11 +188,9 @@ fn event_is_identifiable(event: &Event) -> bool {
             event.op,
             crate::core::Operation::Truncate | crate::core::Operation::SchemaChange
         )
-        // Delegated rather than reimplemented. This function used to walk the key columns
-        // itself, which made it the *third* place in the crate answering "does this event
-        // have a usable key" — and a previous audit found a silent-corruption bug in
-        // exactly that shape, where two of those answers disagreed. One implementation
-        // means they cannot.
+        // Delegated rather than reimplemented: two answers to "does this event have a
+        // usable key" that disagree are a silent-corruption bug. One implementation means
+        // they cannot.
         || event.has_resolvable_key()
 }
 

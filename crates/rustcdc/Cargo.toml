@@ -103,8 +103,7 @@ apicurio = ["schemreg", "schemreg/apicurio"]
 glue = ["schemreg", "schemreg/glue"]
 
 [dependencies]
-# Anonymous spill files for streamed PostgreSQL transactions: unlinked at creation, so no
-# exit, however abrupt, leaves one behind.
+# Spill files for streamed PostgreSQL transactions, deleted at creation so a crash leaves none.
 tempfile = { version = "3.23.0", optional = true }
 # 0.1.92 minimum: 0.1.91 and earlier push `#[must_use]` onto every generated method, which
 # nightly clippy now rejects as `double_must_use` on the boxed-future return type.

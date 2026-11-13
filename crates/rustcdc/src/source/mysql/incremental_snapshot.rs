@@ -489,8 +489,8 @@ fn mysql_row_to_json(row: &mysql_async::Row) -> serde_json::Value {
 
 /// Convert a chunk-read value using the connector's single shared rule.
 ///
-/// This module used to carry its own near-identical copy, which is how two paths of the
-/// same connector can drift on something as load-bearing as the JSON type of a column.
+/// Not a local copy: two paths of the same connector could then drift on something as
+/// load-bearing as the JSON type of a column.
 use super::query::mysql_value_to_json;
 
 #[cfg(test)]

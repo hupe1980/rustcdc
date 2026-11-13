@@ -529,13 +529,10 @@ mod tests {
         assert!(!lock_path.exists());
     }
 
-    /// Same process acquiring the same path twice must succeed (re-entrant).
+    /// Dropping the lease removes the sentinel file. A second in-process `acquire` is
+    /// refused — see `a_second_instance_in_this_process_is_refused`.
     #[test]
     fn dropping_the_lease_removes_the_sentinel_file() {
-        // This test previously asserted that a second in-process `acquire` succeeded
-        // ("re-entrant"), which was the mechanism by which two store instances
-        // silently destroyed each other's records. A second acquire is now refused —
-        // see `a_second_instance_in_this_process_is_refused`.
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("test.owner");
         let lease = acquire(&lock_path, "test").unwrap();

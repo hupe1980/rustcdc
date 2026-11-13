@@ -59,6 +59,11 @@ ERROR source error: failed to connect to mysql: timeout
 ERROR source error: connection to sqlserver closed unexpectedly
 ```
 
+A host that resolves to several addresses (`localhost` → `127.0.0.1` and `::1`) is tried address
+by address, and the PostgreSQL connector reports the **first server's answer**: a rejected
+password surfaces as SQLSTATE `28P01`, not as a refused connection on a later address. A
+"connection refused" therefore means no server answered.
+
 **Diagnosis Checklist:**
 
 1. **Verify network connectivity:**

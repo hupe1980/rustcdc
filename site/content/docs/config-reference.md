@@ -487,7 +487,7 @@ carry a full column list, so a path that skipped the filter would hand an operat
 allow-listed one table the schema of every other table in the publication, binlog or
 `cdc.change_tables`. All three connectors apply the filter there:
 
-| Connector | Where the schema event comes from | Now filtered |
+| Connector | Where the schema event comes from | Filtered |
 |---|---|---|
 | PostgreSQL | a changed pgoutput `RELATION` message | yes — the relation *cache* still tracks every table, because the decoder needs it to attribute rows |
 | MySQL / MariaDB | a captured DDL statement in the binlog | yes — the binlog position still advances, or the statement would replay forever |
@@ -656,32 +656,31 @@ needs `SqlPeek`.
 > with `ssl = off` — a config that says TLS and delivers cleartext, visible only in a packet
 > capture. A server that refuses TLS fails the connection.
 
-### Large transactions spill on the server
+### Large transactions
 
-The connector negotiates pgoutput **`proto_version '1'`**, so PostgreSQL buffers a transaction's
-decoded output **server-side** until it commits. Past `logical_decoding_work_mem` (default
-**64 MB**) the surplus is written under `pg_replslot/<slot>/`, and nothing is delivered until
-`COMMIT` — a bulk `UPDATE` over millions of rows means disk churn on the primary, then a burst.
+On PostgreSQL 14+ under `StreamingReplication`, the connector negotiates pgoutput
+**`proto_version '2'`** with `streaming 'on'`: a transaction past the server's
+`logical_decoding_work_mem` (default **64 MB**) is streamed while it runs and held by the
+connector — in memory up to `stream_buffer_memory_bytes`, then in an anonymous file under
+`stream_spill_directory` — until it commits. Rows are released only at the commit and dropped on
+abort, so a sink receives the same events either way. Details:
+[Large transactions](@/docs/connectors/postgres.md#large-transactions).
 
-Bounded and observable:
+With `stream_in_progress_transactions = false`, under `SqlPeek`, or on PostgreSQL 13 and older,
+the connector negotiates **`proto_version '1'`**. PostgreSQL then buffers the transaction
+**server-side** until it commits, writing the surplus past `logical_decoding_work_mem` under
+`pg_replslot/<slot>/`, and nothing is delivered until `COMMIT` — a bulk `UPDATE` over millions
+of rows means disk churn on the primary, then a burst. Observable:
 
 ```sql
-SELECT slot_name, spill_txns, spill_count, spill_bytes
+SELECT slot_name, spill_txns, spill_bytes, stream_txns, stream_bytes
 FROM   pg_stat_replication_slots;   -- PostgreSQL 14+
 ```
 
-Mitigations, in order of preference: keep source transactions small (the only one that removes
-the cost rather than moving it); raise `logical_decoding_work_mem` (it is per-walsender, so
-budget it against concurrent replication connections); alert on `spill_bytes` *growth* rather
-than its level.
+Either way a committed transaction is delivered as one unit, so its events are held in memory
+while it is. Keeping source transactions small is the only mitigation that removes that cost.
 
-`proto_version '2'` (PostgreSQL 14+) would let the server stream an in-progress transaction
-instead of spilling it. rustcdc does not negotiate it, and the decoder **rejects** v2 and v3
-messages rather than skipping them: v2 moves the buffering to the client, which must then hold
-each transaction until `Stream Commit` and *discard* it on `Stream Abort`. Mishandling that abort
-emits changes the source rolled back. Debezium's pgoutput decoder negotiates `proto_version 1`
-too, so this is a shared frontier rather than a gap — and rejecting the tags means a plugin
-mismatch is loud instead of a silent misreading of transaction boundaries.
+Two-phase commit (v3) is not negotiated: a prepared transaction is decoded at `COMMIT PREPARED`.
 
 ### Secret Loading Patterns
 

@@ -74,6 +74,11 @@ slot_idle_advance_interval_ms      = 30000   # idle WAL advance; 0 disables
 # How the WAL stream is read — see the connector guide before changing this
 wal_transport = "streaming_replication"   # streaming_replication | sql_peek
 
+# Large transactions on PostgreSQL 14+: streamed while they run, released at the commit
+stream_in_progress_transactions = true       # false asks for pgoutput v1
+stream_buffer_memory_bytes      = 67108864   # past it, a transaction spills to disk
+# stream_spill_directory        = "/var/lib/rustcdc/spill"   # defaults to the system temp dir
+
 stream_poll_interval_ms = 100
 max_events_per_poll     = 1000
 

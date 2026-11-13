@@ -2148,8 +2148,7 @@ impl TransactionMetadata {
 ///
 /// [`Event`] is `#[non_exhaustive]`, so downstream crates construct it through this
 /// builder rather than a struct literal. That is deliberate: adding a field to the
-/// envelope is then a non-breaking change, where previously every new field broke every
-/// construction site — including the ones in this crate's own published examples.
+/// envelope is then a non-breaking change rather than a break at every construction site.
 ///
 /// The builder sets `envelope_version` for you. Getting that constant wrong by hand is
 /// not a compile error but makes the event fail validation at the far end of the

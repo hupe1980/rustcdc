@@ -1615,8 +1615,7 @@ async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_res
     // ── First run: consume roughly half the table, then stop abruptly ─────────
     //
     // `save_position` stands in for the crash: it is what a wrapper calls on SIGTERM, and
-    // it is the exact call that used to persist the stream offset while dropping the
-    // chunk cursor.
+    // it must persist the chunk cursor along with the stream offset.
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let stop_after = (row_count / 2) as usize;
 

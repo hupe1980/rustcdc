@@ -2,14 +2,13 @@
 //!
 //! # Why the names are asserted rather than merely observed
 //!
-//! This suite used to expect `rustcdc_events_processed_total` — a name that appears in no
-//! document and that only the OTLP path ever produced. The text exposition emitted
-//! `rustcdc_runtime_events_polled_total`, which is what the runbook, config reference and
-//! troubleshooting guide all reference. So every alert an operator copied from the docs matched
-//! nothing on the OTLP path, and this test confirmed the divergence instead of catching it.
+//! The runbook, config reference and troubleshooting guide reference the text-exposition
+//! names, such as `rustcdc_runtime_events_polled_total`. If the OTLP path produced other names,
+//! every alert an operator copied from the docs would match nothing there, and a test that
+//! merely observed the output would confirm the divergence instead of catching it.
 //!
-//! The names below are therefore the documented contract, and the test also asserts the old
-//! names are *absent*, so the two surfaces cannot drift apart again.
+//! The names below are therefore the documented contract, and the test also asserts
+//! divergent names such as `rustcdc_events_processed_total` are *absent*.
 
 #![cfg(feature = "metrics")]
 

@@ -508,11 +508,6 @@ fn shutdown(mut child: Child) {
 }
 
 /// `SIGTERM` via `kill(1)` — no libc dependency for one signal.
-///
-/// This was `unsafe fn libc_kill`, called from an `unsafe` block, despite spawning a
-/// process and doing nothing unsafe whatsoever. The name and the keyword were left over
-/// from a libc-based version that no longer exists; nothing flagged them because the
-/// crate's `unsafe_code` lint was never actually applied (see `Cargo.toml`).
 #[cfg(unix)]
 fn send_sigterm(pid: i32) {
     let _ = Command::new("kill")
@@ -1122,14 +1117,10 @@ chunk_size = 2
 ///
 /// pgoutput's `RELATION` message flags each column as part of the *replica identity*, and
 /// under `REPLICA IDENTITY FULL` PostgreSQL sets that flag on every column — its own source
-/// says "all columns are sent as part of key". rustcdc read the flag as "part of the primary
-/// key" until 0.12, so every streamed event from a `FULL` table claimed a key of the whole
-/// row. Nothing short of a real pgoutput stream produces that message.
-///
-/// This fixture has used `REPLICA IDENTITY FULL` from the start — it is what gives `DELETE`
-/// a full before-image — so it was capturing the defect all along without asserting on it. A
-/// manual run against 0.11 emitted `"primary_key":["id","note"]` for a table whose key is
-/// `id`.
+/// says "all columns are sent as part of key". Reading the flag as "part of the primary key"
+/// makes every streamed event from a `FULL` table claim a key of the whole row, e.g.
+/// `"primary_key":["id","note"]` for a table whose key is `id`. Nothing short of a real
+/// pgoutput stream produces that message.
 ///
 /// # What it costs when it is wrong
 ///

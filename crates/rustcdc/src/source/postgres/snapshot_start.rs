@@ -208,8 +208,7 @@ impl SnapshotAnchor {
                 .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .await
                 .map_err(PgError::from)?;
-            // One statement: the watermark and the snapshot are taken together, as the reader
-            // took them when it read the watermark first.
+            // One statement: the watermark and the snapshot are taken together.
             let row = client
                 .query_one(
                     "SELECT pg_current_wal_lsn()::text, pg_export_snapshot()",

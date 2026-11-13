@@ -3,8 +3,8 @@
 //! # Why this is generated rather than a file in the repo
 //!
 //! The control plane is a product surface — ten endpoints, two token scopes, a signal
-//! vocabulary, an SSE stream — and it was documented only in prose. A consumer could not
-//! generate a client, and nothing checked that the prose still matched the router.
+//! vocabulary, an SSE stream. Prose alone lets no consumer generate a client, and nothing
+//! checks that it still matches the router.
 //!
 //! A hand-written `openapi.yaml` beside the source would have the same problem one commit
 //! later. So the document is built here, in the same crate as the handlers, and

@@ -92,23 +92,14 @@ const SENSITIVE_KEY_NAME_TOKENS: &[&str] = &[
 /// answers "which variable holds my token?" and "which identity provider am I talking
 /// to?"; blanking those pushes them to read the config file off the disk instead, which is
 /// worse for security, not better.
-///
-/// The treatment used to be visibly arbitrary rather than chosen: `read_token_env` and
-/// `password_env` were redacted while `audit_signing_key_env` was not — the difference being
-/// only which substrings happened to be in the token list.
 const NON_SECRET_KEY_NAME_EXCEPTIONS: &[&str] = &[
     // An OAuth token *endpoint* is a URL. Any credential inside it is stripped by the
     // value-driven URL rule, which is the right instrument for a URL — and blanking the
     // endpoint hides which identity provider the server is talking to.
     //
-    // This list held four more entries — `public_key_hex`, `trusted_public_keys_hex`,
-    // `trusted_signer_public_keys_hex`, `revoked_signer_public_keys_hex`, `signature_hex` —
-    // and **every one of them was a no-op**. They exempt names that no token in
-    // `SENSITIVE_KEY_NAME_TOKENS` matches, so they changed nothing; two of them named fields
-    // that do not exist anywhere in the tree. They are the fossil of an earlier token list
-    // that contained a bare `"key"`. `every_redaction_exception_names_a_field_that_exists`
-    // now refuses both shapes: an entry for a field that is gone, and an entry that would
-    // never have fired.
+    // An entry for a name no token in `SENSITIVE_KEY_NAME_TOKENS` matches is a no-op, and
+    // `every_redaction_exception_names_a_field_that_exists` refuses it, as it refuses an
+    // entry for a field that does not exist.
     "token_endpoint",
 ];
 
@@ -337,9 +328,9 @@ mod tests {
     ///
     /// `GET /config` is where an operator answers "which variable holds my token?" and
     /// "which identity provider am I talking to?". Blanking those sends them to read the
-    /// config file off the disk instead, which is worse for security rather than better —
-    /// and the treatment used to be arbitrary: `read_token_env` was redacted while
-    /// `audit_signing_key_env` was not.
+    /// config file off the disk instead, which is worse for security rather than better.
+    /// Every `*_env` name is treated alike, `read_token_env` and `audit_signing_key_env`
+    /// included.
     #[test]
     fn names_of_variables_and_endpoints_survive_redaction() {
         let out = super::redact_secrets(
@@ -378,11 +369,9 @@ mod tests {
     /// The shape here is the **post-migration, flat** one — `source.password`, not
     /// `source.postgres.password`.
     ///
-    /// This test used to assert against the nested shape, which `normalize_source`
-    /// flattens away before anything is serialised. It exercised a document
-    /// `redacted_config_snapshot` can never produce, so it passed while proving
-    /// nothing about production. `redacts_a_real_app_config` below is the guard
-    /// against that happening again.
+    /// `normalize_source` flattens the nested shape away before anything is serialised, so
+    /// asserting against it would exercise a document `redacted_config_snapshot` can never
+    /// produce. `redacts_a_real_app_config` below guards that.
     #[test]
     fn redacts_schema_sensitive_fields_in_the_flat_source_shape() {
         let input = r#"{

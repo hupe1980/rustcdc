@@ -176,9 +176,8 @@ mod tests {
 
     #[test]
     fn the_primary_key_becomes_a_constraint_without_touching_nullability() {
-        // The regression this pins: `nullable` used to be `!is_primary_key`, so a
-        // `NOT NULL` non-key column was published as nullable and a nullable key was
-        // impossible to express.
+        // Deriving `nullable` as `!is_primary_key` would publish a `NOT NULL` non-key
+        // column as nullable and make a nullable key impossible to express.
         let columns = vec![
             column("id", "bigint", false),
             column("email", "character varying(320)", false),

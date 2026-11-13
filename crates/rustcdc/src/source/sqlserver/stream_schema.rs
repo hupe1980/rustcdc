@@ -16,10 +16,9 @@ impl SqlServerStreamHandle {
 
     /// Describe a capture instance's table from the metadata read at stream start.
     ///
-    /// Every column used to be published with the literal type `"sqlserver_captured"` and
-    /// a `nullable` flag derived from the primary key — a placeholder and an inference,
-    /// where a consumer decoding text values needs the declaration. Both now come from
-    /// `sys.columns` through the capture instance; see
+    /// A consumer decoding text values needs the declared type and nullability, not a
+    /// placeholder and an inference from the primary key. Both come from `sys.columns`
+    /// through the capture instance; see
     /// [`load_captured_columns_for_instance`](super::load_captured_columns_for_instance).
     fn table_schema_from_meta(meta: &CaptureInstanceMeta) -> TableSchema {
         table_schema_from_catalog(

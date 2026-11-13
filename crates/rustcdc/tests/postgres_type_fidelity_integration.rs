@@ -348,9 +348,9 @@ async fn postgres_replica_identity_default_reports_key_only_before_image() -> ru
     // This UPDATE changes `name`, not the key, so under DEFAULT pgoutput sends neither an
     // `O` nor a `K` old tuple and there is genuinely no pre-image.
     //
-    // Asserted unconditionally. This was previously guarded behind `if let Some(before)`,
-    // which meant the case it was written to cover — an absent pre-image — skipped the
-    // block entirely and the test passed while the runtime rejected the very same event.
+    // Asserted unconditionally: behind `if let Some(before)`, the case this covers — an
+    // absent pre-image — would skip the block entirely and the test would pass while the
+    // runtime rejected the very same event.
     assert_eq!(
         update.before,
         BeforeImage::Unavailable,

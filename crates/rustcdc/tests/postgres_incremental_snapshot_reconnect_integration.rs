@@ -4,16 +4,15 @@
 //! per-table chunk cursors and reports them through `StreamHandle::incremental_snapshot_state`,
 //! which is what puts those cursors into every checkpoint record.
 //!
-//! The runtime's reconnect path used to rebuild the stream with a plain `start_stream`, losing
-//! the driver. That did two damaging things at once, neither of them visible:
+//! A reconnect path that rebuilt the stream with a plain `start_stream` would lose the driver,
+//! with two damaging effects, neither of them visible:
 //!
-//! 1. The snapshot **stopped progressing** — no further chunk was ever read, so it never
-//!    completed.
+//! 1. The snapshot **stops progressing** — no further chunk is read, so it never completes.
 //! 2. A plain stream reports no snapshot state, so every checkpoint written after the reconnect
-//!    **erased the progress record**. A later restart then found no snapshot in flight at all,
-//!    and the un-read tables were neither resumed nor reported missing.
+//!    **erases the progress record**. A later restart finds no snapshot in flight at all, and
+//!    the un-read tables are neither resumed nor reported missing.
 //!
-//! Any transient network error during a snapshot reached that path, and a snapshot of a large
+//! Any transient network error during a snapshot reaches that path, and a snapshot of a large
 //! table is a long window. This test provokes the disconnect the way production does — the
 //! walsender goes away — and asserts the snapshot still finishes.
 //!

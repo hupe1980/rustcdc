@@ -35,9 +35,9 @@ pub(crate) async fn handle_polled_batch(
     let token_present = ack_mode.is_required();
     // Deliver the batch, retrying the **same events** under the recovery policy.
     //
-    // Sink failures used to be unconditionally terminal while source failures got
-    // backoff and a circuit breaker, so a few-second broker leader election became a
-    // process exit and a full replay from the last checkpoint. The retry happens here,
+    // Sink failures get the same backoff and circuit breaker as source failures; were they
+    // terminal, a few-second broker leader election would be a process exit and a full
+    // replay from the last checkpoint. The retry happens here,
     // holding the batch, rather than by returning to the poll loop: the events have
     // already been taken from the runtime, and returning without committing would let
     // the next poll advance past them.

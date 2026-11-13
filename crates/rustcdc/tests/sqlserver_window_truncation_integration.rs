@@ -7,16 +7,15 @@
 //! page — the "truncation cursor". Rows beyond it are dropped from the batch and re-read
 //! on the next poll.
 //!
-//! That cursor used to be a local variable in the fill path, applied only if the buffer
-//! happened to drain in the same poll. With two or more capture instances a window
-//! routinely produces more events than one poll returns, so the buffer did *not* drain
-//! there: the cursor was discarded, and the deferred `advance_window()` at the eventual
-//! drain point moved the window past the unread remainder. Those rows were gone —
-//! permanently, silently, with `events_polled` still reporting a plausible count.
+//! With two or more capture instances a window routinely produces more events than one
+//! poll returns, so the buffer does *not* drain in the poll that filled it. A cursor held
+//! only in the fill path would be discarded, and the deferred `advance_window()` at the
+//! eventual drain point would move the window past the unread remainder — permanently,
+//! silently, with `events_polled` still reporting a plausible count.
 //!
-//! The reproduction needs three things together, which is why no existing suite caught
-//! it: **two** capture instances, a `max_events_per_poll` small enough to truncate, and
-//! enough rows in one window that the retained prefix still spans more than one page.
+//! The reproduction needs three things together: **two** capture instances, a
+//! `max_events_per_poll` small enough to truncate, and enough rows in one window that the
+//! retained prefix still spans more than one page.
 
 #![cfg(feature = "sqlserver")]
 

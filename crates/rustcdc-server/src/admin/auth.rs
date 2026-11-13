@@ -1,9 +1,8 @@
 //! Admin API authentication: token sources, scopes, and the manifest loader.
 //!
-//! Split out of `admin/mod.rs` so the code that decides whether a request is allowed can
-//! be read — and reviewed — without the several thousand lines of handlers and metrics it
-//! used to sit among. Everything that answers "is this caller permitted?" is in this file
-//! and nowhere else.
+//! Separate from `admin/mod.rs` so the code that decides whether a request is allowed can
+//! be read — and reviewed — without the handlers and metrics. Everything that answers "is
+//! this caller permitted?" is in this file and nowhere else.
 
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};

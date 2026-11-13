@@ -402,10 +402,10 @@ async fn preserve_transactions_never_delivers_a_partial_transaction() -> Result<
         "withholding must defer events to the next batch, never drop them"
     );
     // This test is also the wedge guard. The runtime drains its queued events before
-    // polling the source, so withholding an entire batch used to mean the rest of the
-    // transaction could never arrive: the same events were re-cut and re-withheld
-    // forever. If that regresses, this test stops making progress and fails on the
-    // delivered count rather than hanging.
+    // polling the source, so withholding an entire batch can wedge it: the rest of the
+    // transaction never arrives and the same events are re-cut and re-withheld forever.
+    // If that happens, this test stops making progress and fails on the delivered count
+    // rather than hanging.
     Ok(())
 }
 

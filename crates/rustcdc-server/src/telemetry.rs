@@ -10,7 +10,7 @@ use crate::error::AppError;
 // RAII guard
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returned by [`init`].  Hold it alive for the duration of `main`; it
+/// Returned by [`init_with_metrics`].  Hold it alive for the duration of `main`; it
 /// flushes and shuts down the OTel trace and metrics exporters on drop.
 pub struct TelemetryGuard {
     tracer_provider: Option<SdkTracerProvider>,
@@ -38,11 +38,9 @@ impl Drop for TelemetryGuard {
 
 /// Everything the OTLP exporters need, in one value.
 ///
-/// Previously seven positional arguments that `main` unpacked field by field from
-/// `ObservabilityConfig`, with the eighth — the insecure-transport override — smuggled in
-/// through a bare `std::env::var` inside the validator. One struct built by
-/// `From<&ObservabilityConfig>` means adding a setting is a field, not a signature change,
-/// and there is exactly one place that decides what telemetry is configured with.
+/// One struct built by `From<&ObservabilityConfig>` means adding a setting is a field, not a
+/// signature change, and there is exactly one place that decides what telemetry is
+/// configured with.
 #[derive(Debug, Clone)]
 pub struct OtlpOptions {
     /// Traces endpoint. `None` disables trace export.
@@ -53,7 +51,7 @@ pub struct OtlpOptions {
     pub metrics_interval_secs: u64,
     pub protocol: OtlpProtocol,
     pub service_name: String,
-    /// Permit plaintext OTLP to a non-loopback host. See [`validate_otlp_endpoint`].
+    /// Permit plaintext OTLP to a non-loopback host. See `validate_otlp_endpoint`.
     ///
     /// Named differently from its configuration field (`observability.otlp_allow_insecure`)
     /// on purpose: `registries.*.allow_insecure` is a distinct setting, and the
@@ -352,11 +350,9 @@ fn http_signal_endpoint(endpoint: &str, signal_path: &str) -> String {
 /// spans — which carry table names, column names and source offsets — to a
 /// attacker-controlled host in the clear.
 ///
-/// The opt-in used to be the bare environment variable `OTLP_ALLOW_INSECURE=1`, read
-/// here and declared nowhere. That made a security-relevant override invisible to
-/// `validate-config`, absent from `GET /config`, unreachable by the inert-settings
-/// scanner, and impossible to see in the configuration an operator reviews. It is a
-/// configuration field now, for the same reason every other switch in this server is.
+/// The opt-in is a configuration field, not an environment variable, so the override is
+/// visible to `validate-config`, `GET /config`, the inert-settings scanner and the
+/// operator reviewing the configuration.
 fn validate_otlp_endpoint(endpoint: &str, allow_insecure: bool) -> Result<(), AppError> {
     // Allow the escape hatch for development / test environments, but emit a
     // prominent warning so this setting is never silently carried to production
@@ -506,10 +502,9 @@ mod tests {
         assert_eq!(OtlpProtocol::from_config("nonsense"), OtlpProtocol::Grpc);
     }
 
-    // These no longer need a mutex. The override used to be a process-global environment
-    // variable, so every test that touched it had to be serialised against every other —
-    // and `std::env::set_var` is a data race against any concurrent `getenv` anywhere in
-    // the binary, which no mutex in this module could prevent. It is a parameter now.
+    // No mutex: the override is a parameter, not a process-global environment variable,
+    // so these tests need no serialising and no `std::env::set_var`, which races any
+    // concurrent `getenv` in the binary.
     #[test]
     fn rejects_plaintext_remote_otlp() {
         let err = validate_otlp_endpoint("http://otel-collector.prod.example.com:4317", false)

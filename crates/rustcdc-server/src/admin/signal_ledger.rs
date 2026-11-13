@@ -78,12 +78,10 @@ pub(super) struct ProcessedSignalLedger {
 
 /// Take the ledger lock, recovering a poisoned one instead of panicking.
 ///
-/// This was `.expect("signal ledger mutex")` at three call sites, which turned a single
-/// panic anywhere under the lock into a permanent outage of the whole signal-ingress path:
-/// the first panic poisons the mutex, and every subsequent `contains` and `record` then
-/// panics too. `catch_unwind` in the signal worker (added for the same defect class) keeps
-/// the *process* alive, so the result was a worker that stayed up and refused every command
-/// for the rest of the run.
+/// Panicking on poison would turn a single panic under the lock into a permanent outage of
+/// the signal-ingress path: every later `contains` and `record` would panic too, and with
+/// `catch_unwind` in the signal worker keeping the process alive, the worker would stay up
+/// and refuse every command for the rest of the run.
 ///
 /// Recovery is sound here because the state is two collections and a counter with no
 /// cross-field invariant that a half-finished mutation can break: `record` inserts into the
@@ -275,8 +273,8 @@ mod tests {
             assert!(ledger.contains(&key));
         }
 
-        // The restart is the whole point: the in-memory audit ring that used to be the
-        // only dedup starts empty here, and this must not.
+        // The restart is the whole point: the in-memory audit ring starts empty here, and
+        // the ledger must not.
         let reopened = ProcessedSignalLedger::open(dir.path()).expect("reopen");
         assert!(
             reopened.contains(&key),

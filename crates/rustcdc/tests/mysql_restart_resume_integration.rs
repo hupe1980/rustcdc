@@ -6,8 +6,7 @@
 //!
 //! MySQL is claimed not to need the same treatment: the binlog event header's `log_pos` is
 //! the position of the **next** event, so a checkpointed coordinate is already a boundary
-//! and `StreamHandle::resume_offset_for` can keep its default. That claim was asserted in
-//! the docs before it was measured. This measures it.
+//! and `StreamHandle::resume_offset_for` can keep its default. This measures that claim.
 #![cfg(feature = "mysql")]
 
 #[path = "support/matrix.rs"]

@@ -160,19 +160,13 @@ fn collect_unknown_keys(
     }
 }
 
-/// Reject `delivery_contract` values that were removed, naming the replacement.
-///
-/// Serde would otherwise report `unknown variant "at_most_once"` and list the valid
-/// ones, which tells an operator *what* is wrong but not *why* it went away or what to
-/// do — and the why matters here, because `at_most_once` used to be accepted and
-/// silently behaved as `at_least_once`.
 /// The HTTP sink's private dead-letter queue moved to the top-level `[dlq]` section.
 ///
 /// Quarantining is a pipeline concern: every sink needs it, and whether an event is
 /// permanently undeliverable is decided by the error classification rather than by the
-/// transport. Leaving the old key to be silently ignored would have been the worst
-/// outcome — an operator who configured a DLQ would get none, and would not find out
-/// until the first poison event took the pipeline down.
+/// transport. Ignoring the old key silently would leave an operator who configured a DLQ
+/// with none, and they would not find out until the first poison event took the pipeline
+/// down.
 fn reject_relocated_http_dlq(raw: &serde_json::Value) -> Result<(), ConfigError> {
     let uses_old_key = |sink: &serde_json::Value| -> bool {
         sink.get("dlq_path").is_some() || sink.get("dlq_max_bytes").is_some()
@@ -266,6 +260,11 @@ fn reject_uncompiled_source_driver(raw: &serde_json::Value) -> Result<(), Config
     )))
 }
 
+/// Reject `delivery_contract` values that were removed, naming the replacement.
+///
+/// Serde would otherwise report `unknown variant "at_most_once"` and list the valid
+/// ones, which tells an operator *what* is wrong but not *why* it went away or what to
+/// do — and a configuration naming `at_most_once` has been receiving at-least-once.
 fn reject_removed_delivery_contracts(raw: &serde_json::Value) -> Result<(), ConfigError> {
     if raw
         .get("delivery_contract")
@@ -1207,13 +1206,12 @@ fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
 ///
 /// Rejecting the alternatives is the point. Any other state backend is a second durability
 /// domain, so the batch and the position that describes it commit separately and a crash
-/// between them replays the batch — the exact window this contract is chosen to avoid. The
-/// combination used to be accepted and the residual window documented; requiring the
-/// backend instead turns a caveat an operator has to read into a configuration they cannot
-/// express.
+/// between them replays the batch — the exact window this contract is chosen to avoid.
+/// Requiring the backend turns a caveat an operator has to read into a configuration they
+/// cannot express.
 ///
-/// `path` names the transactional sink the way the operator wrote it, because it is no
-/// longer necessarily `[sink]` — a `[[sinks]]` entry can be the one carrying the
+/// `path` names the transactional sink the way the operator wrote it, because it is not
+/// necessarily `[sink]` — a `[[sinks]]` entry can be the one carrying the
 /// transaction.
 fn validate_effectively_once_state_backend(
     path: &str,

@@ -58,10 +58,9 @@ fn build_crash_worker(bin: &str, feature: &str) -> rustcdc::Result<()> {
 
 /// Locate the helper binary a process-crash suite kills, building it if absent.
 ///
-/// The caller passes only the binary and the feature that gates it. Everything else is
-/// derived: the four call sites used to spell out the `cargo build` command in a
-/// not-found hint, and every one of those hints still named `-p xtask` long after the
-/// workers moved to their own crate — telling a developer to run a command that fails.
+/// The caller passes only the binary and the feature that gates it. Everything else,
+/// including the `cargo build` command in the not-found hint, is derived here, so no call
+/// site can go stale and tell a developer to run a command that fails.
 pub fn resolve_crash_worker_bin(bin: &str, feature: &str) -> rustcdc::Result<PathBuf> {
     if let Some(path) = cache_get(bin)? {
         return Ok(path);

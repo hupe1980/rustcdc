@@ -183,18 +183,16 @@ impl OTelMetricsCollector {
         // (dots to underscores, `_total` appended to monotonic counters) produces **the same
         // series name** as this crate's own `/metrics` text exposition. That is not cosmetic.
         //
-        // The two surfaces used to name overlapping quantities differently — OTel emitted
-        // `rustcdc.replication_lag_ms` and `rustcdc.buffer_size`, the text exposition emitted
-        // `rustcdc_runtime_replication_lag_ms` and `rustcdc_runtime_buffer_depth` — and the
-        // runbook documents only the latter. So every alert threshold in the runbook, applied
-        // by an operator on the OTel path, matched **nothing and never fired**. An alert that
-        // silently does not fire is worse than no alert: it looks like coverage.
+        // The runbook documents the text-exposition names. If the OTel names differed, every
+        // alert threshold in the runbook, applied by an operator on the OTel path, would match
+        // **nothing and never fire** — and an alert that silently does not fire looks like
+        // coverage.
         //
         // Units are deliberately in the name rather than declared via `with_unit`. A declared
         // unit makes the Prometheus exporter append a unit suffix, which would break the
         // correspondence this comment exists to preserve — and the unit-in-name form is the
         // Prometheus convention anyway. `metric_names_match_the_prometheus_exposition` pins
-        // the mapping so it cannot drift again.
+        // the mapping so it cannot drift.
         let meter = meter_provider.meter("rustcdc");
         let instruments = MetricsInstruments {
             events_processed: meter
@@ -295,9 +293,7 @@ impl OTelMetricsCollector {
 
         if let Ok(mut state) = self.state.lock() {
             // `Operation` is a closed set, so the metric key is one of six `&'static
-            // str`s — no formatting, no allocation. This ran per event and previously
-            // cost an `op.to_string()`, a `format!` for the map key, and an
-            // `"operation".to_string()` plus a clone, all inside the mutex.
+            // str`s — no formatting, no allocation, on a per-event path inside the mutex.
             //
             // Note `Operation::to_str()` returns `&'static str` and its own docs say
             // "Prefer this over `to_string()` on hot paths" — which the hot path was
@@ -608,10 +604,9 @@ fn error_metric_class(error: &Error) -> &'static str {
 /// Maximum samples retained per in-memory histogram.
 ///
 /// The in-memory histograms exist to serve `export_metrics()` between scrapes; they
-/// are not a durable store. They previously appended one `u64` per event **forever**
-/// — only `reset()` cleared them — so a long-running pipeline leaked roughly 2.8 GB
-/// per hour at 100k events/s, on the event path. `export_metrics` also clones the
-/// whole vector per scrape, so unbounded growth made scraping progressively slower too.
+/// are not a durable store. Unbounded, one `u64` per event until `reset()` would leak
+/// roughly 2.8 GB per hour at 100k events/s, and `export_metrics` clones the whole vector
+/// per scrape, so scraping would slow progressively too.
 ///
 /// Retaining a bounded window of the most recent samples keeps p50/p95/p99 meaningful
 /// (they describe recent behaviour, which is what an operator wants) at fixed cost.
@@ -647,8 +642,7 @@ pub struct MetricsReport {
     /// Retained histogram samples keyed by metric name.
     ///
     /// **Bounded**: only the most recent samples are kept (see the collector's window
-    /// size). These previously grew one `u64` per event forever, which leaked roughly
-    /// 2.8 GB/hour at 100k events/sec.
+    /// size).
     pub histograms: HashMap<String, Vec<u64>>,
 }
 

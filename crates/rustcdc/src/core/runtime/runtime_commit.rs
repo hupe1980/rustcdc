@@ -83,12 +83,9 @@ impl CdcRuntime {
         self.observability()
             .tracer
             .trace_checkpoint_barrier("flushing");
-        // Acceptance and the durable write are one operation. Splitting them meant a
-        // checkpoint-store failure left the acceptance marks applied, so the natural
-        // retry failed with "acceptance notification exceeds pending records" forever
-        // and `stop()` refused to run — only `force_stop()`, which discards the
-        // events, could exit. `accept_and_commit` restores the pre-call state on
-        // failure, so retrying the identical `commit_ack` is correct.
+        // Acceptance and the durable write are one operation (see `accept_and_commit`),
+        // which restores the pre-call state on failure, so retrying the identical
+        // `commit_ack` is correct.
         self.commit_barrier
             .accept_and_commit(count as u64, &mut *self.config.checkpoint)
             .await
@@ -120,10 +117,8 @@ impl CdcRuntime {
 
         // Build trace ids only when a tracer will actually consume them.
         //
-        // This used to deep-clone every committed event — both `serde_json::Value`
-        // trees — solely to pass them to `trace_event_end`, whose default
-        // implementation has an empty body. In the default configuration that was a
-        // full copy of the entire batch, per commit, thrown away immediately.
+        // Otherwise the default configuration would pay for copies of the batch handed to
+        // a `trace_event_end` whose default implementation has an empty body.
         let tracing_enabled = self.observability().tracer.is_enabled();
         let committed_trace_ids: Vec<String> = if tracing_enabled {
             self.pending_delivery

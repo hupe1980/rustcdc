@@ -5,7 +5,12 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
-## Unreleased
+## 0.22.0
+
+Large PostgreSQL transactions stream while they run instead of spilling on the primary; a
+PostgreSQL snapshot stays at one point in time through a failed chunk; MariaDB 12.3 incremental
+snapshots work again; CI runs `effectively_once` end to end. **Breaking** for code that builds
+`PostgresSourceConfig` with a struct literal; see below.
 
 ### Added: large PostgreSQL transactions stream while they run
 
@@ -13,9 +18,8 @@ On PostgreSQL 14+ the connector negotiates pgoutput v2 with `streaming 'on'`. A 
 `logical_decoding_work_mem` is sent while it runs instead of being spilled to the **primary's**
 disk until its commit. rustcdc holds it — in memory up to `stream_buffer_memory_bytes`, then in
 an anonymous spill file — and releases it at the commit, so a sink receives exactly what it
-received before. A rollback drops it; `ROLLBACK TO SAVEPOINT` drops that savepoint's rows. No other
-tool in the field streams in-progress transactions: Debezium, Materialize, PeerDB, Supabase etl and
-Sequin all negotiate v1.
+received before. A rollback drops it; `ROLLBACK TO SAVEPOINT` drops that savepoint's rows. Debezium,
+Materialize, PeerDB, Supabase etl and Sequin all negotiate v1.
 
 - **Measured** (`cargo xtask pipeline-bench`, 300 000 updates held open 21 s, one machine): the
   primary spilled 106 MB to its own disk under v1 and **0 MB** under v2, and the last row reached
@@ -30,6 +34,12 @@ Sequin all negotiate v1.
   disk stops the pipeline. A crash leaves no file behind, and the slot streams the transaction
   again.
 - See [Large transactions](site/content/docs/connectors/postgres.md#large-transactions).
+- *Evidence*: the assembler's unit tests fail on a release at Stream Stop and on an ignored
+  savepoint abort. `postgres_streaming_integration` captures one workload — a savepoint rolled back
+  mid-stream, then a streamed transaction that aborts — through v2 and through `sql_peek`'s v1 and
+  requires the same events field by field, with the slots' statistics showing v2 streamed and v1
+  spilled; it fails with the savepoint abort planted out. Every supported PostgreSQL release
+  streams (`postgres_version_matrix`), and a crash mid-stream loses no committed row.
 
 ### Fixed: incremental snapshots failed on MariaDB 12.3
 
@@ -54,12 +64,25 @@ one at a later point, so a row written between the failure and the reopen was re
 and delivered again by the stream. The snapshot now exports its point in time from a second
 connection that does nothing else, and every reader transaction — the first and any reopened —
 imports it. If that connection cannot open or is ended (`idle_in_transaction_session_timeout`), the
-snapshot continues as before and logs a WARN saying what that costs. The snapshot uses one more
-connection while it runs. The connector page also no longer says an interrupted snapshot restarts
-from the beginning: it resumes at each table's cursor.
+snapshot continues as before and logs a WARN saying what that costs. The connector page also
+said an interrupted snapshot restarts from the beginning; it resumes at each table's cursor.
 
 - *Evidence*: the failed-chunk test inserts a row between the failure and the reopen; it was read
   on the previous tree and is not now, and it is read again with the reopen's import planted out.
+
+### Fixed: a wrong PostgreSQL password was reported as "connection refused"
+
+When the host resolves to more than one address — `localhost` on current macOS resolves to
+`127.0.0.1` and `::1` — `tokio-postgres` tries each and reports the last error, so the server's
+refusal of the password (`28P01`) on the first was replaced by a refused connection on the second,
+and an operator debugged the network instead of the credentials. The connector now tries the
+addresses itself and reports the first server's answer. `check_is_primary` opens its connection
+through the same code, so it now rejects `allow_invalid_certificates` like the connection does
+instead of ignoring it.
+
+- *Evidence*: a unit test against a scripted server refusing the password on `127.0.0.1` with
+  nothing on `::1` gets `28P01`, and a connect error with the last-error behaviour planted back;
+  `postgres_connect_errors_carry_the_servers_sqlstate`, failing on a dual-stack host before, passes.
 
 ### Added: CI runs the pipeline end to end under both contracts
 
@@ -82,22 +105,22 @@ that composes the source, the delivery contract and a transactional sink.
   theme toggle rather than only the operating system's.
 - The README shows the console.
 
-### Breaking
+### Breaking and upgrading
 
-- `PostgresSourceConfig` has three new public fields. A struct literal needs
+- **`PostgresSourceConfig` has three new public fields.** A struct literal needs
   `..PostgresSourceConfig::default()`; `RuntimeAdminSnapshot` has one more field.
+- **Streaming is on by default** on PostgreSQL 14+ over the streaming transport. Its spill
+  directory, the system temporary directory unless `stream_spill_directory` says otherwise, must be
+  writable or the stream does not open; under a read-only root filesystem mount an `emptyDir` there,
+  or set `stream_in_progress_transactions = false`.
+- **A snapshot holds one more connection** while it runs. Leave `idle_in_transaction_session_timeout`
+  unset for the CDC role, or the snapshot falls back to a later point after a failed chunk.
+- **`check_is_primary` rejects `allow_invalid_certificates`**, as connecting already did.
 
 ### Evidence
 
-- The assembler's unit tests fail on a release at Stream Stop and on an ignored savepoint abort.
-- `postgres_streaming_integration` captures one workload — a streamed transaction with a
-  savepoint rolled back mid-stream, then a streamed transaction that aborts — through v2 and
-  through `sql_peek`'s v1 and requires the same events, field by field; the slots' statistics
-  must show v2 streamed without spilling and v1 spilled. It fails with the savepoint abort planted
-  out. A held-open transaction is visible, spills past a 16 KiB budget and arrives whole.
-- `postgres_version_matrix` streams a transaction on PostgreSQL 15, 16, 17 and 18.
-- `runtime_postgres_process_crash_integration` kills rustcdc while it holds a streamed transaction
-  and loses no committed row.
+Library 1 291 and server 596 unit tests, the gate, the doc tests and every PostgreSQL, MariaDB
+(12.3 and 10.11) and MySQL container suite pass; each fix above names the test that fails without it.
 
 ## 0.21.0
 

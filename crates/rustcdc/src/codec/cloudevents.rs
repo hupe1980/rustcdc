@@ -150,10 +150,10 @@ impl EventEncoder for CloudEventsEncoder {
 
         // CloudEvents `subject` — logical entity name.
         //
-        // Delegated rather than rebuilt: this used to join the two halves itself and so
-        // rendered `Some("")` as a subject beginning with a dot, where every other consumer
-        // of the same pair — routing, filtering, log lines — treats an empty schema as
-        // absent. `Event::qualified_table_name` is that one rule.
+        // Delegated rather than rebuilt: joining the two halves here would render
+        // `Some("")` as a subject beginning with a dot, where every other consumer of the
+        // pair — routing, filtering, log lines — treats an empty schema as absent.
+        // `Event::qualified_table_name` is that one rule.
         let subject = event.qualified_table_name();
 
         // Build the `data` payload (CDC-specific fields).
@@ -179,10 +179,10 @@ impl EventEncoder for CloudEventsEncoder {
         // `unavailable_columns` exists to make, and the one a diff or a compensating write
         // depends on.
         //
-        // `before_unavailable_columns` was omitted here when it was added to the envelope, so
-        // CloudEvents consumers silently had a weaker contract than JSON, Avro and Protobuf
-        // consumers of the same stream. Only the emptiness check is conditional — the three
-        // fields are written by one loop so a fourth cannot be forgotten the same way.
+        // Omitting one here would silently give CloudEvents consumers a weaker contract than
+        // JSON, Avro and Protobuf consumers of the same stream. Only the emptiness check is
+        // conditional — the three fields are written by one loop so a fourth cannot be
+        // forgotten.
         if event.before.is_key_only() {
             data.insert("before_is_key_only".into(), json!(true));
         }

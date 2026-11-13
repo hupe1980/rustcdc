@@ -81,7 +81,8 @@ chunk_size = 5000
 ```
 
 Streaming starts immediately, and each chunk is a keyset-paginated `SELECT`
-bracketed by low/high watermarks written into the WAL. Rows the stream also
+bracketed by low/high watermarks read from `pg_current_wal_lsn()` — nothing is
+written to the source. Rows the stream also
 delivered inside the override window are reconciled by row identity, so a row
 changed mid-chunk is not delivered twice with stale content.
 
@@ -152,6 +153,11 @@ wal_transport = "streaming_replication"   # or "sql_peek"
 > one fails with *"replication slot is active for PID N"*. Under `sql_peek` nothing holds
 > the slot between polls.
 
+> **TLS is enforced, not preferred.** A connector configured with
+> `transport.mode = "tls"` against a server with `ssl = off` fails to connect instead
+> of silently falling back to an unencrypted connection. Either enable TLS on the
+> server or set `mode = "plaintext"` explicitly.
+
 ### Large transactions
 
 On PostgreSQL 14 and later the connector asks for pgoutput protocol version 2 with
@@ -195,11 +201,6 @@ changes so far, bytes, on disk or not, since when — and the [console](@/docs/c
 **Turning it off.** `stream_in_progress_transactions = false` asks for v1. `sql_peek` always
 uses v1: a peek can stop part-way through a stream and the next one starts it over, so a stream
 longer than one poll would never reach its commit.
-
-> **TLS is enforced, not preferred.** A connector configured with
-> `transport.mode = "tls"` against a server with `ssl = off` fails to connect instead
-> of silently falling back to an unencrypted connection. Either enable TLS on the
-> server or set `mode = "plaintext"` explicitly.
 
 ### Offset / LSN
 

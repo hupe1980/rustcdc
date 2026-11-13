@@ -518,11 +518,11 @@ impl CdcRuntime {
 
         // Fast path: run the whole batch through each stage in turn.
         //
-        // The pipeline used to be driven one event at a time, and because the trait was
-        // `async`, `#[async_trait]` boxed a future per stage per event — O(events × stages)
-        // heap allocations on the hottest path in the library, to await work that never
-        // yields. Batching also lets a stage amortise per-batch setup, and lets the WASM
-        // stage take its instance lock once instead of `batch.len()` times.
+        // Driven one event at a time, `#[async_trait]` would box a future per stage per
+        // event — O(events × stages) heap allocations on the hottest path in the library,
+        // to await work that never yields. Batching also lets a stage amortise per-batch
+        // setup, and lets the WASM stage take its instance lock once instead of
+        // `batch.len()` times.
         //
         // `Halt` is the default, and under it a failure aborts the batch anyway, so there
         // is nothing to attribute per event.
@@ -697,11 +697,8 @@ impl CdcRuntime {
             return Err(error);
         }
 
-        // Cut the batch on the byte budget as well as the event count.
-        //
-        // `max_event_bytes` was previously declared, defaulted, settable and documented
-        // as a flush limit — and never read. An operator setting it to protect a
-        // downstream with a hard message-size limit got no protection and no warning.
+        // Cut the batch on the byte budget as well as the event count: `max_event_bytes`
+        // is how an operator protects a downstream with a hard message-size limit.
         let max_bytes = self.config.options.max_event_bytes;
         let mut chunk = Vec::with_capacity(available.min(self.pending_source_events.len()));
         let mut chunk_bytes = 0usize;
@@ -991,14 +988,11 @@ impl CdcRuntime {
         // requires ("whatever `encode` produces has to be decodable back into a resumable
         // position by the connector that wrote it").
         //
-        // Two things this must not do. It used to JSON-encode the string, so a connector
-        // whose offset was `42` got `"42"` back on restart — quotes and all. And it used to
-        // read `event.source.offset` directly, which silently ignored
-        // `StreamHandle::resume_offset_for` on every source but PostgreSQL, even though the
-        // trait documents it as what the runtime checkpoints. A custom connector whose log
-        // filters at transaction granularity — the situation that override exists for — got
-        // the guaranteed duplicate-per-restart the PostgreSQL connector was fixed for, with
-        // its own correct implementation right there being discarded.
+        // Two things this must not do. JSON-encoding the string would hand a connector
+        // whose offset is `42` back `"42"` on restart — quotes and all. And reading
+        // `event.source.offset` directly would ignore `StreamHandle::resume_offset_for`,
+        // which the trait documents as what the runtime checkpoints: a connector whose log
+        // filters at transaction granularity would get a duplicate on every restart.
         //
         // The default returns `None` and falls back to the event's own offset, so a
         // connector that does not override it is unaffected.
@@ -1176,10 +1170,8 @@ impl CdcRuntime {
     /// The connectors synthesize `Operation::SchemaChange` events directly (PostgreSQL
     /// from a changed RELATION message, MySQL from a binlog QUERY event, SQL Server
     /// from a capture-instance metadata refresh) and hand them to the runtime like any
-    /// other event. Before this hook existed, `record_ddl` had exactly one caller —
-    /// `capture_ddl_statement` — which itself had no non-test callers, so the schema
-    /// history was **never populated in any production path** while `start()`
-    /// nonetheless hard-required a retention policy for it.
+    /// other event; none of them calls `capture_ddl_statement`, so without this hook the
+    /// schema history would **never be populated in any production path**.
     ///
     /// This is the one place every connector's events converge, so recording here
     /// makes the history real for all of them at a single site. Ordering matters and

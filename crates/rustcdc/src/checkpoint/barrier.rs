@@ -141,12 +141,11 @@ impl CommitBarrier {
 
     /// Accept `event_count` further events and durably commit the accepted prefix.
     ///
-    /// Acceptance and commit are one operation because they were previously two, and
-    /// a failure between them wedged the barrier permanently: the acceptance marks
-    /// had already been written, so the natural retry saw zero unaccepted records and
-    /// failed with *"acceptance notification exceeds pending records"* forever, while
-    /// `stop()` refused to run with events pending. The only exit was `force_stop()`,
-    /// which discards them.
+    /// Acceptance and commit are one operation because a failure between two would wedge
+    /// the barrier permanently: with the acceptance marks already written, the retry sees
+    /// zero unaccepted records and fails with *"acceptance notification exceeds pending
+    /// records"* forever, `stop()` refuses to run with events pending, and the only exit
+    /// is `force_stop()`, which discards them.
     ///
     /// On any failure this restores the exact pre-call state — acceptance marks,
     /// barrier state and committed count — so the caller can retry the identical
@@ -463,11 +462,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_durable_write_does_not_wedge_the_barrier() {
-        // Regression: acceptance used to be applied before the durable write and was
-        // not rolled back when the write failed. The retry then saw zero unaccepted
-        // records and failed with "acceptance notification exceeds pending records"
-        // forever; `add_event` also refused because the barrier stayed `Flushing`.
-        // The only exit was `force_stop()`, which discards the events.
+        // Acceptance applied before the durable write and not rolled back on failure
+        // would leave the retry seeing zero unaccepted records ("acceptance notification
+        // exceeds pending records" forever) and `add_event` refusing because the barrier
+        // stays `Flushing`. The only exit would be `force_stop()`, which discards events.
         let mut barrier = CommitBarrier::new(10);
         let mut checkpoint = FlakyCheckpoint {
             failures_remaining: std::sync::atomic::AtomicUsize::new(1),

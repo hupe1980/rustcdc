@@ -1042,7 +1042,8 @@ value — silently.
 - **MySQL** overrides it with executed-GTID **set difference**, because `Executed_Gtid_Set` is
   updated after the engine commit while the binlog coordinate advances before it. A GTID set is
   only *partially* ordered, so no `>` comparison could express this. Requires `gtid_mode = ON`;
-  without it, the ordinal test and its documented residual window apply.
+  without it, and on every MariaDB release, the ordinal test and its documented residual window
+  apply.
 - **SQL Server** takes the default, because its watermark already lags visibility.
 
 **Both bounds must come from the same notion of order.** Mixing them — a set-based lower bound with
@@ -1487,14 +1488,13 @@ assert_eq!(
 
 Several client libraries have a `Display` that names the operation and leaves the real cause
 behind `source()`. `tokio_postgres::Error` renders as *"error connecting to server"* whether
-the socket was refused, DNS failed, or the handshake timed out — so a connector that
-formatted it with `{error}` threw away the one detail that distinguishes them.
+the socket was refused, DNS failed, or the handshake timed out — formatting it with `{error}`
+drops the one detail that distinguishes them.
 
 `render_error_chain` walks the foreign chain when flattening, and the connectors use it:
 
 ```text
-before: postgres tls connection failed: error connecting to server
-after:  postgres tls connection failed: error connecting to server: Connection refused (os error 61)
+postgres tls connection failed: error connecting to server: Connection refused (os error 61)
 ```
 
 ## Schema Registries

@@ -429,10 +429,9 @@ impl LiveMysqlBinlogProvider {
         // after a failover silently reads the wrong data. GTID coordinates are globally
         // meaningful, which is the whole reason GTIDs exist.
         //
-        // Previously `with_gtid()` was called but `with_gtid_set()` never was. An empty
-        // sid_block makes mysql_common clear `BINLOG_THROUGH_GTID`, so the server fell
-        // back to file+pos — GTID mode was effectively a validation flag that positioned
-        // nothing. Encoding is delegated to `mysql_common`, which owns the
+        // `with_gtid()` alone is not enough: an empty sid_block makes mysql_common clear
+        // `BINLOG_THROUGH_GTID`, and the server falls back to file+pos, so the GTID set
+        // must be passed too. Encoding is delegated to `mysql_common`, which owns the
         // COM_BINLOG_DUMP_GTID wire format including the 8.4 tagged-GTID encoding.
         if gtid_mode_enabled {
             request = request.with_gtid();
@@ -2317,12 +2316,12 @@ mod tests {
         // Regression: `binlog_transaction_compression = ON` (MySQL 8.0.20+) writes a
         // whole transaction as one zstd `Transaction_payload_event`. `mysql_async`
         // decompresses it transparently and hands back the inner events, whose headers
-        // carry `log_pos = 0` — they were never written to the file individually. The
-        // position tracker used to assign that zero, so every commit inside a compressed
-        // transaction checkpointed at `<file>:0`. The server rejects a dump request below
-        // position 4 outright, so a restart after any compressed transaction could not
-        // resume; the checkpoint's monotonicity check does not catch it because the
-        // committed-event count still advances.
+        // carry `log_pos = 0` — they were never written to the file individually. A
+        // position tracker that assigned that zero would checkpoint every commit inside a
+        // compressed transaction at `<file>:0`. The server rejects a dump request below
+        // position 4 outright, so a restart could not resume; the checkpoint's
+        // monotonicity check does not catch it because the committed-event count still
+        // advances.
         //
         // This walks the exact header sequence such a transaction produces.
         const PAYLOAD_END: u32 = 4_242;
@@ -3229,8 +3228,8 @@ mod tests {
     #[tokio::test]
     async fn a_ddl_statement_on_an_excluded_table_is_not_emitted_but_still_advances_the_position() {
         // Two separable obligations. The statement carries the table's full column list,
-        // so an excluded table must not produce an event — this path used to bypass the
-        // include/exclude lists that every row event goes through. The binlog position
+        // so an excluded table must not produce an event — the same include/exclude lists
+        // apply as to every row event. The binlog position
         // moved regardless, so it must still be recorded, or the checkpoint would replay
         // the DDL forever.
         let mut captured = extract_captured_ddl(
@@ -3894,11 +3893,10 @@ mod tests {
 
     /// A GTID checkpoint must accumulate a **set**, never collapse to one GTID.
     ///
-    /// The stream previously assigned `stream.gtid = <single gtid>` on every GtidEvent,
-    /// overwriting the executed set read at startup. A connector that began at
-    /// `uuid:1-500` and processed one more transaction checkpointed `uuid:501` —
-    /// resuming from which tells the server the replica executed only transaction 501,
-    /// replaying 1–500 as a silent mass duplication.
+    /// Overwriting the executed set read at startup with each GtidEvent's single GTID
+    /// would checkpoint `uuid:501` for a connector that began at `uuid:1-500` — resuming
+    /// from which tells the server the replica executed only transaction 501, replaying
+    /// 1–500 as a silent mass duplication.
     #[test]
     fn gtid_merge_accumulates_a_set_instead_of_overwriting() {
         use super::query::merge_gtid_into_set;
@@ -4090,8 +4088,8 @@ mod tests {
     #[test]
     fn mariadb_gtid_event_decodes_to_domain_server_sequence() {
         // `mysql_common`'s EventType enum stops below MariaDB's 160-164 range, so
-        // `read_data()` returns Ok(None) and these events used to vanish entirely —
-        // leaving the MariaDB checkpoint with no GTID at all, i.e. a binlog file and
+        // `read_data()` returns Ok(None); dropping these events would leave the MariaDB
+        // checkpoint with no GTID at all, i.e. a binlog file and
         // position, which is server-local and resumes somewhere unrelated after a
         // failover.
         let body = mariadb_gtid_body(100, 0, 0);
@@ -4150,10 +4148,9 @@ mod tests {
 
     #[test]
     fn a_non_empty_batch_stops_once_the_caller_budget_is_spent() {
-        // This is the fix: batch assembly used to be bounded only by max_events_per_poll,
-        // so under a continuous writer the first event of a 1,000-event batch waited for
-        // the other 999 — hundreds of milliseconds the caller's max_poll_wait_ms was
-        // supposed to bound.
+        // Bounded only by max_events_per_poll, under a continuous writer the first event
+        // of a 1,000-event batch would wait for the other 999 — hundreds of milliseconds
+        // the caller's max_poll_wait_ms is supposed to bound.
         assert_eq!(binlog_read_timeout(1, Duration::ZERO, 50), None);
         assert_eq!(binlog_read_timeout(999, Duration::ZERO, 50), None);
     }

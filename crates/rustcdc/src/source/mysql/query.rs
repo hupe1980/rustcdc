@@ -104,12 +104,11 @@ pub(super) fn format_gtid(sid: [u8; 16], gno: u64) -> String {
 ///
 /// This is the difference between a resumable checkpoint and a catastrophic one.
 ///
-/// The stream previously did `stream.gtid = <single gtid>` on every `GtidEvent`,
-/// **overwriting** the executed-set read at startup. So a connector that began at
-/// `uuid:1-500` and processed one more transaction checkpointed `uuid:501` — discarding
-/// all history. Resuming from that tells the server the replica has executed *only*
-/// transaction 501, and it replays 1–500: a mass duplication of everything before the
-/// restart point, silently.
+/// Assigning `stream.gtid = <single gtid>` on every `GtidEvent` would **overwrite** the
+/// executed set read at startup, so a connector that began at `uuid:1-500` and processed
+/// one more transaction would checkpoint `uuid:501`. Resuming from that tells the server
+/// the replica has executed *only* transaction 501, and it replays 1–500: a silent mass
+/// duplication of everything before the restart point.
 ///
 /// Intervals are coalesced so the set stays compact over a long-running stream —
 /// consecutive transactions collapse into one range rather than accumulating one entry
@@ -262,9 +261,9 @@ const MYSQL_BINARY_CHARSET: u16 = 63;
 /// result-set path gets the collation id straight from the column-definition packet. So this
 /// is a lookup, not arithmetic, and it cannot drift from the library's own reading.
 ///
-/// A charset of `0` means the metadata was absent, which is treated as text — the behaviour
-/// before this existed. `binlog_row_metadata = FULL` is already required for column names and
-/// key flags, so present is the normal case.
+/// A charset of `0` means the metadata was absent, which is treated as text.
+/// `binlog_row_metadata = FULL` is already required for column names and key flags, so
+/// present is the normal case.
 fn is_binary_column(column_type: ColumnType, charset: u16) -> bool {
     column_type.is_character_type() && charset == MYSQL_BINARY_CHARSET
 }
@@ -794,7 +793,7 @@ mod binary_column_tests {
     /// indistinguishable from a `VARBINARY` holding those four bytes.
     #[test]
     fn a_binary_column_is_hex_encoded_whatever_its_bytes_happen_to_be() {
-        // Valid UTF-8 in a binary column: used to arrive as text.
+        // Valid UTF-8 in a binary column must not arrive as text.
         assert_eq!(
             mysql_value_to_json_for_column(
                 &bytes(b"hello"),

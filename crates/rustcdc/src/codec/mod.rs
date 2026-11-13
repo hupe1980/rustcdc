@@ -411,11 +411,8 @@ impl Codec for BoxedCodec {
 /// defeat them. Their `encode` is therefore `async`, which fits neither [`Codec`] nor
 /// [`EventEncoder`].
 ///
-/// Before this trait, a sink that wanted to hold "some codec" could not hold all three
-/// Confluent formats behind one type: `ConfluentAvroEncoder` reached [`BoxedCodec`] via
-/// [`EncoderCodec`], while `ConfluentJsonSchemaEncoder` and `ConfluentProtobufEncoder`
-/// sat outside the type system entirely, and every embedder hand-rolled the same
-/// three-variant dispatch enum. `AsyncCodec` is that enum, once, in the library.
+/// `AsyncCodec` lets a sink hold all three Confluent formats behind one type, so no
+/// embedder has to hand-roll the same three-variant dispatch enum.
 ///
 /// (The Confluent encoders are named as plain code rather than linked: they live behind
 /// the `schemreg` feature, and an intra-doc link from this ungated trait to a gated item

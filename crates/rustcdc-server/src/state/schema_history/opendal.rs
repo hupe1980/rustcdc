@@ -212,8 +212,8 @@ mod tests {
 
     /// The schema-history operator must target the **schema-history** table.
     ///
-    /// It was built against `checkpoint_table`, so the configured `schema_history_table`
-    /// did nothing and both artifacts shared one table. A config round-trip test cannot
+    /// Built against `checkpoint_table`, the configured `schema_history_table` would do
+    /// nothing and both artifacts would share one table. A config round-trip test cannot
     /// catch that — the value parses either way; the operator is where the setting either
     /// takes effect or does not, so that is what this asserts.
     ///

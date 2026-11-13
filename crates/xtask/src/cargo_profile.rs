@@ -2,19 +2,10 @@
 //!
 //! # Why this one is in Rust
 //!
-//! It was in shell, and it did not work. The profile name was extracted with gawk's
-//! three-argument `match($0, /…/, arr)`, which is a GNU extension: on BSD awk — that is,
-//! on macOS — the whole program is a syntax error, awk exits immediately, `|| true`
-//! swallows the failure, and the check reports success having read nothing.
-//!
-//! It was therefore silently vacuous for every developer not on Linux, and it stayed that
-//! way through a change that added the exact `[profile.bench] debug-assertions = true`
-//! it exists to reject. The bug was invisible precisely because the check was *about*
-//! something rarely edited: nobody noticed a gate that never fired.
-//!
-//! A check whose correctness depends on which `awk` is installed cannot be trusted by the
-//! people it is meant to protect. This version is compiled, runs identically everywhere,
-//! and — unlike the shell — has tests, including one that plants the violation.
+//! A shell version depends on which `awk` is installed: gawk's three-argument `match` is a
+//! syntax error on BSD awk, and behind `|| true` the check passes having read nothing. A
+//! gate that silently never fires reads as coverage. This one is compiled, runs identically
+//! everywhere, and has tests, including one that plants the violation.
 //!
 //! # What it enforces
 //!

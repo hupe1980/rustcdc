@@ -1038,7 +1038,7 @@ impl KafkaSink {
     /// that got forgotten would publish records a consumer cannot filter — silently, since a
     /// missing header reads exactly like a consumer bug.
     ///
-    /// Ordering and the send window are [`enqueue`](Self::enqueue)'s contract.
+    /// Ordering and the send window are `enqueue`'s contract.
     pub async fn send_encoded(
         &mut self,
         event: &rustcdc::Event,
@@ -1446,18 +1446,11 @@ pub(crate) fn enforce_durable_confirmation(
 
 // `KafkaSink` deliberately does **not** implement `SinkAdapter`.
 //
-// It did, and the impl was dead — nothing ever built a `BoxedSink` from a bare
-// `KafkaSink`, because the router holds `SinkBinding`s. What it would have done if anyone
-// had reached for it was wrong three times over: it serialised the event as JSON directly,
-// ignoring the sink's configured codec; it passed an **empty** message key, which Kafka
-// partitioners hash like any other key, pinning every event across every table to one
-// murmur2("") partition — the exact defect `SinkBinding::send_event`'s key fallback exists
-// to prevent; and it published no tombstone after a delete.
-//
-// A correct Kafka send needs the codec, and the codec lives in `SinkBinding`. Driving the
-// sink through the binding is the only way to get one, so the trait impl that suggested
-// otherwise is gone rather than repaired. Compile errors are better documentation than a
-// comment on a footgun.
+// A correct Kafka send needs the codec, the message key and the delete tombstone, and all
+// three live in `SinkBinding`. Driving the sink through the binding is the only way to get
+// them; a bare-sink impl would ignore the codec, and an empty key pins every event to one
+// murmur2("") partition. Compile errors are better documentation than a comment on a
+// footgun.
 
 #[cfg(test)]
 #[path = "kafka_tests.rs"]

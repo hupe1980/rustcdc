@@ -58,9 +58,8 @@ mod markdown_doctests {
     #[doc = include_str!("../../../site/content/docs/schema-evolution.md")]
     mod schema_evolution {}
 
-    // Every remaining page that carries a Rust block. The set used to be the five pages
-    // above, which meant a sample in the runbook or the deployment guide could rot
-    // silently — and those are the pages an operator copies from under pressure.
+    // Every remaining page that carries a Rust block: the runbook and the deployment guide
+    // are the pages an operator copies from under pressure, so their samples must not rot.
     #[doc = include_str!("../../../site/content/docs/deployment.md")]
     mod deployment {}
 

@@ -7,7 +7,7 @@
 //! `std::env::set_var` is unsafe because it races any concurrent `getenv`, and `cargo test`
 //! is multi-threaded — glibc's `setenv` can reallocate `environ` while another thread walks
 //! it. A per-module lock does not help; the hazard is the shared array, not the key. So
-//! [`EnvGuard`] holds one process-wide lock and restores on drop, which also survives a
+//! `EnvGuard` holds one process-wide lock and restores on drop, which also survives a
 //! panicking assertion.
 //!
 //! `pub` rather than `#[cfg(test)]` because `tests/config_roundtrip.rs` is a separate crate
@@ -59,7 +59,7 @@ impl Drop for EnvGuard {
 
 /// # Safety
 ///
-/// Every caller reaches this through [`EnvGuard`], which holds a process-wide lock for the
+/// Every caller reaches this through `EnvGuard`, which holds a process-wide lock for the
 /// whole set-use-restore window. Reads from unrelated library code stay theoretically
 /// concurrent — which is why `observability.otlp_allow_insecure` is a config field rather
 /// than something tested through here.

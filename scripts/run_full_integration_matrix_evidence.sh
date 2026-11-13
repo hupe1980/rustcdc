@@ -161,12 +161,9 @@ run_case() {
     # infrastructure issues rather than code regressions, so they are recorded as SKIP
     # rather than FAIL.
     #
-    # A skip is **not** a pass. This used to set `passed=1`, which kept the suite out of
-    # `failed_labels` — the only thing the exit check looks at — so a Docker Hub rate-limit
-    # during a release run skipped every container suite and the script still printed
-    # "Full integration matrix completed successfully" and exited 0. The release-evidence
-    # artifact then certified a matrix that never ran, which is the one thing this script
-    # exists to prevent.
+    # A skip is **not** a pass. Counting it as one would keep the suite out of
+    # `failed_labels` — the only thing the exit check looks at — so a rate-limited release
+    # run would skip every container suite, exit 0, and certify a matrix that never ran.
     if is_image_pull_failure "$temp_log"; then
       echo "STATUS: SKIP - $label (image pull failed — registry unavailable; not a code regression)" | tee -a "$report_path"
       skipped_labels+=("$label")

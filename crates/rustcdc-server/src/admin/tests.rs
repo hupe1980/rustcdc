@@ -84,10 +84,8 @@ pub(super) fn auth_token_manifest(id: &str, token: &str, scopes: &[&str]) -> Tok
 
 /// `admin.audit_signing_key_env` must actually be read.
 ///
-/// It was accepted, echoed in `/status` and ignored: the loader read a hardcoded
-/// `CDC_AUDIT_SIGNING_KEY_HEX` instead, so a correctly-configured deployment
-/// produced unsigned audit records with no error anywhere. Nothing failed, because
-/// nothing asserted the key was resolved from the configured name.
+/// A loader that read a hardcoded `CDC_AUDIT_SIGNING_KEY_HEX` instead would produce
+/// unsigned audit records for a correctly-configured deployment, with no error anywhere.
 #[test]
 pub(super) fn the_configured_audit_signing_key_variable_is_the_one_that_is_read() {
     let mut admin = crate::config::schema::AdminConfig::default();
@@ -347,15 +345,9 @@ pub(super) fn configure_test_read_write_tokens(admin: &AdminState) {
     }];
 }
 
-/// The admin workers used to be detached OS threads running private tokio
-/// runtimes in unconditional loops, with no handle kept and no exit condition — they
-/// could not be stopped by any means short of process exit.
-///
-/// This asserts the property that was missing rather than the mechanism: after
-/// `shutdown_workers` returns, every worker task has finished. `JoinHandle::is_finished`
-/// is the direct observation; a test that merely called the method and asserted it
-/// returned would have passed against the old code too, since the old code had nothing
-/// to call.
+/// Asserts the property rather than the mechanism: after `shutdown_workers` returns,
+/// every worker task has finished. `JoinHandle::is_finished` is the direct observation; a
+/// test that merely asserted the method returned would pass against detached workers too.
 #[tokio::test]
 pub(super) async fn admin_workers_stop_when_asked() {
     let cfg = sample_config();
@@ -820,10 +812,9 @@ pub(super) fn abuse_guard_honors_forwarded_ip_from_trusted_proxy() {
     );
 
     let peer_addr: SocketAddr = "10.0.0.10:7777".parse().expect("peer addr");
-    // The **rightmost** hop, not the leftmost. This assertion used to read `1.2.3.4`,
-    // which is the address the *client* put in the header — the proxy appends what it
-    // observed to the end. Keying on the leftmost entry let any caller pick its own
-    // rate-limit bucket and rotate it per request. See
+    // The **rightmost** hop, not the leftmost: `1.2.3.4` is what the *client* put in the
+    // header, and the proxy appends what it observed. Keying on the leftmost entry would
+    // let any caller pick its own rate-limit bucket and rotate it per request. See
     // `a_client_supplied_forwarded_for_prefix_cannot_choose_the_rate_limit_key`.
     assert_eq!(guard.client_key(&headers, Some(peer_addr)), "xff:5.6.7.8");
 }
@@ -1049,8 +1040,8 @@ pub(super) fn a_valid_condition_survives_validation() {
 /// `POST /signals` accepts the Debezium-shaped payload end to end.
 ///
 /// `deny_unknown_fields` is on both wire structs, so an unrecognised `conditions` key
-/// would be a 400 rather than a silently dropped filter — which is exactly how `tables`
-/// used to be lost over HTTP while the file and Kafka paths accepted it.
+/// is a 400 rather than a silently dropped filter, and every ingress path accepts the
+/// same fields.
 #[tokio::test]
 pub(super) async fn the_signals_endpoint_accepts_a_row_filter() {
     let cfg = sample_config();
@@ -1200,7 +1191,7 @@ pub(super) async fn the_openapi_document_is_built_once_and_shared() {
 /// `/openapi.json` must be rate-limited, like every other endpoint that does real work.
 ///
 /// It is deliberately unauthenticated — it describes the shape of the API, not its state —
-/// but unauthenticated and unmetered are different things, and it was briefly both.
+/// but unauthenticated and unmetered are different things.
 #[tokio::test]
 pub(super) async fn the_openapi_endpoint_is_rate_limited() {
     let mut cfg = sample_config();
@@ -1228,11 +1219,10 @@ pub(super) async fn the_openapi_endpoint_is_rate_limited() {
 
 /// A panicking signal action must not take the control plane with it.
 ///
-/// Before this, a panic anywhere in `run_signal_action` terminated the worker task for the
-/// process lifetime. The pipeline kept capturing, `/status` kept reporting
-/// `snapshot_requests_available: true`, and `POST /signals` kept answering `STARTED` —
-/// while every subsequent action was queued and silently never executed. The SLO caught it
-/// 30 s later by a different name, and nothing recovered short of a restart.
+/// A panic in `run_signal_action` that ended the worker task would leave the pipeline
+/// capturing, `/status` reporting `snapshot_requests_available: true` and `POST /signals`
+/// answering `STARTED` — while every subsequent action was queued and silently never
+/// executed, until a restart.
 ///
 /// Three properties, and all three matter:
 ///
@@ -1714,8 +1704,7 @@ async fn notifications_stream_replays_the_backlog_and_stays_open() {
         .unwrap_or_default();
     assert!(content_type.contains("text/event-stream"));
 
-    // Bounded read: the stream is now genuinely open-ended, so reading it to
-    // completion — as this test used to — would never return.
+    // Bounded read: the stream is open-ended, so reading it to completion never returns.
     let body = read_sse_frames(stream_response, 2).await;
     assert!(
         body.contains("event: notification"),
@@ -3513,11 +3502,10 @@ async fn signal_ingress_file_worker_surfaces_parse_rejections_in_slo_and_metrics
 
 /// A restart must not re-execute the signals already in the file.
 ///
-/// The read offset is process-local, so starting at byte 0 meant every restart re-ran
-/// the file's whole history. That was survivable while `execute_snapshot` did nothing;
-/// now it snapshots, and rustcdc *rewinds an already-complete table and reads it again* —
-/// so a restart re-scanned every table ever requested through this channel and re-emitted
-/// every row downstream.
+/// The read offset is process-local, so starting at byte 0 would re-run the file's whole
+/// history on every restart. A snapshot signal *rewinds an already-complete table and reads
+/// it again*, so that would re-scan every table ever requested through this channel and
+/// re-emit every row downstream.
 ///
 /// Restarting is modelled by building a second `AdminState` over the same file, which is
 /// what a redeploy does. Changing `spawn_signal_ingress_file_worker` back to `offset = 0`

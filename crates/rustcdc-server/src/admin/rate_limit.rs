@@ -14,12 +14,12 @@ pub(super) const RATE_LIMIT_MAX_CLIENT_KEYS: usize = 4096;
 /// A rapidly-rotating attacker mints a fresh key per request, so a full burst per new
 /// key would multiply their allowance by the burst size. Starting new clients at one
 /// token defeats that — but applied *unconditionally* it also means an ordinary client
-/// gets one request rather than the burst the operator configured, which made
-/// `*_rate_limit_burst` inert for anyone who had not been seen before.
+/// gets one request rather than the burst the operator configured, which makes
+/// `*_rate_limit_burst` inert for anyone who has not been seen before.
 ///
 /// A filling key table is the signature of the attack, so the restriction is applied
 /// only under that pressure. In steady state (a handful of scrapers and probes) the
-/// configured burst is honoured; under a rotation flood the old behaviour returns.
+/// configured burst is honoured; under a rotation flood new clients start at one token.
 pub(super) const RATE_LIMIT_NEW_CLIENT_BURST_PRESSURE: usize = RATE_LIMIT_MAX_CLIENT_KEYS / 2;
 /// How long a client entry may be idle before being swept.
 pub(super) const RATE_LIMIT_STALE_CLIENT_TTL: Duration = Duration::from_secs(600);

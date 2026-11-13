@@ -163,9 +163,10 @@ Per-connector posture:
 |---|---|---|
 | PostgreSQL | `pg_current_snapshot()` | Applies the engine's own visibility rule, `xid >= xmax \|\| xip.contains(xid)` — **both** halves, since a lone in-flight transaction sits *at* `xmax` and never appears in `xip` |
 | SQL Server | not needed | `fn_cdc_get_max_lsn()` reports what the capture job has *already harvested*, so the watermark lags visibility instead of leading it — the safe direction |
-| MySQL / MariaDB | **closed, with `gtid_mode = ON`** | No in-flight *transaction id* exists on a common scale, so a different mechanism is used: the executed-GTID set. See [closing the MySQL window](#closing-the-mysql-window-with-gtid-sets) |
+| MySQL | **closed, with `gtid_mode = ON`** | No in-flight *transaction id* exists on a common scale, so a different mechanism is used: the executed-GTID set. See [closing the MySQL window](#closing-the-mysql-window-with-gtid-sets) |
+| MariaDB | **open** — ordinal bracket on every release | MariaDB has no GTID set updated after the engine commit: `@@gtid_binlog_pos` (12.3's `Gtid_Binlog_Pos` column) advances at the binlog flush, before it. See [MariaDB notes](@/docs/connectors/mysql.md#mariadb-specific-notes) |
 
-For MySQL, enable `gtid_mode` — see below. Failing that, snapshot from a quiesced replica or scope
+For MySQL, enable `gtid_mode` — see below. On MariaDB, or MySQL without it, snapshot from a quiesced replica or scope
 the snapshot with `table_conditions` to rows that are not being written.
 
 #### Closing the MySQL window with GTID sets
@@ -307,7 +308,9 @@ built-in connectors go through that interface, and so can yours — see
 
 A PostgreSQL stream opens **two** connections, for two different jobs: `tokio-postgres` for
 ordinary SQL (slot and publication introspection, snapshot chunk reads, catalog lookups), and
-rustcdc's own replication client for the WAL stream. Both derive their TLS configuration from
+rustcdc's own replication client for the WAL stream. A blocking snapshot adds a third, the
+**anchor**, whose exported snapshot every chunk read imports, so the snapshot stays at one point
+in time across failed chunks. Both derive their TLS configuration from
 the same `TransportConfig`, so they cannot disagree about what they verify or whether they are
 encrypted.
 
@@ -325,9 +328,11 @@ Updates.
   `default-features = false`, which would force `aws-lc-rs` on every PostgreSQL-only build — and
   Cargo unifies features, so a dependent cannot opt out. Roughly 900 lines of stable, well-specified protocol was the cheaper
   side of that trade.
-- `proto_version '1'` is negotiated, matching what the pgoutput decoder implements. Asking for
-  more would make the server send v2 streaming and v3 two-phase messages the decoder
-  deliberately rejects rather than silently mishandles.
+- On PostgreSQL 14+ `proto_version '2'` with `streaming 'on'` is negotiated (unless
+  `stream_in_progress_transactions = false`), otherwise `proto_version '1'`. The client holds a
+  streamed transaction until `Stream Commit` and drops it on `Stream Abort`, so the decoder only
+  ever sees committed v1-shaped transactions. v3 two-phase messages are never requested, and
+  the decoder rejects them rather than silently mishandling them.
 - Framing is **buffered**, and a poll's time budget wraps only the socket fill, never frame
   decoding. Reading fields straight off the socket under a timeout is not cancel-safe: a budget
   expiring between a message's tag and its payload discards bytes that have already left the
@@ -366,7 +371,7 @@ which makes it the fallback where those cannot be arranged — at a real cost:
   PostgreSQL refuses to advance a slot an active walsender holds
 
 The two transports share the decoder, event construction, table filtering and checkpointing;
-only the route the bytes take differs. `tests/postgres_wal_transport_parity_integration.rs`
+only the route the bytes take differs, and `SqlPeek` always negotiates `proto_version '1'`. `tests/postgres_wal_transport_parity_integration.rs`
 captures one workload through both and asserts the resulting events — including each change's
 LSN — are identical, so their checkpoints stay interchangeable.
 - runtime tracks in-memory and persisted LSN progress

@@ -323,7 +323,7 @@ pub struct GeneratedKeys {
 /// fails *late*. `openssl genpkey` emits PEM; exporting an ed25519 key from most libraries
 /// gives the 64-byte expanded keypair rather than the 32-byte seed; `head -c 32
 /// /dev/urandom | base64` produces a secret with no prefix, which is accepted, so the
-/// mistake is invisible until a receiver cannot verify. [`parse_key`] has a specific error
+/// mistake is invisible until a receiver cannot verify. `parse_key` has a specific error
 /// for each of those, which is the wrong end of the problem to solve — this is the right
 /// end.
 ///

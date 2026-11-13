@@ -731,10 +731,10 @@ tables = ["public.orders"]
 /// runtime-requested table running unfiltered, a restart adopting it filtered — so the
 /// rows delivered would match no single predicate.
 ///
-/// 0.12 resolves all three paths through one function. Pre-declaring is now the supported
-/// way to scope a backfill you will request later, and refusing it would reject a working
-/// configuration. The typo case moved to where both lists arrive together: a `conditions`
-/// entry in an `execute_snapshot` request must name a table in that request's `tables`.
+/// Pre-declaring is the supported way to scope a backfill you will request later, and
+/// refusing it would reject a working configuration. The typo case is caught where both
+/// lists arrive together: a `conditions` entry in an `execute_snapshot` request must name a
+/// table in that request's `tables`.
 #[test]
 fn a_table_condition_may_be_predeclared_for_a_later_on_demand_snapshot() {
     let cfg = load_from_str(&format!(
@@ -797,8 +797,8 @@ tables = ["public.orders"]
 ///
 /// It installs the incremental-snapshot driver without backfilling anything, which is
 /// the only way to make `POST /signals` with `execute_snapshot` available on a pipeline
-/// that has nothing to backfill at startup. While the field was a defaulted struct,
-/// "absent" and "present and empty" were the same value and this was unexpressible.
+/// that has nothing to backfill at startup, so "absent" and "present and empty" must be
+/// different values.
 #[test]
 fn an_empty_incremental_snapshot_section_is_distinguishable_from_an_absent_one() {
     let declared = load_from_str(&format!(

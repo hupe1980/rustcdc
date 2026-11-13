@@ -60,22 +60,9 @@ pub(super) async fn next_postgres_snapshot_chunk(
             )
         };
 
-        // Emit the same identity the streaming path emits.
-        //
-        // Snapshot events previously carried `schema: None` and `primary_key: None`
-        // while streaming populated both, so for one physical table the two phases
-        // disagreed on both the event key and the routing name:
-        //
-        //   * `Event::primary_key_values()` returned `None`, so `encode_key` produced
-        //     an unkeyed record for **every row of the initial load**. Log compaction
-        //     never collapses those rows, upsert consumers cannot correlate them with
-        //     later updates, and the pre-snapshot value resurfaces after compaction.
-        //   * `qualified_table_name()` yielded `"users"` during snapshot but
-        //     `"public.users"` during streaming, so a router configured for
-        //     `public.users` silently received zero snapshot rows.
-        //
-        // MySQL and SQL Server already set the primary key on snapshot rows;
-        // PostgreSQL was the outlier, and `postgres` is the default feature.
+        // The same identity the streaming path emits: without the key a snapshot row is an
+        // unkeyed record that compaction and upserts cannot correlate with later updates, and
+        // without the schema a router for `public.users` receives no snapshot rows.
         let (schema_name, bare_table) = split_qualified_table_name(&table_name);
         let primary_key = if key_columns.is_empty() {
             None

@@ -3,12 +3,10 @@
 //! # Why this is one implementation and not three
 //!
 //! The watermark algorithm is identical for every log-based source; only the
-//! *position type* and the *SQL dialect* differ. It used to be copied once per
-//! connector, and the copies drifted: the resume-from-cursor fix (C1 in the audit)
-//! had to be applied three times because the same missing feature existed three
-//! times. A connector now supplies [`IncrementalSnapshotBackend`] — six methods of
-//! genuinely database-specific work — and inherits the state machine, the override
-//! window, cursor persistence and the [`StreamHandle`] contract unchanged.
+//! *position type* and the *SQL dialect* differ, and per-connector copies drift. A
+//! connector supplies [`IncrementalSnapshotBackend`] — six methods of genuinely
+//! database-specific work — and inherits the state machine, the override window, cursor
+//! persistence and the [`StreamHandle`] contract unchanged.
 //!
 //! This is also the extension point for third-party connectors: an `impl Source`
 //! that implements the backend gets non-blocking snapshots without reimplementing
@@ -252,8 +250,8 @@ pub trait IncrementalSnapshotBackend: Send + Sync {
     ///
     /// # Why the backend decides
     ///
-    /// The default is the ordinal test the driver used to inline: inside when the event's
-    /// position is past `low` (or its transaction was in flight) and at or below `high`. That is
+    /// The default is the ordinal test: inside when the event's position is past `low` (or
+    /// its transaction was in flight) and at or below `high`. That is
     /// correct for a watermark which is a single ordered coordinate, which PostgreSQL's LSN and
     /// SQL Server's capture LSN both are.
     ///
@@ -599,8 +597,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
             // A cursor whose arity no longer matches the primary key cannot be
             // resumed from: continuing would skip every row between the truncated
             // position and the real one, permanently and without an error. Checked
-            // here so every backend gets it, rather than in each backend's chunk read
-            // where two of the three used to forget.
+            // here so every backend gets it, rather than in each backend's chunk read.
             if let Some(cursor) = persisted.and_then(|entry| entry.pk_cursor.as_ref())
                 && cursor.len() != spec.pk_columns.len()
             {
@@ -1647,8 +1644,7 @@ mod tests {
     // ─── Driver state-machine tests ───────────────────────────────────────────
     //
     // These drive the real state machine through a fake backend and a fake inner
-    // stream. Each connector used to carry its own partial re-implementation of
-    // these assertions, which tested the test rather than the driver.
+    // stream, so they test the driver rather than a per-connector re-implementation.
 
     use crate::source::IncrementalSnapshotConfig;
     use std::sync::{Arc, Mutex};
@@ -2185,10 +2181,10 @@ mod tests {
         // The durable checkpoint embeds `incremental_snapshot_state()` on *every*
         // commit, including commits of the live stream events that flow past while a
         // chunk sits in the collect phase. So the cursor must not move when the chunk
-        // is *read* — only when it has been handed to the consumer. It used to move at
-        // read time, which made a restart resume after rows that were never emitted:
-        // up to `chunk_size` rows silently missing from the snapshot, with no error and
-        // no counter to notice it by.
+        // is *read* — only when it has been handed to the consumer. Moving at read time
+        // would make a restart resume after rows that were never emitted: up to
+        // `chunk_size` rows silently missing from the snapshot, with no error and no
+        // counter to notice it by.
         let rows: Vec<serde_json::Value> = (1..=6).map(|id| json!({ "id": id })).collect();
 
         // `advance_on_read = 10` opens a watermark bracket of (100, 110]; the stream
@@ -2854,9 +2850,8 @@ mod tests {
     }
     #[tokio::test]
     async fn a_persisted_cursor_that_no_longer_matches_the_primary_key_is_rejected() {
-        // Hoisted out of the connectors: two of the three used to skip this check, so
-        // a primary-key change silently resumed from a truncated cursor and skipped
-        // every row in between.
+        // Checked in the driver so no connector can skip it: a primary-key change would
+        // silently resume from a truncated cursor and skip every row in between.
         let resume = IncrementalSnapshotState {
             paused: false,
             stopped: false,
@@ -2929,7 +2924,7 @@ mod stop_durability_tests {
         );
         assert!(state.tables.is_empty());
 
-        // Restart with the *same static config* — the case that used to silently restart.
+        // Restart with the *same static config* — the case that must not silently restart.
         let mut resumed = driver_resuming_from(rows, Some(state), 1).await;
 
         let emitted = drain(&mut resumed).await;
@@ -3534,10 +3529,9 @@ mod resnapshot_identity_tests {
     /// A deliberate re-snapshot must not be mistaken for a replay and dropped.
     ///
     /// A snapshot read's offset identifies the *row*, not a log position, so re-reading an
-    /// unchanged row used to produce a byte-identical event — and the runtime's idempotency
-    /// guard, which is **on by default**, correctly classified it as a duplicate and dropped
-    /// it. The operator got `enqueued: 1` and no rows: the component whose job is to protect
-    /// delivery silently discarded the delivery that was asked for.
+    /// unchanged row could produce a byte-identical event — and the runtime's idempotency
+    /// guard, which is **on by default**, would drop it as a duplicate. The operator would
+    /// get `enqueued: 1` and no rows.
     ///
     /// This drives the real driver twice and puts the emitted events through the real guard,
     /// so it fails if either half of the chain regresses.

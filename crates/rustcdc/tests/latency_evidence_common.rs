@@ -272,8 +272,8 @@ pub fn percentile(values: &[f64], pct: f64) -> f64 {
 /// Assert the run produced evidence worth gating on.
 ///
 /// A latency percentile over two samples is not a percentile, and a run where most events
-/// carried no timestamp is not a measurement of the pipeline. Both used to pass silently:
-/// the only assertion was `batches > 0`.
+/// carried no timestamp is not a measurement of the pipeline; `batches > 0` alone passes
+/// both silently.
 pub fn assert_sample_is_meaningful(summary: &LatencySummary, min_samples: u64) {
     assert!(
         summary.events_measured >= min_samples,

@@ -248,11 +248,10 @@ impl IcebergSink {
 
     /// Decode a serialised event and buffer it through the guarded path.
     ///
-    /// This used to push straight onto `pending` with no byte accounting and no
-    /// `max_pending_events` / `max_pending_bytes` check — a second entry point that
-    /// bypassed the backpressure guard entirely. The guard exists because this buffer
-    /// grows during catalog outages, which is exactly when an unbounded second door
-    /// gets used. It now delegates to [`Self::send_event_json_bytes`].
+    /// Delegates to [`Self::send_event_json_bytes`] rather than pushing onto `pending`
+    /// directly, so it cannot bypass the `max_pending_events` / `max_pending_bytes` guard.
+    /// The buffer grows during catalog outages, which is exactly when an unbounded second
+    /// entry point would get used.
     pub async fn send_json_bytes(&mut self, event_json: &[u8]) -> rustcdc::core::Result<()> {
         if self.closed {
             return Err(RtError::StateError("sink is closed".to_string()));

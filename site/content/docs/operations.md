@@ -133,9 +133,9 @@ The same answers are in the browser at `/ui` — see [Console](@/docs/console.md
 
 > [!NOTE]
 > **Every runtime metric carries a `source_type` label** — `postgres`, `mysql`,
-> `sqlserver` and so on. PromQL label matchers select a subset, so existing rules such as
-> `rustcdc_runtime_health{verdict="stalled"} == 1` keep working unchanged; the label is
-> there to tell pipelines apart when more than one is scraped into the same Prometheus.
+> `sqlserver` and so on — to tell pipelines apart when more than one is scraped into the same
+> Prometheus. A rule that names no `source_type`, such as
+> `rustcdc_runtime_health{verdict="stalled"} == 1`, matches every pipeline.
 >
 > These families are rendered by the library, so an embedder and this server export the
 > same names with the same labels, because one implementation renders them.
@@ -251,6 +251,8 @@ rustcdc status --admin-read-token-env RUSTCDC_READ_TOKEN --require-running
 | `rustcdc_replication_slot_lag_bytes` | > 1 GiB sustained | PostgreSQL slot WAL retention; growth risks slot invalidation (`max_slot_wal_keep_size`) or a full WAL volume |
 | `rustcdc_replication_slot_wal_status{status=…}` | `status="unreserved"` == 1 | The slot's `wal_status`, one-hot over `reserved`, `extended`, `unreserved`, `lost`. `unreserved` means the slot is lost at the next checkpoint unless the pipeline catches up — the one alert that fires while the slot can still be saved. `extended` does not page |
 | `rustcdc_replication_slot_safe_wal_size_bytes` | — | The slot's `safe_wal_size`: WAL that can still be written before the slot is endangered; negative once `unreserved`. Absent when `max_slot_wal_keep_size` is unlimited |
+| `rustcdc_streamed_transactions_open` | **do not alert** | PostgreSQL transactions being streamed before their commit (pgoutput v2). Their rows are released at the commit; `/status` names the open one under `source.open_transaction`. See [Large transactions](@/docs/connectors/postgres.md#large-transactions) |
+| `rustcdc_streamed_transaction_bytes{store=…}` | `store="disk"` near the spill volume's free space | Bytes held for those transactions, `memory` or `disk`. A full spill volume stops the pipeline with the I/O error |
 | `rustcdc_sink_kafka_unkeyed_deletes_total` | any increase | A delete arrived with no row key, so no tombstone could be published — on a compacted topic, a key the log will never reclaim. The table has no primary key, and is logged once at WARN. Truncate and schema-change events are excluded |
 | `rustcdc_sink_kafka_tombstones_total` | **do not alert** | Tombstones published. Zero is normal for a pipeline with no deletes — read it beside the counter above, never as a condition |
 | `rustcdc_slo_checkpoint_age_seconds` | > 300 s | Checkpoint has not advanced — sink or source issue |

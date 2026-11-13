@@ -1139,10 +1139,9 @@ impl<R: SchemaRegistryClient> ConfluentAvroDecoder<R> {
     /// `async` because schema fetching from the registry is required for schema
     /// IDs not yet in the local cache.
     pub async fn decode(&self, bytes: &[u8]) -> Result<Event> {
-        // Malformed framing is permanent — these exact bytes will never decode. It was
-        // previously a `SourceError`, which classifies as `Transient` ("safe to retry with
-        // backoff"), so an embedder following the crate's own guidance retried a message
-        // that cannot succeed, forever.
+        // Malformed framing is permanent — these exact bytes will never decode. A
+        // `Transient` classification would have an embedder following the crate's own
+        // guidance retry a message that cannot succeed, forever.
         // `decode_wire_format` reports a `SchemaKey`, not an id: Confluent Platform 8
         // introduced wire format v1, whose magic byte `0x01` is followed by a 16-byte
         // schema GUID rather than a 4-byte id. Both are accepted here, and
@@ -3728,8 +3727,8 @@ mod tests {
     fn malformed_confluent_framing_is_not_classified_as_retryable() {
         use crate::core::ErrorKind;
 
-        // These exact bytes will never decode. Reporting them as `Transient` — which the
-        // decoder used to do, via `SourceError` — invites a retry loop that cannot end.
+        // These exact bytes will never decode. Reporting them as `Transient` invites a
+        // retry loop that cannot end.
         let error = decode_wire_format(&[0xFF, 0x00])
             .map_err(|e| {
                 crate::core::Error::SerializationError(format!("confluent wire format: {e}"))
@@ -3876,11 +3875,9 @@ mod event_json_schema_tests {
 
     #[test]
     fn an_insert_validates_against_the_published_schema() {
-        // `before` is null for an INSERT. The schema previously expressed the row payload
-        // as `oneOf: [null, {}]`, and the empty schema matches null too — so null was
-        // valid under *both* branches and `oneOf` rejected it. That made every INSERT and
-        // every DELETE fail validation: the JSON Schema codec could not encode a normal
-        // event at all.
+        // `before` is null for an INSERT. A row payload expressed as `oneOf: [null, {}]`
+        // matches null under *both* branches, so `oneOf` rejects it and every INSERT and
+        // DELETE fails validation.
         let event = Event::builder("users", Operation::Insert)
             .source(SourceMetadata::new("postgres", "0/16B2E48", 1))
             .after(json!({ "id": 1, "email": "a@example.com" }))

@@ -6,16 +6,16 @@
 //! `fn_cdc_get_max_lsn()` — what the capture job has *harvested* into `cdc.*`, which does not move
 //! while nothing is being harvested.
 //!
-//! The window used to be clamped so it was never inverted: after reading `[S, M]` the next window
-//! became `[M+1, max(M, M+1)]` = `[M+1, M+1]`, and the *next* advance incremented from that clamped
-//! end. So every empty poll pushed the read point one minimal LSN step further above the harvested
-//! maximum, indefinitely, and whether a later change was captured depended on its LSN still being
-//! above wherever the point had crept to.
+//! Clamping the window so it is never inverted is wrong: after reading `[S, M]` the next window
+//! becomes `[M+1, max(M, M+1)]` = `[M+1, M+1]`, and the *next* advance increments from that clamped
+//! end. Every empty poll then pushes the read point one minimal LSN step further above the
+//! harvested maximum, indefinitely, and whether a later change is captured depends on its LSN still
+//! being above wherever the point has crept to.
 //!
 //! The naive repair is worse: parking at `[M+1, M+1]` and advancing from that end once the maximum
 //! moves skips `M+1`, an LSN that was never readable while the window sat there.
 //!
-//! The rule now is that `lsn_end` never exceeds the harvested maximum, so an empty window is
+//! The rule is that `lsn_end` never exceeds the harvested maximum, so an empty window is
 //! *represented* (`lsn_start > lsn_end`) rather than clamped, and the lower bound moves only when
 //! something was consumed.
 //!

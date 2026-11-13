@@ -1113,7 +1113,7 @@ run_bench_critical_list_check() {
 
 run_docs_menu_check() {
   # The sidebar is a hand-kept list in site/config.toml, so a new page is unreachable from the
-  # menu until somebody remembers it. Console, Performance and Supported versions all shipped so.
+  # menu until somebody remembers it.
   local pages menu missing stale
   pages="$(git ls-files 'site/content/docs/*.md' 'site/content/docs/**/*.md' \
     | grep -v '/_index\.md$' | sed -e 's|^site/content||' -e 's|\.md$|/|' | sort -u)"

@@ -99,12 +99,8 @@ async fn run_postgres_version_connection_test(
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
-        // This matrix checks connector behaviour across server *versions*; the containers run
-        // with `ssl = off` and present no certificate. It previously said `tls()` and connected
-        // anyway, because `sslmode=prefer` silently fell back to plaintext — so a line that read
-        // as TLS coverage was providing none. `sslmode=require` is now set whenever the transport
-        // is TLS, which makes that impossible; TLS itself is covered by the connection suites and
-        // by `wire::tests`.
+        // The containers run with `ssl = off`; a TLS transport would require TLS and be refused.
+        // TLS is covered by the connection suites and `wire::tests`.
         transport: TransportConfig::plaintext(),
         ..Default::default()
     };
@@ -154,8 +150,8 @@ async fn run_postgres_version_connection_test(
     Ok(())
 }
 
-/// Connect, stream a large transaction, and close on every tested PostgreSQL version. A tag that no longer pulls
-/// fails: a retired image is the drift this matrix exists to catch.
+/// Connect, stream a large transaction, and close on every tested PostgreSQL version. A tag
+/// that no longer pulls fails: a retired image is the drift this matrix exists to catch.
 #[tokio::test]
 async fn postgres_connection_every_tested_version() -> rustcdc::Result<()> {
     if skip_postgres_version_matrix_case() {

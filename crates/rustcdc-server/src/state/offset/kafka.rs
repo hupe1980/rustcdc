@@ -416,11 +416,9 @@ impl Checkpoint for KafkaTopicCheckpoint {
         // shape a connector defect takes, and the one that makes a pipeline resume before
         // data the sink already committed while every counter reports health.
         //
-        // This used to lean on `FileCheckpoint::save` for that validation and therefore
-        // had to write the local file first. That worked, but it inverted the two stores:
-        // the topic is authoritative and the file is a cache `build_both` rebuilds from it
-        // on every startup. Calling the guard directly removes the constraint, so the
-        // publish can go first and the ordering can follow from which store is the truth.
+        // The guard is called directly rather than through `FileCheckpoint::save`, so the
+        // publish can go first: the topic is authoritative and the file is a cache
+        // `build_both` rebuilds from it on every startup.
         //
         // Under `at_least_once` on this backend the publish is outside any transaction, so
         // a record that reached the topic *is* durable — there is no barrier abort to
@@ -986,10 +984,9 @@ pub(crate) fn validate_topic_config_entries(
 /// that were never published. That is the exact data-loss window the shared transaction
 /// exists to close, reopened by the reader.
 ///
-/// It was invisible because the test that proves the property
-/// (`an_aborted_batch_publishes_neither_data_nor_checkpoint`) reads the topic through its
-/// own `read_committed` consumer rather than through this path — so it asserted the
-/// broker's behaviour, not the server's.
+/// `an_aborted_batch_publishes_neither_data_nor_checkpoint` cannot catch that: it reads
+/// the topic through its own `read_committed` consumer rather than through this path, so
+/// it asserts the broker's behaviour, not the server's.
 ///
 /// `from_consumer_builder` takes the real `ConsumerBuilder` and *imposes* `ReadCommitted`,
 /// `Earliest` and no auto-commit — requirements of materialising a table, not preferences —
@@ -1506,10 +1503,10 @@ mod tests {
 
     /// **A second instance fences the first at the broker.**
     ///
-    /// This state topic used to use a plain idempotent producer, so two instances — which
-    /// a Kubernetes rolling update creates on every deploy — both wrote checkpoints, and
-    /// last-write-wins could move the durable position *backwards*. A transactional id
-    /// makes the broker enforce single-writer: `build_transactional()` bumps the producer
+    /// With a plain idempotent producer, two instances — which a Kubernetes rolling update
+    /// creates on every deploy — would both write checkpoints, and last-write-wins could
+    /// move the durable position *backwards*. A transactional id makes the broker enforce
+    /// single-writer: `build_transactional()` bumps the producer
     /// epoch and permanently fences the previous holder.
     ///
     /// Asserting on the epoch is the real check. A test that only asserted "the second

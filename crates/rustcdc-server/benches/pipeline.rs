@@ -59,14 +59,9 @@ fn events(count: u64) -> Vec<Event> {
 
 /// JSON encoding of a single event.
 ///
-/// The send path used to do this **twice** per
-/// event — once to measure the payload against `runtime.max_event_bytes` and then throw
-/// the buffer away, once for real in the codec. Whatever this benchmark reports was,
-/// until that fix, the per-event tax for doing nothing.
-///
-/// It was never the main point of the finding, though: the discarded encode also meant
-/// the limit was enforced against a JSON rendering that an Avro or Protobuf sink never
-/// transmits.
+/// The send path does this once, in the codec: measuring `runtime.max_event_bytes`
+/// against a separate JSON encode would pay this cost twice per event, and would enforce
+/// the limit against a rendering an Avro or Protobuf sink never transmits.
 fn bench_event_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode");
     let events = events(1_000);
