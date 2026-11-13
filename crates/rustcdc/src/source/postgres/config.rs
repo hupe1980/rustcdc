@@ -326,12 +326,6 @@ impl PostgresSourceConfig {
     /// `false` the server is a primary and this method returns `Ok(true)`. If it
     /// returns `true` the server is a replica/standby and this method returns
     /// `Ok(false)`.
-    /// Verify that the target PostgreSQL instance is currently acting as a primary.
-    ///
-    /// Issues a single `SELECT pg_is_in_recovery()` query: if the function returns
-    /// `false` the server is a primary and this method returns `Ok(true)`. If it
-    /// returns `true` the server is a replica/standby and this method returns
-    /// `Ok(false)`.
     ///
     /// CDC requires a writable primary for logical replication. Call this before
     /// creating or resuming a replication stream whenever topology changes are
@@ -341,99 +335,246 @@ impl PostgresSourceConfig {
     ///
     /// Returns [`Error::SourceError`] if the connection or query fails.
     pub async fn check_is_primary(&self) -> Result<bool> {
-        let connect_config = self.build_connect_config()?;
-        query_is_primary(connect_config, &self.transport).await
+        query_is_primary(self).await
     }
 }
 
 /// Run `SELECT pg_is_in_recovery()` over a fresh short-lived connection.
-///
-/// Each TLS variant produces a distinct `Connection<_, T>` type, so we split
-/// into a helper that resolves early per branch rather than trying to unify
-/// the return type in a single `match` expression.
-async fn query_is_primary(
-    connect_config: PgConnectConfig,
-    transport: &crate::core::TransportConfig,
-) -> Result<bool> {
-    async fn run_query(client: tokio_postgres::Client) -> Result<bool> {
-        let row = client
-            .query_one("SELECT pg_is_in_recovery()", &[])
-            .await
-            .map_err(PgError::from)
-            .map_err(|e| Error::SourceError(format!("check_is_primary: query failed: {e}")))?;
-        let is_in_recovery: bool = row.get(0);
-        Ok(!is_in_recovery)
-    }
+async fn query_is_primary(config: &PostgresSourceConfig) -> Result<bool> {
+    let (client, task) = open_client(config)
+        .await
+        .map_err(|error| Error::SourceError(format!("check_is_primary: {error}")))?;
+    let result = client
+        .query_one("SELECT pg_is_in_recovery()", &[])
+        .await
+        .map_err(PgError::from)
+        .map_err(|e| Error::SourceError(format!("check_is_primary: query failed: {e}")))
+        .map(|row| !row.get::<_, bool>(0));
+    task.abort();
+    result
+}
 
-    match transport {
-        crate::core::TransportConfig::Plaintext => {
-            let (client, connection) = connect_config
-                .connect(tokio_postgres::NoTls)
+/// A SQL connection over the configured transport, not yet validated or registered.
+///
+/// The one place the transport is interpreted: the connection, the snapshot's anchor and
+/// `check_is_primary` all open through here.
+pub(super) async fn open_client(
+    config: &PostgresSourceConfig,
+) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
+    match &config.transport {
+        TransportConfig::Plaintext => {
+            let connect_config = config.build_connect_config()?;
+            let (client, connection) = connect_answering(&connect_config, tokio_postgres::NoTls)
                 .await
-                .map_err(PgError::from)
-                .map_err(|e| {
+                .map_err(|error| {
                     Error::SourceError(format!(
-                        "check_is_primary: postgres plaintext connection failed: {e}"
+                        "postgres plaintext connection failed: {}",
+                        PgError::from(error)
                     ))
                 })?;
-            let handle = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let result = run_query(client).await;
-            handle.abort();
-            result
+            Ok((client, tokio::spawn(super::run_connection_task(connection))))
         }
-        #[cfg(feature = "tls")]
-        crate::core::TransportConfig::Tls {
+        TransportConfig::Tls {
             ca_cert_path,
             client_cert_path,
             client_key_path,
-            ..
+            allow_invalid_certificates,
+            allow_invalid_hostnames,
         } => {
-            use tokio_postgres_rustls::MakeRustlsConnect;
-            let tls_config = super::query::build_tls_client_config(
-                ca_cert_path.as_deref(),
-                client_cert_path.as_deref(),
-                client_key_path.as_deref(),
-            )?;
-            let (client, connection) = connect_config
-                .connect(MakeRustlsConnect::new(tls_config))
-                .await
-                .map_err(PgError::from)
-                .map_err(|e| {
-                    Error::SourceError(format!(
-                        "check_is_primary: postgres tls connection failed: {e}"
-                    ))
-                })?;
-            let handle = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let result = run_query(client).await;
-            handle.abort();
-            result
+            // This connector always verifies the certificate; rejecting the insecure flags
+            // beats an opaque verification failure for an operator who believes they are off.
+            if *allow_invalid_certificates || *allow_invalid_hostnames {
+                return Err(Error::ConfigError(
+                    "postgres transport sets allow_invalid_certificates or \
+                     allow_invalid_hostnames, but this connector always verifies the \
+                     server certificate and cannot disable it. Rather than silently \
+                     ignoring the setting and failing verification with an opaque error, \
+                     it is rejected here. For a self-signed or private-CA server use \
+                     TransportConfig::tls_with_ca_cert_path(Some(path)) and trust the CA \
+                     explicitly; for a plaintext test setup use TransportConfig::Plaintext."
+                        .into(),
+                ));
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = (ca_cert_path, client_cert_path, client_key_path);
+                return Err(Error::ConfigError(
+                    "postgres connector requires crate feature 'tls' for TLS transport".into(),
+                ));
+            }
+
+            #[cfg(feature = "tls")]
+            {
+                use tokio_postgres_rustls::MakeRustlsConnect;
+
+                let tls_config = super::query::build_tls_client_config(
+                    ca_cert_path.as_deref(),
+                    client_cert_path.as_deref(),
+                    client_key_path.as_deref(),
+                )?;
+
+                let tls_connector = MakeRustlsConnect::new(tls_config);
+                let connect_config = config.build_connect_config()?;
+                let (client, connection) = connect_answering(&connect_config, tls_connector)
+                    .await
+                    .map_err(|error| {
+                        Error::SourceError(format!(
+                            "postgres tls connection failed: {}",
+                            PgError::from(error)
+                        ))
+                    })?;
+
+                Ok((client, tokio::spawn(super::run_connection_task(connection))))
+            }
         }
         #[cfg(feature = "tls")]
-        crate::core::TransportConfig::RustlsConfig { config: rustls_cfg } => {
+        TransportConfig::RustlsConfig { config: rustls_cfg } => {
             use tokio_postgres_rustls::MakeRustlsConnect;
-            let (client, connection) = connect_config
-                .connect(MakeRustlsConnect::new((*rustls_cfg.0).clone()))
+            let tls_connector = MakeRustlsConnect::new((*rustls_cfg.0).clone());
+            let connect_config = config.build_connect_config()?;
+            let (client, connection) = connect_answering(&connect_config, tls_connector)
                 .await
                 .map_err(PgError::from)
-                .map_err(|e| {
-                    Error::SourceError(format!(
-                        "check_is_primary: postgres rustls connection failed: {e}"
-                    ))
+                .map_err(|error| {
+                    Error::SourceError(format!("postgres rustls connection failed: {error}"))
                 })?;
-            let handle = tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let result = run_query(client).await;
-            handle.abort();
-            result
+            Ok((client, tokio::spawn(super::run_connection_task(connection))))
         }
-        #[cfg(not(feature = "tls"))]
-        _ => Err(Error::ConfigError(
-            "check_is_primary: TLS transport requires crate feature 'tls'".into(),
-        )),
+    }
+}
+
+/// Connect, and when the host resolves to several addresses, report the first server's answer.
+///
+/// `tokio-postgres` tries each address and returns the **last** error, so a password refused on
+/// `127.0.0.1` is reported as a refused connection on `::1` wherever `localhost` resolves to both.
+async fn connect_answering<T>(
+    config: &PgConnectConfig,
+    tls: T,
+) -> std::result::Result<
+    (
+        tokio_postgres::Client,
+        tokio_postgres::Connection<tokio_postgres::Socket, T::Stream>,
+    ),
+    tokio_postgres::Error,
+>
+where
+    T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone,
+{
+    let target = match (config.get_hosts(), config.get_ports()) {
+        ([tokio_postgres::config::Host::Tcp(host)], [port]) => Some((host.clone(), *port)),
+        _ => None,
+    };
+    let ips = match target {
+        Some((host, port)) => tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map(|addrs| {
+                let mut ips: Vec<std::net::IpAddr> = Vec::new();
+                for addr in addrs {
+                    if !ips.contains(&addr.ip()) {
+                        ips.push(addr.ip());
+                    }
+                }
+                ips
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if ips.len() < 2 {
+        return config.connect(tls).await;
+    }
+    connect_each(config, &ips, tls).await
+}
+
+/// Try `ips` in order. A server error is an answer and ends the search; a connect failure moves
+/// on, and the first one is reported if no address answers.
+async fn connect_each<T>(
+    config: &PgConnectConfig,
+    ips: &[std::net::IpAddr],
+    tls: T,
+) -> std::result::Result<
+    (
+        tokio_postgres::Client,
+        tokio_postgres::Connection<tokio_postgres::Socket, T::Stream>,
+    ),
+    tokio_postgres::Error,
+>
+where
+    T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone,
+{
+    let mut first_failure = None;
+    for ip in ips {
+        let mut attempt = config.clone();
+        attempt.hostaddr(*ip);
+        match attempt.connect(tls.clone()).await {
+            Ok(connected) => return Ok(connected),
+            Err(error) if error.as_db_error().is_some() => return Err(error),
+            Err(error) => {
+                first_failure.get_or_insert(error);
+            }
+        }
+    }
+    match first_failure {
+        Some(error) => Err(error),
+        None => config.connect(tls).await,
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that refuses the password on the first address is the answer, even when a later
+    /// address has no listener: the operator must hear `28P01`, not "connection refused".
+    #[tokio::test]
+    async fn a_server_refusal_on_one_address_is_reported_over_a_later_connect_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut length = [0u8; 4];
+            socket.read_exact(&mut length).await.unwrap();
+            let mut startup = vec![0u8; u32::from_be_bytes(length) as usize - 4];
+            socket.read_exact(&mut startup).await.unwrap();
+            let mut body = Vec::new();
+            for (field, value) in [
+                (b'S', "FATAL"),
+                (b'V', "FATAL"),
+                (b'C', "28P01"),
+                (b'M', "password authentication failed for user \"cdc\""),
+            ] {
+                body.push(field);
+                body.extend_from_slice(value.as_bytes());
+                body.push(0);
+            }
+            body.push(0);
+            socket.write_all(b"E").await.unwrap();
+            socket
+                .write_all(&u32::try_from(body.len() + 4).unwrap().to_be_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+
+        let mut config = PgConnectConfig::new();
+        config
+            .host("localhost")
+            .port(port)
+            .user("cdc")
+            .password("wrong")
+            .dbname("app")
+            .ssl_mode(tokio_postgres::config::SslMode::Disable)
+            .connect_timeout(Duration::from_secs(5));
+        // Nothing listens on `::1` at this port, as on a host whose `localhost` is dual-stack.
+        let ips = ["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
+        let error = connect_each(&config, &ips, tokio_postgres::NoTls)
+            .await
+            .err()
+            .expect("the server refused the password");
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD),
+            "{error}"
+        );
     }
 }

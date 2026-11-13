@@ -881,102 +881,8 @@ impl PostgresConnection {
     }
 
     /// A SQL connection over the configured transport, not yet validated or registered.
-    ///
-    /// The connection itself and the snapshot's anchor both open through here, so the transport
-    /// is interpreted once.
     pub(super) async fn open_client(&self) -> Result<(Client, tokio::task::JoinHandle<()>)> {
-        match &self.config.transport {
-            TransportConfig::Plaintext => {
-                let connect_config = self.config.build_connect_config()?;
-                let (client, connection) = connect_config
-                    .connect(tokio_postgres::NoTls)
-                    .await
-                    .map_err(|error| {
-                        Error::SourceError(format!(
-                            "postgres plaintext connection failed: {}",
-                            PgError::from(error)
-                        ))
-                    })?;
-                Ok((client, tokio::spawn(run_connection_task(connection))))
-            }
-            TransportConfig::Tls {
-                ca_cert_path,
-                client_cert_path,
-                client_key_path,
-                allow_invalid_certificates,
-                allow_invalid_hostnames,
-            } => {
-                // The insecure flags are documented as working, and the PostgreSQL
-                // connector silently ignored them — always building a fully verifying
-                // config. That fails *secure*, but it is still a config lie: an
-                // operator who set `tls_insecure_skip_verify()` to get past a
-                // self-signed certificate in a test environment hit an opaque
-                // verification failure while every doc and the config object told them
-                // verification was disabled. Say so instead.
-                //
-                // Note the three connectors previously interpreted the same
-                // `TransportConfig` three different ways; this makes PostgreSQL explicit
-                // about what it does and does not honour.
-                if *allow_invalid_certificates || *allow_invalid_hostnames {
-                    return Err(Error::ConfigError(
-                        "postgres transport sets allow_invalid_certificates or \
-                         allow_invalid_hostnames, but this connector always verifies the \
-                         server certificate and cannot disable it. Rather than silently \
-                         ignoring the setting and failing verification with an opaque error, \
-                         it is rejected here. For a self-signed or private-CA server use \
-                         TransportConfig::tls_with_ca_cert_path(Some(path)) and trust the CA \
-                         explicitly; for a plaintext test setup use TransportConfig::Plaintext."
-                            .into(),
-                    ));
-                }
-                #[cfg(not(feature = "tls"))]
-                {
-                    let _ = (ca_cert_path, client_cert_path, client_key_path);
-                    return Err(Error::ConfigError(
-                        "postgres connector requires crate feature 'tls' for TLS transport".into(),
-                    ));
-                }
-
-                #[cfg(feature = "tls")]
-                {
-                    use tokio_postgres_rustls::MakeRustlsConnect;
-
-                    let tls_config = build_tls_client_config(
-                        ca_cert_path.as_deref(),
-                        client_cert_path.as_deref(),
-                        client_key_path.as_deref(),
-                    )?;
-
-                    let tls_connector = MakeRustlsConnect::new(tls_config);
-                    let connect_config = self.config.build_connect_config()?;
-                    let (client, connection) = connect_config
-                        .connect(tls_connector)
-                        .await
-                        .map_err(|error| {
-                            Error::SourceError(format!(
-                                "postgres tls connection failed: {}",
-                                PgError::from(error)
-                            ))
-                        })?;
-
-                    Ok((client, tokio::spawn(run_connection_task(connection))))
-                }
-            }
-            #[cfg(feature = "tls")]
-            TransportConfig::RustlsConfig { config: rustls_cfg } => {
-                use tokio_postgres_rustls::MakeRustlsConnect;
-                let tls_connector = MakeRustlsConnect::new((*rustls_cfg.0).clone());
-                let connect_config = self.config.build_connect_config()?;
-                let (client, connection) = connect_config
-                    .connect(tls_connector)
-                    .await
-                    .map_err(PgError::from)
-                    .map_err(|error| {
-                        Error::SourceError(format!("postgres rustls connection failed: {error}"))
-                    })?;
-                Ok((client, tokio::spawn(run_connection_task(connection))))
-            }
-        }
+        config::open_client(&self.config).await
     }
 
     /// Close the connection. Safe to call when already closed.
@@ -1518,20 +1424,6 @@ async fn reconcile_stream_resume_lsn_with_retry(
 
 async fn query_current_wal_lsn(client: &Client) -> Result<u64> {
     query::query_current_wal_lsn(client).await
-}
-
-/// Build a rustls `RootCertStore` from a PEM file path, or use system roots if `None`.
-///
-/// When mTLS paths are provided (`client_cert_path` + `client_key_path`), mutual TLS
-/// authentication is configured. When only `ca_cert_path` is provided, server-auth-only
-/// TLS is used. Falls back to system trust roots when `ca_cert_path` is `None`.
-#[cfg(feature = "tls")]
-fn build_tls_client_config(
-    ca_cert_path: Option<&str>,
-    client_cert_path: Option<&str>,
-    client_key_path: Option<&str>,
-) -> Result<rustls::ClientConfig> {
-    query::build_tls_client_config(ca_cert_path, client_cert_path, client_key_path)
 }
 
 async fn run_connection_task<S>(connection: Connection<Socket, S>)
@@ -2294,13 +2186,11 @@ mod tests {
             }
         }
 
-        /// Nullability is read, never derived — the regression this pins is the one the
-        /// test above used to assert *for*.
+        /// Nullability is read, never derived.
         ///
-        /// `nullable` was `!is_primary_key`, so every `NOT NULL` non-key column was
-        /// published as nullable and a nullable key could not be expressed. pgoutput
-        /// carries no nullability at all, so the only way to be right is to read the
-        /// catalog.
+        /// Deriving `nullable` as `!is_primary_key` publishes every `NOT NULL` non-key
+        /// column as nullable and cannot express a nullable key. pgoutput carries no
+        /// nullability at all, so the only way to be right is to read the catalog.
         #[tokio::test]
         async fn the_published_schema_takes_nullability_from_the_catalog() {
             use crate::source::schema_catalog::{CatalogColumn, CatalogSchemas};
