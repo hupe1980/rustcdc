@@ -24,6 +24,11 @@ const BROKER_PORT: u16 = 19094;
 const PG_PASSWORD: &str = "bench";
 const STATE_TOPIC: &str = "__rustcdc_bench_state";
 
+/// `cargo xtask pipeline-bench --smoke`: the harness as a correctness check.
+fn smoke() -> bool {
+    std::env::var_os("PIPELINE_BENCH_SMOKE").is_some()
+}
+
 fn knob(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -421,13 +426,20 @@ fn wait_for_slot(server: &mut Child, dir: &std::path::Path, contract: &Contract)
 /// its arrival (host clock, µs). The first arrival of each wins; at-least-once may repeat a row.
 type Arrivals = HashMap<(i64, String), (i64, i64)>;
 
+/// First arrivals per row, and how many arrived again: a duplicate at a `read_committed`
+/// consumer is the failure `effectively_once` exists to prevent.
+struct Consumed {
+    arrivals: Arrivals,
+    duplicates: usize,
+}
+
 fn consume(
     topic: String,
     read_committed: bool,
     wanted: usize,
     op: &'static str,
     ready: mpsc::Sender<()>,
-) -> Arrivals {
+) -> Consumed {
     block_on(async move {
         let mut builder = krafka::Kafka::builder(broker())
             .connect()
@@ -447,8 +459,20 @@ fn consume(
         }
         let _ = ready.send(());
         let mut seen: Arrivals = HashMap::new();
+        let mut duplicates = 0;
         let mut last_progress = Instant::now();
-        while seen.len() < wanted && last_progress.elapsed() < Duration::from_secs(60) {
+        // Read on briefly once every row has arrived, so a duplicate sent after the last
+        // first arrival is still counted.
+        let mut complete_at: Option<Instant> = None;
+        loop {
+            if seen.len() >= wanted {
+                let since = *complete_at.get_or_insert_with(Instant::now);
+                if since.elapsed() > Duration::from_millis(1500) {
+                    break;
+                }
+            } else if last_progress.elapsed() > Duration::from_secs(60) {
+                break;
+            }
             let records = match consumer.poll(Duration::from_millis(200)).await {
                 Ok(records) => records,
                 Err(error) if error.is_retriable() => continue,
@@ -478,13 +502,20 @@ fn consume(
                     .or_else(|| after["n"].as_str().and_then(|s| s.parse().ok()))
                     .unwrap_or(0);
                 if let (Some(id), Some(written)) = (id, written) {
-                    seen.entry((id, format!("{row_op}:{n}")))
-                        .or_insert((written, at));
+                    match seen.entry((id, format!("{row_op}:{n}"))) {
+                        std::collections::hash_map::Entry::Occupied(_) => duplicates += 1,
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert((written, at));
+                        }
+                    }
                     last_progress = Instant::now();
                 }
             }
         }
-        seen
+        Consumed {
+            arrivals: seen,
+            duplicates,
+        }
     })
 }
 
@@ -520,6 +551,7 @@ struct Run {
     latency_ms_p50: f64,
     latency_ms_p95: f64,
     latency_ms_p99: f64,
+    duplicates: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -579,7 +611,8 @@ fn pipeline_bench() {
     let per_txn = knob("PIPELINE_BENCH_PER_TXN", 1_000);
     let bulk_rows = knob("PIPELINE_BENCH_BULK_ROWS", 100_000).min(rows);
     // Three passes over the bulk rows pass the default 64 MB `logical_decoding_work_mem`.
-    let passes = knob("PIPELINE_BENCH_LONG_PASSES", 3).max(1);
+    // Zero skips the long transaction (the smoke run).
+    let passes = knob("PIPELINE_BENCH_LONG_PASSES", 3);
     let long_seconds = knob("PIPELINE_BENCH_LONG_SECONDS", 20);
 
     let _containers = start_containers();
@@ -612,7 +645,17 @@ fn pipeline_bench() {
         let started = now_us();
         psql(&format!("CALL load({first}, {rows}, {per_txn})"));
         let written = now_us();
-        let seen = consumer.join().expect("consumer");
+        let Consumed {
+            arrivals: seen,
+            duplicates,
+        } = consumer.join().expect("consumer");
+        assert!(
+            !contract.read_committed || duplicates == 0,
+            "{}: {duplicates} rows reached the read_committed consumer more than once. \
+             rustcdc's log ends:\n{}",
+            contract.name,
+            log_tail(dir.path())
+        );
 
         let mine: Vec<_> = seen
             .iter()
@@ -640,9 +683,10 @@ fn pipeline_bench() {
             latency_ms_p50: percentile(&latency, 50.0),
             latency_ms_p95: percentile(&latency, 95.0),
             latency_ms_p99: percentile(&latency, 99.0),
+            duplicates,
         });
 
-        if index == 0 {
+        if index == 0 && passes > 0 {
             // One long transaction: every bulk row updated `passes` times, held open between
             // passes. Under v2 the primary streams it while it runs; under v1 it spills it.
             let slot = format!("bench_{}", contract.name);
@@ -666,7 +710,7 @@ fn pipeline_bench() {
                 first + bulk_rows as i64
             ));
             let committed = now_us();
-            let seen = consumer.join().expect("consumer");
+            let seen = consumer.join().expect("consumer").arrivals;
             assert_eq!(seen.len(), wanted, "the long transaction lost rows");
             let (streamed, spilled) = slot_bytes(&slot);
             assert!(
@@ -747,11 +791,16 @@ fn card(
     };
     let mut out = format!(
         "rustcdc pipeline bench · {} · {} · rustcdc {}\n\
-         PostgreSQL {pg} → rustcdc (release) → Apache Kafka {} · {} rows, {} per transaction\n\n\
+         PostgreSQL {pg} → rustcdc ({}) → Apache Kafka {} · {} rows, {} per transaction\n\n\
          {:<18}{:>10}{:>10}{:>10}{:>10}   write → broker\n",
         chrono::Utc::now().format("%Y-%m-%d"),
         machine(),
         env!("CARGO_PKG_VERSION"),
+        if smoke() {
+            "debug, smoke run: correctness, not a measurement"
+        } else {
+            "release"
+        },
         matrix::full(matrix::Engine::Kafka),
         n(rows as f64),
         n(per_txn as f64),
@@ -771,6 +820,13 @@ fn card(
             ms(run.latency_ms_p99),
         ));
     }
+    out.push_str(&format!(
+        "Rows that arrived more than once: {}\n",
+        runs.iter()
+            .map(|run| format!("{} {}", run.contract, run.duplicates))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    ));
     if let Some(b) = bulk {
         let mb = |bytes: i64| format!("{:.0} MB", bytes as f64 / 1e6);
         out.push_str(&format!(
@@ -790,8 +846,9 @@ fn card(
     }
     out.push_str(&format!(
         "\nLatency: PostgreSQL's write time to the consumer's arrival, clocks aligned within {:.1} ms.\n\
-         Reproduce: cargo xtask pipeline-bench",
-        rtt_us as f64 / 2000.0
+         Reproduce: cargo xtask pipeline-bench{}",
+        rtt_us as f64 / 2000.0,
+        if smoke() { " --smoke" } else { "" }
     ));
     let set: Vec<String> = OVERRIDES
         .iter()

@@ -63,7 +63,7 @@ const TASKS: &[Task] = &[
     },
     Task {
         name: "pipeline-bench",
-        about: "Rows/s and latency, PostgreSQL → rustcdc → Redpanda, both contracts (Docker, ~10 min).",
+        about: "Rows/s and latency, PostgreSQL → rustcdc → Kafka, both contracts (Docker). --smoke: both contracts end to end, no numbers.",
         run: pipeline_bench,
     },
     Task {
@@ -167,6 +167,14 @@ fn bench(args: &[String]) -> Result<(), String> {
 /// settings below are the Dockerfile's. Its own target directory keeps those settings from
 /// invalidating the ordinary release cache.
 fn pipeline_bench(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--smoke") {
+        let rest: Vec<String> = args
+            .iter()
+            .filter(|arg| *arg != "--smoke")
+            .cloned()
+            .collect();
+        return pipeline_smoke(&rest);
+    }
     let root = workspace_root()?;
     let target = root.join("target").join("pipeline-bench");
     run(Command::new("cargo")
@@ -207,6 +215,37 @@ fn pipeline_bench(args: &[String]) -> Result<(), String> {
             "PIPELINE_BENCH_BINARY",
             target.join("release").join("rustcdc"),
         )
+        .current_dir(&root))
+}
+
+/// The bench's harness as a correctness check: both contracts end to end, a small load, no long
+/// transaction, a debug binary. What CI runs on every pull request; the card is not a measurement.
+fn pipeline_smoke(args: &[String]) -> Result<(), String> {
+    let root = workspace_root()?;
+    run(Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "rustcdc-server",
+            "--bin",
+            "rustcdc",
+            "--all-features",
+            "--locked",
+        ])
+        .current_dir(&root))?;
+    run(Command::new("cargo")
+        .args(["test", "-p", "rustcdc-server", "--all-features", "--locked"])
+        .args(["--test", "pipeline_bench", "--", "--ignored", "--nocapture"])
+        .args(args)
+        .env(
+            "PIPELINE_BENCH_BINARY",
+            root.join("target").join("debug").join("rustcdc"),
+        )
+        .env("PIPELINE_BENCH_SMOKE", "1")
+        .env("PIPELINE_BENCH_ROWS", "5000")
+        .env("PIPELINE_BENCH_PER_TXN", "500")
+        .env("PIPELINE_BENCH_BULK_ROWS", "0")
+        .env("PIPELINE_BENCH_LONG_PASSES", "0")
         .current_dir(&root))
 }
 

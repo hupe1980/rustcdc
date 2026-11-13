@@ -1026,6 +1026,27 @@ jobs:
         if: always()
         run: docker rm -f ${{ matrix.container }} || true
 
+  # ── The pipeline, end to end ───────────────────────────────────────────────
+  #
+  # PostgreSQL → the `rustcdc` binary → Apache Kafka, under both delivery contracts, read back
+  # with a `read_committed` consumer for `effectively_once`. It fails on a row that never
+  # arrives and, under `effectively_once`, on a row that arrives twice. Each layer has its own
+  # suite; this is the only job that composes them, and the single-sink `effectively_once`
+  # defect lived from 0.15.0 to 0.20.1 because nothing did. The card it prints is not a
+  # measurement — `cargo xtask pipeline-bench` without `--smoke` measures, locally.
+  server-pipeline-smoke:
+    name: "server: pipeline end to end (both contracts)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo xtask pipeline-bench --smoke
+      - name: Clean up the containers
+        if: always()
+        run: docker rm -f rustcdc-bench-postgres rustcdc-bench-kafka || true
+
   # ── Fuzz targets (build + short smoke run) ──────────────────────────────────
   #
   # The invariants these targets check also run on stable, every build, in
@@ -1105,6 +1126,7 @@ jobs:
       - server-connector-matrix
       - server-test
       - server-integration
+      - server-pipeline-smoke
       - server-fuzz
     runs-on: ubuntu-latest
     steps:

@@ -47,6 +47,32 @@ advances at the binlog flush, before the engine commit, so it cannot sharpen the
   were checked live to name the column `Executed_Gtid_Set` in `SHOW BINARY LOG STATUS`; the MySQL
   GTID watermark and snapshot suites pass unchanged.
 
+### Fixed: a PostgreSQL snapshot read a later point in time after a failed chunk
+
+A chunk that failed part-way rolled back the snapshot's transaction, and the next chunk opened a new
+one at a later point, so a row written between the failure and the reopen was read by the snapshot
+and delivered again by the stream. The snapshot now exports its point in time from a second
+connection that does nothing else, and every reader transaction — the first and any reopened —
+imports it. If that connection cannot open or is ended (`idle_in_transaction_session_timeout`), the
+snapshot continues as before and logs a WARN saying what that costs. The snapshot uses one more
+connection while it runs. The connector page also no longer says an interrupted snapshot restarts
+from the beginning: it resumes at each table's cursor.
+
+- *Evidence*: the failed-chunk test inserts a row between the failure and the reopen; it was read
+  on the previous tree and is not now, and it is read again with the reopen's import planted out.
+
+### Added: CI runs the pipeline end to end under both contracts
+
+`cargo xtask pipeline-bench --smoke` runs PostgreSQL → the `rustcdc` binary → Apache Kafka under
+`at_least_once` and `effectively_once` and fails when a row never arrives or, under
+`effectively_once`, reaches the `read_committed` consumer twice — the bench's consumer now counts
+duplicates, which it could not see before. CI runs it on every pull request. It is the only job
+that composes the source, the delivery contract and a transactional sink.
+
+- *Evidence*: the smoke run fails with the 0.21 single-sink router defect planted back ("5000 of
+  5000 rows never reached the broker") and with a planted second send of each record ("5000 rows
+  reached the read_committed consumer more than once"); it passes in about two minutes locally.
+
 ### Changed: the documentation site
 
 - **Console, Performance and Supported versions are in the docs menu.** They shipped unreachable

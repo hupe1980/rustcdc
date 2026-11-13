@@ -84,5 +84,10 @@ cargo xtask pipeline-bench
 `PIPELINE_BENCH_POSTGRES` goes into `[source.postgres]`, `PIPELINE_BENCH_RUNTIME` into `[runtime]`.
 The card prints both whenever they are set, so a tuned run never reads as the default.
 `PIPELINE_BENCH_ROWS`, `PIPELINE_BENCH_PER_TXN`, `PIPELINE_BENCH_BULK_ROWS`,
-`PIPELINE_BENCH_LONG_PASSES` and `PIPELINE_BENCH_LONG_SECONDS` change the load.
+`PIPELINE_BENCH_LONG_PASSES` (`0` skips the long transaction) and `PIPELINE_BENCH_LONG_SECONDS`
+change the load.
+
+**`cargo xtask pipeline-bench --smoke`** runs the same harness as a check, not a measurement: a
+debug binary, 5 000 rows, no long transaction, about two minutes. It fails when a row never
+arrives or, under `effectively_once`, arrives twice. CI runs it on every pull request.
 The JSON lands in `target/pipeline-bench.json`.
