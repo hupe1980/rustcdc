@@ -22,8 +22,8 @@ received before. A rollback drops it; `ROLLBACK TO SAVEPOINT` drops that savepoi
 Materialize, PeerDB, Supabase etl and Sequin all negotiate v1.
 
 - **Measured** (`cargo xtask pipeline-bench`, 300 000 updates held open 21 s, one machine): the
-  primary spilled 106 MB to its own disk under v1 and **0 MB** under v2, and the last row reached
-  Kafka **11.1 s** after the commit instead of 16.0 s. See [Performance](site/content/docs/performance.md).
+  primary spilled 108 MB to its own disk under v1 and **0 MB** under v2, and the last row reached
+  Kafka **10.4 s** after the commit instead of 13.1 s. See [Performance](site/content/docs/performance.md).
 - **Default on.** `stream_in_progress_transactions = false` asks for v1. `sql_peek` always uses
   v1: a peek can stop part-way through a stream and restart it on the next poll.
 - **Visible.** `/status` gains `source.open_transaction`, the console says *Reading a transaction

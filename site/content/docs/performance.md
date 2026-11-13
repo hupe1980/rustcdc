@@ -20,19 +20,20 @@ arrives**.
 ## Measured
 
 ```text
-rustcdc pipeline bench · 2026-11-13 · Apple M4 Pro, 14 cores · Darwin 25.6.0 · rustcdc 0.21.0
-PostgreSQL 18.6 → rustcdc (release) → Apache Kafka 4.4.0 · 200 000 rows, 1 000 per transaction
+rustcdc pipeline bench · 2026-11-13 · Apple M4 Pro, 14 cores · Darwin 27.2.0 · rustcdc 0.22.0
+PostgreSQL 18.7 → rustcdc (release) → Apache Kafka 4.4.0 · 200 000 rows, 1 000 per transaction
 
                       rows/s       p50       p95       p99   write → broker
-at_least_once         23 611   4494 ms   7645 ms   7905 ms
-effectively_once      21 742   4836 ms   8081 ms   8372 ms
+at_least_once         22 363   4009 ms   8007 ms   8423 ms
+effectively_once      26 536   3816 ms   6845 ms   7111 ms
+Rows that arrived more than once: at_least_once 0 · effectively_once 0
 
-One transaction of 300 000 updates (100 000 rows × 3), open 21.2 s
-  primary                  streamed 106 MB, spilled 0 MB to its own disk
-  first row at the broker  +0.5 s after the commit   (rows are released at the commit)
-  last row at the broker   +11.1 s after the commit
+One transaction of 300 000 updates (100 000 rows × 3), open 20.9 s
+  primary                  streamed 108 MB, spilled 0 MB to its own disk
+  first row at the broker  +0.4 s after the commit   (rows are released at the commit)
+  last row at the broker   +10.4 s after the commit
 
-Latency: PostgreSQL's write time to the consumer's arrival, clocks aligned within 17.2 ms.
+Latency: PostgreSQL's write time to the consumer's arrival, clocks aligned within 16.6 ms.
 Reproduce: cargo xtask pipeline-bench  (default settings)
 ```
 
@@ -54,9 +55,9 @@ primary, and how much is left to send once the commit lands. The same run with
 
 | 300 000 updates, open 21 s | v1 | v2 (default) |
 |---|---|---|
-| Spilled to the primary's own disk | 106 MB | **0 MB** — streamed instead |
-| First row at the broker | +1.2 s after the commit | +0.5 s |
-| Last row at the broker | +16.0 s after the commit | **+11.1 s** |
+| Spilled to the primary's own disk | 108 MB | **0 MB** — streamed instead |
+| First row at the broker | +0.8 s after the commit | +0.4 s |
+| Last row at the broker | +13.1 s after the commit | **+10.4 s** |
 
 The run fails rather than reporting a number when the transaction neither streamed nor spilled:
 too small to pass `logical_decoding_work_mem`, it would measure nothing.
@@ -69,7 +70,9 @@ See [Large transactions](@/docs/connectors/postgres.md#large-transactions).
 - **One table, one partition, one connector.** Wide rows, many tables, MySQL, SQL Server or a sink
   other than Kafka are not measured here.
 - **Not tuned.** Every setting is the default unless the card says otherwise.
-- **Runs differ by a few percent.** Compare runs from the same machine, not single numbers.
+- **Runs vary.** Four runs of this build on this laptop ranged from 17 500 to 27 200 rows/s, and
+  the long transaction's last row from +9.6 to +14.5 s; the slow runs followed a long container
+  workload. Compare several runs on one machine, not single numbers.
 
 ## Trying a setting
 

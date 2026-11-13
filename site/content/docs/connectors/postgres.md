@@ -174,7 +174,7 @@ the checkpoint never moves for a transaction that has not committed.
 |---|---|---|
 | While a 10 M-row `UPDATE` runs | The primary spills it to its own disk | The primary sends it; the connector holds it |
 | At its commit | The whole transaction crosses the network | Only the rest crosses |
-| 300 000 updates, last row at Kafka ([measured](@/docs/performance.md)) | +16.0 s after the commit | +11.1 s |
+| 300 000 updates, last row at Kafka ([measured](@/docs/performance.md)) | +13.1 s after the commit | +10.4 s |
 | `pg_stat_replication_slots` | `spill_txns`, `spill_bytes` grow | `stream_txns`, `stream_bytes` grow |
 
 **Where it is held.** In memory up to `stream_buffer_memory_bytes` (64 MiB) across open
