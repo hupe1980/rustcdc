@@ -48,18 +48,26 @@ When `snapshot_tables` is configured (top-level in `cdc.toml`, or via
 `rustcdc run --snapshot-table schema.table`), the connector performs an initial
 snapshot before streaming:
 
-1. Opens a consistent `REPEATABLE READ` transaction
-2. Records the current WAL LSN as the snapshot boundary
-3. Performs a full table scan for each table in `snapshot_tables`, emitting
-   one `read` event per row
-4. Commits the transaction and records the snapshot LSN as the checkpoint
-5. Switches to streaming mode from that LSN (snapshot-to-stream handoff)
+1. Opens a second connection, the **anchor**, whose `REPEATABLE READ` transaction reads the
+   current WAL LSN — the snapshot boundary — and exports its snapshot, in one statement
+2. Reads each table in `snapshot_tables` by primary-key keyset in a transaction that imports
+   that snapshot, emitting one `read` event per row
+3. Switches to streaming mode from the boundary LSN (snapshot-to-stream handoff)
+
+**The snapshot is one point in time, failures included.** A chunk that fails part-way rolls its
+transaction back; the next one imports the same exported snapshot, so a row written since the
+snapshot began is never read by it — it reaches the consumer once, through the stream. This holds
+while the anchor lives: it costs one connection for the length of the snapshot, and like any
+snapshot it holds back `xmin`, so vacuum cannot reclaim rows changed since it began. If the anchor
+cannot be opened or is ended — `idle_in_transaction_session_timeout` is the usual cause, so leave
+it unset for the CDC role — the snapshot continues in a new transaction at a later point and logs
+a WARN: a row written in between may then arrive both as a snapshot read and as a stream change.
 
 Without `snapshot_tables`, the connector starts streaming immediately from the
 slot position — existing rows are not re-read.
 
-If the connector is interrupted during the snapshot, it restarts the snapshot
-from the beginning. Only a fully completed snapshot advances the checkpoint.
+**A restart resumes the snapshot** from the checkpoint at each table's keyset cursor, with the
+original boundary LSN; the rows still to read are read as they are at the restart.
 
 ### Incremental snapshot (non-blocking)
 

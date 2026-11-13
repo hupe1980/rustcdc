@@ -286,6 +286,8 @@ pub struct PostgresSnapshotHandle {
     client: Option<Arc<Client>>,
     transaction_open: bool,
     snapshot_watermark: u64,
+    /// Holds the exported snapshot every reader transaction imports; `None` once it is gone.
+    anchor: Option<snapshot_start::SnapshotAnchor>,
     current_table: usize,
     next_chunk_index: u32,
     emitted_rows: u64,
@@ -308,6 +310,7 @@ impl PostgresSnapshotHandle {
             client,
             transaction_open,
             snapshot_watermark,
+            anchor: None,
             current_table: 0,
             next_chunk_index: 0,
             emitted_rows: 0,
@@ -863,7 +866,26 @@ impl PostgresConnection {
         }
 
         self.config.transport.warn_if_insecure("postgres");
-        let connect_result: Result<()> = match &self.config.transport {
+        let (client, connection_task) = self.open_client().await?;
+        self.validate_connected_client(&client).await?;
+        let client = Arc::new(client);
+        let heartbeat_task = self.start_heartbeat(client.clone());
+        {
+            let mut state = self.state.lock().await;
+            state.client = Some(client);
+            state.connection_task = Some(connection_task);
+            state.heartbeat_task = Some(heartbeat_task);
+        }
+        self.logger.source_connected();
+        Ok(())
+    }
+
+    /// A SQL connection over the configured transport, not yet validated or registered.
+    ///
+    /// The connection itself and the snapshot's anchor both open through here, so the transport
+    /// is interpreted once.
+    pub(super) async fn open_client(&self) -> Result<(Client, tokio::task::JoinHandle<()>)> {
+        match &self.config.transport {
             TransportConfig::Plaintext => {
                 let connect_config = self.config.build_connect_config()?;
                 let (client, connection) = connect_config
@@ -875,15 +897,7 @@ impl PostgresConnection {
                             PgError::from(error)
                         ))
                     })?;
-                let connection_task = tokio::spawn(run_connection_task(connection));
-                self.validate_connected_client(&client).await?;
-                let client = Arc::new(client);
-                let heartbeat_task = self.start_heartbeat(client.clone());
-                let mut state = self.state.lock().await;
-                state.client = Some(client);
-                state.connection_task = Some(connection_task);
-                state.heartbeat_task = Some(heartbeat_task);
-                Ok(())
+                Ok((client, tokio::spawn(run_connection_task(connection))))
             }
             TransportConfig::Tls {
                 ca_cert_path,
@@ -945,16 +959,7 @@ impl PostgresConnection {
                             ))
                         })?;
 
-                    let connection_task = tokio::spawn(run_connection_task(connection));
-                    self.validate_connected_client(&client).await?;
-                    let client = Arc::new(client);
-                    let heartbeat_task = self.start_heartbeat(client.clone());
-
-                    let mut state = self.state.lock().await;
-                    state.client = Some(client);
-                    state.connection_task = Some(connection_task);
-                    state.heartbeat_task = Some(heartbeat_task);
-                    Ok(())
+                    Ok((client, tokio::spawn(run_connection_task(connection))))
                 }
             }
             #[cfg(feature = "tls")]
@@ -969,19 +974,9 @@ impl PostgresConnection {
                     .map_err(|error| {
                         Error::SourceError(format!("postgres rustls connection failed: {error}"))
                     })?;
-                let connection_task = tokio::spawn(run_connection_task(connection));
-                self.validate_connected_client(&client).await?;
-                let client = Arc::new(client);
-                let heartbeat_task = self.start_heartbeat(client.clone());
-                let mut state = self.state.lock().await;
-                state.client = Some(client);
-                state.connection_task = Some(connection_task);
-                state.heartbeat_task = Some(heartbeat_task);
-                Ok(())
+                Ok((client, tokio::spawn(run_connection_task(connection))))
             }
-        };
-        connect_result.inspect(|_| self.logger.source_connected())?;
-        Ok(())
+        }
     }
 
     /// Close the connection. Safe to call when already closed.
