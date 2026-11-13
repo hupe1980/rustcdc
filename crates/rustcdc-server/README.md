@@ -15,6 +15,11 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 
 </div>
 
+<a href="../../site/static/console/health-light.webp"><picture>
+  <source srcset="../../site/static/console/health-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="../../site/static/console/health-light.webp" alt="The operator console at /ui: one sentence on whether the pipeline is working, and who can fix it when it is not" width="100%">
+</picture></a>
+
 ---
 
 > [!NOTE]

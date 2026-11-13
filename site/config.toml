@@ -107,6 +107,9 @@ path = "/docs/connectors/sqlserver/"
 [[extra.nav.pages]]
 title = "Snowflake"
 path = "/docs/snowflake/"
+[[extra.nav.pages]]
+title = "Supported versions"
+path = "/docs/supported-versions/"
 
 [[extra.nav]]
 title = "Configure"
@@ -150,6 +153,9 @@ path = "/docs/deployment/"
 title = "Operations"
 path = "/docs/operations/"
 [[extra.nav.pages]]
+title = "Console"
+path = "/docs/console/"
+[[extra.nav.pages]]
 title = "Incident runbook"
 path = "/docs/runbook/"
 [[extra.nav.pages]]
@@ -170,6 +176,9 @@ path = "/docs/engineering/"
 [[extra.nav.pages]]
 title = "Reliability testing"
 path = "/docs/reliability-testing/"
+[[extra.nav.pages]]
+title = "Performance"
+path = "/docs/performance/"
 [[extra.nav.pages]]
 title = "Comparison"
 path = "/docs/library-parity-matrix/"

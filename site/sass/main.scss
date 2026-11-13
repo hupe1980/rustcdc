@@ -577,7 +577,24 @@ img, svg { max-width: 100%; height: auto; }
   hr { border: 0; border-top: 1px solid var(--border); margin: 2.5rem 0; }
 
   img { border-radius: var(--radius); border: 1px solid var(--border); }
+  img.is-zoomable { cursor: zoom-in; transition: box-shadow 0.15s ease; }
+  img.is-zoomable:hover, img.is-zoomable:focus-visible { box-shadow: var(--shadow-lg); outline: none; }
 }
+
+// Full-size screenshot. The page dims behind it; anywhere closes it.
+.lightbox {
+  border: 0; padding: 0; background: transparent; max-width: 96vw; max-height: 94vh; overflow: visible;
+  cursor: zoom-out;
+  &::backdrop { background: rgba(5, 8, 18, 0.82); backdrop-filter: blur(2px); }
+  img { display: block; max-width: 96vw; max-height: 94vh; width: auto; height: auto;
+        border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); }
+}
+.lightbox-close {
+  position: absolute; top: -0.75rem; right: -0.75rem; width: 2.25rem; height: 2.25rem;
+  border-radius: 50%; border: 1px solid var(--border-strong); background: var(--bg); color: var(--fg);
+  font-size: 1.35rem; line-height: 1; cursor: pointer; box-shadow: var(--shadow-sm);
+}
+@media (prefers-reduced-motion: reduce) { .prose img.is-zoomable { transition: none; } }
 
 code {
   font-family: var(--mono); font-size: 0.875em;

@@ -1111,6 +1111,24 @@ run_bench_critical_list_check() {
   echo "Bench critical-list check passed."
 }
 
+run_docs_menu_check() {
+  # The sidebar is a hand-kept list in site/config.toml, so a new page is unreachable from the
+  # menu until somebody remembers it. Console, Performance and Supported versions all shipped so.
+  local pages menu missing stale
+  pages="$(git ls-files 'site/content/docs/*.md' 'site/content/docs/**/*.md' \
+    | grep -v '/_index\.md$' | sed -e 's|^site/content||' -e 's|\.md$|/|' | sort -u)"
+  menu="$(sed -n 's/^path = "\(\/docs\/[^"]*\)"$/\1/p' site/config.toml | sort -u)"
+  missing="$(comm -23 <(printf '%s\n' "$pages") <(printf '%s\n' "$menu"))"
+  stale="$(comm -13 <(printf '%s\n' "$pages") <(printf '%s\n' "$menu"))"
+  if [[ -n "$missing" || -n "$stale" ]]; then
+    [[ -n "$missing" ]] && echo "docs menu check failed: pages missing from [[extra.nav]] in site/config.toml:" >&2 && echo "$missing" >&2
+    [[ -n "$stale" ]] && echo "docs menu check failed: menu entries with no page:" >&2 && echo "$stale" >&2
+    exit 1
+  fi
+
+  echo "Docs menu check passed ($(printf '%s\n' "$pages" | wc -l | tr -d ' ') pages)."
+}
+
 run_config_docs_coverage_check
 run_reexport_coverage_check
 run_schema_contract_check
@@ -1128,5 +1146,6 @@ run_workflow_drift_check
 run_rust_version_pin_check
 run_floating_image_tag_check
 run_published_docs_history_check
+run_docs_menu_check
 
 echo "Policy gate passed."
