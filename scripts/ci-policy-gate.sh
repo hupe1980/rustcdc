@@ -1097,6 +1097,20 @@ run_rust_version_pin_check() {
   echo "Rust version pin check passed ($checked pin(s) match rust-version $msrv)."
 }
 
+run_bench_critical_list_check() {
+  # The critical benchmark groups are listed once, in scripts/ci-benchmark-gate.sh. A second
+  # list in a workflow drifts: a bench added to the script's list stays ungated in CI.
+  local hits
+  hits="$(git grep -n 'BENCHMARK_CRITICAL_GROUP_PREFIXES' -- .github || true)"
+  if [[ -n "$hits" ]]; then
+    echo "bench critical-list check failed: set the critical groups in scripts/ci-benchmark-gate.sh, not in a workflow:" >&2
+    echo "$hits" >&2
+    exit 1
+  fi
+
+  echo "Bench critical-list check passed."
+}
+
 run_config_docs_coverage_check
 run_reexport_coverage_check
 run_schema_contract_check
@@ -1105,6 +1119,7 @@ run_async_trait_policy_check
 run_cargo_profile_safety_check
 run_job_naming_check
 run_bench_invocation_check
+run_bench_critical_list_check
 run_cargo_scope_check
 run_release_evidence_contract_check
 run_workflow_path_check

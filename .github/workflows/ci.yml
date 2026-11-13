@@ -731,7 +731,6 @@ jobs:
       BENCHMARK_REQUIRE_HISTORICAL_BASELINE: "1"
       BENCHMARK_ENFORCE_RELEASE_POLICY: "1"
       CRITERION_BASELINE: ci-baseline
-      BENCHMARK_CRITICAL_GROUP_PREFIXES: "quality_perf/quality_gates cdc_perf/quality_gates cdc_perf/wasm_transform"
       LATENCY_GATE_DEFAULT_P95_MS: "500"
       LATENCY_GATE_DEFAULT_P99_MS: "1000"
     steps:
