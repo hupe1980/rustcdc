@@ -361,6 +361,7 @@ impl CdcRuntime {
                 .and_then(|s| s.replication_slot_lag_bytes()),
             replication_slot_wal_status: self.last_slot_wal_status,
             replication_slot_safe_wal_size_bytes: self.last_slot_safe_wal_size_bytes,
+            streamed_transactions: self.stream.as_ref().and_then(|s| s.streamed_transactions()),
         }
     }
 
@@ -818,6 +819,20 @@ pub fn write_runtime_metrics_prometheus<W: std::io::Write>(
                 "# HELP rustcdc_replication_slot_safe_wal_size_bytes PostgreSQL replication slot safe_wal_size: bytes of WAL that can still be written before the slot is endangered. Negative once the slot is unreserved; absent when max_slot_wal_keep_size is unlimited.\n\
                  # TYPE rustcdc_replication_slot_safe_wal_size_bytes gauge\n\
                  rustcdc_replication_slot_safe_wal_size_bytes{{source_type=\"{source_type}\"}} {safe_bytes}"
+            )?;
+        }
+
+        if let Some(streamed) = &admin.streamed_transactions {
+            writeln!(
+                w,
+                "# HELP rustcdc_streamed_transactions_open Transactions the source is streaming before their commit; their rows are released at the commit.\n\
+                 # TYPE rustcdc_streamed_transactions_open gauge\n\
+                 rustcdc_streamed_transactions_open{{source_type=\"{source_type}\"}} {}\n\
+                 # HELP rustcdc_streamed_transaction_bytes Bytes held for streamed transactions not yet committed, in memory or in spill files.\n\
+                 # TYPE rustcdc_streamed_transaction_bytes gauge\n\
+                 rustcdc_streamed_transaction_bytes{{source_type=\"{source_type}\",store=\"memory\"}} {}\n\
+                 rustcdc_streamed_transaction_bytes{{source_type=\"{source_type}\",store=\"disk\"}} {}",
+                streamed.open, streamed.bytes_in_memory, streamed.bytes_on_disk
             )?;
         }
 

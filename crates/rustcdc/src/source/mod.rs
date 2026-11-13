@@ -682,6 +682,13 @@ pub trait StreamHandle: Send + Sync {
         None
     }
 
+    /// Transactions being received before their commit, when the connector streams them.
+    ///
+    /// `None` for connectors and protocols that receive a transaction only once it commits.
+    fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
+        None
+    }
+
     /// A checkpoint offset describing this handle's own durable position.
     ///
     /// The runtime normally derives the checkpoint offset from the delivered event.

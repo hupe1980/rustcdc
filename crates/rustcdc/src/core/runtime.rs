@@ -1007,6 +1007,70 @@ impl StallOwner {
     }
 }
 
+/// Transactions the source is receiving while they run, held until they commit.
+///
+/// PostgreSQL 14+ streams a large transaction before its commit (pgoutput v2); rustcdc
+/// holds it and releases its rows only at the commit. This is what an operator sees in
+/// the meantime instead of a bare idle verdict. Information, not a fault: nothing routes on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct StreamedTransactions {
+    /// Transactions open now.
+    pub open: u64,
+    /// Bytes held in memory across them.
+    pub bytes_in_memory: u64,
+    /// Bytes held in spill files across them.
+    pub bytes_on_disk: u64,
+    /// The open transaction with the most changes, if any is open.
+    pub largest: Option<OpenTransaction>,
+}
+
+/// One transaction being received before its commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OpenTransaction {
+    /// The source's transaction id.
+    pub xid: u64,
+    /// Row changes and transactional messages received so far.
+    pub changes: u64,
+    /// Bytes held for it.
+    pub bytes: u64,
+    /// Whether it is held in a spill file rather than in memory.
+    pub spilled: bool,
+    /// When its first part arrived, as Unix milliseconds.
+    pub started_at_ms: u64,
+}
+
+impl StreamedTransactions {
+    /// Totals and the largest open transaction, as a connector reports them.
+    pub fn new(
+        open: u64,
+        bytes_in_memory: u64,
+        bytes_on_disk: u64,
+        largest: Option<OpenTransaction>,
+    ) -> Self {
+        Self {
+            open,
+            bytes_in_memory,
+            bytes_on_disk,
+            largest,
+        }
+    }
+}
+
+impl OpenTransaction {
+    /// One open transaction, as a connector reports it.
+    pub fn new(xid: u64, changes: u64, bytes: u64, spilled: bool, started_at_ms: u64) -> Self {
+        Self {
+            xid,
+            changes,
+            bytes,
+            spilled,
+            started_at_ms,
+        }
+    }
+}
+
 /// PostgreSQL's `pg_replication_slots.wal_status`: how safe the slot's retained WAL is.
 ///
 /// The progression is `Reserved` → `Extended` → `Unreserved` → `Lost`. `Unreserved` is the
@@ -1289,6 +1353,10 @@ pub struct RuntimeAdminSnapshot {
     /// slot WAL (`max_slot_wal_keep_size = -1`) or nothing has been sampled.
     #[serde(default)]
     pub replication_slot_safe_wal_size_bytes: Option<i64>,
+    /// Transactions the source is receiving before their commit, when it streams them.
+    ///
+    /// `None` for a connector or protocol that does not stream in-progress transactions.
+    pub streamed_transactions: Option<StreamedTransactions>,
 }
 
 /// Opaque token representing an in-flight batch prefix that may be committed.

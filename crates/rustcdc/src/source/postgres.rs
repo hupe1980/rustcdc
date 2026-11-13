@@ -31,6 +31,7 @@ mod snapshot_chunk;
 mod snapshot_finalize;
 mod snapshot_start;
 mod state;
+mod stream_assembly;
 mod stream_messages;
 mod stream_start;
 mod streaming;
@@ -727,6 +728,27 @@ pub struct PostgresSourceConfig {
     /// when idle advance is disabled.
     #[serde(default)]
     pub slot_state_sample_interval_ms: Option<u64>,
+    /// Have PostgreSQL stream a large transaction while it runs (pgoutput protocol v2,
+    /// PostgreSQL 14+), instead of spilling it to the primary's disk until it commits.
+    ///
+    /// Rows are still released only when the transaction commits, so what reaches a sink is
+    /// the same either way. The streaming transport only: `sql_peek` always negotiates v1,
+    /// because a peek can stop part-way through a stream and the next one restarts it.
+    ///
+    /// Default: `true`.
+    #[serde(default = "PostgresSourceConfig::default_stream_in_progress_transactions")]
+    pub stream_in_progress_transactions: bool,
+    /// Bytes of streamed, not yet committed transactions held in memory. A transaction that
+    /// would cross it moves to an anonymous file in `stream_spill_directory`.
+    ///
+    /// Default: 64 MiB, PostgreSQL's default `logical_decoding_work_mem`.
+    #[serde(default = "PostgresSourceConfig::default_stream_buffer_memory_bytes")]
+    pub stream_buffer_memory_bytes: u64,
+    /// Where streamed transactions spill. Checked writable when streaming starts.
+    ///
+    /// Default: unset, the system temporary directory.
+    #[serde(default)]
+    pub stream_spill_directory: Option<std::path::PathBuf>,
 }
 
 /// How the connector reads the WAL stream from PostgreSQL.
@@ -1427,6 +1449,10 @@ impl StreamHandle for PostgresStreamHandle {
 
     fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
         self.last_slot_state.as_ref()?.safe_wal_size
+    }
+
+    fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
+        self.provider.streamed_transactions()
     }
 }
 

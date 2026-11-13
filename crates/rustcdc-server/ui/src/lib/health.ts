@@ -2,7 +2,7 @@
 // (`health.owner`, `health.restart_helps`, from the library's one routing table); this file only
 // says them. A cause it has no sentence for still gets one, and the runbook link.
 import type { Health, Status } from "./api";
-import { count, duration } from "./format";
+import { bytes, compact, count, duration } from "./format";
 
 export type Tone = "healthy" | "attention" | "stalled";
 export type Hop = "source" | "rustcdc" | "destination";
@@ -80,6 +80,16 @@ export function read(status: Status | null, eventsPerSecond: number | null, reac
   if (status.state === "starting") return { tone: "attention", title: "Starting…" };
   if (status.state !== "running" || h.verdict === "not_running")
     return { tone: "attention", title: `Not running (${status.state})`, next: "The runtime stopped. Check the process log." };
+  const open = status.source?.open_transaction;
+  if (open) {
+    const held = `${bytes(open.bytes)} held ${open.spilled ? "on disk" : "in memory"}`;
+    const since = duration((Date.now() - open.started_at_ms) / 1000);
+    return {
+      tone: "healthy",
+      title: `Reading a transaction in progress — ${compact(open.changes)} changes so far`,
+      detail: `Open for ${since}, ${held}. Its rows are delivered when it commits.`,
+    };
+  }
   if (h.verdict === "idle") return { tone: "healthy", title: `Capturing — the source is quiet${rate}` };
   return { tone: "healthy", title: `Capturing${rate || " — waiting for changes"}` };
 }

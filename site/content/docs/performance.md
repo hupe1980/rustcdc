@@ -13,7 +13,7 @@ cargo xtask pipeline-bench      # Docker; about three minutes after the first bu
 ```
 
 It writes 200 000 rows in transactions of 1 000, with PostgreSQL itself as the writer, then one
-`UPDATE` of 100 000 rows in a single transaction. It reads the topic back with a consumer
+long transaction: 100 000 rows updated three times, held open about 20 s. It reads the topic back with a consumer
 (`read_committed` for `effectively_once`) and **fails rather than reporting a rate if any row never
 arrives**.
 
@@ -24,14 +24,15 @@ rustcdc pipeline bench · 2026-11-13 · Apple M4 Pro, 14 cores · Darwin 25.6.0 
 PostgreSQL 18.6 → rustcdc (release) → Apache Kafka 4.4.0 · 200 000 rows, 1 000 per transaction
 
                       rows/s       p50       p95       p99   write → broker
-at_least_once         23 484   4470 ms   7606 ms   7874 ms
-effectively_once      23 075   4369 ms   7800 ms   8086 ms
+at_least_once         23 611   4494 ms   7645 ms   7905 ms
+effectively_once      21 742   4836 ms   8081 ms   8372 ms
 
-One transaction of 100 000 updates, committed 0.3 s after it began
-  first row at the broker  +0.9 s after the commit   (protocol v1 sends nothing before it)
-  last row at the broker   +3.8 s after the commit
+One transaction of 300 000 updates (100 000 rows × 3), open 21.2 s
+  primary                  streamed 106 MB, spilled 0 MB to its own disk
+  first row at the broker  +0.5 s after the commit   (rows are released at the commit)
+  last row at the broker   +11.1 s after the commit
 
-Latency: PostgreSQL's write time to the consumer's arrival, clocks aligned within 17.3 ms.
+Latency: PostgreSQL's write time to the consumer's arrival, clocks aligned within 17.2 ms.
 Reproduce: cargo xtask pipeline-bench  (default settings)
 ```
 
@@ -46,9 +47,20 @@ finishes in a few seconds, faster than the pipeline drains, so a row's latency i
 backlog in front of it. For capture latency under a paced load, see
 [the latency evidence](@/docs/reliability-testing.md#latency-and-throughput).
 
-**The bulk update shows what pgoutput protocol version 1 does**: PostgreSQL sends a transaction's
-changes only after it commits, so the first row cannot arrive before the commit, and a large
-transaction reaches the topic as one burst after it.
+**The long transaction is where streaming shows.** Its rows reach the topic only after the
+commit either way: rustcdc releases nothing a rollback could take back. What changes is the
+primary, and how much is left to send once the commit lands. The same run with
+`PIPELINE_BENCH_POSTGRES='stream_in_progress_transactions = false'`:
+
+| 300 000 updates, open 21 s | v1 | v2 (default) |
+|---|---|---|
+| Spilled to the primary's own disk | 106 MB | **0 MB** — streamed instead |
+| First row at the broker | +1.2 s after the commit | +0.5 s |
+| Last row at the broker | +16.0 s after the commit | **+11.1 s** |
+
+The run fails rather than reporting a number when the transaction neither streamed nor spilled:
+too small to pass `logical_decoding_work_mem`, it would measure nothing.
+See [Large transactions](@/docs/connectors/postgres.md#large-transactions).
 
 ## What these numbers do not say
 
@@ -71,5 +83,6 @@ cargo xtask pipeline-bench
 
 `PIPELINE_BENCH_POSTGRES` goes into `[source.postgres]`, `PIPELINE_BENCH_RUNTIME` into `[runtime]`.
 The card prints both whenever they are set, so a tuned run never reads as the default.
-`PIPELINE_BENCH_ROWS`, `PIPELINE_BENCH_PER_TXN` and `PIPELINE_BENCH_BULK_ROWS` change the load.
+`PIPELINE_BENCH_ROWS`, `PIPELINE_BENCH_PER_TXN`, `PIPELINE_BENCH_BULK_ROWS`,
+`PIPELINE_BENCH_LONG_PASSES` and `PIPELINE_BENCH_LONG_SECONDS` change the load.
 The JSON lands in `target/pipeline-bench.json`.

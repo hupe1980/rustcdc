@@ -1542,6 +1542,10 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
     fn replication_slot_safe_wal_size_bytes(&self) -> Option<i64> {
         self.inner.replication_slot_safe_wal_size_bytes()
     }
+
+    fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
+        self.inner.streamed_transactions()
+    }
 }
 
 #[cfg(test)]
@@ -1671,6 +1675,20 @@ mod tests {
         async fn confirm_lsn(&mut self, _lsn: u64) -> Result<()> {
             Ok(())
         }
+        fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
+            Some(crate::core::StreamedTransactions::new(1, 10, 0, None))
+        }
+    }
+
+    /// The open transaction belongs to the inner stream; a wrapper that does not forward it
+    /// blanks `/status` for the whole of a snapshot, when a long transaction is likeliest.
+    #[tokio::test]
+    async fn the_driver_reports_its_inner_streams_open_transactions() {
+        let driver = driver_resuming_from(Vec::new(), None, 10).await;
+        assert_eq!(
+            driver.streamed_transactions(),
+            Some(crate::core::StreamedTransactions::new(1, 10, 0, None))
+        );
     }
 
     /// Backend with an in-memory table and a caller-controlled clock.

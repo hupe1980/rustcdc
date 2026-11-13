@@ -277,3 +277,36 @@ pub(super) async fn status_reports_the_verdict_and_its_cause() {
         "how long this condition has held is what decides whether /livez restarts the pod",
     );
 }
+
+/// While a transaction streams in, `/status` names it; once it commits, it is gone.
+#[tokio::test]
+pub(super) async fn status_names_a_transaction_streaming_before_its_commit() {
+    let admin = probe_admin().await;
+    let source = |admin: &super::AdminState| {
+        let admin = admin.clone();
+        async move { super::source_json(&*admin.data.read().await) }
+    };
+
+    assert!(source(&admin).await["open_transaction"].is_null());
+
+    admin.data.write().await.streamed_transactions = Some(rustcdc::StreamedTransactions::new(
+        1,
+        0,
+        4096,
+        Some(rustcdc::OpenTransaction::new(
+            812,
+            2_100_000,
+            4096,
+            true,
+            1_700_000_000_000,
+        )),
+    ));
+    let open = &source(&admin).await["open_transaction"];
+    assert_eq!(open["xid"], 812);
+    assert_eq!(open["changes"], 2_100_000);
+    assert_eq!(open["spilled"], true);
+
+    admin.data.write().await.streamed_transactions =
+        Some(rustcdc::StreamedTransactions::new(0, 0, 0, None));
+    assert!(source(&admin).await["open_transaction"].is_null());
+}

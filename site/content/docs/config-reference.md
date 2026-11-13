@@ -528,6 +528,9 @@ it is a catch-all, not a no-op.
 | `wal_transport` | `WalTransport` | `StreamingReplication` | How the WAL stream is read; see below. |
 | `reselect_unavailable_columns` | `bool` | `false` | Re-read unchanged TOASTed values from the source instead of reporting them absent; see below. |
 | `capture_logical_messages` | `bool` | `false` | Capture `pg_logical_emit_message()` output — the table-free transactional outbox; see below. |
+| `stream_in_progress_transactions` | `bool` | `true` | Stream large transactions while they run (pgoutput v2, PostgreSQL 14+, `StreamingReplication` only). Rows are released at the commit. See [Large transactions](@/docs/connectors/postgres.md#large-transactions). |
+| `stream_buffer_memory_bytes` | `u64` | 67 108 864 | Memory for streamed, not yet committed transactions; past it one spills. Must be > 0. |
+| `stream_spill_directory` | `Option<PathBuf>` | system temp dir | Where streamed transactions spill. Checked writable when the stream opens. |
 
 **`create_replication_slot_if_missing` is not a convenience flag.** A slot that vanishes
 mid-life — dropped by an operator, lost to a failover onto a replica that never had it, or

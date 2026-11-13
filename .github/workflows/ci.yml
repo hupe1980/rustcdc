@@ -397,6 +397,7 @@ jobs:
           - postgres_version_matrix
           - postgres_snapshot_integration
           - postgres_stream_integration
+          - postgres_streaming_integration
           # Reselecting unchanged TOASTed values. Both halves of the claim run against one
           # live server: the default must report the hole, and only then does filling it
           # prove anything — a suite asserting only the filled half would pass just as well

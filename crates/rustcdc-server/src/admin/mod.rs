@@ -129,6 +129,8 @@ pub struct AdminStateData {
     /// describes one continuous condition rather than an accumulation of unrelated ones.
     #[serde(skip)]
     pub stalled_since: Option<std::time::Instant>,
+    /// Transactions the source is streaming before their commit, from the last poll.
+    pub streamed_transactions: Option<rustcdc::StreamedTransactions>,
     pub shutdown_requests_os_signal_total: u64,
     pub shutdown_completions_stopped_total: u64,
     pub shutdown_completions_error_total: u64,
@@ -709,6 +711,7 @@ impl AdminState {
                 health_verdict: None,
                 health_stall_cause: None,
                 stalled_since: None,
+                streamed_transactions: None,
                 shutdown_requests_os_signal_total: 0,
                 shutdown_completions_stopped_total: 0,
                 shutdown_completions_error_total: 0,
@@ -2258,6 +2261,7 @@ impl AdminState {
         // Latch the verdict *before* the snapshot is consumed by the renderer, so
         // `/livez` and `/readyz` can act on it. See `AdminStateData::health_verdict`.
         d.record_health_verdict(&runtime_metrics.runtime_admin.health);
+        d.streamed_transactions = runtime_metrics.runtime_admin.streamed_transactions.clone();
         d.runtime_metrics = runtime_metrics.render_prometheus();
         d.checkpoint_age_seconds = checkpoint_age_seconds;
         d.last_terminal_reason_code = None;
@@ -3118,6 +3122,15 @@ pub(crate) fn health_json(data: &AdminStateData) -> serde_json::Value {
     })
 }
 
+pub(crate) fn source_json(data: &AdminStateData) -> serde_json::Value {
+    serde_json::json!({
+        "open_transaction": data
+            .streamed_transactions
+            .as_ref()
+            .and_then(|streamed| streamed.largest.as_ref()),
+    })
+}
+
 /// The cause a latched label names. The admin state keeps the stable label, not the enum.
 pub(crate) fn stall_cause_from_label(label: &str) -> Option<StallCause> {
     StallCause::ALL
@@ -3334,6 +3347,9 @@ async fn status_authed(
         // runtime's live view: per-table cursors, completion flags and row counters that
         // no admin-side counter could reconstruct. `None` when no snapshot is in flight.
         "incremental_snapshot": snapshot_progress,
+        // A transaction the source is receiving before its commit: what an otherwise idle
+        // pipeline is doing. Absent when none is open.
+        "source": source_json(&data),
         "audit": {
             "entries_total": data.audit_entries_total,
             "recent_entries": data.audit_recent_entries,

@@ -807,26 +807,22 @@ impl PostgresStreamHandle {
                     }
                 }
                 PgOutputMessage::Unknown(tag) => {
-                    // Not every unhandled tag is equally safe to skip.
-                    //
-                    // The connector negotiates `proto_version '1'`, under which the
-                    // server must not send v2 streaming or v3 two-phase messages. If one
-                    // arrives anyway, our view of transaction boundaries is wrong, and
-                    // silently skipping is dangerous in a specific way: dropping a
-                    // Stream Abort ('A') means we commit data the source rolled back.
-                    // Treat those as protocol violations.
+                    // Not every unhandled tag is equally safe to skip. Stream messages
+                    // never reach the decoder: the streaming transport's assembler consumes
+                    // them, and `sql_peek` negotiates v1. One arriving here means our view of
+                    // transaction boundaries is wrong, and skipping a Stream Abort ('A') would
+                    // commit data the source rolled back.
                     match tag {
                         // v2 streaming: Stream Start/Stop/Commit/Abort, Stream Prepare.
                         // v3 two-phase: Begin Prepare, Prepare, Commit Prepared,
                         // Rollback Prepared.
                         b'S' | b'E' | b'c' | b'A' | b'p' | b'b' | b'P' | b'K' | b'r' => {
                             return Err(Error::SourceError(format!(
-                                "postgres sent pgoutput message '{}' (0x{tag:02x}), which \
-                                 belongs to protocol version 2 or 3, but this connector \
-                                 negotiated proto_version 1 and cannot interpret it. \
-                                 Skipping it would misrepresent transaction boundaries — \
-                                 and skipping a Stream Abort would commit data the source \
-                                 rolled back. This indicates a server/plugin mismatch.",
+                                "postgres pgoutput message '{}' (0x{tag:02x}) reached the \
+                                 decoder outside a stream it can assemble. Skipping it would \
+                                 misrepresent transaction boundaries — and skipping a Stream \
+                                 Abort would commit data the source rolled back. This \
+                                 indicates a server/plugin mismatch.",
                                 tag as char
                             )));
                         }

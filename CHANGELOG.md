@@ -5,6 +5,74 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## Unreleased
+
+### Added: large PostgreSQL transactions stream while they run
+
+On PostgreSQL 14+ the connector negotiates pgoutput v2 with `streaming 'on'`. A transaction past
+`logical_decoding_work_mem` is sent while it runs instead of being spilled to the **primary's**
+disk until its commit. rustcdc holds it — in memory up to `stream_buffer_memory_bytes`, then in
+an anonymous spill file — and releases it at the commit, so a sink receives exactly what it
+received before. A rollback drops it; `ROLLBACK TO SAVEPOINT` drops that savepoint's rows. No other
+tool in the field streams in-progress transactions: Debezium, Materialize, PeerDB, Supabase etl and
+Sequin all negotiate v1.
+
+- **Measured** (`cargo xtask pipeline-bench`, 300 000 updates held open 21 s, one machine): the
+  primary spilled 106 MB to its own disk under v1 and **0 MB** under v2, and the last row reached
+  Kafka **11.1 s** after the commit instead of 16.0 s. See [Performance](site/content/docs/performance.md).
+- **Default on.** `stream_in_progress_transactions = false` asks for v1. `sql_peek` always uses
+  v1: a peek can stop part-way through a stream and restart it on the next poll.
+- **Visible.** `/status` gains `source.open_transaction`, the console says *Reading a transaction
+  in progress — 2.1M changes so far*, and `rustcdc_streamed_transactions_open` and
+  `rustcdc_streamed_transaction_bytes{store}` are gauges. In the library:
+  `StreamHandle::streamed_transactions()` and `RuntimeAdminSnapshot::streamed_transactions`.
+- **Fails closed.** An unwritable `stream_spill_directory` stops the stream from opening; a full
+  disk stops the pipeline. A crash leaves no file behind, and the slot streams the transaction
+  again.
+- See [Large transactions](site/content/docs/connectors/postgres.md#large-transactions).
+
+### Fixed: incremental snapshots failed on MariaDB 12.3
+
+MariaDB 12.3 adds a fifth column to `SHOW MASTER STATUS`, `Gtid_Binlog_Pos`, where MySQL reports
+`Executed_Gtid_Set`. The connector read the watermark by position, so on 12.3 — once the server had
+written anything — it tried to parse MariaDB's GTID position (`0-1-3`) as a MySQL GTID set, and
+every incremental snapshot failed at its first watermark with *could not parse Executed_Gtid_Set*.
+Nothing wrong was written; nothing was snapshotted. The connector now reads `Executed_Gtid_Set` by
+name. MariaDB, which has no such value, uses the ordinal bracket on every release — the new column
+advances at the binlog flush, before the engine commit, so it cannot sharpen the bracket.
+[MySQL and MariaDB](site/content/docs/connectors/mysql.md) states the limit per engine.
+
+- *Evidence*: `mariadb_incremental_snapshot_reads_every_row_after_a_write` failed on the previous
+  tree with that error and passes; no suite ran a MariaDB incremental snapshot before it. MySQL 8.4 and 9.7
+  were checked live to name the column `Executed_Gtid_Set` in `SHOW BINARY LOG STATUS`; the MySQL
+  GTID watermark and snapshot suites pass unchanged.
+
+### Changed: the documentation site
+
+- **Console, Performance and Supported versions are in the docs menu.** They shipped unreachable
+  from it; the policy gate now fails when a page is missing from the menu or a menu entry has no
+  page.
+- **Screenshots open full size** on click, in the theme the page is showing, and follow the site's
+  theme toggle rather than only the operating system's.
+- The README shows the console.
+
+### Breaking
+
+- `PostgresSourceConfig` has three new public fields. A struct literal needs
+  `..PostgresSourceConfig::default()`; `RuntimeAdminSnapshot` has one more field.
+
+### Evidence
+
+- The assembler's unit tests fail on a release at Stream Stop and on an ignored savepoint abort.
+- `postgres_streaming_integration` captures one workload — a streamed transaction with a
+  savepoint rolled back mid-stream, then a streamed transaction that aborts — through v2 and
+  through `sql_peek`'s v1 and requires the same events, field by field; the slots' statistics
+  must show v2 streamed without spilling and v1 spilled. It fails with the savepoint abort planted
+  out. A held-open transaction is visible, spills past a 16 KiB budget and arrives whole.
+- `postgres_version_matrix` streams a transaction on PostgreSQL 15, 16, 17 and 18.
+- `runtime_postgres_process_crash_integration` kills rustcdc while it holds a streamed transaction
+  and loses no committed row.
+
 ## 0.21.0
 
 An operator console, a pipeline five times faster on large transactions, `effectively_once` working

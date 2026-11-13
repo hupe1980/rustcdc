@@ -68,6 +68,9 @@ impl Default for PostgresSourceConfig {
             reselect_unavailable_columns: false,
             capture_logical_messages: false,
             slot_state_sample_interval_ms: None,
+            stream_in_progress_transactions: Self::default_stream_in_progress_transactions(),
+            stream_buffer_memory_bytes: Self::default_stream_buffer_memory_bytes(),
+            stream_spill_directory: None,
         }
     }
 }
@@ -98,6 +101,23 @@ impl PostgresSourceConfig {
     /// Default stream poll interval. The serde `default` for the field.
     pub const fn default_stream_poll_interval_ms() -> u64 {
         STREAM_POLL_INTERVAL_MS
+    }
+
+    /// Streaming of in-progress transactions is on unless turned off.
+    pub const fn default_stream_in_progress_transactions() -> bool {
+        true
+    }
+
+    /// 64 MiB of streamed transactions in memory before one spills.
+    pub const fn default_stream_buffer_memory_bytes() -> u64 {
+        64 * 1024 * 1024
+    }
+
+    /// The directory streamed transactions spill to.
+    pub fn stream_spill_directory(&self) -> std::path::PathBuf {
+        self.stream_spill_directory
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
     }
 
     /// Default per-poll event cap. The serde `default` for the field.
@@ -205,6 +225,11 @@ impl PostgresSourceConfig {
         if self.max_events_per_poll == 0 {
             return Err(Error::ConfigError(
                 "postgres max_events_per_poll must be greater than zero".into(),
+            ));
+        }
+        if self.stream_buffer_memory_bytes == 0 {
+            return Err(Error::ConfigError(
+                "postgres stream_buffer_memory_bytes must be greater than zero".into(),
             ));
         }
         if self.max_events_per_poll > MAX_MAX_EVENTS_PER_POLL {

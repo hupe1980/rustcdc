@@ -472,8 +472,13 @@ fn consume(
                 let written = after["written_us"]
                     .as_i64()
                     .or_else(|| after["written_us"].as_str().and_then(|s| s.parse().ok()));
+                // `n` counts a row's updates, so each pass of a long transaction is its own arrival.
+                let n = after["n"]
+                    .as_i64()
+                    .or_else(|| after["n"].as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(0);
                 if let (Some(id), Some(written)) = (id, written) {
-                    seen.entry((id, row_op.to_string()))
+                    seen.entry((id, format!("{row_op}:{n}")))
                         .or_insert((written, at));
                     last_progress = Instant::now();
                 }
@@ -520,9 +525,30 @@ struct Run {
 #[derive(serde::Serialize)]
 struct Bulk {
     rows: u64,
+    passes: u64,
     transaction_seconds: f64,
     first_after_commit_seconds: f64,
     last_after_commit_seconds: f64,
+    primary_streamed_bytes: i64,
+    primary_spilled_bytes: i64,
+}
+
+/// The primary's `(stream_bytes, spill_bytes)` for a slot, once decoding has reported them.
+fn slot_bytes(slot: &str) -> (i64, i64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let row = psql(&format!(
+            "SELECT stream_bytes || ' ' || spill_bytes FROM pg_stat_replication_slots WHERE slot_name = '{slot}'"
+        ));
+        let mut fields = row
+            .split_whitespace()
+            .map(|f| f.parse::<i64>().unwrap_or(0));
+        let (streamed, spilled) = (fields.next().unwrap_or(0), fields.next().unwrap_or(0));
+        if streamed + spilled > 0 || Instant::now() > deadline {
+            return (streamed, spilled);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn machine() -> String {
@@ -552,6 +578,9 @@ fn pipeline_bench() {
     let rows = knob("PIPELINE_BENCH_ROWS", 200_000);
     let per_txn = knob("PIPELINE_BENCH_PER_TXN", 1_000);
     let bulk_rows = knob("PIPELINE_BENCH_BULK_ROWS", 100_000).min(rows);
+    // Three passes over the bulk rows pass the default 64 MB `logical_decoding_work_mem`.
+    let passes = knob("PIPELINE_BENCH_LONG_PASSES", 3).max(1);
+    let long_seconds = knob("PIPELINE_BENCH_LONG_SECONDS", 20);
 
     let _containers = start_containers();
     wait_for_broker();
@@ -614,33 +643,49 @@ fn pipeline_bench() {
         });
 
         if index == 0 {
-            // One transaction, many rows: under protocol v1 nothing leaves PostgreSQL before COMMIT.
+            // One long transaction: every bulk row updated `passes` times, held open between
+            // passes. Under v2 the primary streams it while it runs; under v1 it spills it.
+            let slot = format!("bench_{}", contract.name);
+            psql(&format!("SELECT pg_stat_reset_replication_slot('{slot}')"));
+            let wanted = (bulk_rows * passes) as usize;
             let (ready_tx, ready_rx) = mpsc::channel();
             let consumer = {
                 let topic = topic.clone();
-                std::thread::spawn(move || {
-                    consume(topic, false, bulk_rows as usize, "update", ready_tx)
-                })
+                std::thread::spawn(move || consume(topic, false, wanted, "update", ready_tx))
             };
             ready_rx
                 .recv_timeout(Duration::from_secs(90))
                 .expect("consumer subscribed");
+            let pause = long_seconds as f64 / passes as f64;
             let began = now_us();
             psql(&format!(
-                "BEGIN; UPDATE bench SET n = n + 1, written_us = (extract(epoch FROM clock_timestamp()) * 1e6)::bigint WHERE id < {}; COMMIT;",
+                "DO $$ BEGIN FOR p IN 1..{passes} LOOP \
+                   UPDATE bench SET n = n + 1, written_us = (extract(epoch FROM clock_timestamp()) * 1e6)::bigint WHERE id < {}; \
+                   PERFORM pg_sleep({pause}); \
+                 END LOOP; END $$",
                 first + bulk_rows as i64
             ));
             let committed = now_us();
             let seen = consumer.join().expect("consumer");
-            assert_eq!(seen.len(), bulk_rows as usize, "the bulk update lost rows");
+            assert_eq!(seen.len(), wanted, "the long transaction lost rows");
+            let (streamed, spilled) = slot_bytes(&slot);
+            assert!(
+                streamed + spilled > 0,
+                "the long transaction neither streamed nor spilled on the primary, so it never \
+                 passed logical_decoding_work_mem and measured nothing; raise \
+                 PIPELINE_BENCH_BULK_ROWS or PIPELINE_BENCH_LONG_PASSES"
+            );
             let arrivals: Vec<i64> = seen.values().map(|(_, at)| *at).collect();
             bulk = Some(Bulk {
                 rows: bulk_rows,
+                passes,
                 transaction_seconds: (committed - began) as f64 / 1e6,
                 first_after_commit_seconds: (arrivals.iter().min().unwrap() - committed) as f64
                     / 1e6,
                 last_after_commit_seconds: (arrivals.iter().max().unwrap() - committed) as f64
                     / 1e6,
+                primary_streamed_bytes: streamed,
+                primary_spilled_bytes: spilled,
             });
         }
         let _ = server.kill();
@@ -666,7 +711,7 @@ fn pipeline_bench() {
         "overrides": OVERRIDES.map(|var| (var, overrides(var))).iter().filter(|(_, v)| !v.is_empty()).cloned().collect::<HashMap<_, _>>(),
         "clock_probe_rtt_ms": probe_rtt_us as f64 / 1000.0,
         "runs": runs,
-        "bulk_update": bulk,
+        "long_transaction": bulk,
     });
     let path = artifacts::target_dir().join("pipeline-bench.json");
     std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).expect("write json");
@@ -727,12 +772,18 @@ fn card(
         ));
     }
     if let Some(b) = bulk {
+        let mb = |bytes: i64| format!("{:.0} MB", bytes as f64 / 1e6);
         out.push_str(&format!(
-            "\nOne transaction of {} updates, committed {:.1} s after it began\n\
-             \x20 first row at the broker  {:+.1} s after the commit   (protocol v1 sends nothing before it)\n\
+            "\nOne transaction of {} updates ({} rows × {}), open {:.1} s\n\
+             \x20 primary                  streamed {}, spilled {} to its own disk\n\
+             \x20 first row at the broker  {:+.1} s after the commit   (rows are released at the commit)\n\
              \x20 last row at the broker   {:+.1} s after the commit\n",
+            n((b.rows * b.passes) as f64),
             n(b.rows as f64),
+            b.passes,
             b.transaction_seconds,
+            mb(b.primary_streamed_bytes),
+            mb(b.primary_spilled_bytes),
             b.first_after_commit_seconds,
             b.last_after_commit_seconds,
         ));

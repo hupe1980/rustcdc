@@ -26,6 +26,16 @@ strip lights the hop that owns it.
   <img src="../../console/stalled-health-light.webp" alt="A stall: the destination keeps refusing a batch; the destination hop is lit; restarting will not help" width="1280" height="800" loading="lazy">
 </picture>
 
+While a PostgreSQL transaction is being streamed before its commit, the sentence says so —
+*Reading a transaction in progress — 2.1M changes so far*, how long it has been open and whether
+it is held in memory or on disk — where a quiet pipeline would otherwise just read as idle. Its
+rows arrive when it commits ([Large transactions](@/docs/connectors/postgres.md#large-transactions)).
+
+<picture>
+  <source srcset="../../console/streaming-health-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="../../console/streaming-health-light.webp" alt="A transaction streaming in before its commit: 2.1M changes so far, open for 4 min, 1.3 GB held on disk" width="1280" height="800" loading="lazy">
+</picture>
+
 The owner and whether a restart helps come from the server (`/status` → `health.owner`,
 `health.restart_helps`), the same routing `/livez` acts on; the console only words it. The browser
 tab follows the verdict too — `● Healthy`, `▲ Stalled` — so it can be watched from another tab.

@@ -15,6 +15,7 @@ impl AdminState {
     pub(crate) async fn record_runtime_health(&self, runtime_metrics: RuntimeMetricsSnapshot) {
         let mut d = self.data.write().await;
         d.record_health_verdict(&runtime_metrics.runtime_admin.health);
+        d.streamed_transactions = runtime_metrics.runtime_admin.streamed_transactions.clone();
         d.runtime_metrics = runtime_metrics.render_prometheus();
     }
 }

@@ -135,6 +135,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch()
         "rustcdc_runtime_crash_snapshot_pub",
         Some("public.runtime_crash_snapshot_users"),
         true,
+        false,
     )?;
 
     wait_for_marker(&marker_file, Duration::from_secs(90))?;
@@ -363,6 +364,7 @@ async fn run_postgres_process_kill_replay_scenario(
         "rustcdc_runtime_crash_pub",
         None,
         false,
+        false,
     )?;
 
     wait_for_marker(&marker_file, Duration::from_secs(90))?;
@@ -492,6 +494,168 @@ async fn run_postgres_process_kill_replay_scenario(
     Ok(())
 }
 
+/// A process killed while it holds a streamed transaction loses nothing: the transaction was
+/// never confirmed, so the slot streams it again from its start after the restart.
+#[tokio::test]
+async fn runtime_postgres_process_kill_mid_stream_loses_no_committed_row() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres mid-stream crash test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let error = |error: &dyn std::error::Error| rustcdc::Error::SourceError(error.to_string());
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=8",
+            "-c",
+            "max_wal_senders=8",
+            "-c",
+            "logical_decoding_work_mem=64kB",
+        ])
+        .start()
+        .await
+        .map_err(|e| error(&e))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|e| error(&e))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|e| error(&e))?;
+    let connect = || async {
+        let (client, connection) = tokio_postgres::connect(
+            &format!("host={host} port={port} user=postgres password=postgres dbname=cdc"),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .map_err(|e| error(&e))?;
+        tokio::spawn(connection);
+        Ok::<_, rustcdc::Error>(client)
+    };
+    let admin = connect().await?;
+    admin
+        .batch_execute(
+            "CREATE TABLE public.mid_stream (id BIGINT PRIMARY KEY, v TEXT);
+             CREATE PUBLICATION mid_stream_pub FOR TABLE public.mid_stream;",
+        )
+        .await
+        .map_err(|e| error(&e))?;
+    let lsn_text: String = admin
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot('mid_stream_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .map_err(|e| error(&e))?
+        .get(0);
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
+    let mut seed = FileCheckpoint::new(checkpoint_dir.path());
+    seed.save(
+        &PostgresOffset {
+            lsn: parse_pg_lsn(&lsn_text)?,
+            slot_name: "mid_stream_slot".to_string(),
+            incremental_snapshot: None,
+        },
+        0,
+    )
+    .await?;
+    drop(seed);
+
+    let writer = connect().await?;
+    writer
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO public.mid_stream SELECT g, repeat('m', 200) FROM generate_series(1, 3000) g;",
+        )
+        .await
+        .map_err(|e| error(&e))?;
+
+    let marker_file = checkpoint_dir.path().join("worker-streaming.marker");
+    let mut worker = spawn_crash_worker(
+        &host,
+        port,
+        checkpoint_dir.path(),
+        &marker_file,
+        "mid_stream_slot",
+        "mid_stream_pub",
+        None,
+        false,
+        true,
+    )?;
+    wait_for_marker(&marker_file, Duration::from_secs(90))?;
+    worker.kill().map_err(rustcdc::Error::IoError)?;
+    let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
+    wait_for_slot_released(&admin, "mid_stream_slot").await?;
+
+    writer
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|e| error(&e))?;
+
+    let mut runtime = CdcRuntime::new(
+        RuntimeConfig::new(
+            RuntimeSourceConfig::Postgres(PostgresSourceConfig {
+                host: host.clone(),
+                port,
+                user: "postgres".to_string(),
+                password: "postgres".into(),
+                database: "cdc".to_string(),
+                replication_slot_name: "mid_stream_slot".to_string(),
+                publication_name: "mid_stream_pub".to_string(),
+                stream_poll_interval_ms: 50,
+                max_events_per_poll: 1_000,
+                transport: rustcdc::TransportConfig::plaintext(),
+                ..PostgresSourceConfig::default()
+            }),
+            FileCheckpoint::new(checkpoint_dir.path()),
+            InMemorySchemaHistory::default(),
+        )
+        .with_max_buffer_size(1_000)
+        .with_max_poll_wait_ms(150),
+    )?;
+    runtime.start().await?;
+
+    let mut ids = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while ids.len() < 3000 && std::time::Instant::now() < deadline {
+        let batch = runtime.poll_event_batch().await?;
+        ids.extend(
+            batch
+                .events()
+                .iter()
+                .filter(|event| event.op == Operation::Insert)
+                .filter_map(|event| {
+                    event
+                        .after
+                        .as_ref()?
+                        .get("id")?
+                        .as_str()?
+                        .parse::<i64>()
+                        .ok()
+                }),
+        );
+        runtime.commit_ack(batch.ack_mode()).await?;
+    }
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..=3000).collect::<Vec<_>>(),
+        "every committed row, once"
+    );
+    Ok(())
+}
+
 /// Block until PostgreSQL has released `slot`, or fail with a message that says why.
 ///
 /// `Child::kill` + `Child::wait` reap the *local* process. They say nothing about the
@@ -545,6 +709,7 @@ fn spawn_crash_worker(
     publication: &str,
     snapshot_table: Option<&str>,
     ack_first_batch: bool,
+    until_streaming: bool,
 ) -> rustcdc::Result<Child> {
     let worker_bin = resolve_worker_bin()?;
 
@@ -562,6 +727,10 @@ fn spawn_crash_worker(
         .env(
             "CDC_RS_WORKER_ACK_FIRST_BATCH",
             if ack_first_batch { "1" } else { "0" },
+        )
+        .env(
+            "CDC_RS_WORKER_UNTIL_STREAMING",
+            if until_streaming { "1" } else { "0" },
         );
     if let Some(table) = snapshot_table {
         command.env("CDC_RS_WORKER_SNAPSHOT_TABLES", table);

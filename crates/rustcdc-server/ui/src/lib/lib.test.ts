@@ -54,6 +54,23 @@ describe("the health verdict, in words", () => {
     expect(read(status({ verdict: "not_running" }, "stopped"), null, true).tone).toBe("attention");
   });
 
+  it("says what an otherwise idle pipeline is doing while a transaction streams in", () => {
+    const s = status({ verdict: "idle" });
+    s.source = {
+      open_transaction: { xid: 812, changes: 2_100_000, bytes: 1_300_000_000, spilled: true, started_at_ms: Date.now() - 240_000 },
+    };
+    const r = read(s, 0, true);
+    expect(r.tone).toBe("healthy");
+    expect(r.title).toBe(`Reading a transaction in progress — ${(2_100_000).toLocaleString(undefined, { notation: "compact", maximumFractionDigits: 1 })} changes so far`);
+    expect(r.detail).toBe("Open for 4 min, 1.3 GB held on disk. Its rows are delivered when it commits.");
+  });
+
+  it("puts a stall before an open transaction", () => {
+    const s = status({ verdict: "stalled", stall_cause: "delivery_failing", owner: "destination" });
+    s.source = { open_transaction: { xid: 1, changes: 1, bytes: 1, spilled: false, started_at_ms: Date.now() } };
+    expect(read(s, 0, true).tone).toBe("stalled");
+  });
+
   it("measures events per second between two samples, and refuses a counter that went back", () => {
     expect(rate({ at: 0, events: 0 }, { at: 2000, events: 10 })).toBe(5);
     expect(rate({ at: 0, events: 10 }, { at: 2000, events: 5 })).toBeNull();

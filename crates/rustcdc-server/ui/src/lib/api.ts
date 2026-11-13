@@ -87,8 +87,12 @@ export type Status = {
   batches_processed: number;
   slo: { checkpoint_age_seconds?: number | null; source_lag_seconds?: number | null; readiness_rate?: number | null };
   incremental_snapshot?: SnapshotProgress | null;
+  /** A transaction the source is receiving before its commit. */
+  source?: { open_transaction?: OpenTransaction | null };
   audit: { entries_total: number; recent_entries: AuditEntry[] };
 };
+
+export type OpenTransaction = { xid: number; changes: number; bytes: number; spilled: boolean; started_at_ms: number };
 
 export type SignalDetail = { message?: string; additional_data?: { error?: string } | null };
 /** One step of a signal, as `/notifications` lists it. */

@@ -217,6 +217,17 @@ pub(crate) fn document(version: &str) -> Value {
                         "expected_terminal_state": { "type": "string" }
                     }
                 },
+                "OpenTransaction": {
+                    "type": "object",
+                    "required": ["xid", "changes", "bytes", "spilled", "started_at_ms"],
+                    "properties": {
+                        "xid": { "type": "integer", "description": "The source transaction id." },
+                        "changes": { "type": "integer", "description": "Row changes and transactional messages received so far." },
+                        "bytes": { "type": "integer", "description": "Bytes held for it." },
+                        "spilled": { "type": "boolean", "description": "Held in a spill file rather than in memory." },
+                        "started_at_ms": { "type": "integer", "description": "When its first part arrived, Unix milliseconds." }
+                    }
+                },
                 "Notification": {
                     "type": "object",
                     "description": "One step of a signal. `/notifications/stream` carries the same fields as a CloudEvent's `data`, with `at` as the envelope's `time`.",
@@ -382,6 +393,18 @@ pub(crate) fn document(version: &str) -> Value {
                                             },
                                             "incremental_snapshot": {
                                                 "$ref": "#/components/schemas/IncrementalSnapshotProgress"
+                                            },
+                                            "source": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "open_transaction": {
+                                                        "description": "A transaction the source is streaming before its commit; its rows are released at the commit. Null when none is open.",
+                                                        "oneOf": [
+                                                            { "$ref": "#/components/schemas/OpenTransaction" },
+                                                            { "type": "null" }
+                                                        ]
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -706,6 +729,29 @@ mod tests {
                 "{key} is required but not sent"
             );
         }
+    }
+
+    /// The documented open transaction is the library's, field for field.
+    #[test]
+    fn the_documented_open_transaction_is_what_the_server_sends() {
+        let doc = document(TEST_VERSION);
+        let schema = &doc["components"]["schemas"]["OpenTransaction"];
+        let mut documented: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let sent = serde_json::to_value(rustcdc::OpenTransaction::new(1, 2, 3, true, 4)).unwrap();
+        let mut sent: Vec<&str> = sent
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        documented.sort_unstable();
+        sent.sort_unstable();
+        assert_eq!(documented, sent);
     }
 
     /// Every `$ref` must resolve. A dangling one breaks generators at the worst moment.
