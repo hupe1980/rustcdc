@@ -878,6 +878,12 @@ impl PostgresConnection {
         }
     }
 
+    /// The transaction release the runtime last gave this source.
+    #[cfg(test)]
+    pub(crate) fn transaction_release(&self) -> crate::source::TransactionRelease {
+        self.transaction_release
+    }
+
     /// Build a connection with a caller-supplied structured logger.
     pub fn with_logger(config: PostgresSourceConfig, logger: StructuredLogger) -> Self {
         let stream_poll_interval_ms = config.stream_poll_interval_ms.max(1);
@@ -1109,6 +1115,10 @@ impl Source for PostgresConnection {
 
     fn source_type(&self) -> &str {
         PostgresSourceConfig::source_type()
+    }
+
+    fn set_transaction_release(&mut self, release: crate::source::TransactionRelease) {
+        self.transaction_release = release;
     }
 
     fn capabilities(&self) -> ConnectorCapabilities {

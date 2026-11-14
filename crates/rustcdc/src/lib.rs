@@ -156,7 +156,7 @@ pub use crate::source::{
     IncrementalSnapshotTableState, SnapshotCheckpointHelper, SnapshotEnd, SnapshotProgress,
     SnapshotProgressTracker, SnapshotRequest, SnapshotTable, SnapshotTrackerConfig,
     SnapshotTrackerReport, SnapshotValidationResult, SnapshotValidator, TableProgress,
-    incremental_snapshot_state_from_offset,
+    TransactionRelease, incremental_snapshot_state_from_offset,
 };
 #[cfg(feature = "mariadb")]
 pub use crate::source::{

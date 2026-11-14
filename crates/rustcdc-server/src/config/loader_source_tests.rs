@@ -193,3 +193,41 @@ table_exclude_list = ["dbo.audit"]
     };
     assert_eq!(loaded, expected);
 }
+
+/// The open-transaction buffer limit is a `[source.postgres]` setting.
+#[test]
+#[cfg(feature = "postgres")]
+fn postgres_transaction_buffer_bytes_loads() {
+    let _env = crate::test_env::EnvGuard::set(&[(SECRET_VAR, "pg-secret")]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = write_config(
+        dir.path(),
+        r#"[source.postgres]
+host = "db.internal"
+user = "cdc_user"
+password = { env = "CDC_TEST_SOURCE_PASSWORD" }
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+transaction_buffer_bytes = 1048576
+"#,
+    );
+
+    let cfg = load(&config_path).expect("the limit should load");
+    let pg = match &cfg.source.driver {
+        crate::config::schema::SourceDriver::Postgres(pg) => pg,
+        #[allow(unreachable_patterns)]
+        other => panic!("expected a postgres source, got {other:?}"),
+    };
+    let expected = rustcdc::PostgresSourceConfig {
+        host: "db.internal".into(),
+        user: "cdc_user".into(),
+        password: SecretString::new("pg-secret"),
+        database: "mydb".into(),
+        replication_slot_name: "cdc_slot".into(),
+        publication_name: "cdc_pub".into(),
+        transaction_buffer_bytes: 1_048_576,
+        ..Default::default()
+    };
+    assert_eq!(pg, &expected);
+}

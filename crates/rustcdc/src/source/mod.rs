@@ -811,6 +811,14 @@ pub trait Source: Send + Sync {
     /// on an already-closed source, and must not block indefinitely — the runtime
     /// applies its own timeout but a hung `close` still delays shutdown.
     async fn close(&self) {}
+
+    /// Whether an open transaction that outgrows the source's buffer may be released
+    /// before its commit. The runtime calls this when it takes the source, before any
+    /// stream starts, with [`RuntimeOptions::transaction_release`](crate::core::RuntimeOptions::transaction_release).
+    ///
+    /// A source that holds transactions until their commit honours it; one that does not
+    /// buffer ignores it, which is the default. A source that wraps another must forward it.
+    fn set_transaction_release(&mut self, _release: TransactionRelease) {}
 }
 
 #[cfg(feature = "mariadb")]
