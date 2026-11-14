@@ -575,15 +575,21 @@ impl PostgresStreamHandle {
                     }
                     self.current_xid = Some(begin.xid);
                     self.current_commit_ts = pg_timestamp_to_millis(begin.commit_timestamp_us);
+                    // `lsn_position` moves only at a COMMIT (or at stream start), so here it
+                    // is the last committed end before this BEGIN.
+                    self.current_tx_start = self.stream.lsn_position;
                     self.partial_tx_events.clear();
                 }
                 PgOutputMessage::Commit(commit) => {
                     self.stream.lsn_position = commit.end_lsn;
-                    // Remember where this transaction *ends*, which is the only position a
-                    // restart may resume from. See `PostgresStreamHandle::resume_offset_for`.
+                    // Remember where this transaction starts and ends: its events resume from
+                    // the start until its last one. See `PostgresStreamHandle::resume_offset_for`.
                     if let Some(xid) = self.current_xid {
-                        self.committed_tx_ends
-                            .push_back((u64::from(xid), commit.end_lsn));
+                        self.committed_tx_ends.push_back((
+                            u64::from(xid),
+                            self.current_tx_start,
+                            commit.end_lsn,
+                        ));
                         while self.committed_tx_ends.len() > super::MAX_TRACKED_TX_ENDS {
                             self.committed_tx_ends.pop_front();
                         }

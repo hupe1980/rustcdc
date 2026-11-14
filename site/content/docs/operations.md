@@ -562,7 +562,9 @@ And for MySQL:
 The resume tests assert **no gaps and no replay**, both exactly. PostgreSQL logical
 decoding filters at *transaction* granularity, so resuming from a change's own LSN would
 replay its whole transaction; `StreamHandle::resume_offset_for` gives the position after
-the commit record instead. After a crash the contract is at-least-once.
+the commit record instead, for a transaction's last event. Its earlier events resume from
+before its BEGIN, so a crash part-way through a large transaction replays it rather than
+skipping its rest. After a crash the contract is at-least-once.
 
 If a run is interrupted, clean up with
 `docker rm -f rustcdc-integration-postgres rustcdc-integration-mysql`.

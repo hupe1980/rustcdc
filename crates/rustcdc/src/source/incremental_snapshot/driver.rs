@@ -1543,6 +1543,13 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
     fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
         self.inner.streamed_transactions()
     }
+
+    /// Only the inner stream knows its transaction boundaries. Without this the runtime
+    /// falls back to each event's own position, so the same events would checkpoint
+    /// differently with and without an incremental snapshot configured (#43).
+    fn resume_offset_for(&self, event: &Event) -> Option<String> {
+        self.inner.resume_offset_for(event)
+    }
 }
 
 #[cfg(test)]
@@ -1674,6 +1681,12 @@ mod tests {
         fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
             Some(crate::core::StreamedTransactions::new(1, 10, 0, None))
         }
+        fn resume_offset_for(&self, event: &Event) -> Option<String> {
+            event
+                .transaction
+                .as_ref()
+                .map(|tx| format!("inner-resume-{}", tx.tx_id))
+        }
     }
 
     /// The open transaction belongs to the inner stream; a wrapper that does not forward it
@@ -1684,6 +1697,22 @@ mod tests {
         assert_eq!(
             driver.streamed_transactions(),
             Some(crate::core::StreamedTransactions::new(1, 10, 0, None))
+        );
+    }
+
+    /// Where a stream event resumes from is the inner stream's answer: only it knows the
+    /// transaction boundaries. A wrapper that does not forward it leaves the runtime on the
+    /// event's own change position, so the same events checkpoint differently with and
+    /// without an incremental snapshot configured (#43).
+    #[tokio::test]
+    async fn the_driver_forwards_its_inner_streams_resume_offset() {
+        let driver = driver_resuming_from(Vec::new(), None, 10).await;
+        let event = Event::builder("users", crate::core::Operation::Insert)
+            .transaction(crate::core::TransactionMetadata::new(7, 0, Some(1)))
+            .build();
+        assert_eq!(
+            driver.resume_offset_for(&event),
+            Some("inner-resume-7".to_string())
         );
     }
 
