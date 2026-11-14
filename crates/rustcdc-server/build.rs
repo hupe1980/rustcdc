@@ -1,21 +1,15 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // Cargo treats a watched path that does not exist as changed, and reruns this script, and
+    // recompiles the crate, on every build. In a worktree `.git` is a file, so ask git.
+    if let Some(head) =
+        git(&["rev-parse", "--git-path", "HEAD"]).filter(|path| std::path::Path::new(path).exists())
+    {
+        println!("cargo:rerun-if-changed={head}");
+    }
 
     // Git commit SHA (best-effort; absent in release tarballs)
-    let sha = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let sha = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_SHA={sha}");
 
     // Build profile (debug / release)
@@ -29,6 +23,15 @@ fn main() {
     embed_console();
 }
 
+/// A git command's trimmed output; `None` outside a checkout (a release tarball).
+fn git(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Embed the built console (`ui/dist`) when the `ui` feature is on.
 ///
 /// Without a bundle, a build that ships (`RUSTCDC_REQUIRE_CONSOLE=1`: release, image) fails; any
@@ -37,10 +40,13 @@ fn embed_console() {
     if std::env::var_os("CARGO_FEATURE_UI").is_none() {
         return;
     }
-    println!("cargo:rerun-if-changed=ui/dist");
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist");
+    // CI never builds the console, and a missing watched path reruns this script on every
+    // build. `ui` always exists, and its scan still sees `dist` appear.
+    let watched = if dist.exists() { "ui/dist" } else { "ui" };
+    println!("cargo:rerun-if-changed={watched}");
     println!("cargo:rerun-if-env-changed=RUSTCDC_REQUIRE_CONSOLE");
 
-    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist");
     let mut files: Vec<String> = std::fs::read_dir(&dist)
         .map(|entries| {
             entries
