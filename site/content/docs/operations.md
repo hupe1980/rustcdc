@@ -306,8 +306,8 @@ spec:
   terminationGracePeriodSeconds: 90   # 60s flush + 30s headroom
 ```
 
-**Do not** send `SIGKILL` before the grace period expires — the current batch
-will not be checkpointed and will be redelivered on the next start.
+**Do not** send `SIGKILL` before the grace period expires: what was delivered since the last
+checkpoint write (up to `checkpoint_interval_ms`) is redelivered on the next start.
 
 
 ## 4. Inspect checkpoint

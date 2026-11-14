@@ -367,9 +367,9 @@ Columns that exist on the table but whose value the source **could not supply** 
 `after` image. They are **absent** from `after` — not `null`. Without this list the two are
 indistinguishable.
 
-The concrete case is **PostgreSQL unchanged-TOAST**: when a large value (roughly >8 KB —
-`text`, `bytea`, `jsonb`) is not modified by an `UPDATE`, PostgreSQL omits it from the WAL
-entirely and pgoutput sends a `'u'` placeholder. The value is unrecoverable; reading it back
+The concrete case is **PostgreSQL unchanged-TOAST**: when a large value (`text`, `bytea`,
+`jsonb` stored out of line, over about 2 KB after compression) is not modified by an `UPDATE`,
+PostgreSQL omits it from the WAL entirely and pgoutput sends a `'u'` placeholder. The value is unrecoverable; reading it back
 out-of-band would race concurrent writes and return a value from a different point in time.
 
 > **One exception, and it is not an out-of-band read.** During an incremental snapshot, an event

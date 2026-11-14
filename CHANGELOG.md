@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
-## Unreleased
+## 0.23.0
 
 The checkpoint is written once a second instead of per batch, which streams about a fifth more rows
 per second; a crash replays at most that second, and loses nothing. The initial snapshot is
@@ -34,8 +34,9 @@ comparable tool writes it on a cadence instead (Debezium every 60 s).
   the drive. Not yet measured on Linux, where `fsync` is cheaper. See
   [Performance](site/content/docs/performance.md).
 - *Evidence*: runtime tests fail when the position is written per commit under an interval, when
-  the source is confirmed before the write, when an idle poll, `stop`, `force_stop` or a reconnect
-  does not write it, and when a failed write drops it. A PostgreSQL worker that acknowledges a
+  the source is confirmed before the write, when an idle poll, `stop`, `force_stop` or either
+  reconnect path (straight after the error, or on a later poll after a failed connect) does not
+  write it, and when a failed write drops it. A PostgreSQL worker that acknowledges a
   batch under a one-hour interval and is killed leaves nothing durable, and the restart replays the
   batch (`runtime_postgres_process_kill_replays_a_batch_acknowledged_within_the_interval`). The
   loader tests fail when `effectively_once` defaults to an interval or accepts one.
@@ -52,10 +53,29 @@ row: PostgreSQL alone (`COPY`), rustcdc to a file, rustcdc to Kafka. PostgreSQL 
 From the snapshot's profile, CPU per row to Kafka 23.4 → 17.9 µs:
 
 - The correctness sample fingerprints in process instead of hashing with SHA-256.
-- Spans krafka opens per record no longer reach the log layer, where formatting them was about a
-  quarter of busy CPU at the default `info` level.
+- krafka 0.32 opens its per-record producer span at `debug`, so the default `info` log layer no
+  longer builds and formats one per record: about a quarter of busy CPU.
 - An empty transform pipeline is skipped, and a sink send arms its timeout only when it has to
   wait.
+
+### Changed: krafka 0.31.1 → 0.32.0
+
+The per-record producer span moves to `debug`, a record costs two allocations fewer, and dropping
+a producer that holds no records no longer warns. Snapshot to Kafka, CPU per row 18.3 → 17.5 µs
+(`cargo xtask pipeline-bench`, one machine).
+
+### Upgrading
+
+- **A crash of the server under `at_least_once` now replays up to one second** of delivered rows,
+  where it replayed one batch. `[runtime] checkpoint_interval_ms = 0` restores per-batch writes.
+- **`effectively_once` refuses `checkpoint_interval_ms` above 0** at load.
+- The library's default is unchanged.
+
+### Docs
+
+- [Large transactions](site/content/docs/connectors/postgres.md#large-transactions) states that
+  PostgreSQL cannot stream a transaction whose rows carry TOASTed values; it spills on the primary.
+- The [Performance](site/content/docs/performance.md) card is measured on 0.23.0.
 
 ## 0.22.0
 
