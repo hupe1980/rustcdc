@@ -29,7 +29,7 @@ async fn main() -> rustcdc::Result<()> {
     let until_streaming = optional_bool_env("CDC_RS_WORKER_UNTIL_STREAMING");
     let snapshot_tables = optional_snapshot_tables();
 
-    let source_cfg = PostgresSourceConfig {
+    let mut source_cfg = PostgresSourceConfig {
         host,
         port,
         user,
@@ -46,6 +46,11 @@ async fn main() -> rustcdc::Result<()> {
         transport: rustcdc::TransportConfig::plaintext(),
         ..PostgresSourceConfig::default()
     };
+    if let Ok(limit) = std::env::var("CDC_RS_WORKER_TRANSACTION_BUFFER_BYTES") {
+        source_cfg.transaction_buffer_bytes = limit.parse::<u64>().map_err(|error| {
+            rustcdc::Error::ConfigError(format!("CDC_RS_WORKER_TRANSACTION_BUFFER_BYTES: {error}"))
+        })?;
+    }
 
     let mut runtime_config = RuntimeConfig::new(
         RuntimeSourceConfig::Postgres(source_cfg),
@@ -97,8 +102,19 @@ async fn main() -> rustcdc::Result<()> {
                 runtime.commit_ack(batch.ack_mode()).await?;
             }
             let ids = event_ids(&batch).join(",");
+            // Events released before their transaction's commit carry no total.
+            let unknown_totals = batch
+                .events()
+                .iter()
+                .filter(|event| {
+                    event
+                        .transaction
+                        .as_ref()
+                        .is_some_and(|tx| tx.total_events.is_none())
+                })
+                .count();
             let payload = format!(
-                "events={}\nacked={}\nids={}\n",
+                "events={}\nacked={}\nids={}\nunknown_totals={unknown_totals}\n",
                 batch.len(),
                 if ack_first_batch { 1 } else { 0 },
                 ids
