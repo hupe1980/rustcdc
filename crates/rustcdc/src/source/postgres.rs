@@ -2092,6 +2092,118 @@ mod tests {
         assert_eq!(resumes, vec![lsn(300), lsn(950)]);
     }
 
+    /// pgoutput gives a RELATION message no position of its own, so a schema-change event
+    /// built from a zero frame takes one from the stream. A standalone one after a message
+    /// must not checkpoint behind the message.
+    #[tokio::test]
+    async fn a_standalone_schema_event_after_a_message_does_not_checkpoint_behind_it() {
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(0, build_relation(16384, "public", "t", &[("id", true)])),
+            xlog(
+                300,
+                build_logical_message(false, 300, "audit", b"standalone"),
+            ),
+            xlog(
+                0,
+                build_relation(16384, "public", "t", &[("id", true), ("v", false)]),
+            ),
+        ]]);
+        let mut handle = make_stream_handle(50, provider);
+        let events = handle.next_events(100).await.unwrap();
+        let checkpoints: Vec<u64> = events
+            .iter()
+            .map(|event| {
+                let offset = handle
+                    .resume_offset_for(event)
+                    .unwrap_or_else(|| event.source.offset.clone());
+                super::parser::parse_pg_lsn(&offset).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            checkpoints,
+            vec![300, 300],
+            "message, then the schema event"
+        );
+    }
+
+    /// Without a checkpoint `lsn_position` is the WAL head, past a transaction the slot already
+    /// holds. A zero-frame schema event must not carry that position — into its own checkpoint
+    /// or into the resume floor — or the transaction's earlier events resume past its commit.
+    #[tokio::test]
+    async fn a_zero_frame_schema_event_does_not_carry_the_wal_head_past_a_backlogged_transaction() {
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(0, build_relation(16384, "public", "t", &[("id", true)])),
+            xlog(
+                0,
+                build_relation(16384, "public", "t", &[("id", true), ("v", false)]),
+            ),
+            xlog(200, build_begin(900, 0, 7)),
+            xlog(300, build_insert(16384, &[Some("1"), Some("a")])),
+            xlog(400, build_insert(16384, &[Some("2"), Some("b")])),
+            xlog(900, build_commit(900, 950, 0)),
+        ]]);
+        // The stream starts at the slot (50); the WAL head (0x4000) is past the commit.
+        let mut handle = make_stream_handle(0x4000, provider).with_resume_floor(50);
+        let events = handle.next_events(100).await.unwrap();
+        let lsn = |value: u64| super::parser::format_pg_lsn(value);
+        let schema = events
+            .iter()
+            .find(|event| event.op.is_schema_change())
+            .expect("the changed RELATION is announced");
+        assert_eq!(schema.source.offset, lsn(50));
+        let rows = rows_only(events);
+        let resumes: Vec<String> = rows
+            .iter()
+            .map(|event| {
+                handle
+                    .resume_offset_for(event)
+                    .expect("a stream event resumes")
+            })
+            .collect();
+        assert_eq!(resumes, vec![lsn(50), lsn(950)]);
+    }
+
+    /// Past the tracking cap a transaction's events fall back to their own offsets. A
+    /// schema-change event inside it must still fall back to a position before its commit,
+    /// or a checkpoint there skips the rest of the transaction.
+    #[tokio::test]
+    async fn an_evicted_transactions_schema_event_still_falls_back_inside_it() {
+        let mut frames = vec![
+            xlog(200, build_begin(900, 0, 7)),
+            xlog(0, build_relation(16384, "public", "t", &[("id", true)])),
+            xlog(300, build_insert(16384, &[Some("1")])),
+            xlog(
+                0,
+                build_relation(16384, "public", "t", &[("id", true), ("v", false)]),
+            ),
+            xlog(500, build_insert(16384, &[Some("2"), Some("b")])),
+            xlog(900, build_commit(900, 950, 0)),
+        ];
+        for n in 0..super::MAX_TRACKED_TX_ENDS {
+            let end = 1000 + n as u64 * 100;
+            frames.push(xlog(end - 50, build_begin(end - 1, 0, 8 + n as u32)));
+            frames.push(xlog(end - 1, build_commit(end - 1, end, 0)));
+        }
+        let provider = MockPgOutputProvider::new(vec![frames]);
+        let mut handle = make_stream_handle(1 << 32, provider).with_resume_floor(50);
+        let events = handle.next_events(100).await.unwrap();
+        let schema = events
+            .iter()
+            .find(|event| event.op.is_schema_change())
+            .expect("the changed RELATION is announced");
+        assert_eq!(schema.transaction.as_ref().unwrap().tx_id, 7);
+        assert!(
+            handle.resume_offset_for(schema).is_none(),
+            "the transaction was evicted"
+        );
+        let fallback = super::parser::parse_pg_lsn(&schema.source.offset).unwrap();
+        assert!(
+            fallback < 950,
+            "the evicted transaction's schema event falls back to {fallback}, at or past its \
+             commit (950): a checkpoint there skips its undelivered rows"
+        );
+    }
+
     fn make_stream_handle(
         initial_lsn: u64,
         provider: MockPgOutputProvider,

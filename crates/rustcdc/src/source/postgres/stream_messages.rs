@@ -527,18 +527,16 @@ impl PostgresStreamHandle {
             self.current_commit_ts
         };
         // pgoutput does not stamp a `RELATION` message with a position of its own, so the
-        // frame's `wal_start` is routinely `0`. That is fine while the event rides inside a
-        // transaction — `resume_offset_for` answers with the transaction's end LSN and the
-        // event's own offset is never checkpointed. Outside one it is not: that method
-        // returns `None` without transaction metadata, the runtime falls back to this
-        // offset, and a checkpoint at `0/00000000` resumes from the beginning of the slot.
+        // frame's `wal_start` is routinely `0`. Inside a transaction `resume_offset_for` usually
+        // answers for the event, but not once the transaction is past the tracking cap; outside
+        // one it returns `None`. Either way the runtime falls back to this offset, and a
+        // checkpoint at `0/00000000` would resume from the beginning of the slot.
         //
-        // The stream's current position is the truthful answer and it cannot rewind.
-        let lsn = if lsn == 0 {
-            self.stream.lsn_position
-        } else {
-            lsn
-        };
+        // The resume floor is the answer: the highest position a checkpoint of this stream can
+        // already hold, so it cannot rewind, and never past a transaction not yet delivered.
+        // `lsn_position` is not: without a checkpoint it starts at the WAL head, past any
+        // transaction the slot already holds, and a checkpoint there would skip its rows.
+        let lsn = if lsn == 0 { self.resume_floor } else { lsn };
         let captured = CapturedDdl {
             ddl_type: "ALTER_TABLE".to_string(),
             schema: relation.namespace.clone(),
