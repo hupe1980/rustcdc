@@ -201,6 +201,10 @@ pipeline commits:
   "preserve_transactions"`**: a part of the transaction cannot be delivered without delivering
   it twice after a crash, so the stream stops with a terminal error naming the transaction and
   `transaction_buffer_bytes`. Raise the limit above the transaction; the restart replays it.
+- **`wal_transport = "sql_peek"`, in every mode**: a peek returns whole transactions, so one
+  cannot be released in parts. The limit applies to a transaction's raw messages as the peek
+  is read, and one past it stops the stream with a terminal error naming the limit and
+  `streaming_replication`, before the rest of it is fetched.
 
 *Limits:* the release is decided by bytes, so changing `transaction_buffer_bytes` while a
 transaction is in flight changes which of its events carry `total_events`, and with it their
@@ -690,7 +694,7 @@ mode = "plaintext"    # plaintext | tls
 | `stream_in_progress_transactions` | `true` | Stream large transactions while they run (pgoutput v2, PostgreSQL 14+). Rows are still released at the commit — see [Large transactions](#large-transactions) |
 | `stream_buffer_memory_bytes` | `67108864` | Memory for streamed transactions not yet committed; past it a transaction spills to disk |
 | `stream_spill_directory` | system temp dir | Where streamed transactions spill; must be writable |
-| `transaction_buffer_bytes` | `268435456` | One transaction's events held until its COMMIT message. Past it the events are released early, or the stream stops when transactions must stay whole — see [Large transactions](#large-transactions). Must be > 0 |
+| `transaction_buffer_bytes` | `268435456` | One transaction's events held until its COMMIT message. Past it the events are released early, or the stream stops when transactions must stay whole, and always under `sql_peek` — see [Large transactions](#large-transactions). Must be > 0 |
 | `conn_timeout_secs` | `30` | Connection timeout in seconds |
 | `stream_poll_interval_ms` | `50` | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
 | `max_events_per_poll` | `1000` | Maximum events yielded per poll cycle |

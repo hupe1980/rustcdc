@@ -622,6 +622,64 @@ pub(super) struct LivePgOutputMessageProvider {
     pub(super) confirmed_lsn: u64,
     /// Ask the slot for `pg_logical_emit_message()` output as well as row changes.
     pub(super) capture_logical_messages: bool,
+    /// [`PostgresSourceConfig::transaction_buffer_bytes`](super::PostgresSourceConfig::transaction_buffer_bytes),
+    /// applied to one transaction's raw messages as they are fetched.
+    pub(super) transaction_buffer_bytes: u64,
+}
+
+/// Why a peek stopped before its rows were all read.
+enum PeekStop {
+    Failed(tokio_postgres::Error),
+    /// One transaction's raw messages passed the limit, with the bytes read of it so far.
+    TransactionTooLarge(u64),
+}
+
+impl From<tokio_postgres::Error> for PeekStop {
+    fn from(error: tokio_postgres::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl LivePgOutputMessageProvider {
+    /// Read a peek's rows as they arrive, stopping once one transaction's raw messages pass
+    /// `transaction_buffer_bytes`.
+    ///
+    /// A peek returns whole transactions — `upto_nchanges` is checked only at a commit — and
+    /// the decoder sees them only once the peek returns, so a transaction cannot be released
+    /// in parts here. Collecting it whole would hold all of it in memory, which is what the
+    /// limit exists to prevent.
+    async fn read_peek(
+        &self,
+        sql: &str,
+        params: [&(dyn tokio_postgres::types::ToSql + Sync); 3],
+    ) -> std::result::Result<Vec<tokio_postgres::Row>, PeekStop> {
+        use futures_util::TryStreamExt as _;
+
+        let stream = self
+            .client
+            .query_raw(
+                sql,
+                params
+                    .iter()
+                    .map(|param| *param as &dyn tokio_postgres::types::ToSql),
+            )
+            .await?;
+        futures_util::pin_mut!(stream);
+        let mut rows = Vec::new();
+        let mut transaction_bytes = 0u64;
+        while let Some(row) = stream.try_next().await? {
+            let data: &[u8] = row.get(1);
+            if data.first() == Some(&b'B') {
+                transaction_bytes = 0;
+            }
+            transaction_bytes = transaction_bytes.saturating_add(data.len() as u64);
+            if transaction_bytes > self.transaction_buffer_bytes {
+                return Err(PeekStop::TransactionTooLarge(transaction_bytes));
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
 }
 
 #[async_trait]
@@ -646,8 +704,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             .map_err(|e| Error::SourceError(format!("failed setting statement_timeout: {e}")))?;
 
         let result = self
-            .client
-            .query(
+            .read_peek(
                 // The options array is built rather than interpolated: it is a `text[]`
                 // parameter, so `messages` is added as data instead of as SQL.
                 //
@@ -661,11 +718,7 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
                     "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
                      $2, 'proto_version', '1', 'publication_names', $3)"
                 },
-                &[
-                    &self.slot_name as &(dyn tokio_postgres::types::ToSql + Sync),
-                    &capped,
-                    &self.publication_name,
-                ],
+                [&self.slot_name, &capped, &self.publication_name],
             )
             .await;
 
@@ -675,6 +728,23 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
         // must not inherit the short streaming poll budget.
         let _ = self.client.execute("SET statement_timeout = 0", &[]).await;
 
+        let result = match result {
+            Ok(rows) => Ok(rows),
+            Err(PeekStop::Failed(error)) => Err(error),
+            Err(PeekStop::TransactionTooLarge(bytes)) => {
+                return Err(Error::Unrecoverable(format!(
+                    "a transaction outgrew transaction_buffer_bytes ({limit} bytes) while it \
+                     was fetched from slot '{slot}' ({bytes} bytes of its messages read). \
+                     wal_transport = \"sql_peek\" reads whole transactions in one peek, so it \
+                     cannot release one in parts, and holding it would grow memory with the \
+                     transaction. Use wal_transport = \"streaming_replication\", or raise \
+                     transaction_buffer_bytes above this transaction's size; a restart \
+                     replays it.",
+                    limit = self.transaction_buffer_bytes,
+                    slot = self.slot_name,
+                )));
+            }
+        };
         let rows = match result {
             Ok(rows) => rows,
             Err(ref e) if e.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) => {

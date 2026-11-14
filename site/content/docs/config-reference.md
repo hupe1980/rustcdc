@@ -537,7 +537,7 @@ it is a catch-all, not a no-op.
 | `capture_logical_messages` | `bool` | `false` | Capture `pg_logical_emit_message()` output — the table-free transactional outbox; see below. |
 | `stream_in_progress_transactions` | `bool` | `true` | Stream large transactions while they run (pgoutput v2, PostgreSQL 14+, `StreamingReplication` only). Rows are released at the commit. See [Large transactions](@/docs/connectors/postgres.md#large-transactions). |
 | `stream_buffer_memory_bytes` | `u64` | 67 108 864 | Memory for streamed, not yet committed transactions; past it one spills. Must be > 0. |
-| `transaction_buffer_bytes` | `u64` | 268 435 456 | One committed transaction's events held until its COMMIT message, by estimated serialized size. Past it they are released with `total_events: None`, or, when transactions must stay whole, the stream fails. Must be > 0. See [Large transactions](@/docs/connectors/postgres.md#large-transactions). |
+| `transaction_buffer_bytes` | `u64` | 268 435 456 | One committed transaction's events held until its COMMIT message, by estimated serialized size. Past it they are released with `total_events: None`, or, when transactions must stay whole, the stream fails. Under `sql_peek`, which fetches whole transactions, it applies to a transaction's raw messages and the stream always fails past it. Must be > 0. See [Large transactions](@/docs/connectors/postgres.md#large-transactions). |
 | `stream_spill_directory` | `Option<PathBuf>` | system temp dir | Where streamed transactions spill. Checked writable when the stream opens. |
 
 **`create_replication_slot_if_missing` is not a convenience flag.** A slot that vanishes

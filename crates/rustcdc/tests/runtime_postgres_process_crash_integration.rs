@@ -893,11 +893,49 @@ async fn kill_after_the_first_batch_of_a_large_transaction(
 #[tokio::test]
 async fn runtime_postgres_whole_transaction_past_the_buffer_limit_fails_with_the_limit_named()
 -> rustcdc::Result<()> {
+    let Some(message) = transaction_past_the_buffer_limit(
+        rustcdc::WalTransport::StreamingReplication,
+        rustcdc::TransactionBoundaryPolicy::PreserveTransactions,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    assert!(message.contains("transaction_buffer_bytes"), "{message}");
+    Ok(())
+}
+
+/// Under `sql_peek` every peek returns whole transactions, so one larger than the limit
+/// cannot be fetched in parts: the stream fails, naming the limit and the transport that
+/// can, even where the pipeline would allow an early release — rather than collecting the
+/// whole transaction in memory.
+#[tokio::test]
+async fn runtime_postgres_sql_peek_transaction_past_the_buffer_limit_fails_with_the_limit_named()
+-> rustcdc::Result<()> {
+    let Some(message) = transaction_past_the_buffer_limit(
+        rustcdc::WalTransport::SqlPeek,
+        rustcdc::TransactionBoundaryPolicy::Split,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    assert!(message.contains("transaction_buffer_bytes"), "{message}");
+    assert!(message.contains("streaming_replication"), "{message}");
+    Ok(())
+}
+
+/// Run a 3,000-row transaction against a 16 KiB buffer and return the terminal error the
+/// stream stops with, or `None` when container tests are off. No row may be released first.
+async fn transaction_past_the_buffer_limit(
+    wal_transport: rustcdc::WalTransport,
+    boundary: rustcdc::TransactionBoundaryPolicy,
+) -> rustcdc::Result<Option<String>> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
             "skipping postgres transaction-buffer limit test (set CDC_RS_RUN_DOCKER_TESTS=1)"
         );
-        return Ok(());
+        return Ok(None);
     }
     let error = |error: &dyn std::error::Error| rustcdc::Error::SourceError(error.to_string());
     let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
@@ -942,30 +980,28 @@ async fn runtime_postgres_whole_transaction_past_the_buffer_limit_fails_with_the
     }
 
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
-    let mut runtime =
-        CdcRuntime::new(
-            RuntimeConfig::new(
-                RuntimeSourceConfig::Postgres(PostgresSourceConfig {
-                    host,
-                    port,
-                    user: "postgres".to_string(),
-                    password: "postgres".into(),
-                    database: "cdc".to_string(),
-                    replication_slot_name: "whole_tx_slot".to_string(),
-                    publication_name: "whole_tx_pub".to_string(),
-                    stream_poll_interval_ms: 50,
-                    transport: rustcdc::TransportConfig::plaintext(),
-                    transaction_buffer_bytes: TRANSACTION_BUFFER_BYTES,
-                    ..PostgresSourceConfig::default()
-                }),
-                FileCheckpoint::new(checkpoint_dir.path()),
-                InMemorySchemaHistory::default(),
-            )
-            .with_options(rustcdc::RuntimeOptions::new().with_transaction_boundary(
-                rustcdc::TransactionBoundaryPolicy::PreserveTransactions,
-            ))
-            .with_max_poll_wait_ms(150),
-        )?;
+    let mut runtime = CdcRuntime::new(
+        RuntimeConfig::new(
+            RuntimeSourceConfig::Postgres(PostgresSourceConfig {
+                host,
+                port,
+                user: "postgres".to_string(),
+                password: "postgres".into(),
+                database: "cdc".to_string(),
+                replication_slot_name: "whole_tx_slot".to_string(),
+                publication_name: "whole_tx_pub".to_string(),
+                stream_poll_interval_ms: 50,
+                transport: rustcdc::TransportConfig::plaintext(),
+                transaction_buffer_bytes: TRANSACTION_BUFFER_BYTES,
+                wal_transport,
+                ..PostgresSourceConfig::default()
+            }),
+            FileCheckpoint::new(checkpoint_dir.path()),
+            InMemorySchemaHistory::default(),
+        )
+        .with_options(rustcdc::RuntimeOptions::new().with_transaction_boundary(boundary))
+        .with_max_poll_wait_ms(150),
+    )?;
     runtime.start().await?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -993,8 +1029,7 @@ async fn runtime_postgres_whole_transaction_past_the_buffer_limit_fails_with_the
         rustcdc::core::ErrorKind::Terminal,
         "{message}"
     );
-    assert!(message.contains("transaction_buffer_bytes"), "{message}");
-    Ok(())
+    Ok(Some(message))
 }
 
 /// Block until PostgreSQL has released `slot`, or fail with a message that says why.
