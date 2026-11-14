@@ -1464,3 +1464,7 @@ mod sink_tests;
 #[cfg(test)]
 #[path = "loader_source_tests.rs"]
 mod source_tests;
+
+#[cfg(test)]
+#[path = "loader_admin_tests.rs"]
+mod admin_tests;
