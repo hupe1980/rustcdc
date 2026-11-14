@@ -63,6 +63,35 @@ The run fails rather than reporting a number when the transaction neither stream
 too small to pass `logical_decoding_work_mem`, it would measure nothing.
 See [Large transactions](@/docs/connectors/postgres.md#large-transactions).
 
+**The initial snapshot** is measured separately, on a 1 000 000-row table read three ways:
+
+```text
+  PostgreSQL scan            946 647 rows/s   (COPY TO STDOUT: the source's ceiling)
+  rustcdc → file              19 560 rows/s     6.8 µs CPU per row
+  rustcdc → Kafka             32 968 rows/s    18.3 µs CPU per row
+```
+
+PostgreSQL is not the limit: reading a chunk is a few percent of its time. rustcdc's work per
+row is, and to Kafka most of that is the producer's. The file sink is slower than Kafka on this
+laptop because each of its flushes is an `F_FULLFSYNC`, which on macOS waits for the drive itself;
+on Linux an `fsync` is far cheaper. `PIPELINE_BENCH_SNAPSHOT_ROWS` sets the table size; `0` skips
+it.
+
+**The checkpoint is written once a second, not per batch.** A crash replays at most that second of
+delivered rows and loses none; see [`at_least_once`](@/docs/concepts.md#at-least-once-default).
+Writing it per batch instead (`PIPELINE_BENCH_RUNTIME='checkpoint_interval_ms = 0'`), two
+alternating runs each on this laptop:
+
+| | per batch | once a second (default) |
+|---|---|---|
+| `at_least_once`, rows/s | 26 294 · 25 484 | **31 941 · 31 424** |
+| `at_least_once`, p99 | 7.1 s · 7.4 s | **5.8 s · 5.9 s** |
+| Snapshot → Kafka, rows/s | 28 746 · 27 259 | **32 968 · 34 005** |
+| Snapshot → file, rows/s | 16 264 · 16 256 | **19 560 · 19 821** |
+
+The CPU per row did not change; the gain is time spent waiting on the drive. `effectively_once`
+writes the checkpoint in each Kafka transaction either way, so it does not move.
+
 ## What these numbers do not say
 
 - **They belong to the machine that produced them.** Run the command on yours; the card names the

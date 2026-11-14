@@ -1560,6 +1560,10 @@ sink_flush_interval_events = 100     # flush after N events (whichever comes fir
 max_poll_wait_ms           = 100     # max wait for source events before flushing partial batch
 # health_stall_threshold_ms = 30000   # optional; derived from max_poll_wait_ms when unset
 
+# Durable checkpoint cadence (at_least_once; effectively_once writes per transaction)
+checkpoint_interval_ms = 1000     # a crash replays at most this much; 0 = per batch
+checkpoint_max_events  = 100000   # ...or this many events, whichever comes first
+
 # Parallelism
 prepare_parallelism = 8
 
@@ -1622,6 +1626,8 @@ max_delay_ms     = 10000
 | `sink_flush_interval_events` | `100` | Flush after this many buffered events |
 | `max_poll_wait_ms` | `100` | Maximum source poll wait before a partial batch flush |
 | `health_stall_threshold_ms` | *(derived)* | How long the poll loop may go without returning before the health verdict becomes `stalled`. Omitted, it derives `max_poll_wait_ms × 6` with a 30 s floor. Must exceed `max_poll_wait_ms`; rejected at load if not. See below |
+| `checkpoint_interval_ms` | `1000` | How long a delivered position may wait before it is written and confirmed to the source. A crash replays at most this much; nothing is lost. `0` = per batch. Per batch under `effectively_once`, which refuses any other value |
+| `checkpoint_max_events` | `100000` | Write the position after this many delivered events, whatever the interval |
 | `prepare_parallelism` | `8` | How many events are transformed and encoded concurrently. **Not a general throughput knob** — see below |
 | `sink_send_timeout_ms` | `15000` | Per-request timeout |
 | `sink_flush_timeout_ms` | `60000` | Per-batch flush deadline; set K8s `terminationGracePeriodSeconds` higher |

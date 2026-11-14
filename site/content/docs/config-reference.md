@@ -95,6 +95,8 @@ more than the slower detection it was meant to buy.
 | `connection_retry` | `Option<ConnectionRetryPolicy>` | enabled | Jittered exponential back-off for recoverable source connection errors. `None` propagates immediately. |
 | `sink_close_timeout_ms` | `Option<u64>` | `None` | Timeout applied to a registered sink's `close` during orderly shutdown. |
 | `transaction_boundary` | `TransactionBoundaryPolicy` | `Split` | Whether a delivered batch may end mid-transaction. See [Transaction boundaries](#transaction-boundaries). |
+| `checkpoint_interval` | `Duration` | `ZERO` | How long an acknowledged position may wait before it is written and confirmed to the source. `ZERO`: `commit_ack` returns with it durable. Otherwise a crash replays up to one interval of acknowledged events; nothing is lost. `stop()` writes it. |
+| `checkpoint_max_events` | `u64` | 100 000 | Write after this many acknowledged events, whatever the interval. |
 
 ### RuntimeConfig Builder Example
 
