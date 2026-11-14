@@ -648,6 +648,12 @@ pub trait StreamHandle: Send + Sync {
     /// offset) — so a restart part-way through replays the whole transaction. A handle that
     /// wraps another stream must forward this.
     ///
+    /// *Limit:* the PostgreSQL handle remembers the boundaries of the last 100,000
+    /// transactions not yet confirmed. Past that it returns `None` for an evicted transaction's
+    /// events, its last included, and the runtime falls back to each event's own position: the
+    /// transaction replays on restart rather than resuming after its commit record, and that
+    /// position can sit behind an earlier checkpoint.
+    ///
     /// The runtime uses this for both the durable checkpoint and the source-side
     /// confirmation, so a connector implementing it fixes replication-slot retention and
     /// restart duplicates together.
