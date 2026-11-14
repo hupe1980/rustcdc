@@ -10,10 +10,14 @@ use rustcdc::core::{Error as RtError, Offset};
 use crate::error::AppError;
 
 use crate::state::CheckpointAgeSource;
+use crate::state::file_lock::{self, TryLock};
 use crate::state::remote_lease::{self, LEASE_HEARTBEAT, LEASE_TTL, LeaseRecord};
 
 /// The owner lease file, beside the checkpoint it protects.
 const OWNER_LEASE_FILE: &str = "owner_lease.json";
+
+/// The file the owner holds an advisory lock on for as long as it runs.
+const OWNER_LOCK_FILE: &str = "owner_lease.lock";
 
 /// A `local_fs` state directory this process believes it owns.
 ///
@@ -21,11 +25,9 @@ const OWNER_LEASE_FILE: &str = "owner_lease.json";
 ///
 /// Every other backend is fenced: `redis` and `postgresql` take an owner+epoch lease
 /// through OpenDAL, and `kafka_topic` is fenced at the broker by its transactional id.
-/// `local_fs` — the **default** backend, and the one used outside Kubernetes — had only
-/// `StateDirLock`, a PID file validated with `kill -0` and `/proc/<pid>/cmdline`.
-///
-/// Every one of those checks is host-local. A PID from another host is indistinguishable
-/// from a stale one, so the lock is simply overwritten. Two `rustcdc run` invocations
+/// `local_fs` — the **default** backend, and the one used outside Kubernetes — once had
+/// only a PID file. A PID from another host is indistinguishable from a stale one, so such
+/// a lock is simply overwritten. Two `rustcdc run` invocations
 /// pointed at the same NFS or EFS state directory from different hosts therefore both
 /// proceeded, interleaving checkpoints on a last-write-wins basis — and if the lagging one
 /// wrote last, the durable position moved *backwards*, which is a silent replay on the
@@ -36,15 +38,27 @@ const OWNER_LEASE_FILE: &str = "owner_lease.json";
 /// the wrong things to depend on: RWO is a *node*-level guarantee, so two pods on one node
 /// can both mount the volume, and outside Kubernetes nothing enforces anything.
 ///
-/// # What this guarantees, and what it does not
+/// # Two signals: a lock and a lease
 ///
-/// The same contract as [`crate::state::remote_lease`], deliberately: one record type, one
-/// TTL, one heartbeat, one conflict message. A second instance starting against a live
-/// lease refuses to run and names the holder; a crashed owner's lease expires by itself
-/// after `LEASE_TTL`; an owner whose lease is stolen discovers it on the next renewal and
-/// stops writing rather than continuing blind.
+/// The owner holds an advisory lock on [`OWNER_LOCK_FILE`] for as long as it runs. The
+/// kernel releases it when the owner exits, however it exits, so on a local filesystem the
+/// lock answers "is the owner alive" outright: a second instance that cannot take it is
+/// refused, and one that can, finding a live lease written **on this kernel** (same
+/// [`remote_lease::boot_id`]), is looking at a crash and takes over at once. That holds
+/// whatever the PIDs are — in a container the crashed owner and its successor are both
+/// PID 1 — and needs no external program.
 ///
-/// It is **not** a consensus lease. Acquisition is read-then-write, not compare-and-swap,
+/// The lease covers what the lock cannot see: an owner on another kernel, which on a
+/// shared or network path may hold a lock this one is never told about. There the lease is
+/// authoritative, with the same contract as [`crate::state::remote_lease`]: one record
+/// type, one TTL, one heartbeat, one conflict message. A crashed owner's lease expires by
+/// itself after `LEASE_TTL`; the owner renews it on a timer so an idle pipeline keeps it;
+/// an owner whose lease is stolen discovers it on the next renewal and stops writing rather
+/// than continuing blind.
+///
+/// # What this does not guarantee
+///
+/// The lease is **not** a consensus lease. Acquisition is read-then-write, not compare-and-swap,
 /// so two instances starting inside the same read-write window can both see a free slot.
 /// On a filesystem that does not honour ordinary write visibility across hosts it
 /// guarantees nothing at all. It converts the common silent interleave into a loud
@@ -53,7 +67,11 @@ pub(crate) struct OwnedStateDir {
     path: PathBuf,
     owner: String,
     epoch: u64,
+    boot_id: Option<String>,
     last_renewed_ms: AtomicU64,
+    /// The advisory lock, held until [`release`](Self::release) or drop. `None` when the
+    /// filesystem refused to lock; the lease alone decides then.
+    lock: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 impl OwnedStateDir {
@@ -83,6 +101,7 @@ impl OwnedStateDir {
                 owner: self.owner.clone(),
                 renewed_at_ms: now_ms,
                 epoch: self.epoch,
+                boot_id: self.boot_id.clone(),
             },
         )?;
         self.last_renewed_ms.store(now_ms, Ordering::Relaxed);
@@ -103,10 +122,13 @@ impl OwnedStateDir {
         self.renew()
     }
 
-    /// Release the lease so a successor need not wait out the TTL.
+    /// Release the lock and the lease, so a successor need not wait out the TTL.
     pub(crate) fn release(&self) {
-        // Only if we still hold it: a fenced-out instance deleting the file would hand
-        // the directory to a third process while the real owner is still writing.
+        if let Ok(mut lock) = self.lock.lock() {
+            lock.take();
+        }
+        // The lease only if we still hold it: a fenced-out instance deleting the file would
+        // hand the directory to a third process while the real owner is still writing.
         match read_lease(&self.path) {
             Ok(Some(existing)) if existing.owner != self.owner => return,
             Err(_) => return,
@@ -123,39 +145,6 @@ impl OwnedStateDir {
             );
         }
     }
-}
-
-/// Does this lease belong to a process on **this host** that is no longer running?
-///
-/// `owner_id()` is `host:pid:nonce`. A different host, or an unparseable id, answers
-/// `false` — the TTL is the only evidence available then, and guessing would be the
-/// `StateDirLock` mistake this lease exists to correct.
-fn is_dead_local_owner(record: &LeaseRecord) -> bool {
-    let mut parts = record.owner.splitn(3, ':');
-    let (Some(host), Some(pid), Some(_nonce)) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    // `None` means this process could not determine its own hostname. A PID is only
-    // checkable against the local process table when we know the lease was written on
-    // *this* machine, and "both sides failed to resolve a name" is not that knowledge —
-    // treating it as a match would let a host with a shared state volume steal a lease
-    // from a live writer on another host.
-    let Some(local_host) = remote_lease::owner_host() else {
-        return false;
-    };
-    if host != local_host {
-        return false;
-    }
-    let Ok(pid) = pid.parse::<u32>() else {
-        return false;
-    };
-    // Our own PID is by definition alive; treating it as dead would let one process take
-    // a directory from itself, which is how the delivery-contract harness would silently
-    // run two owners in one process.
-    if pid == std::process::id() {
-        return false;
-    }
-    !crate::commands::run::is_cdc_process_alive(pid)
 }
 
 /// Release on the way out, so a successor need not wait out the TTL.
@@ -218,27 +207,61 @@ fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), AppError> {
 /// Take ownership of a `local_fs` state directory, refusing if a live owner holds it.
 pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, AppError> {
     let path = state_dir.join(OWNER_LEASE_FILE);
+    let lock_path = state_dir.join(OWNER_LOCK_FILE);
     let now_ms = remote_lease::now_unix_ms();
-    let existing = read_lease(&path)?;
+    let boot_id = remote_lease::boot_id();
 
+    let lock = match file_lock::try_lock(&lock_path)? {
+        TryLock::Held(file) => Some(file),
+        // A live owner holds the lock. Refused whatever its lease says: an idle owner whose
+        // lease looks expired is still running.
+        TryLock::Busy => {
+            return Err(match read_lease(&path)? {
+                Some(record) => remote_lease::conflict_error("local_fs", &record, now_ms),
+                None => AppError::Other(format!(
+                    "local_fs state directory '{}' is already owned by another running \
+                     process, which holds '{}'. Two instances writing one pipeline's state \
+                     interleave checkpoints, so this process will not start. Under \
+                     Kubernetes, set `strategy: {{ type: Recreate }}` on the Deployment.",
+                    state_dir.display(),
+                    lock_path.display(),
+                )),
+            });
+        }
+        TryLock::Unsupported(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %lock_path.display(),
+                "the filesystem refused an advisory lock on the local_fs state directory; \
+                 the owner lease alone decides ownership, so a crashed owner blocks a \
+                 restart until its lease expires"
+            );
+            None
+        }
+    };
+
+    let existing = read_lease(&path)?;
     let epoch = match &existing {
-        // A TTL-live lease held by a **dead process on this host** is a crash, not a
-        // conflict, and waiting out the TTL for it would be a regression: a filesystem
-        // backend restarted by systemd or a container runtime seconds after a crash would
-        // refuse to start for a full minute, for a directory nobody holds.
-        //
-        // This is the evidence a local filesystem gives that a remote store cannot: the
-        // owner's PID is checkable, precisely, right now. It only applies same-host —
-        // a PID from another machine means nothing here, which is exactly the case the
-        // old `StateDirLock` got wrong by treating it as stale.
-        Some(record) if record.is_live(now_ms, LEASE_TTL) && is_dead_local_owner(record) => {
+        // We hold the lock, and the lease was written on this kernel: its owner would hold
+        // the lock if it were running, so it has exited — a crash, not a conflict. Waiting
+        // out the TTL here would refuse a restart by systemd or a container runtime for a
+        // full minute, for a directory nobody holds.
+        Some(record)
+            if record.is_live(now_ms, LEASE_TTL)
+                && lock.is_some()
+                && boot_id.is_some()
+                && record.boot_id == boot_id =>
+        {
             tracing::warn!(
                 previous_owner = %record.owner,
                 previous_epoch = record.epoch,
-                "taking over a local_fs state lease from a dead process on this host"
+                "taking over a local_fs state lease from an owner on this kernel that no \
+                 longer holds its lock"
             );
             record.epoch.saturating_add(1)
         }
+        // Another kernel's owner, or one we cannot place: on a shared or network path its
+        // lock may be invisible here, so its lease is authoritative until it expires.
         Some(record) if record.is_live(now_ms, LEASE_TTL) => {
             return Err(remote_lease::conflict_error("local_fs", record, now_ms));
         }
@@ -260,6 +283,7 @@ pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, 
             owner: owner.clone(),
             renewed_at_ms: now_ms,
             epoch,
+            boot_id: boot_id.clone(),
         },
     )?;
 
@@ -269,8 +293,36 @@ pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, 
         path,
         owner,
         epoch,
+        boot_id,
         last_renewed_ms: AtomicU64::new(now_ms),
+        lock: std::sync::Mutex::new(lock),
     }))
+}
+
+/// Renew the lease every `every` while the owner lives, so an idle pipeline — one writing
+/// no checkpoints — keeps it.
+///
+/// Stops when the owner is dropped, or when a renewal finds the lease taken: the write
+/// path then refuses too, so the instance stops rather than writing alongside its successor.
+pub(crate) fn spawn_lease_renewal(
+    owner: &Arc<OwnedStateDir>,
+    every: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let owner = Arc::downgrade(owner);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(every);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(owner) = owner.upgrade() else {
+                return;
+            };
+            if let Err(error) = owner.renew_if_due() {
+                tracing::error!(error = %error, "local_fs state lease renewal failed");
+                return;
+            }
+        }
+    })
 }
 
 /// `FileCheckpoint` that re-asserts its lease before every durable write.
@@ -321,6 +373,7 @@ pub(super) async fn build_checkpoint(
     // Before opening anything. A losing instance must not even read state it has no right
     // to write from, and must certainly not create directories in it.
     let owner = acquire_state_dir(state_dir)?;
+    spawn_lease_renewal(&owner, LEASE_HEARTBEAT);
 
     let checkpoint_dir = state_dir.join("checkpoint");
     std::fs::create_dir_all(&checkpoint_dir)?;
@@ -419,13 +472,10 @@ mod tests {
 #[cfg(test)]
 mod lease_tests {
 
-    /// This host's name as `is_dead_local_owner` will compare it.
+    /// This host's name, as the owner id records it.
     ///
-    /// The tests that seed a lease "from this host" need the same answer the production
-    /// code gets. On a machine where the name cannot be resolved at all the same-host
-    /// liveness shortcut is deliberately disabled, so those tests have nothing to assert
-    /// and skip — the TTL path is covered separately by
-    /// `a_lease_from_another_host_is_judged_by_the_ttl_alone`.
+    /// The tests that seed a lease "from this host" need the name the production code
+    /// writes. On a machine where it cannot be resolved they skip.
     fn this_host() -> Option<String> {
         remote_lease::owner_host()
     }
@@ -481,6 +531,7 @@ mod lease_tests {
                 owner: "other-host:1:deadbeef".to_string(),
                 renewed_at_ms: stale,
                 epoch: 7,
+                boot_id: None,
             },
         )
         .expect("seed a stale lease");
@@ -516,6 +567,7 @@ mod lease_tests {
                 owner: "successor:2:feedface".to_string(),
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: owner.epoch + 1,
+                boot_id: None,
             },
         )
         .expect("successor takes the lease");
@@ -550,6 +602,7 @@ mod lease_tests {
                 owner: "successor:2:feedface".to_string(),
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 99,
+                boot_id: None,
             },
         )
         .expect("successor takes the lease");
@@ -566,43 +619,40 @@ mod lease_tests {
     ///
     /// Without this, a `local_fs` pipeline killed and restarted by systemd or a container
     /// runtime — seconds later, which is the normal case — would refuse to start for a
-    /// full `LEASE_TTL` over a directory nobody holds. That is a worse operational
-    /// regression than the interleave the lease exists to prevent, and it is avoidable:
-    /// on the same host the owner's PID is checkable right now.
+    /// full `LEASE_TTL` over a directory nobody holds.
     ///
-    /// The lease is seeded **fresh** (renewed a moment ago, so TTL-live) with a PID that
-    /// cannot be running, which is precisely the crashed-and-restarted shape. Deleting the
-    /// `is_dead_local_owner` arm from `acquire_state_dir` fails this test.
+    /// The lease is seeded **fresh** (TTL-live), written on this kernel, and nothing holds
+    /// the lock: precisely the crashed-and-restarted shape.
     #[tokio::test]
     async fn a_crashed_owner_on_this_host_does_not_block_a_restart() {
-        let Some(host) = this_host() else {
+        let (Some(host), Some(boot_id)) = (this_host(), this_boot_id()) else {
             return;
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(OWNER_LEASE_FILE);
 
-        // PID 0 is never a live user process, and the host matches ours.
         write_lease(
             &path,
             &LeaseRecord {
                 owner: format!("{host}:0:00000000"),
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 3,
+                boot_id: Some(boot_id),
             },
         )
-        .expect("seed a fresh lease from a dead pid");
+        .expect("seed a fresh lease from a crashed owner");
 
         let owner = acquire_state_dir(dir.path())
-            .expect("a lease held by a dead local process must be takeable immediately");
+            .expect("a lease whose owner on this kernel holds no lock must be takeable at once");
         assert_eq!(owner.epoch, 4, "the takeover must still advance the epoch");
     }
 
-    /// …but a *live* owner on this host is still a conflict.
+    /// A lease without a kernel id — written by an older version — is judged by its TTL.
     ///
-    /// The liveness check must not become a way to take a directory from a running
-    /// process. Our own PID is the sharpest case: it is unambiguously alive.
+    /// Without the kernel id the lock cannot vouch for it: its owner may have run anywhere.
+    /// Refusing until it expires is the conservative reading, and costs one TTL at upgrade.
     #[tokio::test]
-    async fn a_live_owner_on_this_host_is_still_refused() {
+    async fn a_lease_without_a_kernel_id_is_judged_by_its_ttl() {
         let Some(host) = this_host() else {
             return;
         };
@@ -615,13 +665,72 @@ mod lease_tests {
                 owner: format!("{host}:{}:00000000", std::process::id()),
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 1,
+                boot_id: None,
             },
         )
         .expect("seed a live lease");
 
         acquire_state_dir(dir.path())
             .err()
-            .expect("a live owner must still be refused");
+            .expect("a live lease without a kernel id must be refused");
+    }
+
+    /// A lease from another kernel is judged by its TTL even when its hostname is ours.
+    ///
+    /// A pinned hostname is shared by containers on different hosts, and on a network
+    /// filesystem such an owner's lock may be invisible here: taking our lock proves
+    /// nothing about it. The kernel id, not the hostname, decides whether the lock can.
+    #[tokio::test]
+    async fn a_lease_from_another_kernel_with_our_hostname_is_judged_by_its_ttl() {
+        let Some(host) = this_host() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OWNER_LEASE_FILE);
+
+        write_lease(
+            &path,
+            &LeaseRecord {
+                owner: format!("{host}:1:00000000"),
+                renewed_at_ms: remote_lease::now_unix_ms(),
+                epoch: 1,
+                boot_id: Some("another-kernel".to_string()),
+            },
+        )
+        .expect("seed a live lease from another kernel");
+
+        acquire_state_dir(dir.path())
+            .err()
+            .expect("a live lease from another kernel must be refused until it expires");
+    }
+
+    /// An idle owner keeps its lease: the renewal runs on a timer, not only on writes.
+    #[tokio::test]
+    async fn an_idle_owner_renews_its_lease_on_a_timer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("owner");
+        let path = dir.path().join(OWNER_LEASE_FILE);
+
+        // As if the owner had written nothing for most of a TTL.
+        let aged = remote_lease::now_unix_ms() - (LEASE_TTL.as_millis() as u64) + 1_000;
+        let mut lease = read_lease(&path).expect("read").expect("lease");
+        lease.renewed_at_ms = aged;
+        write_lease(&path, &lease).expect("age the lease");
+        owner.last_renewed_ms.store(0, Ordering::Relaxed);
+
+        let renewal = spawn_lease_renewal(&owner, std::time::Duration::from_millis(20));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let renewed = read_lease(&path).expect("read").expect("lease");
+        assert!(
+            renewed.renewed_at_ms > aged + 1_000,
+            "the timer must renew an idle owner's lease"
+        );
+
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(1), renewal)
+            .await
+            .expect("the timer stops once the owner is gone")
+            .expect("the timer task ends cleanly");
     }
 
     /// A lease from another host is judged by the TTL alone.
@@ -639,6 +748,7 @@ mod lease_tests {
                 owner: "some-other-host:0:00000000".to_string(),
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 1,
+                boot_id: None,
             },
         )
         .expect("seed a foreign lease");
@@ -647,6 +757,140 @@ mod lease_tests {
             .err()
             .expect("a live foreign lease must be refused whatever its pid says");
         assert!(error.to_string().contains("some-other-host"));
+    }
+
+    /// This kernel's boot id, as the lease records it; `None` off Linux.
+    fn this_boot_id() -> Option<String> {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    /// Write a lease as raw JSON, so these tests do not depend on the record's Rust shape.
+    fn seed_lease(dir: &Path, value: serde_json::Value) {
+        std::fs::write(
+            dir.join(OWNER_LEASE_FILE),
+            serde_json::to_vec(&value).expect("json"),
+        )
+        .expect("seed the lease");
+    }
+
+    /// A crashed owner with the same PID as its successor is taken over at once.
+    ///
+    /// In a container both are PID 1, so a liveness check that compares PIDs reads the dead
+    /// owner as this very process and waits out the TTL. Here the lease names our own PID
+    /// on this kernel, and nothing holds the lock: that owner is gone.
+    #[tokio::test]
+    async fn a_crashed_owner_with_our_own_pid_on_this_kernel_is_taken_over_at_once() {
+        let (Some(host), Some(boot_id)) = (this_host(), this_boot_id()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_lease(
+            dir.path(),
+            serde_json::json!({
+                "owner": format!("{host}:{}:00000001", std::process::id()),
+                "renewed_at_ms": remote_lease::now_unix_ms(),
+                "epoch": 5,
+                "boot_id": boot_id,
+            }),
+        );
+
+        let owner = acquire_state_dir(dir.path())
+            .expect("a crashed owner with our own PID must not hold the directory for the TTL");
+        assert_eq!(owner.epoch, 6);
+    }
+
+    /// A running owner keeps the directory even when its lease looks expired.
+    ///
+    /// An idle pipeline writes no checkpoints. Liveness must not depend on its lease being
+    /// fresh: here the lease is aged past the TTL while its owner still runs.
+    #[tokio::test]
+    async fn a_running_owner_whose_lease_looks_expired_is_still_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("first owner");
+        let expired = remote_lease::now_unix_ms() - (LEASE_TTL.as_millis() as u64) - 1_000;
+        let mut lease: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join(OWNER_LEASE_FILE)).expect("lease"),
+        )
+        .expect("json");
+        lease["renewed_at_ms"] = serde_json::json!(expired);
+        seed_lease(dir.path(), lease);
+
+        acquire_state_dir(dir.path())
+            .err()
+            .expect("a running owner must keep the directory whatever its lease's age");
+        drop(owner);
+    }
+
+    /// The probe `a_running_owner_is_refused_without_a_kill_binary` runs in a child process.
+    #[tokio::test]
+    async fn lease_probe_child() {
+        let Ok(dir) = std::env::var("RUSTCDC_LEASE_PROBE_DIR") else {
+            return;
+        };
+        match acquire_state_dir(Path::new(&dir)) {
+            Ok(_) => println!("LEASE-PROBE: acquired"),
+            Err(_) => println!("LEASE-PROBE: refused"),
+        }
+    }
+
+    /// Liveness must not depend on an external program.
+    ///
+    /// The release image ships no binaries at all, so a check that runs `kill -0` cannot
+    /// run there and reads every owner as dead. A second process with an empty `PATH`
+    /// must still be refused while this one holds the directory.
+    #[tokio::test]
+    async fn a_running_owner_is_refused_without_a_kill_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("first owner");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "state::offset::local_fs::lease_tests::lease_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RUSTCDC_LEASE_PROBE_DIR", dir.path())
+            .env("PATH", "")
+            .output()
+            .expect("run the probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("LEASE-PROBE: refused"),
+            "a second process without `kill` on its PATH must be refused while the owner \
+             runs; it said: {}",
+            stdout
+                .lines()
+                .find(|line| line.contains("LEASE-PROBE"))
+                .unwrap_or("nothing")
+        );
+        drop(owner);
+    }
+
+    /// The checkpoint a pipeline builds keeps its lease while it writes nothing: the
+    /// renewal timer is started with it, not left to the caller.
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_checkpoint_keeps_its_lease_while_idle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_checkpoint, _age, owner) = build_checkpoint(dir.path()).await.expect("build");
+        let path = dir.path().join(OWNER_LEASE_FILE);
+
+        let aged = remote_lease::now_unix_ms() - (LEASE_TTL.as_millis() as u64) + 1_000;
+        let mut lease = read_lease(&path).expect("read").expect("lease");
+        lease.renewed_at_ms = aged;
+        write_lease(&path, &lease).expect("age the lease");
+        owner.last_renewed_ms.store(0, Ordering::Relaxed);
+
+        // One heartbeat, with no checkpoint written in between.
+        tokio::time::sleep(LEASE_HEARTBEAT + std::time::Duration::from_secs(1)).await;
+        let renewed = read_lease(&path).expect("read").expect("lease");
+        assert!(
+            renewed.renewed_at_ms > aged + 1_000,
+            "a pipeline's lease must be renewed while it is idle"
+        );
     }
 
     /// An unparseable lease is replaced rather than being fatal.

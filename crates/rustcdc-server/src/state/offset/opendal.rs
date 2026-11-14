@@ -106,6 +106,7 @@ impl OwnedLease {
                 owner: self.owner.clone(),
                 renewed_at_ms: now_ms,
                 epoch: self.epoch,
+                boot_id: None,
             },
         )
         .await?;
@@ -196,6 +197,7 @@ pub(crate) async fn acquire_lease(
             owner: owner.clone(),
             renewed_at_ms: now_ms,
             epoch,
+            boot_id: None,
         },
     )
     .await?;

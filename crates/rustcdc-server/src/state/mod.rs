@@ -9,6 +9,7 @@ use rustcdc::schema_history::{DDLEvent, SchemaHistory, SchemaHistoryRetention, T
 use crate::config::schema::StateConfig;
 use crate::error::AppError;
 
+pub(crate) mod file_lock;
 pub(crate) mod metrics;
 pub(crate) mod offset;
 pub(crate) mod remote_lease;
