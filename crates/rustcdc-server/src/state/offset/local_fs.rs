@@ -81,6 +81,9 @@ struct OwnerState {
     lock: Option<HeldLock>,
     /// Set by release: nothing writes the lease after it.
     released: bool,
+    /// Set when a renewal finds the lease taken. Terminal: a fenced owner never takes the
+    /// directory back, even once its successor's lease expires.
+    fenced: bool,
 }
 
 impl OwnedStateDir {
@@ -95,7 +98,6 @@ impl OwnedStateDir {
     /// Losing the lease is terminal by design: an instance that has been fenced out must
     /// stop writing rather than interleave checkpoints with its successor, which is the
     /// failure the lease exists to prevent.
-    #[cfg(test)]
     fn renew(&self) -> Result<(), AppError> {
         self.renew_locked(&mut self.state())
     }
@@ -106,12 +108,20 @@ impl OwnedStateDir {
                 "local_fs state lease was released; this instance no longer writes".to_string(),
             ));
         }
+        if state.fenced {
+            return Err(AppError::Other(format!(
+                "local_fs state lease was taken from this process (ours: '{}', epoch {}); \
+                 this instance has been fenced out and no longer writes",
+                self.owner, self.epoch,
+            )));
+        }
         let now_ms = remote_lease::now_unix_ms();
 
         if let Some(existing) = read_lease(&self.path)?
             && existing.owner != self.owner
             && existing.is_live(now_ms, LEASE_TTL)
         {
+            state.fenced = true;
             return Err(AppError::Other(format!(
                 "local_fs state lease was taken by '{}' while this process held it \
                      (ours: '{}', epoch {}). This instance has been fenced out and will \
@@ -148,6 +158,12 @@ impl OwnedStateDir {
             return Ok(());
         }
         self.renew_locked(&mut state)
+    }
+
+    /// Whether this owner will never write its lease again: released or fenced.
+    fn has_stopped(&self) -> bool {
+        let state = self.state();
+        state.released || state.fenced
     }
 
     /// Release the lock and the lease, so a successor need not wait out the TTL.
@@ -356,6 +372,7 @@ fn acquire_with(
             last_renewed_ms: now_ms,
             lock,
             released: false,
+            fenced: false,
         }),
     }))
 }
@@ -363,24 +380,33 @@ fn acquire_with(
 /// Renew the lease every `every` while the owner lives, so an idle pipeline — one writing
 /// no checkpoints — keeps it.
 ///
-/// Stops when the owner is dropped, or when a renewal finds the lease taken: the write
-/// path then refuses too, so the instance stops rather than writing alongside its successor.
+/// Every tick renews, whether or not a checkpoint write renewed in between: the tick, not
+/// the wall clock, decides, so the heartbeat cannot be skipped by a clock that moves
+/// differently from the timer. A failed write is retried at the next tick. Stops when the
+/// owner is dropped, released or fenced: the write path then refuses too, so the instance
+/// stops rather than writing alongside its successor.
 pub(crate) fn spawn_lease_renewal(
     owner: &Arc<OwnedStateDir>,
     every: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     let owner = Arc::downgrade(owner);
     tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(every);
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
             let Some(owner) = owner.upgrade() else {
                 return;
             };
-            if let Err(error) = owner.renew_if_due() {
-                tracing::error!(error = %error, "local_fs state lease renewal failed");
-                return;
+            if let Err(error) = owner.renew() {
+                if owner.has_stopped() {
+                    tracing::error!(error = %error, "local_fs state lease renewal stopped");
+                    return;
+                }
+                tracing::warn!(
+                    error = %error,
+                    "local_fs state lease renewal failed; retrying at the next heartbeat"
+                );
             }
         }
     })
@@ -769,33 +795,111 @@ mod lease_tests {
             .expect("a live lease from another kernel must be refused until it expires");
     }
 
-    /// An idle owner keeps its lease: the renewal runs on a timer, not only on writes.
-    #[tokio::test]
-    async fn an_idle_owner_renews_its_lease_on_a_timer() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let owner = acquire_state_dir(dir.path()).expect("owner");
-        let path = dir.path().join(OWNER_LEASE_FILE);
-
-        // As if the owner had written nothing for most of a TTL.
+    /// Age the lease as if its owner had written nothing for most of a TTL, and return the
+    /// age written.
+    fn age_lease(dir: &Path) -> u64 {
+        let path = dir.join(OWNER_LEASE_FILE);
         let aged = remote_lease::now_unix_ms() - (LEASE_TTL.as_millis() as u64) + 1_000;
         let mut lease = read_lease(&path).expect("read").expect("lease");
         lease.renewed_at_ms = aged;
         write_lease(&path, &lease).expect("age the lease");
-        owner.state().last_renewed_ms = 0;
+        aged
+    }
 
-        let renewal = spawn_lease_renewal(&owner, std::time::Duration::from_millis(20));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let renewed = read_lease(&path).expect("read").expect("lease");
-        assert!(
-            renewed.renewed_at_ms > aged + 1_000,
-            "the timer must renew an idle owner's lease"
-        );
+    fn renewed_at_ms(dir: &Path) -> u64 {
+        read_lease(&dir.join(OWNER_LEASE_FILE))
+            .expect("read")
+            .expect("lease")
+            .renewed_at_ms
+    }
+
+    /// An idle owner keeps its lease: the timer renews it at every heartbeat, not once,
+    /// and stops when the owner is gone.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_owner_renews_its_lease_on_a_timer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("owner");
+        let renewal = spawn_lease_renewal(&owner, LEASE_HEARTBEAT);
+
+        // Offset from the ticks, so each check runs after the tick it is checking.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        for heartbeat in 1..=3 {
+            let aged = age_lease(dir.path());
+            tokio::time::sleep(LEASE_HEARTBEAT).await;
+            assert!(
+                renewed_at_ms(dir.path()) > aged,
+                "heartbeat {heartbeat} must renew an idle owner's lease"
+            );
+        }
+        assert!(!renewal.is_finished(), "the timer must keep running");
 
         drop(owner);
-        tokio::time::timeout(std::time::Duration::from_secs(1), renewal)
+        tokio::time::timeout(LEASE_HEARTBEAT * 2, renewal)
             .await
             .expect("the timer stops once the owner is gone")
             .expect("the timer task ends cleanly");
+    }
+
+    /// A renewal that fails to write does not stop the timer: the next heartbeat retries,
+    /// so one I/O error does not leave an idle owner to lose its lease.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_renewal_is_retried_at_the_next_heartbeat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("owner");
+        let renewal = spawn_lease_renewal(&owner, LEASE_HEARTBEAT);
+
+        // The lease's temporary file cannot be created while a directory has its name.
+        let aged = age_lease(dir.path());
+        let blocker = dir.path().join(OWNER_LEASE_FILE).with_extension("json.tmp");
+        std::fs::create_dir(&blocker).expect("block the lease write");
+        tokio::time::sleep(LEASE_HEARTBEAT + std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            renewed_at_ms(dir.path()),
+            aged,
+            "the blocked write must fail"
+        );
+        assert!(
+            !renewal.is_finished(),
+            "a failed write must not stop the timer"
+        );
+
+        std::fs::remove_dir(&blocker).expect("unblock");
+        tokio::time::sleep(LEASE_HEARTBEAT).await;
+        assert!(
+            renewed_at_ms(dir.path()) > aged,
+            "the next heartbeat must renew the lease"
+        );
+    }
+
+    /// Once fenced, the timer stops and the owner stays fenced: it never takes the
+    /// directory back, even after the successor's lease expires.
+    #[tokio::test(start_paused = true)]
+    async fn a_fenced_owner_stops_renewing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("owner");
+        let renewal = spawn_lease_renewal(&owner, LEASE_HEARTBEAT);
+
+        write_lease(
+            &owner.path,
+            &LeaseRecord {
+                owner: "successor:2:feedface".to_string(),
+                renewed_at_ms: remote_lease::now_unix_ms(),
+                epoch: owner.epoch + 1,
+                boot_id: None,
+                lock_dev: None,
+            },
+        )
+        .expect("successor takes the lease");
+        tokio::time::timeout(LEASE_HEARTBEAT * 2, renewal)
+            .await
+            .expect("the timer stops once the owner is fenced")
+            .expect("the timer task ends cleanly");
+
+        let stale = remote_lease::now_unix_ms() - (LEASE_TTL.as_millis() as u64) - 1_000;
+        let mut lease = read_lease(&owner.path).expect("read").expect("lease");
+        lease.renewed_at_ms = stale;
+        write_lease(&owner.path, &lease).expect("the successor's lease expires");
+        owner.renew().expect_err("a fenced owner must stay fenced");
     }
 
     /// A lease from another host is judged by the TTL alone.
@@ -975,22 +1079,17 @@ mod lease_tests {
     #[tokio::test(start_paused = true)]
     async fn a_pipeline_checkpoint_keeps_its_lease_while_idle() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (_checkpoint, _age, owner) = build_checkpoint(dir.path()).await.expect("build");
-        let path = dir.path().join(OWNER_LEASE_FILE);
+        let (_checkpoint, _age, _owner) = build_checkpoint(dir.path()).await.expect("build");
 
-        let aged = remote_lease::now_unix_ms() - (LEASE_TTL.as_millis() as u64) + 1_000;
-        let mut lease = read_lease(&path).expect("read").expect("lease");
-        lease.renewed_at_ms = aged;
-        write_lease(&path, &lease).expect("age the lease");
-        owner.state().last_renewed_ms = 0;
-
-        // One heartbeat, with no checkpoint written in between.
-        tokio::time::sleep(LEASE_HEARTBEAT + std::time::Duration::from_secs(1)).await;
-        let renewed = read_lease(&path).expect("read").expect("lease");
-        assert!(
-            renewed.renewed_at_ms > aged + 1_000,
-            "a pipeline's lease must be renewed while it is idle"
-        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        for heartbeat in 1..=3 {
+            let aged = age_lease(dir.path());
+            tokio::time::sleep(LEASE_HEARTBEAT).await;
+            assert!(
+                renewed_at_ms(dir.path()) > aged,
+                "heartbeat {heartbeat}: a pipeline's lease must be renewed while it is idle"
+            );
+        }
     }
 
     /// A lease written by an owner that could not lock is never read as "its owner would
