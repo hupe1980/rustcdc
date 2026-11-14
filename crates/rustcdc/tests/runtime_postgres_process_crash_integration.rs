@@ -925,6 +925,120 @@ async fn runtime_postgres_sql_peek_transaction_past_the_buffer_limit_fails_with_
     Ok(())
 }
 
+/// Standalone logical messages belong to no transaction, so under `sql_peek` they never add
+/// up to one: a backlog of many small ones, together past the limit, is delivered whole —
+/// after a transaction too, whose COMMIT ends what counts.
+#[tokio::test]
+async fn runtime_postgres_sql_peek_standalone_messages_do_not_count_as_one_transaction()
+-> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres standalone-message test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    const MESSAGES: usize = 32;
+    let error = |error: &dyn std::error::Error| rustcdc::Error::SourceError(error.to_string());
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec!["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .map_err(|e| error(&e))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|e| error(&e))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|e| error(&e))?;
+    let (admin, connection) = tokio_postgres::connect(
+        &format!("host={host} port={port} user=postgres password=postgres dbname=cdc"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .map_err(|e| error(&e))?;
+    tokio::spawn(connection);
+    for statement in [
+        "CREATE TABLE public.messages_tx (id BIGINT PRIMARY KEY)",
+        "CREATE PUBLICATION messages_pub FOR TABLE public.messages_tx",
+        "SELECT pg_create_logical_replication_slot('messages_slot', 'pgoutput')",
+    ] {
+        admin
+            .batch_execute(statement)
+            .await
+            .map_err(|e| error(&e))?;
+    }
+    admin
+        .batch_execute("INSERT INTO public.messages_tx VALUES (1)")
+        .await
+        .map_err(|e| error(&e))?;
+    // Each about 1 KiB; together twice the 16 KiB limit.
+    for _ in 0..MESSAGES {
+        admin
+            .batch_execute("SELECT pg_logical_emit_message(false, 'probe', repeat('x', 1024))")
+            .await
+            .map_err(|e| error(&e))?;
+    }
+    admin
+        .batch_execute("INSERT INTO public.messages_tx VALUES (2)")
+        .await
+        .map_err(|e| error(&e))?;
+
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
+    let mut runtime = CdcRuntime::new(
+        RuntimeConfig::new(
+            RuntimeSourceConfig::Postgres(PostgresSourceConfig {
+                host,
+                port,
+                user: "postgres".to_string(),
+                password: "postgres".into(),
+                database: "cdc".to_string(),
+                replication_slot_name: "messages_slot".to_string(),
+                publication_name: "messages_pub".to_string(),
+                stream_poll_interval_ms: 50,
+                transport: rustcdc::TransportConfig::plaintext(),
+                transaction_buffer_bytes: TRANSACTION_BUFFER_BYTES,
+                wal_transport: rustcdc::WalTransport::SqlPeek,
+                capture_logical_messages: true,
+                ..PostgresSourceConfig::default()
+            }),
+            FileCheckpoint::new(checkpoint_dir.path()),
+            InMemorySchemaHistory::default(),
+        )
+        .with_max_poll_wait_ms(150),
+    )?;
+    runtime.start().await?;
+
+    let (mut messages, mut rows) = (0, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while (messages < MESSAGES || rows < 2) && std::time::Instant::now() < deadline {
+        let batch = runtime.poll_event_batch().await?;
+        messages += batch
+            .events()
+            .iter()
+            .filter(|event| event.op == Operation::Message)
+            .count();
+        rows += batch
+            .events()
+            .iter()
+            .filter(|event| event.op == Operation::Insert)
+            .count();
+        runtime.commit_ack(batch.ack_mode()).await?;
+    }
+    assert_eq!(
+        (messages, rows),
+        (MESSAGES, 2),
+        "every standalone message and both rows are delivered"
+    );
+    Ok(())
+}
+
 /// Run a 3,000-row transaction against a 16 KiB buffer and return the terminal error the
 /// stream stops with, or `None` when container tests are off. No row may be released first.
 async fn transaction_past_the_buffer_limit(

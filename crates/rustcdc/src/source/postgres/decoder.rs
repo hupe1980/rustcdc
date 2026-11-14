@@ -666,15 +666,21 @@ impl LivePgOutputMessageProvider {
             .await?;
         futures_util::pin_mut!(stream);
         let mut rows = Vec::new();
-        let mut transaction_bytes = 0u64;
+        // Only what lies between a BEGIN and its COMMIT is one transaction. A standalone
+        // logical message has neither and is counted against nothing.
+        let mut transaction_bytes: Option<u64> = None;
         while let Some(row) = stream.try_next().await? {
             let data: &[u8] = row.get(1);
-            if data.first() == Some(&b'B') {
-                transaction_bytes = 0;
+            match data.first() {
+                Some(b'B') => transaction_bytes = Some(0),
+                Some(b'C') => transaction_bytes = None,
+                _ => {}
             }
-            transaction_bytes = transaction_bytes.saturating_add(data.len() as u64);
-            if transaction_bytes > self.transaction_buffer_bytes {
-                return Err(PeekStop::TransactionTooLarge(transaction_bytes));
+            if let Some(bytes) = transaction_bytes.as_mut() {
+                *bytes = bytes.saturating_add(data.len() as u64);
+                if *bytes > self.transaction_buffer_bytes {
+                    return Err(PeekStop::TransactionTooLarge(*bytes));
+                }
             }
             rows.push(row);
         }
